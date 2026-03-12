@@ -1,0 +1,676 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cctrl — Claude Code Controller
+# Manages settings profiles, tracks token usage locally, extensible via plugins.
+
+# Resolve real path (works through symlinks)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")" && pwd)"
+PROFILES_DIR="$SCRIPT_DIR/profiles"
+PLUGINS_DIR="$SCRIPT_DIR/plugins"
+COSTS_DIR="$SCRIPT_DIR/costs"
+SPENDING_LOG="$COSTS_DIR/spending.jsonl"
+
+CLAUDE_DIR="$HOME/.claude"
+SETTINGS="$CLAUDE_DIR/settings.json"
+PROJECTS_DIR="$CLAUDE_DIR/projects"
+ACTIVE_FILE="$SCRIPT_DIR/.active-profile"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+_active_profile() {
+    if [[ -f "$ACTIVE_FILE" ]]; then
+        cat "$ACTIVE_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+_profile_path() {
+    echo "$PROFILES_DIR/${1}.json"
+}
+
+_profile_exists() {
+    [[ -f "$(_profile_path "$1")" ]]
+}
+
+_log_event() {
+    mkdir -p "$COSTS_DIR"
+    local json="$1"
+    echo "$json" >> "$SPENDING_LOG"
+}
+
+_log_switch() {
+    _log_event "$(printf '{"ts":"%s","event":"switch","from":"%s","to":"%s"}' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2")"
+}
+
+_detect_active() {
+    if [[ ! -f "$SETTINGS" ]]; then
+        echo "none"
+        return
+    fi
+    for f in "$PROFILES_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        local name
+        name="$(basename "$f" .json)"
+        if diff -q <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$f" 2>/dev/null) &>/dev/null; then
+            echo "$name"
+            return
+        fi
+    done
+    if [[ -f "$ACTIVE_FILE" ]]; then
+        cat "$ACTIVE_FILE"
+    else
+        echo "unknown"
+    fi
+}
+
+# ── Commands ──────────────────────────────────────────────────────────
+
+cmd_use() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Usage: cctrl use <profile>${RESET}"
+        echo "Available profiles:"
+        cmd_ls
+        return 1
+    fi
+
+    if ! _profile_exists "$name"; then
+        echo -e "${RED}Profile '$name' not found.${RESET}"
+        echo "Available profiles:"
+        cmd_ls
+        return 1
+    fi
+
+    local prev
+    prev="$(_active_profile)"
+
+    if [[ "$prev" == "$name" ]]; then
+        echo -e "${DIM}Already on profile: ${BOLD}$name${RESET}"
+        return 0
+    fi
+
+    cp "$(_profile_path "$name")" "$SETTINGS"
+    echo "$name" > "$ACTIVE_FILE"
+    _log_switch "$prev" "$name"
+
+    echo -e "${GREEN}Switched to profile: ${BOLD}$name${RESET}"
+    echo -e "${DIM}Settings written to $SETTINGS${RESET}"
+    echo -e "${YELLOW}Restart Claude Code for changes to take effect.${RESET}"
+}
+
+cmd_ls() {
+    local active
+    active="$(_detect_active)"
+
+    if [[ ! -d "$PROFILES_DIR" ]] || [[ -z "$(ls "$PROFILES_DIR"/*.json 2>/dev/null)" ]]; then
+        echo -e "${DIM}No profiles found. Use 'cctrl save <name>' to create one.${RESET}"
+        return
+    fi
+
+    for f in "$PROFILES_DIR"/*.json; do
+        local name
+        name="$(basename "$f" .json)"
+        local model provider
+        model="$(jq -r '.env.ANTHROPIC_MODEL // .model // "default"' "$f" 2>/dev/null)"
+        provider="direct"
+        if jq -e '.env.CLAUDE_CODE_USE_BEDROCK' "$f" &>/dev/null; then
+            provider="bedrock"
+        fi
+
+        if [[ "$name" == "$active" ]]; then
+            echo -e "  ${GREEN}* ${BOLD}$name${RESET}  ${DIM}model=$model  via=$provider${RESET}"
+        else
+            echo -e "    $name  ${DIM}model=$model  via=$provider${RESET}"
+        fi
+    done
+}
+
+cmd_current() {
+    local active
+    active="$(_detect_active)"
+    echo -e "${BOLD}$active${RESET}"
+
+    if _profile_exists "$active"; then
+        local model
+        model="$(jq -r '.env.ANTHROPIC_MODEL // .model // "default"' "$(_profile_path "$active")" 2>/dev/null)"
+        echo -e "${DIM}model: $model${RESET}"
+
+        if [[ -f "$SETTINGS" ]]; then
+            if ! diff -q <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$(_profile_path "$active")" 2>/dev/null) &>/dev/null; then
+                echo -e "${YELLOW}Note: settings.json has been modified since last switch${RESET}"
+            fi
+        fi
+    fi
+}
+
+cmd_save() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Usage: cctrl save <name>${RESET}"
+        return 1
+    fi
+
+    if [[ ! -f "$SETTINGS" ]]; then
+        echo -e "${RED}No settings.json found at $SETTINGS${RESET}"
+        return 1
+    fi
+
+    if _profile_exists "$name"; then
+        echo -en "${YELLOW}Profile '$name' already exists. Overwrite? [y/N] ${RESET}"
+        read -r confirm
+        [[ "$confirm" =~ ^[yY]$ ]] || return 1
+    fi
+
+    cp "$SETTINGS" "$(_profile_path "$name")"
+    echo "$name" > "$ACTIVE_FILE"
+    echo -e "${GREEN}Saved current settings as profile: ${BOLD}$name${RESET}"
+}
+
+cmd_diff() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Usage: cctrl diff <profile>${RESET}"
+        return 1
+    fi
+
+    if ! _profile_exists "$name"; then
+        echo -e "${RED}Profile '$name' not found.${RESET}"
+        return 1
+    fi
+
+    if command -v delta &>/dev/null; then
+        delta <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$(_profile_path "$name")" 2>/dev/null) || true
+    else
+        diff --color=auto <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$(_profile_path "$name")" 2>/dev/null) || true
+    fi
+}
+
+cmd_edit() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Usage: cctrl edit <profile>${RESET}"
+        return 1
+    fi
+
+    if ! _profile_exists "$name"; then
+        echo -e "${RED}Profile '$name' not found.${RESET}"
+        return 1
+    fi
+
+    "${EDITOR:-vim}" "$(_profile_path "$name")"
+}
+
+cmd_costs() {
+    local range="${1:---week}"
+    local project_filter="${2:-}"
+
+    local days
+    case "$range" in
+        --today)  days=1 ;;
+        --week)   days=7 ;;
+        --month)  days=30 ;;
+        --all)    days=9999 ;;
+        *)        days=7 ;;
+    esac
+
+    # Use Python to parse session JSONL files for real token data
+    python3 - "$PROJECTS_DIR" "$days" "$project_filter" "$SPENDING_LOG" <<'PYEOF'
+import bisect, json, os, sys, glob
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+projects_dir = sys.argv[1]
+days = int(sys.argv[2])
+project_filter = sys.argv[3] if len(sys.argv) > 3 else ""
+spending_log = sys.argv[4] if len(sys.argv) > 4 else ""
+
+cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+# Pricing per million tokens (Anthropic API pricing)
+PRICING = {
+    "input": {
+        "opus": 15.0, "claude-opus": 15.0,
+        "sonnet": 3.0, "claude-sonnet": 3.0,
+        "haiku": 0.80, "claude-haiku": 0.80,
+    },
+    "output": {
+        "opus": 75.0, "claude-opus": 75.0,
+        "sonnet": 15.0, "claude-sonnet": 15.0,
+        "haiku": 4.0, "claude-haiku": 4.0,
+    },
+    "cache_write": {
+        "opus": 18.75, "claude-opus": 18.75,
+        "sonnet": 3.75, "claude-sonnet": 3.75,
+        "haiku": 1.0, "claude-haiku": 1.0,
+    },
+    "cache_read": {
+        "opus": 1.50, "claude-opus": 1.50,
+        "sonnet": 0.30, "claude-sonnet": 0.30,
+        "haiku": 0.08, "claude-haiku": 0.08,
+    },
+}
+
+def get_price_key(model_name):
+    """Map model ID to pricing tier."""
+    m = model_name.lower()
+    for key in ["opus", "sonnet", "haiku"]:
+        if key in m:
+            return key
+    return "sonnet"  # default
+
+def cost_for(price_key, input_t, output_t, cache_write_t, cache_read_t):
+    """Estimate cost in USD."""
+    ip = PRICING["input"].get(price_key, 3.0)
+    op = PRICING["output"].get(price_key, 15.0)
+    cwp = PRICING["cache_write"].get(price_key, 3.75)
+    crp = PRICING["cache_read"].get(price_key, 0.30)
+    return (input_t * ip + output_t * op + cache_write_t * cwp + cache_read_t * crp) / 1_000_000
+
+# ── Load spending log: switch timeline + session→profile map ─────────
+# Switch events let us infer the active profile at any timestamp.
+# session_update events give us a direct profile label per session_id.
+all_switches = []        # list of (datetime, from_profile, to_profile)
+session_profile = {}     # session_id -> profile name (from session_update events)
+switches_for_display = []
+
+if spending_log and os.path.exists(spending_log):
+    with open(spending_log) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = e.get("event", "")
+            if event == "switch":
+                switches_for_display.append(e)
+                try:
+                    ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
+                    all_switches.append((ts, e.get("from", "unknown"), e["to"]))
+                except (KeyError, ValueError):
+                    pass
+            elif event in ("session_update", "session_end"):
+                sid = e.get("session_id")
+                prof = e.get("profile")
+                if sid and prof:
+                    session_profile[sid] = prof
+
+all_switches.sort(key=lambda x: x[0])
+switch_times = [s[0] for s in all_switches]
+
+def profile_at(ts):
+    """Return the profile name active at the given datetime.
+
+    Uses the switch timeline: for timestamps before the first recorded
+    switch, return the *from* profile of that switch (not the *to*).
+    """
+    if not all_switches:
+        return "unknown"
+    idx = bisect.bisect_right(switch_times, ts) - 1
+    if idx < 0:
+        # Before the first ever recorded switch — use its 'from' value
+        return all_switches[0][1]
+    return all_switches[idx][2]  # [2] is the 'to' profile
+
+# ── Aggregates ────────────────────────────────────────────────────────
+by_date = {}       # date -> {input, output, cache_write, cache_read, cost, turns}
+by_model = {}      # model -> {input, output, cache_write, cache_read, cost, turns}
+by_project = {}    # project_name -> {input, output, cache_write, cache_read, cost, turns}
+by_profile = {}    # profile -> {input, output, cache_write, cache_read, cost, turns}
+total = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "cost": 0.0, "turns": 0}
+
+def add_to(bucket, key, input_t, output_t, cw, cr, cost):
+    if key not in bucket:
+        bucket[key] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "cost": 0.0, "turns": 0}
+    bucket[key]["input"] += input_t
+    bucket[key]["output"] += output_t
+    bucket[key]["cache_write"] += cw
+    bucket[key]["cache_read"] += cr
+    bucket[key]["cost"] += cost
+    bucket[key]["turns"] += 1
+
+def record_turn(ts, model, usage, project_name, session_id=None):
+    date_str = ts.strftime("%Y-%m-%d")
+    input_t = usage.get("input_tokens", 0)
+    output_t = usage.get("output_tokens", 0)
+    cache_write_t = usage.get("cache_creation_input_tokens", 0)
+    cache_read_t = usage.get("cache_read_input_tokens", 0)
+    price_key = get_price_key(model)
+    c = cost_for(price_key, input_t, output_t, cache_write_t, cache_read_t)
+    # Prefer direct session→profile mapping; fall back to timestamp lookup
+    prof = session_profile.get(session_id) if session_id else None
+    if not prof:
+        prof = profile_at(ts)
+
+    add_to(by_date, date_str, input_t, output_t, cache_write_t, cache_read_t, c)
+    add_to(by_model, model, input_t, output_t, cache_write_t, cache_read_t, c)
+    add_to(by_project, project_name, input_t, output_t, cache_write_t, cache_read_t, c)
+    add_to(by_profile, prof, input_t, output_t, cache_write_t, cache_read_t, c)
+
+    total["input"] += input_t
+    total["output"] += output_t
+    total["cache_write"] += cache_write_t
+    total["cache_read"] += cache_read_t
+    total["cost"] += c
+    total["turns"] += 1
+
+# ── Parse session JSONL files ─────────────────────────────────────────
+session_files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
+
+for sf in session_files:
+    # Skip subagent files for cleaner accounting
+    if "/subagents/" in sf:
+        continue
+
+    # Extract project name and session_id from path
+    rel = os.path.relpath(sf, projects_dir)
+    project_name = rel.split("/")[0].replace("-Users-matthew--projects-", "").replace("-Users-matthew-", "~").replace("-", "/", 1) if "/" in rel else rel.split("/")[0]
+    session_id = os.path.splitext(os.path.basename(sf))[0]
+
+    if project_filter and project_filter not in project_name:
+        continue
+
+    try:
+        with open(sf) as f:
+            lines = f.readlines()
+    except (IOError, OSError):
+        continue
+
+    prev_type = None
+    last_assistant = None
+
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        msg_type = d.get("type", "")
+        msg = d.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+
+        if msg.get("role") == "assistant" and "usage" in msg:
+            last_assistant = d
+            prev_type = "assistant"
+        elif prev_type == "assistant" and last_assistant is not None:
+            a_msg = last_assistant.get("message", {})
+            usage = a_msg.get("usage", {})
+            model = a_msg.get("model", "unknown")
+            ts_ms = last_assistant.get("timestamp")
+
+            if ts_ms:
+                if isinstance(ts_ms, (int, float)):
+                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                else:
+                    try:
+                        ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
+                    except ValueError:
+                        last_assistant = None
+                        prev_type = msg_type
+                        continue
+                if ts >= cutoff:
+                    record_turn(ts, model, usage, project_name, session_id)
+            last_assistant = None
+            prev_type = msg_type
+        else:
+            prev_type = msg_type
+
+    # Flush final assistant if file ends on one
+    if last_assistant is not None:
+        a_msg = last_assistant.get("message", {})
+        usage = a_msg.get("usage", {})
+        model = a_msg.get("model", "unknown")
+        ts_ms = last_assistant.get("timestamp")
+        if ts_ms:
+            if isinstance(ts_ms, (int, float)):
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            else:
+                try:
+                    ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
+                except ValueError:
+                    ts = None
+            if ts and ts >= cutoff:
+                record_turn(ts, model, usage, project_name, session_id)
+
+def fmt(n):
+    return f"{n:,}"
+
+def usd(n):
+    return f"${n:,.2f}"
+
+# ── Print results ──
+print(f"\033[1mClaude Code Token Usage\033[0m  \033[2m(last {days} day{'s' if days != 1 else ''})\033[0m")
+print()
+
+# Daily breakdown
+if by_date:
+    print(f"\033[0;36m{'Date':<12} {'Input':>12} {'Output':>12} {'Cache Write':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
+    print("─" * 78)
+    for date in sorted(by_date.keys()):
+        d = by_date[date]
+        print(f"{date:<12} {fmt(d['input']):>12} {fmt(d['output']):>12} {fmt(d['cache_write']):>12} {fmt(d['cache_read']):>12} {usd(d['cost']):>10} {d['turns']:>6}")
+    print("─" * 78)
+    print(f"\033[1m{'Total':<12} {fmt(total['input']):>12} {fmt(total['output']):>12} {fmt(total['cache_write']):>12} {fmt(total['cache_read']):>12} {usd(total['cost']):>10} {total['turns']:>6}\033[0m")
+    print()
+
+# Model breakdown
+if by_model:
+    print(f"\033[1mBy Model\033[0m")
+    sorted_models = sorted(by_model.items(), key=lambda x: x[1]["cost"], reverse=True)
+    for model, d in sorted_models:
+        print(f"  {model:<40} {fmt(d['input']):>10} in  {fmt(d['output']):>10} out  {usd(d['cost']):>10}  {d['turns']:>5} turns")
+    print()
+
+# Profile breakdown
+if by_profile:
+    print(f"\033[1mBy Profile\033[0m")
+    sorted_profiles = sorted(by_profile.items(), key=lambda x: x[1]["cost"], reverse=True)
+    for prof, d in sorted_profiles:
+        print(f"  {prof:<30} {fmt(d['input']):>10} in  {fmt(d['output']):>10} out  {usd(d['cost']):>10}  {d['turns']:>5} turns")
+    print()
+
+# Project breakdown (top 10)
+if by_project:
+    print(f"\033[1mBy Project\033[0m \033[2m(top 10)\033[0m")
+    sorted_projects = sorted(by_project.items(), key=lambda x: x[1]["cost"], reverse=True)[:10]
+    for proj, d in sorted_projects:
+        label = proj[:45]
+        print(f"  {label:<46} {fmt(d['input']+d['output']):>12} tokens  {usd(d['cost']):>10}  {d['turns']:>5} turns")
+    print()
+
+# Profile switch history
+if switches_for_display:
+    print(f"\033[1mRecent Profile Switches\033[0m")
+    for s in switches_for_display[-10:]:
+        print(f"  \033[2m{s['ts']}\033[0m  {s['from']} -> \033[1m{s['to']}\033[0m")
+    print()
+
+if not by_date:
+    print("\033[2mNo session data found for this period.\033[0m")
+PYEOF
+}
+
+cmd_log() {
+    if [[ ! -f "$SPENDING_LOG" ]]; then
+        echo -e "${DIM}No spending log yet.${RESET}"
+        return
+    fi
+
+    local count="${1:-20}"
+    echo -e "${BOLD}Spending Log${RESET} ${DIM}(last $count entries)${RESET}"
+    echo ""
+    tail -"$count" "$SPENDING_LOG" | while IFS= read -r line; do
+        local ts event
+        ts="$(echo "$line" | jq -r '.ts' 2>/dev/null)"
+        event="$(echo "$line" | jq -r '.event' 2>/dev/null)"
+        case "$event" in
+            switch)
+                local from to
+                from="$(echo "$line" | jq -r '.from' 2>/dev/null)"
+                to="$(echo "$line" | jq -r '.to' 2>/dev/null)"
+                echo -e "  ${DIM}$ts${RESET}  ${BLUE}switch${RESET}  $from -> ${BOLD}$to${RESET}"
+                ;;
+            session_end|session_update)
+                local profile in_tok out_tok models
+                profile="$(echo "$line" | jq -r '.profile' 2>/dev/null)"
+                in_tok="$(echo "$line" | jq -r '.input_tokens' 2>/dev/null)"
+                out_tok="$(echo "$line" | jq -r '.output_tokens' 2>/dev/null)"
+                models="$(echo "$line" | jq -r '.models | keys | join(", ")' 2>/dev/null)"
+                printf "  ${DIM}%s${RESET}  ${GREEN}session${RESET}  profile=${BOLD}%s${RESET}  in=%s  out=%s  ${DIM}[%s]${RESET}\n" \
+                    "$ts" "$profile" "$in_tok" "$out_tok" "$models"
+                ;;
+            *)
+                echo -e "  ${DIM}$ts${RESET}  $event  $(echo "$line" | jq -c 'del(.ts,.event)' 2>/dev/null)"
+                ;;
+        esac
+    done
+}
+
+cmd_rename() {
+    local old="${1:-}" new="${2:-}"
+    if [[ -z "$old" || -z "$new" ]]; then
+        echo -e "${RED}Usage: cctrl rename <old> <new>${RESET}"
+        return 1
+    fi
+
+    if _profile_exists "$old"; then
+        if _profile_exists "$new"; then
+            echo -e "${RED}Profile '$new' already exists.${RESET}"
+            return 1
+        fi
+        mv "$(_profile_path "$old")" "$(_profile_path "$new")"
+        # Update active profile tracking if needed
+        if [[ "$(_active_profile)" == "$old" ]]; then
+            echo "$new" > "$ACTIVE_FILE"
+        fi
+    else
+        echo -e "${YELLOW}Profile '$old' not found on disk; updating log references only.${RESET}"
+    fi
+
+    # Update spending log entries that reference the old profile name
+    if [[ -f "$SPENDING_LOG" ]]; then
+        local tmp
+        tmp="$(mktemp)"
+        python3 -c "
+import json, sys
+old, new = $(printf '%s' "$old" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'), $(printf '%s' "$new" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+with open('$SPENDING_LOG') as f:
+    lines = f.readlines()
+out = []
+for line in lines:
+    line = line.rstrip('\n')
+    if not line:
+        continue
+    try:
+        e = json.loads(line)
+        if e.get('from') == old: e['from'] = new
+        if e.get('to') == old: e['to'] = new
+        if e.get('profile') == old: e['profile'] = new
+        out.append(json.dumps(e))
+    except Exception:
+        out.append(line)
+with open('$SPENDING_LOG', 'w') as f:
+    f.write('\n'.join(out) + '\n')
+"
+        echo -e "${DIM}Updated spending log: '$old' -> '$new'${RESET}"
+    fi
+
+    echo -e "${GREEN}Renamed: ${BOLD}$old${RESET}${GREEN} -> ${BOLD}$new${RESET}"
+}
+
+cmd_start() {
+    local flags=("--dangerously-skip-permissions")
+    flags+=("$@")
+    echo -e "${DIM}claude ${flags[*]}${RESET}"
+    exec claude "${flags[@]}"
+}
+
+cmd_help() {
+    echo -e "${BOLD}cctrl${RESET} — Claude Code Controller"
+    echo ""
+    echo -e "${BOLD}Profile Management${RESET}"
+    echo "  cctrl use <profile>     Switch to a settings profile (alias: switch)"
+    echo "  cctrl ls                List available profiles"
+    echo "  cctrl current           Show active profile"
+    echo "  cctrl save <name>       Save current settings as a profile"
+    echo "  cctrl diff <profile>    Diff current settings vs a profile"
+    echo "  cctrl rename <old> <new>  Rename a profile"
+    echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
+    echo ""
+    echo -e "${BOLD}Session${RESET}"
+    echo "  cctrl start [flags]     Launch claude with --dangerously-skip-permissions"
+    echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
+    echo ""
+    echo -e "${BOLD}Usage Tracking${RESET}"
+    echo "  cctrl costs [--today|--week|--month|--all] [project-filter]"
+    echo "                          Token usage, costs, model & project breakdown"
+    echo "  cctrl log [count]       Show profile switch history"
+    echo ""
+    echo -e "${BOLD}Plugins${RESET}"
+    echo "  Any executable named cctrl-<cmd> in plugins/ or PATH"
+    echo "  is auto-discovered as a subcommand."
+    echo ""
+    echo -e "${DIM}Profiles: $PROFILES_DIR${RESET}"
+    echo -e "${DIM}Plugins:  $PLUGINS_DIR${RESET}"
+}
+
+# ── Plugin discovery ──────────────────────────────────────────────────
+
+_try_plugin() {
+    local cmd="$1"
+    shift
+
+    if [[ -x "$PLUGINS_DIR/cctrl-$cmd" ]]; then
+        "$PLUGINS_DIR/cctrl-$cmd" "$@"
+        return 0
+    fi
+
+    if command -v "cctrl-$cmd" &>/dev/null; then
+        "cctrl-$cmd" "$@"
+        return 0
+    fi
+
+    return 1
+}
+
+# ── Main dispatch ─────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "$cmd" in
+        use|switch) cmd_use "$@" ;;
+        ls|list) cmd_ls "$@" ;;
+        current) cmd_current "$@" ;;
+        save)    cmd_save "$@" ;;
+        rename)  cmd_rename "$@" ;;
+        diff)    cmd_diff "$@" ;;
+        edit)    cmd_edit "$@" ;;
+        start|s) cmd_start "$@" ;;
+        costs|cost|usage) cmd_costs "$@" ;;
+        log)     cmd_log "$@" ;;
+        help|-h|--help) cmd_help "$@" ;;
+        *)
+            if ! _try_plugin "$cmd" "$@"; then
+                echo -e "${RED}Unknown command: $cmd${RESET}"
+                echo ""
+                cmd_help
+                return 1
+            fi
+            ;;
+    esac
+}
+
+main "$@"

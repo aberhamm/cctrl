@@ -1,0 +1,36 @@
+profiles/
+costs/
+.active-profile
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Environment / secrets
+.env
+*.env
+*.env.local
+
+# Runtime / generated data
+*.jsonl
+*.csv
+*.log

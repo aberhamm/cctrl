@@ -1,0 +1,786 @@
+#!/usr/bin/env python3
+"""
+cctrl-scan — directory scanner plugin for cctrl.
+
+Usage:
+  cctrl scan [dir]             Default scan: top-level subdirs, sorted by name
+  cctrl scan --large [dir]     Top 20 largest dirs, up to 3 levels deep
+  cctrl scan --dirty [dir]     Git repos with uncommitted changes
+  cctrl scan --secrets [dir]   Scan dirty repos for credential patterns
+  cctrl scan --clean [dir]     Find and optionally delete reclaimable dirs
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+# ── Colors (matching cctrl style) ─────────────────────────────────────────────
+
+BOLD   = '\033[1m'
+DIM    = '\033[2m'
+RED    = '\033[0;31m'
+GREEN  = '\033[0;32m'
+YELLOW = '\033[0;33m'
+CYAN   = '\033[0;36m'
+RESET  = '\033[0m'
+
+# ── Self-exclusion ────────────────────────────────────────────────────────────
+
+# Walk up two levels from this file: plugins/cctrl-scan -> plugins/ -> cctrl/
+_SELF_DIR = os.path.realpath(__file__)           # .../cctrl/plugins/cctrl-scan
+_PLUGINS_DIR = os.path.dirname(_SELF_DIR)        # .../cctrl/plugins
+_CCTRL_DIR = os.path.dirname(_PLUGINS_DIR)       # .../cctrl
+EXCLUDED_DIR = os.path.realpath(_CCTRL_DIR)
+
+# ── Credential patterns ───────────────────────────────────────────────────────
+
+SECRET_PATTERNS = [
+    (r'[A-Za-z0-9_]*(API_KEY|API_SECRET|SECRET_KEY|PRIVATE_KEY|ACCESS_TOKEN)[A-Za-z0-9_]*\s*[=:]\s*["\'][^"\']{8,}["\']', 'critical'),
+    (r'AKIA[0-9A-Z]{16}', 'critical'),
+    (r'aws_secret_access_key\s*[=:]\s*["\'][^"\']{16,}["\']', 'critical'),
+    (r'sk_live_[A-Za-z0-9]{24,}', 'critical'),
+    (r'shpat_[A-Za-z0-9]{32}', 'critical'),
+    (r'pk\.[A-Za-z0-9._-]{60,}', 'warning'),
+    (r'pk_live_[A-Za-z0-9]{24,}', 'warning'),
+    (r'Bearer\s+[A-Za-z0-9\-._~+/]{20,}=*', 'warning'),
+    (r'shpca_[A-Za-z0-9]{32}', 'warning'),
+]
+
+_COMPILED_PATTERNS = [(re.compile(p), sev) for p, sev in SECRET_PATTERNS]
+
+# Directories considered reclaimable
+RECLAIMABLE_NAMES = {'node_modules', '.next', '__pycache__', '.expo', 'vendor', 'dist', 'build', '.cache'}
+
+# ── Utility helpers ───────────────────────────────────────────────────────────
+
+def human_size(kb: int) -> str:
+    """Convert kilobytes to a human-readable string."""
+    if kb < 1024:
+        return f"{kb}K"
+    elif kb < 1024 * 1024:
+        return f"{kb / 1024:.1f}M"
+    else:
+        return f"{kb / (1024 * 1024):.1f}G"
+
+
+def du_kb(path: str) -> int:
+    """Return disk usage of path in kilobytes, or 0 on failure."""
+    result = subprocess.run(
+        ['du', '-sk', path],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        try:
+            return int(result.stdout.split()[0])
+        except (IndexError, ValueError):
+            pass
+    return 0
+
+
+def is_git(path: str) -> bool:
+    """Return True if path contains a .git directory."""
+    return os.path.isdir(os.path.join(path, '.git'))
+
+
+def git_last_commit(path: str) -> str:
+    """Return relative time of last commit, or '—' on failure."""
+    result = subprocess.run(
+        ['git', '-C', path, 'log', '-1', '--format=%cr'],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip()
+    return '—'
+
+
+def git_status_porcelain(path: str) -> str:
+    """Return raw porcelain status output, or '' on failure."""
+    result = subprocess.run(
+        ['git', '-C', path, 'status', '--porcelain'],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return result.stdout
+    return ''
+
+
+def git_diff_head(path: str) -> str:
+    """Return output of git diff HEAD, or '' on failure."""
+    result = subprocess.run(
+        ['git', '-C', path, 'diff', 'HEAD'],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        return result.stdout
+    return ''
+
+
+def parse_status(porcelain: str) -> dict:
+    """Parse porcelain status into counts by category."""
+    counts = {'modified': 0, 'untracked': 0, 'added': 0, 'deleted': 0, 'renamed': 0}
+    for line in porcelain.splitlines():
+        if len(line) < 2:
+            continue
+        xy = line[:2]
+        if xy == '??':
+            counts['untracked'] += 1
+        elif 'R' in xy:
+            counts['renamed'] += 1
+        elif 'D' in xy:
+            counts['deleted'] += 1
+        elif 'A' in xy:
+            counts['added'] += 1
+        else:
+            counts['modified'] += 1
+    return counts
+
+
+def format_change_summary(counts: dict) -> str:
+    """Format change counts into a compact human-readable summary."""
+    parts = []
+    for key in ('modified', 'added', 'deleted', 'renamed', 'untracked'):
+        n = counts.get(key, 0)
+        if n:
+            parts.append(f"{n} {key}")
+    return ', '.join(parts) if parts else 'no changes'
+
+
+def detect_stack(path: str) -> str:
+    """
+    Detect the primary tech stack for a directory based on file presence.
+    Returns a short label or '—'.
+    """
+    # turbo.json → turborepo (highest priority in the monorepo chain)
+    if os.path.exists(os.path.join(path, 'turbo.json')):
+        return 'turborepo'
+
+    # next.config.* → nextjs
+    for entry in os.scandir(path) if os.path.isdir(path) else []:
+        if entry.name.startswith('next.config.'):
+            return 'nextjs'
+
+    # app.json containing "expo"
+    app_json = os.path.join(path, 'app.json')
+    if os.path.exists(app_json):
+        try:
+            with open(app_json) as f:
+                content = f.read()
+            if '"expo"' in content:
+                return 'expo'
+        except (OSError, IOError):
+            pass
+
+    # package.json — check for strapi before generic node
+    pkg_json = os.path.join(path, 'package.json')
+    if os.path.exists(pkg_json):
+        try:
+            with open(pkg_json) as f:
+                pkg = json.load(f)
+            deps = {}
+            deps.update(pkg.get('dependencies', {}))
+            deps.update(pkg.get('devDependencies', {}))
+            if 'strapi' in deps or '@strapi/strapi' in deps:
+                return 'strapi'
+        except (OSError, IOError, json.JSONDecodeError):
+            pass
+        return 'node'
+
+    # Python
+    if (os.path.exists(os.path.join(path, 'pyproject.toml'))
+            or os.path.exists(os.path.join(path, 'requirements.txt'))):
+        return 'python'
+
+    # PHP
+    if os.path.exists(os.path.join(path, 'composer.json')):
+        return 'php'
+
+    # Swift
+    if os.path.exists(os.path.join(path, 'Package.swift')):
+        return 'swift'
+    if os.path.isdir(path):
+        try:
+            for entry in os.scandir(path):
+                if entry.name.endswith('.xcodeproj'):
+                    return 'swift'
+        except PermissionError:
+            pass
+
+    # Shopify theme
+    if os.path.exists(os.path.join(path, 'shopify.theme.toml')):
+        return 'shopify'
+
+    return '—'
+
+
+def _progress(done: int, total: int, label: str = 'Scanning') -> None:
+    """Print an in-place progress indicator (TTY only)."""
+    if sys.stdout.isatty():
+        print(f"\r{DIM}{label}... ({done}/{total}){RESET}", end='', flush=True)
+
+
+def _progress_clear() -> None:
+    """Erase the progress line (TTY only)."""
+    if sys.stdout.isatty():
+        print(f"\r\033[K", end='', flush=True)
+
+
+def truncate(name: str, max_len: int = 28) -> str:
+    """Truncate a string to max_len chars, appending '...' if truncated."""
+    if len(name) <= max_len:
+        return name
+    return name[:max_len - 3] + '...'
+
+
+def top_level_subdirs(scan_dir: str) -> list[str]:
+    """
+    Return a sorted list of absolute paths to top-level subdirectories,
+    excluding EXCLUDED_DIR and non-directories.
+    """
+    try:
+        entries = sorted(os.scandir(scan_dir), key=lambda e: e.name.lower())
+    except PermissionError:
+        return []
+    result = []
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        real = os.path.realpath(entry.path)
+        if real == EXCLUDED_DIR:
+            continue
+        result.append(entry.path)
+    return result
+
+
+# ── Default scan ──────────────────────────────────────────────────────────────
+
+def _collect_dir_info(path: str) -> dict:
+    """Collect all display fields for a single directory (run in thread pool)."""
+    name = os.path.basename(path)
+    size_kb = du_kb(path)
+    git = is_git(path)
+    stack = detect_stack(path)
+    last_commit = git_last_commit(path) if git else '—'
+
+    status = '—'
+    if git:
+        porcelain = git_status_porcelain(path)
+        if porcelain.strip():
+            status = f"{YELLOW}dirty{RESET}"
+        else:
+            status = f"{GREEN}clean{RESET}"
+
+    return {
+        'path': path,
+        'name': name,
+        'size_kb': size_kb,
+        'size_str': human_size(size_kb),
+        'git': git,
+        'stack': stack,
+        'last_commit': last_commit,
+        'status': status,
+    }
+
+
+def cmd_default(scan_dir: str, args) -> None:
+    """Default scan: show one row per top-level subdir."""
+    dirs = top_level_subdirs(scan_dir)
+    if not dirs:
+        print(f"{DIM}No subdirectories found in {scan_dir}{RESET}")
+        return
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_collect_dir_info, d): d for d in dirs}
+        total = len(futures)
+        for done, future in enumerate(as_completed(futures), 1):
+            _progress(done, total)
+            try:
+                results.append(future.result())
+            except Exception:
+                pass
+    _progress_clear()
+
+    results.sort(key=lambda r: r['name'].lower())
+
+    PAD = 2  # spaces between columns
+
+    # Measure column widths dynamically from data, with minimums from headers
+    COL_NAME   = max(len('Name'),   max(len(r['name'])        for r in results)) + PAD
+    COL_SIZE   = max(len('Size'),   max(len(r['size_str'])    for r in results)) + PAD
+    COL_GIT    = max(len('Git'),    3) + PAD  # 'yes'/'no'
+    COL_STACK  = max(len('Stack'),  max(len(r['stack'])       for r in results)) + PAD
+    COL_COMMIT = max(len('Last Commit'), max(len(r['last_commit']) for r in results)) + PAD
+    rule_width = COL_NAME + COL_SIZE + COL_GIT + COL_STACK + COL_COMMIT + len('Status')
+
+    header = (
+        f"{CYAN}"
+        f"{'Name':<{COL_NAME}}"
+        f"{'Size':>{COL_SIZE}}"
+        f"  {'Git':<{COL_GIT}}"
+        f"{'Stack':<{COL_STACK}}"
+        f"{'Last Commit':<{COL_COMMIT}}"
+        f"Status"
+        f"{RESET}"
+    )
+    print(header)
+    print(DIM + '─' * rule_width + RESET)
+
+    total_kb = 0
+    git_count = 0
+
+    for r in results:
+        total_kb += r['size_kb']
+        if r['git']:
+            git_count += 1
+
+        git_label = 'yes' if r['git'] else 'no'
+
+        print(
+            f"{BOLD}{r['name']:<{COL_NAME}}{RESET}"
+            f"{r['size_str']:>{COL_SIZE}}"
+            f"  {git_label:<{COL_GIT}}"
+            f"{r['stack']:<{COL_STACK}}"
+            f"{r['last_commit']:<{COL_COMMIT}}"
+            f"{r['status']}"
+        )
+
+    print(DIM + '─' * rule_width + RESET)
+    summary = (
+        f"{DIM}{len(results)} dirs · {git_count} git repos · "
+        f"{human_size(total_kb)} total"
+    )
+    if args.reclaimable:
+        _progress_clear()
+        reclaimable_kb = sum(kb for _, kb in find_reclaimable(scan_dir))
+        if reclaimable_kb:
+            summary += f" · {YELLOW}{human_size(reclaimable_kb)} reclaimable{RESET}{DIM}"
+    summary += RESET
+    print(summary)
+
+
+# ── --large ───────────────────────────────────────────────────────────────────
+
+def _collect_subdirs_at_levels(scan_dir: str, max_depth: int = 3) -> list[tuple[str, int]]:
+    """
+    Walk up to max_depth levels deep, collecting (path, depth) for each
+    subdir. Returns a list of (absolute_path, kb) tuples.
+    """
+    # BFS: queue of (path, current_depth)
+    queue = []
+    try:
+        for entry in os.scandir(scan_dir):
+            if entry.is_dir(follow_symlinks=False):
+                real = os.path.realpath(entry.path)
+                if real != EXCLUDED_DIR:
+                    queue.append((entry.path, 1))
+    except PermissionError:
+        return []
+
+    to_measure = []
+
+    while queue:
+        path, depth = queue.pop(0)
+        to_measure.append(path)
+        if depth < max_depth:
+            try:
+                for entry in os.scandir(path):
+                    if entry.is_dir(follow_symlinks=False):
+                        queue.append((entry.path, depth + 1))
+            except PermissionError:
+                pass
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(du_kb, p): p for p in to_measure}
+        total = len(futures)
+        for done, future in enumerate(as_completed(futures), 1):
+            _progress(done, total, 'Measuring')
+            path = futures[future]
+            try:
+                kb = future.result()
+                results.append((path, kb))
+            except Exception:
+                results.append((path, 0))
+    _progress_clear()
+
+    return results
+
+
+def cmd_large(scan_dir: str) -> None:
+    """Show top 20 largest subdirectories up to 3 levels deep."""
+    print(f"{DIM}Measuring directory sizes (up to 3 levels deep)...{RESET}")
+    entries = _collect_subdirs_at_levels(scan_dir, max_depth=3)
+    entries.sort(key=lambda x: x[1], reverse=True)
+    top = entries[:20]
+
+    if not top:
+        print(f"{DIM}No subdirectories found.{RESET}")
+        return
+
+    print()
+    print(f"{CYAN}{'Size':>8}  Path{RESET}")
+    print(DIM + '─' * 60 + RESET)
+
+    has_reclaimable = False
+    for path, kb in top:
+        rel = os.path.relpath(path, scan_dir)
+        basename = os.path.basename(path)
+        if basename in RECLAIMABLE_NAMES:
+            has_reclaimable = True
+            label = f"{YELLOW}{rel}{RESET}"
+        else:
+            label = rel
+        print(f"{human_size(kb):>8}  {label}")
+
+    if has_reclaimable:
+        print()
+        print(f"{DIM}Tip: run with --clean to remove reclaimable dirs{RESET}")
+
+
+# ── --dirty ───────────────────────────────────────────────────────────────────
+
+def _collect_dirty_info(path: str) -> dict | None:
+    """Return dirty repo info dict, or None if clean or not git."""
+    if not is_git(path):
+        return None
+    porcelain = git_status_porcelain(path)
+    if not porcelain.strip():
+        return None
+    counts = parse_status(porcelain)
+    last_commit = git_last_commit(path)
+    return {
+        'path': path,
+        'name': os.path.basename(path),
+        'summary': format_change_summary(counts),
+        'last_commit': last_commit,
+    }
+
+
+def cmd_dirty(scan_dir: str) -> None:
+    """Show only git repos with uncommitted changes."""
+    dirs = top_level_subdirs(scan_dir)
+    if not dirs:
+        print(f"{DIM}No subdirectories found in {scan_dir}{RESET}")
+        return
+
+    dirty_repos = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_collect_dirty_info, d): d for d in dirs}
+        total = len(futures)
+        for done, future in enumerate(as_completed(futures), 1):
+            _progress(done, total)
+            try:
+                info = future.result()
+                if info:
+                    dirty_repos.append(info)
+            except Exception:
+                pass
+    _progress_clear()
+
+    dirty_repos.sort(key=lambda r: r['name'].lower())
+
+    if not dirty_repos:
+        print(f"{GREEN}No dirty git repos found.{RESET}")
+        return
+
+    COL_NAME   = 30
+    COL_SUMMARY = 36
+    COL_COMMIT  = 18
+
+    print(f"{CYAN}{'Repo':<{COL_NAME}} {'Changes':<{COL_SUMMARY}} {'Last Commit':<{COL_COMMIT}}{RESET}")
+    print(DIM + '─' * 82 + RESET)
+
+    for r in dirty_repos:
+        display_name = truncate(r['name'], COL_NAME)
+        print(
+            f"{BOLD}{display_name:<{COL_NAME}}{RESET} "
+            f"{YELLOW}{r['summary']:<{COL_SUMMARY}}{RESET} "
+            f"{r['last_commit']:<{COL_COMMIT}}"
+        )
+
+    print(DIM + '─' * 82 + RESET)
+    print(f"{DIM}{len(dirty_repos)} dirty repo{'s' if len(dirty_repos) != 1 else ''}{RESET}")
+
+
+# ── --secrets ─────────────────────────────────────────────────────────────────
+
+def scan_diff_for_secrets(diff_output: str) -> list[dict]:
+    """
+    Scan diff lines starting with '+' for credential patterns.
+    Returns a list of {line_content, pattern_sev, line_context} dicts.
+    """
+    findings = []
+    lines = diff_output.splitlines()
+    current_file = None
+    line_num = 0
+
+    for line in lines:
+        # Track current file and line numbers from diff headers
+        if line.startswith('+++ b/'):
+            current_file = line[6:]
+            line_num = 0
+            continue
+        if line.startswith('@@ '):
+            # e.g. @@ -0,0 +1,20 @@
+            m = re.search(r'\+(\d+)', line)
+            if m:
+                line_num = int(m.group(1)) - 1
+            continue
+        if line.startswith('+') and not line.startswith('+++'):
+            line_num += 1
+            content = line[1:]  # strip leading '+'
+            for pattern, severity in _COMPILED_PATTERNS:
+                if pattern.search(content):
+                    truncated = content.strip()[:60]
+                    findings.append({
+                        'file': current_file or '?',
+                        'line': line_num,
+                        'content': truncated,
+                        'severity': severity,
+                    })
+                    break  # one finding per line
+        elif not line.startswith('-') and not line.startswith('\\'):
+            line_num += 1
+
+    return findings
+
+
+def _collect_secrets_info(path: str) -> dict | None:
+    """Return secrets scan result for a dirty repo, or None if clean/not git."""
+    if not is_git(path):
+        return None
+    porcelain = git_status_porcelain(path)
+    if not porcelain.strip():
+        return None
+    diff = git_diff_head(path)
+    findings = scan_diff_for_secrets(diff) if diff else []
+    return {
+        'name': os.path.basename(path),
+        'findings': findings,
+    }
+
+
+def cmd_secrets(scan_dir: str) -> None:
+    """Scan dirty git repos for credential patterns in uncommitted changes."""
+    dirs = top_level_subdirs(scan_dir)
+    if not dirs:
+        print(f"{DIM}No subdirectories found in {scan_dir}{RESET}")
+        return
+
+    print(f"{DIM}Scanning uncommitted changes for credentials...{RESET}")
+    print()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_collect_secrets_info, d): d for d in dirs}
+        total = len(futures)
+        for done, future in enumerate(as_completed(futures), 1):
+            _progress(done, total)
+            try:
+                info = future.result()
+                if info is not None:
+                    results.append(info)
+            except Exception:
+                pass
+    _progress_clear()
+
+    results.sort(key=lambda r: r['name'].lower())
+
+    total_critical = 0
+    total_warning = 0
+    clean_count = 0
+
+    for r in results:
+        if not r['findings']:
+            clean_count += 1
+            continue
+
+        repo_printed = False
+        for finding in r['findings']:
+            sev = finding['severity']
+            if sev == 'critical':
+                total_critical += 1
+                marker = f"{RED}✗{RESET}"
+            else:
+                total_warning += 1
+                marker = f"{YELLOW}✗{RESET}"
+
+            if not repo_printed:
+                print(f"{marker}  {BOLD}{r['name']}/{RESET}  {DIM}{finding['file']}:{finding['line']}{RESET}")
+                repo_printed = True
+            else:
+                print(f"   {DIM}{finding['file']}:{finding['line']}{RESET}")
+
+            sev_label = f"{RED}[critical]{RESET}" if sev == 'critical' else f"{YELLOW}[warning]{RESET}"
+            print(f"   {DIM}{finding['content']}{RESET}   {sev_label}")
+            print()
+
+    parts = []
+    if total_critical:
+        parts.append(f"{RED}{total_critical} critical{RESET}")
+    if total_warning:
+        parts.append(f"{YELLOW}{total_warning} warning{RESET}")
+    if clean_count:
+        parts.append(f"{GREEN}{clean_count} repos clean{RESET}")
+
+    if not parts:
+        print(f"{GREEN}No dirty repos found.{RESET}")
+    else:
+        print(' · '.join(parts))
+
+
+# ── --clean ───────────────────────────────────────────────────────────────────
+
+def find_reclaimable(scan_dir: str) -> list[tuple[str, int]]:
+    """
+    Recursively find all directories named in RECLAIMABLE_NAMES under scan_dir.
+    Returns a list of (path, kb) sorted by size descending.
+    """
+    found = []
+    for root, dirs, _files in os.walk(scan_dir):
+        # Prune the scan tool's own directory
+        real_root = os.path.realpath(root)
+        if real_root == EXCLUDED_DIR:
+            dirs.clear()
+            continue
+
+        # Collect reclaimable dirs; prune them so we don't descend inside
+        prune = []
+        for d in list(dirs):
+            if d in RECLAIMABLE_NAMES:
+                found.append(os.path.join(root, d))
+                prune.append(d)
+        for d in prune:
+            dirs.remove(d)
+
+    if not found:
+        return []
+
+    results = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(du_kb, p): p for p in found}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                kb = future.result()
+                results.append((path, kb))
+            except Exception:
+                results.append((path, 0))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results
+
+
+def cmd_clean(scan_dir: str) -> None:
+    """Find reclaimable directories and optionally delete them."""
+    print(f"{DIM}Searching for reclaimable directories...{RESET}")
+    entries = find_reclaimable(scan_dir)
+
+    if not entries:
+        print(f"{GREEN}No reclaimable directories found.{RESET}")
+        return
+
+    total_kb = sum(kb for _, kb in entries)
+
+    print()
+    print(f"{CYAN}{'Size':>8}  Path{RESET}")
+    print(DIM + '─' * 60 + RESET)
+    for path, kb in entries:
+        rel = os.path.relpath(path, scan_dir)
+        print(f"{human_size(kb):>8}  {YELLOW}{rel}{RESET}")
+    print(DIM + '─' * 60 + RESET)
+    print(f"{BOLD}Total reclaimable: {human_size(total_kb)}{RESET}")
+    print()
+
+    answer = input(f"Delete all? [y/N] ").strip().lower()
+    if answer != 'y':
+        print(f"{DIM}Aborted.{RESET}")
+        return
+
+    answer2 = input(
+        f"{YELLOW}Are you sure? This cannot be undone.{RESET} [y/N] "
+    ).strip().lower()
+    if answer2 != 'y':
+        print(f"{DIM}Aborted.{RESET}")
+        return
+
+    print()
+    deleted_count = 0
+    for path, kb in entries:
+        rel = os.path.relpath(path, scan_dir)
+        try:
+            shutil.rmtree(path)
+            print(f"{GREEN}✓{RESET}  {rel}  {DIM}({human_size(kb)}){RESET}")
+            deleted_count += 1
+        except Exception as e:
+            print(f"{RED}✗{RESET}  {rel}  {DIM}error: {e}{RESET}")
+
+    print()
+    print(f"{GREEN}{deleted_count} director{'ies' if deleted_count != 1 else 'y'} deleted · "
+          f"{human_size(total_kb)} freed{RESET}")
+
+
+# ── Argument parsing & dispatch ───────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog='cctrl scan',
+        description='Scan project directories for size, git status, stacks, and more.',
+        add_help=True,
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        '--large', action='store_true',
+        help='List top 20 largest dirs (up to 3 levels deep)',
+    )
+    mode_group.add_argument(
+        '--dirty', action='store_true',
+        help='Show only git repos with uncommitted changes',
+    )
+    mode_group.add_argument(
+        '--secrets', action='store_true',
+        help='Scan dirty repos for credential patterns',
+    )
+    mode_group.add_argument(
+        '--clean', action='store_true',
+        help='Find and optionally delete reclaimable directories',
+    )
+
+    parser.add_argument(
+        '--reclaimable', action='store_true',
+        help='Also calculate reclaimable space (node_modules, .next, etc.)',
+    )
+    parser.add_argument(
+        'dir', nargs='?', default=None,
+        help='Directory to scan (default: current working directory)',
+    )
+
+    args = parser.parse_args()
+
+    scan_dir = os.path.realpath(args.dir) if args.dir else os.path.realpath(os.getcwd())
+
+    if not os.path.isdir(scan_dir):
+        print(f"{RED}Error: '{scan_dir}' is not a directory.{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.large:
+        cmd_large(scan_dir)
+    elif args.dirty:
+        cmd_dirty(scan_dir)
+    elif args.secrets:
+        cmd_secrets(scan_dir)
+    elif args.clean:
+        cmd_clean(scan_dir)
+    else:
+        cmd_default(scan_dir, args)
+
+
+if __name__ == '__main__':
+    main()
