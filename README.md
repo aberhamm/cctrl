@@ -1,6 +1,6 @@
 # cctrl
 
-Claude Code Controller. Switch settings profiles, track token usage, launch sessions.
+Computer Controller. Switch Claude Code settings profiles, track token usage, launch sessions, and audit your project directories.
 
 ## Install
 
@@ -19,6 +19,7 @@ A Stop hook in each profile auto-logs token usage per session.
 ```bash
 cctrl ls                  # list profiles (* = active)
 cctrl use <profile>       # switch ~/.claude/settings.json
+cctrl switch <profile>    # alias for use
 cctrl current             # show active profile + drift detection
 cctrl save <name>         # snapshot current settings as a new profile
 cctrl diff <profile>      # diff current settings vs a profile
@@ -83,6 +84,24 @@ cctrl/
   costs/spending.jsonl  # session log (auto-maintained)
   plugins/           # drop-in subcommands (cctrl-<name>)
 ```
+
+## Directory scanning
+
+`cctrl scan` audits any directory — shows size, git status, tech stack, and last commit for every subdirectory. Works on project folders, download dirs, or anywhere else.
+
+```bash
+cctrl scan                       # scan current directory
+cctrl scan ~/projects            # scan a specific directory
+cctrl scan --large               # top 20 largest subdirs (3 levels deep)
+cctrl scan --dirty               # git repos with uncommitted changes
+cctrl scan --secrets             # scan dirty repos for hardcoded credentials
+cctrl scan --clean               # find and optionally delete node_modules/.next/etc.
+cctrl scan --reclaimable         # include reclaimable space total in summary
+```
+
+The tool auto-excludes the `cctrl` directory itself from results.
+
+**Credential patterns detected:** Algolia, AWS, Mapbox, Stripe, Shopify, Bearer tokens, and generic `API_KEY`/`SECRET_KEY` patterns.
 
 ## Extending
 
