@@ -621,7 +621,7 @@ cmd_start() {
         fi
     fi
 
-    flags+=("${passthrough[@]}")
+    [[ ${#passthrough[@]} -gt 0 ]] && flags+=("${passthrough[@]}")
     echo -e "${DIM}claude ${flags[*]}${RESET}"
     exec claude "${flags[@]}"
 }
