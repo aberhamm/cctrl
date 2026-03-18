@@ -591,7 +591,37 @@ with open('$SPENDING_LOG', 'w') as f:
 
 cmd_start() {
     local flags=("--dangerously-skip-permissions")
-    flags+=("$@")
+    local resume=false
+    local resume_val=""
+    local passthrough=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --resume|-r)
+                resume=true
+                # Check if next arg is a value (not another flag)
+                if [[ $# -gt 1 && "$2" != -* ]]; then
+                    resume_val="$2"
+                    shift
+                fi
+                shift
+                ;;
+            *)
+                passthrough+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if $resume; then
+        if [[ -n "$resume_val" ]]; then
+            flags+=("--resume" "$resume_val")
+        else
+            flags+=("--resume")
+        fi
+    fi
+
+    flags+=("${passthrough[@]}")
     echo -e "${DIM}claude ${flags[*]}${RESET}"
     exec claude "${flags[@]}"
 }
@@ -610,6 +640,7 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Session${RESET}"
     echo "  cctrl start [flags]     Launch claude with --dangerously-skip-permissions"
+    echo "    --resume, -r [id]     Resume a session (interactive picker or by session ID)"
     echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
     echo ""
     echo -e "${BOLD}Usage Tracking${RESET}"
