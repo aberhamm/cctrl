@@ -34,3 +34,9 @@ env/
 *.jsonl
 *.csv
 *.log
+
+# Runtime data
+data/
+
+# Built plugins
+plugins/cctrl-ports
