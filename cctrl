@@ -626,6 +626,372 @@ cmd_start() {
     exec claude "${flags[@]}"
 }
 
+cmd_usage() {
+    local weeks="${1:-2}"
+    # Strip leading -- if passed as flag
+    weeks="${weeks#--}"
+    # If it's a named flag, map it; otherwise treat as number
+    case "$weeks" in
+        [0-9]*) ;;  # already a number
+        *)     weeks=2 ;;
+    esac
+
+    python3 - "$SCRIPT_DIR/data/rate-limits.json" "$SCRIPT_DIR/data/rate-limits-history.jsonl" "$PROJECTS_DIR" "$weeks" <<'PYEOF'
+import json, sys, os, glob
+from datetime import datetime, timedelta, timezone
+
+rate_file = sys.argv[1]
+history_file = sys.argv[2]
+projects_dir = sys.argv[3]
+num_weeks = int(sys.argv[4])
+
+# ── Billing week: resets Tuesday 4pm Eastern ─────────────────────────
+# US Eastern = UTC-5 (EST) or UTC-4 (EDT). Use system local for display.
+from zoneinfo import ZoneInfo
+ET = ZoneInfo("America/New_York")
+
+def billing_week_start(dt):
+    """Find the most recent Tuesday 4pm ET before dt."""
+    dt_et = dt.astimezone(ET)
+    # Walk back to Tuesday
+    days_since_tue = (dt_et.weekday() - 1) % 7  # Tuesday = 1
+    tue = dt_et - timedelta(days=days_since_tue)
+    reset = tue.replace(hour=16, minute=0, second=0, microsecond=0)
+    if dt_et < reset:
+        reset -= timedelta(days=7)
+    return reset
+
+now = datetime.now(timezone.utc)
+current_week_start = billing_week_start(now)
+
+# Build week boundaries going back num_weeks
+weeks = []
+for i in range(num_weeks):
+    w_start = current_week_start - timedelta(weeks=i)
+    w_end = w_start + timedelta(weeks=1)
+    weeks.append((w_start, w_end))
+
+oldest_cutoff = weeks[-1][0]
+
+# ── Pricing (same as cmd_costs) ──────────────────────────────────────
+PRICING = {
+    "input":       {"opus": 15.0, "sonnet": 3.0, "haiku": 0.80},
+    "output":      {"opus": 75.0, "sonnet": 15.0, "haiku": 4.0},
+    "cache_write": {"opus": 18.75, "sonnet": 3.75, "haiku": 1.0},
+    "cache_read":  {"opus": 1.50, "sonnet": 0.30, "haiku": 0.08},
+}
+
+def get_price_key(model_name):
+    m = model_name.lower()
+    for key in ["opus", "sonnet", "haiku"]:
+        if key in m:
+            return key
+    return "sonnet"
+
+def cost_for(price_key, inp, out, cw, cr):
+    ip = PRICING["input"].get(price_key, 3.0)
+    op = PRICING["output"].get(price_key, 15.0)
+    cwp = PRICING["cache_write"].get(price_key, 3.75)
+    crp = PRICING["cache_read"].get(price_key, 0.30)
+    return (inp * ip + out * op + cw * cwp + cr * crp) / 1_000_000
+
+# ── Aggregate tokens per billing week ────────────────────────────────
+week_data = {}
+for w_start, w_end in weeks:
+    key = w_start.strftime("%Y-%m-%d")
+    week_data[key] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "cost": 0.0, "turns": 0, "start": w_start, "end": w_end}
+
+def record_turn(ts, model, usage):
+    for key, wd in week_data.items():
+        if wd["start"] <= ts < wd["end"]:
+            inp = usage.get("input_tokens", 0)
+            out = usage.get("output_tokens", 0)
+            cw = usage.get("cache_creation_input_tokens", 0)
+            cr = usage.get("cache_read_input_tokens", 0)
+            c = cost_for(get_price_key(model), inp, out, cw, cr)
+            wd["input"] += inp
+            wd["output"] += out
+            wd["cache_write"] += cw
+            wd["cache_read"] += cr
+            wd["cost"] += c
+            wd["turns"] += 1
+            return
+
+# ── Parse session JSONL files ────────────────────────────────────────
+session_files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
+
+for sf in session_files:
+    if "/subagents/" in sf:
+        continue
+    try:
+        with open(sf) as f:
+            lines = f.readlines()
+    except (IOError, OSError):
+        continue
+
+    prev_type = None
+    last_assistant = None
+
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        msg = d.get("message", {})
+        if not isinstance(msg, dict):
+            continue
+
+        if msg.get("role") == "assistant" and "usage" in msg:
+            last_assistant = d
+            prev_type = "assistant"
+        elif prev_type == "assistant" and last_assistant is not None:
+            a_msg = last_assistant.get("message", {})
+            usage = a_msg.get("usage", {})
+            model = a_msg.get("model", "unknown")
+            ts_ms = last_assistant.get("timestamp")
+            if ts_ms:
+                if isinstance(ts_ms, (int, float)):
+                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                else:
+                    try:
+                        ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
+                    except ValueError:
+                        last_assistant = None
+                        prev_type = d.get("type", "")
+                        continue
+                if ts >= oldest_cutoff:
+                    record_turn(ts, model, usage)
+            last_assistant = None
+            prev_type = d.get("type", "")
+        else:
+            prev_type = d.get("type", "")
+
+    if last_assistant is not None:
+        a_msg = last_assistant.get("message", {})
+        usage = a_msg.get("usage", {})
+        model = a_msg.get("model", "unknown")
+        ts_ms = last_assistant.get("timestamp")
+        if ts_ms:
+            if isinstance(ts_ms, (int, float)):
+                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+            else:
+                try:
+                    ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
+                except ValueError:
+                    ts = None
+            if ts and ts >= oldest_cutoff:
+                record_turn(ts, model, usage)
+
+# ── Rate limits ──────────────────────────────────────────────────────
+rate_data = None
+if os.path.exists(rate_file):
+    try:
+        with open(rate_file) as f:
+            rate_data = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        pass
+
+# ── Rate limit history: peak usage per billing week ──────────────────
+# week_key -> {peak_five_hour, peak_seven_day}
+week_peaks = {}
+for key in week_data:
+    week_peaks[key] = {"peak_five_hour": None, "peak_seven_day": None}
+
+if os.path.exists(history_file):
+    try:
+        with open(history_file) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts_str = entry.get("ts", "")
+                if not ts_str:
+                    continue
+                try:
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if ts < oldest_cutoff:
+                    continue
+                for key, wd in week_data.items():
+                    if wd["start"] <= ts < wd["end"]:
+                        fh = entry.get("five_hour")
+                        sd = entry.get("seven_day")
+                        if fh is not None:
+                            cur = week_peaks[key]["peak_five_hour"]
+                            week_peaks[key]["peak_five_hour"] = max(cur, fh) if cur is not None else fh
+                        if sd is not None:
+                            cur = week_peaks[key]["peak_seven_day"]
+                            week_peaks[key]["peak_seven_day"] = max(cur, sd) if cur is not None else sd
+                        break
+    except IOError:
+        pass
+
+def bar(pct, width=30):
+    filled = int(pct * width / 100)
+    empty = width - filled
+    if pct >= 80:
+        color = "\033[0;31m"
+    elif pct >= 50:
+        color = "\033[0;33m"
+    else:
+        color = "\033[0;32m"
+    return f"{color}{'█' * filled}{'░' * empty}\033[0m"
+
+def fmt_reset(resets_at):
+    if not resets_at:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(resets_at, tz=timezone.utc)
+        local_dt = dt.astimezone()
+        delta = dt - now
+        hours = delta.total_seconds() / 3600
+        if hours < 0:
+            return "reset overdue"
+        elif hours < 1:
+            return f"resets in {int(delta.total_seconds() / 60)}m"
+        elif hours < 24:
+            return f"resets in {hours:.1f}h"
+        else:
+            return f"resets {local_dt.strftime('%a %I:%M%p').lower()}"
+    except (ValueError, TypeError, OSError):
+        return ""
+
+def fmt(n):
+    return f"{n:,}"
+
+def usd(n):
+    return f"${n:,.2f}"
+
+# ── Print rate limits ────────────────────────────────────────────────
+if rate_data:
+    profile = rate_data.get("profile", "")
+    captured = rate_data.get("captured_at", "")
+    five = rate_data.get("five_hour")
+    seven = rate_data.get("seven_day")
+
+    age_str = ""
+    if captured:
+        try:
+            cap_dt = datetime.fromisoformat(captured.replace("Z", "+00:00"))
+            delta = now - cap_dt
+            mins = int(delta.total_seconds() / 60)
+            if mins < 1:
+                age_str = "just now"
+            elif mins < 60:
+                age_str = f"{mins}m ago"
+            elif mins < 1440:
+                age_str = f"{mins // 60}h ago"
+            else:
+                age_str = f"{mins // 1440}d ago"
+        except (ValueError, TypeError):
+            pass
+
+    header = "\033[1mPlan Usage\033[0m"
+    if profile:
+        header += f"  \033[2m({profile})\033[0m"
+    if age_str:
+        header += f"  \033[2mupdated {age_str}\033[0m"
+    print(header)
+    print()
+
+    if five:
+        pct = five.get("used_percentage", 0)
+        reset_str = fmt_reset(five.get("resets_at"))
+        print(f"  5-hour window   {bar(pct)}  {pct:5.1f}%  \033[2m{reset_str}\033[0m")
+
+    if seven:
+        pct = seven.get("used_percentage", 0)
+        reset_str = fmt_reset(seven.get("resets_at"))
+        print(f"  7-day window    {bar(pct)}  {pct:5.1f}%  \033[2m{reset_str}\033[0m")
+
+    if not five and not seven:
+        print("  \033[2mRate limits only apply to Claude.ai subscriptions (Pro/Max).\033[0m")
+        print("  \033[2mAPI profiles are billed per-token — use 'cctrl costs' for spend tracking.\033[0m")
+
+    print()
+
+# ── Check if we have any rate limit history ──────────────────────────
+has_peaks = any(
+    wp["peak_five_hour"] is not None or wp["peak_seven_day"] is not None
+    for wp in week_peaks.values()
+)
+
+# ── Print billing week breakdown ─────────────────────────────────────
+print(f"\033[1mBilling Weeks\033[0m  \033[2m(resets Tue 4pm ET)\033[0m")
+print()
+
+if has_peaks:
+    print(f"\033[0;36m{'Week':<28} {'Peak 5h':>8} {'Peak 7d':>8} {'Output':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
+    print("─" * 76)
+else:
+    print(f"\033[0;36m{'Week':<28} {'Output':>12} {'Input':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
+    print("─" * 84)
+
+sorted_weeks = sorted(week_data.items(), key=lambda x: x[0], reverse=True)
+for i, (key, wd) in enumerate(sorted_weeks):
+    start_et = wd["start"].astimezone(ET)
+    end_et = wd["end"].astimezone(ET)
+    wp = week_peaks.get(key, {})
+
+    if i == 0:
+        label = f"This week"
+        sublabel = f"  {start_et.strftime('%b %d')} – now"
+    else:
+        label = f"{i} week{'s' if i > 1 else ''} ago"
+        sublabel = f"  {start_et.strftime('%b %d')} – {end_et.strftime('%b %d')}"
+
+    if has_peaks:
+        p5 = wp.get("peak_five_hour")
+        p7 = wp.get("peak_seven_day")
+        p5_str = f"{p5:.0f}%" if p5 is not None else "–"
+        p7_str = f"{p7:.0f}%" if p7 is not None else "–"
+        print(f"  {label:<26} {p5_str:>8} {p7_str:>8} {fmt(wd['output']):>12} {usd(wd['cost']):>10} {wd['turns']:>6}")
+    else:
+        print(f"  {label:<26} {fmt(wd['output']):>12} {fmt(wd['input']):>12} {fmt(wd['cache_read']):>12} {usd(wd['cost']):>10} {wd['turns']:>6}")
+
+    print(f"  \033[2m{sublabel}\033[0m")
+
+# Averages
+if len(sorted_weeks) > 1:
+    if has_peaks:
+        print("─" * 76)
+    else:
+        print("─" * 84)
+    # Average across full weeks only (exclude current partial week)
+    full_weeks = [(key, wd) for key, wd in sorted_weeks[1:]]
+    if full_weeks:
+        avg_cost = sum(wd["cost"] for _, wd in full_weeks) / len(full_weeks)
+        avg_turns = sum(wd["turns"] for _, wd in full_weeks) // len(full_weeks)
+        avg_output = sum(wd["output"] for _, wd in full_weeks) // len(full_weeks)
+
+        if has_peaks:
+            full_peaks = [week_peaks.get(k, {}) for k, _ in full_weeks]
+            p7_vals = [p.get("peak_seven_day") for p in full_peaks if p.get("peak_seven_day") is not None]
+            avg_p7 = f"{sum(p7_vals) / len(p7_vals):.0f}%" if p7_vals else "–"
+            print(f"  {'Avg/week':<26} {'':>8} {avg_p7:>8} {fmt(avg_output):>12} {usd(avg_cost):>10} {avg_turns:>6}")
+        else:
+            print(f"  {'Avg/week':<26} {fmt(avg_output):>12} {'':>12} {'':>12} {usd(avg_cost):>10} {avg_turns:>6}")
+
+        # Delta vs current
+        current = sorted_weeks[0][1]
+        if avg_cost > 0:
+            pct_of_avg = (current["cost"] / avg_cost) * 100
+            elapsed = (now - current["start"]).total_seconds()
+            week_secs = 7 * 86400
+            week_pct = min(elapsed / week_secs * 100, 100)
+            pace_str = ""
+            if week_pct > 10:
+                projected = current["cost"] / (elapsed / week_secs)
+                pace_str = f"  \033[2m(on pace for {usd(projected)})\033[0m"
+            print(f"\n  \033[2mThis week: {pct_of_avg:.0f}% of weekly avg, {week_pct:.0f}% through the week{pace_str}\033[0m")
+
+print()
+PYEOF
+}
+
 cmd_help() {
     echo -e "${BOLD}cctrl${RESET} — Claude Code Controller"
     echo ""
@@ -644,6 +1010,7 @@ cmd_help() {
     echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
     echo ""
     echo -e "${BOLD}Usage Tracking${RESET}"
+    echo "  cctrl usage [weeks]     Plan usage + billing week breakdown (default: 2)"
     echo "  cctrl costs [--today|--week|--month|--all] [project-filter]"
     echo "                          Token usage, costs, model & project breakdown"
     echo "  cctrl log [count]       Show profile switch history"
@@ -705,7 +1072,8 @@ main() {
         diff)    cmd_diff "$@" ;;
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
-        costs|cost|usage) cmd_costs "$@" ;;
+        costs|cost) cmd_costs "$@" ;;
+        usage) cmd_usage "$@" ;;
         log)     cmd_log "$@" ;;
         help|-h|--help) cmd_help "$@" ;;
         *)

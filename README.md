@@ -36,6 +36,8 @@ cctrl start -p "fix bug"  # extra flags passed through
 ### Usage tracking
 
 ```bash
+cctrl usage               # plan usage: rate limits + billing week breakdown
+cctrl usage 4             # show 4 billing weeks (default: 2)
 cctrl costs --today       # token usage: daily, by model, by project
 cctrl costs --week        # (default)
 cctrl costs --month
@@ -43,14 +45,18 @@ cctrl costs --all django  # filter by project name
 cctrl log                 # per-session entries tagged with profile
 ```
 
-Costs are parsed from `~/.claude/projects/*/*.jsonl` session files (input, output, cache write, cache read tokens) with estimated USD. No external API calls.
+`cctrl usage` shows your Claude subscription rate limits (5-hour and 7-day windows) plus token spend per billing week (resets Tuesday 4pm ET). Peak rate limit usage is tracked per week so you can see how close you got to your limits. Only applies to subscription profiles (Pro/Max) — API profiles are billed per-token.
+
+`cctrl costs` parses raw session JSONLs from `~/.claude/projects/` for detailed token breakdowns (input, output, cache write, cache read) with estimated USD. No external API calls.
 
 ## How tracking works
 
 1. Every profile includes a `Stop` hook that runs `hooks/session-log.py` after each assistant turn
 2. The hook finds the current session JSONL, sums deduplicated token usage, and upserts to `costs/spending.jsonl` (one line per session, updated in place)
-3. `cctrl use` logs profile switches to the same file
-4. `cctrl costs` reads the raw session JSONLs for aggregate reporting
+3. Every profile includes a statusline script (`hooks/statusline.sh`) that captures rate limit data from Claude Code on each update, writing to `data/rate-limits.json` (latest snapshot) and `data/rate-limits-history.jsonl` (full history)
+4. `cctrl use` logs profile switches to the spending log
+5. `cctrl costs` reads the raw session JSONLs for aggregate reporting
+6. `cctrl usage` reads rate limit snapshots + history and session data for billing week breakdowns
 
 ## Switching profiles
 
@@ -78,11 +84,14 @@ cctrl use personal        # switch to it later
 
 ```
 cctrl/
-  cctrl              # main script (symlinked to ~/.local/bin)
-  profiles/*.json    # named settings configs
-  hooks/session-log.py  # Stop hook for token tracking
-  costs/spending.jsonl  # session log (auto-maintained)
-  plugins/           # drop-in subcommands (cctrl-<name>)
+  cctrl                  # main script (symlinked to ~/.local/bin)
+  profiles/*.json        # named settings configs
+  hooks/session-log.py   # Stop hook for token tracking
+  hooks/statusline.sh    # statusline script (context bar + rate limit capture)
+  costs/spending.jsonl   # session log (auto-maintained)
+  data/rate-limits.json  # latest rate limit snapshot (auto-maintained)
+  data/rate-limits-history.jsonl  # rate limit history (auto-maintained)
+  plugins/               # drop-in subcommands (cctrl-<name>)
 ```
 
 ## Directory scanning
