@@ -29,7 +29,7 @@ cctrl edit <profile>      # open profile in $EDITOR
 ### Sessions
 
 ```bash
-cctrl start               # launch claude --dangerously-skip-permissions
+cctrl start               # launch claude --permission-mode bypassPermissions
 cctrl start -p "fix bug"  # extra flags passed through
 ```
 

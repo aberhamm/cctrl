@@ -590,7 +590,7 @@ with open('$SPENDING_LOG', 'w') as f:
 }
 
 cmd_start() {
-    local flags=("--dangerously-skip-permissions")
+    local flags=("--permission-mode" "bypassPermissions")
     local resume=false
     local resume_val=""
     local passthrough=()
@@ -1005,7 +1005,7 @@ cmd_help() {
     echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
     echo ""
     echo -e "${BOLD}Session${RESET}"
-    echo "  cctrl start [flags]     Launch claude with --dangerously-skip-permissions"
+    echo "  cctrl start [flags]     Launch claude with --permission-mode bypassPermissions"
     echo "    --resume, -r [id]     Resume a session (interactive picker or by session ID)"
     echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
     echo ""
