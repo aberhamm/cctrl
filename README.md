@@ -29,9 +29,13 @@ cctrl edit <profile>      # open profile in $EDITOR
 ### Sessions
 
 ```bash
-cctrl start               # launch claude --permission-mode bypassPermissions
-cctrl start -p "fix bug"  # extra flags passed through
+cctrl start                       # launch claude with bypassPermissions + Remote Control
+cctrl start --resume              # resume a session (interactive picker)
+cctrl start --no-remote-control   # disable the Remote Control bridge
+cctrl start -p "fix bug"          # extra flags passed through
 ```
+
+`cctrl start` launches `claude` with `--remote-control` enabled and `--remote-control-session-name-prefix <repo>` set to the current git repo's name (or directory basename if not in a repo). Each launch gets a unique adjective-noun suffix from Claude Code (e.g. `cctrl-graceful-unicorn`), so multiple sessions in the same folder stay distinguishable. Within seconds of your first message, the title is replaced by an AI-generated summary. Pass `--no-remote-control` (or `--no-remote`) to opt out.
 
 ### Usage tracking
 

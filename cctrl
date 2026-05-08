@@ -53,6 +53,18 @@ _log_switch() {
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2")"
 }
 
+_remote_prefix() {
+    # Short, safe prefix for --remote-control session naming.
+    # Prefers git repo root basename, falls back to the given directory.
+    local dir="${1:-$PWD}"
+    local root
+    root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || echo "$dir")"
+    local name
+    name="$(basename "$root" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+    [[ -z "$name" ]] && name="claude"
+    printf '%s' "$name"
+}
+
 _detect_active() {
     if [[ ! -f "$SETTINGS" ]]; then
         echo "none"
@@ -590,9 +602,10 @@ with open('$SPENDING_LOG', 'w') as f:
 }
 
 cmd_start() {
-    local flags=("--permission-mode" "bypassPermissions")
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control")
     local resume=false
     local resume_val=""
+    local no_remote=false
     local passthrough=()
 
     while [[ $# -gt 0 ]]; do
@@ -606,12 +619,26 @@ cmd_start() {
                 fi
                 shift
                 ;;
+            --no-remote-control|--no-remote)
+                no_remote=true
+                shift
+                ;;
             *)
                 passthrough+=("$1")
                 shift
                 ;;
         esac
     done
+
+    if $no_remote; then
+        flags=("${flags[@]/--remote-control}")
+        # Strip the empty slot left by the substitution
+        local cleaned=()
+        for f in "${flags[@]}"; do [[ -n "$f" ]] && cleaned+=("$f"); done
+        flags=("${cleaned[@]}")
+    else
+        flags+=("--remote-control-session-name-prefix" "$(_remote_prefix)")
+    fi
 
     if $resume; then
         if [[ -n "$resume_val" ]]; then
@@ -1005,8 +1032,9 @@ cmd_help() {
     echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
     echo ""
     echo -e "${BOLD}Session${RESET}"
-    echo "  cctrl start [flags]     Launch claude with --permission-mode bypassPermissions"
+    echo "  cctrl start [flags]     Launch claude with --permission-mode bypassPermissions --remote-control"
     echo "    --resume, -r [id]     Resume a session (interactive picker or by session ID)"
+    echo "    --no-remote-control   Disable the default --remote-control bridge"
     echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
     echo ""
     echo -e "${BOLD}Usage Tracking${RESET}"
