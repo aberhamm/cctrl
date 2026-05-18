@@ -7,23 +7,32 @@ DATA_DIR="$CCTRL_DIR/data"
 
 input=$(cat)
 
-# ── Display: context window bar ──────────────────────────────────────
+# ── Display: context window ──────────────────────────────────────────
 model=$(echo "$input" | jq -r '.model.display_name // "?"')
-project=$(echo "$input" | jq -r '.workspace.project_dir // .cwd // ""' | xargs basename 2>/dev/null)
-used=$(echo "$input" | jq -r '.context_window.used_percentage // 0')
-bar_length=20
-filled=$((used * bar_length / 100))
-empty=$((bar_length - filled))
-bar=$(printf '█%.0s' $(seq 1 $filled 2>/dev/null))$(printf '░%.0s' $(seq 1 $empty 2>/dev/null))
+project_path=$(echo "$input" | jq -r '.workspace.project_dir // .cwd // ""')
+project_leaf="${project_path##*/}"
+project_parent_path="${project_path%/*}"
+project_parent="${project_parent_path##*/}"
+if [[ "$project_parent" == "Obsidian Vault" ]]; then
+    project="Obsidian/$project_leaf"
+else
+    project="$project_leaf"
+fi
+tokens=$(echo "$input" | jq -r '.context_window.total_input_tokens // 0')
+tokens_fmt=$(awk -v t="$tokens" 'BEGIN {
+    if (t >= 1000000) printf "%.1fM", t/1000000
+    else if (t >= 1000) printf "%.1fk", t/1000
+    else printf "%d", t
+}')
 
 # Add rate limit hint if available
 five_hr=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
 
 if [[ -n "$five_hr" && -n "$seven_day" ]]; then
-    printf "%s | %s | %s %d%% | 5h: %s%% 7d: %s%%" "$model" "$project" "$bar" "$used" "${five_hr%.*}" "${seven_day%.*}"
+    printf "%s | %s | %s | 5h: %s%% 7d: %s%%" "$model" "$project" "$tokens_fmt" "${five_hr%.*}" "${seven_day%.*}"
 else
-    printf "%s | %s | %s %d%%" "$model" "$project" "$bar" "$used"
+    printf "%s | %s | %s" "$model" "$project" "$tokens_fmt"
 fi
 
 # ── Capture: rate_limits to file (if present) ────────────────────────

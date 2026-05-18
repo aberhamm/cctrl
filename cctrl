@@ -10,6 +10,7 @@ PROFILES_DIR="$SCRIPT_DIR/profiles"
 PLUGINS_DIR="$SCRIPT_DIR/plugins"
 COSTS_DIR="$SCRIPT_DIR/costs"
 SPENDING_LOG="$COSTS_DIR/spending.jsonl"
+SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -602,7 +603,14 @@ with open('$SPENDING_LOG', 'w') as f:
 }
 
 cmd_start() {
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control")
+    # `cctrl start @<name> [...]` is an alias for `cctrl @<name> [...]`
+    if [[ "${1:-}" == @* ]]; then
+        local sc="${1#@}"; shift
+        _shortcut_jump "$sc" "$@"
+        return
+    fi
+
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-6[1m]")
     local resume=false
     local resume_val=""
     local no_remote=false
@@ -651,6 +659,156 @@ cmd_start() {
     [[ ${#passthrough[@]} -gt 0 ]] && flags+=("${passthrough[@]}")
     echo -e "${DIM}claude ${flags[*]}${RESET}"
     exec claude "${flags[@]}"
+}
+
+cmd_spawn() {
+    # Open a new iTerm2 window on this Mac and launch a cctrl session in it.
+    # Designed for SSH-from-phone: the iTerm window is owned by the GUI login
+    # session (WindowServer), not the SSH pty, so it persists after disconnect.
+    #
+    # Usage:
+    #   cctrl spawn <dir>            # cctrl start in <dir>
+    #   cctrl spawn @<shortcut>      # cctrl @<shortcut> (cd + profile + start)
+    #   cctrl spawn ... [extras]     # extras passed through
+    #
+    # No-arg form is intentionally NOT supported. Bypass-permissions Claude in
+    # $HOME is dangerous (full read access to ~/.ssh, ~/.aws, browser data,
+    # etc.), and defaulting to $HOME would also hit the trust dialog you can't
+    # accept remotely. Pass an explicit target.
+
+    local target="" target_kind=""   # kind: dir | shortcut
+    local passthrough=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: cctrl spawn <dir | @shortcut> [extra args]"
+                echo ""
+                echo "Opens a new iTerm2 window on the Mac and runs cctrl in it."
+                echo "  <dir>          cd to dir, then run 'cctrl start'"
+                echo "  @<shortcut>    run 'cctrl @<shortcut>' (uses your saved shortcut)"
+                echo ""
+                echo "An explicit target is REQUIRED. Defaulting to \$HOME would drop"
+                echo "bypass-permissions Claude into a folder with ~/.ssh, ~/.aws,"
+                echo "browser data, etc. — not safe, and trust dialog blocks remote use."
+                echo ""
+                echo "Designed for SSH-from-phone: the new iTerm window is owned by the"
+                echo "GUI login session, not the SSH pty, so it persists after disconnect."
+                echo ""
+                echo "Requirements:"
+                echo "  - iTerm2 installed (https://iterm2.com)"
+                echo "  - User logged into the Mac's GUI (screen may be locked, but not"
+                echo "    logged out). A rebooted Mac sitting at the login window has no"
+                echo "    GUI session, so spawn will silently fail to open a window."
+                echo "  - First-time use prompts for Automation permission (must be at"
+                echo "    the Mac to click Allow). Run 'cctrl spawn' locally once before"
+                echo "    relying on it over SSH."
+                echo "  - Target dir must have hasTrustDialogAccepted=true in"
+                echo "    ~/.claude.json. Accept it once locally before remote use."
+                echo ""
+                echo "Recommended Mac config for reliable remote use:"
+                echo "  - Enable auto-login (System Settings > Users) so the GUI session"
+                echo "    comes back automatically after reboot."
+                echo "  - Run 'caffeinate -dimsu &' (or use a launchd job) to keep the"
+                echo "    Mac awake while you're away."
+                echo ""
+                echo "Examples:"
+                echo "  ssh mac 'cctrl spawn ~/_projects/cctrl'"
+                echo "  ssh mac 'cctrl spawn @homelab'"
+                echo "  ssh mac 'cctrl spawn @cctrl --resume'"
+                return 0
+                ;;
+            --)
+                shift
+                passthrough+=("$@")
+                break
+                ;;
+            @*)
+                if [[ -n "$target" ]]; then
+                    passthrough+=("$1")
+                else
+                    target="${1#@}"
+                    target_kind="shortcut"
+                fi
+                shift
+                ;;
+            -*)
+                passthrough+=("$1")
+                shift
+                ;;
+            *)
+                if [[ -n "$target" ]]; then
+                    passthrough+=("$1")
+                else
+                    target="$1"
+                    target_kind="dir"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$target" ]]; then
+        echo -e "${RED}cctrl spawn requires a target.${RESET}" >&2
+        echo "Usage: cctrl spawn <dir | @shortcut> [extra args]" >&2
+        echo -e "${DIM}Run 'cctrl spawn --help' for why no-arg is disallowed.${RESET}" >&2
+        return 1
+    fi
+
+    if ! /usr/bin/osascript -e 'id of application id "com.googlecode.iterm2"' &>/dev/null; then
+        echo -e "${RED}iTerm2 not found.${RESET} Install from https://iterm2.com" >&2
+        return 1
+    fi
+
+    local cctrl_q extras_q="" shell_cmd display_label
+    cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
+    if [[ ${#passthrough[@]} -gt 0 ]]; then
+        for a in "${passthrough[@]}"; do
+            extras_q+=" $(printf '%q' "$a")"
+        done
+    fi
+
+    if [[ "$target_kind" == "shortcut" ]]; then
+        local canonical
+        canonical="$(_shortcut_lookup_key "$target")"
+        if [[ -z "$canonical" ]]; then
+            echo -e "${RED}Shortcut not found: @$target${RESET}" >&2
+            echo -e "${DIM}List with: cctrl @${RESET}" >&2
+            return 1
+        fi
+        local name_q
+        name_q="$(printf '%q' "$canonical")"
+        shell_cmd="$cctrl_q @$name_q$extras_q"
+        display_label="@$canonical"
+    else
+        local dir="$target"
+        dir="${dir/#\~/$HOME}"
+        if [[ ! -d "$dir" ]]; then
+            echo -e "${RED}Directory not found: $dir${RESET}" >&2
+            return 1
+        fi
+        dir="$(cd "$dir" && pwd)"
+        local dir_q
+        dir_q="$(printf '%q' "$dir")"
+        shell_cmd="cd $dir_q && $cctrl_q start$extras_q"
+        display_label="$dir"
+    fi
+
+    # AppleScript-escape backslashes and double-quotes for the "write text" arg
+    local osa_cmd="${shell_cmd//\\/\\\\}"
+    osa_cmd="${osa_cmd//\"/\\\"}"
+
+    /usr/bin/osascript <<EOF
+tell application id "com.googlecode.iterm2"
+    activate
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "$osa_cmd"
+    end tell
+end tell
+EOF
+
+    echo -e "${GREEN}✓${RESET} iTerm2 window launched — ${BOLD}$display_label${RESET}"
+    echo -e "${DIM}Safe to disconnect SSH; the window is owned by the GUI session.${RESET}"
 }
 
 cmd_usage() {
@@ -1032,10 +1190,25 @@ cmd_help() {
     echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
     echo ""
     echo -e "${BOLD}Session${RESET}"
-    echo "  cctrl start [flags]     Launch claude with --permission-mode bypassPermissions --remote-control"
+    echo "  cctrl start [flags]     Launch claude: bypassPermissions, --remote-control, --model claude-opus-4-6[1m]"
+    echo "  cctrl start @<name>     Alias for cctrl @<name> (jump via shortcut)"
     echo "    --resume, -r [id]     Resume a session (interactive picker or by session ID)"
     echo "    --no-remote-control   Disable the default --remote-control bridge"
     echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
+    echo "  cctrl spawn <dir|@name> Open a new iTerm2 window on this Mac and run cctrl"
+    echo "                          For SSH-from-phone: window is owned by the GUI session,"
+    echo "                          so it survives SSH disconnect"
+    echo "                          Requires an explicit dir or shortcut (no \$HOME default)"
+    echo ""
+    echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
+    echo "  cctrl @<name>           Jump: cd to dir, switch profile, start claude (with optional resume + initial prompt)"
+    echo "  cctrl @<name> -m TEXT   Open with an initial prompt (alias: --message, --prompt)"
+    echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
+    echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
+    echo "  cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]"
+    echo "  cctrl @rm <name>        Remove a shortcut"
+    echo "  cctrl @ edit            Open shortcuts file in \$EDITOR"
+    echo "  Extra flags after the name are passed through to claude, e.g. cctrl @HomeLab --resume"
     echo ""
     echo -e "${BOLD}Usage Tracking${RESET}"
     echo "  cctrl usage [weeks]     Plan usage + billing week breakdown (default: 2)"
@@ -1066,6 +1239,287 @@ cmd_help() {
     echo -e "${DIM}Plugins:  $PLUGINS_DIR${RESET}"
 }
 
+# ── Shortcuts ─────────────────────────────────────────────────────────
+# Named jump targets: cd into a directory and launch claude there, optionally
+# switching profile and resuming a session. Configured in data/shortcuts.json.
+# Example: cctrl @HomeLab    cctrl @add HomeLab ~/homelab --profile max --resume
+
+_shortcuts_init() {
+    mkdir -p "$(dirname "$SHORTCUTS_FILE")"
+    [[ -f "$SHORTCUTS_FILE" ]] || echo "{}" > "$SHORTCUTS_FILE"
+}
+
+_shortcut_lookup_key() {
+    # Case-insensitive lookup; echoes the canonical key (or empty)
+    [[ -f "$SHORTCUTS_FILE" ]] || return 0
+    jq -r --arg n "$1" '
+        to_entries
+        | map(select(.key | ascii_downcase == ($n | ascii_downcase)))[0].key // empty
+    ' "$SHORTCUTS_FILE" 2>/dev/null
+}
+
+_shortcut_help() {
+    echo -e "${BOLD}Shortcut commands${RESET}"
+    echo "  cctrl @<name>                     Jump: cd, switch profile, launch claude"
+    echo "  cctrl @<name> -m \"TEXT\"            Launch with an initial prompt"
+    echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
+    echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
+    echo "  cctrl @<name> --no-remote-control Disable Remote Control for this launch"
+    echo "  cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]"
+    echo "  cctrl @rm <name>                  Remove a shortcut"
+    echo "  cctrl @ ls                        List shortcuts (no helper)"
+    echo "  cctrl @ edit                      Open ${SHORTCUTS_FILE/#$HOME/~} in \$EDITOR"
+}
+
+_shortcut_list() {
+    if [[ ! -f "$SHORTCUTS_FILE" ]] || ! jq -e 'length > 0' "$SHORTCUTS_FILE" &>/dev/null; then
+        echo -e "${DIM}No shortcuts yet.${RESET}"
+        echo
+        _shortcut_help
+        return
+    fi
+
+    echo -e "${BOLD}Shortcuts${RESET}"
+    # Emit one field per line (5 lines per entry) to avoid IFS-whitespace field collapsing
+    local _name _dir _profile _resume _prompt
+    while IFS= read -r _name \
+       && IFS= read -r _dir \
+       && IFS= read -r _profile \
+       && IFS= read -r _resume \
+       && IFS= read -r _prompt; do
+        local extras=""
+        [[ -n "$_profile" ]] && extras+="  ${DIM}profile=${_profile}${RESET}"
+        [[ "$_resume" != "false" ]] && extras+="  ${DIM}resume=${_resume}${RESET}"
+        echo -e "  ${GREEN}@${_name}${RESET}  ${DIM}→${RESET}  $_dir$extras"
+        if [[ -n "$_prompt" ]]; then
+            local short="$_prompt"
+            [[ ${#short} -gt 70 ]] && short="${short:0:67}..."
+            echo -e "      ${DIM}prompt: \"$short\"${RESET}"
+        fi
+    done < <(jq -r 'to_entries[] | .key, (.value.dir // ""), (.value.profile // ""), (.value.resume // false | tostring), (.value.prompt // "")' "$SHORTCUTS_FILE")
+}
+
+_shortcut_add() {
+    local name="${1:-}" dir="${2:-}"
+    if [[ -z "$name" || -z "$dir" ]]; then
+        echo -e "${RED}Usage: cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]${RESET}"
+        return 1
+    fi
+    shift 2
+
+    local profile=""
+    local resume="false"
+    local prompt=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --profile|-p)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
+                profile="$2"; shift 2 ;;
+            --resume|-r)
+                if [[ $# -gt 1 && "$2" != -* ]]; then
+                    resume="$2"; shift 2
+                else
+                    resume="true"; shift
+                fi ;;
+            --message|--prompt|-m)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--message needs a value${RESET}"; return 1; }
+                prompt="$2"; shift 2 ;;
+            *)
+                echo -e "${RED}Unknown flag: $1${RESET}"; return 1 ;;
+        esac
+    done
+
+    if [[ -n "$profile" ]] && ! _profile_exists "$profile"; then
+        echo -e "${YELLOW}Warning: profile '$profile' does not exist (saving anyway).${RESET}"
+    fi
+
+    _shortcuts_init
+
+    local existing
+    existing=$(_shortcut_lookup_key "$name")
+    if [[ -n "$existing" && "$existing" != "$name" ]]; then
+        echo -e "${YELLOW}A shortcut '$existing' already exists with different casing. Overwriting under new name '$name'.${RESET}"
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    jq --arg name "$name" \
+       --arg dir "$dir" \
+       --arg profile "$profile" \
+       --arg resume "$resume" \
+       --arg prompt "$prompt" \
+       --arg existing "$existing" '
+        (if $existing != "" and $existing != $name then del(.[$existing]) else . end)
+        + {
+            ($name): (
+                {dir: $dir}
+                + (if $profile != "" then {profile: $profile} else {} end)
+                + (if $resume == "true" then {resume: true}
+                   elif $resume == "false" then {}
+                   else {resume: $resume} end)
+                + (if $prompt != "" then {prompt: $prompt} else {} end)
+            )
+        }
+    ' "$SHORTCUTS_FILE" > "$tmp" && mv "$tmp" "$SHORTCUTS_FILE"
+
+    echo -e "${GREEN}Saved ${BOLD}@$name${RESET}${GREEN} → $dir${RESET}"
+    [[ -n "$profile" ]] && echo -e "${DIM}  profile=$profile${RESET}"
+    [[ "$resume" != "false" ]] && echo -e "${DIM}  resume=$resume${RESET}"
+    [[ -n "$prompt" ]] && echo -e "${DIM}  prompt=\"$prompt\"${RESET}"
+    return 0
+}
+
+_shortcut_rm() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo -e "${RED}Usage: cctrl @rm <name>${RESET}"
+        return 1
+    fi
+    [[ -f "$SHORTCUTS_FILE" ]] || { echo -e "${DIM}No shortcuts file.${RESET}"; return 1; }
+
+    local key
+    key=$(_shortcut_lookup_key "$name")
+    if [[ -z "$key" ]]; then
+        echo -e "${RED}Shortcut '$name' not found.${RESET}"
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    jq --arg key "$key" 'del(.[$key])' "$SHORTCUTS_FILE" > "$tmp" && mv "$tmp" "$SHORTCUTS_FILE"
+    echo -e "${GREEN}Removed @$key${RESET}"
+}
+
+_shortcut_jump() {
+    local name="$1"; shift
+
+    if [[ ! -f "$SHORTCUTS_FILE" ]]; then
+        echo -e "${RED}No shortcuts configured.${RESET} Add one with: cctrl @add <name> <dir>"
+        return 1
+    fi
+
+    local key
+    key=$(_shortcut_lookup_key "$name")
+    if [[ -z "$key" ]]; then
+        echo -e "${RED}Shortcut '@$name' not found.${RESET}"
+        echo
+        _shortcut_list
+        return 1
+    fi
+
+    local dir profile resume prompt
+    { IFS= read -r dir; IFS= read -r profile; IFS= read -r resume; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
+        .[$k] | (.dir // ""), (.profile // ""), (.resume // false | tostring), (.prompt // "")
+    ' "$SHORTCUTS_FILE")
+
+    # Expand leading ~
+    dir="${dir/#\~/$HOME}"
+
+    if [[ -z "$dir" || ! -d "$dir" ]]; then
+        echo -e "${RED}Directory does not exist: $dir${RESET}"
+        return 1
+    fi
+
+    # Optional profile switch
+    if [[ -n "$profile" ]]; then
+        if ! _profile_exists "$profile"; then
+            echo -e "${YELLOW}Profile '$profile' not found; skipping switch.${RESET}"
+        else
+            local active
+            active="$(_active_profile)"
+            if [[ "$active" != "$profile" ]]; then
+                cp "$(_profile_path "$profile")" "$SETTINGS"
+                echo "$profile" > "$ACTIVE_FILE"
+                _log_switch "$active" "$profile"
+                echo -e "${GREEN}Switched profile: ${BOLD}$profile${RESET}"
+            fi
+        fi
+    fi
+
+    # Build claude flags. CLI args override the shortcut's resume/prompt settings.
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-6[1m]")
+    local cli_resume=false
+    local cli_resume_val=""
+    local cli_prompt=""
+    local cli_prompt_set=false
+    local no_remote=false
+    local passthrough=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --resume|-r)
+                cli_resume=true
+                if [[ $# -gt 1 && "$2" != -* ]]; then
+                    cli_resume_val="$2"; shift
+                fi
+                shift ;;
+            --message|--prompt|-m)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--message needs a value${RESET}"; return 1; }
+                cli_prompt="$2"; cli_prompt_set=true; shift 2 ;;
+            --no-remote-control|--no-remote)
+                no_remote=true; shift ;;
+            --)
+                shift
+                # Everything after -- is a literal prompt (joined by space)
+                if [[ $# -gt 0 ]]; then
+                    cli_prompt="$*"; cli_prompt_set=true
+                fi
+                break ;;
+            *)
+                passthrough+=("$1"); shift ;;
+        esac
+    done
+
+    if $no_remote; then
+        flags=("${flags[@]/--remote-control}")
+        local cleaned=()
+        for f in "${flags[@]}"; do [[ -n "$f" ]] && cleaned+=("$f"); done
+        flags=("${cleaned[@]}")
+    else
+        flags+=("--remote-control-session-name-prefix" "$(_remote_prefix "$dir")")
+    fi
+
+    if $cli_resume; then
+        if [[ -n "$cli_resume_val" ]]; then
+            flags+=("--resume" "$cli_resume_val")
+        else
+            flags+=("--resume")
+        fi
+    elif [[ "$resume" == "true" ]]; then
+        flags+=("--resume")
+    elif [[ -n "$resume" && "$resume" != "false" ]]; then
+        flags+=("--resume" "$resume")
+    fi
+
+    [[ ${#passthrough[@]} -gt 0 ]] && flags+=("${passthrough[@]}")
+
+    # Prompt: CLI overrides config. Goes last (claude treats final positional as prompt).
+    local final_prompt=""
+    if $cli_prompt_set; then
+        final_prompt="$cli_prompt"
+    elif [[ -n "$prompt" ]]; then
+        final_prompt="$prompt"
+    fi
+    [[ -n "$final_prompt" ]] && flags+=("$final_prompt")
+
+    cd "$dir"
+    echo -e "${DIM}→ @${key}  ($dir)${RESET}"
+    echo -e "${DIM}claude ${flags[*]}${RESET}"
+    exec claude "${flags[@]}"
+}
+
+cmd_shortcut() {
+    local action="${1:-}"
+    case "$action" in
+        "")                _shortcut_list; echo; _shortcut_help ;;
+        help|-h|--help)    _shortcut_help ;;
+        ls|list)           _shortcut_list ;;
+        add)               shift; _shortcut_add "$@" ;;
+        rm|remove|delete)  shift; _shortcut_rm "$@" ;;
+        edit)              _shortcuts_init; "${EDITOR:-vim}" "$SHORTCUTS_FILE" ;;
+        *)                 shift; _shortcut_jump "$action" "$@" ;;
+    esac
+}
+
 # ── Plugin discovery ──────────────────────────────────────────────────
 
 _try_plugin() {
@@ -1092,6 +1546,15 @@ main() {
     shift 2>/dev/null || true
 
     case "$cmd" in
+        @*)
+            local name="${cmd#@}"
+            # Support both `cctrl @HomeLab` and `cctrl @ HomeLab` / `cctrl @ add ...`
+            if [[ -z "$name" && $# -gt 0 ]]; then
+                name="$1"; shift
+            fi
+            cmd_shortcut "$name" "$@"
+            ;;
+        shortcuts) cmd_shortcut "$@" ;;
         use|switch) cmd_use "$@" ;;
         ls|list) cmd_ls "$@" ;;
         current) cmd_current "$@" ;;
@@ -1100,6 +1563,7 @@ main() {
         diff)    cmd_diff "$@" ;;
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
+        spawn)   cmd_spawn "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         log)     cmd_log "$@" ;;

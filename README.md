@@ -37,6 +37,57 @@ cctrl start -p "fix bug"          # extra flags passed through
 
 `cctrl start` launches `claude` with `--remote-control` enabled and `--remote-control-session-name-prefix <repo>` set to the current git repo's name (or directory basename if not in a repo). Each launch gets a unique adjective-noun suffix from Claude Code (e.g. `cctrl-graceful-unicorn`), so multiple sessions in the same folder stay distinguishable. Within seconds of your first message, the title is replaced by an AI-generated summary. Pass `--no-remote-control` (or `--no-remote`) to opt out.
 
+### Spawn (remote-launch from SSH)
+
+```bash
+cctrl spawn                       # cctrl start in $HOME
+cctrl spawn ~/_projects/cctrl     # cctrl start in <dir>
+cctrl spawn @homelab              # uses a saved shortcut
+cctrl spawn @cctrl --resume       # extra flags pass through
+```
+
+`cctrl spawn` opens a **new iTerm2 window on the Mac** and runs `cctrl` inside it. The window is owned by the macOS GUI login session (WindowServer), not the calling shell — so when invoked over SSH, the session keeps running after you disconnect. Built for the case where you're away from home with only a phone-side SSH client and want to kick off a Claude Code session that's waiting on screen when you get back.
+
+**Requirements**
+
+- iTerm2 installed (https://iterm2.com)
+- User logged into the Mac's GUI. The screen may be locked, but the user must not be logged out. A rebooted Mac sitting at the login window has no GUI session, so `spawn` silently fails to open a window.
+- **First-time use prompts for Automation permission.** macOS will show a *"Terminal/zsh wants to control iTerm"* dialog the first time `spawn` runs. You must be at the Mac to click Allow. Run `cctrl spawn` locally once before relying on it over SSH.
+
+**Recommended Mac config for reliable remote use**
+
+- Enable auto-login (System Settings → Users & Groups) so the GUI session comes back automatically after a reboot or power loss.
+- Run `caffeinate -dimsu &` (or set up a launchd job) to keep the Mac awake while you're away.
+
+**Behavior after `claude` exits.** The iTerm window stays open or closes based on your iTerm profile's *"When the session ends"* setting. Set it to "No action" if you want the window to stay around after a session ends.
+
+### Shortcuts
+
+Named jump targets — cd into a directory, optionally switch profile and resume, and launch claude in one command. Names are case-insensitive.
+
+```bash
+cctrl @<name>                # cd + switch profile + start claude
+cctrl @<name> -m "TEXT"      # pass an initial prompt (alias: --message, --prompt)
+cctrl @<name> -- TEXT        # everything after -- becomes the prompt
+cctrl @<name> --resume       # resume picker for that project
+cctrl @                      # list shortcuts (also: cctrl @ ls)
+cctrl @ edit                 # open shortcuts file in $EDITOR
+cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]
+cctrl @rm <name>             # remove
+```
+
+Examples:
+
+```bash
+cctrl @add cctrl ~/_projects/cctrl
+cctrl @add homelab ~/_projects/homelab --profile max --resume
+cctrl @add notes "$HOME/Documents/Obsidian Vault" -m "summarize today's notes"
+cctrl @cctrl                 # jump in
+cctrl @homelab --resume      # extra flags pass through to claude
+```
+
+Stored in `data/shortcuts.json`.
+
 ### Usage tracking
 
 ```bash
@@ -95,6 +146,7 @@ cctrl/
   costs/spending.jsonl   # session log (auto-maintained)
   data/rate-limits.json  # latest rate limit snapshot (auto-maintained)
   data/rate-limits-history.jsonl  # rate limit history (auto-maintained)
+  data/shortcuts.json    # named project shortcuts (cctrl @<name>)
   plugins/               # drop-in subcommands (cctrl-<name>)
 ```
 
