@@ -1555,7 +1555,37 @@ _shortcut_jump() {
     key=$(_shortcut_lookup_key "$name")
     if [[ -z "$key" ]]; then
         echo -e "${RED}Shortcut '@$name' not found.${RESET}"
-        echo -e "${DIM}Add it with:${RESET} cctrl @add $name <dir> [--profile X] [--resume [id]] [--message TEXT]"
+        echo
+        # Search common project directories for a matching folder name
+        local -a candidates=()
+        local search_dirs=("$HOME/_projects" "$HOME/Documents/Obsidian Vault" "$HOME/Projects" "$HOME/projects" "$HOME/src")
+        for sdir in "${search_dirs[@]}"; do
+            [[ -d "$sdir" ]] || continue
+            while IFS= read -r match; do
+                candidates+=("$match")
+            done < <(find "$sdir" -maxdepth 3 -type d -iname "*$name*" 2>/dev/null | head -10)
+        done
+
+        if [[ ${#candidates[@]} -gt 0 ]]; then
+            echo -e "${BOLD}Found directories matching '$name':${RESET}"
+            local i=1
+            for c in "${candidates[@]}"; do
+                echo -e "  ${GREEN}[$i]${RESET} $c"
+                ((i++))
+            done
+            echo
+            echo -n "Add as shortcut? Enter number (or n to skip): "
+            read -r choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
+                local chosen="${candidates[$((choice-1))]}"
+                _shortcut_add "$name" "$chosen"
+                echo
+                echo -e "${DIM}Run ${BOLD}cctrl @$name${RESET}${DIM} again to launch.${RESET}"
+                return 0
+            fi
+        else
+            echo -e "${DIM}Add it with:${RESET} cctrl @add $name <dir> [--profile X] [--resume [id]] [--message TEXT]"
+        fi
         echo
         _shortcut_list
         return 1
@@ -1571,6 +1601,39 @@ _shortcut_jump() {
 
     if [[ -z "$dir" || ! -d "$dir" ]]; then
         echo -e "${RED}Directory does not exist: $dir${RESET}"
+        echo
+        # Try to find where the folder moved to
+        local basename="${dir##*/}"
+        local -a candidates=()
+        local search_dirs=("$HOME/_projects" "$HOME/Documents/Obsidian Vault" "$HOME/Projects" "$HOME/projects" "$HOME/src")
+        for sdir in "${search_dirs[@]}"; do
+            [[ -d "$sdir" ]] || continue
+            while IFS= read -r match; do
+                [[ "$match" != "$dir" ]] && candidates+=("$match")
+            done < <(find "$sdir" -maxdepth 4 -type d -name "$basename" 2>/dev/null | head -10)
+        done
+
+        if [[ ${#candidates[@]} -gt 0 ]]; then
+            echo -e "${BOLD}Found possible new location(s) for '$basename':${RESET}"
+            local i=1
+            for c in "${candidates[@]}"; do
+                echo -e "  ${GREEN}[$i]${RESET} $c"
+                ((i++))
+            done
+            echo
+            echo -n "Update @$key to new path? Enter number (or n to skip): "
+            read -r choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#candidates[@]} )); then
+                local chosen="${candidates[$((choice-1))]}"
+                local tmp
+                tmp=$(mktemp)
+                jq --arg k "$key" --arg d "$chosen" '.[$k].dir = $d' "$SHORTCUTS_FILE" > "$tmp" && mv "$tmp" "$SHORTCUTS_FILE"
+                echo -e "${GREEN}Updated @$key → $chosen${RESET}"
+                echo
+                echo -e "${DIM}Run ${BOLD}cctrl @$key${RESET}${DIM} again to launch.${RESET}"
+                return 0
+            fi
+        fi
         return 1
     fi
 
