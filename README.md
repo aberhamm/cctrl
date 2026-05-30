@@ -75,7 +75,15 @@ cctrl spawn @myapp                # use a saved shortcut
 
 Opens a **new iTerm2 window on the Mac's GUI session** and runs `cctrl start` inside it. The window is owned by WindowServer, not the SSH shell — so it persists after you disconnect. Built for the case where you're away from home with a phone-side SSH client and want to start a Claude Code session that's waiting on screen when you get back.
 
-**Requirements:** iTerm2 installed, user logged into the Mac GUI (screen can be locked). First-time use prompts for macOS Automation permission — run `cctrl spawn` locally once before relying on it remotely.
+**Requirements:**
+- iTerm2 installed
+- User logged into the Mac GUI (screen can be locked, but not logged out — a rebooted Mac at the login window has no GUI session, so `spawn` silently fails)
+- First-time use prompts for macOS Automation permission — run `cctrl spawn` locally once before relying on it remotely
+
+**Recommended Mac config for reliable remote use:**
+- Enable auto-login (System Settings → Users & Groups) so the GUI session comes back after reboot or power loss
+- Run `caffeinate -dimsu &` (or a launchd job) to keep the Mac awake while you're away
+- Set iTerm's "When the session ends" to "No action" if you want the window to stay after claude exits
 
 ## Usage & cost tracking
 
