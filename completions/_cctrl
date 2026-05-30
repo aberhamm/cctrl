@@ -1,0 +1,193 @@
+#compdef cctrl
+
+# Resolve cctrl's install dir from the command path (works through symlinks)
+_cctrl_dir() {
+    local bin="${commands[cctrl]:-$(whence -p cctrl 2>/dev/null)}"
+    [[ -n "$bin" ]] || return 1
+    local real="$(readlink -f "$bin" 2>/dev/null || realpath "$bin" 2>/dev/null)"
+    echo "${real:h}"
+}
+
+_cctrl_profiles() {
+    local dir="$(_cctrl_dir)/profiles"
+    [[ -d "$dir" ]] || return
+    local -a profiles
+    for f in "$dir"/*.json(N); do
+        profiles+=("${f:t:r}")
+    done
+    (( ${#profiles} )) && compadd -X "profiles" "$@" -- "${profiles[@]}"
+}
+
+_cctrl_shortcuts() {
+    local file="$(_cctrl_dir)/data/shortcuts.json"
+    [[ -f "$file" ]] || return
+    local -a names descs
+    local key val
+    while IFS=$'\t' read -r key val; do
+        names+=("@${key}")
+        descs+=("@${key}:${val}")
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.dir // "")"' "$file" 2>/dev/null)
+    (( ${#names} )) && _describe "shortcuts" descs
+}
+
+_cctrl_shortcut_names() {
+    local file="$(_cctrl_dir)/data/shortcuts.json"
+    [[ -f "$file" ]] || return
+    local -a names
+    names=("${(@f)$(jq -r 'keys[]' "$file" 2>/dev/null)}")
+    (( ${#names} )) && compadd "$@" -- "${names[@]}"
+}
+
+_cctrl_plugins() {
+    local dir="$(_cctrl_dir)/plugins"
+    [[ -d "$dir" ]] || return
+    local -a plugs
+    for f in "$dir"/cctrl-*(N); do
+        [[ -x "$f" ]] && plugs+=("${${f:t}#cctrl-}")
+    done
+    (( ${#plugs} )) && compadd -X "plugins" "$@" -- "${plugs[@]}"
+}
+
+_cctrl() {
+    local -a subcmds=(
+        'use:Switch to a settings profile'
+        'switch:Switch to a settings profile'
+        'ls:List available profiles'
+        'list:List available profiles'
+        'current:Show active profile'
+        'save:Save current settings as a profile'
+        'diff:Diff current settings vs a profile'
+        'rename:Rename a profile'
+        'edit:Open a profile in \$EDITOR'
+        'start:Launch claude with standard flags'
+        's:Launch claude with standard flags'
+        'spawn:Open a new iTerm2 window and run cctrl'
+        'costs:Token usage and cost breakdown'
+        'usage:Plan usage and billing week breakdown'
+        'log:Show profile switch history'
+        'chrome:Launch Chrome with CDP remote debugging'
+        'shortcuts:Manage shortcuts'
+        'help:Show help'
+    )
+
+    if (( CURRENT == 2 )); then
+        _describe "commands" subcmds
+        _cctrl_shortcuts
+        _cctrl_plugins
+        return
+    fi
+
+    local cmd="${words[2]}"
+
+    case "$cmd" in
+        @*)
+            local name="${cmd#@}"
+            if [[ -z "$name" ]]; then
+                if (( CURRENT == 3 )); then
+                    _cctrl_shortcut_names
+                    local -a shortcut_cmds=(
+                        'add:Add a new shortcut'
+                        'rm:Remove a shortcut'
+                        'ls:List shortcuts'
+                        'edit:Open shortcuts file in \$EDITOR'
+                    )
+                    _describe "shortcut commands" shortcut_cmds
+                    return
+                fi
+                local subcmd="${words[3]}"
+                case "$subcmd" in
+                    add)
+                        case $CURRENT in
+                            4) ;; # name — freeform
+                            5) _directories ;;
+                            *)
+                                _arguments \
+                                    '--profile[Profile to switch to]:profile:_cctrl_profiles' \
+                                    '--resume[Resume a session]' \
+                                    '--message[Initial prompt]:message:'
+                                ;;
+                        esac
+                        return
+                        ;;
+                    rm|remove|delete)
+                        (( CURRENT == 4 )) && _cctrl_shortcut_names
+                        return
+                        ;;
+                esac
+            fi
+            _arguments \
+                '--resume[Resume a session]' \
+                '--no-remote-control[Disable Remote Control]' \
+                '--no-remote[Disable Remote Control]' \
+                {-m,--message,--prompt}'[Initial prompt]:message:' \
+                '--[Everything after is the prompt]'
+            ;;
+        use|switch|diff|edit)
+            (( CURRENT == 3 )) && _cctrl_profiles
+            ;;
+        rename)
+            (( CURRENT == 3 || CURRENT == 4 )) && _cctrl_profiles
+            ;;
+        save)
+            ;; # name is freeform
+        start|s)
+            _arguments \
+                {--resume,-r}'[Resume a session]' \
+                '--no-remote-control[Disable Remote Control]' \
+                '--no-remote[Disable Remote Control]'
+            # Also allow @shortcut as first arg to start
+            if (( CURRENT == 3 )); then
+                _cctrl_shortcuts
+            fi
+            ;;
+        spawn)
+            if (( CURRENT == 3 )); then
+                _directories
+                _cctrl_shortcuts
+            else
+                _arguments \
+                    {--resume,-r}'[Resume a session]' \
+                    '--no-remote-control[Disable Remote Control]' \
+                    '--no-remote[Disable Remote Control]'
+            fi
+            ;;
+        shortcuts)
+            if (( CURRENT == 3 )); then
+                local -a shortcut_cmds=(
+                    'add:Add a new shortcut'
+                    'rm:Remove a shortcut'
+                    'ls:List shortcuts'
+                    'edit:Open shortcuts file in \$EDITOR'
+                )
+                _describe "shortcut commands" shortcut_cmds
+                _cctrl_shortcut_names
+            fi
+            ;;
+        costs|cost)
+            if (( CURRENT == 3 )); then
+                local -a ranges=(
+                    '--today:Last 24 hours'
+                    '--week:Last 7 days'
+                    '--month:Last 30 days'
+                    '--all:All time'
+                )
+                _describe "ranges" ranges
+            fi
+            ;;
+        usage)
+            (( CURRENT == 3 )) && compadd -- 1 2 3 4 5 6 7 8
+            ;;
+        chrome|cdp)
+            _arguments \
+                {--port,-p}'[CDP port]:port:' \
+                {--status,-s}'[Check if CDP is active]' \
+                {--connect,-c}'[Connect gstack browse]' \
+                {--kill,-k}'[Kill Chrome without relaunching]'
+            ;;
+        log)
+            (( CURRENT == 3 )) && compadd -- 10 20 50 100
+            ;;
+    esac
+}
+
+_cctrl "$@"

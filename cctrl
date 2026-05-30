@@ -1231,12 +1231,165 @@ cmd_help() {
     echo "  cctrl ports --min N --max N     Port range for suggestions (default: 3000–9999)"
     echo "  cctrl ports --count N           How many free ports to suggest (default: 10)"
     echo ""
+    echo -e "${BOLD}Chrome CDP${RESET}"
+    echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
+    echo "  cctrl chrome --status           Check if CDP is active"
+    echo "  cctrl chrome --port 9333        Use a different port"
+    echo "  cctrl chrome --connect          Also connect gstack browse to the session"
+    echo "  cctrl chrome --kill             Kill Chrome without relaunching"
+    echo ""
     echo -e "${BOLD}Plugins${RESET}"
     echo "  Any executable named cctrl-<cmd> in plugins/ or PATH"
     echo "  is auto-discovered as a subcommand."
     echo ""
     echo -e "${DIM}Profiles: $PROFILES_DIR${RESET}"
     echo -e "${DIM}Plugins:  $PLUGINS_DIR${RESET}"
+}
+
+# ── Chrome CDP ────────────────────────────────────────────────────────
+
+CHROME_DATA_DIR="$HOME/.chrome-debug"
+CHROME_DEFAULT_PORT=9222
+
+_chrome_bin() {
+    local candidates=(
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary"
+        "/Applications/Chromium.app/Contents/MacOS/Chromium"
+    )
+    for bin in "${candidates[@]}"; do
+        [[ -x "$bin" ]] && { echo "$bin"; return 0; }
+    done
+    return 1
+}
+
+_chrome_cdp_ready() {
+    local port="${1:-$CHROME_DEFAULT_PORT}"
+    curl -s --max-time 1 "http://localhost:$port/json/version" &>/dev/null
+}
+
+cmd_chrome() {
+    local port="$CHROME_DEFAULT_PORT"
+    local data_dir="$CHROME_DATA_DIR"
+    local connect=false
+    local kill_first=false
+    local status_only=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port|-p) port="$2"; shift 2 ;;
+            --data-dir|-d) data_dir="$2"; shift 2 ;;
+            --connect|-c) connect=true; shift ;;
+            --kill|-k) kill_first=true; shift ;;
+            --status|-s) status_only=true; shift ;;
+            --help|-h)
+                echo -e "${BOLD}cctrl chrome${RESET} — Launch Chrome with CDP remote debugging"
+                echo ""
+                echo "  cctrl chrome              Kill existing Chrome, launch with CDP on :9222"
+                echo "  cctrl chrome --status     Check if CDP is active"
+                echo "  cctrl chrome --port 9333  Use a different port"
+                echo "  cctrl chrome --connect    Also connect gstack browse to the CDP session"
+                echo "  cctrl chrome --kill       Kill Chrome without relaunching"
+                echo ""
+                echo -e "${DIM}Data dir: $data_dir${RESET}"
+                return 0
+                ;;
+            *) echo -e "${RED}Unknown flag: $1${RESET}"; return 1 ;;
+        esac
+    done
+
+    if $status_only; then
+        if _chrome_cdp_ready "$port"; then
+            local version
+            version="$(curl -s "http://localhost:$port/json/version" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("Browser","unknown"))' 2>/dev/null)"
+            echo -e "${GREEN}CDP active${RESET} on :$port — $version"
+            local tabs
+            tabs="$(curl -s "http://localhost:$port/json/list" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)))' 2>/dev/null || echo '?')"
+            echo -e "${DIM}$tabs tab(s) open${RESET}"
+        else
+            echo -e "${YELLOW}CDP not active${RESET} on :$port"
+        fi
+        return 0
+    fi
+
+    local chrome_bin
+    chrome_bin="$(_chrome_bin)" || {
+        echo -e "${RED}No Chrome installation found${RESET}"
+        return 1
+    }
+
+    if $kill_first && ! $status_only; then
+        echo -e "${DIM}Killing Chrome...${RESET}"
+        killall "Google Chrome" "Google Chrome Helper" 2>/dev/null || true
+        if [[ $# -eq 0 ]] && $kill_first; then
+            # --kill alone means just kill, don't relaunch
+            sleep 1
+            if pgrep -q "Google Chrome"; then
+                echo -e "${YELLOW}Chrome still running (force kill may be needed)${RESET}"
+            else
+                echo -e "${GREEN}Chrome stopped${RESET}"
+            fi
+            return 0
+        fi
+    fi
+
+    # Kill existing Chrome (CDP requires being the first instance)
+    if pgrep -q "Google Chrome"; then
+        echo -e "${DIM}Stopping existing Chrome (CDP needs a fresh launch)...${RESET}"
+        killall "Google Chrome" 2>/dev/null || true
+        local waited=0
+        while pgrep -q "Google Chrome" && [[ $waited -lt 5 ]]; do
+            sleep 1
+            ((waited++))
+        done
+        if pgrep -q "Google Chrome"; then
+            echo -e "${RED}Chrome didn't stop cleanly. Run: killall -9 'Google Chrome'${RESET}"
+            return 1
+        fi
+    fi
+
+    mkdir -p "$data_dir"
+
+    echo -e "${DIM}Launching Chrome with CDP on :$port${RESET}"
+    echo -e "${DIM}Data dir: $data_dir${RESET}"
+
+    nohup "$chrome_bin" \
+        --remote-debugging-port="$port" \
+        --user-data-dir="$data_dir" \
+        '--remote-allow-origins=*' \
+        &>/dev/null &
+
+    # Wait for CDP to come up
+    local attempts=0
+    while ! _chrome_cdp_ready "$port" && [[ $attempts -lt 10 ]]; do
+        sleep 1
+        ((attempts++))
+    done
+
+    if _chrome_cdp_ready "$port"; then
+        local version
+        version="$(curl -s "http://localhost:$port/json/version" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("Browser","unknown"))' 2>/dev/null)"
+        echo -e "${GREEN}CDP ready${RESET} on :$port — $version"
+
+        if $connect; then
+            local browse_bin="$HOME/.claude/skills/gstack/browse/dist/browse"
+            if [[ -x "$browse_bin" ]]; then
+                echo -e "${DIM}Connecting browse...${RESET}"
+                "$browse_bin" connect "http://localhost:$port" 2>/dev/null && \
+                    echo -e "${GREEN}browse connected${RESET}" || \
+                    echo -e "${YELLOW}browse connect failed (try manually: \$B connect http://localhost:$port)${RESET}"
+            else
+                echo -e "${DIM}browse not found — connect manually in Claude Code${RESET}"
+            fi
+        fi
+
+        echo -e "\n${DIM}Connect from Claude Code:${RESET}"
+        echo -e "  \$B connect http://localhost:$port"
+    else
+        echo -e "${RED}CDP failed to start after 10s${RESET}"
+        echo -e "${DIM}Check: is another Chrome instance still running?${RESET}"
+        return 1
+    fi
 }
 
 # ── Shortcuts ─────────────────────────────────────────────────────────
@@ -1402,6 +1555,7 @@ _shortcut_jump() {
     key=$(_shortcut_lookup_key "$name")
     if [[ -z "$key" ]]; then
         echo -e "${RED}Shortcut '@$name' not found.${RESET}"
+        echo -e "${DIM}Add it with:${RESET} cctrl @add $name <dir> [--profile X] [--resume [id]] [--message TEXT]"
         echo
         _shortcut_list
         return 1
@@ -1567,6 +1721,7 @@ main() {
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         log)     cmd_log "$@" ;;
+        chrome|cdp) cmd_chrome "$@" ;;
         help|-h|--help) cmd_help "$@" ;;
         *)
             if ! _try_plugin "$cmd" "$@"; then
