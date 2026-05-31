@@ -40,3 +40,5 @@ data/
 
 # Built plugins
 plugins/cctrl-ports
+.mstack/
+.mstack-*
