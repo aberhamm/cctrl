@@ -1,7 +1,10 @@
 ---
 id: 001
 title: Add --host flag and host registry for remote cctrl execution over SSH
-status: in-progress
+status: done
+completed: 2026-06-01
+reviewed: false
+qa: automated,verified
 blocked-by: []
 priority:
 allows-migrations: false

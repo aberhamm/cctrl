@@ -87,6 +87,33 @@ cctrl spawn --attach homelab
 
 **Requires:** tmux (`brew install tmux`)
 
+## Remote Hosts
+
+Run any cctrl command on a named remote host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.
+
+```bash
+cctrl host add studio ms-128g-bln         # register a host
+cctrl host add studio ms-128g-bln matt    # with explicit user
+cctrl host list                            # show registered hosts
+cctrl host rm studio                       # remove a host
+cctrl host doctor studio                   # check SSH, brew, tmux, claude, cctrl
+```
+
+Then use `--host` with any command:
+
+```bash
+cctrl --host studio spawn @homelab         # spawn a session on the remote host
+cctrl --host studio spawn --list           # list remote tmux sessions
+cctrl --host studio spawn --attach homelab # attach interactively (TTY)
+cctrl --host studio costs --week           # view remote cost data
+```
+
+**TTY handling:** Interactive commands (`start`, `@shortcut`, `spawn --attach`, `edit`) use `ssh -t`. Non-interactive commands (`spawn @x`, `spawn --list`, `costs`, `usage`, `ls`) use plain `ssh`.
+
+**Host doctor** checks SSH connectivity, brew, tmux, claude, cctrl availability, and `~/.tmux.conf` on the remote host — with interactive auto-fix offers for missing dependencies.
+
+The host registry lives in `data/hosts.json` (gitignored, machine-local). Each machine is its own source of truth — no sync.
+
 ## Usage & cost tracking
 
 ```bash

@@ -11,6 +11,7 @@ PLUGINS_DIR="$SCRIPT_DIR/plugins"
 COSTS_DIR="$SCRIPT_DIR/costs"
 SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
+HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -1266,6 +1267,13 @@ cmd_help() {
     echo "  cctrl ports --min N --max N     Port range for suggestions (default: 3000–9999)"
     echo "  cctrl ports --count N           How many free ports to suggest (default: 10)"
     echo ""
+    echo -e "${BOLD}Remote Hosts${RESET}"
+    echo "  cctrl host add <alias> <host> [user]  Register a remote host"
+    echo "  cctrl host list                       List registered hosts"
+    echo "  cctrl host rm <alias>                 Remove a host"
+    echo "  cctrl host doctor <alias>             Check SSH, tmux, claude, cctrl on remote"
+    echo "  cctrl --host <alias> <command>        Run any cctrl command on a remote host"
+    echo ""
     echo -e "${BOLD}Chrome CDP${RESET}"
     echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
     echo "  cctrl chrome --status           Check if CDP is active"
@@ -1425,6 +1433,274 @@ cmd_chrome() {
         echo -e "${DIM}Check: is another Chrome instance still running?${RESET}"
         return 1
     fi
+}
+
+# ── Host Registry ────────────────────────────────────────────────────
+# Named remote hosts for transparent SSH execution.
+# Configured in data/hosts.json. Each entry maps an alias to a hostname.
+
+_hosts_init() {
+    mkdir -p "$(dirname "$HOSTS_FILE")"
+    [[ -f "$HOSTS_FILE" ]] || echo "{}" > "$HOSTS_FILE"
+}
+
+_host_lookup() {
+    # Look up a host alias; echoes "hostname user" or empty
+    [[ -f "$HOSTS_FILE" ]] || return 0
+    local hostname user
+    hostname="$(jq -r --arg n "$1" '.[$n].hostname // empty' "$HOSTS_FILE" 2>/dev/null)"
+    user="$(jq -r --arg n "$1" '.[$n].user // ""' "$HOSTS_FILE" 2>/dev/null)"
+    if [[ -n "$hostname" ]]; then
+        echo "$hostname $user"
+    fi
+    return 0
+}
+
+_remote_exec() {
+    # Execute a cctrl command on a remote host over SSH.
+    # Usage: _remote_exec <host-alias> <args...>
+    local host_alias="$1"; shift
+    local lookup
+    lookup="$(_host_lookup "$host_alias")"
+    if [[ -z "$lookup" ]]; then
+        echo -e "${RED}Unknown host: '$host_alias'${RESET}" >&2
+        echo -e "${DIM}List hosts with: cctrl host list${RESET}" >&2
+        return 1
+    fi
+
+    local hostname user
+    hostname="${lookup%% *}"
+    user="${lookup#* }"
+
+    local ssh_target
+    if [[ -n "$user" ]]; then
+        ssh_target="${user}@${hostname}"
+    else
+        ssh_target="$hostname"
+    fi
+
+    # Decide whether to use TTY (-t) based on the command
+    local use_tty=false
+    local first_arg="${1:-}"
+    case "$first_arg" in
+        start|s)       use_tty=true ;;
+        edit)          use_tty=true ;;
+        @*)            use_tty=true ;;
+    esac
+    # Check for spawn --attach (interactive)
+    if [[ "$first_arg" == "spawn" ]]; then
+        for a in "$@"; do
+            case "$a" in
+                --attach|-a) use_tty=true; break ;;
+            esac
+        done
+    fi
+
+    # Quote each argument for safe SSH transport
+    local quoted_args=""
+    for arg in "$@"; do
+        quoted_args+=" $(printf '%q' "$arg")"
+    done
+
+    local ssh_opts=()
+    if $use_tty; then
+        ssh_opts+=("-t")
+    fi
+
+    echo -e "${DIM}ssh ${ssh_opts[*]} $ssh_target cctrl$quoted_args${RESET}" >&2
+    exec ssh "${ssh_opts[@]}" "$ssh_target" "cctrl$quoted_args"
+}
+
+cmd_host() {
+    local action="${1:-list}"
+    shift 2>/dev/null || true
+
+    case "$action" in
+        add)
+            local name="${1:-}" hostname="${2:-}" user="${3:-}"
+            if [[ -z "$name" || -z "$hostname" ]]; then
+                echo -e "${RED}Usage: cctrl host add <alias> <hostname> [user]${RESET}"
+                return 1
+            fi
+            _hosts_init
+            local tmp
+            tmp=$(mktemp)
+            jq --arg name "$name" --arg hostname "$hostname" --arg user "$user" \
+                '. + {($name): {hostname: $hostname, user: $user}}' \
+                "$HOSTS_FILE" > "$tmp" && mv "$tmp" "$HOSTS_FILE"
+            echo -e "${GREEN}Added host: ${BOLD}$name${RESET}${GREEN} → $hostname${RESET}"
+            [[ -n "$user" ]] && echo -e "${DIM}  user=$user${RESET}" || true
+            ;;
+        list|ls)
+            if [[ ! -f "$HOSTS_FILE" ]] || ! jq -e 'length > 0' "$HOSTS_FILE" &>/dev/null; then
+                echo -e "${DIM}No hosts registered.${RESET}"
+                echo -e "${DIM}Add one with: cctrl host add <alias> <hostname> [user]${RESET}"
+                return
+            fi
+            echo -e "${BOLD}Registered Hosts${RESET}"
+            local _name _hostname _user
+            while IFS= read -r _name && IFS= read -r _hostname && IFS= read -r _user; do
+                local label="$_hostname"
+                [[ -n "$_user" ]] && label="${_user}@${_hostname}"
+                echo -e "  ${GREEN}$_name${RESET}  ${DIM}→${RESET}  $label"
+            done < <(jq -r 'to_entries[] | .key, .value.hostname, (.value.user // "")' "$HOSTS_FILE" 2>/dev/null)
+            ;;
+        rm|remove|delete)
+            local name="${1:-}"
+            if [[ -z "$name" ]]; then
+                echo -e "${RED}Usage: cctrl host rm <alias>${RESET}"
+                return 1
+            fi
+            if [[ ! -f "$HOSTS_FILE" ]] || ! jq -e --arg n "$name" 'has($n)' "$HOSTS_FILE" &>/dev/null; then
+                echo -e "${RED}Host '$name' not found.${RESET}"
+                return 1
+            fi
+            local tmp
+            tmp=$(mktemp)
+            jq --arg n "$name" 'del(.[$n])' "$HOSTS_FILE" > "$tmp" && mv "$tmp" "$HOSTS_FILE"
+            echo -e "${GREEN}Removed host: $name${RESET}"
+            ;;
+        doctor)
+            local name="${1:-}"
+            if [[ -z "$name" ]]; then
+                echo -e "${RED}Usage: cctrl host doctor <alias>${RESET}"
+                return 1
+            fi
+            local lookup
+            lookup="$(_host_lookup "$name")"
+            if [[ -z "$lookup" ]]; then
+                echo -e "${RED}Host '$name' not found.${RESET}"
+                return 1
+            fi
+
+            local hostname user ssh_target
+            hostname="${lookup%% *}"
+            user="${lookup#* }"
+            if [[ -n "$user" ]]; then
+                ssh_target="${user}@${hostname}"
+            else
+                ssh_target="$hostname"
+            fi
+
+            echo -e "${BOLD}Host Doctor: $name${RESET} ($ssh_target)"
+            echo ""
+
+            local all_ok=true
+
+            # 1. SSH connectivity
+            echo -n "  SSH connectivity... "
+            if ssh -o ConnectTimeout=5 -o BatchMode=yes "$ssh_target" "echo ok" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${RED}FAIL${RESET}"
+                echo -e "    ${DIM}Cannot connect. Check SSH keys and ~/.ssh/config.${RESET}"
+                all_ok=false
+                # Can't continue if SSH fails
+                echo ""
+                echo -e "${RED}Cannot continue without SSH connectivity.${RESET}"
+                return 1
+            fi
+
+            # 2. brew in PATH
+            echo -n "  brew in PATH... "
+            if ssh "$ssh_target" "command -v brew" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                echo -n "    Fix: add brew to ~/.zprofile? [y/N] "
+                read -r confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    ssh "$ssh_target" 'echo "eval \"\$(/opt/homebrew/bin/brew shellenv)\"" >> ~/.zprofile'
+                    echo -e "    ${GREEN}Added to ~/.zprofile (reconnect to take effect)${RESET}"
+                fi
+            fi
+
+            # 3. tmux installed
+            echo -n "  tmux installed... "
+            if ssh "$ssh_target" "command -v tmux" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                echo -n "    Fix: brew install tmux? [y/N] "
+                read -r confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    ssh "$ssh_target" "brew install tmux"
+                    echo -e "    ${GREEN}Installed tmux${RESET}"
+                fi
+            fi
+
+            # 4. claude installed
+            echo -n "  claude installed... "
+            if ssh "$ssh_target" "command -v claude" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                echo -n "    Fix: brew install claude-code? [y/N] "
+                read -r confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    ssh "$ssh_target" "brew install claude-code"
+                    echo -e "    ${GREEN}Installed claude-code${RESET}"
+                fi
+            fi
+
+            # 5. cctrl available
+            echo -n "  cctrl available... "
+            if ssh "$ssh_target" "command -v cctrl" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                echo -e "    ${DIM}Fix: clone the repo and symlink cctrl into PATH${RESET}"
+                echo -e "    ${DIM}  git clone https://github.com/aberhamm/cctrl.git${RESET}"
+                echo -e "    ${DIM}  ln -s \$(pwd)/cctrl/cctrl ~/.local/bin/cctrl${RESET}"
+            fi
+
+            # 6. ~/.tmux.conf exists
+            echo -n "  ~/.tmux.conf exists... "
+            if ssh "$ssh_target" "test -f ~/.tmux.conf" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                if [[ -f "$HOME/.tmux.conf" ]]; then
+                    echo -n "    Fix: scp your local ~/.tmux.conf? [y/N] "
+                    read -r confirm
+                    if [[ "$confirm" =~ ^[yY]$ ]]; then
+                        scp "$HOME/.tmux.conf" "$ssh_target:~/.tmux.conf"
+                        echo -e "    ${GREEN}Copied ~/.tmux.conf${RESET}"
+                    fi
+                else
+                    echo -e "    ${DIM}No local ~/.tmux.conf to copy.${RESET}"
+                fi
+            fi
+
+            echo ""
+            if $all_ok; then
+                echo -e "${GREEN}All checks passed.${RESET}"
+            else
+                echo -e "${YELLOW}Some checks failed. Fix issues above for full remote support.${RESET}"
+            fi
+            ;;
+        help|-h|--help)
+            echo -e "${BOLD}cctrl host${RESET} — Manage remote hosts"
+            echo ""
+            echo "  cctrl host add <alias> <hostname> [user]"
+            echo "  cctrl host list"
+            echo "  cctrl host rm <alias>"
+            echo "  cctrl host doctor <alias>"
+            echo ""
+            echo "Use with --host flag:"
+            echo "  cctrl --host <alias> <command> [args...]"
+            ;;
+        *)
+            echo -e "${RED}Unknown host subcommand: $action${RESET}"
+            echo "Available: add, list, rm, doctor, help"
+            return 1
+            ;;
+    esac
 }
 
 # ── Shortcuts ─────────────────────────────────────────────────────────
@@ -1794,6 +2070,20 @@ _try_plugin() {
 # ── Main dispatch ─────────────────────────────────────────────────────
 
 main() {
+    # Parse --host global flag before subcommand routing
+    if [[ "${1:-}" == "--host" ]]; then
+        shift
+        local _host_alias="${1:-}"
+        if [[ -z "$_host_alias" ]]; then
+            echo -e "${RED}--host requires a host alias${RESET}" >&2
+            echo -e "${DIM}List hosts with: cctrl host list${RESET}" >&2
+            return 1
+        fi
+        shift
+        _remote_exec "$_host_alias" "$@"
+        return $?
+    fi
+
     local cmd="${1:-help}"
     shift 2>/dev/null || true
 
@@ -1807,6 +2097,7 @@ main() {
             cmd_shortcut "$name" "$@"
             ;;
         shortcuts) cmd_shortcut "$@" ;;
+        host) cmd_host "$@" ;;
         use|switch) cmd_use "$@" ;;
         ls|list) cmd_ls "$@" ;;
         current) cmd_current "$@" ;;

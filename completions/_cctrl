@@ -48,6 +48,14 @@ _cctrl_plugins() {
     (( ${#plugs} )) && compadd -X "plugins" "$@" -- "${plugs[@]}"
 }
 
+_cctrl_hosts() {
+    local file="$(_cctrl_dir)/data/hosts.json"
+    [[ -f "$file" ]] || return
+    local -a names
+    names=("${(@f)$(jq -r 'keys[]' "$file" 2>/dev/null)}")
+    (( ${#names} )) && compadd "$@" -- "${names[@]}"
+}
+
 _cctrl() {
     local -a subcmds=(
         'use:Switch to a settings profile'
@@ -62,6 +70,7 @@ _cctrl() {
         'start:Launch claude with standard flags'
         's:Launch claude with standard flags'
         'spawn:Open a new iTerm2 window and run cctrl'
+        'host:Manage remote hosts'
         'costs:Token usage and cost breakdown'
         'usage:Plan usage and billing week breakdown'
         'log:Show profile switch history'
@@ -74,6 +83,17 @@ _cctrl() {
         _describe "commands" subcmds
         _cctrl_shortcuts
         _cctrl_plugins
+        _arguments '--host[Run on a remote host]:host:_cctrl_hosts'
+        return
+    fi
+
+    # Handle --host <alias> <subcommand...>
+    if [[ "${words[2]}" == "--host" ]]; then
+        if (( CURRENT == 3 )); then
+            _cctrl_hosts
+        elif (( CURRENT == 4 )); then
+            _describe "commands" subcmds
+        fi
         return
     fi
 
@@ -184,6 +204,26 @@ _cctrl() {
             ;;
         usage)
             (( CURRENT == 3 )) && compadd -- 1 2 3 4 5 6 7 8
+            ;;
+        host)
+            if (( CURRENT == 3 )); then
+                local -a host_cmds=(
+                    'add:Register a remote host'
+                    'list:List registered hosts'
+                    'ls:List registered hosts'
+                    'rm:Remove a host'
+                    'doctor:Check remote host health'
+                    'help:Show host help'
+                )
+                _describe "host commands" host_cmds
+            elif (( CURRENT == 4 )); then
+                local hostcmd="${words[3]}"
+                case "$hostcmd" in
+                    rm|remove|delete|doctor)
+                        _cctrl_hosts
+                        ;;
+                esac
+            fi
             ;;
         chrome|cdp)
             _arguments \
