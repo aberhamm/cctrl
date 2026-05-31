@@ -662,61 +662,60 @@ cmd_start() {
 }
 
 cmd_spawn() {
-    # Open a new iTerm2 window on this Mac and launch a cctrl session in it.
-    # Designed for SSH-from-phone: the iTerm window is owned by the GUI login
-    # session (WindowServer), not the SSH pty, so it persists after disconnect.
+    # Launch a cctrl session in a detached tmux session.
+    # Designed for SSH-from-phone: the tmux session persists after disconnect.
+    # No GUI, no iTerm, no AppleScript — just tmux.
     #
     # Usage:
     #   cctrl spawn <dir>            # cctrl start in <dir>
     #   cctrl spawn @<shortcut>      # cctrl @<shortcut> (cd + profile + start)
     #   cctrl spawn ... [extras]     # extras passed through
+    #   cctrl spawn --list           # list active tmux sessions
+    #   cctrl spawn --attach <name>  # reattach to an existing session
+    #   cctrl spawn --kill <name>    # kill a tmux session
     #
     # No-arg form is intentionally NOT supported. Bypass-permissions Claude in
     # $HOME is dangerous (full read access to ~/.ssh, ~/.aws, browser data,
-    # etc.), and defaulting to $HOME would also hit the trust dialog you can't
-    # accept remotely. Pass an explicit target.
+    # etc.). Pass an explicit target.
 
     local target="" target_kind=""   # kind: dir | shortcut
     local passthrough=()
+    local attach_target="" kill_target="" list_sessions=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
                 echo "Usage: cctrl spawn <dir | @shortcut> [extra args]"
                 echo ""
-                echo "Opens a new iTerm2 window on the Mac and runs cctrl in it."
-                echo "  <dir>          cd to dir, then run 'cctrl start'"
-                echo "  @<shortcut>    run 'cctrl @<shortcut>' (uses your saved shortcut)"
+                echo "Launches a cctrl session in a detached tmux session."
+                echo "  <dir>              cd to dir, then run 'cctrl start'"
+                echo "  @<shortcut>        run 'cctrl @<shortcut>' (uses your saved shortcut)"
                 echo ""
                 echo "An explicit target is REQUIRED. Defaulting to \$HOME would drop"
                 echo "bypass-permissions Claude into a folder with ~/.ssh, ~/.aws,"
-                echo "browser data, etc. — not safe, and trust dialog blocks remote use."
+                echo "browser data, etc."
                 echo ""
-                echo "Designed for SSH-from-phone: the new iTerm window is owned by the"
-                echo "GUI login session, not the SSH pty, so it persists after disconnect."
+                echo "The tmux session persists after SSH disconnect. Reattach anytime."
                 echo ""
-                echo "Requirements:"
-                echo "  - iTerm2 installed (https://iterm2.com)"
-                echo "  - User logged into the Mac's GUI (screen may be locked, but not"
-                echo "    logged out). A rebooted Mac sitting at the login window has no"
-                echo "    GUI session, so spawn will silently fail to open a window."
-                echo "  - First-time use prompts for Automation permission (must be at"
-                echo "    the Mac to click Allow). Run 'cctrl spawn' locally once before"
-                echo "    relying on it over SSH."
-                echo "  - Target dir must have hasTrustDialogAccepted=true in"
-                echo "    ~/.claude.json. Accept it once locally before remote use."
-                echo ""
-                echo "Recommended Mac config for reliable remote use:"
-                echo "  - Enable auto-login (System Settings > Users) so the GUI session"
-                echo "    comes back automatically after reboot."
-                echo "  - Run 'caffeinate -dimsu &' (or use a launchd job) to keep the"
-                echo "    Mac awake while you're away."
+                echo "Session management:"
+                echo "  cctrl spawn --list             List active tmux sessions"
+                echo "  cctrl spawn --attach <name>    Reattach to a session"
+                echo "  cctrl spawn --kill <name>      Kill a session"
                 echo ""
                 echo "Examples:"
                 echo "  ssh mac 'cctrl spawn ~/_projects/cctrl'"
                 echo "  ssh mac 'cctrl spawn @homelab'"
                 echo "  ssh mac 'cctrl spawn @cctrl --resume'"
+                echo "  cctrl spawn --attach homelab   # reattach later"
                 return 0
                 ;;
+            --list|--ls|-l)
+                list_sessions=true; shift ;;
+            --attach|-a)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--attach needs a session name${RESET}"; return 1; }
+                attach_target="$2"; shift 2 ;;
+            --kill|-K)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--kill needs a session name${RESET}"; return 1; }
+                kill_target="$2"; shift 2 ;;
             --)
                 shift
                 passthrough+=("$@")
@@ -747,19 +746,50 @@ cmd_spawn() {
         esac
     done
 
+    if ! command -v tmux &>/dev/null; then
+        echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
+        return 1
+    fi
+
+    # Session management subcommands
+    if $list_sessions; then
+        if tmux list-sessions 2>/dev/null; then
+            return 0
+        else
+            echo -e "${DIM}No active tmux sessions.${RESET}"
+            return 0
+        fi
+    fi
+
+    if [[ -n "$attach_target" ]]; then
+        if tmux has-session -t "$attach_target" 2>/dev/null; then
+            exec tmux attach-session -t "$attach_target"
+        else
+            echo -e "${RED}No tmux session named '$attach_target'.${RESET}" >&2
+            tmux list-sessions 2>/dev/null || echo -e "${DIM}No active sessions.${RESET}"
+            return 1
+        fi
+    fi
+
+    if [[ -n "$kill_target" ]]; then
+        if tmux has-session -t "$kill_target" 2>/dev/null; then
+            tmux kill-session -t "$kill_target"
+            echo -e "${GREEN}Killed session: $kill_target${RESET}"
+        else
+            echo -e "${RED}No tmux session named '$kill_target'.${RESET}" >&2
+        fi
+        return 0
+    fi
+
+    # Spawn a new session
     if [[ -z "$target" ]]; then
         echo -e "${RED}cctrl spawn requires a target.${RESET}" >&2
         echo "Usage: cctrl spawn <dir | @shortcut> [extra args]" >&2
-        echo -e "${DIM}Run 'cctrl spawn --help' for why no-arg is disallowed.${RESET}" >&2
+        echo -e "${DIM}Run 'cctrl spawn --help' for details.${RESET}" >&2
         return 1
     fi
 
-    if ! /usr/bin/osascript -e 'id of application id "com.googlecode.iterm2"' &>/dev/null; then
-        echo -e "${RED}iTerm2 not found.${RESET} Install from https://iterm2.com" >&2
-        return 1
-    fi
-
-    local cctrl_q extras_q="" shell_cmd display_label
+    local cctrl_q extras_q="" shell_cmd session_name display_label
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
     if [[ ${#passthrough[@]} -gt 0 ]]; then
         for a in "${passthrough[@]}"; do
@@ -778,6 +808,7 @@ cmd_spawn() {
         local name_q
         name_q="$(printf '%q' "$canonical")"
         shell_cmd="$cctrl_q @$name_q$extras_q"
+        session_name="$canonical"
         display_label="@$canonical"
     else
         local dir="$target"
@@ -790,25 +821,28 @@ cmd_spawn() {
         local dir_q
         dir_q="$(printf '%q' "$dir")"
         shell_cmd="cd $dir_q && $cctrl_q start$extras_q"
+        session_name="$(basename "$dir")"
         display_label="$dir"
     fi
 
-    # AppleScript-escape backslashes and double-quotes for the "write text" arg
-    local osa_cmd="${shell_cmd//\\/\\\\}"
-    osa_cmd="${osa_cmd//\"/\\\"}"
+    # Sanitize session name (tmux doesn't allow dots or colons)
+    session_name="${session_name//./-}"
+    session_name="${session_name//:/-}"
 
-    /usr/bin/osascript <<EOF
-tell application id "com.googlecode.iterm2"
-    activate
-    set newWindow to (create window with default profile)
-    tell current session of newWindow
-        write text "$osa_cmd"
-    end tell
-end tell
-EOF
+    # If session already exists, offer to attach
+    if tmux has-session -t "$session_name" 2>/dev/null; then
+        echo -e "${YELLOW}Session '$session_name' already exists.${RESET}"
+        echo -e "  Attach:  ${BOLD}cctrl spawn --attach $session_name${RESET}"
+        echo -e "  Kill:    ${BOLD}cctrl spawn --kill $session_name${RESET}"
+        return 1
+    fi
 
-    echo -e "${GREEN}✓${RESET} iTerm2 window launched — ${BOLD}$display_label${RESET}"
-    echo -e "${DIM}Safe to disconnect SSH; the window is owned by the GUI session.${RESET}"
+    tmux new-session -d -s "$session_name" "$shell_cmd"
+
+    echo -e "${GREEN}✓${RESET} tmux session started — ${BOLD}$display_label${RESET}"
+    echo -e "${DIM}  Attach:  cctrl spawn --attach $session_name${RESET}"
+    echo -e "${DIM}  List:    cctrl spawn --list${RESET}"
+    echo -e "${DIM}  Kill:    cctrl spawn --kill $session_name${RESET}"
 }
 
 cmd_usage() {
@@ -1195,10 +1229,11 @@ cmd_help() {
     echo "    --resume, -r [id]     Resume a session (interactive picker or by session ID)"
     echo "    --no-remote-control   Disable the default --remote-control bridge"
     echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
-    echo "  cctrl spawn <dir|@name> Open a new iTerm2 window on this Mac and run cctrl"
-    echo "                          For SSH-from-phone: window is owned by the GUI session,"
-    echo "                          so it survives SSH disconnect"
-    echo "                          Requires an explicit dir or shortcut (no \$HOME default)"
+    echo "  cctrl spawn <dir|@name> Launch cctrl in a detached tmux session"
+    echo "                          Survives SSH disconnect; reattach anytime"
+    echo "  cctrl spawn --list      List active tmux sessions"
+    echo "  cctrl spawn --attach N  Reattach to a session"
+    echo "  cctrl spawn --kill N    Kill a session"
     echo ""
     echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
     echo "  cctrl @<name>           Jump: cd to dir, switch profile, start claude (with optional resume + initial prompt)"

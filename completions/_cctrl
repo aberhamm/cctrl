@@ -144,6 +144,14 @@ _cctrl() {
             if (( CURRENT == 3 )); then
                 _directories
                 _cctrl_shortcuts
+                _arguments \
+                    {--list,--ls,-l}'[List active tmux sessions]' \
+                    {--attach,-a}'[Reattach to a session]:session:->tmux_sessions' \
+                    {--kill,-K}'[Kill a tmux session]:session:->tmux_sessions'
+            elif [[ "${words[3]}" == --attach || "${words[3]}" == -a || "${words[3]}" == --kill || "${words[3]}" == -K ]]; then
+                local -a sessions
+                sessions=("${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null)}")
+                (( ${#sessions} )) && compadd "$@" -- "${sessions[@]}"
             else
                 _arguments \
                     {--resume,-r}'[Resume a session]' \

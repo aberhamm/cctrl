@@ -68,22 +68,24 @@ cctrl @rm myapp
 ### Spawn (remote launch over SSH)
 
 ```bash
-cctrl spawn                       # launch in $HOME
-cctrl spawn ~/_projects/myapp     # launch in a specific directory
+cctrl spawn ~/_projects/myapp     # launch in a detached tmux session
 cctrl spawn @myapp                # use a saved shortcut
+cctrl spawn --list                # list active sessions
+cctrl spawn --attach myapp        # reattach to a session
+cctrl spawn --kill myapp          # kill a session
 ```
 
-Opens a **new iTerm2 window on the Mac's GUI session** and runs `cctrl start` inside it. The window is owned by WindowServer, not the SSH shell — so it persists after you disconnect. Built for the case where you're away from home with a phone-side SSH client and want to start a Claude Code session that's waiting on screen when you get back.
+Launches a cctrl session inside a detached **tmux** session. The session persists after SSH disconnect — reattach anytime from any terminal. No GUI, no iTerm2, no AppleScript required.
 
-**Requirements:**
-- iTerm2 installed
-- User logged into the Mac GUI (screen can be locked, but not logged out — a rebooted Mac at the login window has no GUI session, so `spawn` silently fails)
-- First-time use prompts for macOS Automation permission — run `cctrl spawn` locally once before relying on it remotely
+```bash
+# From your phone over SSH:
+ssh mac 'cctrl spawn @homelab'
 
-**Recommended Mac config for reliable remote use:**
-- Enable auto-login (System Settings → Users & Groups) so the GUI session comes back after reboot or power loss
-- Run `caffeinate -dimsu &` (or a launchd job) to keep the Mac awake while you're away
-- Set iTerm's "When the session ends" to "No action" if you want the window to stay after claude exits
+# Later, from any terminal:
+cctrl spawn --attach homelab
+```
+
+**Requires:** tmux (`brew install tmux`)
 
 ## Usage & cost tracking
 
