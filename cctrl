@@ -1518,8 +1518,8 @@ _remote_exec() {
         ssh_opts+=("-t")
     fi
 
-    echo -e "${DIM}ssh ${ssh_opts[*]} $ssh_target cctrl$quoted_args${RESET}" >&2
-    exec ssh "${ssh_opts[@]}" "$ssh_target" "cctrl$quoted_args"
+    echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
+    exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "cctrl$quoted_args"
 }
 
 cmd_host() {
