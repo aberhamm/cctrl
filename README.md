@@ -15,16 +15,16 @@ A CLI for managing [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 ## Install
 
 ```bash
-git clone https://github.com/aberhamm/cctrl.git
-ln -s "$(pwd)/cctrl/cctrl" ~/.local/bin/cctrl
+curl -fsSL https://raw.githubusercontent.com/aberhamm/cctrl/main/install.sh | bash
 ```
 
-Optional: add zsh completions:
+This clones the repo, symlinks the binary to `~/.local/bin`, adds it to your PATH, and sets up zsh completions. Re-run to update.
+
+Or manually:
 
 ```bash
-# Add to your .zshrc (adjust path as needed)
-fpath=(~/path/to/cctrl/completions $fpath)
-autoload -Uz compinit && compinit
+git clone https://github.com/aberhamm/cctrl.git ~/.local/share/cctrl
+ln -s ~/.local/share/cctrl/cctrl ~/.local/bin/cctrl
 ```
 
 ## Profiles
