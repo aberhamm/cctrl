@@ -1499,12 +1499,19 @@ _remote_exec() {
         @*)            use_tty=true ;;
     esac
     # Check for spawn --attach (interactive)
+    local spawn_and_attach=false
     if [[ "$first_arg" == "spawn" ]]; then
+        local has_management_flag=false
         for a in "$@"; do
             case "$a" in
-                --attach|-a) use_tty=true; break ;;
+                --attach|-a) use_tty=true; has_management_flag=true; break ;;
+                --list|--ls|-l|--kill|-K) has_management_flag=true; break ;;
             esac
         done
+        # spawn @foo or spawn <dir> — create session then auto-attach
+        if ! $has_management_flag; then
+            spawn_and_attach=true
+        fi
     fi
 
     # Quote each argument for safe SSH transport
@@ -1516,6 +1523,18 @@ _remote_exec() {
     local ssh_opts=()
     if $use_tty; then
         ssh_opts+=("-t")
+    fi
+
+    if $spawn_and_attach; then
+        # Spawn detached, then attach with TTY
+        ssh "$ssh_target" "source ~/.zprofile 2>/dev/null; cctrl$quoted_args"
+        # The session name is the slug of the target (shortcut name or dir basename)
+        local spawn_target="${2:-}"
+        spawn_target="${spawn_target#@}"
+        local session_slug
+        session_slug="$(_session_slug "$spawn_target")"
+        echo -e "${DIM}Attaching to remote session...${RESET}" >&2
+        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t \$(tmux list-sessions -F '#{session_name}' | grep '^${session_slug}' | tail -1)"
     fi
 
     echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
