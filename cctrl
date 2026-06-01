@@ -729,8 +729,12 @@ cmd_spawn() {
             --list|--ls|-l)
                 list_sessions=true; shift ;;
             --attach|-a)
-                [[ $# -ge 2 ]] || { echo -e "${RED}--attach needs a session name${RESET}"; return 1; }
-                attach_target="$2"; shift 2 ;;
+                if [[ $# -ge 2 && "$2" != -* ]]; then
+                    attach_target="$2"; shift 2
+                else
+                    attach_target="__picker__"; shift
+                fi
+                ;;
             --kill|-K)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--kill needs a session name${RESET}"; return 1; }
                 kill_target="$2"; shift 2 ;;
@@ -780,11 +784,68 @@ cmd_spawn() {
     fi
 
     if [[ -n "$attach_target" ]]; then
+        local -a sessions=()
+        while IFS= read -r s; do
+            [[ -n "$s" ]] && sessions+=("$s")
+        done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+        if [[ ${#sessions[@]} -eq 0 ]]; then
+            echo -e "${DIM}No active tmux sessions.${RESET}"
+            return 1
+        fi
+
+        # Picker mode (no argument) or partial match
+        if [[ "$attach_target" == "__picker__" ]]; then
+            # Show all sessions
+            if [[ ${#sessions[@]} -eq 1 ]]; then
+                exec tmux attach-session -t "${sessions[0]}"
+            fi
+            echo -e "${BOLD}Active sessions:${RESET}"
+            local i=1
+            for s in "${sessions[@]}"; do
+                echo -e "  ${GREEN}[$i]${RESET} $s"
+                ((i++))
+            done
+            echo
+            echo -n "Attach to: "
+            read -r choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
+                exec tmux attach-session -t "${sessions[$((choice-1))]}"
+            fi
+            return 1
+        fi
+
+        # Exact match
         if tmux has-session -t "$attach_target" 2>/dev/null; then
             exec tmux attach-session -t "$attach_target"
+        fi
+
+        # Partial match — filter sessions containing the target
+        local -a matches=()
+        for s in "${sessions[@]}"; do
+            [[ "$s" == *"$attach_target"* ]] && matches+=("$s")
+        done
+
+        if [[ ${#matches[@]} -eq 0 ]]; then
+            echo -e "${RED}No session matching '$attach_target'.${RESET}" >&2
+            echo -e "${BOLD}Active sessions:${RESET}"
+            for s in "${sessions[@]}"; do echo "  $s"; done
+            return 1
+        elif [[ ${#matches[@]} -eq 1 ]]; then
+            exec tmux attach-session -t "${matches[0]}"
         else
-            echo -e "${RED}No tmux session named '$attach_target'.${RESET}" >&2
-            tmux list-sessions 2>/dev/null || echo -e "${DIM}No active sessions.${RESET}"
+            echo -e "${BOLD}Multiple sessions matching '$attach_target':${RESET}"
+            local i=1
+            for s in "${matches[@]}"; do
+                echo -e "  ${GREEN}[$i]${RESET} $s"
+                ((i++))
+            done
+            echo
+            echo -n "Attach to: "
+            read -r choice
+            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
+                exec tmux attach-session -t "${matches[$((choice-1))]}"
+            fi
             return 1
         fi
     fi
