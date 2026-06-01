@@ -72,7 +72,11 @@ _session_slug() {
     fi
     name="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
     [[ -z "$name" ]] && name="claude"
-    printf '%s' "$name"
+    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
+        printf '%s--%s' "$CCTRL_HOST_PREFIX" "$name"
+    else
+        printf '%s' "$name"
+    fi
 }
 
 _remote_prefix() {
@@ -1525,20 +1529,21 @@ _remote_exec() {
         ssh_opts+=("-t")
     fi
 
+    local env_prefix="CCTRL_HOST_PREFIX=$host_alias"
+
     if $spawn_and_attach; then
         # Spawn detached, then attach with TTY
-        ssh "$ssh_target" "source ~/.zprofile 2>/dev/null; cctrl$quoted_args"
+        ssh "$ssh_target" "source ~/.zprofile 2>/dev/null; $env_prefix cctrl$quoted_args"
         # The session name is the slug of the target (shortcut name or dir basename)
         local spawn_target="${2:-}"
         spawn_target="${spawn_target#@}"
-        local session_slug
-        session_slug="$(_session_slug "$spawn_target")"
+        local session_slug="${host_alias}--$(_session_slug "$spawn_target")"
         echo -e "${DIM}Attaching to remote session...${RESET}" >&2
         exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t \$(tmux list-sessions -F '#{session_name}' | grep '^${session_slug}' | tail -1)"
     fi
 
     echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
-    exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "source ~/.zprofile 2>/dev/null; cctrl$quoted_args"
+    exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "source ~/.zprofile 2>/dev/null; $env_prefix cctrl$quoted_args"
 }
 
 cmd_host() {
