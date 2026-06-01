@@ -834,10 +834,10 @@ cmd_spawn() {
     local base_name="$session_name"
     if tmux has-session -t "$session_name" 2>/dev/null; then
         local n=2
-        while tmux has-session -t "${base_name}-${n}" 2>/dev/null; do
+        while tmux has-session -t "${base_name}--${n}" 2>/dev/null; do
             ((n++))
         done
-        session_name="${base_name}-${n}"
+        session_name="${base_name}--${n}"
     fi
 
     tmux new-session -d -s "$session_name" "$shell_cmd"
