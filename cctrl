@@ -55,16 +55,29 @@ _log_switch() {
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2")"
 }
 
-_remote_prefix() {
-    # Short, safe prefix for --remote-control session naming.
-    # Prefers git repo root basename, falls back to the given directory.
-    local dir="${1:-$PWD}"
-    local root
-    root="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null || echo "$dir")"
+_session_slug() {
+    # Canonical slug for a directory or shortcut name. Used by both tmux
+    # session naming and Remote Control prefix. Single source of truth.
+    # Usage: _session_slug <name_or_dir>
+    #   _session_slug homelab        → "homelab"
+    #   _session_slug ~/projects/foo → "foo" (git root basename)
+    local input="${1:-$PWD}"
     local name
-    name="$(basename "$root" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+    if [[ -d "$input" ]]; then
+        local root
+        root="$(git -C "$input" rev-parse --show-toplevel 2>/dev/null || echo "$input")"
+        name="$(basename "$root")"
+    else
+        name="$input"
+    fi
+    name="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
     [[ -z "$name" ]] && name="claude"
-    printf '%s-' "$name"
+    printf '%s' "$name"
+}
+
+_remote_prefix() {
+    # Trailing dash so Claude appends --adjective-noun (double-dash separator).
+    printf '%s-' "$(_session_slug "${1:-$PWD}")"
 }
 
 _detect_active() {
@@ -809,7 +822,7 @@ cmd_spawn() {
         local name_q
         name_q="$(printf '%q' "$canonical")"
         shell_cmd="$cctrl_q @$name_q$extras_q"
-        session_name="$canonical"
+        session_name="$(_session_slug "$canonical")"
         display_label="@$canonical"
     else
         local dir="$target"
@@ -822,13 +835,9 @@ cmd_spawn() {
         local dir_q
         dir_q="$(printf '%q' "$dir")"
         shell_cmd="cd $dir_q && $cctrl_q start$extras_q"
-        session_name="$(basename "$dir")"
+        session_name="$(_session_slug "$dir")"
         display_label="$dir"
     fi
-
-    # Sanitize session name (tmux doesn't allow dots or colons)
-    session_name="${session_name//./-}"
-    session_name="${session_name//:/-}"
 
     # Auto-increment if session name already exists (homelab, homelab-2, homelab-3, ...)
     local base_name="$session_name"
