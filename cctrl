@@ -830,12 +830,14 @@ cmd_spawn() {
     session_name="${session_name//./-}"
     session_name="${session_name//:/-}"
 
-    # If session already exists, offer to attach
+    # Auto-increment if session name already exists (homelab, homelab-2, homelab-3, ...)
+    local base_name="$session_name"
     if tmux has-session -t "$session_name" 2>/dev/null; then
-        echo -e "${YELLOW}Session '$session_name' already exists.${RESET}"
-        echo -e "  Attach:  ${BOLD}cctrl spawn --attach $session_name${RESET}"
-        echo -e "  Kill:    ${BOLD}cctrl spawn --kill $session_name${RESET}"
-        return 1
+        local n=2
+        while tmux has-session -t "${base_name}-${n}" 2>/dev/null; do
+            ((n++))
+        done
+        session_name="${base_name}-${n}"
     fi
 
     tmux new-session -d -s "$session_name" "$shell_cmd"
