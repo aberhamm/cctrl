@@ -12,12 +12,6 @@ needs-review: none
 created: 2026-05-31
 ---
 
-> **API update (2026-06-02):** The session API was later redesigned. The
-> `spawn` command was removed and folded into `start -d` (detached launch),
-> with session management moved under `cctrl session ls|attach|kill`. Examples
-> below have been updated to the current syntax; the `--host` proxy design
-> this plan delivered is unchanged.
-
 ## Requirements
 
 When running cctrl from the MacBook, users need to execute commands on remote

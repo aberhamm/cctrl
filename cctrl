@@ -57,7 +57,7 @@ _log_switch() {
 
 _session_slug() {
     # Canonical slug for a directory or shortcut name. Used by both tmux
-    # session naming and Remote Control prefix. Single source of truth.
+    # session naming and the bridge session-name prefix. Single source of truth.
     # Usage: _session_slug <name_or_dir>
     #   _session_slug homelab        → "homelab"
     #   _session_slug ~/projects/foo → "foo" (git root basename)
@@ -620,11 +620,6 @@ with open('$SPENDING_LOG', 'w') as f:
     echo -e "${GREEN}Renamed: ${BOLD}$old${RESET}${GREEN} -> ${BOLD}$new${RESET}"
 }
 
-_err_bridge_renamed() {
-    echo -e "${RED}--no-remote-control / --no-remote were renamed to --no-bridge.${RESET}" >&2
-    echo -e "${DIM}The phone-control 'bridge' is on by default; disable it with --no-bridge.${RESET}" >&2
-}
-
 cmd_start() {
     # Unified launch verb. Foreground in the current dir by default; -d/--detach
     # runs the session in a persistent tmux session that survives SSH disconnect.
@@ -635,8 +630,7 @@ cmd_start() {
     for arg in "$@"; do
         [[ "$arg" == "--" ]] && break   # rest is a literal prompt; stop scanning
         case "$arg" in
-            -d|--detach) detach=true ;;
-            --no-remote-control|--no-remote) _err_bridge_renamed; return 1 ;;
+            -d|--detach) detach=true; break ;;
         esac
     done
 
@@ -721,12 +715,6 @@ _launch_detached() {
         case "$1" in
             -d|--detach)
                 shift ;;
-            --list|--ls|-l|--attach|-a|--kill|-K)
-                echo -e "${RED}Session management moved to 'cctrl session'.${RESET}" >&2
-                echo -e "${DIM}  cctrl session ls            List detached sessions${RESET}" >&2
-                echo -e "${DIM}  cctrl session attach [name] Reattach to a session${RESET}" >&2
-                echo -e "${DIM}  cctrl session kill <name>   Kill a session${RESET}" >&2
-                return 1 ;;
             --)
                 shift
                 passthrough+=("$@")
@@ -828,7 +816,7 @@ _launch_detached() {
     echo -e "${DIM}  List:    cctrl session ls${RESET}"
     echo -e "${DIM}  Kill:    cctrl session kill $session_name${RESET}"
 
-    # Machine-readable line so remote spawns can attach to the exact session
+    # Machine-readable line so a remote launch can attach to the exact session
     # name (including any auto-increment suffix). See _remote_exec.
     if [[ -n "${CCTRL_EMIT_SESSION:-}" ]]; then
         printf 'CCTRL_SESSION=%s\n' "$session_name"
@@ -1601,7 +1589,7 @@ _remote_exec() {
 
     # Decide TTY (-t) and auto-attach behavior based on the command.
     local use_tty=false
-    local spawn_and_attach=false
+    local detach_and_attach=false
     local first_arg="${1:-}"
     case "$first_arg" in
         edit) use_tty=true ;;
@@ -1613,7 +1601,7 @@ _remote_exec() {
             esac
             ;;
         start|s)
-            # Detached start (-d) spawns on the remote, then auto-attaches over
+            # Detached start (-d) launches on the remote, then auto-attaches over
             # a second connection. Foreground start is plain interactive.
             local is_detach=false
             for a in "$@"; do
@@ -1623,7 +1611,7 @@ _remote_exec() {
                 esac
             done
             if $is_detach; then
-                spawn_and_attach=true
+                detach_and_attach=true
             else
                 use_tty=true
             fi
@@ -1643,8 +1631,8 @@ _remote_exec() {
 
     local env_prefix="CCTRL_HOST_PREFIX=$host_alias"
 
-    if $spawn_and_attach; then
-        # Spawn detached on the remote, capture the resolved session name, then
+    if $detach_and_attach; then
+        # Launch detached on the remote, capture the resolved session name, then
         # attach to that exact session over a TTY connection. Capturing the
         # name (rather than reconstructing the slug) handles auto-increment
         # suffixes and git-root basenames without guessing.
@@ -2145,8 +2133,6 @@ _shortcut_jump() {
                 cli_prompt="$2"; cli_prompt_set=true; shift 2 ;;
             --no-bridge)
                 no_bridge=true; shift ;;
-            --no-remote-control|--no-remote)
-                _err_bridge_renamed; return 1 ;;
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
                 passthrough+=("--name" "$2"); shift 2 ;;
@@ -2272,12 +2258,6 @@ main() {
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
         session|sess) cmd_session "$@" ;;
-        spawn)
-            echo -e "${RED}'cctrl spawn' was removed.${RESET}" >&2
-            echo -e "${DIM}  Launch detached:  cctrl start -d <dir | @shortcut>${RESET}" >&2
-            echo -e "${DIM}  Manage sessions:  cctrl session ls | attach | kill${RESET}" >&2
-            return 1
-            ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         log)     cmd_log "$@" ;;

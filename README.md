@@ -6,7 +6,7 @@ A CLI for managing [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 
 - **Profile switching** — swap between settings configs (API keys, models, hooks, permissions) with one command
 - **Session launching** — start Claude Code with consistent flags, resume previous sessions, jump into projects via named shortcuts, or run detached so it survives SSH disconnect
-- **Remote hosts** — run any cctrl command on another machine over SSH; spawn a detached session on your Mac from your phone and auto-attach
+- **Remote hosts** — run any cctrl command on another machine over SSH; start a detached session on your Mac from your phone and auto-attach
 - **Usage & cost tracking** — token spend by model/project/day, rate limit monitoring, billing week breakdowns
 - **Port management** — track port history, find free ports, kill processes by port, discover ports from project files
 - **Chrome CDP** — launch Chrome with remote debugging for browser automation workflows
@@ -64,7 +64,7 @@ cctrl start --no-bridge           # launch without the phone-control bridge
 
 ### Detached sessions
 
-Add `-d` to run inside a detached **tmux** session that persists after SSH disconnect — reattach anytime from any terminal. No GUI, no iTerm2, no AppleScript. A detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop bypass-permissions Claude into `~/.ssh`, `~/.aws`, etc.
+Add `-d` to run inside a detached **tmux** session that persists after SSH disconnect — reattach anytime from any terminal. No GUI required — just tmux. A detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop bypass-permissions Claude into `~/.ssh`, `~/.aws`, etc.
 
 ```bash
 cctrl start -d ~/_projects/myapp  # launch detached in a directory
@@ -106,13 +106,13 @@ cctrl host doctor studio                   # check SSH, brew, tmux, claude, cctr
 `--host` is orthogonal — it forwards *any* command, so the three axes compose. `--host` says **where**, `-d` says **durable**:
 
 ```bash
-cctrl --host studio start -d @homelab        # spawn a detached session there, then auto-attach
+cctrl --host studio start -d @homelab        # start a detached session there, then auto-attach
 cctrl --host studio session ls               # list remote detached sessions
 cctrl --host studio session attach homelab   # attach interactively (TTY)
 cctrl --host studio costs --week             # view remote cost data
 ```
 
-`cctrl --host studio start -d @homelab` is the "spawn on my Mac from my phone" workflow: it SSHes in, starts the detached session, then attaches to that exact session over a second connection. The remote prints its resolved session name so the attach targets the right one even with auto-increment suffixes.
+`cctrl --host studio start -d @homelab` is the "start a session on my Mac from my phone" workflow: it SSHes in, starts the detached session, then attaches to that exact session over a second connection. The remote prints its resolved session name so the attach targets the right one even with auto-increment suffixes.
 
 **TTY handling:** Interactive commands (`start` foreground, `start -d` auto-attach, `@shortcut`, `session attach`, `edit`) use `ssh -t`. Non-interactive commands (`session ls`, `costs`, `usage`, `ls`) use plain `ssh`.
 
