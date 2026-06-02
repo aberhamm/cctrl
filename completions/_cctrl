@@ -71,7 +71,7 @@ _cctrl() {
         'edit:Open a profile in \$EDITOR'
         'start:Launch claude (foreground, or -d for a detached session)'
         's:Launch claude (foreground, or -d for a detached session)'
-        'session:Manage detached sessions (ls/summary/attach/kill)'
+        'session:Manage detached sessions (ls/attach/kill)'
         'host:Manage remote hosts'
         'whoami:Show this machine and which host aliases mean local'
         'costs:Token usage and cost breakdown'
@@ -168,16 +168,14 @@ _cctrl() {
             if (( CURRENT == 3 )); then
                 local -a session_cmds=(
                     'ls:List sessions (dir, claude/shell, model, state)'
-                    'summary:Haiku summary of a session (or all)'
                     'attach:Reattach to a session'
                     'kill:Kill a detached session'
                 )
                 _describe "session commands" session_cmds
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == ls ]]; then
                 _arguments \
-                    '--json[Machine-readable output]' \
-                    {--summary,-s}'[Add a one-line Haiku summary per session]'
-            elif (( CURRENT == 4 )) && [[ "${words[3]}" == (summary|attach|a|kill|k|rm) ]]; then
+                    '--json[Machine-readable output]'
+            elif (( CURRENT == 4 )) && [[ "${words[3]}" == (attach|a|kill|k|rm) ]]; then
                 local -a sessions
                 sessions=("${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null)}")
                 (( ${#sessions} )) && compadd "$@" -- "${sessions[@]}"

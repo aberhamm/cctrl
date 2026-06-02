@@ -831,12 +831,10 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | summary | attach | kill>"
+            echo "Usage: cctrl session <ls | attach | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, claude/shell, model, state)"
             echo "    --json                       Machine-readable output"
-            echo "    --summary, -s                Add a one-line Haiku summary per session"
-            echo "  cctrl session summary [name]   Haiku summary of one session (or all)"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session kill <name>      Kill a session"
             echo ""
@@ -844,18 +842,6 @@ cmd_session() {
             return 0
             ;;
         ls|list)   _session_list "$@" ;;
-        summary)
-            if [[ -n "${1:-}" ]]; then
-                if tmux has-session -t "$1" 2>/dev/null; then
-                    echo -e "${BOLD}$1${RESET}  ${DIM}↳ $(_session_summary "$1")${RESET}"
-                else
-                    echo -e "${RED}No session named '$1'.${RESET}" >&2
-                    return 1
-                fi
-            else
-                _session_list --summary
-            fi
-            ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
         *)
@@ -889,24 +875,12 @@ _session_claude_cmd() {
     printf '%s' "$cmd"
 }
 
-_session_summary() {
-    # One-line Haiku summary of a session's recent pane output. Best-effort;
-    # uses an empty MCP config so it starts fast and loads no servers.
-    local sess="$1" text out
-    command -v claude &>/dev/null || { echo "(claude not available)"; return 0; }
-    text="$(tmux capture-pane -t "$sess" -p -S -160 2>/dev/null | sed 's/[[:cntrl:]]//g' | grep -v '^[[:space:]]*$' | tail -120)"
-    if [[ -z "${text// /}" ]]; then echo "(no visible output)"; return 0; fi
-    out="$(printf '%s\n' "$text" | claude --model claude-haiku-4-5 --mcp-config '{"mcpServers":{}}' -p 'This is the recent visible output of a terminal / Claude Code session. In ONE short sentence (max ~15 words), say what it is currently working on or showing. Output only the sentence, no preamble.' 2>/dev/null | tr -d '\r' | grep -v '^[[:space:]]*$' | head -1)"
-    [[ -n "$out" ]] && printf '%s' "$out" || echo "(summary unavailable)"
-}
-
 _session_list() {
     _session_require_tmux || return 1
-    local json=false summary=false a
+    local json=false a
     for a in "$@"; do
         case "$a" in
-            --json)        json=true ;;
-            --summary|-s)  summary=true ;;
+            --json) json=true ;;
         esac
     done
 
@@ -920,21 +894,9 @@ _session_list() {
         return 0
     fi
 
-    # Haiku summaries are ~10s each — compute them in parallel up front.
-    local tmpd="" idx=0
-    if $summary; then
-        tmpd="$(mktemp -d)"
-        for a in "${names[@]}"; do
-            ( _session_summary "$a" > "$tmpd/$idx" 2>/dev/null ) &
-            ((idx++))
-        done
-        wait
-    fi
-
     local -a json_items=()
-    $json || $summary || echo -e "${DIM}✦ = cctrl-managed Claude session${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir summ base
-    idx=0
+    $json || echo -e "${DIM}✦ = cctrl-managed Claude session${RESET}"
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
@@ -955,30 +917,18 @@ _session_list() {
         disp_dir="${dir/#$HOME/~}"
 
         if $json; then
-            local jobj
-            jobj="$(jq -n \
+            json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached")}')"
-            if $summary; then
-                summ="$(cat "$tmpd/$idx" 2>/dev/null)"
-                jobj="$(printf '%s' "$jobj" | jq --arg s "$summ" '. + {summary:$s}')"
-            fi
-            json_items+=("$jobj")
+                '{name:$name, managed:$managed, claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached")}')")
         else
             $managed && marker="✦" || marker=" "
             printf '%s %-15s %-18s %-34s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state"
-            if $summary; then
-                summ="$(cat "$tmpd/$idx" 2>/dev/null)"
-                echo -e "    ${DIM}↳ ${summ}${RESET}"
-            fi
         fi
-        ((idx++))
     done
 
     $json && printf '%s\n' "${json_items[@]}" | jq -s '.'
-    [[ -n "$tmpd" ]] && rm -rf "$tmpd"
     return 0
 }
 
@@ -1456,8 +1406,6 @@ cmd_help() {
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
     echo ""
     echo "  cctrl session ls            List sessions (dir, claude/shell, model, state; --json)"
-    echo "  cctrl session ls --summary  ...with a one-line Haiku summary per session"
-    echo "  cctrl session summary [name] Haiku summary of one session (or all)"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
     echo "  cctrl session kill <name>   Kill a detached session"
     echo ""
