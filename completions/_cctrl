@@ -67,9 +67,9 @@ _cctrl() {
         'diff:Diff current settings vs a profile'
         'rename:Rename a profile'
         'edit:Open a profile in \$EDITOR'
-        'start:Launch claude with standard flags'
-        's:Launch claude with standard flags'
-        'spawn:Open a new iTerm2 window and run cctrl'
+        'start:Launch claude (foreground, or -d for a detached session)'
+        's:Launch claude (foreground, or -d for a detached session)'
+        'session:Manage detached sessions (ls/attach/kill)'
         'host:Manage remote hosts'
         'costs:Token usage and cost breakdown'
         'usage:Plan usage and billing week breakdown'
@@ -137,8 +137,7 @@ _cctrl() {
             fi
             _arguments \
                 '--resume[Resume a session]' \
-                '--no-remote-control[Disable Remote Control]' \
-                '--no-remote[Disable Remote Control]' \
+                '--no-bridge[Disable the phone-control bridge]' \
                 {-m,--message,--prompt}'[Initial prompt]:message:' \
                 '--[Everything after is the prompt]'
             ;;
@@ -152,31 +151,28 @@ _cctrl() {
             ;; # name is freeform
         start|s)
             _arguments \
+                {--detach,-d}'[Run in a detached tmux session]' \
                 {--resume,-r}'[Resume a session]' \
-                '--no-remote-control[Disable Remote Control]' \
-                '--no-remote[Disable Remote Control]'
-            # Also allow @shortcut as first arg to start
+                {--name,-n}'[Session display name]:name:' \
+                '--no-bridge[Disable the phone-control bridge]'
+            # Allow @shortcut or a directory as the target
             if (( CURRENT == 3 )); then
                 _cctrl_shortcuts
+                _directories
             fi
             ;;
-        spawn)
+        session|sess)
             if (( CURRENT == 3 )); then
-                _directories
-                _cctrl_shortcuts
-                _arguments \
-                    {--list,--ls,-l}'[List active tmux sessions]' \
-                    {--attach,-a}'[Reattach to a session]:session:->tmux_sessions' \
-                    {--kill,-K}'[Kill a tmux session]:session:->tmux_sessions'
-            elif [[ "${words[3]}" == --attach || "${words[3]}" == -a || "${words[3]}" == --kill || "${words[3]}" == -K ]]; then
+                local -a session_cmds=(
+                    'ls:List detached sessions'
+                    'attach:Reattach to a session'
+                    'kill:Kill a detached session'
+                )
+                _describe "session commands" session_cmds
+            elif (( CURRENT == 4 )) && [[ "${words[3]}" == (attach|a|kill|k|rm) ]]; then
                 local -a sessions
                 sessions=("${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null)}")
                 (( ${#sessions} )) && compadd "$@" -- "${sessions[@]}"
-            else
-                _arguments \
-                    {--resume,-r}'[Resume a session]' \
-                    '--no-remote-control[Disable Remote Control]' \
-                    '--no-remote[Disable Remote Control]'
             fi
             ;;
         shortcuts)

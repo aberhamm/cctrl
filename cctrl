@@ -620,7 +620,31 @@ with open('$SPENDING_LOG', 'w') as f:
     echo -e "${GREEN}Renamed: ${BOLD}$old${RESET}${GREEN} -> ${BOLD}$new${RESET}"
 }
 
+_err_bridge_renamed() {
+    echo -e "${RED}--no-remote-control / --no-remote were renamed to --no-bridge.${RESET}" >&2
+    echo -e "${DIM}The phone-control 'bridge' is on by default; disable it with --no-bridge.${RESET}" >&2
+}
+
 cmd_start() {
+    # Unified launch verb. Foreground in the current dir by default; -d/--detach
+    # runs the session in a persistent tmux session that survives SSH disconnect.
+    #   cctrl start                 foreground, current dir
+    #   cctrl start @name           foreground via shortcut
+    #   cctrl start -d <dir|@name>  detached tmux session
+    local detach=false arg
+    for arg in "$@"; do
+        [[ "$arg" == "--" ]] && break   # rest is a literal prompt; stop scanning
+        case "$arg" in
+            -d|--detach) detach=true ;;
+            --no-remote-control|--no-remote) _err_bridge_renamed; return 1 ;;
+        esac
+    done
+
+    if $detach; then
+        _launch_detached "$@"
+        return
+    fi
+
     # `cctrl start @<name> [...]` is an alias for `cctrl @<name> [...]`
     if [[ "${1:-}" == @* ]]; then
         local sc="${1#@}"; shift
@@ -631,7 +655,7 @@ cmd_start() {
     local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-6[1m]")
     local resume=false
     local resume_val=""
-    local no_remote=false
+    local no_bridge=false
     local passthrough=()
 
     while [[ $# -gt 0 ]]; do
@@ -645,9 +669,13 @@ cmd_start() {
                 fi
                 shift
                 ;;
-            --no-remote-control|--no-remote)
-                no_remote=true
+            --no-bridge)
+                no_bridge=true
                 shift
+                ;;
+            --name|-n)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
+                passthrough+=("--name" "$2"); shift 2
                 ;;
             *)
                 passthrough+=("$1")
@@ -656,7 +684,7 @@ cmd_start() {
         esac
     done
 
-    if $no_remote; then
+    if $no_bridge; then
         flags=("${flags[@]/--remote-control}")
         # Strip the empty slot left by the substitution
         local cleaned=()
@@ -679,65 +707,26 @@ cmd_start() {
     exec claude "${flags[@]}"
 }
 
-cmd_spawn() {
-    # Launch a cctrl session in a detached tmux session.
-    # Designed for SSH-from-phone: the tmux session persists after disconnect.
-    # No GUI, no iTerm, no AppleScript — just tmux.
+_launch_detached() {
+    # Launch a cctrl session in a detached tmux session (survives SSH
+    # disconnect). Invoked by `cctrl start -d`. No GUI — just tmux.
     #
-    # Usage:
-    #   cctrl spawn <dir>            # cctrl start in <dir>
-    #   cctrl spawn @<shortcut>      # cctrl @<shortcut> (cd + profile + start)
-    #   cctrl spawn ... [extras]     # extras passed through
-    #   cctrl spawn --list           # list active tmux sessions
-    #   cctrl spawn --attach <name>  # reattach to an existing session
-    #   cctrl spawn --kill <name>    # kill a tmux session
-    #
-    # No-arg form is intentionally NOT supported. Bypass-permissions Claude in
-    # $HOME is dangerous (full read access to ~/.ssh, ~/.aws, browser data,
-    # etc.). Pass an explicit target.
+    # An explicit target is REQUIRED. Defaulting to $HOME would drop
+    # bypass-permissions Claude into a folder with ~/.ssh, ~/.aws, browser
+    # data, etc. Session management lives under `cctrl session`.
 
     local target="" target_kind=""   # kind: dir | shortcut
     local passthrough=()
-    local attach_target="" kill_target="" list_sessions=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -h|--help)
-                echo "Usage: cctrl spawn <dir | @shortcut> [extra args]"
-                echo ""
-                echo "Launches a cctrl session in a detached tmux session."
-                echo "  <dir>              cd to dir, then run 'cctrl start'"
-                echo "  @<shortcut>        run 'cctrl @<shortcut>' (uses your saved shortcut)"
-                echo ""
-                echo "An explicit target is REQUIRED. Defaulting to \$HOME would drop"
-                echo "bypass-permissions Claude into a folder with ~/.ssh, ~/.aws,"
-                echo "browser data, etc."
-                echo ""
-                echo "The tmux session persists after SSH disconnect. Reattach anytime."
-                echo ""
-                echo "Session management:"
-                echo "  cctrl spawn --list             List active tmux sessions"
-                echo "  cctrl spawn --attach <name>    Reattach to a session"
-                echo "  cctrl spawn --kill <name>      Kill a session"
-                echo ""
-                echo "Examples:"
-                echo "  ssh mac 'cctrl spawn ~/_projects/cctrl'"
-                echo "  ssh mac 'cctrl spawn @homelab'"
-                echo "  ssh mac 'cctrl spawn @cctrl --resume'"
-                echo "  cctrl spawn --attach homelab   # reattach later"
-                return 0
-                ;;
-            --list|--ls|-l)
-                list_sessions=true; shift ;;
-            --attach|-a)
-                if [[ $# -ge 2 && "$2" != -* ]]; then
-                    attach_target="$2"; shift 2
-                else
-                    attach_target="__picker__"; shift
-                fi
-                ;;
-            --kill|-K)
-                [[ $# -ge 2 ]] || { echo -e "${RED}--kill needs a session name${RESET}"; return 1; }
-                kill_target="$2"; shift 2 ;;
+            -d|--detach)
+                shift ;;
+            --list|--ls|-l|--attach|-a|--kill|-K)
+                echo -e "${RED}Session management moved to 'cctrl session'.${RESET}" >&2
+                echo -e "${DIM}  cctrl session ls            List detached sessions${RESET}" >&2
+                echo -e "${DIM}  cctrl session attach [name] Reattach to a session${RESET}" >&2
+                echo -e "${DIM}  cctrl session kill <name>   Kill a session${RESET}" >&2
+                return 1 ;;
             --)
                 shift
                 passthrough+=("$@")
@@ -773,102 +762,15 @@ cmd_spawn() {
         return 1
     fi
 
-    # Session management subcommands
-    if $list_sessions; then
-        if tmux list-sessions 2>/dev/null; then
-            return 0
-        else
-            echo -e "${DIM}No active tmux sessions.${RESET}"
-            return 0
-        fi
-    fi
-
-    if [[ -n "$attach_target" ]]; then
-        local -a sessions=()
-        while IFS= read -r s; do
-            [[ -n "$s" ]] && sessions+=("$s")
-        done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
-
-        if [[ ${#sessions[@]} -eq 0 ]]; then
-            echo -e "${DIM}No active tmux sessions.${RESET}"
-            return 1
-        fi
-
-        # Picker mode (no argument) or partial match
-        if [[ "$attach_target" == "__picker__" ]]; then
-            # Show all sessions
-            if [[ ${#sessions[@]} -eq 1 ]]; then
-                exec tmux attach-session -t "${sessions[0]}"
-            fi
-            echo -e "${BOLD}Active sessions:${RESET}"
-            local i=1
-            for s in "${sessions[@]}"; do
-                echo -e "  ${GREEN}[$i]${RESET} $s"
-                ((i++))
-            done
-            echo
-            echo -n "Attach to: "
-            read -r choice
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
-                exec tmux attach-session -t "${sessions[$((choice-1))]}"
-            fi
-            return 1
-        fi
-
-        # Exact match
-        if tmux has-session -t "$attach_target" 2>/dev/null; then
-            exec tmux attach-session -t "$attach_target"
-        fi
-
-        # Partial match — filter sessions containing the target
-        local -a matches=()
-        for s in "${sessions[@]}"; do
-            [[ "$s" == *"$attach_target"* ]] && matches+=("$s")
-        done
-
-        if [[ ${#matches[@]} -eq 0 ]]; then
-            echo -e "${RED}No session matching '$attach_target'.${RESET}" >&2
-            echo -e "${BOLD}Active sessions:${RESET}"
-            for s in "${sessions[@]}"; do echo "  $s"; done
-            return 1
-        elif [[ ${#matches[@]} -eq 1 ]]; then
-            exec tmux attach-session -t "${matches[0]}"
-        else
-            echo -e "${BOLD}Multiple sessions matching '$attach_target':${RESET}"
-            local i=1
-            for s in "${matches[@]}"; do
-                echo -e "  ${GREEN}[$i]${RESET} $s"
-                ((i++))
-            done
-            echo
-            echo -n "Attach to: "
-            read -r choice
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
-                exec tmux attach-session -t "${matches[$((choice-1))]}"
-            fi
-            return 1
-        fi
-    fi
-
-    if [[ -n "$kill_target" ]]; then
-        if tmux has-session -t "$kill_target" 2>/dev/null; then
-            tmux kill-session -t "$kill_target"
-            echo -e "${GREEN}Killed session: $kill_target${RESET}"
-        else
-            echo -e "${RED}No tmux session named '$kill_target'.${RESET}" >&2
-        fi
-        return 0
-    fi
-
-    # Spawn a new session
     if [[ -z "$target" ]]; then
-        echo -e "${RED}cctrl spawn requires a target.${RESET}" >&2
-        echo "Usage: cctrl spawn <dir | @shortcut> [extra args]" >&2
-        echo -e "${DIM}Run 'cctrl spawn --help' for details.${RESET}" >&2
+        echo -e "${RED}cctrl start -d requires a target.${RESET}" >&2
+        echo "Usage: cctrl start -d <dir | @shortcut> [extra args]" >&2
+        echo -e "${DIM}A detached session needs an explicit dir or shortcut — defaulting${RESET}" >&2
+        echo -e "${DIM}to \$HOME would drop bypass-permissions Claude into ~/.ssh, ~/.aws, etc.${RESET}" >&2
         return 1
     fi
 
-    local cctrl_q extras_q="" shell_cmd session_name display_label
+    local cctrl_q extras_q="" shell_cmd session_name display_label friendly_name
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
     if [[ ${#passthrough[@]} -gt 0 ]]; then
         for a in "${passthrough[@]}"; do
@@ -876,6 +778,7 @@ cmd_spawn() {
         done
     fi
 
+    # Claude Code display name gets "TMUX." prefix for detached sessions
     if [[ "$target_kind" == "shortcut" ]]; then
         local canonical
         canonical="$(_shortcut_lookup_key "$target")"
@@ -884,9 +787,11 @@ cmd_spawn() {
             echo -e "${DIM}List with: cctrl @${RESET}" >&2
             return 1
         fi
-        local name_q
+        friendly_name="$canonical"
+        local name_q cc_name_q
         name_q="$(printf '%q' "$canonical")"
-        shell_cmd="$cctrl_q @$name_q$extras_q"
+        cc_name_q="$(printf '%q' "TMUX. $friendly_name")"
+        shell_cmd="$cctrl_q @$name_q --name $cc_name_q$extras_q"
         session_name="$(_session_slug "$canonical")"
         display_label="@$canonical"
     else
@@ -897,14 +802,16 @@ cmd_spawn() {
             return 1
         fi
         dir="$(cd "$dir" && pwd)"
-        local dir_q
+        friendly_name="$(basename "$dir")"
+        local dir_q cc_name_q
         dir_q="$(printf '%q' "$dir")"
-        shell_cmd="cd $dir_q && $cctrl_q start$extras_q"
+        cc_name_q="$(printf '%q' "TMUX. $friendly_name")"
+        shell_cmd="cd $dir_q && $cctrl_q start --name $cc_name_q$extras_q"
         session_name="$(_session_slug "$dir")"
         display_label="$dir"
     fi
 
-    # Auto-increment if session name already exists (homelab, homelab-2, homelab-3, ...)
+    # Auto-increment if session name already exists (homelab, homelab--2, ...)
     local base_name="$session_name"
     if tmux has-session -t "$session_name" 2>/dev/null; then
         local n=2
@@ -916,10 +823,145 @@ cmd_spawn() {
 
     tmux new-session -d -s "$session_name" "$shell_cmd"
 
-    echo -e "${GREEN}✓${RESET} tmux session started — ${BOLD}$display_label${RESET}"
-    echo -e "${DIM}  Attach:  cctrl spawn --attach $session_name${RESET}"
-    echo -e "${DIM}  List:    cctrl spawn --list${RESET}"
-    echo -e "${DIM}  Kill:    cctrl spawn --kill $session_name${RESET}"
+    echo -e "${GREEN}✓${RESET} detached session started — ${BOLD}$display_label${RESET}"
+    echo -e "${DIM}  Attach:  cctrl session attach $session_name${RESET}"
+    echo -e "${DIM}  List:    cctrl session ls${RESET}"
+    echo -e "${DIM}  Kill:    cctrl session kill $session_name${RESET}"
+
+    # Machine-readable line so remote spawns can attach to the exact session
+    # name (including any auto-increment suffix). See _remote_exec.
+    if [[ -n "${CCTRL_EMIT_SESSION:-}" ]]; then
+        printf 'CCTRL_SESSION=%s\n' "$session_name"
+    fi
+}
+
+# ── Detached session management ───────────────────────────────────────
+
+cmd_session() {
+    # Manage detached tmux sessions created by `cctrl start -d`.
+    local action="${1:-ls}"
+    shift 2>/dev/null || true
+    case "$action" in
+        -h|--help|help)
+            echo "Usage: cctrl session <ls | attach | kill>"
+            echo ""
+            echo "  cctrl session ls               List detached sessions"
+            echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
+            echo "  cctrl session kill <name>      Kill a session"
+            echo ""
+            echo "Create a session with:  cctrl start -d <dir | @shortcut>"
+            return 0
+            ;;
+        ls|list)   _session_list ;;
+        attach|a)  _session_attach "${1:-__picker__}" ;;
+        kill|k|rm) _session_kill "${1:-}" ;;
+        *)
+            echo -e "${RED}Unknown session command: $action${RESET}" >&2
+            echo -e "${DIM}Run 'cctrl session --help' for usage.${RESET}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_session_require_tmux() {
+    command -v tmux &>/dev/null && return 0
+    echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
+    return 1
+}
+
+_session_list() {
+    _session_require_tmux || return 1
+    if tmux list-sessions 2>/dev/null; then
+        return 0
+    fi
+    echo -e "${DIM}No active sessions.${RESET}"
+    return 0
+}
+
+_session_attach() {
+    _session_require_tmux || return 1
+    local attach_target="$1"
+    local -a sessions=()
+    local s choice i
+    while IFS= read -r s; do
+        [[ -n "$s" ]] && sessions+=("$s")
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    if [[ ${#sessions[@]} -eq 0 ]]; then
+        echo -e "${DIM}No active sessions.${RESET}"
+        return 1
+    fi
+
+    # Picker mode (no argument)
+    if [[ "$attach_target" == "__picker__" ]]; then
+        if [[ ${#sessions[@]} -eq 1 ]]; then
+            exec tmux attach-session -t "${sessions[0]}"
+        fi
+        echo -e "${BOLD}Active sessions:${RESET}"
+        i=1
+        for s in "${sessions[@]}"; do
+            echo -e "  ${GREEN}[$i]${RESET} $s"
+            ((i++))
+        done
+        echo
+        echo -n "Attach to: "
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
+            exec tmux attach-session -t "${sessions[$((choice-1))]}"
+        fi
+        return 1
+    fi
+
+    # Exact match
+    if tmux has-session -t "$attach_target" 2>/dev/null; then
+        exec tmux attach-session -t "$attach_target"
+    fi
+
+    # Partial match
+    local -a matches=()
+    for s in "${sessions[@]}"; do
+        [[ "$s" == *"$attach_target"* ]] && matches+=("$s")
+    done
+
+    if [[ ${#matches[@]} -eq 0 ]]; then
+        echo -e "${RED}No session matching '$attach_target'.${RESET}" >&2
+        echo -e "${BOLD}Active sessions:${RESET}"
+        for s in "${sessions[@]}"; do echo "  $s"; done
+        return 1
+    elif [[ ${#matches[@]} -eq 1 ]]; then
+        exec tmux attach-session -t "${matches[0]}"
+    else
+        echo -e "${BOLD}Multiple sessions matching '$attach_target':${RESET}"
+        i=1
+        for s in "${matches[@]}"; do
+            echo -e "  ${GREEN}[$i]${RESET} $s"
+            ((i++))
+        done
+        echo
+        echo -n "Attach to: "
+        read -r choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
+            exec tmux attach-session -t "${matches[$((choice-1))]}"
+        fi
+        return 1
+    fi
+}
+
+_session_kill() {
+    _session_require_tmux || return 1
+    local kill_target="$1"
+    if [[ -z "$kill_target" ]]; then
+        echo -e "${RED}cctrl session kill needs a session name.${RESET}" >&2
+        echo -e "${DIM}List sessions with: cctrl session ls${RESET}" >&2
+        return 1
+    fi
+    if tmux has-session -t "$kill_target" 2>/dev/null; then
+        tmux kill-session -t "$kill_target"
+        echo -e "${GREEN}Killed session: $kill_target${RESET}"
+    else
+        echo -e "${RED}No session named '$kill_target'.${RESET}" >&2
+        return 1
+    fi
 }
 
 cmd_usage() {
@@ -1300,17 +1342,18 @@ cmd_help() {
     echo "  cctrl rename <old> <new>  Rename a profile"
     echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
     echo ""
-    echo -e "${BOLD}Session${RESET}"
-    echo "  cctrl start [flags]     Launch claude: bypassPermissions, --remote-control, --model claude-opus-4-6[1m]"
-    echo "  cctrl start @<name>     Alias for cctrl @<name> (jump via shortcut)"
-    echo "    --resume, -r [id]     Resume a session (interactive picker or by session ID)"
-    echo "    --no-remote-control   Disable the default --remote-control bridge"
-    echo "                          Extra flags are appended (e.g. cctrl start -p foo)"
-    echo "  cctrl spawn <dir|@name> Launch cctrl in a detached tmux session"
-    echo "                          Survives SSH disconnect; reattach anytime"
-    echo "  cctrl spawn --list      List active tmux sessions"
-    echo "  cctrl spawn --attach N  Reattach to a session"
-    echo "  cctrl spawn --kill N    Kill a session"
+    echo -e "${BOLD}Session${RESET} ${DIM}(one verb; flags pick foreground vs detached)${RESET}"
+    echo "  cctrl start [@name]         Launch claude in the foreground (current dir, or shortcut)"
+    echo "    -d, --detach              Run in a detached tmux session (survives SSH disconnect)"
+    echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
+    echo "    -n, --name NAME           Set the session display name"
+    echo "    --no-bridge               Disable the phone-control bridge (on by default)"
+    echo "                              Extra flags are appended (e.g. cctrl start -p foo)"
+    echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
+    echo ""
+    echo "  cctrl session ls            List detached sessions"
+    echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
+    echo "  cctrl session kill <name>   Kill a detached session"
     echo ""
     echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
     echo "  cctrl @<name>           Jump: cd to dir, switch profile, start claude (with optional resume + initial prompt)"
@@ -1348,7 +1391,8 @@ cmd_help() {
     echo "  cctrl host list                       List registered hosts"
     echo "  cctrl host rm <alias>                 Remove a host"
     echo "  cctrl host doctor <alias>             Check SSH, tmux, claude, cctrl on remote"
-    echo "  cctrl --host <alias> <command>        Run any cctrl command on a remote host"
+    echo "  cctrl --host <alias> <command>         Run any cctrl command on a remote host"
+    echo "  cctrl --host <alias> start -d @<name>  Spawn a detached session there, then attach"
     echo ""
     echo -e "${BOLD}Chrome CDP${RESET}"
     echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
@@ -1555,29 +1599,36 @@ _remote_exec() {
         ssh_target="$hostname"
     fi
 
-    # Decide whether to use TTY (-t) based on the command
+    # Decide TTY (-t) and auto-attach behavior based on the command.
     local use_tty=false
+    local spawn_and_attach=false
     local first_arg="${1:-}"
     case "$first_arg" in
-        start|s)       use_tty=true ;;
-        edit)          use_tty=true ;;
-        @*)            use_tty=true ;;
-    esac
-    # Check for spawn --attach (interactive)
-    local spawn_and_attach=false
-    if [[ "$first_arg" == "spawn" ]]; then
-        local has_management_flag=false
-        for a in "$@"; do
-            case "$a" in
-                --attach|-a) use_tty=true; has_management_flag=true; break ;;
-                --list|--ls|-l|--kill|-K) has_management_flag=true; break ;;
+        edit) use_tty=true ;;
+        @*)   use_tty=true ;;
+        session)
+            # `session attach` is interactive; ls/kill are not.
+            case "${2:-}" in
+                attach|a) use_tty=true ;;
             esac
-        done
-        # spawn @foo or spawn <dir> — create session then auto-attach
-        if ! $has_management_flag; then
-            spawn_and_attach=true
-        fi
-    fi
+            ;;
+        start|s)
+            # Detached start (-d) spawns on the remote, then auto-attaches over
+            # a second connection. Foreground start is plain interactive.
+            local is_detach=false
+            for a in "$@"; do
+                [[ "$a" == "--" ]] && break
+                case "$a" in
+                    -d|--detach) is_detach=true; break ;;
+                esac
+            done
+            if $is_detach; then
+                spawn_and_attach=true
+            else
+                use_tty=true
+            fi
+            ;;
+    esac
 
     # Quote each argument for safe SSH transport
     local quoted_args=""
@@ -1593,14 +1644,27 @@ _remote_exec() {
     local env_prefix="CCTRL_HOST_PREFIX=$host_alias"
 
     if $spawn_and_attach; then
-        # Spawn detached, then attach with TTY
-        ssh "$ssh_target" "source ~/.zprofile 2>/dev/null; $env_prefix cctrl$quoted_args"
-        # The session name is the slug of the target (shortcut name or dir basename)
-        local spawn_target="${2:-}"
-        spawn_target="${spawn_target#@}"
-        local session_slug="${host_alias}--$(_session_slug "$spawn_target")"
-        echo -e "${DIM}Attaching to remote session...${RESET}" >&2
-        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t \$(tmux list-sessions -F '#{session_name}' | grep '^${session_slug}' | tail -1)"
+        # Spawn detached on the remote, capture the resolved session name, then
+        # attach to that exact session over a TTY connection. Capturing the
+        # name (rather than reconstructing the slug) handles auto-increment
+        # suffixes and git-root basenames without guessing.
+        local launch_out rc
+        launch_out="$(ssh "$ssh_target" "source ~/.zprofile 2>/dev/null; CCTRL_EMIT_SESSION=1 $env_prefix cctrl$quoted_args")"
+        rc=$?
+        # Echo the launch output, minus the machine-readable marker line.
+        printf '%s\n' "$launch_out" | grep -v '^CCTRL_SESSION=' || true
+        [[ $rc -eq 0 ]] || return $rc
+        local remote_session
+        remote_session="$(printf '%s\n' "$launch_out" | sed -n 's/^CCTRL_SESSION=//p' | tail -1)"
+        if [[ -z "$remote_session" ]]; then
+            echo -e "${RED}Could not determine the remote session name; not attaching.${RESET}" >&2
+            echo -e "${DIM}List remote sessions with: cctrl --host $host_alias session ls${RESET}" >&2
+            return 1
+        fi
+        echo -e "${DIM}Attaching to remote session: $remote_session${RESET}" >&2
+        local sess_q
+        sess_q="$(printf '%q' "$remote_session")"
+        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t $sess_q"
     fi
 
     echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
@@ -1824,7 +1888,7 @@ _shortcut_help() {
     echo "  cctrl @<name> -m \"TEXT\"            Launch with an initial prompt"
     echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
-    echo "  cctrl @<name> --no-remote-control Disable Remote Control for this launch"
+    echo "  cctrl @<name> --no-bridge         Disable the phone-control bridge for this launch"
     echo "  cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]"
     echo "  cctrl @rm <name>                  Remove a shortcut"
     echo "  cctrl @ ls                        List shortcuts (no helper)"
@@ -2066,7 +2130,7 @@ _shortcut_jump() {
     local cli_resume_val=""
     local cli_prompt=""
     local cli_prompt_set=false
-    local no_remote=false
+    local no_bridge=false
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2079,8 +2143,13 @@ _shortcut_jump() {
             --message|--prompt|-m)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--message needs a value${RESET}"; return 1; }
                 cli_prompt="$2"; cli_prompt_set=true; shift 2 ;;
+            --no-bridge)
+                no_bridge=true; shift ;;
             --no-remote-control|--no-remote)
-                no_remote=true; shift ;;
+                _err_bridge_renamed; return 1 ;;
+            --name|-n)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
+                passthrough+=("--name" "$2"); shift 2 ;;
             --)
                 shift
                 # Everything after -- is a literal prompt (joined by space)
@@ -2093,7 +2162,7 @@ _shortcut_jump() {
         esac
     done
 
-    if $no_remote; then
+    if $no_bridge; then
         flags=("${flags[@]/--remote-control}")
         local cleaned=()
         for f in "${flags[@]}"; do [[ -n "$f" ]] && cleaned+=("$f"); done
@@ -2202,7 +2271,13 @@ main() {
         diff)    cmd_diff "$@" ;;
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
-        spawn)   cmd_spawn "$@" ;;
+        session|sess) cmd_session "$@" ;;
+        spawn)
+            echo -e "${RED}'cctrl spawn' was removed.${RESET}" >&2
+            echo -e "${DIM}  Launch detached:  cctrl start -d <dir | @shortcut>${RESET}" >&2
+            echo -e "${DIM}  Manage sessions:  cctrl session ls | attach | kill${RESET}" >&2
+            return 1
+            ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         log)     cmd_log "$@" ;;

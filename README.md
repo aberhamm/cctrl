@@ -5,8 +5,8 @@ A CLI for managing [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
 ## What it does
 
 - **Profile switching** — swap between settings configs (API keys, models, hooks, permissions) with one command
-- **Session launching** — start Claude Code with consistent flags, resume previous sessions, jump into projects via named shortcuts
-- **Remote spawning** — SSH into your Mac and launch a Claude Code session in a new iTerm2 window that persists after you disconnect
+- **Session launching** — start Claude Code with consistent flags, resume previous sessions, jump into projects via named shortcuts, or run detached so it survives SSH disconnect
+- **Remote hosts** — run any cctrl command on another machine over SSH; spawn a detached session on your Mac from your phone and auto-attach
 - **Usage & cost tracking** — token spend by model/project/day, rate limit monitoring, billing week breakdowns
 - **Port management** — track port history, find free ports, kill processes by port, discover ports from project files
 - **Chrome CDP** — launch Chrome with remote debugging for browser automation workflows
@@ -43,13 +43,39 @@ cctrl edit <profile>      # open in $EDITOR
 
 ## Sessions
 
+A launch is described by three independent axes:
+
+| Axis | Question | How you set it |
+| --- | --- | --- |
+| **Location** | which machine runs it? | `--host <alias>` (default: local) |
+| **Durability** | does it survive disconnect? | `-d` / `--detach` (default: foreground) |
+| **Bridge** | can the phone app drive it? | on by default; `--no-bridge` to disable |
+
+There's **one launch verb — `start`** — and the flags above pick the behavior. Managing detached sessions (list/attach/kill) lives under `cctrl session`.
+
 ```bash
-cctrl start                       # launch claude with Remote Control enabled
+cctrl start                       # foreground, current dir, phone bridge on
 cctrl start --resume              # resume a session (interactive picker)
-cctrl start -p "fix bug"          # extra flags passed through
+cctrl start -p "fix bug"          # extra flags passed through to claude
+cctrl start --no-bridge           # launch without the phone-control bridge
 ```
 
-`cctrl start` launches `claude` with `--remote-control` and a session name prefix based on the current git repo. Multiple sessions in the same folder get unique suffixes (e.g. `cctrl-graceful-unicorn`), replaced by an AI-generated summary within seconds.
+`cctrl start` launches `claude` with the phone-control bridge and a session name prefix based on the current git repo. Multiple sessions in the same folder get unique suffixes (e.g. `cctrl-graceful-unicorn`), replaced by an AI-generated summary within seconds.
+
+### Detached sessions
+
+Add `-d` to run inside a detached **tmux** session that persists after SSH disconnect — reattach anytime from any terminal. No GUI, no iTerm2, no AppleScript. A detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop bypass-permissions Claude into `~/.ssh`, `~/.aws`, etc.
+
+```bash
+cctrl start -d ~/_projects/myapp  # launch detached in a directory
+cctrl start -d @myapp             # ...or via a saved shortcut
+
+cctrl session ls                  # list detached sessions
+cctrl session attach myapp        # reattach (interactive picker if no name)
+cctrl session kill myapp          # kill a session
+```
+
+**Requires:** tmux (`brew install tmux`)
 
 ### Shortcuts
 
@@ -65,28 +91,6 @@ cctrl @add myapp ~/projects/myapp --profile work
 cctrl @rm myapp
 ```
 
-### Spawn (remote launch over SSH)
-
-```bash
-cctrl spawn ~/_projects/myapp     # launch in a detached tmux session
-cctrl spawn @myapp                # use a saved shortcut
-cctrl spawn --list                # list active sessions
-cctrl spawn --attach myapp        # reattach to a session
-cctrl spawn --kill myapp          # kill a session
-```
-
-Launches a cctrl session inside a detached **tmux** session. The session persists after SSH disconnect — reattach anytime from any terminal. No GUI, no iTerm2, no AppleScript required.
-
-```bash
-# From your phone over SSH:
-ssh mac 'cctrl spawn @homelab'
-
-# Later, from any terminal:
-cctrl spawn --attach homelab
-```
-
-**Requires:** tmux (`brew install tmux`)
-
 ## Remote Hosts
 
 Run any cctrl command on a named remote host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.
@@ -99,16 +103,18 @@ cctrl host rm studio                       # remove a host
 cctrl host doctor studio                   # check SSH, brew, tmux, claude, cctrl
 ```
 
-Then use `--host` with any command:
+`--host` is orthogonal — it forwards *any* command, so the three axes compose. `--host` says **where**, `-d` says **durable**:
 
 ```bash
-cctrl --host studio spawn @homelab         # spawn a session on the remote host
-cctrl --host studio spawn --list           # list remote tmux sessions
-cctrl --host studio spawn --attach homelab # attach interactively (TTY)
-cctrl --host studio costs --week           # view remote cost data
+cctrl --host studio start -d @homelab        # spawn a detached session there, then auto-attach
+cctrl --host studio session ls               # list remote detached sessions
+cctrl --host studio session attach homelab   # attach interactively (TTY)
+cctrl --host studio costs --week             # view remote cost data
 ```
 
-**TTY handling:** Interactive commands (`start`, `@shortcut`, `spawn --attach`, `edit`) use `ssh -t`. Non-interactive commands (`spawn @x`, `spawn --list`, `costs`, `usage`, `ls`) use plain `ssh`.
+`cctrl --host studio start -d @homelab` is the "spawn on my Mac from my phone" workflow: it SSHes in, starts the detached session, then attaches to that exact session over a second connection. The remote prints its resolved session name so the attach targets the right one even with auto-increment suffixes.
+
+**TTY handling:** Interactive commands (`start` foreground, `start -d` auto-attach, `@shortcut`, `session attach`, `edit`) use `ssh -t`. Non-interactive commands (`session ls`, `costs`, `usage`, `ls`) use plain `ssh`.
 
 **Host doctor** checks SSH connectivity, brew, tmux, claude, cctrl availability, and `~/.tmux.conf` on the remote host — with interactive auto-fix offers for missing dependencies.
 

@@ -12,6 +12,12 @@ needs-review: none
 created: 2026-05-31
 ---
 
+> **API update (2026-06-02):** The session API was later redesigned. The
+> `spawn` command was removed and folded into `start -d` (detached launch),
+> with session management moved under `cctrl session ls|attach|kill`. Examples
+> below have been updated to the current syntax; the `--host` proxy design
+> this plan delivered is unchanged.
+
 ## Requirements
 
 When running cctrl from the MacBook, users need to execute commands on remote
@@ -24,9 +30,9 @@ makes any cctrl command run on a named remote host transparently over SSH.
 - [ ] `cctrl host list` shows registered hosts
 - [ ] `cctrl host rm studio` removes a host
 - [ ] `cctrl host doctor studio` checks SSH, remote cctrl, tmux, claude presence and offers to fix missing packages
-- [ ] `cctrl --host studio spawn @homelab` creates a tmux session on the remote host
-- [ ] `cctrl --host studio spawn --list` lists remote tmux sessions
-- [ ] `cctrl --host studio spawn --attach homelab` attaches interactively (TTY)
+- [ ] `cctrl --host studio start -d @homelab` creates a detached session on the remote host
+- [ ] `cctrl --host studio session ls` lists remote detached sessions
+- [ ] `cctrl --host studio session attach homelab` attaches interactively (TTY)
 - [ ] `cctrl --host studio costs --week` shows remote cost data
 - [ ] Commands fail fast with actionable error if remote cctrl is missing
 
@@ -50,8 +56,8 @@ No sync. Each machine is its own source of truth.
 
 **TTY rules:**
 
-- Interactive commands (`spawn --attach`, `start`, `@shortcut`, `edit`) use `ssh -t`
-- Non-interactive (`spawn @x`, `spawn --list`, `spawn --kill`, `costs`, `usage`, `ls`) use plain `ssh`
+- Interactive commands (`session attach`, `start`, `start -d` auto-attach, `@shortcut`, `edit`) use `ssh -t`
+- Non-interactive (`session ls`, `session kill`, `costs`, `usage`, `ls`) use plain `ssh`
 
 **`host doctor` auto-fix scope:**
 
@@ -78,7 +84,7 @@ optional (defaults to current user, uses `~/.ssh/config` when set). The
 registry stores nothing sensitive.
 
 **Arg quoting:** Use `printf '%q'` on each forwarded argument (same pattern
-as spawn). Handles spaces, quotes, and bash specials in paths like Obsidian vault.
+as the detached launch). Handles spaces, quotes, and bash specials in paths like Obsidian vault.
 
 **Out of scope:** shortcut syncing, profile syncing, multi-hop SSH, SSH key
 management, non-macOS remote hosts.
@@ -93,7 +99,7 @@ management, non-macOS remote hosts.
 6. Implement `host doctor` with connectivity checks and interactive auto-fix
 7. Update zsh completions for `host` subcommand and `--host` flag
 8. Update README with host feature documentation
-9. Test: `cctrl host add studio ms-128g-bln && cctrl --host studio spawn --list`
+9. Test: `cctrl host add studio ms-128g-bln && cctrl --host studio session ls`
 
 ## Verification
 
