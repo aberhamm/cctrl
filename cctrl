@@ -1856,6 +1856,10 @@ cmd_host() {
             echo ""
 
             local all_ok=true
+            # Tool checks must source ~/.zprofile, exactly like _remote_exec does
+            # before running cctrl — otherwise brew-installed tools (tmux, claude,
+            # cctrl) look MISSING under the bare non-interactive SSH PATH.
+            local renv='source ~/.zprofile 2>/dev/null; '
 
             # 1. SSH connectivity
             echo -n "  SSH connectivity... "
@@ -1871,9 +1875,9 @@ cmd_host() {
                 return 1
             fi
 
-            # 2. brew in PATH
+            # 2. brew in PATH (after sourcing ~/.zprofile)
             echo -n "  brew in PATH... "
-            if ssh "$ssh_target" "command -v brew" &>/dev/null; then
+            if ssh "$ssh_target" "${renv}command -v brew" &>/dev/null; then
                 echo -e "${GREEN}OK${RESET}"
             else
                 echo -e "${YELLOW}MISSING${RESET}"
@@ -1888,7 +1892,7 @@ cmd_host() {
 
             # 3. tmux installed
             echo -n "  tmux installed... "
-            if ssh "$ssh_target" "command -v tmux" &>/dev/null; then
+            if ssh "$ssh_target" "${renv}command -v tmux" &>/dev/null; then
                 echo -e "${GREEN}OK${RESET}"
             else
                 echo -e "${YELLOW}MISSING${RESET}"
@@ -1896,14 +1900,14 @@ cmd_host() {
                 echo -n "    Fix: brew install tmux? [y/N] "
                 read -r confirm
                 if [[ "$confirm" =~ ^[yY]$ ]]; then
-                    ssh "$ssh_target" "brew install tmux"
+                    ssh "$ssh_target" "${renv}brew install tmux"
                     echo -e "    ${GREEN}Installed tmux${RESET}"
                 fi
             fi
 
             # 4. claude installed
             echo -n "  claude installed... "
-            if ssh "$ssh_target" "command -v claude" &>/dev/null; then
+            if ssh "$ssh_target" "${renv}command -v claude" &>/dev/null; then
                 echo -e "${GREEN}OK${RESET}"
             else
                 echo -e "${YELLOW}MISSING${RESET}"
@@ -1911,14 +1915,14 @@ cmd_host() {
                 echo -n "    Fix: brew install claude-code? [y/N] "
                 read -r confirm
                 if [[ "$confirm" =~ ^[yY]$ ]]; then
-                    ssh "$ssh_target" "brew install claude-code"
+                    ssh "$ssh_target" "${renv}brew install claude-code"
                     echo -e "    ${GREEN}Installed claude-code${RESET}"
                 fi
             fi
 
             # 5. cctrl available
             echo -n "  cctrl available... "
-            if ssh "$ssh_target" "command -v cctrl" &>/dev/null; then
+            if ssh "$ssh_target" "${renv}command -v cctrl" &>/dev/null; then
                 echo -e "${GREEN}OK${RESET}"
             else
                 echo -e "${YELLOW}MISSING${RESET}"
