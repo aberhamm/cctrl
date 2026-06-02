@@ -49,6 +49,8 @@ _cctrl_plugins() {
 }
 
 _cctrl_hosts() {
+    # Built-in aliases for the local machine, plus any registered hosts.
+    compadd "$@" -- local self
     local file="$(_cctrl_dir)/data/hosts.json"
     [[ -f "$file" ]] || return
     local -a names
@@ -69,8 +71,9 @@ _cctrl() {
         'edit:Open a profile in \$EDITOR'
         'start:Launch claude (foreground, or -d for a detached session)'
         's:Launch claude (foreground, or -d for a detached session)'
-        'session:Manage detached sessions (ls/attach/kill)'
+        'session:Manage detached sessions (ls/summary/attach/kill)'
         'host:Manage remote hosts'
+        'whoami:Show this machine and which host aliases mean local'
         'costs:Token usage and cost breakdown'
         'usage:Plan usage and billing week breakdown'
         'log:Show profile switch history'
@@ -164,12 +167,17 @@ _cctrl() {
         session|sess)
             if (( CURRENT == 3 )); then
                 local -a session_cmds=(
-                    'ls:List detached sessions'
+                    'ls:List sessions (dir, claude/shell, model, state)'
+                    'summary:Haiku summary of a session (or all)'
                     'attach:Reattach to a session'
                     'kill:Kill a detached session'
                 )
                 _describe "session commands" session_cmds
-            elif (( CURRENT == 4 )) && [[ "${words[3]}" == (attach|a|kill|k|rm) ]]; then
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == ls ]]; then
+                _arguments \
+                    '--json[Machine-readable output]' \
+                    {--summary,-s}'[Add a one-line Haiku summary per session]'
+            elif (( CURRENT == 4 )) && [[ "${words[3]}" == (summary|attach|a|kill|k|rm) ]]; then
                 local -a sessions
                 sessions=("${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null)}")
                 (( ${#sessions} )) && compadd "$@" -- "${sessions[@]}"

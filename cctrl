@@ -831,16 +831,31 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | attach | kill>"
+            echo "Usage: cctrl session <ls | summary | attach | kill>"
             echo ""
-            echo "  cctrl session ls               List detached sessions"
+            echo "  cctrl session ls               List sessions (dir, claude/shell, model, state)"
+            echo "    --json                       Machine-readable output"
+            echo "    --summary, -s                Add a one-line Haiku summary per session"
+            echo "  cctrl session summary [name]   Haiku summary of one session (or all)"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session kill <name>      Kill a session"
             echo ""
             echo "Create a session with:  cctrl start -d <dir | @shortcut>"
             return 0
             ;;
-        ls|list)   _session_list ;;
+        ls|list)   _session_list "$@" ;;
+        summary)
+            if [[ -n "${1:-}" ]]; then
+                if tmux has-session -t "$1" 2>/dev/null; then
+                    echo -e "${BOLD}$1${RESET}  ${DIM}↳ $(_session_summary "$1")${RESET}"
+                else
+                    echo -e "${RED}No session named '$1'.${RESET}" >&2
+                    return 1
+                fi
+            else
+                _session_list --summary
+            fi
+            ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
         *)
@@ -857,12 +872,113 @@ _session_require_tmux() {
     return 1
 }
 
+_session_claude_cmd() {
+    # Echo the foreground command of a session's pane. cctrl detaches with
+    # `exec claude`, so the pane root IS claude; fall back to first child.
+    local sess="$1" pid cmd child ccmd
+    pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    [[ -n "$pid" ]] || return 0
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
+    if [[ "$cmd" != *claude* ]]; then
+        child="$(pgrep -P "$pid" 2>/dev/null | head -1)"
+        if [[ -n "$child" ]]; then
+            ccmd="$(ps -o command= -p "$child" 2>/dev/null)"
+            [[ "$ccmd" == *claude* ]] && cmd="$ccmd"
+        fi
+    fi
+    printf '%s' "$cmd"
+}
+
+_session_summary() {
+    # One-line Haiku summary of a session's recent pane output. Best-effort;
+    # uses an empty MCP config so it starts fast and loads no servers.
+    local sess="$1" text out
+    command -v claude &>/dev/null || { echo "(claude not available)"; return 0; }
+    text="$(tmux capture-pane -t "$sess" -p -S -160 2>/dev/null | sed 's/[[:cntrl:]]//g' | grep -v '^[[:space:]]*$' | tail -120)"
+    if [[ -z "${text// /}" ]]; then echo "(no visible output)"; return 0; fi
+    out="$(printf '%s\n' "$text" | claude --model claude-haiku-4-5 --mcp-config '{"mcpServers":{}}' -p 'This is the recent visible output of a terminal / Claude Code session. In ONE short sentence (max ~15 words), say what it is currently working on or showing. Output only the sentence, no preamble.' 2>/dev/null | tr -d '\r' | grep -v '^[[:space:]]*$' | head -1)"
+    [[ -n "$out" ]] && printf '%s' "$out" || echo "(summary unavailable)"
+}
+
 _session_list() {
     _session_require_tmux || return 1
-    if tmux list-sessions 2>/dev/null; then
+    local json=false summary=false a
+    for a in "$@"; do
+        case "$a" in
+            --json)        json=true ;;
+            --summary|-s)  summary=true ;;
+        esac
+    done
+
+    local -a names=()
+    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
+        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    if [[ ${#names[@]} -eq 0 ]]; then
+        $json && { echo "[]"; return 0; }
+        echo -e "${DIM}No active sessions.${RESET}"
         return 0
     fi
-    echo -e "${DIM}No active sessions.${RESET}"
+
+    # Haiku summaries are ~10s each — compute them in parallel up front.
+    local tmpd="" idx=0
+    if $summary; then
+        tmpd="$(mktemp -d)"
+        for a in "${names[@]}"; do
+            ( _session_summary "$a" > "$tmpd/$idx" 2>/dev/null ) &
+            ((idx++))
+        done
+        wait
+    fi
+
+    local -a json_items=()
+    $json || $summary || echo -e "${DIM}✦ = cctrl-managed Claude session${RESET}"
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir summ base
+    idx=0
+    for name in "${names[@]}"; do
+        dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
+        attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
+        cmd="$(_session_claude_cmd "$name")"
+        if [[ "$cmd" == *claude* ]]; then
+            claude_yes=true
+            model="$(printf '%s' "$cmd" | grep -oE '\-\-model [^ ]+' | awk '{print $2}')"
+            model="${model#claude-}"; model="${model%%\[*}"
+            [[ -z "$model" ]] && model="?"
+            kind="claude ($model)"
+            [[ "$cmd" == *"--name TMUX."* ]] && managed=true || managed=false
+        else
+            claude_yes=false; managed=false; model=""
+            base="${cmd%% *}"; base="${base##*/}"; base="${base#-}"
+            kind="shell (${base:-sh})"
+        fi
+        [[ "$attached" == "1" ]] && state="attached" || state="detached"
+        disp_dir="${dir/#$HOME/~}"
+
+        if $json; then
+            local jobj
+            jobj="$(jq -n \
+                --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
+                --arg model "$model" --arg state "$state" \
+                --argjson managed "$managed" --argjson claude "$claude_yes" \
+                '{name:$name, managed:$managed, claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached")}')"
+            if $summary; then
+                summ="$(cat "$tmpd/$idx" 2>/dev/null)"
+                jobj="$(printf '%s' "$jobj" | jq --arg s "$summ" '. + {summary:$s}')"
+            fi
+            json_items+=("$jobj")
+        else
+            $managed && marker="✦" || marker=" "
+            printf '%s %-15s %-18s %-34s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state"
+            if $summary; then
+                summ="$(cat "$tmpd/$idx" 2>/dev/null)"
+                echo -e "    ${DIM}↳ ${summ}${RESET}"
+            fi
+        fi
+        ((idx++))
+    done
+
+    $json && printf '%s\n' "${json_items[@]}" | jq -s '.'
+    [[ -n "$tmpd" ]] && rm -rf "$tmpd"
     return 0
 }
 
@@ -1339,7 +1455,9 @@ cmd_help() {
     echo "                              Extra flags are appended (e.g. cctrl start -p foo)"
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
     echo ""
-    echo "  cctrl session ls            List detached sessions"
+    echo "  cctrl session ls            List sessions (dir, claude/shell, model, state; --json)"
+    echo "  cctrl session ls --summary  ...with a one-line Haiku summary per session"
+    echo "  cctrl session summary [name] Haiku summary of one session (or all)"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
     echo "  cctrl session kill <name>   Kill a detached session"
     echo ""
@@ -1375,12 +1493,13 @@ cmd_help() {
     echo "  cctrl ports --count N           How many free ports to suggest (default: 10)"
     echo ""
     echo -e "${BOLD}Remote Hosts${RESET}"
-    echo "  cctrl host add <alias> <host> [user]  Register a remote host"
-    echo "  cctrl host list                       List registered hosts"
+    echo "  cctrl whoami                          Show this machine + which aliases mean 'local'"
+    echo "  cctrl host add <alias> <host> [user]  Register a host (use this machine's name = local)"
+    echo "  cctrl host list                       List registered hosts (marks local)"
     echo "  cctrl host rm <alias>                 Remove a host"
     echo "  cctrl host doctor <alias>             Check SSH, tmux, claude, cctrl on remote"
-    echo "  cctrl --host <alias> <command>         Run any cctrl command on a remote host"
-    echo "  cctrl --host <alias> start -d @<name>  Spawn a detached session there, then attach"
+    echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
+    echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
     echo ""
     echo -e "${BOLD}Chrome CDP${RESET}"
     echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
@@ -1552,8 +1671,33 @@ _hosts_init() {
     [[ -f "$HOSTS_FILE" ]] || echo "{}" > "$HOSTS_FILE"
 }
 
+_local_names() {
+    # Names that identify THIS machine, used to short-circuit --host to local.
+    printf '%s\n' localhost 127.0.0.1 ::1
+    local h
+    h="$(hostname 2>/dev/null)"; [[ -n "$h" ]] && printf '%s\n%s\n' "$h" "${h%.local}"
+    h="$(hostname -s 2>/dev/null)"; [[ -n "$h" ]] && printf '%s\n' "$h"
+}
+
+_host_is_local() {
+    # True if the given SSH target points at the current machine.
+    local target="$1" n
+    [[ -z "$target" ]] && return 1
+    target="$(printf '%s' "${target%.local}" | tr '[:upper:]' '[:lower:]')"
+    while IFS= read -r n; do
+        [[ -z "$n" ]] && continue
+        n="$(printf '%s' "${n%.local}" | tr '[:upper:]' '[:lower:]')"
+        [[ "$target" == "$n" ]] && return 0
+    done < <(_local_names)
+    return 1
+}
+
 _host_lookup() {
-    # Look up a host alias; echoes "hostname user" or empty
+    # Look up a host alias; echoes "hostname user" or empty.
+    # `local`/`self` are built-in aliases that always resolve to this machine.
+    case "$1" in
+        local|self) echo "$(hostname) "; return 0 ;;
+    esac
     [[ -f "$HOSTS_FILE" ]] || return 0
     local hostname user
     hostname="$(jq -r --arg n "$1" '.[$n].hostname // empty' "$HOSTS_FILE" 2>/dev/null)"
@@ -1659,6 +1803,31 @@ _remote_exec() {
     exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "source ~/.zprofile 2>/dev/null; $env_prefix cctrl$quoted_args"
 }
 
+cmd_whoami() {
+    # Report this machine's identity and which host aliases resolve to it.
+    local cn hn
+    cn="$(scutil --get ComputerName 2>/dev/null || true)"
+    hn="$(hostname 2>/dev/null)"
+    echo -e "${BOLD}This machine${RESET}"
+    [[ -n "$cn" ]] && echo -e "  Name:       $cn"
+    echo -e "  Hostname:   $hn"
+    echo -e "  OS:         $(uname -sr)"
+
+    local -a matches=()
+    if [[ -f "$HOSTS_FILE" ]]; then
+        local a h
+        while IFS=$'\t' read -r a h; do
+            [[ -n "$a" ]] && _host_is_local "$h" && matches+=("$a")
+        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.hostname)"' "$HOSTS_FILE" 2>/dev/null)
+    fi
+    if [[ ${#matches[@]} -gt 0 ]]; then
+        echo -e "  Host alias: ${GREEN}${matches[*]}${RESET} ${DIM}(also built-in: local, self)${RESET}"
+    else
+        echo -e "  Host alias: ${DIM}local, self (built-in)${RESET}"
+    fi
+    echo -e "${DIM}'cctrl --host <any-of-these> ...' runs locally — no SSH.${RESET}"
+}
+
 cmd_host() {
     local action="${1:-list}"
     shift 2>/dev/null || true
@@ -1690,8 +1859,13 @@ cmd_host() {
             while IFS= read -r _name && IFS= read -r _hostname && IFS= read -r _user; do
                 local label="$_hostname"
                 [[ -n "$_user" ]] && label="${_user}@${_hostname}"
-                echo -e "  ${GREEN}$_name${RESET}  ${DIM}→${RESET}  $label"
+                if _host_is_local "$_hostname"; then
+                    echo -e "  ${GREEN}$_name${RESET}  ${DIM}→${RESET}  $label  ${DIM}(this machine — runs locally)${RESET}"
+                else
+                    echo -e "  ${GREEN}$_name${RESET}  ${DIM}→${RESET}  $label"
+                fi
             done < <(jq -r 'to_entries[] | .key, .value.hostname, (.value.user // "")' "$HOSTS_FILE" 2>/dev/null)
+            echo -e "  ${DIM}local, self${RESET}  ${DIM}→  this machine (built-in)${RESET}"
             ;;
         rm|remove|delete)
             local name="${1:-}"
@@ -2231,10 +2405,26 @@ main() {
             return 1
         fi
         shift
+        local _lookup
+        _lookup="$(_host_lookup "$_host_alias")"
+        if [[ -z "$_lookup" ]]; then
+            echo -e "${RED}Unknown host: '$_host_alias'${RESET}" >&2
+            echo -e "${DIM}List hosts with: cctrl host list${RESET}" >&2
+            return 1
+        fi
+        # If the alias points at this machine, run locally — no SSH-to-self.
+        if _host_is_local "${_lookup%% *}"; then
+            _dispatch "$@"
+            return $?
+        fi
         _remote_exec "$_host_alias" "$@"
         return $?
     fi
 
+    _dispatch "$@"
+}
+
+_dispatch() {
     local cmd="${1:-help}"
     shift 2>/dev/null || true
 
@@ -2249,6 +2439,7 @@ main() {
             ;;
         shortcuts) cmd_shortcut "$@" ;;
         host) cmd_host "$@" ;;
+        whoami) cmd_whoami "$@" ;;
         use|switch) cmd_use "$@" ;;
         ls|list) cmd_ls "$@" ;;
         current) cmd_current "$@" ;;

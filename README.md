@@ -70,12 +70,29 @@ Add `-d` to run inside a detached **tmux** session that persists after SSH disco
 cctrl start -d ~/_projects/myapp  # launch detached in a directory
 cctrl start -d @myapp             # ...or via a saved shortcut
 
-cctrl session ls                  # list detached sessions
+cctrl session ls                  # list sessions (see below)
 cctrl session attach myapp        # reattach (interactive picker if no name)
 cctrl session kill myapp          # kill a session
 ```
 
 **Requires:** tmux (`brew install tmux`)
+
+`cctrl session ls` is self-describing — for each tmux session it shows the working
+directory, whether it's a live `claude` process (and which model) or a plain shell,
+and attached/detached state. A `✦` marks sessions cctrl spawned. Add `--json` for
+machine-readable output, or `--summary` for a one-line, Haiku-generated description
+of what each session is currently doing (also `cctrl session summary [name]`):
+
+```
+$ cctrl session ls --summary
+✦ homelab    claude (opus-4-6)  ~/_projects/homelab   detached
+    ↳ Investigating a failing auth test and editing the token refresh logic.
+  scratch    shell (zsh)        ~/tmp                 attached
+    ↳ Idle shell at a clean prompt.
+```
+
+Summaries call `claude` once per session (with no MCP servers loaded, run in
+parallel), so they take a few seconds — they're opt-in, not part of the default list.
 
 ### Shortcuts
 
@@ -93,14 +110,27 @@ cctrl @rm myapp
 
 ## Remote Hosts
 
-Run any cctrl command on a named remote host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.
+Run any cctrl command on a named host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.
 
 ```bash
+cctrl whoami                              # which machine am I? which aliases mean "local"?
 cctrl host add studio ms-128g-bln         # register a host
 cctrl host add studio ms-128g-bln matt    # with explicit user
-cctrl host list                            # show registered hosts
+cctrl host list                            # show registered hosts (marks the local one)
 cctrl host rm studio                       # remove a host
 cctrl host doctor studio                   # check SSH, brew, tmux, claude, cctrl
+```
+
+**Local is just another host.** `local` and `self` are built-in aliases for the
+current machine, and any host you register whose hostname matches this machine is
+recognized as local too. When `--host` points at this machine, cctrl runs the
+command directly instead of SSH-ing into itself — so addressing is symmetric: you
+can always write `--host <name>`, local or remote.
+
+```bash
+cctrl host add macbook "$(hostname)"      # name this machine
+cctrl --host macbook session ls           # runs locally, no SSH
+cctrl --host local whoami                 # built-in alias, always local
 ```
 
 `--host` is orthogonal — it forwards *any* command, so the three axes compose. `--host` says **where**, `-d` says **durable**:
