@@ -243,30 +243,44 @@ cmd_edit() {
 }
 
 cmd_costs() {
-    local range="${1:---week}"
+    local range="${1:---month}"
     local project_filter="${2:-}"
 
-    local days
+    local num_periods
     case "$range" in
-        --today)  days=1 ;;
-        --week)   days=7 ;;
-        --month)  days=30 ;;
-        --all)    days=9999 ;;
-        *)        days=7 ;;
+        --today|--current)  num_periods=1 ;;
+        --week)             num_periods=1 ;;
+        --month)            num_periods=4 ;;
+        --all)              num_periods=9999 ;;
+        *)                  num_periods=4 ;;
     esac
 
-    # Use Python to parse session JSONL files for real token data
-    python3 - "$PROJECTS_DIR" "$days" "$project_filter" "$SPENDING_LOG" <<'PYEOF'
+    python3 - "$PROJECTS_DIR" "$num_periods" "$project_filter" "$SPENDING_LOG" <<'PYEOF'
 import bisect, json, os, sys, glob
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 projects_dir = sys.argv[1]
-days = int(sys.argv[2])
+num_periods = int(sys.argv[2])
 project_filter = sys.argv[3] if len(sys.argv) > 3 else ""
 spending_log = sys.argv[4] if len(sys.argv) > 4 else ""
 
-cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+TZ = ZoneInfo("Europe/Berlin")
+
+def billing_period_start(dt):
+    """Find the most recent Thursday 6:00 AM Europe/Berlin before dt."""
+    dt_tz = dt.astimezone(TZ)
+    days_since_thu = (dt_tz.weekday() - 3) % 7
+    thu = dt_tz - timedelta(days=days_since_thu)
+    reset = thu.replace(hour=6, minute=0, second=0, microsecond=0)
+    if dt_tz < reset:
+        reset -= timedelta(days=7)
+    return reset
+
+now = datetime.now(timezone.utc)
+current_period = billing_period_start(now)
+cutoff = current_period - timedelta(weeks=max(num_periods - 1, 0))
 
 # Pricing per million tokens (Anthropic API pricing)
 PRICING = {
@@ -354,7 +368,7 @@ def profile_at(ts):
     return all_switches[idx][2]  # [2] is the 'to' profile
 
 # ── Aggregates ────────────────────────────────────────────────────────
-by_date = {}       # date -> {input, output, cache_write, cache_read, cost, turns}
+by_period = {}     # period_start_date -> {input, output, cache_write, cache_read, cost, turns}
 by_model = {}      # model -> {input, output, cache_write, cache_read, cost, turns}
 by_project = {}    # project_name -> {input, output, cache_write, cache_read, cost, turns}
 by_profile = {}    # profile -> {input, output, cache_write, cache_read, cost, turns}
@@ -371,19 +385,18 @@ def add_to(bucket, key, input_t, output_t, cw, cr, cost):
     bucket[key]["turns"] += 1
 
 def record_turn(ts, model, usage, project_name, session_id=None):
-    date_str = ts.strftime("%Y-%m-%d")
+    period_key = billing_period_start(ts).strftime("%Y-%m-%d")
     input_t = usage.get("input_tokens", 0)
     output_t = usage.get("output_tokens", 0)
     cache_write_t = usage.get("cache_creation_input_tokens", 0)
     cache_read_t = usage.get("cache_read_input_tokens", 0)
     price_key = get_price_key(model)
     c = cost_for(price_key, input_t, output_t, cache_write_t, cache_read_t)
-    # Prefer direct session→profile mapping; fall back to timestamp lookup
     prof = session_profile.get(session_id) if session_id else None
     if not prof:
         prof = profile_at(ts)
 
-    add_to(by_date, date_str, input_t, output_t, cache_write_t, cache_read_t, c)
+    add_to(by_period, period_key, input_t, output_t, cache_write_t, cache_read_t, c)
     add_to(by_model, model, input_t, output_t, cache_write_t, cache_read_t, c)
     add_to(by_project, project_name, input_t, output_t, cache_write_t, cache_read_t, c)
     add_to(by_profile, prof, input_t, output_t, cache_write_t, cache_read_t, c)
@@ -399,10 +412,6 @@ def record_turn(ts, model, usage, project_name, session_id=None):
 session_files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
 
 for sf in session_files:
-    # Skip subagent files for cleaner accounting
-    if "/subagents/" in sf:
-        continue
-
     # Extract project name and session_id from path
     rel = os.path.relpath(sf, projects_dir)
     project_name = rel.split("/")[0].replace("-Users-matthew--projects-", "").replace("-Users-matthew-", "~").replace("-", "/", 1) if "/" in rel else rel.split("/")[0]
@@ -481,18 +490,31 @@ def usd(n):
     return f"${n:,.2f}"
 
 # ── Print results ──
-print(f"\033[1mClaude Code Token Usage\033[0m  \033[2m(last {days} day{'s' if days != 1 else ''})\033[0m")
+current_period_key = current_period.strftime("%Y-%m-%d")
+period_label = f"{num_periods} billing period{'s' if num_periods != 1 else ''}" if num_periods < 9999 else "all billing periods"
+print(f"\033[1mClaude Code Token Usage\033[0m  \033[2m({period_label}, resets Thu 6am)\033[0m")
 print()
 
-# Daily breakdown
-if by_date:
-    print(f"\033[0;36m{'Date':<12} {'Input':>12} {'Output':>12} {'Cache Write':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
-    print("─" * 78)
-    for date in sorted(by_date.keys()):
-        d = by_date[date]
-        print(f"{date:<12} {fmt(d['input']):>12} {fmt(d['output']):>12} {fmt(d['cache_write']):>12} {fmt(d['cache_read']):>12} {usd(d['cost']):>10} {d['turns']:>6}")
-    print("─" * 78)
-    print(f"\033[1m{'Total':<12} {fmt(total['input']):>12} {fmt(total['output']):>12} {fmt(total['cache_write']):>12} {fmt(total['cache_read']):>12} {usd(total['cost']):>10} {total['turns']:>6}\033[0m")
+if by_period:
+    print(f"\033[0;36m{'Period':<22} {'Input':>12} {'Output':>12} {'Cache Write':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
+    print("─" * 88)
+    for pkey in sorted(by_period.keys(), reverse=True):
+        d = by_period[pkey]
+        p_start = datetime.strptime(pkey, "%Y-%m-%d").replace(tzinfo=TZ)
+        p_end = p_start + timedelta(weeks=1)
+        start_label = p_start.strftime("%b %d")
+        if pkey == current_period_key:
+            end_label = "now"
+            marker = "\033[1m▶\033[0m"
+        else:
+            end_label = (p_end - timedelta(days=1)).strftime("%b %d")
+            marker = " "
+        label = f"{marker} {start_label} – {end_label}"
+        # ANSI bold on ▶ row adds non-printable chars; pad accordingly
+        pad = 22 if pkey != current_period_key else 30
+        print(f"{label:<{pad}} {fmt(d['input']):>12} {fmt(d['output']):>12} {fmt(d['cache_write']):>12} {fmt(d['cache_read']):>12} {usd(d['cost']):>10} {d['turns']:>6}")
+    print("─" * 88)
+    print(f"\033[1m{'Total':<22} {fmt(total['input']):>12} {fmt(total['output']):>12} {fmt(total['cache_write']):>12} {fmt(total['cache_read']):>12} {usd(total['cost']):>10} {total['turns']:>6}\033[0m")
     print()
 
 # Model breakdown
@@ -527,7 +549,7 @@ if switches_for_display:
         print(f"  \033[2m{s['ts']}\033[0m  {s['from']} -> \033[1m{s['to']}\033[0m")
     print()
 
-if not by_date:
+if not by_period:
     print("\033[2mNo session data found for this period.\033[0m")
 PYEOF
 }
@@ -646,7 +668,7 @@ cmd_start() {
         return
     fi
 
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-6[1m]")
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-8[1m]")
     local resume=false
     local resume_val=""
     local no_bridge=false
@@ -1037,19 +1059,17 @@ history_file = sys.argv[2]
 projects_dir = sys.argv[3]
 num_weeks = int(sys.argv[4])
 
-# ── Billing week: resets Tuesday 4pm Eastern ─────────────────────────
-# US Eastern = UTC-5 (EST) or UTC-4 (EDT). Use system local for display.
+# ── Billing week: resets Thursday 6am Europe/Berlin ──────────────────
 from zoneinfo import ZoneInfo
-ET = ZoneInfo("America/New_York")
+TZ = ZoneInfo("Europe/Berlin")
 
 def billing_week_start(dt):
-    """Find the most recent Tuesday 4pm ET before dt."""
-    dt_et = dt.astimezone(ET)
-    # Walk back to Tuesday
-    days_since_tue = (dt_et.weekday() - 1) % 7  # Tuesday = 1
-    tue = dt_et - timedelta(days=days_since_tue)
-    reset = tue.replace(hour=16, minute=0, second=0, microsecond=0)
-    if dt_et < reset:
+    """Find the most recent Thursday 6:00 AM Europe/Berlin before dt."""
+    dt_tz = dt.astimezone(TZ)
+    days_since_thu = (dt_tz.weekday() - 3) % 7  # Thursday = 3
+    thu = dt_tz - timedelta(days=days_since_thu)
+    reset = thu.replace(hour=6, minute=0, second=0, microsecond=0)
+    if dt_tz < reset:
         reset -= timedelta(days=7)
     return reset
 
@@ -1113,8 +1133,6 @@ def record_turn(ts, model, usage):
 session_files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
 
 for sf in session_files:
-    if "/subagents/" in sf:
-        continue
     try:
         with open(sf) as f:
             lines = f.readlines()
@@ -1312,7 +1330,7 @@ has_peaks = any(
 )
 
 # ── Print billing week breakdown ─────────────────────────────────────
-print(f"\033[1mBilling Weeks\033[0m  \033[2m(resets Tue 4pm ET)\033[0m")
+print(f"\033[1mBilling Weeks\033[0m  \033[2m(resets Thu 6am)\033[0m")
 print()
 
 if has_peaks:
@@ -1324,16 +1342,16 @@ else:
 
 sorted_weeks = sorted(week_data.items(), key=lambda x: x[0], reverse=True)
 for i, (key, wd) in enumerate(sorted_weeks):
-    start_et = wd["start"].astimezone(ET)
-    end_et = wd["end"].astimezone(ET)
+    start_tz = wd["start"].astimezone(TZ)
+    end_tz = wd["end"].astimezone(TZ)
     wp = week_peaks.get(key, {})
 
     if i == 0:
         label = f"This week"
-        sublabel = f"  {start_et.strftime('%b %d')} – now"
+        sublabel = f"  {start_tz.strftime('%b %d')} – now"
     else:
         label = f"{i} week{'s' if i > 1 else ''} ago"
-        sublabel = f"  {start_et.strftime('%b %d')} – {end_et.strftime('%b %d')}"
+        sublabel = f"  {start_tz.strftime('%b %d')} – {end_tz.strftime('%b %d')}"
 
     if has_peaks:
         p5 = wp.get("peak_five_hour")
@@ -2239,7 +2257,7 @@ _shortcut_jump() {
     fi
 
     # Build claude flags. CLI args override the shortcut's resume/prompt settings.
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-6[1m]")
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-8[1m]")
     local cli_resume=false
     local cli_resume_val=""
     local cli_prompt=""
