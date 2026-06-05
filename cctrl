@@ -44,6 +44,34 @@ _profile_exists() {
     [[ -f "$(_profile_path "$1")" ]]
 }
 
+# Export a profile's `env` block into the current process so the subsequent
+# `exec claude` inherits it. Values are base64-encoded through jq so multi-line
+# values and embedded spaces (e.g. Portkey ANTHROPIC_CUSTOM_HEADERS) survive
+# intact. Tab separates key from value. No-op if the file/env block is absent.
+_apply_profile_overlay() {
+    local pf="${1:-}"
+    [[ -n "$pf" && -f "$pf" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    local key valb64 val
+    while IFS=$'\t' read -r key valb64; do
+        [[ -n "$key" ]] || continue
+        # base64 -d (GNU/newer macOS) with -D fallback (older BSD/macOS).
+        val="$(printf '%s' "$valb64" | base64 -d 2>/dev/null || printf '%s' "$valb64" | base64 -D 2>/dev/null)"
+        export "$key=$val"
+    done < <(jq -r '(.env // {}) | to_entries[] | "\(.key)\t\(.value|tostring|@base64)"' "$pf")
+}
+
+# Resolve the launch model. Precedence: explicit CLI --model > profile .model >
+# empty (omit --model entirely and let Claude Code use its own default).
+#   $1 = cli_model (may be empty), $2 = profile_file (may be empty)
+_resolve_model() {
+    local cli="${1:-}" pf="${2:-}"
+    if [[ -n "$cli" ]]; then printf '%s' "$cli"; return; fi
+    if [[ -n "$pf" && -f "$pf" ]] && command -v jq >/dev/null 2>&1; then
+        jq -r '.model // empty' "$pf" 2>/dev/null
+    fi
+}
+
 _log_event() {
     mkdir -p "$COSTS_DIR"
     local json="$1"
@@ -85,23 +113,13 @@ _remote_prefix() {
 }
 
 _detect_active() {
-    if [[ ! -f "$SETTINGS" ]]; then
-        echo "none"
-        return
-    fi
-    for f in "$PROFILES_DIR"/*.json; do
-        [[ -f "$f" ]] || continue
-        local name
-        name="$(basename "$f" .json)"
-        if diff -q <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$f" 2>/dev/null) &>/dev/null; then
-            echo "$name"
-            return
-        fi
-    done
+    # Profiles are overlays (model + env), not full settings snapshots, so a
+    # whole-file match against the intentionally-richer global settings.json is
+    # no longer meaningful. The active profile is whatever `cctrl use` recorded.
     if [[ -f "$ACTIVE_FILE" ]]; then
         cat "$ACTIVE_FILE"
     else
-        echo "unknown"
+        echo "none"
     fi
 }
 
@@ -131,12 +149,33 @@ cmd_use() {
         return 0
     fi
 
-    cp "$(_profile_path "$name")" "$SETTINGS"
+    # Overlay the profile's model + env onto the existing global settings.json
+    # (non-destructive: hooks, permissions, mcpServers, etc. are preserved).
+    # Note: env is merged, so switching profiles cannot UNSET a key a prior
+    # profile added. For clean per-session auth, prefer `cctrl start --profile`.
+    local pf tmp
+    pf="$(_profile_path "$name")"
+    tmp="$(mktemp)"
+    if [[ -f "$SETTINGS" ]]; then
+        jq -s '.[0] as $g | .[1] as $p
+               | $g + {model: ($p.model // $g.model),
+                       env: (($g.env // {}) + ($p.env // {}))}' \
+            "$SETTINGS" "$pf" > "$tmp"
+    else
+        mkdir -p "$(dirname "$SETTINGS")"
+        jq '{model, env}' "$pf" > "$tmp"
+    fi
+    if [[ -s "$tmp" ]]; then
+        mv "$tmp" "$SETTINGS"
+    else
+        rm -f "$tmp"
+        echo -e "${RED}Failed to merge profile into settings.${RESET}"; return 1
+    fi
     echo "$name" > "$ACTIVE_FILE"
     _log_switch "$prev" "$name"
 
     echo -e "${GREEN}Switched to profile: ${BOLD}$name${RESET}"
-    echo -e "${DIM}Settings written to $SETTINGS${RESET}"
+    echo -e "${DIM}Merged model + env into $SETTINGS${RESET}"
     echo -e "${YELLOW}Restart Claude Code for changes to take effect.${RESET}"
 }
 
@@ -178,8 +217,9 @@ cmd_current() {
         echo -e "${DIM}model: $model${RESET}"
 
         if [[ -f "$SETTINGS" ]]; then
-            if ! diff -q <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$(_profile_path "$active")" 2>/dev/null) &>/dev/null; then
-                echo -e "${YELLOW}Note: settings.json has been modified since last switch${RESET}"
+            local sub='{model: (.model // null), env: (.env // {})}'
+            if ! diff -q <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(jq -S "$sub" "$(_profile_path "$active")" 2>/dev/null) &>/dev/null; then
+                echo -e "${YELLOW}Note: live model/env differ from profile '${active}'${RESET}"
             fi
         fi
     fi
@@ -203,9 +243,11 @@ cmd_save() {
         [[ "$confirm" =~ ^[yY]$ ]] || return 1
     fi
 
-    cp "$SETTINGS" "$(_profile_path "$name")"
+    # Capture only the overlay-relevant keys (model + env), not the whole
+    # settings.json — profiles are auth/model overlays, not full snapshots.
+    jq '{model: (.model // null), env: (.env // {})}' "$SETTINGS" > "$(_profile_path "$name")"
     echo "$name" > "$ACTIVE_FILE"
-    echo -e "${GREEN}Saved current settings as profile: ${BOLD}$name${RESET}"
+    echo -e "${GREEN}Saved current model + env as profile: ${BOLD}$name${RESET}"
 }
 
 cmd_diff() {
@@ -220,10 +262,13 @@ cmd_diff() {
         return 1
     fi
 
+    # Compare only the overlay subset (model + env); global settings.json
+    # carries hooks/permissions/mcpServers a profile intentionally does not.
+    local sub='{model: (.model // null), env: (.env // {})}'
     if command -v delta &>/dev/null; then
-        delta <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$(_profile_path "$name")" 2>/dev/null) || true
+        delta <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(jq -S "$sub" "$(_profile_path "$name")" 2>/dev/null) || true
     else
-        diff --color=auto <(jq -S . "$SETTINGS" 2>/dev/null) <(jq -S . "$(_profile_path "$name")" 2>/dev/null) || true
+        diff --color=auto <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(jq -S "$sub" "$(_profile_path "$name")" 2>/dev/null) || true
     fi
 }
 
@@ -668,14 +713,23 @@ cmd_start() {
         return
     fi
 
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-8[1m]")
     local resume=false
     local resume_val=""
     local no_bridge=false
+    local profile=""
+    local cli_model=""
     local passthrough=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --profile)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
+                profile="$2"; shift 2
+                ;;
+            --model)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--model needs a value${RESET}"; return 1; }
+                cli_model="$2"; shift 2
+                ;;
             --resume|-r)
                 resume=true
                 # Check if next arg is a value (not another flag)
@@ -699,6 +753,28 @@ cmd_start() {
                 ;;
         esac
     done
+
+    # Resolve profile: explicit --profile wins; else fall back to the last
+    # `cctrl use` profile if recorded. Empty = no overlay (Claude's own default).
+    # Explicit --profile is concurrency-safe: it never touches global state.
+    if [[ -z "$profile" ]]; then
+        local active; active="$(_active_profile)"
+        [[ "$active" != "unknown" ]] && profile="$active"
+    fi
+    local pf=""
+    if [[ -n "$profile" ]]; then
+        if _profile_exists "$profile"; then
+            pf="$(_profile_path "$profile")"
+        else
+            echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
+        fi
+    fi
+    _apply_profile_overlay "$pf"
+
+    # Model precedence: CLI --model > profile .model > omit (Claude's default).
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control")
+    local mdl; mdl="$(_resolve_model "$cli_model" "$pf")"
+    [[ -n "$mdl" ]] && flags+=("--model" "$mdl")
 
     if $no_bridge; then
         flags=("${flags[@]/--remote-control}")
@@ -2240,29 +2316,27 @@ _shortcut_jump() {
         return 1
     fi
 
-    # Optional profile switch
+    # Apply the shortcut's profile as a per-process overlay (env + model). No
+    # global-settings mutation: concurrent shortcuts with different profiles stay
+    # independent and there's no launch race on ~/.claude/settings.json.
+    local pf=""
     if [[ -n "$profile" ]]; then
-        if ! _profile_exists "$profile"; then
-            echo -e "${YELLOW}Profile '$profile' not found; skipping switch.${RESET}"
+        if _profile_exists "$profile"; then
+            pf="$(_profile_path "$profile")"
         else
-            local active
-            active="$(_active_profile)"
-            if [[ "$active" != "$profile" ]]; then
-                cp "$(_profile_path "$profile")" "$SETTINGS"
-                echo "$profile" > "$ACTIVE_FILE"
-                _log_switch "$active" "$profile"
-                echo -e "${GREEN}Switched profile: ${BOLD}$profile${RESET}"
-            fi
+            echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
         fi
     fi
+    _apply_profile_overlay "$pf"
 
     # Build claude flags. CLI args override the shortcut's resume/prompt settings.
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control" "--model" "claude-opus-4-8[1m]")
+    local flags=("--permission-mode" "bypassPermissions" "--remote-control")
     local cli_resume=false
     local cli_resume_val=""
     local cli_prompt=""
     local cli_prompt_set=false
     local no_bridge=false
+    local cli_model=""
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2280,6 +2354,9 @@ _shortcut_jump() {
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
                 passthrough+=("--name" "$2"); shift 2 ;;
+            --model)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--model needs a value${RESET}"; return 1; }
+                cli_model="$2"; shift 2 ;;
             --)
                 shift
                 # Everything after -- is a literal prompt (joined by space)
@@ -2291,6 +2368,10 @@ _shortcut_jump() {
                 passthrough+=("$1"); shift ;;
         esac
     done
+
+    # Model precedence: CLI --model > profile .model > omit (Claude's default).
+    local mdl; mdl="$(_resolve_model "$cli_model" "$pf")"
+    [[ -n "$mdl" ]] && flags+=("--model" "$mdl")
 
     if $no_bridge; then
         flags=("${flags[@]/--remote-control}")

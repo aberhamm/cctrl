@@ -29,17 +29,35 @@ ln -s ~/.local/share/cctrl/cctrl ~/.local/bin/cctrl
 
 ## Profiles
 
-Each profile is a complete `~/.claude/settings.json` snapshot stored in `profiles/`. Swap between different API keys, models, hooks, or permission sets.
+Each profile is a **model + env overlay** stored in `profiles/` (e.g. one routed
+through an API gateway, one on your subscription). Shared settings — hooks,
+permissions, MCP servers, statusline — live once in `~/.claude/settings.json`;
+profiles only carry what differs (`model` and the `env` block).
+
+The concurrency-safe way to use a profile is to pick it at launch:
 
 ```bash
-cctrl ls                  # list profiles (* = active)
-cctrl use <profile>       # switch to a profile
-cctrl current             # show active profile + drift detection
-cctrl save <name>         # snapshot current settings as a new profile
-cctrl diff <profile>      # diff current settings vs a profile
+cctrl start --profile work        # launch with work's model + env, this session only
+cctrl start --profile personal    # a second window can use a different profile at the same time
+cctrl @myapp                       # a shortcut applies its profile the same way
+```
+
+`--profile` injects the profile's `env` into the launched process and passes its
+`model` as `--model` (CLI `--model` still wins). It does **not** touch global
+state, so two windows can run different profiles simultaneously without conflict.
+
+```bash
+cctrl ls                  # list profiles (* = active default)
+cctrl use <profile>       # set a profile as the global default (merges its model+env into settings.json)
+cctrl current             # show active default + model/env drift
+cctrl save <name>         # capture current model+env as a new profile
+cctrl diff <profile>      # diff current model+env vs a profile
 cctrl rename <old> <new>  # rename a profile
 cctrl edit <profile>      # open in $EDITOR
 ```
+
+> `cctrl use` merges (non-destructive) but cannot *unset* an env key a prior
+> profile added — for clean per-session auth switching, prefer `cctrl start --profile`.
 
 ## Sessions
 
