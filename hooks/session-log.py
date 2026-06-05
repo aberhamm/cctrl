@@ -9,6 +9,7 @@ updated totals. This way, only the final snapshot per session persists.
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,16 +25,17 @@ def get_active_profile():
     return "unknown"
 
 
-def find_latest_session():
-    """Find the most recently modified session JSONL (non-subagent)."""
+def find_recent_sessions(max_age_seconds=120):
+    """Find all session JSONL files modified within the last max_age_seconds."""
+    now = time.time()
     candidates = []
     for p in CLAUDE_PROJECTS.rglob("*.jsonl"):
-        if "subagents" in str(p):
+        try:
+            if now - p.stat().st_mtime <= max_age_seconds:
+                candidates.append(p)
+        except OSError:
             continue
-        candidates.append(p)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return candidates
 
 
 def sum_session_tokens(session_path):
@@ -94,59 +96,56 @@ def _flush(assistant_entry, totals, by_model):
     by_model[model]["output_tokens"] += usage.get("output_tokens", 0)
 
 
-def upsert_entry(entry):
-    """Write entry to spending log. If the last line is the same session, replace it."""
-    SPENDING_LOG.parent.mkdir(parents=True, exist_ok=True)
+def main():
+    recent = find_recent_sessions()
+    if not recent:
+        return
 
+    profile = get_active_profile()
+
+    SPENDING_LOG.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     if SPENDING_LOG.exists():
         with open(SPENDING_LOG) as f:
             lines = f.readlines()
 
-    # Check if the last line is a session_update for the same session
-    replaced = False
-    if lines:
-        try:
-            last = json.loads(lines[-1])
-            if (last.get("event") in ("session_update", "session_end")
-                    and last.get("session_id") == entry["session_id"]):
-                lines[-1] = json.dumps(entry) + "\n"
-                replaced = True
-        except (json.JSONDecodeError, IndexError):
-            pass
+    for session_path in recent:
+        session_id, totals, by_model = sum_session_tokens(session_path)
 
-    if not replaced:
-        lines.append(json.dumps(entry) + "\n")
+        if totals["input_tokens"] == 0 and totals["output_tokens"] == 0:
+            continue
+
+        entry_line = json.dumps({
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "event": "session_update",
+            "profile": profile,
+            "session_id": session_id,
+            "session_file": str(session_path),
+            "input_tokens": totals["input_tokens"],
+            "output_tokens": totals["output_tokens"],
+            "cache_write_tokens": totals["cache_creation_input_tokens"],
+            "cache_read_tokens": totals["cache_read_input_tokens"],
+            "models": by_model,
+        }) + "\n"
+
+        replaced = False
+        search_start = max(0, len(lines) - 100)
+        for i in range(len(lines) - 1, search_start - 1, -1):
+            try:
+                existing = json.loads(lines[i])
+                if (existing.get("event") in ("session_update", "session_end")
+                        and existing.get("session_id") == session_id):
+                    lines[i] = entry_line
+                    replaced = True
+                    break
+            except (json.JSONDecodeError, IndexError):
+                continue
+
+        if not replaced:
+            lines.append(entry_line)
 
     with open(SPENDING_LOG, "w") as f:
         f.writelines(lines)
-
-
-def main():
-    session_path = find_latest_session()
-    if not session_path:
-        return
-
-    profile = get_active_profile()
-    session_id, totals, by_model = sum_session_tokens(session_path)
-
-    if totals["input_tokens"] == 0 and totals["output_tokens"] == 0:
-        return
-
-    entry = {
-        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "event": "session_update",
-        "profile": profile,
-        "session_id": session_id,
-        "session_file": str(session_path),
-        "input_tokens": totals["input_tokens"],
-        "output_tokens": totals["output_tokens"],
-        "cache_write_tokens": totals["cache_creation_input_tokens"],
-        "cache_read_tokens": totals["cache_read_input_tokens"],
-        "models": by_model,
-    }
-
-    upsert_entry(entry)
 
 
 if __name__ == "__main__":
