@@ -32,7 +32,7 @@ _active_profile() {
     if [[ -f "$ACTIVE_FILE" ]]; then
         cat "$ACTIVE_FILE"
     else
-        echo "unknown"
+        echo "personal"
     fi
 }
 
@@ -758,8 +758,7 @@ cmd_start() {
     # `cctrl use` profile if recorded. Empty = no overlay (Claude's own default).
     # Explicit --profile is concurrency-safe: it never touches global state.
     if [[ -z "$profile" ]]; then
-        local active; active="$(_active_profile)"
-        [[ "$active" != "unknown" ]] && profile="$active"
+        profile="$(_active_profile)"
     fi
     local pf=""
     if [[ -n "$profile" ]]; then
