@@ -1013,7 +1013,7 @@ _session_list() {
         if [[ "$cmd" == *claude* || "$cmd" == *codex* ]]; then
             [[ "$cmd" == *codex* ]] && agent="codex" || agent="claude"
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
-            model="$(printf '%s' "$cmd" | grep -oE '\-\-model [^ ]+' | awk '{print $2}')"
+            model="$(printf '%s' "$cmd" | grep -oE -- '--model(=| )[^ ]+' | head -1 | sed -E 's/^--model[= ]//' || true)"
             model="${model#claude-}"; model="${model%%\[*}"
             [[ -z "$model" ]] && model="?"
             kind="$agent ($model)"

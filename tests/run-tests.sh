@@ -33,21 +33,56 @@ make_fake_tmux() {
     local path="$1"
     cat > "$path" <<'SH'
 #!/usr/bin/env bash
-{
-    printf 'TMUX'
-    for arg in "$@"; do
-        printf ' %q' "$arg"
-    done
-    printf '\n'
-} >> "${TMUX_LOG:?}"
+if [[ -n "${TMUX_LOG:-}" ]]; then
+    {
+        printf 'TMUX'
+        for arg in "$@"; do
+            printf ' %q' "$arg"
+        done
+        printf '\n'
+    } >> "$TMUX_LOG"
+fi
 if [[ "${1:-}" == "new-session" ]]; then
     printf 'SHELL_CMD=%s\n' "${@: -1}" >> "${TMUX_LOG:?}"
 fi
 
 case "${1:-}" in
     has-session) exit 1 ;;
+    list-sessions)
+        printf 'demo\n'
+        exit 0
+        ;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then
+            printf '/tmp/demo\n'
+        else
+            printf '12345\n'
+        fi
+        exit 0
+        ;;
+    display-message)
+        printf '0\n'
+        exit 0
+        ;;
+    show-option)
+        printf '1\n'
+        exit 0
+        ;;
     *) exit 0 ;;
 esac
+SH
+    chmod +x "$path"
+}
+
+make_fake_ps() {
+    local path="$1"
+    cat > "$path" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *12345* ]]; then
+    printf 'codex --yolo\n'
+    exit 0
+fi
+exec /bin/ps "$@"
 SH
     chmod +x "$path"
 }
@@ -114,6 +149,17 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
 }
 
+test_session_list_codex_default_model() {
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+
+    local out
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"name": "demo"'
+    assert_contains "$out" '"agent": "codex"'
+    assert_contains "$out" '"model": "?"'
+}
+
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
     local claude_dir="$base/claude/projects/-Users-matthew--projects-demo"
@@ -149,6 +195,7 @@ JSONL
 test_syntax
 test_launch_args
 test_detached_arg_parsing
+test_session_list_codex_default_model
 test_usage_cost_fixtures
 
 echo "ok"
