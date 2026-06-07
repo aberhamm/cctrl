@@ -101,15 +101,15 @@ A launch is described by three independent axes:
 | --- | --- | --- |
 | **Location** | which machine runs it? | `--host <alias>` (default: local) |
 | **Durability** | does it survive disconnect? | `-d` / `--detach` (default: foreground) |
-| **Agent** | which CLI runs? | `--agent claude` (default) or `--agent codex` |
+| **Agent** | which CLI runs? | `--agent codex` (default for now) or `--agent claude` |
 | **Bridge** | can the phone app drive it? | Claude only, on by default; `--no-bridge` to disable |
 
 There's **one launch verb — `start`** — and the flags above pick the behavior. Managing detached sessions (list/attach/kill) lives under `cctrl session`.
 
 ```bash
-cctrl start                       # foreground, current dir, phone bridge on
-cctrl start --agent codex         # launch Codex instead of Claude
-cctrl --agent codex start         # same, useful with global flags
+cctrl start                       # foreground, current dir, Codex by default
+cctrl start --agent claude        # launch Claude instead of Codex
+cctrl --agent claude start        # same, useful with global flags
 cctrl start --resume              # resume a session (interactive picker)
 cctrl start --yolo                # full bypass: Claude bypassPermissions / Codex --yolo
 cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
@@ -117,7 +117,7 @@ cctrl start -m "fix bug"          # launch with an initial prompt
 cctrl start --no-bridge           # launch without the phone-control bridge
 ```
 
-`cctrl start` launches `claude` by default with the phone-control bridge and a session name prefix based on the current git repo. `--agent codex` launches `codex` instead. Multiple detached sessions in the same folder get unique suffixes (e.g. `homelab--2`).
+`cctrl start` launches the default agent from `data/config.json`; it is currently set to `codex`. Use `--agent claude` when you want Claude Code and its phone-control bridge. Multiple detached sessions in the same folder get unique suffixes (e.g. `homelab--2`).
 
 ### Detached sessions
 

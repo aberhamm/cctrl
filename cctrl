@@ -12,6 +12,7 @@ COSTS_DIR="$SCRIPT_DIR/costs"
 SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
 HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
+CONFIG_FILE="$SCRIPT_DIR/data/config.json"
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -48,7 +49,21 @@ _profile_exists() {
 }
 
 _default_agent() {
-    printf '%s' "${CCTRL_AGENT:-claude}"
+    if [[ -n "${CCTRL_AGENT:-}" ]]; then
+        printf '%s' "$CCTRL_AGENT"
+        return
+    fi
+
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        local configured
+        configured="$(jq -r '.defaultAgent // .default_agent // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+        case "$(printf '%s' "$configured" | tr '[:upper:]' '[:lower:]')" in
+            claude|claude-code) printf 'claude'; return ;;
+            codex|openai)       printf 'codex'; return ;;
+        esac
+    fi
+
+    printf 'claude'
 }
 
 _normalize_agent() {
@@ -1131,7 +1146,7 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Session${RESET} ${DIM}(one verb; flags pick foreground vs detached)${RESET}"
     echo "  cctrl start [@name]         Launch the selected agent in the foreground (current dir, or shortcut)"
-    echo "    --agent claude|codex      Select runtime (default: ${CCTRL_AGENT:-claude})"
+    echo "    --agent claude|codex      Select runtime (default: $(_default_agent))"
     echo "    -d, --detach              Run in a detached tmux session (survives SSH disconnect)"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
     echo "    -n, --name NAME           Set the session display name"

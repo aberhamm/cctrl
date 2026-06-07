@@ -86,6 +86,11 @@ test_launch_args() {
     assert_contains "$out" "ARG[2]=--model"
     assert_contains "$out" "ARG[3]=sonnet"
     assert_contains "$out" "ARG[4]=fix bug"
+
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start -m "default agent")"
+    assert_contains "$out" "CMD=codex"
+    assert_contains "$out" "ARG[0]=--yolo"
+    assert_contains "$out" "ARG[1]=default agent"
 }
 
 test_detached_arg_parsing() {
