@@ -632,21 +632,22 @@ def print_usage(argv):
     week_peaks = {}
     for w_start, w_end in weeks:
         key = w_start.strftime("%Y-%m-%d")
-        week_data[key] = {**empty_totals(), "start": w_start, "end": w_end}
-        week_peaks[key] = {"peak_five_hour": None, "peak_seven_day": None}
+        week_data[key] = {"start": w_start, "end": w_end, "agents": {}}
+        week_peaks[key] = {}
 
     def record(rec):
         usage = rec["usage"]
         cost = estimate_cost(rec["agent"], rec["model"], usage)
         for key, wd in week_data.items():
             if wd["start"] <= rec["ts"] < wd["end"]:
-                wd["input"] += usage["input"]
-                wd["output"] += usage["output"]
-                wd["cache_write"] += usage["cache_write"]
-                wd["cache_read"] += usage["cache_read"]
-                wd["reasoning"] += usage.get("reasoning", 0)
-                wd["cost"] += cost
-                wd["turns"] += 1
+                agent_data = wd["agents"].setdefault(rec["agent"], empty_totals())
+                agent_data["input"] += usage["input"]
+                agent_data["output"] += usage["output"]
+                agent_data["cache_write"] += usage["cache_write"]
+                agent_data["cache_read"] += usage["cache_read"]
+                agent_data["reasoning"] += usage.get("reasoning", 0)
+                agent_data["cost"] += cost
+                agent_data["turns"] += 1
                 return
 
     latest_codex_rate = [None]
@@ -661,14 +662,15 @@ def print_usage(argv):
                 continue
             primary = rate_limits.get("primary") or {}
             secondary = rate_limits.get("secondary") or {}
+            peaks = week_peaks[key].setdefault("codex", {"peak_five_hour": None, "peak_seven_day": None})
             if primary.get("used_percent") is not None:
-                cur = week_peaks[key]["peak_five_hour"]
+                cur = peaks["peak_five_hour"]
                 val = float(primary.get("used_percent") or 0)
-                week_peaks[key]["peak_five_hour"] = max(cur, val) if cur is not None else val
+                peaks["peak_five_hour"] = max(cur, val) if cur is not None else val
             if secondary.get("used_percent") is not None:
-                cur = week_peaks[key]["peak_seven_day"]
+                cur = peaks["peak_seven_day"]
                 val = float(secondary.get("used_percent") or 0)
-                week_peaks[key]["peak_seven_day"] = max(cur, val) if cur is not None else val
+                peaks["peak_seven_day"] = max(cur, val) if cur is not None else val
             break
 
     load_claude_peak_history(history_file, week_data, week_peaks, oldest_cutoff)
@@ -687,21 +689,23 @@ def print_usage(argv):
         print()
 
     has_peaks = any(
-        wp["peak_five_hour"] is not None or wp["peak_seven_day"] is not None
+        ap["peak_five_hour"] is not None or ap["peak_seven_day"] is not None
         for wp in week_peaks.values()
+        for ap in wp.values()
     )
 
     print("\033[1mBilling Weeks\033[0m  \033[2m(resets Thu 6am)\033[0m")
     print()
     if has_peaks:
-        print(f"\033[0;36m{'Week':<28} {'Peak 5h':>8} {'Peak 7d':>8} {'Output':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
-        print("-" * 76)
+        print(f"\033[0;36m{'Week':<24} {'Agent':<7} {'Peak 5h':>8} {'Peak 7d':>8} {'Output':>12} {'API Value':>10} {'Turns':>6}\033[0m")
+        print("-" * 82)
     else:
-        print(f"\033[0;36m{'Week':<28} {'Output':>12} {'Input':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
-        print("-" * 84)
+        print(f"\033[0;36m{'Week':<24} {'Agent':<7} {'Output':>12} {'Input':>12} {'Cache Read':>12} {'API Value':>10} {'Turns':>6}\033[0m")
+        print("-" * 92)
 
     sorted_weeks = sorted(week_data.items(), key=lambda x: x[0], reverse=True)
-    for _, wd in sorted_weeks:
+    agent_order = ["claude", "codex"]
+    for key, wd in sorted_weeks:
         start_tz = wd["start"].astimezone(TZ)
         end_tz = wd["end"].astimezone(TZ)
         if wd["start"] <= now < wd["end"]:
@@ -709,19 +713,44 @@ def print_usage(argv):
         else:
             label = f"  {start_tz.strftime('%b %d')} - {(end_tz - timedelta(days=1)).strftime('%b %d')}"
 
-        if has_peaks:
-            peaks = week_peaks[wd["start"].strftime("%Y-%m-%d")]
-            p5 = f"{peaks['peak_five_hour']:.0f}%" if peaks["peak_five_hour"] is not None else "-"
-            p7 = f"{peaks['peak_seven_day']:.0f}%" if peaks["peak_seven_day"] is not None else "-"
-            print(f"{label:<28} {p5:>8} {p7:>8} {fmt(wd['output']):>12} {usd(wd['cost']):>10} {wd['turns']:>6}")
-        else:
-            print(f"{label:<28} {fmt(wd['output']):>12} {fmt(wd['input']):>12} {fmt(wd['cache_read']):>12} {usd(wd['cost']):>10} {wd['turns']:>6}")
+        agents = wd["agents"]
+        ordered_agents = [a for a in agent_order if a in agents]
+        ordered_agents.extend(sorted(a for a in agents if a not in agent_order))
+        for agent in agent_order:
+            peaks = week_peaks.get(key, {}).get(agent, {})
+            if agent not in ordered_agents and (
+                peaks.get("peak_five_hour") is not None or peaks.get("peak_seven_day") is not None
+            ):
+                ordered_agents.append(agent)
+
+        for agent in ordered_agents:
+            agent_data = agents.get(agent, empty_totals())
+            peaks = week_peaks.get(key, {}).get(agent, {})
+            peak_five_hour = peaks.get("peak_five_hour")
+            peak_seven_day = peaks.get("peak_seven_day")
+            p5 = f"{peak_five_hour:.0f}%" if peak_five_hour is not None else "-"
+            p7 = f"{peak_seven_day:.0f}%" if peak_seven_day is not None else "-"
+            if has_peaks:
+                print(f"{label:<24} {agent:<7} {p5:>8} {p7:>8} {fmt(agent_data['output']):>12} {usd(agent_data['cost']):>10} {agent_data['turns']:>6}")
+            else:
+                print(f"{label:<24} {agent:<7} {fmt(agent_data['output']):>12} {fmt(agent_data['input']):>12} {fmt(agent_data['cache_read']):>12} {usd(agent_data['cost']):>10} {agent_data['turns']:>6}")
 
     print()
-    total_output = sum(wd["output"] for _, wd in sorted_weeks)
-    total_cost = sum(wd["cost"] for _, wd in sorted_weeks)
-    total_turns = sum(wd["turns"] for _, wd in sorted_weeks)
-    print(f"\033[2mShown: {fmt(total_output)} output tokens, {usd(total_cost)} estimated API-equivalent cost, {total_turns} turns.\033[0m")
+    totals_by_agent = {}
+    for _, wd in sorted_weeks:
+        for agent, agent_data in wd["agents"].items():
+            totals = totals_by_agent.setdefault(agent, empty_totals())
+            totals["output"] += agent_data["output"]
+            totals["cost"] += agent_data["cost"]
+            totals["turns"] += agent_data["turns"]
+    summaries = []
+    for agent in agent_order + sorted(a for a in totals_by_agent if a not in agent_order):
+        totals = totals_by_agent.get(agent)
+        if not totals or totals["turns"] == 0:
+            continue
+        summaries.append(f"{agent}: {fmt(totals['output'])} output, {usd(totals['cost'])} API value, {totals['turns']} turns")
+    if summaries:
+        print(f"\033[2mShown by agent: {'; '.join(summaries)}.\033[0m")
     print("\033[2mCodex ChatGPT-plan sessions may consume included plan usage instead of API billing.\033[0m")
 
 
@@ -746,12 +775,13 @@ def load_claude_peak_history(history_file, week_data, week_peaks, oldest_cutoff)
                     continue
                 fh = entry.get("five_hour")
                 sd = entry.get("seven_day")
+                peaks = week_peaks[key].setdefault("claude", {"peak_five_hour": None, "peak_seven_day": None})
                 if fh is not None:
-                    cur = week_peaks[key]["peak_five_hour"]
-                    week_peaks[key]["peak_five_hour"] = max(cur, fh) if cur is not None else fh
+                    cur = peaks["peak_five_hour"]
+                    peaks["peak_five_hour"] = max(cur, fh) if cur is not None else fh
                 if sd is not None:
-                    cur = week_peaks[key]["peak_seven_day"]
-                    week_peaks[key]["peak_seven_day"] = max(cur, sd) if cur is not None else sd
+                    cur = peaks["peak_seven_day"]
+                    peaks["peak_seven_day"] = max(cur, sd) if cur is not None else sd
                 break
 
 

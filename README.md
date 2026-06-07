@@ -218,7 +218,7 @@ cctrl costs --all django  # filter by project name
 cctrl log                 # per-session log tagged with profile
 ```
 
-`cctrl usage` shows Claude and Codex rate-limit snapshots when local data is available, plus token spend per billing week. Peak rate limit usage is tracked per week.
+`cctrl usage` shows Claude and Codex rate-limit snapshots when local data is available, plus token spend/API-equivalent value per billing week split by agent. Peak rate limit usage is tracked per week per agent.
 
 `cctrl costs` parses Claude session JSONLs from `~/.claude/projects/` and Codex session JSONLs from `~/.codex/sessions/` and `~/.codex/archived_sessions/` for detailed token breakdowns (input, output, cache write, cache read) with estimated USD. Codex costs are API-equivalent estimates; ChatGPT-plan sessions may consume included plan usage instead of API billing. No external API calls.
 

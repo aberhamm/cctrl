@@ -190,6 +190,9 @@ JSONL
     assert_contains "$out" "Codex Plan Usage"
     assert_contains "$out" "plus"
     assert_contains "$out" "Billing Weeks"
+    assert_contains "$out" "Agent"
+    assert_contains "$out" "API Value"
+    assert_contains "$out" "codex:"
 }
 
 test_syntax
