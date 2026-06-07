@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# cctrl — Claude Code Controller
+# cctrl — Coding Agent Controller
 # Manages settings profiles, tracks token usage locally, extensible via plugins.
 
 # Resolve real path (works through symlinks)
@@ -17,6 +17,9 @@ CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
 PROJECTS_DIR="$CLAUDE_DIR/projects"
 ACTIVE_FILE="$SCRIPT_DIR/.active-profile"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SESSIONS_DIR="$CODEX_DIR/sessions"
+CODEX_ARCHIVED_SESSIONS_DIR="$CODEX_DIR/archived_sessions"
 
 # Colors
 RED='\033[0;31m'
@@ -44,12 +47,87 @@ _profile_exists() {
     [[ -f "$(_profile_path "$1")" ]]
 }
 
-# Export a profile's `env` block into the current process so the subsequent
-# `exec claude` inherits it. Values are base64-encoded through jq so multi-line
-# values and embedded spaces (e.g. Portkey ANTHROPIC_CUSTOM_HEADERS) survive
-# intact. Tab separates key from value. No-op if the file/env block is absent.
+_default_agent() {
+    printf '%s' "${CCTRL_AGENT:-claude}"
+}
+
+_normalize_agent() {
+    local agent
+    agent="$(printf '%s' "${1:-claude}" | tr '[:upper:]' '[:lower:]')"
+    case "$agent" in
+        claude|claude-code) printf 'claude' ;;
+        codex|openai) printf 'codex' ;;
+        *)
+            echo -e "${RED}Unknown agent: $1${RESET}" >&2
+            echo -e "${DIM}Supported agents: claude, codex${RESET}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_agent_bin() {
+    case "$1" in
+        codex) printf 'codex' ;;
+        *)     printf 'claude' ;;
+    esac
+}
+
+_profile_model_for_agent() {
+    local agent="$1" pf="$2" model
+    [[ -n "$pf" && -f "$pf" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+
+    model="$(jq -r --arg agent "$agent" '
+        (.agents[$agent].model // .model // empty)
+    ' "$pf" 2>/dev/null)"
+    [[ -n "$model" ]] || return 0
+
+    # Existing profiles are Claude-oriented. Avoid accidentally passing a Claude
+    # model alias such as "sonnet" into Codex when the active default is reused.
+    if [[ "$agent" == "codex" ]]; then
+        case "$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')" in
+            *claude*|*sonnet*|*opus*|*haiku*|anthropic/*) return 0 ;;
+        esac
+    fi
+    printf '%s' "$model"
+}
+
+_profile_args_for_agent() {
+    local agent="$1" pf="$2"
+    [[ -n "$pf" && -f "$pf" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -r --arg agent "$agent" '
+        (.agents[$agent].args // [])
+        | if type == "array" then .[] else empty end
+        | tostring
+    ' "$pf" 2>/dev/null
+}
+
+_profile_env_entries_for_agent() {
+    local agent="$1" pf="$2"
+    [[ -n "$pf" && -f "$pf" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -r --arg agent "$agent" '
+        (has("agents")) as $has_agents
+        | (
+            if $has_agents then
+                ((.env // {}) + (.agents[$agent].env // {}))
+            elif $agent == "claude" then
+                (.env // {})
+            else
+                {}
+            end
+          )
+        | to_entries[]
+        | "\(.key)\t\(.value|tostring|@base64)"
+    ' "$pf" 2>/dev/null
+}
+
+# Export a profile's shared env plus agent-specific env into the current process
+# so the selected agent inherits it. Legacy profiles with no `agents` block keep
+# applying their top-level env to Claude only.
 _apply_profile_overlay() {
-    local pf="${1:-}"
+    local agent="${1:-claude}" pf="${2:-}"
     [[ -n "$pf" && -f "$pf" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     local key valb64 val
@@ -58,18 +136,179 @@ _apply_profile_overlay() {
         # base64 -d (GNU/newer macOS) with -D fallback (older BSD/macOS).
         val="$(printf '%s' "$valb64" | base64 -d 2>/dev/null || printf '%s' "$valb64" | base64 -D 2>/dev/null)"
         export "$key=$val"
-    done < <(jq -r '(.env // {}) | to_entries[] | "\(.key)\t\(.value|tostring|@base64)"' "$pf")
+    done < <(_profile_env_entries_for_agent "$agent" "$pf")
 }
 
-# Resolve the launch model. Precedence: explicit CLI --model > profile .model >
-# empty (omit --model entirely and let Claude Code use its own default).
-#   $1 = cli_model (may be empty), $2 = profile_file (may be empty)
+# Resolve the launch model. Precedence: explicit CLI --model > profile model >
+# empty (omit --model entirely and let the selected agent use its own default).
+#   $1 = agent, $2 = cli_model (may be empty), $3 = profile_file (may be empty)
 _resolve_model() {
-    local cli="${1:-}" pf="${2:-}"
+    local agent="${1:-claude}" cli="${2:-}" pf="${3:-}"
     if [[ -n "$cli" ]]; then printf '%s' "$cli"; return; fi
-    if [[ -n "$pf" && -f "$pf" ]] && command -v jq >/dev/null 2>&1; then
-        jq -r '.model // empty' "$pf" 2>/dev/null
+    _profile_model_for_agent "$agent" "$pf"
+}
+
+_profile_overlay_json_for_agent() {
+    local agent="$1" pf="$2"
+    [[ -n "$pf" && -f "$pf" ]] || { echo '{"model":null,"env":{}}'; return 0; }
+    command -v jq >/dev/null 2>&1 || { echo '{"model":null,"env":{}}'; return 0; }
+    jq --arg agent "$agent" '
+        if has("agents") then
+            {
+                model: (.agents[$agent].model // null),
+                env: ((.env // {}) + (.agents[$agent].env // {}))
+            }
+        elif $agent == "claude" then
+            {model: (.model // null), env: (.env // {})}
+        else
+            {model: null, env: {}}
+        end
+    ' "$pf" 2>/dev/null
+}
+
+_profile_summary() {
+    local pf="$1"
+    command -v jq >/dev/null 2>&1 || { printf 'model=unknown'; return; }
+    jq -r '
+        def model_for($a):
+            if has("agents") then
+                (.agents[$a].env.ANTHROPIC_MODEL // .agents[$a].model // empty)
+            elif $a == "claude" then
+                (.env.ANTHROPIC_MODEL // .model // empty)
+            else
+                empty
+            end;
+        def provider_for($a):
+            if has("agents") then
+                if (.agents[$a].env.CLAUDE_CODE_USE_BEDROCK // false) then "bedrock" else "direct" end
+            elif $a == "claude" then
+                if (.env.CLAUDE_CODE_USE_BEDROCK // false) then "bedrock" else "direct" end
+            else
+                "direct"
+            end;
+        [
+            (model_for("claude") as $m | if $m != "" then "claude=\($m) via=\(provider_for("claude"))" else empty end),
+            (model_for("codex") as $m | if $m != "" then "codex=\($m)" else empty end)
+        ] | if length > 0 then join("  ") else "model=default" end
+    ' "$pf" 2>/dev/null
+}
+
+_launch_apply_profile_args() {
+    local agent="$1" pf="$2" parg
+    while IFS= read -r parg; do
+        [[ -n "$parg" ]] && LAUNCH_PROFILE_ARGS+=("$parg")
+    done < <(_profile_args_for_agent "$agent" "$pf")
+
+    if [[ ${#LAUNCH_PROFILE_ARGS[@]} -eq 0 ]]; then
+        return 0
     fi
+
+    local i=0 next
+    while (( i < ${#LAUNCH_PROFILE_ARGS[@]} )); do
+        parg="${LAUNCH_PROFILE_ARGS[$i]}"
+        case "$parg" in
+            --yolo|--dangerously-bypass-approvals-and-sandbox)
+                LAUNCH_FULL_BYPASS=true
+                LAUNCH_ACCESS_EXPLICIT=true
+                ((i++))
+                ;;
+            --permission-mode)
+                if (( i + 1 >= ${#LAUNCH_PROFILE_ARGS[@]} )); then
+                    echo -e "${RED}Profile arg --permission-mode needs a value${RESET}" >&2
+                    return 1
+                fi
+                next="${LAUNCH_PROFILE_ARGS[$((i + 1))]}"
+                LAUNCH_PERMISSION_MODE="$next"
+                LAUNCH_ACCESS_EXPLICIT=true
+                ((i+=2))
+                ;;
+            --sandbox|-s|--ask-for-approval|-a)
+                if (( i + 1 >= ${#LAUNCH_PROFILE_ARGS[@]} )); then
+                    echo -e "${RED}Profile arg $parg needs a value${RESET}" >&2
+                    return 1
+                fi
+                next="${LAUNCH_PROFILE_ARGS[$((i + 1))]}"
+                LAUNCH_ACCESS_EXPLICIT=true
+                LAUNCH_FLAGS+=("$parg" "$next")
+                ((i+=2))
+                ;;
+            *)
+                LAUNCH_FLAGS+=("$parg")
+                ((i++))
+                ;;
+        esac
+    done
+}
+
+_launch_exec_agent() {
+    local agent="$1" pf="$2" cli_model="$3" launch_name="$4" no_bridge="$5"
+    local resume="$6" resume_val="$7" final_prompt="$8" bridge_dir="${9:-$PWD}"
+
+    LAUNCH_FLAGS=()
+    LAUNCH_PROFILE_ARGS=()
+    _launch_apply_profile_args "$agent" "$pf" || return 1
+
+    local mdl
+    mdl="$(_resolve_model "$agent" "$cli_model" "$pf")"
+    [[ -n "$mdl" ]] && LAUNCH_FLAGS+=("--model" "$mdl")
+
+    if [[ "$agent" == "claude" ]]; then
+        if $LAUNCH_FULL_BYPASS; then
+            LAUNCH_PERMISSION_MODE="bypassPermissions"
+        fi
+        if [[ ${#LAUNCH_FLAGS[@]} -gt 0 ]]; then
+            LAUNCH_FLAGS=("--permission-mode" "${LAUNCH_PERMISSION_MODE:-bypassPermissions}" "${LAUNCH_FLAGS[@]}")
+        else
+            LAUNCH_FLAGS=("--permission-mode" "${LAUNCH_PERMISSION_MODE:-bypassPermissions}")
+        fi
+        [[ -n "$launch_name" ]] && LAUNCH_FLAGS+=("--name" "$launch_name")
+        if [[ "$no_bridge" != "true" ]]; then
+            LAUNCH_FLAGS+=("--remote-control" "--remote-control-session-name-prefix" "$(_remote_prefix "$bridge_dir")")
+        fi
+
+        if [[ "$resume" == "true" ]]; then
+            if [[ -n "$resume_val" ]]; then
+                LAUNCH_FLAGS+=("--resume" "$resume_val")
+            else
+                LAUNCH_FLAGS+=("--resume")
+            fi
+        fi
+        [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
+        [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
+
+        echo -e "${DIM}claude ${LAUNCH_FLAGS[*]}${RESET}"
+        exec claude "${LAUNCH_FLAGS[@]}"
+    fi
+
+    if [[ -n "$LAUNCH_PERMISSION_MODE" && "$LAUNCH_PERMISSION_MODE" != "bypassPermissions" ]]; then
+        echo -e "${RED}Codex can only translate --permission-mode bypassPermissions.${RESET}" >&2
+        echo -e "${DIM}Use Codex-native flags like --sandbox and --ask-for-approval for other modes.${RESET}" >&2
+        return 1
+    fi
+
+    [[ "$LAUNCH_PERMISSION_MODE" == "bypassPermissions" ]] && LAUNCH_FULL_BYPASS=true
+    if $LAUNCH_FULL_BYPASS || ! $LAUNCH_ACCESS_EXPLICIT; then
+        if [[ ${#LAUNCH_FLAGS[@]} -gt 0 ]]; then
+            LAUNCH_FLAGS=("--yolo" "${LAUNCH_FLAGS[@]}")
+        else
+            LAUNCH_FLAGS=("--yolo")
+        fi
+    fi
+    [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
+
+    if [[ "$resume" == "true" ]]; then
+        if [[ -n "$resume_val" ]]; then
+            [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$resume_val" "$final_prompt") || LAUNCH_FLAGS+=("$resume_val")
+        else
+            [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("--last" "$final_prompt")
+        fi
+        echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]}${RESET}"
+        exec codex resume "${LAUNCH_FLAGS[@]}"
+    fi
+
+    [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
+    echo -e "${DIM}codex ${LAUNCH_FLAGS[*]}${RESET}"
+    exec codex "${LAUNCH_FLAGS[@]}"
 }
 
 _log_event() {
@@ -99,7 +338,7 @@ _session_slug() {
         name="$input"
     fi
     name="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
-    [[ -z "$name" ]] && name="claude"
+    [[ -z "$name" ]] && name="agent"
     if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
         printf '%s--%s' "$CCTRL_HOST_PREFIX" "$name"
     else
@@ -149,7 +388,7 @@ cmd_use() {
         return 0
     fi
 
-    # Overlay the profile's model + env onto the existing global settings.json
+    # Overlay the profile's Claude model + env onto the existing global settings.json
     # (non-destructive: hooks, permissions, mcpServers, etc. are preserved).
     # Note: env is merged, so switching profiles cannot UNSET a key a prior
     # profile added. For clean per-session auth, prefer `cctrl start --profile`.
@@ -160,10 +399,10 @@ cmd_use() {
         jq -s '.[0] as $g | .[1] as $p
                | $g + {model: ($p.model // $g.model),
                        env: (($g.env // {}) + ($p.env // {}))}' \
-            "$SETTINGS" "$pf" > "$tmp"
+            "$SETTINGS" <(_profile_overlay_json_for_agent claude "$pf") > "$tmp"
     else
         mkdir -p "$(dirname "$SETTINGS")"
-        jq '{model, env}' "$pf" > "$tmp"
+        _profile_overlay_json_for_agent claude "$pf" | jq '{model, env}' > "$tmp"
     fi
     if [[ -s "$tmp" ]]; then
         mv "$tmp" "$SETTINGS"
@@ -175,8 +414,9 @@ cmd_use() {
     _log_switch "$prev" "$name"
 
     echo -e "${GREEN}Switched to profile: ${BOLD}$name${RESET}"
-    echo -e "${DIM}Merged model + env into $SETTINGS${RESET}"
-    echo -e "${YELLOW}Restart Claude Code for changes to take effect.${RESET}"
+    echo -e "${DIM}Default CCTRL profile is now '$name'.${RESET}"
+    echo -e "${DIM}Merged Claude model + env into $SETTINGS for Claude Code compatibility.${RESET}"
+    echo -e "${YELLOW}Prefer per-session launches with: cctrl start --profile $name${RESET}"
 }
 
 cmd_ls() {
@@ -191,17 +431,13 @@ cmd_ls() {
     for f in "$PROFILES_DIR"/*.json; do
         local name
         name="$(basename "$f" .json)"
-        local model provider
-        model="$(jq -r '.env.ANTHROPIC_MODEL // .model // "default"' "$f" 2>/dev/null)"
-        provider="direct"
-        if jq -e '.env.CLAUDE_CODE_USE_BEDROCK' "$f" &>/dev/null; then
-            provider="bedrock"
-        fi
+        local summary
+        summary="$(_profile_summary "$f")"
 
         if [[ "$name" == "$active" ]]; then
-            echo -e "  ${GREEN}* ${BOLD}$name${RESET}  ${DIM}model=$model  via=$provider${RESET}"
+            echo -e "  ${GREEN}* ${BOLD}$name${RESET}  ${DIM}$summary${RESET}"
         else
-            echo -e "    $name  ${DIM}model=$model  via=$provider${RESET}"
+            echo -e "    $name  ${DIM}$summary${RESET}"
         fi
     done
 }
@@ -212,14 +448,15 @@ cmd_current() {
     echo -e "${BOLD}$active${RESET}"
 
     if _profile_exists "$active"; then
-        local model
-        model="$(jq -r '.env.ANTHROPIC_MODEL // .model // "default"' "$(_profile_path "$active")" 2>/dev/null)"
-        echo -e "${DIM}model: $model${RESET}"
+        local pf summary
+        pf="$(_profile_path "$active")"
+        summary="$(_profile_summary "$pf")"
+        echo -e "${DIM}$summary${RESET}"
 
         if [[ -f "$SETTINGS" ]]; then
             local sub='{model: (.model // null), env: (.env // {})}'
-            if ! diff -q <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(jq -S "$sub" "$(_profile_path "$active")" 2>/dev/null) &>/dev/null; then
-                echo -e "${YELLOW}Note: live model/env differ from profile '${active}'${RESET}"
+            if ! diff -q <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$pf" | jq -S "$sub" 2>/dev/null) &>/dev/null; then
+                echo -e "${YELLOW}Note: live Claude model/env differ from profile '${active}'${RESET}"
             fi
         fi
     fi
@@ -243,11 +480,11 @@ cmd_save() {
         [[ "$confirm" =~ ^[yY]$ ]] || return 1
     fi
 
-    # Capture only the overlay-relevant keys (model + env), not the whole
+    # Capture only the overlay-relevant Claude keys, not the whole
     # settings.json — profiles are auth/model overlays, not full snapshots.
-    jq '{model: (.model // null), env: (.env // {})}' "$SETTINGS" > "$(_profile_path "$name")"
+    jq '{agents: {claude: {model: (.model // null), env: (.env // {})}}}' "$SETTINGS" > "$(_profile_path "$name")"
     echo "$name" > "$ACTIVE_FILE"
-    echo -e "${GREEN}Saved current model + env as profile: ${BOLD}$name${RESET}"
+    echo -e "${GREEN}Saved current Claude model + env as profile: ${BOLD}$name${RESET}"
 }
 
 cmd_diff() {
@@ -262,13 +499,13 @@ cmd_diff() {
         return 1
     fi
 
-    # Compare only the overlay subset (model + env); global settings.json
+    # Compare only the Claude overlay subset (model + env); global settings.json
     # carries hooks/permissions/mcpServers a profile intentionally does not.
     local sub='{model: (.model // null), env: (.env // {})}'
     if command -v delta &>/dev/null; then
-        delta <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(jq -S "$sub" "$(_profile_path "$name")" 2>/dev/null) || true
+        delta <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_path "$name")" | jq -S "$sub" 2>/dev/null) || true
     else
-        diff --color=auto <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(jq -S "$sub" "$(_profile_path "$name")" 2>/dev/null) || true
+        diff --color=auto <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_path "$name")" | jq -S "$sub" 2>/dev/null) || true
     fi
 }
 
@@ -300,303 +537,13 @@ cmd_costs() {
         *)                  num_periods=4 ;;
     esac
 
-    python3 - "$PROJECTS_DIR" "$num_periods" "$project_filter" "$SPENDING_LOG" <<'PYEOF'
-import bisect, json, os, sys, glob
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from zoneinfo import ZoneInfo
-
-projects_dir = sys.argv[1]
-num_periods = int(sys.argv[2])
-project_filter = sys.argv[3] if len(sys.argv) > 3 else ""
-spending_log = sys.argv[4] if len(sys.argv) > 4 else ""
-
-TZ = ZoneInfo("Europe/Berlin")
-
-def billing_period_start(dt):
-    """Find the most recent Thursday 6:00 AM Europe/Berlin before dt."""
-    dt_tz = dt.astimezone(TZ)
-    days_since_thu = (dt_tz.weekday() - 3) % 7
-    thu = dt_tz - timedelta(days=days_since_thu)
-    reset = thu.replace(hour=6, minute=0, second=0, microsecond=0)
-    if dt_tz < reset:
-        reset -= timedelta(days=7)
-    return reset
-
-now = datetime.now(timezone.utc)
-current_period = billing_period_start(now)
-cutoff = current_period - timedelta(weeks=max(num_periods - 1, 0))
-
-# Pricing per million tokens (Anthropic API pricing)
-PRICING = {
-    "input": {
-        "opus": 15.0, "claude-opus": 15.0,
-        "sonnet": 3.0, "claude-sonnet": 3.0,
-        "haiku": 0.80, "claude-haiku": 0.80,
-    },
-    "output": {
-        "opus": 75.0, "claude-opus": 75.0,
-        "sonnet": 15.0, "claude-sonnet": 15.0,
-        "haiku": 4.0, "claude-haiku": 4.0,
-    },
-    "cache_write": {
-        "opus": 18.75, "claude-opus": 18.75,
-        "sonnet": 3.75, "claude-sonnet": 3.75,
-        "haiku": 1.0, "claude-haiku": 1.0,
-    },
-    "cache_read": {
-        "opus": 1.50, "claude-opus": 1.50,
-        "sonnet": 0.30, "claude-sonnet": 0.30,
-        "haiku": 0.08, "claude-haiku": 0.08,
-    },
-}
-
-def get_price_key(model_name):
-    """Map model ID to pricing tier."""
-    m = model_name.lower()
-    for key in ["opus", "sonnet", "haiku"]:
-        if key in m:
-            return key
-    return "sonnet"  # default
-
-def cost_for(price_key, input_t, output_t, cache_write_t, cache_read_t):
-    """Estimate cost in USD."""
-    ip = PRICING["input"].get(price_key, 3.0)
-    op = PRICING["output"].get(price_key, 15.0)
-    cwp = PRICING["cache_write"].get(price_key, 3.75)
-    crp = PRICING["cache_read"].get(price_key, 0.30)
-    return (input_t * ip + output_t * op + cache_write_t * cwp + cache_read_t * crp) / 1_000_000
-
-# ── Load spending log: switch timeline + session→profile map ─────────
-# Switch events let us infer the active profile at any timestamp.
-# session_update events give us a direct profile label per session_id.
-all_switches = []        # list of (datetime, from_profile, to_profile)
-session_profile = {}     # session_id -> profile name (from session_update events)
-switches_for_display = []
-
-if spending_log and os.path.exists(spending_log):
-    with open(spending_log) as f:
-        for line in f:
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            event = e.get("event", "")
-            if event == "switch":
-                switches_for_display.append(e)
-                try:
-                    ts = datetime.fromisoformat(e["ts"].replace("Z", "+00:00"))
-                    all_switches.append((ts, e.get("from", "unknown"), e["to"]))
-                except (KeyError, ValueError):
-                    pass
-            elif event in ("session_update", "session_end"):
-                sid = e.get("session_id")
-                prof = e.get("profile")
-                if sid and prof:
-                    session_profile[sid] = prof
-
-all_switches.sort(key=lambda x: x[0])
-switch_times = [s[0] for s in all_switches]
-
-def profile_at(ts):
-    """Return the profile name active at the given datetime.
-
-    Uses the switch timeline: for timestamps before the first recorded
-    switch, return the *from* profile of that switch (not the *to*).
-    """
-    if not all_switches:
-        return "unknown"
-    idx = bisect.bisect_right(switch_times, ts) - 1
-    if idx < 0:
-        # Before the first ever recorded switch — use its 'from' value
-        return all_switches[0][1]
-    return all_switches[idx][2]  # [2] is the 'to' profile
-
-# ── Aggregates ────────────────────────────────────────────────────────
-by_period = {}     # period_start_date -> {input, output, cache_write, cache_read, cost, turns}
-by_model = {}      # model -> {input, output, cache_write, cache_read, cost, turns}
-by_project = {}    # project_name -> {input, output, cache_write, cache_read, cost, turns}
-by_profile = {}    # profile -> {input, output, cache_write, cache_read, cost, turns}
-total = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "cost": 0.0, "turns": 0}
-
-def add_to(bucket, key, input_t, output_t, cw, cr, cost):
-    if key not in bucket:
-        bucket[key] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "cost": 0.0, "turns": 0}
-    bucket[key]["input"] += input_t
-    bucket[key]["output"] += output_t
-    bucket[key]["cache_write"] += cw
-    bucket[key]["cache_read"] += cr
-    bucket[key]["cost"] += cost
-    bucket[key]["turns"] += 1
-
-def record_turn(ts, model, usage, project_name, session_id=None):
-    period_key = billing_period_start(ts).strftime("%Y-%m-%d")
-    input_t = usage.get("input_tokens", 0)
-    output_t = usage.get("output_tokens", 0)
-    cache_write_t = usage.get("cache_creation_input_tokens", 0)
-    cache_read_t = usage.get("cache_read_input_tokens", 0)
-    price_key = get_price_key(model)
-    c = cost_for(price_key, input_t, output_t, cache_write_t, cache_read_t)
-    prof = session_profile.get(session_id) if session_id else None
-    if not prof:
-        prof = profile_at(ts)
-
-    add_to(by_period, period_key, input_t, output_t, cache_write_t, cache_read_t, c)
-    add_to(by_model, model, input_t, output_t, cache_write_t, cache_read_t, c)
-    add_to(by_project, project_name, input_t, output_t, cache_write_t, cache_read_t, c)
-    add_to(by_profile, prof, input_t, output_t, cache_write_t, cache_read_t, c)
-
-    total["input"] += input_t
-    total["output"] += output_t
-    total["cache_write"] += cache_write_t
-    total["cache_read"] += cache_read_t
-    total["cost"] += c
-    total["turns"] += 1
-
-# ── Parse session JSONL files ─────────────────────────────────────────
-session_files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
-
-for sf in session_files:
-    # Extract project name and session_id from path
-    rel = os.path.relpath(sf, projects_dir)
-    project_name = rel.split("/")[0].replace("-Users-matthew--projects-", "").replace("-Users-matthew-", "~").replace("-", "/", 1) if "/" in rel else rel.split("/")[0]
-    session_id = os.path.splitext(os.path.basename(sf))[0]
-
-    if project_filter and project_filter not in project_name:
-        continue
-
-    try:
-        with open(sf) as f:
-            lines = f.readlines()
-    except (IOError, OSError):
-        continue
-
-    prev_type = None
-    last_assistant = None
-
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        msg_type = d.get("type", "")
-        msg = d.get("message", {})
-        if not isinstance(msg, dict):
-            continue
-
-        if msg.get("role") == "assistant" and "usage" in msg:
-            last_assistant = d
-            prev_type = "assistant"
-        elif prev_type == "assistant" and last_assistant is not None:
-            a_msg = last_assistant.get("message", {})
-            usage = a_msg.get("usage", {})
-            model = a_msg.get("model", "unknown")
-            ts_ms = last_assistant.get("timestamp")
-
-            if ts_ms:
-                if isinstance(ts_ms, (int, float)):
-                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-                else:
-                    try:
-                        ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
-                    except ValueError:
-                        last_assistant = None
-                        prev_type = msg_type
-                        continue
-                if ts >= cutoff:
-                    record_turn(ts, model, usage, project_name, session_id)
-            last_assistant = None
-            prev_type = msg_type
-        else:
-            prev_type = msg_type
-
-    # Flush final assistant if file ends on one
-    if last_assistant is not None:
-        a_msg = last_assistant.get("message", {})
-        usage = a_msg.get("usage", {})
-        model = a_msg.get("model", "unknown")
-        ts_ms = last_assistant.get("timestamp")
-        if ts_ms:
-            if isinstance(ts_ms, (int, float)):
-                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            else:
-                try:
-                    ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
-                except ValueError:
-                    ts = None
-            if ts and ts >= cutoff:
-                record_turn(ts, model, usage, project_name, session_id)
-
-def fmt(n):
-    return f"{n:,}"
-
-def usd(n):
-    return f"${n:,.2f}"
-
-# ── Print results ──
-current_period_key = current_period.strftime("%Y-%m-%d")
-period_label = f"{num_periods} billing period{'s' if num_periods != 1 else ''}" if num_periods < 9999 else "all billing periods"
-print(f"\033[1mClaude Code Token Usage\033[0m  \033[2m({period_label}, resets Thu 6am)\033[0m")
-print()
-
-if by_period:
-    print(f"\033[0;36m{'Period':<22} {'Input':>12} {'Output':>12} {'Cache Write':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
-    print("─" * 88)
-    for pkey in sorted(by_period.keys(), reverse=True):
-        d = by_period[pkey]
-        p_start = datetime.strptime(pkey, "%Y-%m-%d").replace(tzinfo=TZ)
-        p_end = p_start + timedelta(weeks=1)
-        start_label = p_start.strftime("%b %d")
-        if pkey == current_period_key:
-            end_label = "now"
-            marker = "\033[1m▶\033[0m"
-        else:
-            end_label = (p_end - timedelta(days=1)).strftime("%b %d")
-            marker = " "
-        label = f"{marker} {start_label} – {end_label}"
-        # ANSI bold on ▶ row adds non-printable chars; pad accordingly
-        pad = 22 if pkey != current_period_key else 30
-        print(f"{label:<{pad}} {fmt(d['input']):>12} {fmt(d['output']):>12} {fmt(d['cache_write']):>12} {fmt(d['cache_read']):>12} {usd(d['cost']):>10} {d['turns']:>6}")
-    print("─" * 88)
-    print(f"\033[1m{'Total':<22} {fmt(total['input']):>12} {fmt(total['output']):>12} {fmt(total['cache_write']):>12} {fmt(total['cache_read']):>12} {usd(total['cost']):>10} {total['turns']:>6}\033[0m")
-    print()
-
-# Model breakdown
-if by_model:
-    print(f"\033[1mBy Model\033[0m")
-    sorted_models = sorted(by_model.items(), key=lambda x: x[1]["cost"], reverse=True)
-    for model, d in sorted_models:
-        print(f"  {model:<40} {fmt(d['input']):>10} in  {fmt(d['output']):>10} out  {usd(d['cost']):>10}  {d['turns']:>5} turns")
-    print()
-
-# Profile breakdown
-if by_profile:
-    print(f"\033[1mBy Profile\033[0m")
-    sorted_profiles = sorted(by_profile.items(), key=lambda x: x[1]["cost"], reverse=True)
-    for prof, d in sorted_profiles:
-        print(f"  {prof:<30} {fmt(d['input']):>10} in  {fmt(d['output']):>10} out  {usd(d['cost']):>10}  {d['turns']:>5} turns")
-    print()
-
-# Project breakdown (top 10)
-if by_project:
-    print(f"\033[1mBy Project\033[0m \033[2m(top 10)\033[0m")
-    sorted_projects = sorted(by_project.items(), key=lambda x: x[1]["cost"], reverse=True)[:10]
-    for proj, d in sorted_projects:
-        label = proj[:45]
-        print(f"  {label:<46} {fmt(d['input']+d['output']):>12} tokens  {usd(d['cost']):>10}  {d['turns']:>5} turns")
-    print()
-
-# Profile switch history
-if switches_for_display:
-    print(f"\033[1mRecent Profile Switches\033[0m")
-    for s in switches_for_display[-10:]:
-        print(f"  \033[2m{s['ts']}\033[0m  {s['from']} -> \033[1m{s['to']}\033[0m")
-    print()
-
-if not by_period:
-    print("\033[2mNo session data found for this period.\033[0m")
-PYEOF
+    python3 "$SCRIPT_DIR/lib/usage_costs.py" costs \
+        "$PROJECTS_DIR" \
+        "$CODEX_SESSIONS_DIR" \
+        "$CODEX_ARCHIVED_SESSIONS_DIR" \
+        "$num_periods" \
+        "$project_filter" \
+        "$SPENDING_LOG"
 }
 
 cmd_log() {
@@ -718,10 +665,21 @@ cmd_start() {
     local no_bridge=false
     local profile=""
     local cli_model=""
+    local cli_prompt=""
+    local cli_prompt_set=false
+    local agent="$(_default_agent)"
+    local launch_name=""
+    local full_bypass=false
+    local access_explicit=false
+    local permission_mode=""
     local passthrough=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --agent)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
+                agent="$2"; shift 2
+                ;;
             --profile)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
                 profile="$2"; shift 2
@@ -743,9 +701,40 @@ cmd_start() {
                 no_bridge=true
                 shift
                 ;;
+            --message|--prompt|-m)
+                [[ $# -ge 2 ]] || { echo -e "${RED}$1 needs a value${RESET}"; return 1; }
+                cli_prompt="$2"
+                cli_prompt_set=true
+                shift 2
+                ;;
+            --yolo|--dangerously-bypass-approvals-and-sandbox)
+                full_bypass=true
+                access_explicit=true
+                shift
+                ;;
+            --permission-mode)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--permission-mode needs a value${RESET}"; return 1; }
+                permission_mode="$2"
+                access_explicit=true
+                shift 2
+                ;;
+            --sandbox|-s|--ask-for-approval|-a)
+                [[ $# -ge 2 ]] || { echo -e "${RED}$1 needs a value${RESET}"; return 1; }
+                access_explicit=true
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
-                passthrough+=("--name" "$2"); shift 2
+                launch_name="$2"; shift 2
+                ;;
+            --)
+                shift
+                if [[ $# -gt 0 ]]; then
+                    cli_prompt="$*"
+                    cli_prompt_set=true
+                fi
+                break
                 ;;
             *)
                 passthrough+=("$1")
@@ -754,8 +743,10 @@ cmd_start() {
         esac
     done
 
+    agent="$(_normalize_agent "$agent")" || return 1
+
     # Resolve profile: explicit --profile wins; else fall back to the last
-    # `cctrl use` profile if recorded. Empty = no overlay (Claude's own default).
+    # `cctrl use` profile if recorded. Empty = no overlay (agent's own default).
     # Explicit --profile is concurrency-safe: it never touches global state.
     if [[ -z "$profile" ]]; then
         profile="$(_active_profile)"
@@ -768,43 +759,26 @@ cmd_start() {
             echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
         fi
     fi
-    _apply_profile_overlay "$pf"
+    _apply_profile_overlay "$agent" "$pf"
 
-    # Model precedence: CLI --model > profile .model > omit (Claude's default).
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control")
-    local mdl; mdl="$(_resolve_model "$cli_model" "$pf")"
-    [[ -n "$mdl" ]] && flags+=("--model" "$mdl")
+    local final_prompt=""
+    $cli_prompt_set && final_prompt="$cli_prompt"
 
-    if $no_bridge; then
-        flags=("${flags[@]/--remote-control}")
-        # Strip the empty slot left by the substitution
-        local cleaned=()
-        for f in "${flags[@]}"; do [[ -n "$f" ]] && cleaned+=("$f"); done
-        flags=("${cleaned[@]}")
-    else
-        flags+=("--remote-control-session-name-prefix" "$(_remote_prefix)")
-    fi
-
-    if $resume; then
-        if [[ -n "$resume_val" ]]; then
-            flags+=("--resume" "$resume_val")
-        else
-            flags+=("--resume")
-        fi
-    fi
-
-    [[ ${#passthrough[@]} -gt 0 ]] && flags+=("${passthrough[@]}")
-    echo -e "${DIM}claude ${flags[*]}${RESET}"
-    exec claude "${flags[@]}"
+    LAUNCH_FULL_BYPASS=$full_bypass
+    LAUNCH_ACCESS_EXPLICIT=$access_explicit
+    LAUNCH_PERMISSION_MODE="$permission_mode"
+    LAUNCH_PASSTHROUGH=()
+    [[ ${#passthrough[@]} -gt 0 ]] && LAUNCH_PASSTHROUGH=("${passthrough[@]}")
+    _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$resume" "$resume_val" "$final_prompt" "$PWD"
 }
 
 _launch_detached() {
     # Launch a cctrl session in a detached tmux session (survives SSH
     # disconnect). Invoked by `cctrl start -d`. No GUI — just tmux.
     #
-    # An explicit target is REQUIRED. Defaulting to $HOME would drop
-    # bypass-permissions Claude into a folder with ~/.ssh, ~/.aws, browser
-    # data, etc. Session management lives under `cctrl session`.
+    # An explicit target is REQUIRED. Defaulting to $HOME would drop a
+    # full-access agent into a folder with ~/.ssh, ~/.aws, browser data, etc.
+    # Session management lives under `cctrl session`.
 
     local target="" target_kind=""   # kind: dir | shortcut
     local passthrough=()
@@ -814,8 +788,24 @@ _launch_detached() {
                 shift ;;
             --)
                 shift
-                passthrough+=("$@")
+                passthrough+=("--" "$@")
                 break
+                ;;
+            --agent|--profile|--model|--message|--prompt|-m|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--name|-n)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}$1 needs a value${RESET}" >&2
+                    return 1
+                fi
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
+            --resume|-r)
+                passthrough+=("$1")
+                if [[ $# -gt 1 && "$2" != -* && "$2" != @* ]]; then
+                    passthrough+=("$2")
+                    shift
+                fi
+                shift
                 ;;
             @*)
                 if [[ -n "$target" ]]; then
@@ -851,19 +841,25 @@ _launch_detached() {
         echo -e "${RED}cctrl start -d requires a target.${RESET}" >&2
         echo "Usage: cctrl start -d <dir | @shortcut> [extra args]" >&2
         echo -e "${DIM}A detached session needs an explicit dir or shortcut — defaulting${RESET}" >&2
-        echo -e "${DIM}to \$HOME would drop bypass-permissions Claude into ~/.ssh, ~/.aws, etc.${RESET}" >&2
+        echo -e "${DIM}to \$HOME would drop a full-access agent into ~/.ssh, ~/.aws, etc.${RESET}" >&2
         return 1
     fi
 
-    local cctrl_q extras_q="" shell_cmd session_name display_label friendly_name
+    local cctrl_q extras_q="" env_q="" shell_cmd session_name display_label friendly_name
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
+    local env_name env_val
+    for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX; do
+        env_val="${!env_name:-}"
+        [[ -n "$env_val" ]] && env_q+=" $env_name=$(printf '%q' "$env_val")"
+    done
+    [[ -n "$env_q" ]] && env_q="${env_q# } "
     if [[ ${#passthrough[@]} -gt 0 ]]; then
         for a in "${passthrough[@]}"; do
             extras_q+=" $(printf '%q' "$a")"
         done
     fi
 
-    # Claude Code display name gets "TMUX." prefix for detached sessions
+    # Detached agent display names get a "TMUX." prefix.
     if [[ "$target_kind" == "shortcut" ]]; then
         local canonical
         canonical="$(_shortcut_lookup_key "$target")"
@@ -876,7 +872,7 @@ _launch_detached() {
         local name_q cc_name_q
         name_q="$(printf '%q' "$canonical")"
         cc_name_q="$(printf '%q' "TMUX. $friendly_name")"
-        shell_cmd="$cctrl_q @$name_q --name $cc_name_q$extras_q"
+        shell_cmd="${env_q}$cctrl_q @$name_q --name $cc_name_q$extras_q"
         session_name="$(_session_slug "$canonical")"
         display_label="@$canonical"
     else
@@ -891,7 +887,7 @@ _launch_detached() {
         local dir_q cc_name_q
         dir_q="$(printf '%q' "$dir")"
         cc_name_q="$(printf '%q' "TMUX. $friendly_name")"
-        shell_cmd="cd $dir_q && $cctrl_q start --name $cc_name_q$extras_q"
+        shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --name $cc_name_q$extras_q"
         session_name="$(_session_slug "$dir")"
         display_label="$dir"
     fi
@@ -907,6 +903,7 @@ _launch_detached() {
     fi
 
     tmux new-session -d -s "$session_name" "$shell_cmd"
+    tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
 
     echo -e "${GREEN}✓${RESET} detached session started — ${BOLD}$display_label${RESET}"
     echo -e "${DIM}  Attach:  cctrl session attach $session_name${RESET}"
@@ -930,7 +927,7 @@ cmd_session() {
         -h|--help|help)
             echo "Usage: cctrl session <ls | attach | kill>"
             echo ""
-            echo "  cctrl session ls               List sessions (dir, claude/shell, model, state)"
+            echo "  cctrl session ls               List sessions (dir, agent/shell, model, state)"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session kill <name>      Kill a session"
@@ -955,18 +952,18 @@ _session_require_tmux() {
     return 1
 }
 
-_session_claude_cmd() {
+_session_agent_cmd() {
     # Echo the foreground command of a session's pane. cctrl detaches with
-    # `exec claude`, so the pane root IS claude; fall back to first child.
+    # `exec <agent>`, so the pane root usually is the agent; fall back to first child.
     local sess="$1" pid cmd child ccmd
     pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
     [[ -n "$pid" ]] || return 0
     cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
-    if [[ "$cmd" != *claude* ]]; then
+    if [[ "$cmd" != *claude* && "$cmd" != *codex* ]]; then
         child="$(pgrep -P "$pid" 2>/dev/null | head -1)"
         if [[ -n "$child" ]]; then
             ccmd="$(ps -o command= -p "$child" 2>/dev/null)"
-            [[ "$ccmd" == *claude* ]] && cmd="$ccmd"
+            [[ "$ccmd" == *claude* || "$ccmd" == *codex* ]] && cmd="$ccmd"
         fi
     fi
     printf '%s' "$cmd"
@@ -992,21 +989,26 @@ _session_list() {
     fi
 
     local -a json_items=()
-    $json || echo -e "${DIM}✦ = cctrl-managed Claude session${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir base
+    $json || echo -e "${DIM}✦ = cctrl-managed agent session${RESET}"
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
-        cmd="$(_session_claude_cmd "$name")"
-        if [[ "$cmd" == *claude* ]]; then
-            claude_yes=true
+        cmd="$(_session_agent_cmd "$name")"
+        if [[ "$cmd" == *claude* || "$cmd" == *codex* ]]; then
+            [[ "$cmd" == *codex* ]] && agent="codex" || agent="claude"
+            [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
             model="$(printf '%s' "$cmd" | grep -oE '\-\-model [^ ]+' | awk '{print $2}')"
             model="${model#claude-}"; model="${model%%\[*}"
             [[ -z "$model" ]] && model="?"
-            kind="claude ($model)"
-            [[ "$cmd" == *"--name TMUX."* ]] && managed=true || managed=false
+            kind="$agent ($model)"
+            if [[ "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* ]]; then
+                managed=true
+            else
+                managed=false
+            fi
         else
-            claude_yes=false; managed=false; model=""
+            claude_yes=false; managed=false; model=""; agent=""
             base="${cmd%% *}"; base="${base##*/}"; base="${base#-}"
             kind="shell (${base:-sh})"
         fi
@@ -1016,9 +1018,9 @@ _session_list() {
         if $json; then
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
-                --arg model "$model" --arg state "$state" \
+                --arg model "$model" --arg state "$state" --arg agent "$agent" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached")}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached")}')")
         else
             $managed && marker="✦" || marker=" "
             printf '%s %-15s %-18s %-34s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state"
@@ -1115,6 +1117,73 @@ _session_kill() {
     fi
 }
 
+cmd_help() {
+    echo -e "${BOLD}cctrl${RESET} — agent session controller"
+    echo ""
+    echo -e "${BOLD}Profile Management${RESET}"
+    echo "  cctrl use <profile>     Switch to a settings profile (alias: switch)"
+    echo "  cctrl ls                List available profiles"
+    echo "  cctrl current           Show active profile"
+    echo "  cctrl save <name>       Save current Claude model/env as a profile"
+    echo "  cctrl diff <profile>    Diff current Claude model/env vs a profile"
+    echo "  cctrl rename <old> <new>  Rename a profile"
+    echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
+    echo ""
+    echo -e "${BOLD}Session${RESET} ${DIM}(one verb; flags pick foreground vs detached)${RESET}"
+    echo "  cctrl start [@name]         Launch the selected agent in the foreground (current dir, or shortcut)"
+    echo "    --agent claude|codex      Select runtime (default: ${CCTRL_AGENT:-claude})"
+    echo "    -d, --detach              Run in a detached tmux session (survives SSH disconnect)"
+    echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
+    echo "    -n, --name NAME           Set the session display name"
+    echo "    -m, --message TEXT        Start with an initial prompt"
+    echo "    --yolo                    Full bypass alias (Codex) / bypassPermissions (Claude)"
+    echo "    --no-bridge               Disable the phone-control bridge (on by default)"
+    echo "                              Extra flags are appended to the selected agent"
+    echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
+    echo ""
+    echo "  cctrl session ls            List sessions (dir, agent/shell, model, state; --json)"
+    echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
+    echo "  cctrl session kill <name>   Kill a detached session"
+    echo ""
+    echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
+    echo "  cctrl @<name>           Jump: cd to dir, switch profile, start selected agent"
+    echo "  cctrl @<name> -m TEXT   Open with an initial prompt (alias: --message, --prompt)"
+    echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
+    echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
+    echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
+    echo "  cctrl @rm <name>        Remove a shortcut"
+    echo "  cctrl @ edit            Open shortcuts file in \$EDITOR"
+    echo "  Extra flags after the name are passed through to the selected agent, e.g. cctrl @HomeLab --resume"
+    echo ""
+    echo -e "${BOLD}Usage Tracking${RESET}"
+    echo "  cctrl usage [weeks]     Claude/Codex rate limits + billing week breakdown (default: 2)"
+    echo "  cctrl costs [range]     Token usage and estimated API-equivalent cost by agent/model/project"
+    echo "    ranges: --today, --week, --month, --all [project-filter]"
+    echo "  cctrl log [count]       Show profile switch history"
+    echo ""
+    echo -e "${BOLD}Statusline${RESET}"
+    echo "  cctrl statusline claude install  Configure Claude Code statusLine script"
+    echo "  cctrl statusline codex install   Configure Codex TUI footer fields"
+    echo "  cctrl statusline <agent> show    Show current statusline config"
+    echo ""
+    echo -e "${BOLD}Remote Hosts${RESET}"
+    echo "  cctrl whoami                          Show this machine + which aliases mean 'local'"
+    echo "  cctrl host add <alias> <host> [user]  Register a host (use this machine's name = local)"
+    echo "  cctrl host list                       List registered hosts (marks local)"
+    echo "  cctrl host rm <alias>                 Remove a host"
+    echo "  cctrl host doctor <alias>             Check SSH, tmux, selected agent, cctrl on remote"
+    echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
+    echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
+    echo ""
+    echo -e "${BOLD}Chrome CDP${RESET}"
+    echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
+    echo "  cctrl chrome --status           Check if CDP is active"
+    echo "  cctrl chrome --port 9333        Use a different port"
+    echo "  cctrl chrome --connect          Also connect gstack browse to the session"
+    echo ""
+    echo -e "${DIM}Plugins: executable cctrl-* in $PLUGINS_DIR or PATH are auto-dispatched.${RESET}"
+}
+
 cmd_usage() {
     local weeks="${1:-2}"
     # Strip leading -- if passed as flag
@@ -1125,436 +1194,124 @@ cmd_usage() {
         *)     weeks=2 ;;
     esac
 
-    python3 - "$SCRIPT_DIR/data/rate-limits.json" "$SCRIPT_DIR/data/rate-limits-history.jsonl" "$PROJECTS_DIR" "$weeks" <<'PYEOF'
-import json, sys, os, glob
-from datetime import datetime, timedelta, timezone
-
-rate_file = sys.argv[1]
-history_file = sys.argv[2]
-projects_dir = sys.argv[3]
-num_weeks = int(sys.argv[4])
-
-# ── Billing week: resets Thursday 6am Europe/Berlin ──────────────────
-from zoneinfo import ZoneInfo
-TZ = ZoneInfo("Europe/Berlin")
-
-def billing_week_start(dt):
-    """Find the most recent Thursday 6:00 AM Europe/Berlin before dt."""
-    dt_tz = dt.astimezone(TZ)
-    days_since_thu = (dt_tz.weekday() - 3) % 7  # Thursday = 3
-    thu = dt_tz - timedelta(days=days_since_thu)
-    reset = thu.replace(hour=6, minute=0, second=0, microsecond=0)
-    if dt_tz < reset:
-        reset -= timedelta(days=7)
-    return reset
-
-now = datetime.now(timezone.utc)
-current_week_start = billing_week_start(now)
-
-# Build week boundaries going back num_weeks
-weeks = []
-for i in range(num_weeks):
-    w_start = current_week_start - timedelta(weeks=i)
-    w_end = w_start + timedelta(weeks=1)
-    weeks.append((w_start, w_end))
-
-oldest_cutoff = weeks[-1][0]
-
-# ── Pricing (same as cmd_costs) ──────────────────────────────────────
-PRICING = {
-    "input":       {"opus": 15.0, "sonnet": 3.0, "haiku": 0.80},
-    "output":      {"opus": 75.0, "sonnet": 15.0, "haiku": 4.0},
-    "cache_write": {"opus": 18.75, "sonnet": 3.75, "haiku": 1.0},
-    "cache_read":  {"opus": 1.50, "sonnet": 0.30, "haiku": 0.08},
+    python3 "$SCRIPT_DIR/lib/usage_costs.py" usage \
+        "$SCRIPT_DIR/data/rate-limits.json" \
+        "$SCRIPT_DIR/data/rate-limits-history.jsonl" \
+        "$PROJECTS_DIR" \
+        "$CODEX_SESSIONS_DIR" \
+        "$CODEX_ARCHIVED_SESSIONS_DIR" \
+        "$weeks"
 }
 
-def get_price_key(model_name):
-    m = model_name.lower()
-    for key in ["opus", "sonnet", "haiku"]:
-        if key in m:
-            return key
-    return "sonnet"
+cmd_statusline() {
+    local agent="${1:-}" action="${2:-install}"
 
-def cost_for(price_key, inp, out, cw, cr):
-    ip = PRICING["input"].get(price_key, 3.0)
-    op = PRICING["output"].get(price_key, 15.0)
-    cwp = PRICING["cache_write"].get(price_key, 3.75)
-    crp = PRICING["cache_read"].get(price_key, 0.30)
-    return (inp * ip + out * op + cw * cwp + cr * crp) / 1_000_000
+    case "$agent" in
+        claude|claude-code|codex|openai)
+            agent="$(_normalize_agent "$agent")" || return 1
+            ;;
+        install|show|-h|--help|help|"")
+            action="${agent:-help}"
+            agent="$(_default_agent)"
+            agent="$(_normalize_agent "$agent")" || return 1
+            ;;
+        *)
+            echo -e "${RED}Unknown statusline target: $agent${RESET}" >&2
+            echo "Usage: cctrl statusline <claude|codex> [install|show]" >&2
+            return 1
+            ;;
+    esac
 
-# ── Aggregate tokens per billing week ────────────────────────────────
-week_data = {}
-for w_start, w_end in weeks:
-    key = w_start.strftime("%Y-%m-%d")
-    week_data[key] = {"input": 0, "output": 0, "cache_write": 0, "cache_read": 0, "cost": 0.0, "turns": 0, "start": w_start, "end": w_end}
+    case "$action" in
+        install)
+            if [[ "$agent" == "claude" ]]; then
+                mkdir -p "$CLAUDE_DIR"
+                [[ -f "$SETTINGS" ]] || echo "{}" > "$SETTINGS"
+                local tmp status_cmd
+                tmp="$(mktemp)"
+                status_cmd="$SCRIPT_DIR/hooks/statusline.sh"
+                jq --arg cmd "$status_cmd" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+                echo -e "${GREEN}Installed Claude statusline:${RESET} $status_cmd"
+                return 0
+            fi
 
-def record_turn(ts, model, usage):
-    for key, wd in week_data.items():
-        if wd["start"] <= ts < wd["end"]:
-            inp = usage.get("input_tokens", 0)
-            out = usage.get("output_tokens", 0)
-            cw = usage.get("cache_creation_input_tokens", 0)
-            cr = usage.get("cache_read_input_tokens", 0)
-            c = cost_for(get_price_key(model), inp, out, cw, cr)
-            wd["input"] += inp
-            wd["output"] += out
-            wd["cache_write"] += cw
-            wd["cache_read"] += cr
-            wd["cost"] += c
-            wd["turns"] += 1
-            return
+            mkdir -p "$CODEX_DIR"
+            local config="$CODEX_DIR/config.toml"
+            [[ -f "$config" ]] || touch "$config"
+            python3 - "$config" <<'PY'
+import sys
+from pathlib import Path
 
-# ── Parse session JSONL files ────────────────────────────────────────
-session_files = glob.glob(os.path.join(projects_dir, "**", "*.jsonl"), recursive=True)
+path = Path(sys.argv[1])
+line = 'status_line = ["model-with-reasoning", "context-remaining", "context-used", "git-branch", "current-dir", "run-state"]'
+text = path.read_text() if path.exists() else ""
+lines = text.splitlines()
+out = []
+in_tui = False
+found_tui = False
+set_line = False
 
-for sf in session_files:
-    try:
-        with open(sf) as f:
-            lines = f.readlines()
-    except (IOError, OSError):
+for raw in lines:
+    stripped = raw.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        if in_tui and not set_line:
+            out.append(line)
+            set_line = True
+        in_tui = stripped == "[tui]"
+        found_tui = found_tui or in_tui
+        out.append(raw)
         continue
+    if in_tui and stripped.startswith("status_line"):
+        if not set_line:
+            out.append(line)
+            set_line = True
+        continue
+    out.append(raw)
 
-    prev_type = None
-    last_assistant = None
-
-    for line in lines:
-        try:
-            d = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        msg = d.get("message", {})
-        if not isinstance(msg, dict):
-            continue
-
-        if msg.get("role") == "assistant" and "usage" in msg:
-            last_assistant = d
-            prev_type = "assistant"
-        elif prev_type == "assistant" and last_assistant is not None:
-            a_msg = last_assistant.get("message", {})
-            usage = a_msg.get("usage", {})
-            model = a_msg.get("model", "unknown")
-            ts_ms = last_assistant.get("timestamp")
-            if ts_ms:
-                if isinstance(ts_ms, (int, float)):
-                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-                else:
-                    try:
-                        ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
-                    except ValueError:
-                        last_assistant = None
-                        prev_type = d.get("type", "")
-                        continue
-                if ts >= oldest_cutoff:
-                    record_turn(ts, model, usage)
-            last_assistant = None
-            prev_type = d.get("type", "")
-        else:
-            prev_type = d.get("type", "")
-
-    if last_assistant is not None:
-        a_msg = last_assistant.get("message", {})
-        usage = a_msg.get("usage", {})
-        model = a_msg.get("model", "unknown")
-        ts_ms = last_assistant.get("timestamp")
-        if ts_ms:
-            if isinstance(ts_ms, (int, float)):
-                ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
-            else:
-                try:
-                    ts = datetime.fromisoformat(str(ts_ms).replace("Z", "+00:00"))
-                except ValueError:
-                    ts = None
-            if ts and ts >= oldest_cutoff:
-                record_turn(ts, model, usage)
-
-# ── Rate limits ──────────────────────────────────────────────────────
-rate_data = None
-if os.path.exists(rate_file):
-    try:
-        with open(rate_file) as f:
-            rate_data = json.load(f)
-    except (json.JSONDecodeError, IOError):
-        pass
-
-# ── Rate limit history: peak usage per billing week ──────────────────
-# week_key -> {peak_five_hour, peak_seven_day}
-week_peaks = {}
-for key in week_data:
-    week_peaks[key] = {"peak_five_hour": None, "peak_seven_day": None}
-
-if os.path.exists(history_file):
-    try:
-        with open(history_file) as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts_str = entry.get("ts", "")
-                if not ts_str:
-                    continue
-                try:
-                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                except ValueError:
-                    continue
-                if ts < oldest_cutoff:
-                    continue
-                for key, wd in week_data.items():
-                    if wd["start"] <= ts < wd["end"]:
-                        fh = entry.get("five_hour")
-                        sd = entry.get("seven_day")
-                        if fh is not None:
-                            cur = week_peaks[key]["peak_five_hour"]
-                            week_peaks[key]["peak_five_hour"] = max(cur, fh) if cur is not None else fh
-                        if sd is not None:
-                            cur = week_peaks[key]["peak_seven_day"]
-                            week_peaks[key]["peak_seven_day"] = max(cur, sd) if cur is not None else sd
-                        break
-    except IOError:
-        pass
-
-def bar(pct, width=30):
-    filled = int(pct * width / 100)
-    empty = width - filled
-    if pct >= 80:
-        color = "\033[0;31m"
-    elif pct >= 50:
-        color = "\033[0;33m"
-    else:
-        color = "\033[0;32m"
-    return f"{color}{'█' * filled}{'░' * empty}\033[0m"
-
-def fmt_reset(resets_at):
-    if not resets_at:
-        return ""
-    try:
-        dt = datetime.fromtimestamp(resets_at, tz=timezone.utc)
-        local_dt = dt.astimezone()
-        delta = dt - now
-        hours = delta.total_seconds() / 3600
-        if hours < 0:
-            return "reset overdue"
-        elif hours < 1:
-            return f"resets in {int(delta.total_seconds() / 60)}m"
-        elif hours < 24:
-            return f"resets in {hours:.1f}h"
-        else:
-            return f"resets {local_dt.strftime('%a %I:%M%p').lower()}"
-    except (ValueError, TypeError, OSError):
-        return ""
-
-def fmt(n):
-    return f"{n:,}"
-
-def usd(n):
-    return f"${n:,.2f}"
-
-# ── Print rate limits ────────────────────────────────────────────────
-if rate_data:
-    profile = rate_data.get("profile", "")
-    captured = rate_data.get("captured_at", "")
-    five = rate_data.get("five_hour")
-    seven = rate_data.get("seven_day")
-
-    age_str = ""
-    if captured:
-        try:
-            cap_dt = datetime.fromisoformat(captured.replace("Z", "+00:00"))
-            delta = now - cap_dt
-            mins = int(delta.total_seconds() / 60)
-            if mins < 1:
-                age_str = "just now"
-            elif mins < 60:
-                age_str = f"{mins}m ago"
-            elif mins < 1440:
-                age_str = f"{mins // 60}h ago"
-            else:
-                age_str = f"{mins // 1440}d ago"
-        except (ValueError, TypeError):
-            pass
-
-    header = "\033[1mPlan Usage\033[0m"
-    if profile:
-        header += f"  \033[2m({profile})\033[0m"
-    if age_str:
-        header += f"  \033[2mupdated {age_str}\033[0m"
-    print(header)
-    print()
-
-    if five:
-        pct = five.get("used_percentage", 0)
-        reset_str = fmt_reset(five.get("resets_at"))
-        print(f"  5-hour window   {bar(pct)}  {pct:5.1f}%  \033[2m{reset_str}\033[0m")
-
-    if seven:
-        pct = seven.get("used_percentage", 0)
-        reset_str = fmt_reset(seven.get("resets_at"))
-        print(f"  7-day window    {bar(pct)}  {pct:5.1f}%  \033[2m{reset_str}\033[0m")
-
-    if not five and not seven:
-        print("  \033[2mRate limits only apply to Claude.ai subscriptions (Pro/Max).\033[0m")
-        print("  \033[2mAPI profiles are billed per-token — use 'cctrl costs' for spend tracking.\033[0m")
-
-    print()
-
-# ── Check if we have any rate limit history ──────────────────────────
-has_peaks = any(
-    wp["peak_five_hour"] is not None or wp["peak_seven_day"] is not None
-    for wp in week_peaks.values()
-)
-
-# ── Print billing week breakdown ─────────────────────────────────────
-print(f"\033[1mBilling Weeks\033[0m  \033[2m(resets Thu 6am)\033[0m")
-print()
-
-if has_peaks:
-    print(f"\033[0;36m{'Week':<28} {'Peak 5h':>8} {'Peak 7d':>8} {'Output':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
-    print("─" * 76)
+if found_tui:
+    if in_tui and not set_line:
+        out.append(line)
 else:
-    print(f"\033[0;36m{'Week':<28} {'Output':>12} {'Input':>12} {'Cache Read':>12} {'Est. Cost':>10} {'Turns':>6}\033[0m")
-    print("─" * 84)
+    if out and out[-1].strip():
+        out.append("")
+    out.extend(["[tui]", line])
 
-sorted_weeks = sorted(week_data.items(), key=lambda x: x[0], reverse=True)
-for i, (key, wd) in enumerate(sorted_weeks):
-    start_tz = wd["start"].astimezone(TZ)
-    end_tz = wd["end"].astimezone(TZ)
-    wp = week_peaks.get(key, {})
-
-    if i == 0:
-        label = f"This week"
-        sublabel = f"  {start_tz.strftime('%b %d')} – now"
-    else:
-        label = f"{i} week{'s' if i > 1 else ''} ago"
-        sublabel = f"  {start_tz.strftime('%b %d')} – {end_tz.strftime('%b %d')}"
-
-    if has_peaks:
-        p5 = wp.get("peak_five_hour")
-        p7 = wp.get("peak_seven_day")
-        p5_str = f"{p5:.0f}%" if p5 is not None else "–"
-        p7_str = f"{p7:.0f}%" if p7 is not None else "–"
-        print(f"  {label:<26} {p5_str:>8} {p7_str:>8} {fmt(wd['output']):>12} {usd(wd['cost']):>10} {wd['turns']:>6}")
-    else:
-        print(f"  {label:<26} {fmt(wd['output']):>12} {fmt(wd['input']):>12} {fmt(wd['cache_read']):>12} {usd(wd['cost']):>10} {wd['turns']:>6}")
-
-    print(f"  \033[2m{sublabel}\033[0m")
-
-# Averages
-if len(sorted_weeks) > 1:
-    if has_peaks:
-        print("─" * 76)
-    else:
-        print("─" * 84)
-    # Average across full weeks only (exclude current partial week)
-    full_weeks = [(key, wd) for key, wd in sorted_weeks[1:]]
-    if full_weeks:
-        avg_cost = sum(wd["cost"] for _, wd in full_weeks) / len(full_weeks)
-        avg_turns = sum(wd["turns"] for _, wd in full_weeks) // len(full_weeks)
-        avg_output = sum(wd["output"] for _, wd in full_weeks) // len(full_weeks)
-
-        if has_peaks:
-            full_peaks = [week_peaks.get(k, {}) for k, _ in full_weeks]
-            p7_vals = [p.get("peak_seven_day") for p in full_peaks if p.get("peak_seven_day") is not None]
-            avg_p7 = f"{sum(p7_vals) / len(p7_vals):.0f}%" if p7_vals else "–"
-            print(f"  {'Avg/week':<26} {'':>8} {avg_p7:>8} {fmt(avg_output):>12} {usd(avg_cost):>10} {avg_turns:>6}")
-        else:
-            print(f"  {'Avg/week':<26} {fmt(avg_output):>12} {'':>12} {'':>12} {usd(avg_cost):>10} {avg_turns:>6}")
-
-        # Delta vs current
-        current = sorted_weeks[0][1]
-        if avg_cost > 0:
-            pct_of_avg = (current["cost"] / avg_cost) * 100
-            elapsed = (now - current["start"]).total_seconds()
-            week_secs = 7 * 86400
-            week_pct = min(elapsed / week_secs * 100, 100)
-            pace_str = ""
-            if week_pct > 10:
-                projected = current["cost"] / (elapsed / week_secs)
-                pace_str = f"  \033[2m(on pace for {usd(projected)})\033[0m"
-            print(f"\n  \033[2mThis week: {pct_of_avg:.0f}% of weekly avg, {week_pct:.0f}% through the week{pace_str}\033[0m")
-
-print()
-PYEOF
-}
-
-cmd_help() {
-    echo -e "${BOLD}cctrl${RESET} — Claude Code Controller"
-    echo ""
-    echo -e "${BOLD}Profile Management${RESET}"
-    echo "  cctrl use <profile>     Switch to a settings profile (alias: switch)"
-    echo "  cctrl ls                List available profiles"
-    echo "  cctrl current           Show active profile"
-    echo "  cctrl save <name>       Save current settings as a profile"
-    echo "  cctrl diff <profile>    Diff current settings vs a profile"
-    echo "  cctrl rename <old> <new>  Rename a profile"
-    echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
-    echo ""
-    echo -e "${BOLD}Session${RESET} ${DIM}(one verb; flags pick foreground vs detached)${RESET}"
-    echo "  cctrl start [@name]         Launch claude in the foreground (current dir, or shortcut)"
-    echo "    -d, --detach              Run in a detached tmux session (survives SSH disconnect)"
-    echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
-    echo "    -n, --name NAME           Set the session display name"
-    echo "    --no-bridge               Disable the phone-control bridge (on by default)"
-    echo "                              Extra flags are appended (e.g. cctrl start -p foo)"
-    echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
-    echo ""
-    echo "  cctrl session ls            List sessions (dir, claude/shell, model, state; --json)"
-    echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
-    echo "  cctrl session kill <name>   Kill a detached session"
-    echo ""
-    echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
-    echo "  cctrl @<name>           Jump: cd to dir, switch profile, start claude (with optional resume + initial prompt)"
-    echo "  cctrl @<name> -m TEXT   Open with an initial prompt (alias: --message, --prompt)"
-    echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
-    echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
-    echo "  cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]"
-    echo "  cctrl @rm <name>        Remove a shortcut"
-    echo "  cctrl @ edit            Open shortcuts file in \$EDITOR"
-    echo "  Extra flags after the name are passed through to claude, e.g. cctrl @HomeLab --resume"
-    echo ""
-    echo -e "${BOLD}Usage Tracking${RESET}"
-    echo "  cctrl usage [weeks]     Plan usage + billing week breakdown (default: 2)"
-    echo "  cctrl costs [--today|--week|--month|--all] [project-filter]"
-    echo "                          Token usage, costs, model & project breakdown"
-    echo "  cctrl log [count]       Show profile switch history"
-    echo ""
-    echo -e "${BOLD}Ports${RESET}"
-    echo "  cctrl ports                     Scan active ports, update history, suggest free ports"
-    echo "  cctrl ports --check PORTS       Check if port(s) are safe to use: 3000  3000-3003  3000,3001"
-    echo "  cctrl ports --kill PORTS        Kill process(es) on port(s): 3000  3000-3003  3000,3001"
-    echo "  cctrl ports --kill PORTS --force  SIGKILL instead of SIGTERM"
-    echo "  cctrl ports --discover [dir]    Scan project files for port references, add to history"
-    echo "  cctrl ports --free [options]    Suggest free ports from history (no live scan)"
-    echo "  cctrl ports --consecutive N     Find runs of N consecutive free ports (shows options)"
-    echo "  cctrl ports --history           Show all ports ever seen"
-    echo "  cctrl ports --known             List well-known ports always excluded from suggestions"
-    echo "  cctrl ports --reset             Clear port history"
-    echo "  cctrl ports --ranges            Group suggestions as contiguous ranges"
-    echo "  cctrl ports --min N --max N     Port range for suggestions (default: 3000–9999)"
-    echo "  cctrl ports --count N           How many free ports to suggest (default: 10)"
-    echo ""
-    echo -e "${BOLD}Remote Hosts${RESET}"
-    echo "  cctrl whoami                          Show this machine + which aliases mean 'local'"
-    echo "  cctrl host add <alias> <host> [user]  Register a host (use this machine's name = local)"
-    echo "  cctrl host list                       List registered hosts (marks local)"
-    echo "  cctrl host rm <alias>                 Remove a host"
-    echo "  cctrl host doctor <alias>             Check SSH, tmux, claude, cctrl on remote"
-    echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
-    echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
-    echo ""
-    echo -e "${BOLD}Chrome CDP${RESET}"
-    echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
-    echo "  cctrl chrome --status           Check if CDP is active"
-    echo "  cctrl chrome --port 9333        Use a different port"
-    echo "  cctrl chrome --connect          Also connect gstack browse to the session"
-    echo "  cctrl chrome --kill             Kill Chrome without relaunching"
-    echo ""
-    echo -e "${BOLD}Plugins${RESET}"
-    echo "  Any executable named cctrl-<cmd> in plugins/ or PATH"
-    echo "  is auto-discovered as a subcommand."
-    echo ""
-    echo -e "${DIM}Profiles: $PROFILES_DIR${RESET}"
-    echo -e "${DIM}Plugins:  $PLUGINS_DIR${RESET}"
+path.write_text("\n".join(out).rstrip() + "\n")
+PY
+            echo -e "${GREEN}Installed Codex statusline:${RESET} $config"
+            echo -e "${DIM}Restart Codex or run /statusline inside Codex to review it.${RESET}"
+            ;;
+        show)
+            if [[ "$agent" == "claude" ]]; then
+                if [[ -f "$SETTINGS" ]]; then
+                    jq '.statusLine // "not configured"' "$SETTINGS"
+                else
+                    echo "not configured"
+                fi
+            else
+                if [[ -f "$CODEX_DIR/config.toml" ]]; then
+                    awk '
+                        /^\[tui\]$/ {in_tui=1; next}
+                        /^\[/ && in_tui {exit}
+                        in_tui && /^status_line[[:space:]]*=/ {print; found=1}
+                        END {if (!found) print "not configured"}
+                    ' "$CODEX_DIR/config.toml"
+                else
+                    echo "not configured"
+                fi
+            fi
+            ;;
+        help|-h|--help)
+            echo "Usage: cctrl statusline <claude|codex> [install|show]"
+            echo ""
+            echo "  claude install   Configure ~/.claude/settings.json statusLine command"
+            echo "  codex install    Configure ~/.codex/config.toml tui.status_line"
+            ;;
+        *)
+            echo -e "${RED}Unknown statusline action: $action${RESET}" >&2
+            return 1
+            ;;
+    esac
 }
 
 # ── Chrome CDP ────────────────────────────────────────────────────────
@@ -1814,7 +1571,10 @@ _remote_exec() {
         ssh_opts+=("-t")
     fi
 
-    local env_prefix="CCTRL_HOST_PREFIX=$host_alias"
+    local env_prefix="CCTRL_HOST_PREFIX=$(printf '%q' "$host_alias")"
+    if [[ -n "${CCTRL_AGENT:-}" ]]; then
+        env_prefix+=" CCTRL_AGENT=$(printf '%q' "$CCTRL_AGENT")"
+    fi
 
     if $detach_and_attach; then
         # Launch detached on the remote, capture the resolved session name, then
@@ -1926,9 +1686,22 @@ cmd_host() {
         doctor)
             local name="${1:-}"
             if [[ -z "$name" ]]; then
-                echo -e "${RED}Usage: cctrl host doctor <alias>${RESET}"
+                echo -e "${RED}Usage: cctrl host doctor <alias> [--agent claude|codex]${RESET}"
                 return 1
             fi
+            shift 2>/dev/null || true
+            local doctor_agent="$(_default_agent)"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --agent)
+                        [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
+                        doctor_agent="$(_normalize_agent "$2")" || return 1
+                        shift 2 ;;
+                    *)
+                        echo -e "${RED}Unknown host doctor flag: $1${RESET}"
+                        return 1 ;;
+                esac
+            done
             local lookup
             lookup="$(_host_lookup "$name")"
             if [[ -z "$lookup" ]]; then
@@ -1945,7 +1718,14 @@ cmd_host() {
                 ssh_target="$hostname"
             fi
 
-            echo -e "${BOLD}Host Doctor: $name${RESET} ($ssh_target)"
+            local doctor_bin doctor_install_hint
+            doctor_bin="$(_agent_bin "$doctor_agent")"
+            case "$doctor_agent" in
+                codex) doctor_install_hint="brew install codex" ;;
+                *)     doctor_install_hint="brew install claude-code" ;;
+            esac
+
+            echo -e "${BOLD}Host Doctor: $name${RESET} ($ssh_target, agent=$doctor_agent)"
             echo ""
 
             local all_ok=true
@@ -1998,18 +1778,18 @@ cmd_host() {
                 fi
             fi
 
-            # 4. claude installed
-            echo -n "  claude installed... "
-            if ssh "$ssh_target" "${renv}command -v claude" &>/dev/null; then
+            # 4. selected agent installed
+            echo -n "  $doctor_bin installed... "
+            if ssh "$ssh_target" "${renv}command -v $doctor_bin" &>/dev/null; then
                 echo -e "${GREEN}OK${RESET}"
             else
                 echo -e "${YELLOW}MISSING${RESET}"
                 all_ok=false
-                echo -n "    Fix: brew install claude-code? [y/N] "
+                echo -n "    Fix: $doctor_install_hint? [y/N] "
                 read -r confirm
                 if [[ "$confirm" =~ ^[yY]$ ]]; then
-                    ssh "$ssh_target" "${renv}brew install claude-code"
-                    echo -e "    ${GREEN}Installed claude-code${RESET}"
+                    ssh "$ssh_target" "${renv}$doctor_install_hint"
+                    echo -e "    ${GREEN}Installed $doctor_bin${RESET}"
                 fi
             fi
 
@@ -2057,7 +1837,7 @@ cmd_host() {
             echo "  cctrl host add <alias> <hostname> [user]"
             echo "  cctrl host list"
             echo "  cctrl host rm <alias>"
-            echo "  cctrl host doctor <alias>"
+            echo "  cctrl host doctor <alias> [--agent claude|codex]"
             echo ""
             echo "Use with --host flag:"
             echo "  cctrl --host <alias> <command> [args...]"
@@ -2071,7 +1851,7 @@ cmd_host() {
 }
 
 # ── Shortcuts ─────────────────────────────────────────────────────────
-# Named jump targets: cd into a directory and launch claude there, optionally
+# Named jump targets: cd into a directory and launch an agent there, optionally
 # switching profile and resuming a session. Configured in data/shortcuts.json.
 # Example: cctrl @HomeLab    cctrl @add HomeLab ~/homelab --profile max --resume
 
@@ -2091,12 +1871,12 @@ _shortcut_lookup_key() {
 
 _shortcut_help() {
     echo -e "${BOLD}Shortcut commands${RESET}"
-    echo "  cctrl @<name>                     Jump: cd, switch profile, launch claude"
+    echo "  cctrl @<name>                     Jump: cd, switch profile, launch selected agent"
     echo "  cctrl @<name> -m \"TEXT\"            Launch with an initial prompt"
     echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
     echo "  cctrl @<name> --no-bridge         Disable the phone-control bridge for this launch"
-    echo "  cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]"
+    echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
     echo "  cctrl @rm <name>                  Remove a shortcut"
     echo "  cctrl @ ls                        List shortcuts (no helper)"
     echo "  cctrl @ edit                      Open ${SHORTCUTS_FILE/#$HOME/~} in \$EDITOR"
@@ -2111,15 +1891,17 @@ _shortcut_list() {
     fi
 
     echo -e "${BOLD}Shortcuts${RESET}"
-    # Emit one field per line (5 lines per entry) to avoid IFS-whitespace field collapsing
-    local _name _dir _profile _resume _prompt
+    # Emit one field per line to avoid IFS-whitespace field collapsing.
+    local _name _dir _profile _agent _resume _prompt
     while IFS= read -r _name \
        && IFS= read -r _dir \
        && IFS= read -r _profile \
+       && IFS= read -r _agent \
        && IFS= read -r _resume \
        && IFS= read -r _prompt; do
         local extras=""
         [[ -n "$_profile" ]] && extras+="  ${DIM}profile=${_profile}${RESET}"
+        [[ -n "$_agent" ]] && extras+="  ${DIM}agent=${_agent}${RESET}"
         [[ "$_resume" != "false" ]] && extras+="  ${DIM}resume=${_resume}${RESET}"
         echo -e "  ${GREEN}@${_name}${RESET}  ${DIM}→${RESET}  $_dir$extras"
         if [[ -n "$_prompt" ]]; then
@@ -2127,18 +1909,19 @@ _shortcut_list() {
             [[ ${#short} -gt 70 ]] && short="${short:0:67}..."
             echo -e "      ${DIM}prompt: \"$short\"${RESET}"
         fi
-    done < <(jq -r 'to_entries[] | .key, (.value.dir // ""), (.value.profile // ""), (.value.resume // false | tostring), (.value.prompt // "")' "$SHORTCUTS_FILE")
+    done < <(jq -r 'to_entries[] | .key, (.value.dir // ""), (.value.profile // ""), (.value.agent // ""), (.value.resume // false | tostring), (.value.prompt // "")' "$SHORTCUTS_FILE")
 }
 
 _shortcut_add() {
     local name="${1:-}" dir="${2:-}"
     if [[ -z "$name" || -z "$dir" ]]; then
-        echo -e "${RED}Usage: cctrl @add <name> <dir> [--profile X] [--resume [id]] [--message TEXT]${RESET}"
+        echo -e "${RED}Usage: cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]${RESET}"
         return 1
     fi
     shift 2
 
     local profile=""
+    local agent=""
     local resume="false"
     local prompt=""
     while [[ $# -gt 0 ]]; do
@@ -2146,6 +1929,10 @@ _shortcut_add() {
             --profile|-p)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
                 profile="$2"; shift 2 ;;
+            --agent)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
+                agent="$(_normalize_agent "$2")" || return 1
+                shift 2 ;;
             --resume|-r)
                 if [[ $# -gt 1 && "$2" != -* ]]; then
                     resume="$2"; shift 2
@@ -2177,6 +1964,7 @@ _shortcut_add() {
     jq --arg name "$name" \
        --arg dir "$dir" \
        --arg profile "$profile" \
+       --arg agent "$agent" \
        --arg resume "$resume" \
        --arg prompt "$prompt" \
        --arg existing "$existing" '
@@ -2185,6 +1973,7 @@ _shortcut_add() {
             ($name): (
                 {dir: $dir}
                 + (if $profile != "" then {profile: $profile} else {} end)
+                + (if $agent != "" then {agent: $agent} else {} end)
                 + (if $resume == "true" then {resume: true}
                    elif $resume == "false" then {}
                    else {resume: $resume} end)
@@ -2195,6 +1984,7 @@ _shortcut_add() {
 
     echo -e "${GREEN}Saved ${BOLD}@$name${RESET}${GREEN} → $dir${RESET}"
     [[ -n "$profile" ]] && echo -e "${DIM}  profile=$profile${RESET}"
+    [[ -n "$agent" ]] && echo -e "${DIM}  agent=$agent${RESET}"
     [[ "$resume" != "false" ]] && echo -e "${DIM}  resume=$resume${RESET}"
     [[ -n "$prompt" ]] && echo -e "${DIM}  prompt=\"$prompt\"${RESET}"
     return 0
@@ -2262,16 +2052,16 @@ _shortcut_jump() {
                 return 0
             fi
         else
-            echo -e "${DIM}Add it with:${RESET} cctrl @add $name <dir> [--profile X] [--resume [id]] [--message TEXT]"
+            echo -e "${DIM}Add it with:${RESET} cctrl @add $name <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
         fi
         echo
         _shortcut_list
         return 1
     fi
 
-    local dir profile resume prompt
-    { IFS= read -r dir; IFS= read -r profile; IFS= read -r resume; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
-        .[$k] | (.dir // ""), (.profile // ""), (.resume // false | tostring), (.prompt // "")
+    local dir profile shortcut_agent resume prompt
+    { IFS= read -r dir; IFS= read -r profile; IFS= read -r shortcut_agent; IFS= read -r resume; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
+        .[$k] | (.dir // ""), (.profile // ""), (.agent // ""), (.resume // false | tostring), (.prompt // "")
     ' "$SHORTCUTS_FILE")
 
     # Expand leading ~
@@ -2315,30 +2105,24 @@ _shortcut_jump() {
         return 1
     fi
 
-    # Apply the shortcut's profile as a per-process overlay (env + model). No
-    # global-settings mutation: concurrent shortcuts with different profiles stay
-    # independent and there's no launch race on ~/.claude/settings.json.
-    local pf=""
-    if [[ -n "$profile" ]]; then
-        if _profile_exists "$profile"; then
-            pf="$(_profile_path "$profile")"
-        else
-            echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
-        fi
-    fi
-    _apply_profile_overlay "$pf"
-
-    # Build claude flags. CLI args override the shortcut's resume/prompt settings.
-    local flags=("--permission-mode" "bypassPermissions" "--remote-control")
+    # Build selected-agent flags. CLI args override shortcut resume/prompt/agent settings.
     local cli_resume=false
     local cli_resume_val=""
     local cli_prompt=""
     local cli_prompt_set=false
     local no_bridge=false
     local cli_model=""
+    local agent="${shortcut_agent:-$(_default_agent)}"
+    local launch_name=""
+    local full_bypass=false
+    local access_explicit=false
+    local permission_mode=""
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --agent)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
+                agent="$2"; shift 2 ;;
             --resume|-r)
                 cli_resume=true
                 if [[ $# -gt 1 && "$2" != -* ]]; then
@@ -2350,9 +2134,18 @@ _shortcut_jump() {
                 cli_prompt="$2"; cli_prompt_set=true; shift 2 ;;
             --no-bridge)
                 no_bridge=true; shift ;;
+            --yolo|--dangerously-bypass-approvals-and-sandbox)
+                full_bypass=true; access_explicit=true; shift ;;
+            --permission-mode)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--permission-mode needs a value${RESET}"; return 1; }
+                permission_mode="$2"; access_explicit=true; shift 2 ;;
+            --sandbox|-s|--ask-for-approval|-a)
+                [[ $# -ge 2 ]] || { echo -e "${RED}$1 needs a value${RESET}"; return 1; }
+                access_explicit=true
+                passthrough+=("$1" "$2"); shift 2 ;;
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
-                passthrough+=("--name" "$2"); shift 2 ;;
+                launch_name="$2"; shift 2 ;;
             --model)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--model needs a value${RESET}"; return 1; }
                 cli_model="$2"; shift 2 ;;
@@ -2367,33 +2160,20 @@ _shortcut_jump() {
                 passthrough+=("$1"); shift ;;
         esac
     done
+    agent="$(_normalize_agent "$agent")" || return 1
 
-    # Model precedence: CLI --model > profile .model > omit (Claude's default).
-    local mdl; mdl="$(_resolve_model "$cli_model" "$pf")"
-    [[ -n "$mdl" ]] && flags+=("--model" "$mdl")
-
-    if $no_bridge; then
-        flags=("${flags[@]/--remote-control}")
-        local cleaned=()
-        for f in "${flags[@]}"; do [[ -n "$f" ]] && cleaned+=("$f"); done
-        flags=("${cleaned[@]}")
-    else
-        flags+=("--remote-control-session-name-prefix" "$(_remote_prefix "$dir")")
-    fi
-
-    if $cli_resume; then
-        if [[ -n "$cli_resume_val" ]]; then
-            flags+=("--resume" "$cli_resume_val")
+    # Apply the shortcut's profile as a per-process overlay (env + model). No
+    # global-settings mutation: concurrent shortcuts with different profiles stay
+    # independent and there's no launch race on global agent config.
+    local pf=""
+    if [[ -n "$profile" ]]; then
+        if _profile_exists "$profile"; then
+            pf="$(_profile_path "$profile")"
         else
-            flags+=("--resume")
+            echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
         fi
-    elif [[ "$resume" == "true" ]]; then
-        flags+=("--resume")
-    elif [[ -n "$resume" && "$resume" != "false" ]]; then
-        flags+=("--resume" "$resume")
     fi
-
-    [[ ${#passthrough[@]} -gt 0 ]] && flags+=("${passthrough[@]}")
+    _apply_profile_overlay "$agent" "$pf"
 
     # Prompt: CLI overrides config. Goes last (claude treats final positional as prompt).
     local final_prompt=""
@@ -2402,12 +2182,27 @@ _shortcut_jump() {
     elif [[ -n "$prompt" ]]; then
         final_prompt="$prompt"
     fi
-    [[ -n "$final_prompt" ]] && flags+=("$final_prompt")
 
     cd "$dir"
     echo -e "${DIM}→ @${key}  ($dir)${RESET}"
-    echo -e "${DIM}claude ${flags[*]}${RESET}"
-    exec claude "${flags[@]}"
+
+    local launch_resume=false launch_resume_val=""
+    if $cli_resume; then
+        launch_resume=true
+        launch_resume_val="$cli_resume_val"
+    elif [[ "$resume" == "true" ]]; then
+        launch_resume=true
+    elif [[ -n "$resume" && "$resume" != "false" ]]; then
+        launch_resume=true
+        launch_resume_val="$resume"
+    fi
+
+    LAUNCH_FULL_BYPASS=$full_bypass
+    LAUNCH_ACCESS_EXPLICIT=$access_explicit
+    LAUNCH_PERMISSION_MODE="$permission_mode"
+    LAUNCH_PASSTHROUGH=()
+    [[ ${#passthrough[@]} -gt 0 ]] && LAUNCH_PASSTHROUGH=("${passthrough[@]}")
+    _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$launch_resume" "$launch_resume_val" "$final_prompt" "$dir"
 }
 
 cmd_shortcut() {
@@ -2445,16 +2240,40 @@ _try_plugin() {
 # ── Main dispatch ─────────────────────────────────────────────────────
 
 main() {
-    # Parse --host global flag before subcommand routing
-    if [[ "${1:-}" == "--host" ]]; then
-        shift
-        local _host_alias="${1:-}"
-        if [[ -z "$_host_alias" ]]; then
-            echo -e "${RED}--host requires a host alias${RESET}" >&2
-            echo -e "${DIM}List hosts with: cctrl host list${RESET}" >&2
-            return 1
-        fi
-        shift
+    # Parse global flags before subcommand routing. Subcommands may also accept
+    # --agent locally; this form is useful when combined with --host.
+    local _host_alias="" _agent=""
+    while [[ $# -gt 0 ]]; do
+        case "${1:-}" in
+            --host)
+                shift
+                _host_alias="${1:-}"
+                if [[ -z "$_host_alias" ]]; then
+                    echo -e "${RED}--host requires a host alias${RESET}" >&2
+                    echo -e "${DIM}List hosts with: cctrl host list${RESET}" >&2
+                    return 1
+                fi
+                shift
+                ;;
+            --agent)
+                shift
+                _agent="${1:-}"
+                if [[ -z "$_agent" ]]; then
+                    echo -e "${RED}--agent requires a value${RESET}" >&2
+                    echo -e "${DIM}Supported agents: claude, codex${RESET}" >&2
+                    return 1
+                fi
+                _agent="$(_normalize_agent "$_agent")" || return 1
+                export CCTRL_AGENT="$_agent"
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -n "$_host_alias" ]]; then
         local _lookup
         _lookup="$(_host_lookup "$_host_alias")"
         if [[ -z "$_lookup" ]]; then
@@ -2501,6 +2320,7 @@ _dispatch() {
         session|sess) cmd_session "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
+        statusline|status-line) cmd_statusline "$@" ;;
         log)     cmd_log "$@" ;;
         chrome|cdp) cmd_chrome "$@" ;;
         help|-h|--help) cmd_help "$@" ;;

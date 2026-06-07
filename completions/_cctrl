@@ -58,6 +58,10 @@ _cctrl_hosts() {
     (( ${#names} )) && compadd "$@" -- "${names[@]}"
 }
 
+_cctrl_agents() {
+    compadd "$@" -- claude codex
+}
+
 _cctrl() {
     local -a subcmds=(
         'use:Switch to a settings profile'
@@ -69,13 +73,14 @@ _cctrl() {
         'diff:Diff current settings vs a profile'
         'rename:Rename a profile'
         'edit:Open a profile in \$EDITOR'
-        'start:Launch claude (foreground, or -d for a detached session)'
-        's:Launch claude (foreground, or -d for a detached session)'
+        'start:Launch selected agent (foreground, or -d for a detached session)'
+        's:Launch selected agent (foreground, or -d for a detached session)'
         'session:Manage detached sessions (ls/attach/kill)'
         'host:Manage remote hosts'
         'whoami:Show this machine and which host aliases mean local'
         'costs:Token usage and cost breakdown'
         'usage:Plan usage and billing week breakdown'
+        'statusline:Configure Claude/Codex status lines'
         'log:Show profile switch history'
         'chrome:Launch Chrome with CDP remote debugging'
         'shortcuts:Manage shortcuts'
@@ -86,7 +91,19 @@ _cctrl() {
         _describe "commands" subcmds
         _cctrl_shortcuts
         _cctrl_plugins
-        _arguments '--host[Run on a remote host]:host:_cctrl_hosts'
+        _arguments \
+            '--host[Run on a remote host]:host:_cctrl_hosts' \
+            '--agent[Select agent runtime]:agent:_cctrl_agents'
+        return
+    fi
+
+    # Handle --agent <name> <subcommand...>
+    if [[ "${words[2]}" == "--agent" ]]; then
+        if (( CURRENT == 3 )); then
+            _cctrl_agents
+        elif (( CURRENT == 4 )); then
+            _describe "commands" subcmds
+        fi
         return
     fi
 
@@ -126,6 +143,7 @@ _cctrl() {
                             *)
                                 _arguments \
                                     '--profile[Profile to switch to]:profile:_cctrl_profiles' \
+                                    '--agent[Agent runtime]:agent:_cctrl_agents' \
                                     '--resume[Resume a session]' \
                                     '--message[Initial prompt]:message:'
                                 ;;
@@ -140,7 +158,10 @@ _cctrl() {
             fi
             _arguments \
                 '--resume[Resume a session]' \
+                '--agent[Agent runtime]:agent:_cctrl_agents' \
                 '--no-bridge[Disable the phone-control bridge]' \
+                '--yolo[Full bypass mode]' \
+                '--permission-mode[Claude permission mode]:mode:' \
                 {-m,--message,--prompt}'[Initial prompt]:message:' \
                 '--[Everything after is the prompt]'
             ;;
@@ -156,7 +177,13 @@ _cctrl() {
             _arguments \
                 {--detach,-d}'[Run in a detached tmux session]' \
                 {--resume,-r}'[Resume a session]' \
+                '--agent[Agent runtime]:agent:_cctrl_agents' \
                 {--name,-n}'[Session display name]:name:' \
+                '--yolo[Full bypass mode]' \
+                '--permission-mode[Claude permission mode]:mode:' \
+                {-m,--message,--prompt}'[Initial prompt]:message:' \
+                {--sandbox,-s}'[Codex sandbox mode]:mode:(read-only workspace-write danger-full-access)' \
+                {--ask-for-approval,-a}'[Codex approval policy]:policy:(untrusted on-request never)' \
                 '--no-bridge[Disable the phone-control bridge]'
             # Allow @shortcut or a directory as the target
             if (( CURRENT == 3 )); then
@@ -167,7 +194,7 @@ _cctrl() {
         session|sess)
             if (( CURRENT == 3 )); then
                 local -a session_cmds=(
-                    'ls:List sessions (dir, claude/shell, model, state)'
+                    'ls:List sessions (dir, agent/shell, model, state)'
                     'attach:Reattach to a session'
                     'kill:Kill a detached session'
                 )
@@ -206,6 +233,13 @@ _cctrl() {
             ;;
         usage)
             (( CURRENT == 3 )) && compadd -- 1 2 3 4 5 6 7 8
+            ;;
+        statusline|status-line)
+            if (( CURRENT == 3 )); then
+                _cctrl_agents
+            elif (( CURRENT == 4 )); then
+                compadd -- install show help
+            fi
             ;;
         host)
             if (( CURRENT == 3 )); then
