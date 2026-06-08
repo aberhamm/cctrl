@@ -346,12 +346,13 @@ _log_switch() {
         "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" "$2")"
 }
 
-_session_slug() {
-    # Canonical slug for a directory or shortcut name. Used by both tmux
-    # session naming and the bridge session-name prefix. Single source of truth.
-    # Usage: _session_slug <name_or_dir>
-    #   _session_slug homelab        → "homelab"
-    #   _session_slug ~/projects/foo → "foo" (git root basename)
+_slugify() {
+    local value="${1:-}"
+    value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+    printf '%s' "$value"
+}
+
+_target_slug() {
     local input="${1:-$PWD}"
     local name
     if [[ -d "$input" ]]; then
@@ -361,18 +362,53 @@ _session_slug() {
     else
         name="$input"
     fi
-    name="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g')"
+    name="$(_slugify "$name")"
     [[ -z "$name" ]] && name="agent"
-    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
-        printf '%s--%s' "$CCTRL_HOST_PREFIX" "$name"
-    else
-        printf '%s' "$name"
+    printf '%s' "$name"
+}
+
+_context_slug() {
+    # Canonical context names use stable segments:
+    #   <host>--<target>             for foreground remote agent/bridge names
+    #   TMUX--<host>--<target>       for detached tmux-backed agent names
+    # The host segment is present only for --host launches.
+    local include_tmux="${1:-false}" input="${2:-$PWD}"
+    local name host out=""
+    name="$(_target_slug "$input")"
+    if [[ "$include_tmux" == "true" ]]; then
+        out="TMUX"
     fi
+    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
+        host="$(_slugify "$CCTRL_HOST_PREFIX")"
+        if [[ -n "$host" ]]; then
+            [[ -n "$out" ]] && out+="--"
+            out+="$host"
+        fi
+    fi
+    [[ -n "$out" ]] && out+="--"
+    out+="$name"
+    printf '%s' "${out:-agent}"
+}
+
+_session_slug() {
+    # Host-aware slug used for non-tmux remote-control names.
+    _context_slug false "${1:-$PWD}"
+}
+
+_tmux_session_slug() {
+    # Tmux-managed sessions include an explicit TMUX segment so they stand out
+    # in tmux lists, Claude Code display names, and bridge session names.
+    _context_slug true "${1:-$PWD}"
 }
 
 _remote_prefix() {
-    # Trailing dash so Claude appends --adjective-noun (double-dash separator).
-    printf '%s-' "$(_session_slug "${1:-$PWD}")"
+    # Claude adds "-<generated-name>" after this prefix. A single trailing dash
+    # yields final bridge names like TMUX--ms--cctrl--brisk-river.
+    if [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]]; then
+        printf '%s-' "$(_tmux_session_slug "${1:-$PWD}")"
+    else
+        printf '%s-' "$(_session_slug "${1:-$PWD}")"
+    fi
 }
 
 _detect_active() {
@@ -659,21 +695,37 @@ with open('$SPENDING_LOG', 'w') as f:
 }
 
 cmd_start() {
-    # Unified launch verb. Foreground in the current dir by default; -d/--detach
-    # runs the session in a persistent tmux session that survives SSH disconnect.
-    #   cctrl start                 foreground, current dir
-    #   cctrl start @name           foreground via shortcut
-    #   cctrl start -d <dir|@name>  detached tmux session
+    # Unified launch verb. Interactive starts are tmux-backed by default so
+    # local and remote sessions are durable and addressable. Use
+    # --foreground/--no-tmux for one-off direct launches.
+    #   cctrl start                 tmux-backed, current dir
+    #   cctrl start @name           tmux-backed via shortcut
+    #   cctrl start --foreground    direct foreground, current dir
+    #   cctrl start -d <dir|@name>  detached tmux session, do not auto-attach
     local detach=false arg
+    local foreground=false
+    [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && foreground=true
     for arg in "$@"; do
         [[ "$arg" == "--" ]] && break   # rest is a literal prompt; stop scanning
         case "$arg" in
             -d|--detach) detach=true; break ;;
+            --foreground|--no-tmux) foreground=true ;;
         esac
     done
 
     if $detach; then
         _launch_detached "$@"
+        return
+    fi
+
+    if ! $foreground; then
+        if [[ "${1:-}" == @* ]]; then
+            _launch_detached "$@"
+        elif [[ -n "${1:-}" && "${1:-}" != -* && -d "${1/#\~/$HOME}" ]]; then
+            CCTRL_ATTACH_AFTER_START=1 _launch_detached "$@"
+        else
+            CCTRL_ATTACH_AFTER_START=1 _launch_detached "$PWD" "$@"
+        fi
         return
     fi
 
@@ -723,6 +775,9 @@ cmd_start() {
                 ;;
             --no-bridge)
                 no_bridge=true
+                shift
+                ;;
+            --foreground|--no-tmux|--tmux)
                 shift
                 ;;
             --message|--prompt|-m)
@@ -828,6 +883,9 @@ _launch_detached() {
                 passthrough+=("$1" "$2")
                 shift 2
                 ;;
+            --foreground|--no-tmux|--tmux)
+                shift
+                ;;
             --resume|-r)
                 passthrough+=("$1")
                 if [[ $# -gt 1 && "$2" != -* && "$2" != @* ]]; then
@@ -874,7 +932,7 @@ _launch_detached() {
         return 1
     fi
 
-    local cctrl_q extras_q="" env_q="" shell_cmd session_name display_label friendly_name
+    local cctrl_q extras_q="" env_q="CCTRL_TMUX_CONTEXT=1" shell_cmd session_name display_label context_name
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
     local env_name env_val
     for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX; do
@@ -888,7 +946,8 @@ _launch_detached() {
         done
     fi
 
-    # Detached agent display names get a "TMUX." prefix.
+    # Detached tmux sessions and agent display names share one visible context
+    # slug: TMUX--<host>--<target>.
     if [[ "$target_kind" == "shortcut" ]]; then
         local canonical
         canonical="$(_shortcut_lookup_key "$target")"
@@ -897,12 +956,12 @@ _launch_detached() {
             echo -e "${DIM}List with: cctrl @${RESET}" >&2
             return 1
         fi
-        friendly_name="$canonical"
         local name_q cc_name_q
+        context_name="$(_tmux_session_slug "$canonical")"
         name_q="$(printf '%q' "$canonical")"
-        cc_name_q="$(printf '%q' "TMUX. $friendly_name")"
-        shell_cmd="${env_q}$cctrl_q @$name_q --name $cc_name_q$extras_q"
-        session_name="$(_session_slug "$canonical")"
+        cc_name_q="$(printf '%q' "$context_name")"
+        shell_cmd="${env_q}$cctrl_q @$name_q --foreground --name $cc_name_q$extras_q"
+        session_name="$context_name"
         display_label="@$canonical"
     else
         local dir="$target"
@@ -912,12 +971,12 @@ _launch_detached() {
             return 1
         fi
         dir="$(cd "$dir" && pwd)"
-        friendly_name="$(basename "$dir")"
         local dir_q cc_name_q
+        context_name="$(_tmux_session_slug "$dir")"
         dir_q="$(printf '%q' "$dir")"
-        cc_name_q="$(printf '%q' "TMUX. $friendly_name")"
-        shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --name $cc_name_q$extras_q"
-        session_name="$(_session_slug "$dir")"
+        cc_name_q="$(printf '%q' "$context_name")"
+        shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
+        session_name="$context_name"
         display_label="$dir"
     fi
 
@@ -944,6 +1003,10 @@ _launch_detached() {
     if [[ -n "${CCTRL_EMIT_SESSION:-}" ]]; then
         printf 'CCTRL_SESSION=%s\n' "$session_name"
     fi
+
+    if [[ "${CCTRL_ATTACH_AFTER_START:-}" == "1" && -t 0 && -t 1 ]]; then
+        exec tmux attach-session -t "$session_name"
+    fi
 }
 
 # ── Detached session management ───────────────────────────────────────
@@ -961,7 +1024,7 @@ cmd_session() {
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session kill <name>      Kill a session"
             echo ""
-            echo "Create a session with:  cctrl start -d <dir | @shortcut>"
+            echo "Create a session with:  cctrl start [dir flags] or cctrl start -d <dir | @shortcut>"
             return 0
             ;;
         ls|list)   _session_list "$@" ;;
@@ -1031,7 +1094,7 @@ _session_list() {
             model="${model#claude-}"; model="${model%%\[*}"
             [[ -z "$model" ]] && model="?"
             kind="$agent ($model)"
-            if [[ "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* ]]; then
+            if [[ "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
                 managed=true
             else
                 managed=false
@@ -1158,10 +1221,11 @@ cmd_help() {
     echo "  cctrl rename <old> <new>  Rename a profile"
     echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
     echo ""
-    echo -e "${BOLD}Session${RESET} ${DIM}(one verb; flags pick foreground vs detached)${RESET}"
-    echo "  cctrl start [@name]         Launch the selected agent in the foreground (current dir, or shortcut)"
+    echo -e "${BOLD}Session${RESET} ${DIM}(tmux-backed by default; --foreground for one-offs)${RESET}"
+    echo "  cctrl start [@name]         Launch selected agent in tmux and attach when interactive"
     echo "    --agent claude|codex      Select runtime (default: $(_default_agent))"
-    echo "    -d, --detach              Run in a detached tmux session (survives SSH disconnect)"
+    echo "    --foreground, --no-tmux   Launch directly without tmux"
+    echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
     echo "    -n, --name NAME           Set the session display name"
     echo "    -m, --message TEXT        Start with an initial prompt"
@@ -1177,7 +1241,8 @@ cmd_help() {
     echo "  cctrl session kill <name>   Kill a detached session"
     echo ""
     echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
-    echo "  cctrl @<name>           Jump: cd to dir, switch profile, start selected agent"
+    echo "  cctrl @<name>           Jump: cd to dir, switch profile, start tmux-backed agent"
+    echo "  cctrl @<name> --foreground  Launch directly without tmux"
     echo "  cctrl @<name> -m TEXT   Open with an initial prompt (alias: --message, --prompt)"
     echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
     echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
@@ -1902,8 +1967,9 @@ _shortcut_lookup_key() {
 
 _shortcut_help() {
     echo -e "${BOLD}Shortcut commands${RESET}"
-    echo "  cctrl @<name>                     Jump: cd, switch profile, launch selected agent"
+    echo "  cctrl @<name>                     Jump: cd, switch profile, launch tmux-backed agent"
     echo "  cctrl @<name> -m \"TEXT\"            Launch with an initial prompt"
+    echo "  cctrl @<name> --foreground        Launch directly without tmux"
     echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
     echo "  cctrl @<name> --no-bridge         Disable the phone-control bridge for this launch"
@@ -2045,6 +2111,7 @@ _shortcut_rm() {
 
 _shortcut_jump() {
     local name="$1"; shift
+    local original_args=("$@")
 
     if [[ ! -f "$SHORTCUTS_FILE" ]]; then
         echo -e "${RED}No shortcuts configured.${RESET} Add one with: cctrl @add <name> <dir>"
@@ -2137,6 +2204,20 @@ _shortcut_jump() {
         return 1
     fi
 
+    local shortcut_foreground=false a
+    [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && shortcut_foreground=true
+    for a in "${original_args[@]}"; do
+        [[ "$a" == "--" ]] && break
+        case "$a" in
+            --foreground|--no-tmux) shortcut_foreground=true ;;
+        esac
+    done
+
+    if ! $shortcut_foreground; then
+        _launch_detached "@$key" "${original_args[@]}"
+        return
+    fi
+
     # Build selected-agent flags. CLI args override shortcut resume/prompt/agent settings.
     local cli_resume=false
     local cli_resume_val=""
@@ -2166,6 +2247,8 @@ _shortcut_jump() {
                 cli_prompt="$2"; cli_prompt_set=true; shift 2 ;;
             --no-bridge)
                 no_bridge=true; shift ;;
+            --foreground|--no-tmux|--tmux)
+                shift ;;
             --yolo|--dangerously-bypass-approvals-and-sandbox)
                 full_bypass=true; access_explicit=true; shift ;;
             --permission-mode)

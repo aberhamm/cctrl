@@ -97,7 +97,7 @@ test_launch_args() {
     make_fake_agent "$TMPDIR/claude" claude
 
     local out
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --agent codex --model gpt-5.5 --sandbox workspace-write --ask-for-approval on-request -m "fix bug")"
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent codex --model gpt-5.5 --sandbox workspace-write --ask-for-approval on-request -m "fix bug")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--model"
     assert_contains "$out" "ARG[1]=gpt-5.5"
@@ -107,14 +107,14 @@ test_launch_args() {
     assert_contains "$out" "ARG[5]=on-request"
     assert_contains "$out" "ARG[6]=fix bug"
 
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --agent codex --resume -m "continue bug")"
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent codex --resume -m "continue bug")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=resume"
     assert_contains "$out" "ARG[1]=--yolo"
     assert_contains "$out" "ARG[2]=--last"
     assert_contains "$out" "ARG[3]=continue bug"
 
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --agent claude --model sonnet --yolo --no-bridge -m "fix bug")"
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --model sonnet --yolo --no-bridge -m "fix bug")"
     assert_contains "$out" "CMD=claude"
     assert_contains "$out" "ARG[0]=--permission-mode"
     assert_contains "$out" "ARG[1]=bypassPermissions"
@@ -122,12 +122,12 @@ test_launch_args() {
     assert_contains "$out" "ARG[3]=sonnet"
     assert_contains "$out" "ARG[4]=fix bug"
 
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start -m "default agent")"
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground -m "default agent")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=default agent"
 
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --agent codex --remote unix:// -m "remote prompt")"
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent codex --remote unix:// -m "remote prompt")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=--remote"
@@ -145,8 +145,11 @@ test_detached_arg_parsing() {
     local out
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex -m "line one" "$project")"
     assert_contains "$out" "detached session started"
-    assert_contains "$out" "CCTRL_SESSION=project"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--project"
     assert_contains "$(cat "$log")" "new-session"
+    assert_contains "$(cat "$log")" "--name TMUX--project"
+    assert_contains "$(cat "$log")" "start --foreground"
+    assert_contains "$(cat "$log")" "CCTRL_TMUX_CONTEXT=1"
     assert_contains "$(cat "$log")" "--agent\\ codex"
     assert_contains "$(cat "$log")" "-m line\\ one"
 
@@ -154,12 +157,52 @@ test_detached_arg_parsing() {
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
+    assert_contains "$(cat "$log")" "start --foreground"
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex --remote unix:// -m "remote line" "$project")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "--remote unix://"
     assert_contains "$(cat "$log")" "-m remote\\ line"
+    assert_contains "$(cat "$log")" "start --foreground"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex "$project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--project"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--project"
+    assert_contains "$(cat "$log")" "--name TMUX--ms--project"
+    assert_contains "$(cat "$log")" "start --foreground"
+}
+
+test_start_defaults_to_tmux() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local project="$TMPDIR/default-project"
+    local log="$TMPDIR/default-tmux.log"
+    mkdir -p "$project"
+
+    : > "$log"
+    local out
+    out="$(cd "$project" && PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start --agent codex -m "default tmux")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--default-project"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--default-project"
+    assert_contains "$(cat "$log")" "start --foreground --name TMUX--default-project"
+    assert_contains "$(cat "$log")" "--agent\\ codex"
+    assert_contains "$(cat "$log")" "-m default\\ tmux"
+}
+
+test_context_names() {
+    make_fake_agent "$TMPDIR/claude" claude
+    local project="$TMPDIR/context project"
+    mkdir -p "$project"
+
+    local out
+    out="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 "$ROOT/cctrl" start --agent claude -m "bridge prompt")"
+    assert_contains "$out" "CMD=claude"
+    assert_contains "$out" "--remote-control"
+    assert_contains "$out" "--remote-control-session-name-prefix"
+    assert_contains "$out" "TMUX--ms--context-project-"
 }
 
 test_session_list_codex_default_model() {
@@ -211,6 +254,8 @@ JSONL
 test_syntax
 test_launch_args
 test_detached_arg_parsing
+test_start_defaults_to_tmux
+test_context_names
 test_session_list_codex_default_model
 test_usage_cost_fixtures
 

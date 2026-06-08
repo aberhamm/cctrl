@@ -100,16 +100,17 @@ A launch is described by three independent axes:
 | Axis | Question | How you set it |
 | --- | --- | --- |
 | **Location** | which machine runs it? | `--host <alias>` (default: local) |
-| **Durability** | does it survive disconnect? | `-d` / `--detach` (default: foreground) |
+| **Durability** | does it survive disconnect? | tmux-backed by default; `--foreground` for direct one-offs; `-d` / `--detach` to start detached and return |
 | **Agent** | which CLI runs? | `--agent codex` (default for now) or `--agent claude` |
 | **Bridge** | can the phone app drive it? | Claude only, on by default; `--no-bridge` to disable |
 
-There's **one launch verb — `start`** — and the flags above pick the behavior. Managing detached sessions (list/attach/kill) lives under `cctrl session`.
+There's **one launch verb — `start`** — and the flags above pick the behavior. Interactive starts are tmux-backed by default so local and remote agents are durable and addressable. Managing tmux sessions (list/attach/kill) lives under `cctrl session`.
 
 ```bash
-cctrl start                       # foreground, current dir, Codex by default
+cctrl start                       # tmux-backed, current dir, Codex by default
 cctrl start --agent claude        # launch Claude instead of Codex
 cctrl --agent claude start        # same, useful with global flags
+cctrl start --foreground          # direct one-off launch without tmux
 cctrl start --resume              # resume a session (interactive picker)
 cctrl start --yolo                # full bypass: Claude bypassPermissions / Codex --yolo
 cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
@@ -118,23 +119,40 @@ cctrl start --no-bridge           # launch without the phone-control bridge
 cctrl start --agent codex --remote unix://  # connect Codex TUI to local app-server
 ```
 
-`cctrl start` launches the default agent from `data/config.json`; it is currently set to `codex`. Use `--agent claude` when you want Claude Code and its phone-control bridge. Multiple detached sessions in the same folder get unique suffixes (e.g. `homelab--2`).
+`cctrl start` launches the default agent from `data/config.json`; it is currently set to `codex`. Use `--agent claude` when you want Claude Code and its phone-control bridge. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
 
-### Detached sessions
+### Tmux sessions
 
-Add `-d` to run inside a detached **tmux** session that persists after SSH disconnect — reattach anytime from any terminal. No GUI required — just tmux. A detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop a full-access agent into `~/.ssh`, `~/.aws`, etc.
+By default, `cctrl start` and `cctrl @shortcut` create a **tmux** session and
+attach when launched from an interactive terminal. This gives local and remote
+agents a stable session name and lets them survive SSH disconnects. Use
+`--foreground` or `--no-tmux` for quick direct one-offs.
+
+Add `-d` to start the tmux session and return without attaching. No GUI required — just tmux. An explicit detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop a full-access agent into `~/.ssh`, `~/.aws`, etc.
 
 ```bash
+cctrl start ~/_projects/myapp     # tmux-backed and auto-attaches in a TTY
+cctrl @myapp                      # shortcut launch, also tmux-backed
+cctrl @myapp --foreground         # direct launch without tmux
+
 cctrl start -d ~/_projects/myapp  # launch detached in a directory
 cctrl start -d @myapp             # ...or via a saved shortcut
 cctrl start -d @myapp --agent codex
 
 cctrl session ls                  # list sessions (see below)
-cctrl session attach myapp        # reattach (interactive picker if no name)
-cctrl session kill myapp          # kill a session
+cctrl session attach myapp        # partial names work; full name is TMUX--myapp
+cctrl session kill TMUX--myapp    # kill a session
 ```
 
 **Requires:** tmux (`brew install tmux`)
+
+Detached sessions use segmented names so tmux, remote hosts, and Claude Code
+display/bridge names line up:
+
+```text
+TMUX--myapp              # local detached session
+TMUX--studio--myapp      # detached session launched with --host studio
+```
 
 `cctrl session ls` is self-describing — for each tmux session it shows the working
 directory, whether it's a live agent process (and which model) or a plain shell,
@@ -144,9 +162,9 @@ machine-readable output:
 ```
 $ cctrl session ls
 ✦ = cctrl-managed agent session
-✦ homelab    claude (opus-4-6)  ~/_projects/homelab   detached
-✦ cctrl      codex (?)          ~/_projects/cctrl      detached
-  scratch    shell (zsh)        ~/tmp                 attached
+✦ TMUX--homelab    claude (opus-4-6)  ~/_projects/homelab   detached
+✦ TMUX--cctrl      codex (?)          ~/_projects/cctrl      detached
+  scratch          shell (zsh)        ~/tmp                 attached
 ```
 
 ### Shortcuts
@@ -195,7 +213,7 @@ cctrl --host local whoami                 # built-in alias, always local
 ```bash
 cctrl --host studio start -d @homelab        # start a detached session there, then auto-attach
 cctrl --host studio session ls               # list remote detached sessions
-cctrl --host studio session attach homelab   # attach interactively (TTY)
+cctrl --host studio session attach homelab   # partial match for TMUX--studio--homelab
 cctrl --host studio costs --week             # view remote cost data
 ```
 

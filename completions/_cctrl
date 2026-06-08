@@ -159,6 +159,8 @@ _cctrl() {
             _arguments \
                 '--resume[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
+                '--foreground[Launch directly without tmux]' \
+                '--no-tmux[Launch directly without tmux]' \
                 '--no-bridge[Disable the phone-control bridge]' \
                 '--yolo[Full bypass mode]' \
                 '--permission-mode[Claude permission mode]:mode:' \
@@ -177,7 +179,9 @@ _cctrl() {
             ;; # name is freeform
         start|s)
             _arguments \
-                {--detach,-d}'[Run in a detached tmux session]' \
+                {--detach,-d}'[Start a tmux session and return without attaching]' \
+                '--foreground[Launch directly without tmux]' \
+                '--no-tmux[Launch directly without tmux]' \
                 {--resume,-r}'[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
                 {--name,-n}'[Session display name]:name:' \
