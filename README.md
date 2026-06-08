@@ -115,6 +115,7 @@ cctrl start --yolo                # full bypass: Claude bypassPermissions / Code
 cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
 cctrl start -m "fix bug"          # launch with an initial prompt
 cctrl start --no-bridge           # launch without the phone-control bridge
+cctrl start --agent codex --remote unix://  # connect Codex TUI to local app-server
 ```
 
 `cctrl start` launches the default agent from `data/config.json`; it is currently set to `codex`. Use `--agent claude` when you want Claude Code and its phone-control bridge. Multiple detached sessions in the same folder get unique suffixes (e.g. `homelab--2`).
@@ -263,6 +264,7 @@ and is surfaced through `cctrl usage`.
 | Initial prompt with `-m` | yes | yes |
 | `--yolo` | maps to `bypassPermissions` | native |
 | Native sandbox/approval flags | Claude permission mode | Codex `--sandbox` / `--ask-for-approval` |
+| App-server-backed TUI | n/a | `--remote unix://` passthrough |
 | Usage and cost parsing | local JSONL | local JSONL |
 | Rate-limit reporting | statusline/history files | session JSONL `token_count` events |
 | Status line | external script | built-in TUI footer |

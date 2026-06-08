@@ -162,6 +162,8 @@ _cctrl() {
                 '--no-bridge[Disable the phone-control bridge]' \
                 '--yolo[Full bypass mode]' \
                 '--permission-mode[Claude permission mode]:mode:' \
+                '--remote[Codex app-server endpoint]:addr:(unix://)' \
+                '--remote-auth-token-env[Env var containing remote auth token]:envvar:' \
                 {-m,--message,--prompt}'[Initial prompt]:message:' \
                 '--[Everything after is the prompt]'
             ;;
@@ -184,6 +186,8 @@ _cctrl() {
                 {-m,--message,--prompt}'[Initial prompt]:message:' \
                 {--sandbox,-s}'[Codex sandbox mode]:mode:(read-only workspace-write danger-full-access)' \
                 {--ask-for-approval,-a}'[Codex approval policy]:policy:(untrusted on-request never)' \
+                '--remote[Codex app-server endpoint]:addr:(unix://)' \
+                '--remote-auth-token-env[Env var containing remote auth token]:envvar:' \
                 '--no-bridge[Disable the phone-control bridge]'
             # Allow @shortcut or a directory as the target
             if (( CURRENT == 3 )); then

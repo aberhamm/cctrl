@@ -247,6 +247,15 @@ _launch_apply_profile_args() {
                 LAUNCH_FLAGS+=("$parg" "$next")
                 ((i+=2))
                 ;;
+            --remote|--remote-auth-token-env)
+                if (( i + 1 >= ${#LAUNCH_PROFILE_ARGS[@]} )); then
+                    echo -e "${RED}Profile arg $parg needs a value${RESET}" >&2
+                    return 1
+                fi
+                next="${LAUNCH_PROFILE_ARGS[$((i + 1))]}"
+                LAUNCH_FLAGS+=("$parg" "$next")
+                ((i+=2))
+                ;;
             *)
                 LAUNCH_FLAGS+=("$parg")
                 ((i++))
@@ -739,6 +748,11 @@ cmd_start() {
                 passthrough+=("$1" "$2")
                 shift 2
                 ;;
+            --remote|--remote-auth-token-env)
+                [[ $# -ge 2 ]] || { echo -e "${RED}$1 needs a value${RESET}"; return 1; }
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
                 launch_name="$2"; shift 2
@@ -806,7 +820,7 @@ _launch_detached() {
                 passthrough+=("--" "$@")
                 break
                 ;;
-            --agent|--profile|--model|--message|--prompt|-m|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--name|-n)
+            --agent|--profile|--model|--message|--prompt|-m|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
                 if [[ $# -lt 2 ]]; then
                     echo -e "${RED}$1 needs a value${RESET}" >&2
                     return 1
@@ -1153,6 +1167,8 @@ cmd_help() {
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --yolo                    Full bypass alias (Codex) / bypassPermissions (Claude)"
     echo "    --no-bridge               Disable the phone-control bridge (on by default)"
+    echo "    --remote ADDR             Codex: connect TUI to app-server (e.g. unix://)"
+    echo "    --remote-auth-token-env E Codex: env var containing remote auth token"
     echo "                              Extra flags are appended to the selected agent"
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
     echo ""
@@ -1891,6 +1907,7 @@ _shortcut_help() {
     echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
     echo "  cctrl @<name> --no-bridge         Disable the phone-control bridge for this launch"
+    echo "  cctrl @<name> --remote unix://    Codex: launch through local app-server"
     echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
     echo "  cctrl @rm <name>                  Remove a shortcut"
     echo "  cctrl @ ls                        List shortcuts (no helper)"
@@ -2157,6 +2174,9 @@ _shortcut_jump() {
             --sandbox|-s|--ask-for-approval|-a)
                 [[ $# -ge 2 ]] || { echo -e "${RED}$1 needs a value${RESET}"; return 1; }
                 access_explicit=true
+                passthrough+=("$1" "$2"); shift 2 ;;
+            --remote|--remote-auth-token-env)
+                [[ $# -ge 2 ]] || { echo -e "${RED}$1 needs a value${RESET}"; return 1; }
                 passthrough+=("$1" "$2"); shift 2 ;;
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }

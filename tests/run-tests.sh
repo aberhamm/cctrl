@@ -126,6 +126,13 @@ test_launch_args() {
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=default agent"
+
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --agent codex --remote unix:// -m "remote prompt")"
+    assert_contains "$out" "CMD=codex"
+    assert_contains "$out" "ARG[0]=--yolo"
+    assert_contains "$out" "ARG[1]=--remote"
+    assert_contains "$out" "ARG[2]=unix://"
+    assert_contains "$out" "ARG[3]=remote prompt"
 }
 
 test_detached_arg_parsing() {
@@ -147,6 +154,12 @@ test_detached_arg_parsing() {
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex --remote unix:// -m "remote line" "$project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$(cat "$log")" "--remote unix://"
+    assert_contains "$(cat "$log")" "-m remote\\ line"
 }
 
 test_session_list_codex_default_model() {
