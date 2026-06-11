@@ -62,6 +62,12 @@ _cctrl_agents() {
     compadd "$@" -- claude codex
 }
 
+_cctrl_tmux_sessions() {
+    local -a sessions
+    sessions=("${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null)}")
+    (( ${#sessions} )) && compadd "$@" -- "${sessions[@]}"
+}
+
 _cctrl() {
     local -a subcmds=(
         'use:Switch to a settings profile'
@@ -75,7 +81,8 @@ _cctrl() {
         'edit:Open a profile in \$EDITOR'
         'start:Launch selected agent (foreground, or -d for a detached session)'
         's:Launch selected agent (foreground, or -d for a detached session)'
-        'session:Manage detached sessions (ls/attach/kill)'
+        'session:Manage detached sessions (ls/attach/close/kill)'
+        'close:Gracefully close a tmux session (default: the one you are inside)'
         'host:Manage remote hosts'
         'whoami:Show this machine and which host aliases mean local'
         'costs:Token usage and cost breakdown'
@@ -159,6 +166,7 @@ _cctrl() {
             _arguments \
                 '--resume[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
+                '--purpose[Session purpose metadata]:purpose:' \
                 '--foreground[Launch directly without tmux]' \
                 '--no-tmux[Launch directly without tmux]' \
                 '--no-bridge[Disable the phone-control bridge]' \
@@ -185,6 +193,7 @@ _cctrl() {
                 {--resume,-r}'[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
                 {--name,-n}'[Session display name]:name:' \
+                '--purpose[Session purpose metadata]:purpose:' \
                 '--yolo[Full bypass mode]' \
                 '--permission-mode[Claude permission mode]:mode:' \
                 {-m,--message,--prompt}'[Initial prompt]:message:' \
@@ -204,17 +213,31 @@ _cctrl() {
                 local -a session_cmds=(
                     'ls:List sessions (dir, agent/shell, model, state)'
                     'attach:Reattach to a session'
+                    'close:Gracefully close a session (default: the one you are inside)'
                     'kill:Kill a detached session'
                 )
                 _describe "session commands" session_cmds
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == ls ]]; then
                 _arguments \
                     '--json[Machine-readable output]'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == (close|stop) ]]; then
+                _arguments \
+                    '--in[Grace period in seconds]:seconds:' \
+                    '--now[Kill immediately, no grace period]' \
+                    '--force[Allow closing non-cctrl sessions]' \
+                    '*:session:_cctrl_tmux_sessions'
             elif (( CURRENT == 4 )) && [[ "${words[3]}" == (attach|a|kill|k|rm) ]]; then
                 local -a sessions
                 sessions=("${(@f)$(tmux list-sessions -F '#{session_name}' 2>/dev/null)}")
                 (( ${#sessions} )) && compadd "$@" -- "${sessions[@]}"
             fi
+            ;;
+        close)
+            _arguments \
+                '--in[Grace period in seconds]:seconds:' \
+                '--now[Kill immediately, no grace period]' \
+                '--force[Allow closing non-cctrl sessions]' \
+                '*:session:_cctrl_tmux_sessions'
             ;;
         shortcuts)
             if (( CURRENT == 3 )); then

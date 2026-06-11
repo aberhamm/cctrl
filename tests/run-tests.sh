@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
+export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 fail() {
@@ -52,7 +53,10 @@ if [[ "${1:-}" == "new-session" ]]; then
 fi
 
 case "${1:-}" in
-    has-session) exit 1 ;;
+    has-session)
+        [[ -n "${TMUX_FAKE_HAS_SESSION:-}" ]] && exit 0
+        exit 1
+        ;;
     list-sessions)
         printf 'demo\n'
         exit 0
@@ -66,7 +70,11 @@ case "${1:-}" in
         exit 0
         ;;
     display-message)
-        printf '0\n'
+        if [[ "$*" == *session_name* ]]; then
+            printf '%s\n' "${TMUX_FAKE_SESSION_NAME:-demo}"
+        else
+            printf '0\n'
+        fi
         exit 0
         ;;
     show-option)
@@ -157,12 +165,22 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "CCTRL_TMUX_CONTEXT=1"
     assert_contains "$(cat "$log")" "--agent\\ codex"
     assert_contains "$(cat "$log")" "-m line\\ one"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "line one"'
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"initial_prompt": "line one"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
     assert_contains "$(cat "$log")" "start --foreground"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "literal prompt words"'
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --purpose "cleanup context" "$project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$(cat "$log")" "start --foreground"
+    assert_not_contains "$(cat "$log")" "--purpose"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "cleanup context"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex --remote unix:// -m "remote line" "$project")"
@@ -283,12 +301,18 @@ test_context_names() {
 test_session_list_codex_default_model() {
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"review stale session cleanup","created_at":"2026-06-11T10:00:00Z"}
+JSON
 
     local out
     out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" session ls --json)"
     assert_contains "$out" '"name": "demo"'
     assert_contains "$out" '"agent": "codex"'
     assert_contains "$out" '"model": "?"'
+    assert_contains "$out" '"purpose": "review stale session cleanup"'
+    assert_contains "$out" '"created_at": "2026-06-11T10:00:00Z"'
 }
 
 test_usage_cost_fixtures() {

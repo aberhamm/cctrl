@@ -13,6 +13,7 @@ SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
 HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
+SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -786,6 +787,10 @@ cmd_start() {
                 cli_prompt_set=true
                 shift 2
                 ;;
+            --purpose)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--purpose needs a value${RESET}"; return 1; }
+                shift 2
+                ;;
             --yolo|--dangerously-bypass-approvals-and-sandbox)
                 full_bypass=true
                 access_explicit=true
@@ -856,6 +861,83 @@ cmd_start() {
     _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$resume" "$resume_val" "$final_prompt" "$PWD"
 }
 
+_session_metadata_file() {
+    local safe
+    safe="$(printf '%s' "$1" | tr '/:' '__')"
+    printf '%s/%s.json' "$SESSION_METADATA_DIR" "$safe"
+}
+
+_session_metadata_field() {
+    local session_name="$1" field="$2" file
+    file="$(_session_metadata_file "$session_name")"
+    [[ -f "$file" ]] || return 0
+    jq -r --arg field "$field" '.[$field] // empty' "$file" 2>/dev/null
+}
+
+_session_write_metadata() {
+    local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8"
+    mkdir -p "$SESSION_METADATA_DIR"
+    local tmp created_at host_label
+    tmp="$(mktemp)"
+    created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    host_label="${CCTRL_HOST_PREFIX:-local}"
+    jq -n \
+        --arg name "$session_name" \
+        --arg created_at "$created_at" \
+        --arg cwd "$cwd" \
+        --arg target_kind "$target_kind" \
+        --arg target "$target" \
+        --arg display_label "$display_label" \
+        --arg purpose "$purpose" \
+        --arg initial_prompt "$initial_prompt" \
+        --arg launch_command "$launch_command" \
+        --arg host "$host_label" \
+        '{
+            name: $name,
+            created_at: $created_at,
+            cwd: $cwd,
+            target_kind: $target_kind,
+            target: $target,
+            display_label: $display_label,
+            purpose: (if $purpose == "" then null else $purpose end),
+            initial_prompt: (if $initial_prompt == "" then null else $initial_prompt end),
+            launch_command: $launch_command,
+            host: $host,
+            cctrl_managed: true
+        }' > "$tmp" && mv "$tmp" "$(_session_metadata_file "$session_name")"
+}
+
+_prompt_session_purpose() {
+    local default_purpose="$1" answer
+    case "${CCTRL_PURPOSE_PROMPT:-auto}" in
+        never)
+            printf '%s' "$default_purpose"
+            return 0
+            ;;
+        always)
+            ;;
+        *)
+            if [[ ! -t 0 || ! -t 1 ]]; then
+                printf '%s' "$default_purpose"
+                return 0
+            fi
+            ;;
+    esac
+
+    if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+        printf '%s' "$default_purpose"
+        return 0
+    fi
+
+    if [[ -n "$default_purpose" ]]; then
+        printf 'Session purpose? [%s]\n> ' "$default_purpose" > /dev/tty
+    else
+        printf 'Session purpose? [optional]\n> ' > /dev/tty
+    fi
+    IFS= read -r answer < /dev/tty || answer=""
+    printf '%s' "${answer:-$default_purpose}"
+}
+
 _launch_detached() {
     # Launch a cctrl session in a detached tmux session (survives SSH
     # disconnect). Invoked by `cctrl start -d`. No GUI — just tmux.
@@ -865,6 +947,7 @@ _launch_detached() {
     # Session management lives under `cctrl session`.
 
     local target="" target_kind=""   # kind: dir | shortcut
+    local purpose="" purpose_set=false initial_prompt=""
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -872,10 +955,29 @@ _launch_detached() {
                 shift ;;
             --)
                 shift
+                [[ $# -gt 0 ]] && initial_prompt="$*"
                 passthrough+=("--" "$@")
                 break
                 ;;
-            --agent|--profile|--model|--message|--prompt|-m|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
+            --purpose)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--purpose needs a value${RESET}" >&2
+                    return 1
+                fi
+                purpose="$2"
+                purpose_set=true
+                shift 2
+                ;;
+            --message|--prompt|-m)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}$1 needs a value${RESET}" >&2
+                    return 1
+                fi
+                initial_prompt="$2"
+                passthrough+=("$1" "$2")
+                shift 2
+                ;;
+            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
                 if [[ $# -lt 2 ]]; then
                     echo -e "${RED}$1 needs a value${RESET}" >&2
                     return 1
@@ -933,6 +1035,7 @@ _launch_detached() {
     fi
 
     local cctrl_q extras_q="" env_q="CCTRL_TMUX_CONTEXT=1" shell_cmd session_name display_label context_name
+    local metadata_cwd="" metadata_target=""
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
     local env_name env_val
     for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX; do
@@ -963,6 +1066,9 @@ _launch_detached() {
         shell_cmd="${env_q}$cctrl_q @$name_q --foreground --name $cc_name_q$extras_q"
         session_name="$context_name"
         display_label="@$canonical"
+        metadata_target="@$canonical"
+        metadata_cwd="$(jq -r --arg k "$canonical" '.[$k].dir // ""' "$SHORTCUTS_FILE" 2>/dev/null)"
+        metadata_cwd="${metadata_cwd/#\~/$HOME}"
     else
         local dir="$target"
         dir="${dir/#\~/$HOME}"
@@ -978,6 +1084,8 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
         session_name="$context_name"
         display_label="$dir"
+        metadata_target="$dir"
+        metadata_cwd="$dir"
     fi
 
     # Auto-increment if session name already exists (homelab, homelab--2, ...)
@@ -990,12 +1098,28 @@ _launch_detached() {
         session_name="${base_name}--${n}"
     fi
 
+    local default_purpose final_purpose
+    if $purpose_set; then
+        final_purpose="$purpose"
+    else
+        if [[ -n "$initial_prompt" ]]; then
+            default_purpose="$initial_prompt"
+        elif [[ "$target_kind" == "shortcut" ]]; then
+            default_purpose="$metadata_target"
+        else
+            default_purpose="${metadata_cwd##*/}"
+        fi
+        final_purpose="$(_prompt_session_purpose "$default_purpose")"
+    fi
+
     tmux new-session -d -s "$session_name" "$shell_cmd"
     tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
+    _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" 2>/dev/null || true
 
     echo -e "${GREEN}✓${RESET} detached session started — ${BOLD}$display_label${RESET}"
     echo -e "${DIM}  Attach:  cctrl session attach $session_name${RESET}"
     echo -e "${DIM}  List:    cctrl session ls${RESET}"
+    echo -e "${DIM}  Close:   cctrl session close $session_name  (or 'cctrl close' from inside)${RESET}"
     echo -e "${DIM}  Kill:    cctrl session kill $session_name${RESET}"
 
     # Machine-readable line so a remote launch can attach to the exact session
@@ -1045,18 +1169,24 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | attach | kill>"
+            echo "Usage: cctrl session <ls | attach | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state)"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
-            echo "  cctrl session kill <name>      Kill a session"
+            echo "  cctrl session close [name]     Gracefully close a session; with no name,"
+            echo "                                 closes the session you are running inside"
+            echo "                                 (delayed kill so the caller can finish output)"
+            echo "    --in SECONDS | --now         Grace period (default 5s for own session)"
+            echo "    --force                      Allow closing non-cctrl sessions"
+            echo "  cctrl session kill <name>      Kill a session immediately"
             echo ""
             echo "Create a session with:  cctrl start [dir flags] or cctrl start -d <dir | @shortcut>"
             return 0
             ;;
         ls|list)   _session_list "$@" ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
+        close|stop) _session_close "$@" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
@@ -1110,11 +1240,13 @@ _session_list() {
 
     local -a json_items=()
     $json || echo -e "${DIM}✦ = cctrl-managed agent session${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at purpose_display
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
+        purpose="$(_session_metadata_field "$name" purpose)"
+        created_at="$(_session_metadata_field "$name" created_at)"
         if [[ "$cmd" == *claude* || "$cmd" == *codex* ]]; then
             [[ "$cmd" == *codex* ]] && agent="codex" || agent="claude"
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
@@ -1139,11 +1271,16 @@ _session_list() {
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" --arg agent "$agent" \
+                --arg purpose "$purpose" --arg created_at "$created_at" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached")}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end)}')")
         else
             $managed && marker="✦" || marker=" "
-            printf '%s %-15s %-18s %-34s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state"
+            purpose_display="$purpose"
+            if [[ ${#purpose_display} -gt 42 ]]; then
+                purpose_display="${purpose_display:0:39}..."
+            fi
+            printf '%s %-15s %-18s %-34s %-9s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state" "$purpose_display"
         fi
     done
 
@@ -1237,6 +1374,121 @@ _session_kill() {
     fi
 }
 
+_session_current_name() {
+    # Name of the tmux session this process is running inside, if any.
+    [[ -n "${TMUX:-}" ]] || return 1
+    tmux display-message -p '#{session_name}' 2>/dev/null
+}
+
+_session_close() {
+    # Gracefully close a session. Designed so an agent running INSIDE a
+    # cctrl-launched tmux session can shut its own session down: with no
+    # name it targets the current session and schedules the kill a few
+    # seconds out, giving the caller time to finish its final output
+    # before the pane disappears.
+    _session_require_tmux || return 1
+
+    local target="" grace="" force=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --in|--after)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}$1 needs a value (seconds)${RESET}" >&2
+                    return 1
+                fi
+                grace="$2"; shift 2
+                ;;
+            --now) grace=0; shift ;;
+            --force|-f) force=true; shift ;;
+            -h|--help)
+                echo "Usage: cctrl session close [name] [--in SECONDS | --now] [--force]"
+                echo ""
+                echo "  Without a name, closes the tmux session you are currently inside."
+                echo "  When closing your own session the kill is delayed (default 5s) so"
+                echo "  the calling process can finish its output first."
+                echo ""
+                echo "  --in SECONDS   Grace period before the session is killed"
+                echo "  --now          Kill immediately, no grace period"
+                echo "  --force        Allow closing sessions not started by cctrl"
+                return 0
+                ;;
+            -*)
+                echo -e "${RED}Unknown flag: $1${RESET}" >&2
+                echo -e "${DIM}Usage: cctrl session close [name] [--in SECONDS | --now] [--force]${RESET}" >&2
+                return 1
+                ;;
+            *)
+                if [[ -n "$target" ]]; then
+                    echo -e "${RED}Only one session name expected.${RESET}" >&2
+                    return 1
+                fi
+                target="$1"; shift
+                ;;
+        esac
+    done
+
+    local current=""
+    current="$(_session_current_name || true)"
+
+    if [[ -z "$target" ]]; then
+        if [[ -z "$current" ]]; then
+            echo -e "${RED}Not inside a tmux session — pass a session name.${RESET}" >&2
+            echo -e "${DIM}Usage: cctrl session close [name]   (list with: cctrl session ls)${RESET}" >&2
+            return 1
+        fi
+        target="$current"
+    fi
+
+    if ! tmux has-session -t "$target" 2>/dev/null; then
+        echo -e "${RED}No session named '$target'.${RESET}" >&2
+        echo -e "${DIM}List sessions with: cctrl session ls${RESET}" >&2
+        return 1
+    fi
+
+    if ! $force; then
+        if [[ "$(tmux show-option -qv -t "$target" @cctrl_managed 2>/dev/null)" != "1" \
+              && ! -f "$(_session_metadata_file "$target")" ]]; then
+            echo -e "${RED}Session '$target' was not started by cctrl.${RESET}" >&2
+            echo -e "${DIM}Close it anyway with: cctrl session close $target --force${RESET}" >&2
+            return 1
+        fi
+    fi
+
+    # Default grace: delayed when closing the session we're inside (let the
+    # caller finish talking), immediate when closing some other session.
+    if [[ -z "$grace" ]]; then
+        if [[ -n "$current" && "$target" == "$current" ]]; then
+            grace="${CCTRL_CLOSE_GRACE:-5}"
+        else
+            grace=0
+        fi
+    fi
+    if [[ ! "$grace" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}Grace period must be a number of seconds, got: $grace${RESET}" >&2
+        return 1
+    fi
+
+    if (( grace > 0 )); then
+        local target_q
+        target_q="$(printf '%q' "$target")"
+        # run-shell -b runs on the tmux server, so the delayed kill survives
+        # the death of the calling pane/client.
+        if ! tmux run-shell -b "sleep $grace; tmux kill-session -t $target_q" 2>/dev/null; then
+            tmux kill-session -t "$target"
+            echo -e "${GREEN}Closed session: $target${RESET}"
+            return 0
+        fi
+        if [[ "$target" == "$current" ]]; then
+            echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s — wrap up now."
+        else
+            echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s."
+        fi
+    else
+        tmux kill-session -t "$target"
+        echo -e "${GREEN}Closed session: $target${RESET}"
+    fi
+}
+
 cmd_help() {
     echo -e "${BOLD}cctrl${RESET} — agent session controller"
     echo ""
@@ -1257,6 +1509,7 @@ cmd_help() {
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
     echo "    -n, --name NAME           Set the session display name"
     echo "    -m, --message TEXT        Start with an initial prompt"
+    echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
     echo "    --yolo                    Full bypass alias (Codex) / bypassPermissions (Claude)"
     echo "    --no-bridge               Disable the phone-control bridge (on by default)"
     echo "    --remote ADDR             Codex: connect TUI to app-server (e.g. unix://)"
@@ -1266,12 +1519,16 @@ cmd_help() {
     echo ""
     echo "  cctrl session ls            List sessions (dir, agent/shell, model, state; --json)"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
-    echo "  cctrl session kill <name>   Kill a detached session"
+    echo "  cctrl session close [name]  Gracefully close a session (alias: cctrl close);"
+    echo "                              no name = the session you're inside, killed after"
+    echo "                              a short grace period (--in N, --now, --force)"
+    echo "  cctrl session kill <name>   Kill a detached session immediately"
     echo ""
     echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
     echo "  cctrl @<name>           Jump: cd to dir, switch profile, start tmux-backed agent"
     echo "  cctrl @<name> --foreground  Launch directly without tmux"
     echo "  cctrl @<name> -m TEXT   Open with an initial prompt (alias: --message, --prompt)"
+    echo "  cctrl @<name> --purpose TEXT  Set cleanup/review metadata without prompting"
     echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
     echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
     echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
@@ -2090,6 +2347,7 @@ _shortcut_help() {
     echo -e "${BOLD}Shortcut commands${RESET}"
     echo "  cctrl @<name>                     Jump: cd, switch profile, launch tmux-backed agent"
     echo "  cctrl @<name> -m \"TEXT\"            Launch with an initial prompt"
+    echo "  cctrl @<name> --purpose TEXT      Set cleanup/review metadata without prompting"
     echo "  cctrl @<name> --foreground        Launch directly without tmux"
     echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
@@ -2366,6 +2624,9 @@ _shortcut_jump() {
             --message|--prompt|-m)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--message needs a value${RESET}"; return 1; }
                 cli_prompt="$2"; cli_prompt_set=true; shift 2 ;;
+            --purpose)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--purpose needs a value${RESET}"; return 1; }
+                shift 2 ;;
             --no-bridge)
                 no_bridge=true; shift ;;
             --foreground|--no-tmux|--tmux)
@@ -2557,6 +2818,7 @@ _dispatch() {
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
         session|sess) cmd_session "$@" ;;
+        close) cmd_session close "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         statusline|status-line) cmd_statusline "$@" ;;

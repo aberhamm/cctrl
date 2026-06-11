@@ -115,6 +115,7 @@ cctrl start --resume              # resume a session (interactive picker)
 cctrl start --yolo                # full bypass: Claude bypassPermissions / Codex --yolo
 cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
 cctrl start -m "fix bug"          # launch with an initial prompt
+cctrl start --purpose "fix bug"   # store cleanup/review context without sending a prompt
 cctrl start --no-bridge           # launch without the phone-control bridge
 cctrl start --agent codex --remote unix://  # connect Codex TUI to local app-server
 ```
@@ -138,11 +139,19 @@ cctrl @myapp --foreground         # direct launch without tmux
 cctrl start -d ~/_projects/myapp  # launch detached; prompts with default "no"
 cctrl start -d @myapp             # ...or via a saved shortcut
 cctrl start -d @myapp --agent codex
+cctrl start -d @myapp --purpose "review auth logs"
 
 cctrl session ls                  # list sessions (see below)
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
 cctrl session kill TMUX--myapp    # kill a session
 ```
+
+When a tmux-backed launch runs in an interactive terminal, `cctrl` asks for a
+session purpose before creating the session. Press Enter to accept the inferred
+default, usually the initial `-m` prompt, shortcut name, or project folder. The
+purpose is stored as local metadata for `cctrl session ls` and future cleanup
+commands; it is not sent to Claude or Codex unless you also pass it as
+`-m/--message`.
 
 **Requires:** tmux (`brew install tmux`)
 
