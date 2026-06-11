@@ -315,6 +315,43 @@ JSON
     assert_contains "$out" '"created_at": "2026-06-11T10:00:00Z"'
 }
 
+test_session_close_self_graceful() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/close-self.log"
+    : > "$log"
+
+    # Inside a tmux session (TMUX set), no name: schedule a delayed kill of
+    # the current session via run-shell so the caller can finish its output.
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX="fake,1,0" \
+        TMUX_FAKE_SESSION_NAME="TMUX--demo" TMUX_FAKE_HAS_SESSION=1 \
+        "$ROOT/cctrl" session close)"
+    assert_contains "$out" "will close in 5s"
+    assert_contains "$(cat "$log")" "run-shell -b sleep\\ 5\\;\\ tmux\\ kill-session\\ -t\\ TMUX--demo"
+}
+
+test_session_close_named_immediate() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/close-named.log"
+    : > "$log"
+
+    # Outside tmux with an explicit name: immediate kill.
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX= TMUX_FAKE_HAS_SESSION=1 \
+        "$ROOT/cctrl" close TMUX--demo)"
+    assert_contains "$out" "Closed session: TMUX--demo"
+    assert_contains "$(cat "$log")" "kill-session -t TMUX--demo"
+    assert_not_contains "$(cat "$log")" "run-shell"
+}
+
+test_session_close_outside_requires_name() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX= "$ROOT/cctrl" session close 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected close outside tmux without a name to fail"
+    assert_contains "$out" "Not inside a tmux session"
+}
+
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
     local claude_dir="$base/claude/projects/-Users-matthew--projects-demo"
@@ -393,6 +430,9 @@ test_attach_prompt_after_start
 test_codex_statusline_tui_config
 test_context_names
 test_session_list_codex_default_model
+test_session_close_self_graceful
+test_session_close_named_immediate
+test_session_close_outside_requires_name
 test_usage_cost_fixtures
 
 echo "ok"
