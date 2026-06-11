@@ -255,6 +255,31 @@ test_shortcut_no_args_defaults_to_tmux() {
     assert_contains "$(cat "$log")" "@mstack --foreground --name TMUX--mstack"
 }
 
+test_purpose_prompt_uses_controlling_tty() {
+    command -v script >/dev/null 2>&1 || return 0
+    script -q /dev/null true >/dev/null 2>&1 || return 0
+
+    make_fake_tmux "$TMPDIR/tmux"
+    local rootcopy="$TMPDIR/cctrl-devtty-copy"
+    local project="$TMPDIR/devtty-project"
+    local log="$TMPDIR/devtty-tmux.log"
+    local out_file="$TMPDIR/devtty-output.log"
+    mkdir -p "$rootcopy/data" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"cctrl":{"dir":"%s","agent":"codex"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    printf '\n' | env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
+        CCTRL_ATTACH_PROMPT=never script -q /dev/null "$rootcopy/cctrl" @cctrl \
+        > "$out_file" 2>&1
+
+    local out
+    out="$(cat "$out_file")"
+    assert_contains "$out" "Session purpose? [@cctrl]"
+}
+
 test_remote_shortcut_injects_purpose() {
     make_fake_ssh "$TMPDIR/ssh"
     local rootcopy="$TMPDIR/cctrl-remote-copy"
@@ -467,6 +492,7 @@ test_launch_args
 test_detached_arg_parsing
 test_start_defaults_to_tmux
 test_shortcut_no_args_defaults_to_tmux
+test_purpose_prompt_uses_controlling_tty
 test_remote_shortcut_injects_purpose
 test_attach_prompt_after_start
 test_codex_statusline_tui_config

@@ -907,6 +907,10 @@ _session_write_metadata() {
         }' > "$tmp" && mv "$tmp" "$(_session_metadata_file "$session_name")"
 }
 
+_prompt_tty_available() {
+    { : < /dev/tty; } 2>/dev/null && { : > /dev/tty; } 2>/dev/null
+}
+
 _prompt_session_purpose() {
     local default_purpose="$1" answer
     case "${CCTRL_PURPOSE_PROMPT:-auto}" in
@@ -917,14 +921,14 @@ _prompt_session_purpose() {
         always)
             ;;
         *)
-            if [[ ! -t 0 || ! -t 1 ]]; then
+            if ! _prompt_tty_available; then
                 printf '%s' "$default_purpose"
                 return 0
             fi
             ;;
     esac
 
-    if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    if ! _prompt_tty_available; then
         printf '%s' "$default_purpose"
         return 0
     fi
