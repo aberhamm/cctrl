@@ -143,8 +143,29 @@ cctrl start -d @myapp --purpose "review auth logs"
 
 cctrl session ls                  # list sessions (see below)
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
-cctrl session kill TMUX--myapp    # kill a session
+cctrl session close TMUX--myapp   # gracefully close a session
+cctrl session kill TMUX--myapp    # kill a session immediately
 ```
+
+#### Letting the agent close its own session
+
+`cctrl session close` (alias: `cctrl close`) run with no arguments from
+**inside** a cctrl tmux session targets the session it's running in and
+schedules the kill a few seconds out, so the calling process can finish its
+output before the pane disappears. That means you can simply tell the agent
+running in a session *"close this session with cctrl"* — it runs `cctrl close`,
+says goodbye, and the session shuts down behind it.
+
+```bash
+cctrl close                       # inside a session: close it after a 5s grace period
+cctrl close --in 15               # longer grace period
+cctrl close --now                 # no grace period
+cctrl close TMUX--myapp           # close a specific session (immediate from outside)
+```
+
+Sessions not started by cctrl are refused unless you add `--force`. The default
+grace period is 5 seconds (override per call with `--in`, or globally with
+`CCTRL_CLOSE_GRACE`).
 
 When a tmux-backed launch runs in an interactive terminal, `cctrl` asks for a
 session purpose before creating the session. Press Enter to accept the inferred
