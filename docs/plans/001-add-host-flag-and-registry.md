@@ -6,7 +6,7 @@ completed: 2026-06-01
 reviewed: false
 qa: automated,verified
 blocked-by: []
-priority:
+priority: 1
 allows-migrations: false
 needs-review: none
 created: 2026-05-31

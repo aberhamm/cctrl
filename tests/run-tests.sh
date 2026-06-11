@@ -15,6 +15,11 @@ assert_contains() {
     [[ "$haystack" == *"$needle"* ]] || fail "expected output to contain: $needle"
 }
 
+assert_not_contains() {
+    local haystack="$1" needle="$2"
+    [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
+}
+
 make_fake_agent() {
     local path="$1" name="$2"
     cat > "$path" <<SH
@@ -192,6 +197,76 @@ test_start_defaults_to_tmux() {
     assert_contains "$(cat "$log")" "-m default\\ tmux"
 }
 
+test_shortcut_no_args_defaults_to_tmux() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local rootcopy="$TMPDIR/cctrl-shortcut-copy"
+    local project="$TMPDIR/mstack"
+    local log="$TMPDIR/shortcut-tmux.log"
+    mkdir -p "$rootcopy/data" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"mstack":{"dir":"%s","agent":"codex"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$rootcopy/cctrl" @mstack)"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--mstack"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--mstack"
+    assert_contains "$(cat "$log")" "@mstack --foreground --name TMUX--mstack"
+}
+
+test_attach_prompt_after_start() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local project="$TMPDIR/prompt-project"
+    local log="$TMPDIR/prompt-tmux.log"
+    mkdir -p "$project"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "")"
+    assert_contains "$out" "Connect to session TMUX--prompt-project now? [y/N]"
+    assert_contains "$out" "Not connected. Attach later: cctrl session attach TMUX--prompt-project"
+    assert_not_contains "$(cat "$log")" "attach-session"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "y")"
+    assert_contains "$out" "Connect to session TMUX--prompt-project now? [y/N]"
+    assert_contains "$(cat "$log")" "attach-session -t TMUX--prompt-project"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start "$project" <<< "")"
+    assert_contains "$out" "Connect to session TMUX--prompt-project now? [Y/n]"
+    assert_contains "$(cat "$log")" "attach-session -t TMUX--prompt-project"
+}
+
+test_codex_statusline_tui_config() {
+    local codex_home="$TMPDIR/codex-home"
+    local expected='status_line = ["model-with-reasoning", "current-dir", "context-used", "git-branch", "run-state"]'
+    mkdir -p "$codex_home"
+    cat > "$codex_home/config.toml" <<'TOML'
+model = "gpt-5.5"
+status_line = ["current-dir"]
+
+[tui.model_availability_nux]
+"gpt-5.5" = 4
+TOML
+
+    local out config
+    out="$(CODEX_HOME="$codex_home" "$ROOT/cctrl" statusline codex install)"
+    assert_contains "$out" "Installed Codex statusline"
+
+    config="$(cat "$codex_home/config.toml")"
+    assert_contains "$config" "$expected"
+    assert_contains "$config" '[tui]'
+    assert_contains "$config" '[tui.model_availability_nux]'
+    assert_not_contains "$config" $'\nstatus_line = ["current-dir"]\n'
+
+    out="$(CODEX_HOME="$codex_home" "$ROOT/cctrl" statusline codex show)"
+    assert_contains "$out" "$expected"
+}
+
 test_context_names() {
     make_fake_agent "$TMPDIR/claude" claude
     local project="$TMPDIR/context project"
@@ -219,19 +294,53 @@ test_session_list_codex_default_model() {
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
     local claude_dir="$base/claude/projects/-Users-matthew--projects-demo"
-    local codex_dir="$base/codex/sessions/2026/06/07"
     local archive_dir="$base/codex/archived_sessions"
+    local claude_ts claude_user_ts codex_meta_ts codex_context_ts codex_token_ts codex_path primary_reset secondary_reset
+    { IFS= read -r claude_ts
+      IFS= read -r claude_user_ts
+      IFS= read -r codex_meta_ts
+      IFS= read -r codex_context_ts
+      IFS= read -r codex_token_ts
+      IFS= read -r codex_path
+      IFS= read -r primary_reset
+      IFS= read -r secondary_reset
+    } < <(python3 - <<'PY'
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+tz = ZoneInfo("Europe/Berlin")
+now = datetime.now(timezone.utc).astimezone(tz)
+days_since_thu = (now.weekday() - 3) % 7
+start = (now - timedelta(days=days_since_thu)).replace(hour=6, minute=0, second=0, microsecond=0)
+if now < start:
+    start -= timedelta(days=7)
+base = (start + timedelta(hours=1)).astimezone(timezone.utc)
+
+def iso(dt):
+    return dt.isoformat().replace("+00:00", "Z")
+
+print(iso(base))
+print(iso(base + timedelta(seconds=1)))
+print(iso(base + timedelta(hours=1)))
+print(iso(base + timedelta(hours=1, seconds=1)))
+print(iso(base + timedelta(hours=1, seconds=2)))
+print(base.strftime("%Y/%m/%d"))
+print(iso(base + timedelta(hours=5)))
+print(iso(start.astimezone(timezone.utc) + timedelta(days=7)))
+PY
+    )
+    local codex_dir="$base/codex/sessions/$codex_path"
     mkdir -p "$claude_dir" "$codex_dir" "$archive_dir"
 
-    cat > "$claude_dir/claude-session.jsonl" <<'JSONL'
-{"timestamp":"2026-06-06T10:00:00Z","sessionId":"claude-session","type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":400}}}
-{"timestamp":"2026-06-06T10:00:01Z","type":"user","message":{"role":"user","content":"ok"}}
+    cat > "$claude_dir/claude-session.jsonl" <<JSONL
+{"timestamp":"$claude_ts","sessionId":"claude-session","type":"assistant","message":{"role":"assistant","model":"claude-sonnet-4-6","usage":{"input_tokens":1000,"output_tokens":200,"cache_creation_input_tokens":300,"cache_read_input_tokens":400}}}
+{"timestamp":"$claude_user_ts","type":"user","message":{"role":"user","content":"ok"}}
 JSONL
 
-    cat > "$codex_dir/codex-session.jsonl" <<'JSONL'
-{"timestamp":"2026-06-06T11:00:00Z","type":"session_meta","payload":{"id":"codex-session","cwd":"/Users/matthew/_projects/demo"}}
-{"timestamp":"2026-06-06T11:00:01Z","type":"turn_context","payload":{"cwd":"/Users/matthew/_projects/demo","model":"gpt-5.5"}}
-{"timestamp":"2026-06-06T11:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":100,"reasoning_output_tokens":10},"total_token_usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":100,"reasoning_output_tokens":10}},"rate_limits":{"plan_type":"plus","primary":{"used_percent":12,"resets_at":"2026-06-06T16:00:00Z"},"secondary":{"used_percent":34,"resets_at":"2026-06-11T04:00:00Z"}}}}
+    cat > "$codex_dir/codex-session.jsonl" <<JSONL
+{"timestamp":"$codex_meta_ts","type":"session_meta","payload":{"id":"codex-session","cwd":"/Users/matthew/_projects/demo"}}
+{"timestamp":"$codex_context_ts","type":"turn_context","payload":{"cwd":"/Users/matthew/_projects/demo","model":"gpt-5.5"}}
+{"timestamp":"$codex_token_ts","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":100,"reasoning_output_tokens":10},"total_token_usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":100,"reasoning_output_tokens":10}},"rate_limits":{"plan_type":"plus","primary":{"used_percent":12,"resets_at":"$primary_reset"},"secondary":{"used_percent":34,"resets_at":"$secondary_reset"}}}}
 JSONL
 
     local out
@@ -255,6 +364,9 @@ test_syntax
 test_launch_args
 test_detached_arg_parsing
 test_start_defaults_to_tmux
+test_shortcut_no_args_defaults_to_tmux
+test_attach_prompt_after_start
+test_codex_statusline_tui_config
 test_context_names
 test_session_list_codex_default_model
 test_usage_cost_fixtures

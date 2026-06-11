@@ -124,18 +124,18 @@ cctrl start --agent codex --remote unix://  # connect Codex TUI to local app-ser
 ### Tmux sessions
 
 By default, `cctrl start` and `cctrl @shortcut` create a **tmux** session and
-attach when launched from an interactive terminal. This gives local and remote
-agents a stable session name and lets them survive SSH disconnects. Use
-`--foreground` or `--no-tmux` for quick direct one-offs.
+ask whether to connect when launched from an interactive terminal. This gives
+local and remote agents a stable session name and lets them survive SSH
+disconnects. Use `--foreground` or `--no-tmux` for quick direct one-offs.
 
 Add `-d` to start the tmux session and return without attaching. No GUI required — just tmux. An explicit detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop a full-access agent into `~/.ssh`, `~/.aws`, etc.
 
 ```bash
-cctrl start ~/_projects/myapp     # tmux-backed and auto-attaches in a TTY
+cctrl start ~/_projects/myapp     # tmux-backed; prompts to connect in a TTY
 cctrl @myapp                      # shortcut launch, also tmux-backed
 cctrl @myapp --foreground         # direct launch without tmux
 
-cctrl start -d ~/_projects/myapp  # launch detached in a directory
+cctrl start -d ~/_projects/myapp  # launch detached; prompts with default "no"
 cctrl start -d @myapp             # ...or via a saved shortcut
 cctrl start -d @myapp --agent codex
 
@@ -192,7 +192,7 @@ cctrl host add studio ms-128g-bln         # register a host
 cctrl host add studio ms-128g-bln matt    # with explicit user
 cctrl host list                            # show registered hosts (marks the local one)
 cctrl host rm studio                       # remove a host
-cctrl host doctor studio                   # check SSH, brew, tmux, default agent, cctrl
+cctrl host doctor studio                   # check SSH, tmux, cctrl, agent, shared skills
 cctrl host doctor studio --agent codex     # check codex instead of claude
 ```
 
@@ -221,7 +221,7 @@ cctrl --host studio costs --week             # view remote cost data
 
 **TTY handling:** Interactive commands (`start` foreground, `start -d` auto-attach, `@shortcut`, `session attach`, `edit`) use `ssh -t`. Non-interactive commands (`session ls`, `costs`, `usage`, `ls`) use plain `ssh`.
 
-**Host doctor** checks SSH connectivity, brew, tmux, the selected agent, cctrl availability, and `~/.tmux.conf` on the remote host — with interactive auto-fix offers for missing dependencies.
+**Host doctor** checks SSH connectivity, brew, tmux, the selected agent, cctrl availability, `~/.tmux.conf`, shared Skillshare targets, and the selected agent's common instruction file (`~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`) — with interactive auto-fix offers for missing dependencies.
 
 The host registry lives in `data/hosts.json` (gitignored, machine-local). Each machine is its own source of truth — no sync.
 

@@ -1004,9 +1004,37 @@ _launch_detached() {
         printf 'CCTRL_SESSION=%s\n' "$session_name"
     fi
 
-    if [[ "${CCTRL_ATTACH_AFTER_START:-}" == "1" && -t 0 && -t 1 ]]; then
-        exec tmux attach-session -t "$session_name"
+    local attach_default="no"
+    [[ "${CCTRL_ATTACH_AFTER_START:-}" == "1" ]] && attach_default="yes"
+    _prompt_attach_session "$session_name" "$attach_default"
+}
+
+_prompt_attach_session() {
+    local session_name="$1" default="${2:-no}" answer prompt default_answer
+
+    case "${CCTRL_ATTACH_PROMPT:-auto}" in
+        never) return 0 ;;
+        always) ;;
+        *) [[ -t 0 && -t 1 ]] || return 0 ;;
+    esac
+
+    if [[ "$default" == "yes" ]]; then
+        prompt="Connect to session $session_name now? [Y/n] "
+        default_answer="yes"
+    else
+        prompt="Connect to session $session_name now? [y/N] "
+        default_answer="no"
     fi
+
+    printf '%s' "$prompt"
+    IFS= read -r answer || return 0
+    answer="$(printf '%s' "${answer:-$default_answer}" | tr '[:upper:]' '[:lower:]')"
+    case "$answer" in
+        y|yes) exec tmux attach-session -t "$session_name" ;;
+        *)
+            echo -e "${DIM}Not connected. Attach later: cctrl session attach $session_name${RESET}"
+            ;;
+    esac
 }
 
 # ── Detached session management ───────────────────────────────────────
@@ -1335,17 +1363,27 @@ cmd_statusline() {
             local config="$CODEX_DIR/config.toml"
             [[ -f "$config" ]] || touch "$config"
             python3 - "$config" <<'PY'
+import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-line = 'status_line = ["model-with-reasoning", "context-remaining", "context-used", "git-branch", "current-dir", "run-state"]'
+line = 'status_line = ["model-with-reasoning", "current-dir", "context-used", "git-branch", "run-state"]'
 text = path.read_text() if path.exists() else ""
 lines = text.splitlines()
 out = []
-in_tui = False
 found_tui = False
+in_tui = False
 set_line = False
+current_table = ""
+
+def append_tui_before_current_table():
+    global set_line, found_tui
+    if out and out[-1].strip():
+        out.append("")
+    out.extend(["[tui]", line, ""])
+    found_tui = True
+    set_line = True
 
 for raw in lines:
     stripped = raw.strip()
@@ -1353,15 +1391,21 @@ for raw in lines:
         if in_tui and not set_line:
             out.append(line)
             set_line = True
+        if not found_tui and stripped.startswith("[tui."):
+            append_tui_before_current_table()
+        current_table = stripped
         in_tui = stripped == "[tui]"
         found_tui = found_tui or in_tui
         out.append(raw)
         continue
-    if in_tui and stripped.startswith("status_line"):
-        if not set_line:
+    if re.match(r"^status_line\s*=", stripped):
+        if in_tui and not set_line:
             out.append(line)
             set_line = True
-        continue
+            continue
+        # Top-level status_line is ignored by Codex TUI; remove it during migration.
+        if current_table == "":
+            continue
     out.append(raw)
 
 if found_tui:
@@ -1386,12 +1430,37 @@ PY
                 fi
             else
                 if [[ -f "$CODEX_DIR/config.toml" ]]; then
-                    awk '
-                        /^\[tui\]$/ {in_tui=1; next}
-                        /^\[/ && in_tui {exit}
-                        in_tui && /^status_line[[:space:]]*=/ {print; found=1}
-                        END {if (!found) print "not configured"}
-                    ' "$CODEX_DIR/config.toml"
+                    python3 - "$CODEX_DIR/config.toml" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+ignored_top_level = None
+configured_tui = None
+in_tui = False
+current_table = ""
+
+for raw in lines:
+    stripped = raw.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        current_table = stripped
+        in_tui = stripped == "[tui]"
+        continue
+    if re.match(r"^status_line\s*=", stripped):
+        if in_tui:
+            configured_tui = stripped
+            break
+        if current_table == "":
+            ignored_top_level = stripped
+
+if configured_tui:
+    print(configured_tui)
+elif ignored_top_level:
+    print("not configured (ignored top-level status_line present)")
+else:
+    print("not configured")
+PY
                 else
                     echo "not configured"
                 fi
@@ -1920,6 +1989,58 @@ cmd_host() {
                 fi
             fi
 
+            # 7. Shared Skillshare skills are visible to the selected agent.
+            local remote_skill_target local_common_file remote_common_file common_label
+            case "$doctor_agent" in
+                codex)
+                    remote_skill_target="$HOME/.codex/skills"
+                    local_common_file="$HOME/.codex/AGENTS.md"
+                    remote_common_file="$HOME/.codex/AGENTS.md"
+                    common_label="Codex AGENTS.md"
+                    ;;
+                *)
+                    remote_skill_target="$HOME/.claude/skills"
+                    local_common_file="$HOME/.claude/CLAUDE.md"
+                    remote_common_file="$HOME/.claude/CLAUDE.md"
+                    common_label="Claude CLAUDE.md"
+                    ;;
+            esac
+
+            echo -n "  shared skills target... "
+            if ssh "$ssh_target" "test -d ~/.config/skillshare/skills && test -e ${remote_skill_target/#$HOME/~} && test -f ${remote_skill_target/#$HOME/~}/mstack-run/SKILL.md" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                echo -e "    ${DIM}Expected ~/.config/skillshare/skills plus ${remote_skill_target/#$HOME/~}/mstack-run/SKILL.md.${RESET}"
+                echo -n "    Fix: link ${remote_skill_target/#$HOME/~} to ~/.config/skillshare/skills? [y/N] "
+                read -r confirm
+                if [[ "$confirm" =~ ^[yY]$ ]]; then
+                    ssh "$ssh_target" "mkdir -p ~/.config/skillshare ~/.codex ~/.claude; if test -d ~/.config/skillshare/skills; then rm -rf ${remote_skill_target/#$HOME/~}; ln -s ~/.config/skillshare/skills ${remote_skill_target/#$HOME/~}; fi"
+                    echo -e "    ${GREEN}Linked shared skills target${RESET}"
+                fi
+            fi
+
+            echo -n "  common skill instructions... "
+            if ssh "$ssh_target" "test -f ${remote_common_file/#$HOME/~} && grep -q '## mstack' ${remote_common_file/#$HOME/~} && grep -q 'Skillshare & Custom Skills' ${remote_common_file/#$HOME/~}" &>/dev/null; then
+                echo -e "${GREEN}OK${RESET}"
+            else
+                echo -e "${YELLOW}MISSING${RESET}"
+                all_ok=false
+                echo -e "    ${DIM}Expected ${remote_common_file/#$HOME/~} with mstack and Skillshare routing.${RESET}"
+                if [[ -f "$local_common_file" ]]; then
+                    echo -n "    Fix: copy local $common_label to remote? [y/N] "
+                    read -r confirm
+                    if [[ "$confirm" =~ ^[yY]$ ]]; then
+                        ssh "$ssh_target" "mkdir -p $(dirname "${remote_common_file/#$HOME/~}")"
+                        scp "$local_common_file" "$ssh_target:${remote_common_file/#$HOME/~}"
+                        echo -e "    ${GREEN}Copied $common_label${RESET}"
+                    fi
+                else
+                    echo -e "    ${DIM}No local $local_common_file to copy.${RESET}"
+                fi
+            fi
+
             echo ""
             if $all_ok; then
                 echo -e "${GREEN}All checks passed.${RESET}"
@@ -2206,7 +2327,7 @@ _shortcut_jump() {
 
     local shortcut_foreground=false a
     [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && shortcut_foreground=true
-    for a in "${original_args[@]}"; do
+    for a in ${original_args[@]+"${original_args[@]}"}; do
         [[ "$a" == "--" ]] && break
         case "$a" in
             --foreground|--no-tmux) shortcut_foreground=true ;;
@@ -2214,7 +2335,7 @@ _shortcut_jump() {
     done
 
     if ! $shortcut_foreground; then
-        _launch_detached "@$key" "${original_args[@]}"
+        _launch_detached "@$key" ${original_args[@]+"${original_args[@]}"}
         return
     fi
 

@@ -1,6 +1,6 @@
 # Claude Max Plan Rate Limits — Research & Data
 
-**Last updated:** 2026-06-07  
+**Last updated:** 2026-06-08
 **Account:** Claude Max 20x ($200/month), primarily Opus, two machines (MacBook Pro + Mac Studio)
 
 ---
@@ -12,6 +12,8 @@
 Anthropic never publishes concrete token budgets. Rate limits are expressed as percentages (5-hour % and 7-day %) but Anthropic does not document what 100% maps to in tokens, dollars, or compute units. The "20x" in "Max 20x" is a tier multiplier vs. the Pro plan ($20/month) — it is not a dollar amount ($200 × 20 = $4,000 is wrong) and it is not tied to any published number.
 
 This means the only way to reverse-engineer your actual limit is: **implied cap = estimated API cost ÷ (usage % / 100)**.
+
+Important caveat: only periods that actually hit 100% are direct observations of a saturated limit. Rows below 100% are inferred estimates and can be noisy because usage mix, cache behavior, model mix, and possible mid-period resets all change the apparent cap.
 
 GitHub issue #54714 (April 2026) documents the same complaint: *"No published concrete token budgets, making it impossible to verify whether limits were actually changed."* Anthropic labeled it `stale` without responding.
 
@@ -54,7 +56,7 @@ Subagent sessions are stored under `/subagents/` in `~/.claude/projects/`. They 
 
 ## Weekly Usage Data
 
-All periods use Thursday 6am Berlin as the boundary. Usage % = peak 7-day rate limit reading during that period. Implied cap = Est. Cost ÷ (Usage% / 100). Rows without % have no rate-limit history data.
+All periods use Thursday 6am Berlin as the boundary. Usage % = peak 7-day rate limit reading during that period. Implied cap = Est. Cost ÷ (Usage% / 100). Rows without % have no rate-limit history data. "Tokens In" is raw input tokens, not cache reads; estimated cost includes input, output, cache write, and cache read tokens.
 
 | Period          | Usage % | Tokens In  | Tokens Out | Est. Cost | Implied Cap |
 |-----------------|---------|-----------|-----------|-----------|-------------|
@@ -71,12 +73,14 @@ All periods use Thursday 6am Berlin as the boundary. Usage % = peak 7-day rate l
 | May 14 – 20     | 95%     | 132K      | 9.3M      | $5,682    | ~$5,980     |
 | May 21 – 27     | 100%    | 306K      | 8.7M      | $4,296    | ~$4,300     |
 | May 28 – Jun 4  | ~73%    | 407K      | 9.6M      | $5,927    | ~$8,120     |
-| Jun 4 – 7 (~3d) | 100%    | 420K      | 4.6M      | $2,730    | ~$2,730     |
+| Jun 4 – 7 (~3d; first 100% hit) | 100% | 420K | 4.6M | $2,730 | ~$2,730 |
+| Jun 4 – 8 (live rollup) | 100% | 899K | 6.7M | $3,190 | n/a — already saturated |
 
 **Notes:**
-- Jun 4–7: Hit 100% in ~3 days (not a full week). Monthly spend cap also exhausted (incl. $20 overage buffer).
+- Jun 4–7: First observed 100% hit in ~3 days (not a full week). This is the cleaner cap-reading point for the current week.
+- Jun 4–8: Live `./cctrl costs --week` rollup after the 100% hit. Because the rate-limit counter was already saturated, this row should not be used as a fresh cap estimate.
 - May 28–Jun 4: A mid-week reset was observed live on Mon Jun 1 — rate limit counter dropped to ~0 then resumed accumulating. Cause unknown.
-- The two confirmed 100% hits (May 21–27 and Jun 4–7) are the most reliable implied-cap readings. They show $4,300 → $2,730, a ~37% drop — but the Jun period was only 3 days, so usage intensity may be the variable, not cap reduction.
+- The two confirmed 100% hits (May 21–27 and Jun 4–7) are the most reliable implied-cap readings. They show $4,300 → $2,730, a ~37% drop — but this is still not enough to claim Anthropic cut the cap by 37%, because the Jun period was only 3 days and usage intensity/model mix may be the variable.
 
 ---
 
@@ -91,15 +95,15 @@ All periods use Thursday 6am Berlin as the boundary. Usage % = peak 7-day rate l
 | Mar 23 | Peak-hours throttle introduced (5am–11am PT / 1pm–7pm GMT weekdays) | No — confirmed ~3 days later after press coverage |
 | Apr 1 | Claude Code v2.1.89 — suspected token accounting change causes limits to drain in ~70 min | No |
 | Apr 23 | Postmortem + v2.1.116 fix | Yes |
-| May 6 | 5-hour limits doubled for Pro/Max/Team; peak-hour throttling removed. Tied to SpaceX 220K GPU deal. | Yes |
-| May 13 | Additional 50% weekly limit increase, through Jul 13. Framed as anti-Codex competitive move. | Yes |
+| May 6 | 5-hour limits doubled for Pro/Max/Team; peak-hour throttling removed. Announced alongside Anthropic's SpaceX compute partnership. | Yes |
+| May 13 | Additional 50% weekly limit increase, through Jul 13. | Yes |
 | May 15 | Manual reset of all 5-hour and weekly limits for all users | Yes |
 | May 28–29 | Billing/subscription management incident on claude.ai | Yes (status page) |
 | Jun 1 | Mid-week rate limit reset (observed live, cause unknown) | No |
 | Jun 2 | June 15 billing split announced | Yes |
 | Jun 5–7 | Elevated API errors on Opus models | Yes (status page) |
 
-**Pattern:** Limit increases are announced proactively. Limit reductions or silent tightenings are confirmed only after users surface complaints publicly — or never confirmed at all.
+**Pattern:** Limit increases are announced proactively. Limit reductions or tighter effective limits are harder to verify because Anthropic does not publish the underlying baseline; in several public complaint threads, users could only compare local usage history against changing percentage counters.
 
 ---
 
@@ -115,24 +119,24 @@ Multiple GitHub issues, press coverage, and forum posts corroborate this experie
 
 ---
 
-## The June 15 Billing Split (Likely Not Relevant to Interactive Claude Code)
+## The June 15 Programmatic Usage Split
 
-Starting June 15, 2026, **programmatic usage** moves to a separate monthly credit pool at full API rates:
+Starting June 15, 2026, Anthropic says **Agent SDK and `claude -p` usage** moves to a separate monthly credit pool at full API rates:
 - Max 20x: $200/mo in API credits
 
-Programmatic = Agent SDK, `claude -p` (non-interactive), Claude Code GitHub Actions, third-party agents.
+Programmatic examples: Agent SDK, `claude -p` non-interactive runs, Claude Code GitHub Actions, and third-party agents authenticated through the Agent SDK.
 
-Interactive Claude Code sessions (human at terminal, spawning subagents within a session) almost certainly remain on the flat subscription. This change targets automated pipelines, not interactive use. Pre-change, heavy programmatic users were reportedly extracting ~$35,000/month equivalent value for $200/mo.
+Interactive Claude Code sessions remain covered by the normal subscription usage limits according to Anthropic's Claude Code plan docs. This change targets automated/programmatic usage rather than the human-at-terminal workflow measured here.
 
 ---
 
 ## Key Takeaway for Post Framing
 
-The strongest defensible claim isn't "40% reduction" (hard to prove, noisy data). It's:
+The strongest defensible claim isn't "Anthropic cut my limit by 40%" (hard to prove, noisy data). It's:
 
 > **Anthropic doesn't publish what you're paying for. The "20x" in Max 20x has no documented baseline. The only way to know your limit is to hit it — and that limit has changed multiple times in 2026 with no announcement.**
 
-The data supports this. The GitHub issues corroborate it. The Anthropic response pattern (announce increases, go silent on decreases) reinforces it.
+The data supports this. The GitHub issues corroborate it. The public comms pattern reinforces it: increases get concrete announcements, while the underlying baseline remains opaque.
 
 ---
 

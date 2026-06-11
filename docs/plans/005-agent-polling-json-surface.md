@@ -3,7 +3,7 @@ id: 005
 title: Add agent polling and JSON command surface
 status: blocked
 blocked-by: [002, 003]
-priority:
+priority: 5
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: eng
@@ -38,9 +38,21 @@ Testing approach: unit-only.
 
 **Command contract additions:**
 
-- `cctrl peer check [--as NAME] [--json]`
-- `cctrl peer recv [--as NAME] [--status queued,delivered] [--json]`
+- `cctrl peer check [--as NAME] [--json] [--exit-on-empty]`
+- `cctrl peer recv [--as NAME] [--status queued,delivered] [--json] [--exit-on-empty]`
 - `cctrl peer send <to> --from <from> --body-file - [--json]`
+
+`recv` is the polling-agent delivery operation. When it returns a queued
+message, it must transition that message to `delivered` with `delivered_at` and
+history, but it must not transition to `acked`; agents explicitly call `ack`
+after handling the message. `check` is read-only and returns counts only.
+
+**JSON contracts:**
+
+- `check --json`: `{"peer":"comet","queued":1,"delivered":2,"failed":0}`
+- `recv --json`: `{"message":{...},"empty":false}` or `{"message":null,"empty":true}`
+- `ack --json`: `{"message":{...},"status":"acked"}`
+- JSON errors: `{"ok":false,"error":{"code":"unknown-peer","message":"..."}}`
 
 **Exit code guidance:**
 
@@ -58,7 +70,7 @@ contract that MCP will wrap.
 - `cctrl`: add polling-oriented command aliases/options, stdin body handling, JSON error helpers, and stable exit codes
 - `tests/run-tests.sh`: add JSON contract and stdin body tests
 - `README.md`: add polling examples and agent prompt snippets
-- `completions/_cctrl`: add `check`, `recv`, `--body-file`, and polling options
+- `completions/_cctrl`: add `check`, `recv`, `--body-file`, `--exit-on-empty`, and polling options
 
 **Out of scope:** tmux delivery changes, MCP server implementation, background
 watch mode, and cross-machine synchronization.
@@ -68,9 +80,9 @@ watch mode, and cross-machine synchronization.
 1. Add shared JSON output helpers that suppress ANSI color in JSON mode.
 2. Add `check` and `recv` commands on top of the existing mailbox filters.
 3. Add stdin body support with `--body-file -` for `peer send`.
-4. Normalize exit codes for polling commands and document them in README.
-5. Add tests for JSON shape, `CCTRL_PEER` identity, `--as`, empty inbox behavior, stdin bodies, and parse errors.
-6. Update completions and README with non-tmux polling instructions.
+4. Normalize exit codes for polling commands, including opt-in `--exit-on-empty`, and document them in README.
+5. Add tests for JSON shape, `CCTRL_PEER` identity, `--as`, empty inbox behavior, `--exit-on-empty`, stdin bodies, delivered-state transition on `recv`, and parse errors.
+6. Update completions and README with non-tmux polling instructions, including `--exit-on-empty`.
 
 ## Verification
 
@@ -79,6 +91,8 @@ Checks:
 - [cmd] `tests/run-tests.sh`
 - [assert] `printf 'hello from stdin' | ./cctrl peer send comet --from orchestrator --body-file - --json` in the test suite preserves the exact body
 - [assert] `./cctrl peer check --as comet --json` in the test suite returns valid JSON with unread counts
+- [assert] `./cctrl peer recv --as comet --json` in the test suite returns a full message body and transitions it to `delivered`, not `acked`
+- [assert] `./cctrl peer check --as comet --json --exit-on-empty` in the test suite exits 2 only when no messages are available
 
 ## GSTACK REVIEW REPORT
 

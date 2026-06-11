@@ -3,7 +3,7 @@ id: 004
 title: Add tmux delivery adapter for peer messages
 status: blocked
 blocked-by: [002, 003]
-priority:
+priority: 4
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: eng
@@ -37,6 +37,12 @@ target pane, and updates mailbox state.
 
 Testing approach: unit-only.
 
+`peer deliver <name>` processes all queued messages for that recipient in
+oldest-first order. `--dry-run` prints every envelope that would be pasted and
+must not mutate state. `--json` returns an array of per-message results. State
+changes must use the plan 003 mailbox transition helper rather than editing
+`messages.jsonl` directly.
+
 **Pasted envelope:**
 
 ```text
@@ -53,6 +59,11 @@ Reply by sending or acknowledging this message through cctrl peer.
 `--submit` may add `tmux send-keys -t <target> Enter` after paste, but the safe
 default is paste-only. This avoids accidentally submitting into an agent that is
 mid-edit or not ready.
+
+Use a message-scoped tmux buffer name such as `cctrl-msg-<message-id>`. Load the
+envelope through stdin, paste that named buffer into the target pane, and delete
+the buffer after the paste attempt so message bodies are not left in tmux's
+global buffer list.
 
 **Files expected to change:**
 
@@ -71,7 +82,7 @@ tools, and message polling by non-tmux agents.
 3. Implement `peer deliver <name|--all> [--dry-run] [--json] [--submit] [--no-mark-failed]`.
 4. Use safe tmux buffer commands for body delivery and quote tmux target names correctly.
 5. Update mailbox state for delivered and failed messages through the locking helper from plan 003.
-6. Add fake tmux tests for dry-run, successful paste, skipped non-tmux peer, failed target, and optional submit.
+6. Add fake tmux tests for dry-run no-mutation, successful paste state transition, skipped non-tmux peer, failed target, `--no-mark-failed`, named buffer cleanup, and optional submit.
 7. Update README and completions.
 
 ## Verification
@@ -81,6 +92,7 @@ Checks:
 - [cmd] `tests/run-tests.sh`
 - [assert] fake tmux log in the test suite contains `load-buffer` and `paste-buffer` for `cctrl peer deliver comet`
 - [assert] fake tmux log in the test suite does not contain `send-keys Enter` unless `--submit` is passed
+- [assert] delivery tests prove dry-run leaves queued messages unchanged, successful paste marks delivered, failed target marks failed, and `--no-mark-failed` preserves queued state
 
 ## GSTACK REVIEW REPORT
 

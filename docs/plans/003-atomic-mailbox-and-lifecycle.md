@@ -3,7 +3,7 @@ id: 003
 title: Add atomic mailbox and message lifecycle
 status: blocked
 blocked-by: [002]
-priority:
+priority: 3
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: eng
@@ -27,14 +27,17 @@ and acknowledge messages at the same time.
 - [ ] `queued`, `delivered`, `failed`, and `acked` states are persisted with timestamped history
 - [ ] Concurrent send/ack operations use locking or atomic replace semantics and do not corrupt `data/messages.jsonl`
 - [ ] Unknown senders or recipients fail unless explicitly allowed by a documented `--allow-unknown` flag
+- [ ] Message records include enough timestamp metadata for later garbage collection by status and age
 
 ## Design
 
-Store messages in `data/messages.jsonl` because append-friendly JSON Lines fits
-the existing shell-first repo and is easy to inspect. Updates that change state
-should take an exclusive lock, rewrite through a temporary file, and then move
-the file into place atomically. On macOS, prefer `shlock` if available or a
-portable lock directory fallback; tests should exercise the chosen helper.
+Store messages in `${CCTRL_DATA_DIR}/messages.jsonl` because append-friendly
+JSON Lines fits the existing shell-first repo and is easy to inspect. Updates
+that change state should take an exclusive lock, rewrite through a temporary
+file, and then move the file into place atomically. On macOS, prefer `shlock`
+if available or a portable lock directory fallback; tests should exercise the
+chosen helper using `CCTRL_DATA_DIR="$TMPDIR/data"` so they never touch the real
+mailbox.
 
 Testing approach: unit-only.
 
@@ -60,6 +63,13 @@ Testing approach: unit-only.
 }
 ```
 
+Lifecycle state must preserve messages after read/receive. Do not delete on
+read. The mailbox should distinguish "seen" from "handled" with timestamps such
+as `delivered_at` or `read_at` and `acked_at`. Old-message cleanup will be a
+separate garbage-collection command in the orchestrator workflow plan, so this
+plan must keep status and timestamp fields consistent enough for retention
+filters.
+
 **Files expected to change:**
 
 - `cctrl`: add `MESSAGES_FILE`, mailbox locking helpers, message ID generation, send/inbox/outbox/show/ack commands under `cmd_peer`
@@ -70,6 +80,7 @@ Testing approach: unit-only.
 **Command contract:**
 
 - `cctrl peer send <to> [--from NAME] [--subject TEXT] [--json] -- <body>`
+- `cctrl peer send <to> [--from NAME] [--subject TEXT] [--allow-unknown] [--json] -- <body>`
 - `cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]`
 - `cctrl peer outbox [--as NAME] [--status STATUS] [--json]`
 - `cctrl peer show <message-id> [--json]`
@@ -77,11 +88,13 @@ Testing approach: unit-only.
 
 `--from` should default to the resolved peer identity from `--as` or
 `CCTRL_PEER` when available. If neither is available, it should default to
-`user` only for interactive sends, and JSON mode should report that fallback
-explicitly.
+`user` only for interactive human sends. In `--json` mode, missing sender
+identity must fail with the unknown-peer exit code unless `--from` is provided.
+`--allow-unknown` applies only to `peer send`; it permits unknown sender or
+recipient names and marks the resulting message with `"unknown_peer": true`.
 
 **Out of scope:** tmux paste delivery, MCP server implementation, background
-watch loops, and cross-machine mailbox synchronization.
+watch loops, garbage collection, and cross-machine mailbox synchronization.
 
 ## Tasks
 
@@ -89,8 +102,9 @@ watch loops, and cross-machine mailbox synchronization.
 2. Add message ID generation that avoids collisions across rapid sends.
 3. Implement `send`, `inbox`, `outbox`, `show`, and `ack` using the peer resolver from plan 002.
 4. Implement state transition validation so invalid transitions fail clearly.
-5. Add tests for send/list/show/ack, unknown peer errors, authorization on ack, JSON output, and lock behavior.
-6. Update README and completions for mailbox commands.
+5. Add tests for send/list/show/ack, unknown peer errors, `--allow-unknown`, JSON sender fallback failure, authorization on ack, JSON output, and lock behavior.
+6. Add a lock-contention test that runs parallel send/ack operations against `CCTRL_DATA_DIR="$TMPDIR/data"` and verifies `messages.jsonl` remains parseable with no lost records.
+7. Update README and completions for mailbox commands.
 
 ## Verification
 
@@ -99,6 +113,7 @@ Checks:
 - [cmd] `tests/run-tests.sh`
 - [assert] `./cctrl peer send comet --from orchestrator -- "hello"` in the test suite creates a message with `"status": "queued"`
 - [assert] `./cctrl peer ack <id> --as wrong-peer` in the test suite fails without changing message state
+- [assert] parallel mailbox operations in the test suite leave `messages.jsonl` valid JSONL with the expected record count
 
 ## GSTACK REVIEW REPORT
 
