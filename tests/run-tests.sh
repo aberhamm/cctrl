@@ -6,6 +6,10 @@ TMPDIR="$(mktemp -d)"
 export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
 trap 'rm -rf "$TMPDIR"' EXIT
 
+# Tests may be run from inside a cctrl tmux session; don't let its context
+# leak in (CCTRL_TMUX_CONTEXT flips `cctrl start` into foreground mode).
+unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX
+
 fail() {
     echo "FAIL: $*" >&2
     exit 1
