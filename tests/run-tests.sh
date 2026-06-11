@@ -104,6 +104,22 @@ SH
     chmod +x "$path"
 }
 
+make_fake_ssh() {
+    local path="$1"
+    cat > "$path" <<'SH'
+#!/usr/bin/env bash
+{
+    printf 'SSH'
+    for arg in "$@"; do
+        printf ' %q' "$arg"
+    done
+    printf '\n'
+} >> "${SSH_LOG:?}"
+exit 0
+SH
+    chmod +x "$path"
+}
+
 test_syntax() {
     bash -n "$ROOT/cctrl" "$ROOT/completions/_cctrl" "$ROOT/hooks/notify.sh" "$ROOT/hooks/statusline.sh" "$ROOT/install.sh"
     python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
@@ -237,6 +253,27 @@ test_shortcut_no_args_defaults_to_tmux() {
     assert_contains "$out" "CCTRL_SESSION=TMUX--mstack"
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--mstack"
     assert_contains "$(cat "$log")" "@mstack --foreground --name TMUX--mstack"
+}
+
+test_remote_shortcut_injects_purpose() {
+    make_fake_ssh "$TMPDIR/ssh"
+    local rootcopy="$TMPDIR/cctrl-remote-copy"
+    local log="$TMPDIR/ssh.log"
+    mkdir -p "$rootcopy/data"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"ms":{"hostname":"example.invalid","user":"tester"}}\n' > "$rootcopy/data/hosts.json"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" SSH_LOG="$log" CCTRL_PURPOSE_PROMPT=never \
+        "$rootcopy/cctrl" --host ms @homelab --agent claude >/dev/null 2>&1
+
+    local ssh_log
+    ssh_log="$(cat "$log")"
+    assert_contains "$ssh_log" "SSH -t tester@example.invalid"
+    assert_contains "$ssh_log" "CCTRL_HOST_PREFIX=ms\\ cctrl\\ @homelab"
+    assert_contains "$ssh_log" "--agent\\ claude"
+    assert_contains "$ssh_log" "--purpose\\ @homelab"
 }
 
 test_attach_prompt_after_start() {
@@ -430,6 +467,7 @@ test_launch_args
 test_detached_arg_parsing
 test_start_defaults_to_tmux
 test_shortcut_no_args_defaults_to_tmux
+test_remote_shortcut_injects_purpose
 test_attach_prompt_after_start
 test_codex_statusline_tui_config
 test_context_names

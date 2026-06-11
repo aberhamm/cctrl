@@ -1982,12 +1982,6 @@ _remote_exec() {
             ;;
     esac
 
-    # Quote each argument for safe SSH transport
-    local quoted_args=""
-    for arg in "$@"; do
-        quoted_args+=" $(printf '%q' "$arg")"
-    done
-
     local ssh_opts=()
     if $use_tty; then
         ssh_opts+=("-t")
@@ -1997,6 +1991,98 @@ _remote_exec() {
     if [[ -n "${CCTRL_AGENT:-}" ]]; then
         env_prefix+=" CCTRL_AGENT=$(printf '%q' "$CCTRL_AGENT")"
     fi
+
+    # Remote tmux-backed launches may run over non-interactive SSH, especially
+    # the detach-and-attach path that captures CCTRL_SESSION. Collect purpose on
+    # the local terminal, then pass it as metadata to the remote cctrl process.
+    local -a remote_args=("$@")
+    local remote_tmux_launch=false remote_has_purpose=false remote_default_purpose="" remote_purpose=""
+    case "${remote_args[0]:-}" in
+        @*)
+            remote_tmux_launch=true
+            remote_default_purpose="${remote_args[0]}"
+            ;;
+        start|s)
+            remote_tmux_launch=true
+            ;;
+    esac
+    if $remote_tmux_launch; then
+        local i j a
+        i=0
+        while (( i < ${#remote_args[@]} )); do
+            a="${remote_args[$i]}"
+            case "$a" in
+                --)
+                    if [[ -z "$remote_default_purpose" ]]; then
+                        for (( j = i + 1; j < ${#remote_args[@]}; j++ )); do
+                            [[ -n "$remote_default_purpose" ]] && remote_default_purpose+=" "
+                            remote_default_purpose+="${remote_args[$j]}"
+                        done
+                    fi
+                    break
+                    ;;
+                --purpose)
+                    remote_has_purpose=true
+                    ((i+=2))
+                    continue
+                    ;;
+                --foreground|--no-tmux)
+                    remote_tmux_launch=false
+                    ;;
+                --message|--prompt|-m)
+                    if (( i + 1 < ${#remote_args[@]} )); then
+                        remote_default_purpose="${remote_args[$((i + 1))]}"
+                    fi
+                    ((i+=2))
+                    continue
+                    ;;
+                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
+                    ((i+=2))
+                    continue
+                    ;;
+                @*)
+                    [[ -z "$remote_default_purpose" ]] && remote_default_purpose="$a"
+                    ;;
+                *)
+                    if [[ "${remote_args[0]:-}" == start || "${remote_args[0]:-}" == s ]]; then
+                        if (( i > 0 )) && [[ "$a" != -* && -z "$remote_default_purpose" ]]; then
+                            if [[ "$a" == @* ]]; then
+                                remote_default_purpose="$a"
+                            else
+                                remote_default_purpose="${a##*/}"
+                            fi
+                        fi
+                    fi
+                    ;;
+            esac
+            ((i++))
+        done
+    fi
+    if $remote_tmux_launch && ! $remote_has_purpose; then
+        [[ -n "$remote_default_purpose" ]] || remote_default_purpose="$host_alias"
+        remote_purpose="$(_prompt_session_purpose "$remote_default_purpose")"
+        local -a updated_args=()
+        local inserted=false
+        for a in "${remote_args[@]}"; do
+            if [[ "$a" == "--" && "$inserted" == "false" ]]; then
+                updated_args+=("--purpose" "$remote_purpose")
+                inserted=true
+            fi
+            updated_args+=("$a")
+        done
+        if [[ "$inserted" == "false" ]]; then
+            updated_args+=("--purpose" "$remote_purpose")
+        fi
+        remote_args=("${updated_args[@]}")
+        set -- "${remote_args[@]}"
+    fi
+
+    # Quote each argument for safe SSH transport after any local-only remote
+    # metadata has been injected into the forwarded cctrl invocation.
+    local quoted_args=""
+    for arg in "$@"; do
+        quoted_args+=" $(printf '%q' "$arg")"
+    done
 
     if $detach_and_attach; then
         # Launch detached on the remote, capture the resolved session name, then
