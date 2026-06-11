@@ -269,6 +269,12 @@ _launch_exec_agent() {
     local agent="$1" pf="$2" cli_model="$3" launch_name="$4" no_bridge="$5"
     local resume="$6" resume_val="$7" final_prompt="$8" bridge_dir="${9:-$PWD}"
 
+    export CCTRL_AGENT="$agent"
+    if [[ "${CCTRL_SESSION_KIND:-}" != "tmux" ]]; then
+        export CCTRL_SESSION_KIND="foreground"
+        unset CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
+    fi
+
     LAUNCH_FLAGS=()
     LAUNCH_PROFILE_ARGS=()
     _launch_apply_profile_args "$agent" "$pf" || return 1
@@ -1038,15 +1044,14 @@ _launch_detached() {
         return 1
     fi
 
-    local cctrl_q extras_q="" env_q="CCTRL_TMUX_CONTEXT=1" shell_cmd session_name display_label context_name
+    local cctrl_q extras_q="" env_q="" base_env_q="CCTRL_TMUX_CONTEXT=1" shell_cmd session_name display_label context_name
     local metadata_cwd="" metadata_target=""
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
     local env_name env_val
     for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX; do
         env_val="${!env_name:-}"
-        [[ -n "$env_val" ]] && env_q+=" $env_name=$(printf '%q' "$env_val")"
+        [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(printf '%q' "$env_val")"
     done
-    [[ -n "$env_q" ]] && env_q="${env_q# } "
     if [[ ${#passthrough[@]} -gt 0 ]]; then
         for a in "${passthrough[@]}"; do
             extras_q+=" $(printf '%q' "$a")"
@@ -1063,11 +1068,7 @@ _launch_detached() {
             echo -e "${DIM}List with: cctrl @${RESET}" >&2
             return 1
         fi
-        local name_q cc_name_q
         context_name="$(_tmux_session_slug "$canonical")"
-        name_q="$(printf '%q' "$canonical")"
-        cc_name_q="$(printf '%q' "$context_name")"
-        shell_cmd="${env_q}$cctrl_q @$name_q --foreground --name $cc_name_q$extras_q"
         session_name="$context_name"
         display_label="@$canonical"
         metadata_target="@$canonical"
@@ -1081,11 +1082,7 @@ _launch_detached() {
             return 1
         fi
         dir="$(cd "$dir" && pwd)"
-        local dir_q cc_name_q
         context_name="$(_tmux_session_slug "$dir")"
-        dir_q="$(printf '%q' "$dir")"
-        cc_name_q="$(printf '%q' "$context_name")"
-        shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
         session_name="$context_name"
         display_label="$dir"
         metadata_target="$dir"
@@ -1114,6 +1111,23 @@ _launch_detached() {
             default_purpose="${metadata_cwd##*/}"
         fi
         final_purpose="$(_prompt_session_purpose "$default_purpose")"
+    fi
+
+    env_q="$base_env_q CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=$(printf '%q' "$session_name")"
+    [[ -n "$metadata_target" ]] && env_q+=" CCTRL_SESSION_TARGET=$(printf '%q' "$metadata_target")"
+    [[ -n "$final_purpose" ]] && env_q+=" CCTRL_SESSION_PURPOSE=$(printf '%q' "$final_purpose")"
+    env_q="${env_q# } "
+
+    local cc_name_q
+    cc_name_q="$(printf '%q' "$session_name")"
+    if [[ "$target_kind" == "shortcut" ]]; then
+        local name_q
+        name_q="$(printf '%q' "${metadata_target#@}")"
+        shell_cmd="${env_q}$cctrl_q @$name_q --foreground --name $cc_name_q$extras_q"
+    else
+        local dir_q
+        dir_q="$(printf '%q' "$metadata_cwd")"
+        shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
     tmux new-session -d -s "$session_name" "$shell_cmd"
@@ -1177,6 +1191,7 @@ cmd_session() {
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state)"
             echo "    --json                       Machine-readable output"
+            echo "  cctrl session current [--json] Show this process/session identity"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session close [name]     Gracefully close a session; with no name,"
             echo "                                 closes the session you are running inside"
@@ -1189,6 +1204,7 @@ cmd_session() {
             return 0
             ;;
         ls|list)   _session_list "$@" ;;
+        current|whoami|identity) _session_current "$@" ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
         close|stop) _session_close "$@" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
@@ -1378,10 +1394,133 @@ _session_kill() {
     fi
 }
 
-_session_current_name() {
-    # Name of the tmux session this process is running inside, if any.
+_session_tmux_display_current_name() {
     [[ -n "${TMUX:-}" ]] || return 1
     tmux display-message -p '#{session_name}' 2>/dev/null
+}
+
+_session_process_in_session() {
+    local session="$1" pid="${2:-${BASHPID:-$$}}" pane_pid ppid
+    local -a pane_pids=()
+    while IFS= read -r pane_pid; do
+        [[ "$pane_pid" =~ ^[0-9]+$ ]] && pane_pids+=("$pane_pid")
+    done < <(CCTRL_CURRENT_PID="$pid" tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null)
+    [[ ${#pane_pids[@]} -gt 0 ]] || return 1
+
+    while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); do
+        for pane_pid in "${pane_pids[@]}"; do
+            [[ "$pid" == "$pane_pid" ]] && return 0
+        done
+        (( pid == 1 )) && break
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$ppid" && "$ppid" != "$pid" ]] || break
+        pid="$ppid"
+    done
+    return 1
+}
+
+_session_current_name() {
+    # Name of the cctrl tmux session this process is actually running inside.
+    # `TMUX` can be stale in agent subprocesses, so do not trust display-message
+    # unless this process is also a descendant of one of the session's panes.
+    local explicit="${CCTRL_SESSION_NAME:-}" tmux_current
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "$explicit" ]]; then
+        tmux has-session -t "$explicit" 2>/dev/null || return 1
+        _session_process_in_session "$explicit" || return 1
+        printf '%s\n' "$explicit"
+        return 0
+    fi
+
+    tmux_current="$(_session_tmux_display_current_name || true)"
+    [[ -n "$tmux_current" ]] || return 1
+    _session_process_in_session "$tmux_current" || return 1
+    printf '%s\n' "$tmux_current"
+}
+
+_session_current() {
+    local json=false a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            -h|--help)
+                echo "Usage: cctrl session current [--json]"
+                echo ""
+                echo "Shows this agent/process identity and whether cctrl close can safely"
+                echo "close the current session."
+                return 0
+                ;;
+        esac
+    done
+
+    local env_kind="${CCTRL_SESSION_KIND:-unknown}"
+    local env_session="${CCTRL_SESSION_NAME:-}"
+    local env_target="${CCTRL_SESSION_TARGET:-}"
+    local env_purpose="${CCTRL_SESSION_PURPOSE:-}"
+    local agent="${CCTRL_AGENT:-}"
+    local tmux_current="" current="" managed=false can_close=false purpose="" target="" cwd="" close_command=""
+
+    if command -v tmux &>/dev/null; then
+        tmux_current="$(_session_tmux_display_current_name || true)"
+        current="$(_session_current_name || true)"
+    fi
+
+    if [[ -n "$current" ]]; then
+        if [[ "$(tmux show-option -qv -t "$current" @cctrl_managed 2>/dev/null)" == "1" \
+              || -f "$(_session_metadata_file "$current")" ]]; then
+            managed=true
+            can_close=true
+            close_command="cctrl close"
+        fi
+        purpose="$(_session_metadata_field "$current" purpose)"
+        target="$(_session_metadata_field "$current" target)"
+        cwd="$(_session_metadata_field "$current" cwd)"
+    fi
+
+    [[ -n "$purpose" ]] || purpose="$env_purpose"
+    [[ -n "$target" ]] || target="$env_target"
+
+    if $json; then
+        jq -n \
+            --arg agent "$agent" \
+            --arg kind "$env_kind" \
+            --arg session "$current" \
+            --arg tmux_current "$tmux_current" \
+            --arg env_session "$env_session" \
+            --arg target "$target" \
+            --arg cwd "$cwd" \
+            --arg purpose "$purpose" \
+            --arg close_command "$close_command" \
+            --argjson managed "$managed" \
+            --argjson can_close "$can_close" \
+            '{
+                agent: (if $agent == "" then null else $agent end),
+                kind: $kind,
+                session: (if $session == "" then null else $session end),
+                tmux_current: (if $tmux_current == "" then null else $tmux_current end),
+                env_session: (if $env_session == "" then null else $env_session end),
+                managed: $managed,
+                can_close_self: $can_close,
+                close_command: (if $close_command == "" then null else $close_command end),
+                target: (if $target == "" then null else $target end),
+                cwd: (if $cwd == "" then null else $cwd end),
+                purpose: (if $purpose == "" then null else $purpose end)
+            }'
+        return 0
+    fi
+
+    echo -e "${BOLD}Session Identity${RESET}"
+    echo "  Agent:          ${agent:-unknown}"
+    echo "  Kind:           $env_kind"
+    echo "  Session:        ${current:-none}"
+    echo "  Env session:    ${env_session:-none}"
+    echo "  Tmux reports:   ${tmux_current:-none}"
+    echo "  Target:         ${target:-unknown}"
+    echo "  Purpose:        ${purpose:-unknown}"
+    if $can_close; then
+        echo "  Close self:     cctrl close"
+    else
+        echo "  Close self:     unavailable"
+    fi
 }
 
 _session_close() {
@@ -1436,7 +1575,12 @@ _session_close() {
 
     if [[ -z "$target" ]]; then
         if [[ -z "$current" ]]; then
-            echo -e "${RED}Not inside a tmux session — pass a session name.${RESET}" >&2
+            if [[ "${CCTRL_SESSION_KIND:-}" == "foreground" ]]; then
+                echo -e "${RED}This agent is not running in a cctrl tmux session.${RESET}" >&2
+            else
+                echo -e "${RED}Could not verify that this process is inside a cctrl tmux session.${RESET}" >&2
+            fi
+            echo -e "${DIM}Check identity with: cctrl session current --json${RESET}" >&2
             echo -e "${DIM}Usage: cctrl session close [name]   (list with: cctrl session ls)${RESET}" >&2
             return 1
         fi
@@ -1522,6 +1666,7 @@ cmd_help() {
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
     echo ""
     echo "  cctrl session ls            List sessions (dir, agent/shell, model, state; --json)"
+    echo "  cctrl session current       Show this process/session identity; --json for agents"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
     echo "  cctrl session close [name]  Gracefully close a session (alias: cctrl close);"
     echo "                              no name = the session you're inside, killed after"

@@ -142,6 +142,7 @@ cctrl start -d @myapp --agent codex
 cctrl start -d @myapp --purpose "review auth logs"
 
 cctrl session ls                  # list sessions (see below)
+cctrl session current --json      # machine-readable identity for the current agent/process
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
 cctrl session close TMUX--myapp   # gracefully close a session
 cctrl session kill TMUX--myapp    # kill a session immediately
@@ -149,12 +150,13 @@ cctrl session kill TMUX--myapp    # kill a session immediately
 
 #### Letting the agent close its own session
 
-`cctrl session close` (alias: `cctrl close`) run with no arguments from
-**inside** a cctrl tmux session targets the session it's running in and
-schedules the kill a few seconds out, so the calling process can finish its
-output before the pane disappears. That means you can simply tell the agent
-running in a session *"close this session with cctrl"* — it runs `cctrl close`,
-says goodbye, and the session shuts down behind it.
+`cctrl session current --json` tells an agent exactly what kind of cctrl launch
+it is running under, the verified tmux session name if there is one, and whether
+`cctrl close` can safely close the current session. `cctrl session close` (alias:
+`cctrl close`) run with no arguments only self-closes after cctrl verifies the
+caller is actually inside the cctrl tmux session's pane tree. When verified, it
+schedules the kill a few seconds out so the calling process can finish its
+output before the pane disappears.
 
 ```bash
 cctrl close                       # inside a session: close it after a 5s grace period
@@ -163,9 +165,11 @@ cctrl close --now                 # no grace period
 cctrl close TMUX--myapp           # close a specific session (immediate from outside)
 ```
 
-Sessions not started by cctrl are refused unless you add `--force`. The default
-grace period is 5 seconds (override per call with `--in`, or globally with
-`CCTRL_CLOSE_GRACE`).
+Sessions not started by cctrl are refused unless you add `--force`. Stale or
+inherited tmux-looking environment is refused for no-arg self-close; pass an
+explicit session name only when you intentionally want to close another session.
+The default grace period is 5 seconds (override per call with `--in`, or
+globally with `CCTRL_CLOSE_GRACE`).
 
 When a tmux-backed launch runs in an interactive terminal, `cctrl` asks for a
 session purpose before creating the session. Press Enter to accept the inferred

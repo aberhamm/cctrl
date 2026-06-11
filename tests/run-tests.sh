@@ -58,7 +58,20 @@ fi
 
 case "${1:-}" in
     has-session)
-        [[ -n "${TMUX_FAKE_HAS_SESSION:-}" ]] && exit 0
+        if [[ "${TMUX_FAKE_HAS_SESSION:-}" == "1" ]]; then
+            exit 0
+        fi
+        if [[ -n "${TMUX_FAKE_HAS_SESSION:-}" ]]; then
+            target=""
+            for ((i = 1; i <= $#; i++)); do
+                if [[ "${!i}" == "-t" ]]; then
+                    j=$((i + 1))
+                    target="${!j:-}"
+                    break
+                fi
+            done
+            [[ " ${TMUX_FAKE_HAS_SESSION} " == *" ${target} "* ]] && exit 0
+        fi
         exit 1
         ;;
     list-sessions)
@@ -68,6 +81,10 @@ case "${1:-}" in
     list-panes)
         if [[ "$*" == *pane_current_path* ]]; then
             printf '/tmp/demo\n'
+        elif [[ "${TMUX_FAKE_PANE_PID:-}" == "__current__" ]]; then
+            printf '%s\n' "${CCTRL_CURRENT_PID:?}"
+        elif [[ -n "${TMUX_FAKE_PANE_PID:-}" ]]; then
+            printf '%s\n' "$TMUX_FAKE_PANE_PID"
         else
             printf '12345\n'
         fi
@@ -216,6 +233,14 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--project"
     assert_contains "$(cat "$log")" "--name TMUX--ms--project"
     assert_contains "$(cat "$log")" "start --foreground"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 \
+        TMUX_FAKE_HAS_SESSION="TMUX--project" "$ROOT/cctrl" start -d "$project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--project--2"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--project--2"
+    assert_contains "$(cat "$log")" "CCTRL_SESSION_NAME=TMUX--project--2"
+    assert_contains "$(cat "$log")" "--name TMUX--project--2"
 }
 
 test_start_defaults_to_tmux() {
@@ -391,9 +416,44 @@ test_session_close_self_graceful() {
     local out
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX="fake,1,0" \
         TMUX_FAKE_SESSION_NAME="TMUX--demo" TMUX_FAKE_HAS_SESSION=1 \
+        TMUX_FAKE_PANE_PID="__current__" \
         "$ROOT/cctrl" session close)"
     assert_contains "$out" "will close in 5s"
     assert_contains "$(cat "$log")" "run-shell -b sleep\\ 5\\;\\ tmux\\ kill-session\\ -t\\ TMUX--demo"
+}
+
+test_session_close_stale_tmux_refuses_current() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/close-stale.log"
+    : > "$log"
+
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX="fake,1,0" \
+        TMUX_FAKE_SESSION_NAME="TMUX--demo" TMUX_FAKE_HAS_SESSION=1 \
+        TMUX_FAKE_PANE_PID="999999" \
+        "$ROOT/cctrl" session close 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected stale tmux environment to refuse no-arg close"
+    assert_contains "$out" "Could not verify that this process is inside a cctrl tmux session"
+    assert_not_contains "$(cat "$log")" "kill-session"
+}
+
+test_session_current_identity_json() {
+    make_fake_tmux "$TMPDIR/tmux"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--demo.json" <<'JSON'
+{"target":"@demo","cwd":"/tmp/demo","purpose":"verify identity"}
+JSON
+
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX="fake,1,0" CCTRL_AGENT=codex \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="TMUX--demo" \
+        TMUX_FAKE_HAS_SESSION=1 TMUX_FAKE_PANE_PID="__current__" \
+        "$ROOT/cctrl" session current --json)"
+    assert_contains "$out" '"agent": "codex"'
+    assert_contains "$out" '"session": "TMUX--demo"'
+    assert_contains "$out" '"can_close_self": true'
+    assert_contains "$out" '"close_command": "cctrl close"'
+    assert_contains "$out" '"purpose": "verify identity"'
 }
 
 test_session_close_named_immediate() {
@@ -415,7 +475,7 @@ test_session_close_outside_requires_name() {
     local out rc=0
     out="$(PATH="$TMPDIR:$PATH" TMUX= "$ROOT/cctrl" session close 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected close outside tmux without a name to fail"
-    assert_contains "$out" "Not inside a tmux session"
+    assert_contains "$out" "Could not verify that this process is inside a cctrl tmux session"
 }
 
 test_usage_cost_fixtures() {
@@ -499,6 +559,8 @@ test_codex_statusline_tui_config
 test_context_names
 test_session_list_codex_default_model
 test_session_close_self_graceful
+test_session_close_stale_tmux_refuses_current
+test_session_current_identity_json
 test_session_close_named_immediate
 test_session_close_outside_requires_name
 test_usage_cost_fixtures
