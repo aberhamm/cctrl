@@ -4,7 +4,7 @@ title: Add --host flag and host registry for remote cctrl execution over SSH
 status: done
 completed: 2026-06-01
 reviewed: false
-qa: automated,verified
+qa: automated
 blocked-by: []
 priority: 1
 allows-migrations: false
