@@ -1,13 +1,16 @@
 ---
 id: 005
 title: Add agent polling and JSON command surface
-status: in-progress
+status: done
 blocked-by: [002, 003]
 priority: 4
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-08
+completed: 2026-06-13
+reviewed: false
+qa: automated,verified
 ---
 
 ## Requirements
@@ -110,3 +113,21 @@ Checks:
 | Eng Review | `/plan-eng-review` | This command contract becomes the MCP bridge's API boundary | 1 | CLEAR | 0 issues; JSON contracts, idempotent redelivery, and exit codes validated |
 
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Implemented the polling JSON surface for peer messaging: JSON-safe mailbox
+errors, stdin/file body loading, `check`, `recv`, and JSON `ack`, plus
+completion and README coverage for non-tmux polling agents. Verification
+covered full suite execution and focused JSON contract assertions for body
+preservation, unread counts, delivery transitions, and `--exit-on-empty`
+semantics.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `README.md` (modified)
+- `completions/_cctrl` (modified)
+
+**Commit:** `PENDING` — `feat(peer): add polling JSON surface`

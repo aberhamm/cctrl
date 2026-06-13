@@ -271,6 +271,8 @@ _cctrl() {
                     'send:Queue a mailbox message'
                     'inbox:List inbound mailbox messages'
                     'outbox:List outbound mailbox messages'
+                    'check:Check unread mailbox counts'
+                    'recv:Receive the next mailbox message'
                     'show:Show a mailbox message'
                     'ack:Acknowledge a delivered message'
                     'help:Show peer help'
@@ -321,6 +323,7 @@ _cctrl() {
                                 '--from[Sender peer]:peer:_cctrl_peers' \
                                 '--as[Sender identity]:peer:_cctrl_peers' \
                                 '--subject[Message subject]:subject:' \
+                                '--body-file[Read message body from file or stdin]:path:_files' \
                                 '--allow-unknown[Allow unknown sender or recipient]' \
                                 '--json[Machine-readable output]' \
                                 '--[Everything after is the message body]'
@@ -338,6 +341,19 @@ _cctrl() {
                             '--status[Status filter]:status:(queued delivered acked)' \
                             '--json[Machine-readable output]'
                         ;;
+                    check)
+                        _arguments \
+                            '--as[Peer identity]:peer:_cctrl_peers' \
+                            '--json[Machine-readable output]' \
+                            '--exit-on-empty[Exit 2 when no queued or delivered messages are available]'
+                        ;;
+                    recv)
+                        _arguments \
+                            '--as[Peer identity]:peer:_cctrl_peers' \
+                            '--status[Status filter]:status:(queued delivered)' \
+                            '--json[Machine-readable output]' \
+                            '--exit-on-empty[Exit 2 when no message is available]'
+                        ;;
                     show)
                         if (( CURRENT == 4 )); then
                             _cctrl_message_ids
@@ -349,7 +365,9 @@ _cctrl() {
                         if (( CURRENT == 4 )); then
                             _cctrl_message_ids
                         else
-                            _arguments '--as[Peer identity]:peer:_cctrl_peers'
+                            _arguments \
+                                '--as[Peer identity]:peer:_cctrl_peers' \
+                                '--json[Machine-readable output]'
                         fi
                         ;;
                 esac

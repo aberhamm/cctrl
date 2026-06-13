@@ -632,7 +632,7 @@ test_peer_mailbox_unknowns_and_identity() {
     rc=0
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --json -- "hello" 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected JSON send without sender to fail"
-    assert_contains "$out" "No sender identity"
+    assert_contains "$out" '"code": "missing-identity"'
 
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send missing --from missing --allow-unknown --json -- "hello")"
     assert_contains "$out" '"unknown_peer": true'
@@ -676,6 +676,95 @@ test_peer_mailbox_concurrency_and_stale_lock() {
     out="$(CCTRL_MAILBOX_LOCK_KIND=dir CCTRL_DATA_DIR="$stale_data" "$ROOT/cctrl" peer send ghost --from phantom --allow-unknown --json -- "stale lock")"
     assert_contains "$out" '"status": "queued"'
     [[ ! -d "$stale_data/messages.jsonl.lock" ]] || fail "expected stale lock directory to be reclaimed and released"
+}
+
+test_peer_polling_json_contracts() {
+    local data="$TMPDIR/polling-json-data"
+    setup_mailbox_peers "$data"
+
+    local out id check recv shown acked rc body_file
+    out="$(printf 'hello from stdin\n' | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --body-file - --json)"
+    printf '%s\n' "$out" | jq -e '.body == "hello from stdin\n"' >/dev/null || fail "expected stdin body to preserve trailing newline"
+    assert_contains "$out" '"status": "queued"'
+    assert_not_contains "$out" $'\033['
+    id="$(printf '%s\n' "$out" | jq -r '.id')"
+
+    check="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json)"
+    assert_contains "$check" '"peer": "comet"'
+    assert_contains "$check" '"queued": 1'
+    assert_contains "$check" '"delivered_unacked": 0'
+    assert_contains "$check" '"oldest_queued_age_seconds":'
+    assert_not_contains "$check" $'\033['
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json --exit-on-empty 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected check --exit-on-empty to return 0 while messages are available, got $rc"
+
+    recv="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json)"
+    assert_contains "$recv" '"empty": false'
+    printf '%s\n' "$recv" | jq -e '.message.body == "hello from stdin\n"' >/dev/null || fail "expected recv to preserve stdin body"
+    assert_contains "$recv" '"status": "delivered"'
+    assert_not_contains "$recv" '"status": "acked"'
+    shown="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json)"
+    assert_contains "$shown" '"status": "delivered"'
+    assert_contains "$shown" '"delivered_at": "'
+    assert_not_contains "$shown" '"acked_at": "'
+
+    check="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json)"
+    assert_contains "$check" '"queued": 0'
+    assert_contains "$check" '"delivered_unacked": 1'
+
+    acked="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet --json)"
+    assert_contains "$acked" '"status": "acked"'
+    assert_contains "$acked" '"message": {'
+    assert_not_contains "$acked" $'\033['
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json --exit-on-empty 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "expected check --exit-on-empty to return 2 for empty mailbox, got $rc"
+    assert_contains "$out" '"queued": 0'
+    assert_contains "$out" '"delivered_unacked": 0'
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json)"
+    assert_contains "$out" '"empty": true'
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json --exit-on-empty 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "expected recv --exit-on-empty to return 2 for empty mailbox, got $rc"
+    assert_contains "$out" '"empty": true'
+
+    body_file="$data/body.txt"
+    printf 'file body\nsecond line\n' > "$body_file"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --body-file "$body_file" --json)"
+    printf '%s\n' "$out" | jq -e '.body == "file body\nsecond line\n"' >/dev/null || fail "expected file body to preserve content"
+}
+
+test_peer_polling_identity_and_errors() {
+    local data="$TMPDIR/polling-identity-data"
+    setup_mailbox_peers "$data"
+
+    local out rc
+    out="$(printf 'from env' | CCTRL_DATA_DIR="$data" CCTRL_PEER=orchestrator "$ROOT/cctrl" peer send comet --body-file - --json)"
+    assert_contains "$out" '"from": "orchestrator"'
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_PEER=comet "$ROOT/cctrl" peer recv --json)"
+    assert_contains "$out" '"body": "from env"'
+    assert_contains "$out" '"status": "delivered"'
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as missing --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected unknown peer to exit 66, got $rc"
+    assert_contains "$out" '"code": "unknown-peer"'
+    assert_not_contains "$out" $'\033['
+
+    printf '{not-json\n' > "$data/messages.jsonl"
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected corrupt mailbox to exit 65, got $rc"
+    assert_contains "$out" '"code": "mailbox-corrupt"'
+    assert_not_contains "$out" $'\033['
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected corrupt mailbox recv to exit 65, got $rc"
+    assert_contains "$out" '"code": "mailbox-corrupt"'
 }
 
 test_session_close_self_graceful() {
@@ -839,6 +928,8 @@ test_peer_mailbox_send_list_show
 test_peer_mailbox_ack_authorization_and_states
 test_peer_mailbox_unknowns_and_identity
 test_peer_mailbox_concurrency_and_stale_lock
+test_peer_polling_json_contracts
+test_peer_polling_identity_and_errors
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json

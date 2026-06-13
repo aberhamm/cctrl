@@ -256,10 +256,14 @@ addressed to the acking peer.
 
 ```bash
 cctrl peer send comet --from orchestrator --subject "Check" -- "Please check XYZ"
+cctrl peer send comet --from orchestrator --body-file prompt.txt --json
+printf 'Handle this\n' | cctrl peer send comet --from orchestrator --body-file - --json
 cctrl peer inbox --as comet --json          # queued + delivered messages for comet
+cctrl peer check --as comet --json          # compact unread summary
+cctrl peer recv --as comet --json           # deliver/read the next message
 cctrl peer outbox --as orchestrator --json  # messages sent by orchestrator
 cctrl peer show msg_20260608_070000_abc123 --json
-cctrl peer ack msg_20260608_070000_abc123 --as comet
+cctrl peer ack msg_20260608_070000_abc123 --as comet --json
 ```
 
 Senders and recipients must resolve to known peers unless `peer send` is given
@@ -268,6 +272,38 @@ can be omitted when `--as` or `CCTRL_PEER` identifies the sender; JSON sends
 without an identity fail instead of silently defaulting. Mailbox writes use an
 exclusive lock and atomic rewrites for state transitions; stale fallback lock
 directories record their holder PID and are reclaimed automatically.
+
+Agents that do not have a tmux session can poll the mailbox directly:
+
+```bash
+export CCTRL_PEER=comet
+
+if cctrl peer check --json --exit-on-empty >/tmp/cctrl-check.json; then
+  msg_json="$(cctrl peer recv --json)"
+  msg_id="$(printf '%s\n' "$msg_json" | jq -r '.message.id')"
+  msg_body="$(printf '%s\n' "$msg_json" | jq -r '.message.body')"
+  # handle "$msg_body"
+  cctrl peer ack "$msg_id" --json >/dev/null
+elif [ "$?" -eq 2 ]; then
+  : # no queued or delivered-unacked messages
+fi
+```
+
+`peer recv` transitions the oldest queued message for the peer to
+`delivered` and leaves it unacked. If no queued message exists, it returns the
+oldest delivered-but-unacked message without changing it, which lets a crashed
+agent retry before calling `ack`. JSON errors use
+`{"ok":false,"error":{"code":"...","message":"..."}}`.
+
+Polling exit codes:
+
+| Code | Meaning |
+|---:|---|
+| 0 | Command succeeded |
+| 2 | No messages for `check`/`recv` with `--exit-on-empty` |
+| 64 | Usage or validation error |
+| 65 | Corrupted mailbox JSONL |
+| 66 | Unknown peer or unresolved identity |
 
 ## Remote Hosts
 
