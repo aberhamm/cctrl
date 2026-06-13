@@ -273,6 +273,7 @@ _cctrl() {
                     'outbox:List outbound mailbox messages'
                     'check:Check unread mailbox counts'
                     'recv:Receive the next mailbox message'
+                    'deliver:Nudge tmux peers with queued messages'
                     'show:Show a mailbox message'
                     'ack:Acknowledge a delivered message'
                     'help:Show peer help'
@@ -353,6 +354,21 @@ _cctrl() {
                             '--status[Status filter]:status:(queued delivered)' \
                             '--json[Machine-readable output]' \
                             '--exit-on-empty[Exit 2 when no message is available]'
+                        ;;
+                    deliver)
+                        if (( CURRENT == 4 )); then
+                            _arguments \
+                                '--all[Deliver to every queued tmux-capable peer]' \
+                                '*:peer:_cctrl_peers'
+                        else
+                            _arguments \
+                                '--all[Deliver to every queued tmux-capable peer]' \
+                                '--dry-run[Print the nudge without changing mailbox state]' \
+                                '--json[Machine-readable output]' \
+                                '--no-submit[Paste the nudge without pressing Enter]' \
+                                '--inline[Paste a full message body without submitting]:message:_cctrl_message_ids' \
+                                '--force-busy[Paste even when readiness cannot be proven]'
+                        fi
                         ;;
                     show)
                         if (( CURRENT == 4 )); then

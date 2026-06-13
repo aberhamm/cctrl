@@ -58,6 +58,35 @@ if [[ "${1:-}" == "new-session" ]]; then
 fi
 
 case "${1:-}" in
+    capture-pane)
+        if [[ "${TMUX_FAKE_CAPTURE_FAIL:-}" == "1" ]]; then
+            echo "capture failed" >&2
+            exit 1
+        fi
+        printf '%s' "${TMUX_FAKE_CAPTURE_PANE:-}"
+        exit 0
+        ;;
+    load-buffer)
+        if [[ "${TMUX_FAKE_LOAD_FAIL:-}" == "1" ]]; then
+            echo "load failed" >&2
+            exit 1
+        fi
+        sentinel=$'\037'
+        input="$(cat; printf '%s' "$sentinel")"
+        input="${input%$sentinel}"
+        printf 'BUFFER %s\n' "$input" >> "${TMUX_LOG:?}"
+        exit 0
+        ;;
+    paste-buffer)
+        if [[ "${TMUX_FAKE_PASTE_FAIL:-}" == "1" ]]; then
+            echo "paste failed" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    send-keys|delete-buffer)
+        exit 0
+        ;;
     has-session)
         if [[ "${TMUX_FAKE_HAS_SESSION:-}" == "1" ]]; then
             exit 0
@@ -543,6 +572,14 @@ setup_mailbox_peers() {
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register wrong-peer --dir "$TMPDIR/wrong-peer" --agent codex >/dev/null
 }
 
+setup_delivery_peers() {
+    local data="$1"
+    mkdir -p "$TMPDIR/comet" "$TMPDIR/orchestrator" "$TMPDIR/offline"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent codex --session TMUX--comet >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orchestrator --dir "$TMPDIR/orchestrator" --agent codex >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register offline --dir "$TMPDIR/offline" --agent codex >/dev/null
+}
+
 mark_message_delivered() {
     local file="$1" id="$2"
     jq -c --arg id "$id" '
@@ -767,6 +804,122 @@ test_peer_polling_identity_and_errors() {
     assert_contains "$out" '"code": "mailbox-corrupt"'
 }
 
+test_peer_deliver_tmux_nudge_lifecycle() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/deliver-nudge-data"
+    local log="$TMPDIR/deliver-nudge-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+
+    local out before after messages
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "secret body A" >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "secret body B" >/dev/null
+
+    before="$(cat "$data/messages.jsonl")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --dry-run)"
+    assert_contains "$out" "[cctrl] 2 new peer message(s) for comet. Run: cctrl peer recv --as comet --json"
+    after="$(cat "$data/messages.jsonl")"
+    [[ "$before" == "$after" ]] || fail "expected dry-run delivery to leave mailbox unchanged"
+    assert_not_contains "$(cat "$log")" "load-buffer"
+
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:01Z" "$ROOT/cctrl" peer deliver comet --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].queued == 2 and .results[0].submitted == true' >/dev/null || fail "expected JSON nudged result"
+    assert_contains "$(cat "$log")" "load-buffer -b cctrl-nudge-comet-"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+    assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+    assert_contains "$(cat "$log")" "delete-buffer -b cctrl-nudge-comet-"
+    assert_not_contains "$(cat "$log")" "secret body A"
+    assert_not_contains "$(cat "$log")" "secret body B"
+
+    messages="$(jq -s '.' "$data/messages.jsonl")"
+    printf '%s\n' "$messages" | jq -e '
+      length == 2
+      and all(.[]; .status == "queued")
+      and all(.[]; .nudge_count == 1)
+      and all(.[]; .last_nudge_at == "2026-06-13T00:00:01Z")
+      and all(.[]; .last_nudge_error == null)
+      and all(.[]; any(.history[]; .event == "nudge" and .ok == true and .adapter == "tmux"))
+    ' >/dev/null || fail "expected successful nudge metadata without status transition"
+}
+
+test_peer_deliver_busy_no_submit_and_inline() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/deliver-busy-data"
+    local log="$TMPDIR/deliver-busy-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+
+    local out id inline_id messages
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "queued for nudge" | jq -r '.id')"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="Allow command? y/N" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected busy pane deferral"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    messages="$(jq -s '.' "$data/messages.jsonl")"
+    printf '%s\n' "$messages" | jq -e '.[0].status == "queued" and .[0].nudge_count == 0 and .[0].last_nudge_at == null' >/dev/null || fail "expected deferred message to remain queued without nudge metadata"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:02Z" "$ROOT/cctrl" peer deliver comet --json --no-submit)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == false' >/dev/null || fail "expected --no-submit nudge"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+    assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+
+    inline_id="$(printf 'inline body\n' | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --body-file - --json | jq -r '.id')"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$inline_id" --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "inline" and .results[0].inline == true and .results[0].submitted == false' >/dev/null || fail "expected inline paste result"
+    assert_contains "$(cat "$log")" "BUFFER inline body"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-inline-comet-"
+    assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+}
+
+test_peer_deliver_failures_all_and_concurrency() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/deliver-failure-data"
+    local log="$TMPDIR/deliver-failure-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+
+    local out rc messages count failed=0 pid
+    local -a pids=()
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "failed target" >/dev/null
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected missing tmux session deliver to fail"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "failed" and (.results[0].reason | contains("tmux session not found"))' >/dev/null || fail "expected failed target JSON result"
+    messages="$(jq -s '.' "$data/messages.jsonl")"
+    printf '%s\n' "$messages" | jq -e '.[0].status == "queued" and (.[0].last_nudge_error | contains("tmux session not found"))' >/dev/null || fail "expected failed target to leave queued message with last_nudge_error"
+
+    data="$TMPDIR/deliver-all-data"
+    log="$TMPDIR/deliver-all-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "wake comet" >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send offline --from orchestrator --json -- "wake offline" >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver --all --json)"
+    printf '%s\n' "$out" | jq -e '
+      (.results | map(select(.peer == "comet" and .status == "nudged")) | length) == 1
+      and (.results | map(select(.peer == "offline" and .status == "skipped" and .reason == "no-tmux-capability")) | length) == 1
+    ' >/dev/null || fail "expected --all to nudge tmux peer and skip non-tmux peer"
+
+    data="$TMPDIR/deliver-concurrency-data"
+    log="$TMPDIR/deliver-concurrency-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "race" >/dev/null
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:03Z" "$ROOT/cctrl" peer deliver comet --json >/dev/null &
+    pids+=("$!")
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:03Z" "$ROOT/cctrl" peer deliver comet --json >/dev/null &
+    pids+=("$!")
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+    done
+    [[ "$failed" -eq 0 ]] || fail "expected concurrent deliver commands to complete"
+    count="$(grep -c 'paste-buffer -b cctrl-nudge-comet-' "$log" || true)"
+    [[ "$count" -eq 1 ]] || fail "expected concurrent deliver to paste one nudge, got $count"
+    messages="$(jq -s '.' "$data/messages.jsonl")"
+    printf '%s\n' "$messages" | jq -e '.[0].status == "queued" and .[0].nudge_count == 1' >/dev/null || fail "expected concurrent deliver to record one nudge"
+}
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"
@@ -930,6 +1083,9 @@ test_peer_mailbox_unknowns_and_identity
 test_peer_mailbox_concurrency_and_stale_lock
 test_peer_polling_json_contracts
 test_peer_polling_identity_and_errors
+test_peer_deliver_tmux_nudge_lifecycle
+test_peer_deliver_busy_no_submit_and_inline
+test_peer_deliver_failures_all_and_concurrency
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json

@@ -1,13 +1,16 @@
 ---
 id: 004
 title: Add tmux nudge adapter for peer messages
-status: in-progress
+status: done
 blocked-by: [002, 003, 005]
 priority: 5
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-08
+completed: 2026-06-13
+reviewed: false
+qa: automated,verified
 ---
 
 ## Requirements
@@ -124,3 +127,21 @@ Checks:
 | Eng Review | `/plan-eng-review` | Terminal injection has quoting, safety, and state risk | 1 | CLEAR | 0 issues; Codex hardening: 5s tmux timeout, real-tmux manual smoke check |
 
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Implemented the tmux delivery adapter for peer mailboxes. `peer deliver` now
+supports dry-run nudges, default submit, `--no-submit`, `--all`, busy-pane
+deferral, timeout-bound tmux operations, nudge metadata/history, failed-target
+recording, and explicit paste-only `--inline` delivery. The nudge path uses
+`tmux load-buffer`, `paste-buffer`, and a scoped buffer name instead of
+interpolating text through `send-keys`.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `README.md` (modified)
+- `completions/_cctrl` (modified)
+
+**Commit:** `PENDING` — `feat(peer): add tmux nudge delivery`

@@ -295,6 +295,34 @@ oldest delivered-but-unacked message without changing it, which lets a crashed
 agent retry before calling `ack`. JSON errors use
 `{"ok":false,"error":{"code":"...","message":"..."}}`.
 
+Tmux-backed peers can also be nudged when they have queued messages. This is a
+doorbell, not message transport: the pasted text is a fixed one-line command
+that tells the agent to poll its mailbox, and message bodies stay in
+`peer recv`.
+
+```bash
+cctrl peer deliver comet --dry-run       # show the nudge without mutation
+cctrl peer deliver comet                 # paste and submit one nudge
+cctrl peer deliver comet --no-submit     # paste without pressing Enter
+cctrl peer deliver --all --json          # nudge every queued tmux-capable peer
+```
+
+The nudge format is constant:
+
+```text
+[cctrl] N new peer message(s) for comet. Run: cctrl peer recv --as comet --json
+```
+
+Before pasting, cctrl captures the last lines of the target pane and defers
+delivery when it sees known Claude/Codex approval or permission prompts. A
+deferred nudge leaves messages queued for the next pass. Successful and failed
+nudge attempts update `nudge_count`, `last_nudge_at`, `last_nudge_error`, and
+message history without changing message status.
+
+`--inline <message-id>` is explicit paste-only delivery for a full message
+body. It never presses Enter and should not be used for unattended sessions,
+because it pastes arbitrary message content into the target pane.
+
 Polling exit codes:
 
 | Code | Meaning |

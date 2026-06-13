@@ -1190,6 +1190,10 @@ _peer_init() {
 }
 
 _peer_now_utc() {
+    if [[ -n "${CCTRL_NOW_UTC:-}" ]]; then
+        printf '%s\n' "$CCTRL_NOW_UTC"
+        return
+    fi
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
@@ -2293,6 +2297,520 @@ _peer_cmd_recv() {
     fi
 }
 
+_peer_nudge_line() {
+    local peer="$1" count="$2"
+    printf '[cctrl] %s new peer message(s) for %s. Run: cctrl peer recv --as %s --json' "$count" "$peer" "$peer"
+}
+
+_peer_has_capability() {
+    local peer_json="$1" capability="$2"
+    jq -e --arg c "$capability" '(.capabilities // []) | index($c)' <<< "$peer_json" >/dev/null 2>&1
+}
+
+_tmux_run_with_timeout() {
+    local timeout="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}" pid start now rc tmpout tmperr
+    tmpout="$(mktemp)"
+    tmperr="$(mktemp)"
+    tmux "$@" >"$tmpout" 2>"$tmperr" &
+    pid=$!
+    start="$(date +%s)"
+    while kill -0 "$pid" 2>/dev/null; do
+        now="$(date +%s)"
+        if (( now - start >= timeout )); then
+            kill "$pid" 2>/dev/null || true
+            sleep 0.05
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            TMUX_RUN_OUTPUT="$(cat "$tmpout" 2>/dev/null || true)"
+            TMUX_RUN_ERROR="tmux command timed out after ${timeout}s: tmux $*"
+            rm -f "$tmpout" "$tmperr"
+            return 124
+        fi
+        sleep 0.05
+    done
+    wait "$pid"; rc=$?
+    TMUX_RUN_OUTPUT="$(cat "$tmpout" 2>/dev/null || true)"
+    TMUX_RUN_ERROR="$(cat "$tmperr" 2>/dev/null || true)"
+    rm -f "$tmpout" "$tmperr"
+    return $rc
+}
+
+_tmux_run_stdin_with_timeout() {
+    local input="$1" timeout="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}" pid start now rc tmpin tmpout tmperr
+    shift
+    tmpin="$(mktemp)"
+    tmpout="$(mktemp)"
+    tmperr="$(mktemp)"
+    printf '%s' "$input" > "$tmpin"
+    tmux "$@" <"$tmpin" >"$tmpout" 2>"$tmperr" &
+    pid=$!
+    start="$(date +%s)"
+    while kill -0 "$pid" 2>/dev/null; do
+        now="$(date +%s)"
+        if (( now - start >= timeout )); then
+            kill "$pid" 2>/dev/null || true
+            sleep 0.05
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            TMUX_RUN_OUTPUT="$(cat "$tmpout" 2>/dev/null || true)"
+            TMUX_RUN_ERROR="tmux command timed out after ${timeout}s: tmux $*"
+            rm -f "$tmpin" "$tmpout" "$tmperr"
+            return 124
+        fi
+        sleep 0.05
+    done
+    wait "$pid"; rc=$?
+    TMUX_RUN_OUTPUT="$(cat "$tmpout" 2>/dev/null || true)"
+    TMUX_RUN_ERROR="$(cat "$tmperr" 2>/dev/null || true)"
+    rm -f "$tmpin" "$tmpout" "$tmperr"
+    return $rc
+}
+
+_peer_tmux_target_for_delivery() {
+    local peer_json="$1" peer target
+    peer="$(jq -r '.name' <<< "$peer_json")"
+    if ! _peer_has_capability "$peer_json" "tmux"; then
+        PEER_DELIVER_STATUS="skipped"
+        PEER_DELIVER_REASON="no-tmux-capability"
+        return 1
+    fi
+    target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+    if [[ -z "$target" ]]; then
+        PEER_DELIVER_STATUS="failed"
+        PEER_DELIVER_REASON="missing tmux session for $peer"
+        return 1
+    fi
+    if ! command -v tmux >/dev/null 2>&1; then
+        PEER_DELIVER_STATUS="failed"
+        PEER_DELIVER_REASON="tmux unavailable"
+        return 1
+    fi
+    if ! _tmux_run_with_timeout has-session -t "$target"; then
+        PEER_DELIVER_STATUS="failed"
+        PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux session not found: $target}"
+        [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux session not found: $target"
+        return 1
+    fi
+    PEER_DELIVER_STATUS="ok"
+    PEER_DELIVER_REASON=""
+    PEER_DELIVER_TARGET="$target"
+    return 0
+}
+
+_peer_pane_ready_for_delivery() {
+    local target="$1" agent="${2:-}" force_busy="${3:-false}" capture
+    if ! _tmux_run_with_timeout capture-pane -p -S -15 -t "$target"; then
+        PEER_DELIVER_READY_REASON="${TMUX_RUN_ERROR:-capture-pane failed}"
+        [[ -n "$PEER_DELIVER_READY_REASON" ]] || PEER_DELIVER_READY_REASON="capture-pane failed"
+        return 2
+    fi
+    capture="$TMUX_RUN_OUTPUT"
+    case "$agent" in
+        claude)
+            if printf '%s\n' "$capture" | grep -E 'Do you want|Do you trust|. 1\.' >/dev/null 2>&1; then
+                PEER_DELIVER_READY_REASON="modal prompt visible"
+                return 1
+            fi
+            ;;
+        codex)
+            if printf '%s\n' "$capture" | grep -E 'Allow command|Approve|y/N' >/dev/null 2>&1; then
+                PEER_DELIVER_READY_REASON="modal prompt visible"
+                return 1
+            fi
+            ;;
+        *)
+            if [[ "$force_busy" != "true" ]]; then
+                PEER_DELIVER_READY_REASON="unknown agent readiness"
+                return 1
+            fi
+            ;;
+    esac
+    PEER_DELIVER_READY_REASON=""
+    return 0
+}
+
+_peer_tmux_paste() {
+    local target="$1" buffer="$2" payload="$3" submit="${4:-true}"
+    if ! _tmux_run_stdin_with_timeout "$payload" load-buffer -b "$buffer" -; then
+        PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux load-buffer failed}"
+        [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux load-buffer failed"
+        return 1
+    fi
+    if ! _tmux_run_with_timeout paste-buffer -b "$buffer" -t "$target"; then
+        PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux paste-buffer failed}"
+        [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux paste-buffer failed"
+        _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if [[ "$submit" == "true" ]]; then
+        if ! _tmux_run_with_timeout send-keys -t "$target" Enter; then
+            PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux send-keys failed}"
+            [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux send-keys failed"
+            _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
+    _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+    PEER_DELIVER_REASON=""
+    return 0
+}
+
+_peer_record_nudge_json() {
+    local messages="$1" peer="$2" ok="$3" error="$4" now="$5" count_it="${6:-true}"
+    jq --arg peer "$peer" --arg now "$now" --arg error "$error" --argjson ok "$ok" --argjson countit "$count_it" '
+        map(
+          if .to == $peer and .status == "queued" then
+            (if $countit then .nudge_count = ((.nudge_count // 0) + 1) else . end)
+            | .updated_at = $now
+            | (if $countit then .last_nudge_at = $now else . end)
+            | .last_nudge_error = (if $error == "" then null else $error end)
+            | .history = ((.history // []) + [
+                ({at: $now, event: "nudge", ok: $ok, by: "cctrl", adapter: "tmux"}
+                 + (if $error == "" then {} else {error: $error} end))
+              ])
+          else . end
+        )
+    ' <<< "$messages"
+}
+
+_peer_record_inline_json() {
+    local messages="$1" id="$2" ok="$3" error="$4" now="$5"
+    jq --arg id "$id" --arg now "$now" --arg error "$error" --argjson ok "$ok" '
+        map(
+          if .id == $id then
+            .updated_at = $now
+            | .last_nudge_error = (if $error == "" then null else $error end)
+            | .history = ((.history // []) + [
+                ({at: $now, event: "inline", ok: $ok, by: "cctrl", adapter: "tmux"}
+                 + (if $error == "" then {} else {error: $error} end))
+              ])
+          else . end
+        )
+    ' <<< "$messages"
+}
+
+_peer_message_body_from_json() {
+    local messages="$1" id="$2" body sentinel=$'\037'
+    body="$(jq -j --arg id "$id" '[.[] | select(.id == $id)][0].body // ""' <<< "$messages"; printf '%s' "$sentinel")"
+    PEER_MESSAGE_BODY="${body%$sentinel}"
+}
+
+_peer_delivery_result_json() {
+    jq -n \
+      --arg peer "$PEER_DELIVER_PEER" \
+      --arg status "$PEER_DELIVER_STATUS" \
+      --arg reason "${PEER_DELIVER_REASON:-}" \
+      --arg target "${PEER_DELIVER_TARGET:-}" \
+      --arg nudge "${PEER_DELIVER_NUDGE:-}" \
+      --arg message_id "${PEER_DELIVER_MESSAGE_ID:-}" \
+      --argjson queued "${PEER_DELIVER_QUEUED:-0}" \
+      --argjson submitted "${PEER_DELIVER_SUBMITTED:-false}" \
+      --argjson dry_run "${PEER_DELIVER_DRY_RUN:-false}" \
+      --argjson inline "${PEER_DELIVER_INLINE:-false}" \
+      '{
+        peer: $peer,
+        status: $status,
+        queued: $queued,
+        submitted: $submitted,
+        dry_run: $dry_run,
+        inline: $inline
+      }
+      + (if $reason != "" then {reason: $reason} else {} end)
+      + (if $target != "" then {target: $target} else {} end)
+      + (if $nudge != "" then {nudge: $nudge} else {} end)
+      + (if $message_id != "" then {message_id: $message_id} else {} end)'
+}
+
+_peer_print_delivery_human() {
+    local result="$1" peer status queued reason
+    peer="$(jq -r '.peer' <<< "$result")"
+    status="$(jq -r '.status' <<< "$result")"
+    queued="$(jq -r '.queued' <<< "$result")"
+    reason="$(jq -r '.reason // empty' <<< "$result")"
+    case "$status" in
+        nudged) echo -e "${GREEN}Nudged $peer${RESET} (${queued} queued)" ;;
+        dry-run)
+            echo "$(jq -r '.nudge' <<< "$result")"
+            ;;
+        deferred) echo -e "${YELLOW}Deferred $peer${RESET}: $reason" ;;
+        skipped) echo -e "${DIM}Skipped $peer: $reason${RESET}" ;;
+        no_messages) echo -e "${DIM}No queued messages for $peer.${RESET}" ;;
+        inline) echo -e "${GREEN}Pasted inline message for $peer${RESET}" ;;
+        failed) echo -e "${RED}Failed $peer:${RESET} $reason" ;;
+        *) echo "$status $peer $reason" ;;
+    esac
+}
+
+_peer_deliver_one_locked() {
+    local peer_json="$1" messages="$2" dry_run="$3" json="$4" no_submit="$5" force_busy="$6" inline_id="$7"
+    local peer agent target queued now nudge buffer submit payload result message_body message_to updated recent
+    peer="$(jq -r '.name' <<< "$peer_json")"
+    agent="$(jq -r '.agent // empty' <<< "$peer_json")"
+    PEER_DELIVER_PEER="$peer"
+    PEER_DELIVER_TARGET=""
+    PEER_DELIVER_REASON=""
+    PEER_DELIVER_NUDGE=""
+    PEER_DELIVER_MESSAGE_ID="$inline_id"
+    PEER_DELIVER_DRY_RUN="$dry_run"
+    PEER_DELIVER_INLINE=false
+    PEER_DELIVER_SUBMITTED=false
+
+    if [[ -n "$inline_id" ]]; then
+        PEER_DELIVER_INLINE=true
+        message_to="$(jq -r --arg id "$inline_id" '[.[] | select(.id == $id)][0].to // empty' <<< "$messages")"
+        if [[ -z "$message_to" ]]; then
+            PEER_DELIVER_STATUS="failed"
+            PEER_DELIVER_REASON="unknown message: $inline_id"
+            PEER_DELIVER_QUEUED=0
+            _peer_delivery_result_json
+            return 1
+        fi
+        if [[ "$message_to" != "$peer" ]]; then
+            PEER_DELIVER_STATUS="failed"
+            PEER_DELIVER_REASON="message $inline_id is addressed to $message_to"
+            PEER_DELIVER_QUEUED=0
+            _peer_delivery_result_json
+            return 1
+        fi
+        _peer_message_body_from_json "$messages" "$inline_id"
+        message_body="$PEER_MESSAGE_BODY"
+        unset PEER_MESSAGE_BODY
+        queued="$(jq -r --arg peer "$peer" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
+        PEER_DELIVER_QUEUED="$queued"
+        payload="$message_body"
+        submit=false
+    else
+        queued="$(jq -r --arg peer "$peer" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
+        PEER_DELIVER_QUEUED="$queued"
+        if (( queued == 0 )); then
+            PEER_DELIVER_STATUS="no_messages"
+            _peer_delivery_result_json
+            return 0
+        fi
+        nudge="$(_peer_nudge_line "$peer" "$queued")"
+        PEER_DELIVER_NUDGE="$nudge"
+        payload="$nudge"
+        submit=true
+        [[ "$no_submit" == "true" ]] && submit=false
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        PEER_DELIVER_STATUS="dry-run"
+        PEER_DELIVER_SUBMITTED="$submit"
+        _peer_delivery_result_json
+        return 0
+    fi
+
+    if ! _peer_tmux_target_for_delivery "$peer_json"; then
+        if [[ "$PEER_DELIVER_STATUS" == "failed" ]]; then
+            now="$(_peer_now_utc)"
+            if [[ -n "$inline_id" ]]; then
+                updated="$(_peer_record_inline_json "$messages" "$inline_id" false "$PEER_DELIVER_REASON" "$now")"
+            else
+                updated="$(_peer_record_nudge_json "$messages" "$peer" false "$PEER_DELIVER_REASON" "$now" false)"
+            fi
+            _mailbox_rewrite_json_locked "$updated"
+            PEER_DELIVER_QUEUED="$queued"
+        fi
+        _peer_delivery_result_json
+        [[ "$PEER_DELIVER_STATUS" == "skipped" ]] && return 0
+        return 1
+    fi
+    target="$PEER_DELIVER_TARGET"
+
+    _peer_pane_ready_for_delivery "$target" "$agent" "$force_busy"
+    case "$?" in
+        1)
+            PEER_DELIVER_STATUS="deferred"
+            PEER_DELIVER_REASON="$PEER_DELIVER_READY_REASON"
+            _peer_delivery_result_json
+            return 0 ;;
+        2)
+            PEER_DELIVER_STATUS="failed"
+            PEER_DELIVER_REASON="$PEER_DELIVER_READY_REASON"
+            now="$(_peer_now_utc)"
+            if [[ -n "$inline_id" ]]; then
+                updated="$(_peer_record_inline_json "$messages" "$inline_id" false "$PEER_DELIVER_REASON" "$now")"
+            else
+                updated="$(_peer_record_nudge_json "$messages" "$peer" false "$PEER_DELIVER_REASON" "$now" false)"
+            fi
+            _mailbox_rewrite_json_locked "$updated"
+            _peer_delivery_result_json
+            return 1 ;;
+    esac
+
+    if [[ -z "$inline_id" ]]; then
+        recent="$(jq -r --arg peer "$peer" --arg now "$(_peer_now_utc)" '
+            [ .[] | select(.to == $peer and .status == "queued") ] as $queued
+            | if ($queued | length) == 0 then 0
+              elif all($queued[]; (.last_nudge_at // "") == $now) then 1
+              else 0
+              end
+        ' <<< "$messages")"
+        if (( recent > 0 )); then
+            PEER_DELIVER_STATUS="skipped"
+            PEER_DELIVER_REASON="recently nudged"
+            _peer_delivery_result_json
+            return 0
+        fi
+    fi
+
+    if [[ -n "$inline_id" ]]; then
+        buffer="cctrl-inline-${peer}-$(date +%s)"
+    else
+        buffer="cctrl-nudge-${peer}-$(date +%s)"
+    fi
+    if ! _peer_tmux_paste "$target" "$buffer" "$payload" "$submit"; then
+        PEER_DELIVER_STATUS="failed"
+        now="$(_peer_now_utc)"
+        if [[ -n "$inline_id" ]]; then
+            updated="$(_peer_record_inline_json "$messages" "$inline_id" false "$PEER_DELIVER_REASON" "$now")"
+        else
+            updated="$(_peer_record_nudge_json "$messages" "$peer" false "$PEER_DELIVER_REASON" "$now" true)"
+        fi
+        _mailbox_rewrite_json_locked "$updated"
+        _peer_delivery_result_json
+        return 1
+    fi
+
+    now="$(_peer_now_utc)"
+    if [[ -n "$inline_id" ]]; then
+        PEER_DELIVER_STATUS="inline"
+        updated="$(_peer_record_inline_json "$messages" "$inline_id" true "" "$now")"
+    else
+        PEER_DELIVER_STATUS="nudged"
+        updated="$(_peer_record_nudge_json "$messages" "$peer" true "" "$now" true)"
+        PEER_DELIVER_SUBMITTED="$submit"
+    fi
+    _mailbox_rewrite_json_locked "$updated"
+    _peer_delivery_result_json
+}
+
+_peer_cmd_deliver() {
+    local target="" all=false dry_run=false json=false no_submit=false force_busy=false inline_id="" a
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --all)
+                all=true; shift ;;
+            --dry-run)
+                dry_run=true; shift ;;
+            --json)
+                json=true; shift ;;
+            --no-submit)
+                no_submit=true; shift ;;
+            --force-busy)
+                force_busy=true; shift ;;
+            --inline)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--inline needs a message id" || echo -e "${RED}--inline needs a message id${RESET}" >&2; return 64; }
+                inline_id="$2"; shift 2 ;;
+            -*)
+                $json && _json_error "validation" "Unknown peer deliver flag: $1" || echo -e "${RED}Unknown peer deliver flag: $1${RESET}" >&2
+                return 64 ;;
+            *)
+                if [[ -n "$target" ]]; then
+                    $json && _json_error "validation" "Only one peer target is allowed" || echo -e "${RED}Only one peer target is allowed.${RESET}" >&2
+                    return 64
+                fi
+                target="$1"; shift ;;
+        esac
+    done
+    if $all && [[ -n "$target" ]]; then
+        $json && _json_error "validation" "Use either --all or a peer target, not both." || echo -e "${RED}Use either --all or a peer target, not both.${RESET}" >&2
+        return 64
+    fi
+    if $all && [[ -n "$inline_id" ]]; then
+        $json && _json_error "validation" "--inline cannot be combined with --all" || echo -e "${RED}--inline cannot be combined with --all.${RESET}" >&2
+        return 64
+    fi
+    if [[ -z "$target" && "$all" != "true" && -z "$inline_id" ]]; then
+        $json && _json_error "validation" "Usage: cctrl peer deliver <peer|--all> [--dry-run] [--json] [--no-submit] [--inline ID] [--force-busy]" || echo -e "${RED}Usage: cctrl peer deliver <peer|--all> [--dry-run] [--json] [--no-submit] [--inline ID] [--force-busy]${RESET}" >&2
+        return 64
+    fi
+
+    local messages peer_json results="[]" result rc=0 lock_rc=0 recipients inline_to json_ok=true
+    _mailbox_lock_acquire || return 1
+    if ! {
+        _mailbox_read_json_or_error "$json" || lock_rc=$?
+        if [[ $lock_rc -eq 0 ]]; then
+            messages="$MAILBOX_MESSAGES"
+            if [[ -n "$inline_id" && -z "$target" ]]; then
+                inline_to="$(jq -r --arg id "$inline_id" '[.[] | select(.id == $id)][0].to // empty' <<< "$messages")"
+                if [[ -z "$inline_to" ]]; then
+                    PEER_DELIVER_PEER=""
+                    PEER_DELIVER_STATUS="failed"
+                    PEER_DELIVER_REASON="unknown message: $inline_id"
+                    PEER_DELIVER_TARGET=""
+                    PEER_DELIVER_NUDGE=""
+                    PEER_DELIVER_MESSAGE_ID="$inline_id"
+                    PEER_DELIVER_QUEUED=0
+                    PEER_DELIVER_SUBMITTED=false
+                    PEER_DELIVER_DRY_RUN="$dry_run"
+                    PEER_DELIVER_INLINE=true
+                    result="$(_peer_delivery_result_json)"
+                    results="$(jq --argjson r "$result" '. + [$r]' <<< "$results")"
+                    rc=1
+                else
+                    target="$inline_to"
+                fi
+            fi
+            if [[ $rc -eq 0 ]]; then
+                if $all; then
+                    recipients="$(jq -r '[.[] | select(.status == "queued") | .to] | unique[]' <<< "$messages")"
+                    if [[ -z "$recipients" ]]; then
+                        results="[]"
+                    else
+                        while IFS= read -r target; do
+                            [[ -n "$target" ]] || continue
+                            if ! peer_json="$(_peer_resolve_json "$target" 2>/dev/null)"; then
+                                PEER_DELIVER_PEER="$target"
+                                PEER_DELIVER_STATUS="skipped"
+                                PEER_DELIVER_REASON="unknown-peer"
+                                PEER_DELIVER_TARGET=""
+                                PEER_DELIVER_NUDGE=""
+                                PEER_DELIVER_MESSAGE_ID=""
+                                PEER_DELIVER_QUEUED="$(jq -r --arg peer "$target" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
+                                PEER_DELIVER_SUBMITTED=false
+                                PEER_DELIVER_DRY_RUN="$dry_run"
+                                PEER_DELIVER_INLINE=false
+                                result="$(_peer_delivery_result_json)"
+                            else
+                                result="$(_peer_deliver_one_locked "$peer_json" "$messages" "$dry_run" "$json" "$no_submit" "$force_busy" "")" || rc=1
+                                messages="$(_mailbox_read_json)"
+                            fi
+                            results="$(jq --argjson r "$result" '. + [$r]' <<< "$results")"
+                        done <<< "$recipients"
+                    fi
+                elif [[ $rc -eq 0 ]]; then
+                    if ! peer_json="$(_peer_resolve_json "$target" 2>/dev/null)"; then
+                        $json && _json_error "unknown-peer" "Unknown peer: $target" || _mailbox_require_peer "peer" "$target" false
+                        rc=66
+                    else
+                        result="$(_peer_deliver_one_locked "$peer_json" "$messages" "$dry_run" "$json" "$no_submit" "$force_busy" "$inline_id")" || rc=1
+                        results="$(jq --argjson r "$result" '. + [$r]' <<< "$results")"
+                    fi
+                fi
+            fi
+        else
+            rc=$lock_rc
+        fi
+    }; then
+        rc=1
+    fi
+    _mailbox_lock_release
+    [[ $rc -eq 66 ]] && return 66
+    [[ $rc -eq 65 ]] && return 65
+    [[ $rc -ne 0 ]] && json_ok=false
+    if $json; then
+        jq -n --argjson ok "$json_ok" --argjson results "$results" '{ok:$ok,results:$results}'
+    else
+        jq -c '.[]' <<< "$results" | while IFS= read -r result; do
+            _peer_print_delivery_human "$result"
+        done
+    fi
+    return $rc
+}
+
 cmd_peer() {
     local action="${1:-ls}"
     shift 2>/dev/null || true
@@ -2310,6 +2828,7 @@ cmd_peer() {
         ack) _peer_cmd_ack "$@" ;;
         check) _peer_cmd_check "$@" ;;
         recv) _peer_cmd_recv "$@" ;;
+        deliver) _peer_cmd_deliver "$@" ;;
         help|-h|--help)
             echo -e "${BOLD}cctrl peer${RESET} — Addressable agent registry"
             echo "  cctrl peer ls [--json]"
@@ -2323,6 +2842,7 @@ cmd_peer() {
             echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"
             echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]"
             echo "  cctrl peer recv [--as NAME] [--status queued,delivered] [--json] [--exit-on-empty]"
+            echo "  cctrl peer deliver <peer|--all> [--dry-run] [--json] [--no-submit] [--inline ID] [--force-busy]"
             echo "  cctrl peer show <message-id> [--json]"
             echo "  cctrl peer ack <message-id> [--as NAME] [--json]"
             ;;
@@ -2837,6 +3357,7 @@ cmd_help() {
     echo "  cctrl peer send <to> -- <body>      Queue a mailbox message"
     echo "  cctrl peer inbox [--as NAME]        List queued/delivered messages for a peer"
     echo "  cctrl peer outbox [--as NAME]       List messages sent by a peer"
+    echo "  cctrl peer deliver <peer|--all>     Nudge tmux peers with queued messages"
     echo "  cctrl peer show <id> [--json]       Show a full message envelope"
     echo "  cctrl peer ack <id> [--as NAME]     Acknowledge a delivered message"
     echo ""
