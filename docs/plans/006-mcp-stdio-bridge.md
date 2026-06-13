@@ -1,7 +1,7 @@
 ---
 id: 006
 title: Add MCP stdio bridge for peer messaging
-status: pending
+status: in-progress
 blocked-by: [005]
 priority: 6
 goal: cctrl-agent-peer-messaging
