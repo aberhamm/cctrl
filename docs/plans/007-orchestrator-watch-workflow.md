@@ -1,7 +1,7 @@
 ---
 id: 007
 title: Add orchestrator watch workflow for peer messaging
-status: pending
+status: in-progress
 blocked-by: [004, 005, 006]
 priority: 7
 goal: cctrl-agent-peer-messaging
