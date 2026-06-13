@@ -1,7 +1,7 @@
 ---
 id: 005
 title: Add agent polling and JSON command surface
-status: pending
+status: in-progress
 blocked-by: [002, 003]
 priority: 4
 goal: cctrl-agent-peer-messaging
