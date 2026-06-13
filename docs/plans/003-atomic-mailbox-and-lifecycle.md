@@ -1,7 +1,7 @@
 ---
 id: 003
 title: Add atomic mailbox and message lifecycle
-status: pending
+status: in-progress
 blocked-by: [002]
 priority: 3
 goal: cctrl-agent-peer-messaging
