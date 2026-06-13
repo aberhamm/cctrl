@@ -174,7 +174,7 @@ test_syntax() {
     bash -n "$ROOT/hooks/statusline.sh"
     bash -n "$ROOT/install.sh"
     zsh -n "$ROOT/completions/_cctrl"
-    python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
+    python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/lib/peer_mcp.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
 }
 
 test_launch_args() {
@@ -595,8 +595,9 @@ mark_message_delivered() {
 test_peer_mailbox_send_list_show() {
     local data="$TMPDIR/mailbox-send-data"
     setup_mailbox_peers "$data"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet halley >/dev/null
 
-    local out id inbox outbox shown
+    local out id alias_id inbox outbox shown
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --subject "Check" --json -- "Please check XYZ")"
     assert_contains "$out" '"status": "queued"'
     assert_contains "$out" '"body": "Please check XYZ"'
@@ -616,6 +617,13 @@ test_peer_mailbox_send_list_show() {
     assert_contains "$shown" '"subject": "Check"'
     assert_contains "$shown" '"nudge_count": 0'
     assert_contains "$shown" '"last_nudge_error": null'
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send halley --from orchestrator --json -- "via alias")"
+    printf '%s\n' "$out" | jq -e '.to == "comet"' >/dev/null || fail "expected peer send to canonicalize recipient aliases"
+    alias_id="$(printf '%s\n' "$out" | jq -r '.id')"
+    inbox="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer inbox --as comet --json)"
+    assert_contains "$inbox" "$alias_id"
+    assert_contains "$inbox" '"body": "via alias"'
 }
 
 test_peer_mailbox_ack_authorization_and_states() {
@@ -802,6 +810,63 @@ test_peer_polling_identity_and_errors() {
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json 2>&1)" || rc=$?
     [[ "$rc" -eq 65 ]] || fail "expected corrupt mailbox recv to exit 65, got $rc"
     assert_contains "$out" '"code": "mailbox-corrupt"'
+}
+
+test_peer_mcp_bridge_stdio() {
+    local data="$TMPDIR/mcp-bridge-data"
+    setup_mailbox_peers "$data"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet halley >/dev/null
+
+    local out rc send_req recv_req show_req bad_req extra_req alias_req message_id shown
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp 2>&1 </dev/null)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected peer mcp without identity to exit 66, got $rc"
+    assert_contains "$out" "needs --as <peer> or CCTRL_PEER"
+
+    out="$(
+        {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+            printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+        } | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as comet
+    )"
+    printf '%s\n' "$out" | jq -s -e '
+      length == 2
+      and .[0].id == 1
+      and .[1].id == 2
+      and ([.[1].result.tools[].name] | sort) == (["ack_message","check_messages","list_peers","recv_message","resolve_peer","send_message","show_message","whoami"] | sort)
+    ' >/dev/null || fail "expected MCP tools/list to advertise peer messaging tools"
+
+    send_req="$(jq -cn --arg to comet --arg subject "MCP" --arg body $'hello from mcp\n' '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:$to,subject:$subject,body:$body}}}')"
+    out="$(printf '%s\n' "$send_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.from == "orchestrator" and .result.structuredContent.data.to == "comet" and .result.structuredContent.data.body == "hello from mcp\n"' >/dev/null || fail "expected MCP send_message to queue body from server identity"
+    message_id="$(printf '%s\n' "$out" | jq -r '.result.structuredContent.data.id')"
+
+    show_req="$(jq -cn --arg id "$message_id" '{jsonrpc:"2.0",id:8,method:"tools/call",params:{name:"show_message",arguments:{id:$id}}}')"
+    out="$(printf '%s\n' "$show_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as comet)"
+    printf '%s\n' "$out" | jq -e --arg id "$message_id" '.result.structuredContent.ok == true and .result.structuredContent.data.id == $id' >/dev/null || fail "expected MCP show_message to allow addressed peer"
+    out="$(printf '%s\n' "$show_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as wrong-peer)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.error.code == "forbidden"' >/dev/null || fail "expected MCP show_message to reject unrelated peer"
+
+    recv_req="$(jq -cn '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"recv_message",arguments:{}}}')"
+    out="$(printf '%s\n' "$recv_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as comet)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.empty == false and .result.structuredContent.data.message.body == "hello from mcp\n" and .result.structuredContent.data.message.status == "delivered"' >/dev/null || fail "expected MCP recv_message to deliver queued message"
+    shown="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$message_id" --json)"
+    printf '%s\n' "$shown" | jq -e '.status == "delivered" and .acked_at == null' >/dev/null || fail "expected MCP recv side effect to match CLI delivered state"
+
+    bad_req="$(jq -cn '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"send_message",arguments:{to:"comet",from:"wrong",body:"bad"}}}')"
+    out="$(printf '%s\n' "$bad_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.ok == false and .result.structuredContent.error.code == "validation"' >/dev/null || fail "expected MCP tools to reject from/as arguments"
+
+    extra_req="$(jq -cn '{jsonrpc:"2.0",id:6,method:"tools/call",params:{name:"whoami",arguments:{unexpected:"value"}}}')"
+    out="$(printf '%s\n' "$extra_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.ok == false and .result.structuredContent.error.message == "Unexpected argument: unexpected"' >/dev/null || fail "expected MCP tools to reject unexpected arguments"
+
+    alias_req="$(jq -cn --arg to halley --arg body "via alias" '{jsonrpc:"2.0",id:7,method:"tools/call",params:{name:"send_message",arguments:{to:$to,body:$body}}}')"
+    out="$(printf '%s\n' "$alias_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.to == "comet"' >/dev/null || fail "expected MCP send_message to canonicalize recipient aliases through CLI"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json)"
+    printf '%s\n' "$out" | jq -e '.queued == 1 and .delivered_unacked == 1' >/dev/null || fail "expected alias-addressed MCP message to be visible to canonical peer"
 }
 
 test_peer_deliver_tmux_nudge_lifecycle() {
@@ -1083,6 +1148,7 @@ test_peer_mailbox_unknowns_and_identity
 test_peer_mailbox_concurrency_and_stale_lock
 test_peer_polling_json_contracts
 test_peer_polling_identity_and_errors
+test_peer_mcp_bridge_stdio
 test_peer_deliver_tmux_nudge_lifecycle
 test_peer_deliver_busy_no_submit_and_inline
 test_peer_deliver_failures_all_and_concurrency

@@ -1,13 +1,16 @@
 ---
 id: 006
 title: Add MCP stdio bridge for peer messaging
-status: in-progress
+status: done
 blocked-by: [005]
 priority: 6
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-08
+completed: 2026-06-13
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -115,3 +118,29 @@ Checks:
 | Eng Review | `/plan-eng-review` | MCP protocol boundary and dependency strategy need review before implementation | 1 | CLEAR | 0 issues; Codex hardening: real-client manual smoke check (claude + codex registration) |
 
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Added a stdlib JSON-RPC stdio MCP bridge for peer messaging, exposed through
+`cctrl peer mcp`, with startup identity binding via `--as` or `CCTRL_PEER`.
+The bridge shells out to existing `cctrl peer ... --json` commands for mailbox
+operations, returns structured MCP tool results, rejects tool-level identity
+arguments, scopes `show_message` to messages visible to the bound peer, and
+uses canonical peer names for mailbox send recipients so aliases do not strand
+messages.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `lib/peer_mcp.py` (created)
+- `tests/run-tests.sh` (modified)
+- `README.md` (modified)
+- `completions/_cctrl` (modified)
+- `docs/plans/006-mcp-stdio-bridge.md` (modified)
+
+**Verification:**
+
+- `PLAN_ID=006 bash /Users/matthew/dev/projects/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
+- `codex review --uncommitted` -> 2 P2 findings, both fixed
+
+**Commit:** `PENDING` — `feat(peer): add MCP stdio bridge`

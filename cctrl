@@ -1931,7 +1931,7 @@ _peer_cmd_send() {
         fi
     fi
 
-    local unknown_peer=false
+    local unknown_peer=false to_peer_json="" from_peer_json=""
     if ! _mailbox_validate_label "recipient" "$to" false >/dev/null 2>&1; then
         $json && _json_error "validation" "Invalid recipient: $to" || _mailbox_validate_label "recipient" "$to" false
         return 64
@@ -1941,17 +1941,32 @@ _peer_cmd_send() {
         return 64
     fi
     if ! $allow_unknown; then
-        if ! _mailbox_peer_known "$to" false; then
+        if ! to_peer_json="$(_peer_resolve_json "$to" 2>/dev/null)"; then
             $json && _json_error "unknown-peer" "Unknown recipient: $to" || _mailbox_require_peer "recipient" "$to" false
             return 66
         fi
-        if ! _mailbox_peer_known "$from" true; then
+        to="$(jq -r '.name' <<< "$to_peer_json")"
+        if [[ "$from" == "user" ]]; then
+            :
+        elif ! from_peer_json="$(_peer_resolve_json "$from" 2>/dev/null)"; then
             $json && _json_error "unknown-peer" "Unknown sender: $from" || _mailbox_require_peer "sender" "$from" true
             return 66
+        else
+            from="$(jq -r '.name' <<< "$from_peer_json")"
         fi
     else
-        if ! _mailbox_peer_known "$to" false || ! _mailbox_peer_known "$from" true; then
+        to_peer_json="$(_peer_resolve_json "$to" 2>/dev/null || true)"
+        if [[ "$from" == "user" ]]; then
+            from_peer_json=""
+        else
+            from_peer_json="$(_peer_resolve_json "$from" 2>/dev/null || true)"
+        fi
+        if [[ -z "$to_peer_json" || ( "$from" != "user" && -z "$from_peer_json" ) ]]; then
             unknown_peer=true
+        fi
+        [[ -n "$to_peer_json" ]] && to="$(jq -r '.name' <<< "$to_peer_json")"
+        if [[ "$from" != "user" && -n "$from_peer_json" ]]; then
+            from="$(jq -r '.name' <<< "$from_peer_json")"
         fi
     fi
 
@@ -2811,6 +2826,33 @@ _peer_cmd_deliver() {
     return $rc
 }
 
+_peer_cmd_mcp() {
+    local as_identity="" identity peer_json
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 64; }
+                as_identity="$2"; shift 2 ;;
+            *)
+                echo -e "${RED}Unknown peer mcp flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+
+    identity="$as_identity"
+    [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    if [[ -z "$identity" ]]; then
+        echo "cctrl peer mcp needs --as <peer> or CCTRL_PEER" >&2
+        return 66
+    fi
+    if ! peer_json="$(_peer_resolve_json "$identity" 2>/dev/null)"; then
+        echo "cctrl peer mcp could not resolve peer identity: $identity" >&2
+        return 66
+    fi
+    identity="$(jq -r '.name' <<< "$peer_json")"
+    exec python3 "$SCRIPT_DIR/lib/peer_mcp.py" --as "$identity" --cctrl "$SCRIPT_DIR/cctrl"
+}
+
 cmd_peer() {
     local action="${1:-ls}"
     shift 2>/dev/null || true
@@ -2829,6 +2871,7 @@ cmd_peer() {
         check) _peer_cmd_check "$@" ;;
         recv) _peer_cmd_recv "$@" ;;
         deliver) _peer_cmd_deliver "$@" ;;
+        mcp) _peer_cmd_mcp "$@" ;;
         help|-h|--help)
             echo -e "${BOLD}cctrl peer${RESET} — Addressable agent registry"
             echo "  cctrl peer ls [--json]"
@@ -2843,6 +2886,7 @@ cmd_peer() {
             echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]"
             echo "  cctrl peer recv [--as NAME] [--status queued,delivered] [--json] [--exit-on-empty]"
             echo "  cctrl peer deliver <peer|--all> [--dry-run] [--json] [--no-submit] [--inline ID] [--force-busy]"
+            echo "  cctrl peer mcp [--as NAME]"
             echo "  cctrl peer show <message-id> [--json]"
             echo "  cctrl peer ack <message-id> [--as NAME] [--json]"
             ;;
@@ -3358,6 +3402,7 @@ cmd_help() {
     echo "  cctrl peer inbox [--as NAME]        List queued/delivered messages for a peer"
     echo "  cctrl peer outbox [--as NAME]       List messages sent by a peer"
     echo "  cctrl peer deliver <peer|--all>     Nudge tmux peers with queued messages"
+    echo "  cctrl peer mcp [--as NAME]          Run stdio MCP tools for one peer identity"
     echo "  cctrl peer show <id> [--json]       Show a full message envelope"
     echo "  cctrl peer ack <id> [--as NAME]     Acknowledge a delivered message"
     echo ""

@@ -333,6 +333,79 @@ Polling exit codes:
 | 65 | Corrupted mailbox JSONL |
 | 66 | Unknown peer or unresolved identity |
 
+### Peer MCP Bridge
+
+Tool-calling agents can use the same mailbox through a stdio MCP server:
+
+```bash
+cctrl peer mcp --as comet
+CCTRL_PEER=comet cctrl peer mcp
+```
+
+Each server is bound to one peer identity at startup. Tools do not accept
+`as` or `from` arguments; `send_message` always sends from the configured
+identity, and `recv_message`/`ack_message` always operate as that identity.
+
+Exposed tools:
+
+```text
+whoami
+list_peers
+resolve_peer
+send_message
+check_messages
+recv_message
+show_message
+ack_message
+```
+
+Codex global config in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.cctrl-peer-comet]
+command = "/path/to/cctrl"
+args = ["peer", "mcp"]
+env = { CCTRL_PEER = "comet" }
+```
+
+Claude Code project config in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "cctrl-peer-comet": {
+      "command": "/path/to/cctrl",
+      "args": ["peer", "mcp"],
+      "env": {
+        "CCTRL_PEER": "comet"
+      }
+    }
+  }
+}
+```
+
+For a user-scoped Claude Code server:
+
+```bash
+claude mcp add -s user cctrl-peer-comet -- /path/to/cctrl peer mcp
+```
+
+Then add the peer identity env var to that server entry in `~/.claude.json`:
+
+```json
+{
+  "mcpServers": {
+    "cctrl-peer-comet": {
+      "command": "/path/to/cctrl",
+      "args": ["peer", "mcp"],
+      "env": {
+        "CCTRL_PEER": "comet"
+      }
+    }
+  }
+}
+```
+
 ## Remote Hosts
 
 Run any cctrl command on a named host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.

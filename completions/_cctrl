@@ -274,6 +274,7 @@ _cctrl() {
                     'check:Check unread mailbox counts'
                     'recv:Receive the next mailbox message'
                     'deliver:Nudge tmux peers with queued messages'
+                    'mcp:Run stdio MCP peer messaging server'
                     'show:Show a mailbox message'
                     'ack:Acknowledge a delivered message'
                     'help:Show peer help'
@@ -369,6 +370,9 @@ _cctrl() {
                                 '--inline[Paste a full message body without submitting]:message:_cctrl_message_ids' \
                                 '--force-busy[Paste even when readiness cannot be proven]'
                         fi
+                        ;;
+                    mcp)
+                        _arguments '--as[Peer identity]:peer:_cctrl_peers'
                         ;;
                     show)
                         if (( CURRENT == 4 )); then
