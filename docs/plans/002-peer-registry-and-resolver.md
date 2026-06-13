@@ -151,4 +151,4 @@ Implemented the `cctrl peer` namespace with a machine-local manual registry, liv
 - `README.md` (modified)
 - `docs/plans/002-peer-registry-and-resolver.md` (modified)
 
-**Commit:** `88bd9f7` — `feat(peer): add agent registry and resolver`
+**Commit:** `8d16495` — `feat(peer): add agent registry and resolver`
