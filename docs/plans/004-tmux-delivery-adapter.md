@@ -144,4 +144,4 @@ interpolating text through `send-keys`.
 - `README.md` (modified)
 - `completions/_cctrl` (modified)
 
-**Commit:** `PENDING` — `feat(peer): add tmux nudge delivery`
+**Commit:** `64aacc3` — `feat(peer): add tmux nudge delivery`
