@@ -132,4 +132,4 @@ doctor` with doorbell presence, executable, and registration checks.
 - `PLAN_ID=008 bash /Users/matthew/dev/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
 - `codex exec` review pass -> no findings
 
-**Commit:** PENDING
+**Commit:** `0039d61` — `feat(peer): add idle hook doorbell`
