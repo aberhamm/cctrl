@@ -130,4 +130,4 @@ semantics.
 - `README.md` (modified)
 - `completions/_cctrl` (modified)
 
-**Commit:** `PENDING` — `feat(peer): add polling JSON surface`
+**Commit:** `60a3db0` — `feat(peer): add polling JSON surface`
