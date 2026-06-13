@@ -155,4 +155,4 @@ Implemented durable peer mailbox storage in `${CCTRL_DATA_DIR}/messages.jsonl` w
 - `README.md` (modified)
 - `docs/plans/003-atomic-mailbox-and-lifecycle.md` (modified)
 
-**Commit:** `PENDING` — `PENDING`
+**Commit:** `1aa77f3` — `feat(peer): add atomic mailbox lifecycle`
