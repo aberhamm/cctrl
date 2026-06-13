@@ -1,7 +1,7 @@
 ---
 id: 004
 title: Add tmux nudge adapter for peer messages
-status: pending
+status: in-progress
 blocked-by: [002, 003, 005]
 priority: 5
 goal: cctrl-agent-peer-messaging
