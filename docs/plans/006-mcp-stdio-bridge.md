@@ -143,4 +143,4 @@ messages.
 - `PLAN_ID=006 bash /Users/matthew/dev/projects/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
 - `codex review --uncommitted` -> 2 P2 findings, both fixed
 
-**Commit:** `PENDING` — `feat(peer): add MCP stdio bridge`
+**Commit:** `21460c9` — `feat(peer): add MCP stdio bridge`
