@@ -1,7 +1,7 @@
 ---
 id: 008
 title: Add idle-hook doorbell for peer messages
-status: pending
+status: in-progress
 blocked-by: [004, 005]
 priority: 8
 goal: cctrl-agent-peer-messaging
