@@ -216,6 +216,38 @@ cctrl @add cctrl ~/projects/cctrl --agent codex
 cctrl @rm myapp
 ```
 
+### Peers
+
+Peers are named coding agents that other cctrl workflows can address. The peer
+registry combines manual entries from `data/peers.json` with live cctrl-managed
+tmux sessions derived from `cctrl session ls --json`.
+
+```bash
+cctrl peer register comet --dir /Users/matthew/_projects/comet-automation --agent codex
+cctrl peer register reviewer --agent codex --capability polling
+cctrl peer alias comet comet-agent
+
+cctrl peer ls
+cctrl peer ls --json
+cctrl peer resolve comet-agent --json
+cctrl peer whoami --as comet --json
+CCTRL_PEER=comet cctrl peer whoami --json
+cctrl peer unregister comet
+```
+
+Manual peers can carry `--host`, `--dir`, `--agent`, `--session`,
+`--purpose`, and repeated `--capability` metadata. Live tmux peers are derived
+at read time and include `mailbox` and `tmux` capabilities plus a computed
+`tmux_target`; pane targets are not stored because they go stale. If a manual
+peer has the same name as a live session, the manual entry wins and `peer ls
+--json` marks it with `shadows`.
+
+Peer names and aliases may contain letters, numbers, dots, underscores, and
+dashes. Whitespace, shell metacharacters, and the reserved name `user` are
+rejected. Peer state is machine-local. Tests and isolated workflows can set
+`CCTRL_DATA_DIR` to move only peer-messaging runtime files; existing shortcuts,
+hosts, profiles, and cost data keep using their normal cctrl paths.
+
 ## Remote Hosts
 
 Run any cctrl command on a named host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.

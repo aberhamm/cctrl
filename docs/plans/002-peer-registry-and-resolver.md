@@ -1,13 +1,16 @@
 ---
 id: 002
 title: Add peer registry and resolver for addressable agents
-status: in-progress
+status: done
 blocked-by: []
 priority: 2
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-08
+completed: 2026-06-13
+reviewed: false
+qa: automated,verified
 ---
 
 ## Requirements
@@ -135,3 +138,17 @@ Checks:
 
 - **CODEX:** combined outside-voice pass over plans 002–008; 16 findings triaged, 4 hardening changes applied across the backlog.
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Implemented the `cctrl peer` namespace with a machine-local manual registry, live cctrl-managed tmux peer derivation, normalized resolver output, manual-over-derived shadowing, ambient identity resolution via `--as`/`CCTRL_PEER`, and peer name/alias validation. Added `CCTRL_DATA_DIR` scoping for peer runtime files only, zsh completions, README documentation, and unit coverage for manual peers, derived peers, alias resolution, shadowing, collision rejection, missing tmux discovery, validation errors, and `CCTRL_PEER`.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `completions/_cctrl` (modified)
+- `README.md` (modified)
+- `docs/plans/002-peer-registry-and-resolver.md` (modified)
+
+**Commit:** `88bd9f7` — `feat(peer): add agent registry and resolver`

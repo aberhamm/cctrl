@@ -58,6 +58,14 @@ _cctrl_hosts() {
     (( ${#names} )) && compadd "$@" -- "${names[@]}"
 }
 
+_cctrl_peers() {
+    local file="$(_cctrl_dir)/data/peers.json"
+    [[ -f "$file" ]] || return
+    local -a names
+    names=("${(@f)$(jq -r 'to_entries[] | .key, ((.value.aliases // [])[])' "$file" 2>/dev/null)}")
+    (( ${#names} )) && compadd "$@" -- "${names[@]}"
+}
+
 _cctrl_agents() {
     compadd "$@" -- claude codex
 }
@@ -83,6 +91,7 @@ _cctrl() {
         's:Launch selected agent (foreground, or -d for a detached session)'
         'session:Manage detached sessions (ls/attach/close/kill)'
         'close:Gracefully close a tmux session (default: the one you are inside)'
+        'peer:Manage addressable agent peers'
         'host:Manage remote hosts'
         'whoami:Show this machine and which host aliases mean local'
         'costs:Token usage and cost breakdown'
@@ -238,6 +247,61 @@ _cctrl() {
                 '--now[Kill immediately, no grace period]' \
                 '--force[Allow closing non-cctrl sessions]' \
                 '*:session:_cctrl_tmux_sessions'
+            ;;
+        peer)
+            if (( CURRENT == 3 )); then
+                local -a peer_cmds=(
+                    'ls:List peers'
+                    'list:List peers'
+                    'resolve:Resolve a peer'
+                    'register:Register a manual peer'
+                    'add:Register a manual peer'
+                    'alias:Add an alias to a manual peer'
+                    'unregister:Remove a manual peer'
+                    'rm:Remove a manual peer'
+                    'whoami:Resolve peer identity'
+                    'help:Show peer help'
+                )
+                _describe "peer commands" peer_cmds
+            elif (( CURRENT >= 4 )); then
+                local peercmd="${words[3]}"
+                case "$peercmd" in
+                    ls|list)
+                        _arguments '--json[Machine-readable output]'
+                        ;;
+                    resolve)
+                        if (( CURRENT == 4 )); then
+                            _cctrl_peers
+                        else
+                            _arguments '--json[Machine-readable output]'
+                        fi
+                        ;;
+                    register|add)
+                        if (( CURRENT == 4 )); then
+                            return
+                        fi
+                        _arguments \
+                            '--alias[Peer alias]:alias:' \
+                            '--host[Host label]:host:_cctrl_hosts' \
+                            '--dir[Working directory]:directory:_directories' \
+                            '--agent[Agent metadata]:agent:' \
+                            '--session[Tmux session name]:session:_cctrl_tmux_sessions' \
+                            '--purpose[Peer purpose]:purpose:' \
+                            '--capability[Capability label]:capability:'
+                        ;;
+                    alias)
+                        (( CURRENT == 4 )) && _cctrl_peers
+                        ;;
+                    unregister|rm|remove|delete)
+                        (( CURRENT == 4 )) && _cctrl_peers
+                        ;;
+                    whoami|identity)
+                        _arguments \
+                            '--as[Peer identity]:peer:_cctrl_peers' \
+                            '--json[Machine-readable output]'
+                        ;;
+                esac
+            fi
             ;;
         shortcuts)
             if (( CURRENT == 3 )); then

@@ -13,6 +13,8 @@ SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
 HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
+PEER_DATA_DIR="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}"
+PEERS_FILE="$PEER_DATA_DIR/peers.json"
 SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
 
 CLAUDE_DIR="$HOME/.claude"
@@ -1179,6 +1181,475 @@ _prompt_attach_session() {
     esac
 }
 
+# ── Peer registry ─────────────────────────────────────────────────────
+
+_peer_init() {
+    mkdir -p "$(dirname "$PEERS_FILE")"
+    [[ -f "$PEERS_FILE" ]] || echo "{}" > "$PEERS_FILE"
+}
+
+_peer_now_utc() {
+    date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+_peer_validate_label() {
+    local kind="$1" value="${2:-}"
+    if [[ -z "$value" ]]; then
+        echo -e "${RED}Peer $kind cannot be empty.${RESET}" >&2
+        return 1
+    fi
+    if [[ "$value" == "user" ]]; then
+        echo -e "${RED}Invalid peer $kind: 'user' is reserved for the human sender.${RESET}" >&2
+        return 1
+    fi
+    if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        echo -e "${RED}Invalid peer $kind: '$value'.${RESET}" >&2
+        echo -e "${DIM}Use letters, numbers, dot, underscore, or dash; no whitespace or shell metacharacters.${RESET}" >&2
+        return 1
+    fi
+}
+
+_peer_json_array() {
+    if [[ $# -eq 0 ]]; then
+        printf '[]\n'
+        return
+    fi
+    printf '%s\n' "$@" | jq -R . | jq -s 'unique'
+}
+
+_peer_lookup_manual_key() {
+    local name="$1"
+    _peer_init
+    jq -r --arg n "$name" '
+        ([to_entries[]
+          | select(.key == $n or ((.value.aliases // []) | index($n)))
+          | .key][0]) // empty
+    ' "$PEERS_FILE" 2>/dev/null
+}
+
+_peer_manual_collision_owner() {
+    local label="$1" owner="${2:-}" found
+    found="$(_peer_lookup_manual_key "$label")"
+    if [[ -n "$found" && "$found" != "$owner" ]]; then
+        printf '%s\n' "$found"
+        return 0
+    fi
+    return 1
+}
+
+_peer_derived_name_exists() {
+    local label="$1" doc
+    doc="$(_peer_derived_json)" || return 1
+    jq -e --arg n "$label" '.peers[]? | select(.name == $n)' <<< "$doc" >/dev/null 2>&1
+}
+
+_peer_derived_json() {
+    local host_label="${CCTRL_HOST_PREFIX:-local}" sessions_json
+    if ! command -v tmux >/dev/null 2>&1; then
+        jq -n '{skipped:true, reason:"tmux unavailable", peers:[]}'
+        return
+    fi
+
+    if ! sessions_json="$(_session_list --json 2>/dev/null)"; then
+        jq -n '{skipped:true, reason:"tmux session discovery failed", peers:[]}'
+        return
+    fi
+    if ! printf '%s\n' "$sessions_json" | jq empty >/dev/null 2>&1; then
+        jq -n '{skipped:true, reason:"tmux session discovery returned invalid JSON", peers:[]}'
+        return
+    fi
+
+    jq -n --argjson sessions "$sessions_json" --arg host "$host_label" '
+        {
+          skipped: false,
+          reason: null,
+          peers: [
+            $sessions[]
+            | select(.managed == true)
+            | {
+                name: .name,
+                aliases: [],
+                host: $host,
+                dir: .dir,
+                agent: .agent,
+                session: .name,
+                purpose: .purpose,
+                capabilities: ["mailbox", "tmux"],
+                source: "derived",
+                tmux_target: .name,
+                created_at: .created_at
+              }
+            | with_entries(select(.value != null))
+          ]
+        }'
+}
+
+_peer_all_json() {
+    _peer_init
+    local manual_json derived_json
+    manual_json="$(cat "$PEERS_FILE")"
+    derived_json="$(_peer_derived_json)"
+    jq -n --argjson manual "$manual_json" --argjson derived "$derived_json" '
+        def clean: with_entries(select(.value != null));
+        def with_tmux_target:
+          if ((.session // "") != "") then . + {tmux_target: .session} else . end;
+
+        ($derived.peers // []) as $derived_peers
+        | ($manual | to_entries | map(
+            .key as $k
+            | .value as $v
+            | ([ $derived_peers[] | select(.name == $k) | (.session // .name) ][0] // "") as $shadow
+            | ({
+                name: ($v.name // $k),
+                aliases: ($v.aliases // []),
+                host: ($v.host // "local"),
+                dir: ($v.dir // null),
+                agent: ($v.agent // null),
+                session: ($v.session // null),
+                purpose: ($v.purpose // null),
+                capabilities: ($v.capabilities // []),
+                registered_at: ($v.registered_at // null),
+                source: "manual"
+              }
+              | with_tmux_target
+              | if $shadow != "" then . + {shadows: $shadow} else . end
+              | clean)
+          )) as $manual_peers
+        | ($manual_peers | map(.name)) as $manual_names
+        | {
+            derived_skipped: ($derived.skipped // false),
+            derived_skip_reason: ($derived.reason // null),
+            peers: (
+              $manual_peers
+              + [ $derived_peers[] | . as $p | select(($manual_names | index($p.name)) | not) ]
+            )
+          }'
+}
+
+_peer_resolve_json() {
+    local name="$1" doc matches count skipped reason
+    doc="$(_peer_all_json)" || return 1
+    matches="$(jq -c --arg n "$name" '
+        [ .peers[]
+          | select(.name == $n or ((.aliases // []) | index($n)))
+        ]
+    ' <<< "$doc")"
+    count="$(jq -r 'length' <<< "$matches")"
+    if [[ "$count" == "0" ]]; then
+        skipped="$(jq -r '.derived_skipped' <<< "$doc")"
+        reason="$(jq -r '.derived_skip_reason // empty' <<< "$doc")"
+        echo -e "${RED}Unknown peer: '$name'${RESET}" >&2
+        if [[ "$skipped" == "true" && -n "$reason" ]]; then
+            echo -e "${YELLOW}Derived tmux peer discovery skipped: $reason.${RESET}" >&2
+        fi
+        echo -e "${DIM}Register it with: cctrl peer register $name --dir <path> --agent <agent>${RESET}" >&2
+        return 1
+    fi
+    if (( count > 1 )); then
+        echo -e "${RED}Ambiguous peer identity: '$name'${RESET}" >&2
+        jq -r '.[] | "  - " + .name + " (" + .source + ")"' <<< "$matches" >&2
+        return 1
+    fi
+    jq '.[0]' <<< "$matches"
+}
+
+_peer_print_human() {
+    jq -r '
+        def value:
+          if type == "array" then join(", ")
+          else tostring
+          end;
+        to_entries[]
+        | select(.value != null)
+        | "  \(.key): \(.value | value)"
+    '
+}
+
+_peer_cmd_register() {
+    local name="${1:-}"
+    [[ -n "$name" ]] || { echo -e "${RED}Usage: cctrl peer register <name> [flags]${RESET}" >&2; return 1; }
+    shift
+    _peer_validate_label "name" "$name" || return 1
+
+    local host="local" dir="" agent="" session="" purpose=""
+    local -a aliases=() capabilities=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --alias)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--alias needs a value${RESET}" >&2; return 1; }
+                _peer_validate_label "alias" "$2" || return 1
+                aliases+=("$2"); shift 2 ;;
+            --host)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--host needs a value${RESET}" >&2; return 1; }
+                host="$2"; shift 2 ;;
+            --dir)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--dir needs a value${RESET}" >&2; return 1; }
+                dir="${2/#\~/$HOME}"; shift 2 ;;
+            --agent)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}" >&2; return 1; }
+                [[ -n "$2" ]] || { echo -e "${RED}--agent cannot be empty${RESET}" >&2; return 1; }
+                agent="$2"; shift 2 ;;
+            --session)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--session needs a value${RESET}" >&2; return 1; }
+                session="$2"; shift 2 ;;
+            --purpose)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--purpose needs a value${RESET}" >&2; return 1; }
+                purpose="$2"; shift 2 ;;
+            --capability)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--capability needs a value${RESET}" >&2; return 1; }
+                _peer_validate_label "capability" "$2" || return 1
+                capabilities+=("$2"); shift 2 ;;
+            *)
+                echo -e "${RED}Unknown peer register flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+
+    _peer_init
+    local existing owner alias
+    existing="$(_peer_lookup_manual_key "$name")"
+    if [[ -n "$existing" && "$existing" != "$name" ]]; then
+        echo -e "${RED}Peer name '$name' collides with alias on '$existing'.${RESET}" >&2
+        return 1
+    fi
+    if [[ ${#aliases[@]} -gt 0 ]]; then
+        for alias in "${aliases[@]}"; do
+            if [[ "$alias" == "$name" ]]; then
+                echo -e "${RED}Alias '$alias' matches the peer name.${RESET}" >&2
+                return 1
+            fi
+            if owner="$(_peer_manual_collision_owner "$alias" "$name")"; then
+                echo -e "${RED}Peer alias '$alias' collides with '$owner'.${RESET}" >&2
+                return 1
+            fi
+            if _peer_derived_name_exists "$alias"; then
+                echo -e "${RED}Peer alias '$alias' collides with a live tmux peer.${RESET}" >&2
+                return 1
+            fi
+        done
+    fi
+
+    local aliases_json capabilities_json now tmp
+    if [[ ${#capabilities[@]} -eq 0 ]]; then
+        if [[ -n "$session" ]]; then
+            capabilities=("mailbox" "tmux")
+        else
+            capabilities=("mailbox")
+        fi
+    else
+        local has_mailbox=false capability
+        for capability in "${capabilities[@]}"; do
+            [[ "$capability" == "mailbox" ]] && has_mailbox=true
+        done
+        $has_mailbox || capabilities=("mailbox" "${capabilities[@]}")
+    fi
+    if [[ ${#aliases[@]} -gt 0 ]]; then
+        aliases_json="$(_peer_json_array "${aliases[@]}")"
+    else
+        aliases_json="[]"
+    fi
+    capabilities_json="$(_peer_json_array "${capabilities[@]}")"
+    now="$(_peer_now_utc)"
+    tmp="$(mktemp)"
+    jq --arg name "$name" \
+       --arg host "$host" \
+       --arg dir "$dir" \
+       --arg agent "$agent" \
+       --arg session "$session" \
+       --arg purpose "$purpose" \
+       --arg now "$now" \
+       --argjson aliases "$aliases_json" \
+       --argjson capabilities "$capabilities_json" '
+        . + {
+          ($name): (
+            {
+              name: $name,
+              aliases: $aliases,
+              host: $host,
+              capabilities: $capabilities,
+              registered_at: (.[$name].registered_at // $now)
+            }
+            + (if $dir != "" then {dir: $dir} else {} end)
+            + (if $agent != "" then {agent: $agent} else {} end)
+            + (if $session != "" then {session: $session} else {} end)
+            + (if $purpose != "" then {purpose: $purpose} else {} end)
+          )
+        }' "$PEERS_FILE" > "$tmp" && mv "$tmp" "$PEERS_FILE"
+
+    echo -e "${GREEN}Registered peer: ${BOLD}$name${RESET}"
+}
+
+_peer_cmd_alias() {
+    local name="${1:-}" alias="${2:-}" key owner doc derived_count tmp
+    if [[ -z "$name" || -z "$alias" ]]; then
+        echo -e "${RED}Usage: cctrl peer alias <name> <alias>${RESET}" >&2
+        return 1
+    fi
+    _peer_validate_label "alias" "$alias" || return 1
+    key="$(_peer_lookup_manual_key "$name")"
+    if [[ -z "$key" ]]; then
+        doc="$(_peer_all_json)" || return 1
+        derived_count="$(jq -r --arg n "$name" '[.peers[] | select(.source == "derived" and .name == $n)] | length' <<< "$doc")"
+        if (( derived_count > 0 )); then
+            echo -e "${RED}Peer '$name' is derived from tmux; register this peer first before adding aliases.${RESET}" >&2
+        else
+            echo -e "${RED}Unknown manual peer: '$name'${RESET}" >&2
+        fi
+        return 1
+    fi
+    if [[ "$alias" == "$key" ]]; then
+        echo -e "${RED}Alias '$alias' matches the peer name.${RESET}" >&2
+        return 1
+    fi
+    if owner="$(_peer_manual_collision_owner "$alias" "$key")"; then
+        echo -e "${RED}Peer alias '$alias' collides with '$owner'.${RESET}" >&2
+        return 1
+    fi
+    if _peer_derived_name_exists "$alias"; then
+        echo -e "${RED}Peer alias '$alias' collides with a live tmux peer.${RESET}" >&2
+        return 1
+    fi
+
+    tmp="$(mktemp)"
+    jq --arg key "$key" --arg alias "$alias" '
+        .[$key].aliases = ((.[$key].aliases // []) + [$alias] | unique)
+    ' "$PEERS_FILE" > "$tmp" && mv "$tmp" "$PEERS_FILE"
+    echo -e "${GREEN}Added alias: ${BOLD}$alias${RESET}${GREEN} → $key${RESET}"
+}
+
+_peer_cmd_unregister() {
+    local name="${1:-}" key tmp
+    [[ -n "$name" ]] || { echo -e "${RED}Usage: cctrl peer unregister <name>${RESET}" >&2; return 1; }
+    key="$(_peer_lookup_manual_key "$name")"
+    if [[ -z "$key" ]]; then
+        echo -e "${RED}No manual peer registered as '$name'.${RESET}" >&2
+        return 1
+    fi
+    tmp="$(mktemp)"
+    jq --arg key "$key" 'del(.[$key])' "$PEERS_FILE" > "$tmp" && mv "$tmp" "$PEERS_FILE"
+    echo -e "${GREEN}Unregistered peer: $key${RESET}"
+}
+
+_peer_cmd_ls() {
+    local json=false a doc
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            *)
+                echo -e "${RED}Unknown peer ls flag: $a${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    doc="$(_peer_all_json)" || return 1
+    if $json; then
+        jq '.' <<< "$doc"
+        return
+    fi
+    if [[ "$(jq -r '.derived_skipped' <<< "$doc")" == "true" ]]; then
+        echo -e "${YELLOW}Derived tmux peer discovery skipped: $(jq -r '.derived_skip_reason' <<< "$doc").${RESET}" >&2
+    fi
+    if [[ "$(jq -r '.peers | length' <<< "$doc")" == "0" ]]; then
+        echo -e "${DIM}No peers registered or discovered.${RESET}"
+        return
+    fi
+    echo -e "${BOLD}Peers${RESET}"
+    jq -r '
+        .peers[]
+        | [
+            .name,
+            .source,
+            (.agent // "-"),
+            (.dir // "-"),
+            ((.capabilities // []) | join(",")),
+            (.purpose // ""),
+            (.shadows // "")
+          ]
+        | @tsv
+    ' <<< "$doc" | while IFS=$'\t' read -r name source agent dir capabilities purpose shadows; do
+        local shadow_text=""
+        [[ -n "$shadows" ]] && shadow_text=" ${DIM}shadows=$shadows${RESET}"
+        printf '  %b%-18s%b %-8s %-7s %-32s %-15s %s\n' "$GREEN" "$name" "$RESET" "$source" "$agent" "$dir" "$capabilities" "$purpose$shadow_text"
+    done
+}
+
+_peer_cmd_resolve() {
+    local target="${1:-}" json=false peer_json a
+    [[ -n "$target" ]] || { echo -e "${RED}Usage: cctrl peer resolve <name-or-alias> [--json]${RESET}" >&2; return 1; }
+    shift
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            *)
+                echo -e "${RED}Unknown peer resolve flag: $a${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    peer_json="$(_peer_resolve_json "$target")" || return 1
+    if $json; then
+        jq '.' <<< "$peer_json"
+        return
+    fi
+    if [[ "$(jq -r '.shadows // empty' <<< "$peer_json")" != "" ]]; then
+        echo -e "${YELLOW}Manual peer shadows live tmux session: $(jq -r '.shadows' <<< "$peer_json").${RESET}" >&2
+    fi
+    jq '.' <<< "$peer_json" | _peer_print_human
+}
+
+_peer_cmd_whoami() {
+    local json=false identity="" a peer_json
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 1; }
+                identity="$2"; shift 2 ;;
+            --json)
+                json=true; shift ;;
+            *)
+                echo -e "${RED}Unknown peer whoami flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    if [[ -z "$identity" ]]; then
+        echo -e "${RED}No peer identity provided.${RESET}" >&2
+        echo -e "${DIM}Use: cctrl peer whoami --as <peer>  or set CCTRL_PEER.${RESET}" >&2
+        return 1
+    fi
+    peer_json="$(_peer_resolve_json "$identity")" || return 1
+    if $json; then
+        jq '.' <<< "$peer_json"
+    else
+        echo -e "${BOLD}Peer Identity${RESET}"
+        jq '.' <<< "$peer_json" | _peer_print_human
+    fi
+}
+
+cmd_peer() {
+    local action="${1:-ls}"
+    shift 2>/dev/null || true
+    case "$action" in
+        ls|list) _peer_cmd_ls "$@" ;;
+        resolve) _peer_cmd_resolve "$@" ;;
+        register|add) _peer_cmd_register "$@" ;;
+        alias) _peer_cmd_alias "$@" ;;
+        unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
+        whoami|identity) _peer_cmd_whoami "$@" ;;
+        help|-h|--help)
+            echo -e "${BOLD}cctrl peer${RESET} — Addressable agent registry"
+            echo "  cctrl peer ls [--json]"
+            echo "  cctrl peer resolve <name-or-alias> [--json]"
+            echo "  cctrl peer register <name> [--alias NAME] [--host HOST] [--dir DIR] [--agent AGENT] [--session SESSION] [--purpose TEXT] [--capability NAME]"
+            echo "  cctrl peer alias <name> <alias>"
+            echo "  cctrl peer unregister <name>"
+            echo "  cctrl peer whoami [--as NAME] [--json]"
+            ;;
+        *)
+            echo -e "${RED}Unknown peer command: $action${RESET}" >&2
+            echo -e "${DIM}Run 'cctrl peer help' for usage.${RESET}" >&2
+            return 1 ;;
+    esac
+}
+
 # ── Detached session management ───────────────────────────────────────
 
 cmd_session() {
@@ -1672,6 +2143,14 @@ cmd_help() {
     echo "                              no name = the session you're inside, killed after"
     echo "                              a short grace period (--in N, --now, --force)"
     echo "  cctrl session kill <name>   Kill a detached session immediately"
+    echo ""
+    echo -e "${BOLD}Peers${RESET}"
+    echo "  cctrl peer ls [--json]              List registered and live cctrl-managed peers"
+    echo "  cctrl peer resolve <name> [--json]  Resolve a peer name or alias"
+    echo "  cctrl peer register <name> [flags]  Register a manual peer"
+    echo "  cctrl peer alias <name> <alias>     Add an alias to a manual peer"
+    echo "  cctrl peer unregister <name>        Remove a manual peer"
+    echo "  cctrl peer whoami [--as NAME]       Resolve identity from --as or CCTRL_PEER"
     echo ""
     echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
     echo "  cctrl @<name>           Jump: cd to dir, switch profile, start tmux-backed agent"
@@ -3041,6 +3520,7 @@ _dispatch() {
             fi
             cmd_shortcut "$name" "$@"
             ;;
+        peer) cmd_peer "$@" ;;
         shortcuts) cmd_shortcut "$@" ;;
         host) cmd_host "$@" ;;
         whoami) cmd_whoami "$@" ;;

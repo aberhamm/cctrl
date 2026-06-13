@@ -8,7 +8,8 @@ trap 'rm -rf "$TMPDIR"' EXIT
 
 # Tests may be run from inside a cctrl tmux session; don't let its context
 # leak in (CCTRL_TMUX_CONTEXT flips `cctrl start` into foreground mode).
-unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX
+unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER
+unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
 
 fail() {
     echo "FAIL: $*" >&2
@@ -138,7 +139,12 @@ SH
 }
 
 test_syntax() {
-    bash -n "$ROOT/cctrl" "$ROOT/completions/_cctrl" "$ROOT/hooks/notify.sh" "$ROOT/hooks/statusline.sh" "$ROOT/install.sh"
+    bash -n "$ROOT/cctrl"
+    bash -n "$ROOT/tests/run-tests.sh"
+    bash -n "$ROOT/hooks/notify.sh"
+    bash -n "$ROOT/hooks/statusline.sh"
+    bash -n "$ROOT/install.sh"
+    zsh -n "$ROOT/completions/_cctrl"
     python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
 }
 
@@ -406,6 +412,129 @@ JSON
     assert_contains "$out" '"created_at": "2026-06-11T10:00:00Z"'
 }
 
+test_peer_registry_manual_alias_and_identity() {
+    local data="$TMPDIR/peer-manual-data"
+    local project="$TMPDIR/comet-automation"
+    mkdir -p "$project"
+
+    local out
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet \
+        --dir "$project" --agent codex --purpose "PiKVM automation work" \
+        --capability polling)"
+    assert_contains "$out" "Registered peer"
+    assert_contains "$(cat "$data/peers.json")" '"comet"'
+    assert_contains "$(cat "$data/peers.json")" '"dir": "'"$project"'"'
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet comet-agent)"
+    assert_contains "$out" "Added alias"
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    assert_contains "$out" '"name": "comet"'
+    assert_contains "$out" '"purpose": "PiKVM automation work"'
+    assert_contains "$out" '"polling"'
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve comet-agent --json)"
+    assert_contains "$out" '"name": "comet"'
+    assert_contains "$out" '"source": "manual"'
+
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_PEER=comet "$ROOT/cctrl" peer whoami --json)"
+    assert_contains "$out" '"name": "comet"'
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer unregister comet)"
+    assert_contains "$out" "Unregistered peer"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    assert_not_contains "$out" '"name": "comet"'
+}
+
+test_peer_derived_tmux_and_shadowing() {
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local data="$TMPDIR/peer-derived-data"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"review stale session cleanup","created_at":"2026-06-11T10:00:00Z"}
+JSON
+
+    local out
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    assert_contains "$out" '"name": "demo"'
+    assert_contains "$out" '"source": "derived"'
+    assert_contains "$out" '"session": "demo"'
+    assert_contains "$out" '"tmux_target": "demo"'
+    assert_contains "$out" '"purpose": "review stale session cleanup"'
+
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve demo --json)"
+    assert_contains "$out" '"capabilities": ['
+    assert_contains "$out" '"tmux"'
+
+    local rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --alias demo 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected alias collision with derived peer to fail"
+    assert_contains "$out" "collides with a live tmux peer"
+
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register demo --dir /manual/demo --agent other)"
+    assert_contains "$out" "Registered peer"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    assert_contains "$out" '"name": "demo"'
+    assert_contains "$out" '"source": "manual"'
+    assert_contains "$out" '"shadows": "demo"'
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve demo --json)"
+    assert_contains "$out" '"dir": "/manual/demo"'
+    assert_contains "$out" '"source": "manual"'
+}
+
+test_peer_validation_and_errors() {
+    local data="$TMPDIR/peer-validation-data"
+    local out rc
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register bad/name 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected invalid peer name to fail"
+    assert_contains "$out" "Invalid peer name"
+    assert_contains "$out" "no whitespace or shell metacharacters"
+
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet comet-agent >/dev/null
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register other --alias comet-agent 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected alias collision to fail"
+    assert_contains "$out" "collides"
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve missing --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected missing peer resolve to fail"
+    assert_contains "$out" "Unknown peer"
+}
+
+test_peer_alias_derived_requires_manual_registration() {
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local data="$TMPDIR/peer-derived-alias-data"
+    local out rc=0
+
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias demo demo-agent 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected derived-only alias to fail"
+    assert_contains "$out" "register this peer first"
+}
+
+test_peer_tmux_missing_still_resolves_manual() {
+    local data="$TMPDIR/peer-no-tmux-data"
+
+    local out
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register offline --agent codex --capability polling)"
+    assert_contains "$out" "Registered peer"
+
+    out="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    assert_contains "$out" '"derived_skipped": true'
+    assert_contains "$out" '"derived_skip_reason": "tmux unavailable"'
+    assert_contains "$out" '"name": "offline"'
+
+    out="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve offline --json)"
+    assert_contains "$out" '"name": "offline"'
+    assert_contains "$out" '"polling"'
+}
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"
@@ -558,6 +687,11 @@ test_attach_prompt_after_start
 test_codex_statusline_tui_config
 test_context_names
 test_session_list_codex_default_model
+test_peer_registry_manual_alias_and_identity
+test_peer_derived_tmux_and_shadowing
+test_peer_validation_and_errors
+test_peer_alias_derived_requires_manual_registration
+test_peer_tmux_missing_still_resolves_manual
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
