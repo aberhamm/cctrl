@@ -1,7 +1,7 @@
 ---
 id: 002
 title: Add peer registry and resolver for addressable agents
-status: pending
+status: in-progress
 blocked-by: []
 priority: 2
 goal: cctrl-agent-peer-messaging
