@@ -15,6 +15,7 @@ HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
 PEER_DATA_DIR="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}"
 PEERS_FILE="$PEER_DATA_DIR/peers.json"
+MESSAGES_FILE="$PEER_DATA_DIR/messages.jsonl"
 SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
 
 CLAUDE_DIR="$HOME/.claude"
@@ -1624,6 +1625,423 @@ _peer_cmd_whoami() {
     fi
 }
 
+_mailbox_init() {
+    mkdir -p "$(dirname "$MESSAGES_FILE")"
+    [[ -f "$MESSAGES_FILE" ]] || : > "$MESSAGES_FILE"
+}
+
+_mailbox_lock_path() {
+    printf '%s.lock' "$MESSAGES_FILE"
+}
+
+_pid_alive() {
+    local pid="${1:-}"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+_mailbox_lock_acquire() {
+    mkdir -p "$(dirname "$MESSAGES_FILE")"
+    local lock_path start now timeout pid
+    lock_path="$(_mailbox_lock_path)"
+    timeout="${CCTRL_MAILBOX_LOCK_TIMEOUT:-10}"
+    start="$(date +%s)"
+
+    if command -v shlock >/dev/null 2>&1 && [[ "${CCTRL_MAILBOX_LOCK_KIND:-auto}" != "dir" ]]; then
+        while ! shlock -p "$$" -f "$lock_path" 2>/dev/null; do
+            now="$(date +%s)"
+            if (( now - start >= timeout )); then
+                echo -e "${RED}Timed out waiting for mailbox lock.${RESET}" >&2
+                return 1
+            fi
+            sleep 0.1
+        done
+        MAILBOX_LOCK_HELD="$lock_path"
+        MAILBOX_LOCK_KIND="file"
+        return 0
+    fi
+
+    while ! mkdir "$lock_path" 2>/dev/null; do
+        if [[ -f "$lock_path/pid" ]]; then
+            pid="$(cat "$lock_path/pid" 2>/dev/null || true)"
+            if ! _pid_alive "$pid"; then
+                rm -rf "$lock_path" 2>/dev/null || true
+                continue
+            fi
+        else
+            rm -rf "$lock_path" 2>/dev/null || true
+            continue
+        fi
+        now="$(date +%s)"
+        if (( now - start >= timeout )); then
+            echo -e "${RED}Timed out waiting for mailbox lock held by PID ${pid:-unknown}.${RESET}" >&2
+            return 1
+        fi
+        sleep 0.1
+    done
+    printf '%s\n' "$$" > "$lock_path/pid"
+    date -u +"%Y-%m-%dT%H:%M:%SZ" > "$lock_path/created_at" 2>/dev/null || true
+    MAILBOX_LOCK_HELD="$lock_path"
+    MAILBOX_LOCK_KIND="dir"
+}
+
+_mailbox_lock_release() {
+    local lock_path="${MAILBOX_LOCK_HELD:-}"
+    [[ -n "$lock_path" ]] || return 0
+    case "${MAILBOX_LOCK_KIND:-}" in
+        file) rm -f "$lock_path" ;;
+        dir) rm -rf "$lock_path" ;;
+    esac
+    unset MAILBOX_LOCK_HELD MAILBOX_LOCK_KIND
+}
+
+_mailbox_read_json() {
+    _mailbox_init
+    if [[ ! -s "$MESSAGES_FILE" ]]; then
+        printf '[]\n'
+        return
+    fi
+    jq -s '.' "$MESSAGES_FILE"
+}
+
+_mailbox_rewrite_json_locked() {
+    local messages_json="$1" tmp
+    tmp="$(mktemp)"
+    jq -c '.[]' <<< "$messages_json" > "$tmp" && mv "$tmp" "$MESSAGES_FILE"
+}
+
+_mailbox_generate_id_locked() {
+    local stamp rand id
+    while true; do
+        stamp="$(date -u +"%Y%m%d_%H%M%S")"
+        rand="$(od -An -N3 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+        [[ -n "$rand" ]] || rand="$(printf '%06x' "$((RANDOM % 16777216))")"
+        id="msg_${stamp}_${rand}"
+        if ! jq -e --arg id "$id" 'select(.id == $id)' "$MESSAGES_FILE" >/dev/null 2>&1; then
+            printf '%s\n' "$id"
+            return
+        fi
+    done
+}
+
+_mailbox_validate_label() {
+    local kind="$1" value="${2:-}" allow_user="${3:-false}"
+    if [[ "$allow_user" == "true" && "$value" == "user" ]]; then
+        return 0
+    fi
+    _peer_validate_label "$kind" "$value"
+}
+
+_mailbox_peer_known() {
+    local name="$1" allow_user="${2:-false}"
+    [[ "$allow_user" == "true" && "$name" == "user" ]] && return 0
+    _peer_resolve_json "$name" >/dev/null 2>&1
+}
+
+_mailbox_require_peer() {
+    local role="$1" name="$2" allow_user="${3:-false}"
+    _mailbox_validate_label "$role" "$name" "$allow_user" || return 1
+    if ! _mailbox_peer_known "$name" "$allow_user"; then
+        echo -e "${RED}Unknown $role: '$name'${RESET}" >&2
+        echo -e "${DIM}Register it first, or use --allow-unknown for peer send.${RESET}" >&2
+        return 1
+    fi
+}
+
+_mailbox_resolve_identity() {
+    local explicit="$1" env_identity="${CCTRL_PEER:-}" identity
+    identity="$explicit"
+    [[ -n "$identity" ]] || identity="$env_identity"
+    if [[ -z "$identity" ]]; then
+        echo -e "${RED}No peer identity provided.${RESET}" >&2
+        echo -e "${DIM}Use --as <peer> or set CCTRL_PEER.${RESET}" >&2
+        return 1
+    fi
+    _mailbox_require_peer "peer" "$identity" false || return 1
+    _peer_resolve_json "$identity" | jq -r '.name'
+}
+
+_mailbox_status_filter_json() {
+    local status_csv="${1:-}" default_csv="${2:-}" effective status
+    effective="$status_csv"
+    [[ -n "$effective" ]] || effective="$default_csv"
+    if [[ -z "$effective" ]]; then
+        printf '[]\n'
+        return
+    fi
+    printf '%s\n' "$effective" | tr ',' '\n' | while IFS= read -r status; do
+        status="${status//[[:space:]]/}"
+        [[ -n "$status" ]] && printf '%s\n' "$status"
+    done | jq -R . | jq -s 'unique'
+}
+
+_mailbox_print_messages_human() {
+    jq -r '
+        .[]
+        | "\(.id)  \(.status)  \(.from) -> \(.to)  \(.subject // "")"
+    '
+}
+
+_peer_cmd_send() {
+    local to="${1:-}"
+    [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--allow-unknown] [--json] -- <body>${RESET}" >&2; return 1; }
+    shift
+
+    local from="" as_identity="" subject="" body="" json=false allow_unknown=false saw_body=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--from needs a value${RESET}" >&2; return 1; }
+                from="$2"; shift 2 ;;
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 1; }
+                as_identity="$2"; shift 2 ;;
+            --subject)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--subject needs a value${RESET}" >&2; return 1; }
+                subject="$2"; shift 2 ;;
+            --allow-unknown)
+                allow_unknown=true; shift ;;
+            --json)
+                json=true; shift ;;
+            --)
+                shift
+                body="$*"
+                saw_body=true
+                break ;;
+            *)
+                echo -e "${RED}Unknown peer send flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    if ! $saw_body || [[ -z "$body" ]]; then
+        echo -e "${RED}peer send needs a body after --.${RESET}" >&2
+        return 1
+    fi
+
+    if [[ -z "$from" ]]; then
+        if [[ -n "$as_identity" || -n "${CCTRL_PEER:-}" ]]; then
+            from="$(_mailbox_resolve_identity "$as_identity")" || return 1
+        elif $json; then
+            echo -e "${RED}No sender identity for JSON send.${RESET}" >&2
+            echo -e "${DIM}Use --from NAME, --as NAME, CCTRL_PEER, or --allow-unknown.${RESET}" >&2
+            return 1
+        elif [[ -t 0 && -t 1 ]]; then
+            from="user"
+        else
+            echo -e "${RED}No sender identity provided.${RESET}" >&2
+            echo -e "${DIM}Use --from NAME, --as NAME, or CCTRL_PEER.${RESET}" >&2
+            return 1
+        fi
+    fi
+
+    local unknown_peer=false
+    _mailbox_validate_label "recipient" "$to" false || return 1
+    _mailbox_validate_label "sender" "$from" true || return 1
+    if ! $allow_unknown; then
+        _mailbox_require_peer "recipient" "$to" false || return 1
+        _mailbox_require_peer "sender" "$from" true || return 1
+    else
+        if ! _mailbox_peer_known "$to" false || ! _mailbox_peer_known "$from" true; then
+            unknown_peer=true
+        fi
+    fi
+
+    _mailbox_lock_acquire || return 1
+    local now id message rc=0
+    if ! {
+        _mailbox_init
+        now="$(_peer_now_utc)"
+        id="$(_mailbox_generate_id_locked)"
+        message="$(jq -cn \
+            --arg id "$id" \
+            --arg from "$from" \
+            --arg to "$to" \
+            --arg subject "$subject" \
+            --arg body "$body" \
+            --arg now "$now" \
+            --argjson unknown "$unknown_peer" \
+            '{
+              id: $id,
+              from: $from,
+              to: $to,
+              status: "queued",
+              subject: $subject,
+              body: $body,
+              created_at: $now,
+              updated_at: $now,
+              delivered_at: null,
+              acked_at: null,
+              nudge_count: 0,
+              last_nudge_at: null,
+              last_nudge_error: null,
+              history: [{at: $now, status: "queued", by: $from}]
+            } + (if $unknown then {unknown_peer: true} else {} end)')"
+        printf '%s\n' "$message" >> "$MESSAGES_FILE"
+    }; then
+        rc=1
+    fi
+    _mailbox_lock_release
+    [[ $rc -eq 0 ]] || return $rc
+
+    if $json; then
+        jq '.' <<< "$message"
+    else
+        echo -e "${GREEN}Queued message: ${BOLD}$id${RESET}"
+    fi
+}
+
+_peer_cmd_inbox() {
+    local as_identity="" status_csv="" json=false a identity messages statuses
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 1; }
+                as_identity="$2"; shift 2 ;;
+            --status)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--status needs a value${RESET}" >&2; return 1; }
+                status_csv="$2"; shift 2 ;;
+            --json)
+                json=true; shift ;;
+            *)
+                echo -e "${RED}Unknown peer inbox flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    identity="$(_mailbox_resolve_identity "$as_identity")" || return 1
+    messages="$(_mailbox_read_json)" || return 1
+    statuses="$(_mailbox_status_filter_json "$status_csv" "queued,delivered")"
+    messages="$(jq --arg who "$identity" --argjson statuses "$statuses" '
+        [ .[] | .status as $status | select(.to == $who and ($statuses | index($status))) ]
+    ' <<< "$messages")"
+    if $json; then
+        jq '.' <<< "$messages"
+    else
+        jq '.' <<< "$messages" | _mailbox_print_messages_human
+    fi
+}
+
+_peer_cmd_outbox() {
+    local as_identity="" status_csv="" json=false identity messages statuses
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 1; }
+                as_identity="$2"; shift 2 ;;
+            --status)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--status needs a value${RESET}" >&2; return 1; }
+                status_csv="$2"; shift 2 ;;
+            --json)
+                json=true; shift ;;
+            *)
+                echo -e "${RED}Unknown peer outbox flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    identity="$(_mailbox_resolve_identity "$as_identity")" || return 1
+    messages="$(_mailbox_read_json)" || return 1
+    statuses="$(_mailbox_status_filter_json "$status_csv" "")"
+    messages="$(jq --arg who "$identity" --argjson statuses "$statuses" '
+        [ .[] | .status as $status | select(.from == $who and (($statuses | length) == 0 or ($statuses | index($status)))) ]
+    ' <<< "$messages")"
+    if $json; then
+        jq '.' <<< "$messages"
+    else
+        jq '.' <<< "$messages" | _mailbox_print_messages_human
+    fi
+}
+
+_peer_cmd_show() {
+    local id="${1:-}" json=false message
+    [[ -n "$id" ]] || { echo -e "${RED}Usage: cctrl peer show <message-id> [--json]${RESET}" >&2; return 1; }
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            *)
+                echo -e "${RED}Unknown peer show flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    message="$(jq --arg id "$id" '[.[] | select(.id == $id)][0] // empty' <<< "$(_mailbox_read_json)")"
+    if [[ -z "$message" ]]; then
+        echo -e "${RED}Unknown message: '$id'${RESET}" >&2
+        return 1
+    fi
+    if $json; then
+        jq '.' <<< "$message"
+    else
+        jq '.' <<< "$message" | _peer_print_human
+    fi
+}
+
+_peer_cmd_ack() {
+    local id="${1:-}" as_identity="" identity messages result updated now rc=0
+    [[ -n "$id" ]] || { echo -e "${RED}Usage: cctrl peer ack <message-id> [--as NAME]${RESET}" >&2; return 1; }
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 1; }
+                as_identity="$2"; shift 2 ;;
+            *)
+                echo -e "${RED}Unknown peer ack flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    identity="$(_mailbox_resolve_identity "$as_identity")" || return 1
+
+    _mailbox_lock_acquire || return 1
+    if ! {
+        _mailbox_init
+        messages="$(_mailbox_read_json)"
+        result="$(jq -r --arg id "$id" --arg who "$identity" '
+            ([.[] | select(.id == $id)][0]) as $m
+            | if $m == null then "missing"
+              elif $m.to != $who then "forbidden"
+              elif $m.status == "acked" then "noop"
+              elif $m.status == "queued" then "queued"
+              elif $m.status == "delivered" then "ack"
+              else "invalid:" + ($m.status // "unknown")
+              end
+        ' <<< "$messages")"
+        case "$result" in
+            missing)
+                echo -e "${RED}Unknown message: '$id'${RESET}" >&2
+                rc=1 ;;
+            forbidden)
+                echo -e "${RED}Message '$id' is not addressed to '$identity'.${RESET}" >&2
+                rc=1 ;;
+            queued)
+                echo -e "${RED}Message '$id' is still queued; receive it first (cctrl peer recv).${RESET}" >&2
+                rc=1 ;;
+            invalid:*)
+                echo -e "${RED}Message '$id' cannot be acked from status '${result#invalid:}'.${RESET}" >&2
+                rc=1 ;;
+            noop)
+                rc=0 ;;
+            ack)
+                now="$(_peer_now_utc)"
+                updated="$(jq --arg id "$id" --arg who "$identity" --arg now "$now" '
+                    map(
+                      if .id == $id then
+                        .status = "acked"
+                        | .updated_at = $now
+                        | .acked_at = $now
+                        | .history = ((.history // []) + [{at: $now, status: "acked", by: $who}])
+                      else . end
+                    )
+                ' <<< "$messages")"
+                _mailbox_rewrite_json_locked "$updated"
+                rc=0 ;;
+        esac
+    }; then
+        rc=1
+    fi
+    _mailbox_lock_release
+    [[ $rc -eq 0 ]] || return $rc
+    echo -e "${GREEN}Acked message: $id${RESET}"
+}
+
 cmd_peer() {
     local action="${1:-ls}"
     shift 2>/dev/null || true
@@ -1634,6 +2052,11 @@ cmd_peer() {
         alias) _peer_cmd_alias "$@" ;;
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
+        send) _peer_cmd_send "$@" ;;
+        inbox) _peer_cmd_inbox "$@" ;;
+        outbox) _peer_cmd_outbox "$@" ;;
+        show) _peer_cmd_show "$@" ;;
+        ack) _peer_cmd_ack "$@" ;;
         help|-h|--help)
             echo -e "${BOLD}cctrl peer${RESET} — Addressable agent registry"
             echo "  cctrl peer ls [--json]"
@@ -1642,6 +2065,11 @@ cmd_peer() {
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer whoami [--as NAME] [--json]"
+            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--allow-unknown] [--json] -- <body>"
+            echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"
+            echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"
+            echo "  cctrl peer show <message-id> [--json]"
+            echo "  cctrl peer ack <message-id> [--as NAME]"
             ;;
         *)
             echo -e "${RED}Unknown peer command: $action${RESET}" >&2
@@ -2151,6 +2579,11 @@ cmd_help() {
     echo "  cctrl peer alias <name> <alias>     Add an alias to a manual peer"
     echo "  cctrl peer unregister <name>        Remove a manual peer"
     echo "  cctrl peer whoami [--as NAME]       Resolve identity from --as or CCTRL_PEER"
+    echo "  cctrl peer send <to> -- <body>      Queue a mailbox message"
+    echo "  cctrl peer inbox [--as NAME]        List queued/delivered messages for a peer"
+    echo "  cctrl peer outbox [--as NAME]       List messages sent by a peer"
+    echo "  cctrl peer show <id> [--json]       Show a full message envelope"
+    echo "  cctrl peer ack <id> [--as NAME]     Acknowledge a delivered message"
     echo ""
     echo -e "${BOLD}Shortcuts${RESET} ${DIM}(case-insensitive)${RESET}"
     echo "  cctrl @<name>           Jump: cd to dir, switch profile, start tmux-backed agent"

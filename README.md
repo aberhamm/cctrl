@@ -248,6 +248,27 @@ rejected. Peer state is machine-local. Tests and isolated workflows can set
 `CCTRL_DATA_DIR` to move only peer-messaging runtime files; existing shortcuts,
 hosts, profiles, and cost data keep using their normal cctrl paths.
 
+Mailbox messages are stored as JSON Lines in `data/messages.jsonl` under the
+same peer data root. The lifecycle is intentionally small:
+`queued -> delivered -> acked`. Sending creates `queued` messages; later receive
+commands mark messages `delivered`; `ack` only succeeds for delivered messages
+addressed to the acking peer.
+
+```bash
+cctrl peer send comet --from orchestrator --subject "Check" -- "Please check XYZ"
+cctrl peer inbox --as comet --json          # queued + delivered messages for comet
+cctrl peer outbox --as orchestrator --json  # messages sent by orchestrator
+cctrl peer show msg_20260608_070000_abc123 --json
+cctrl peer ack msg_20260608_070000_abc123 --as comet
+```
+
+Senders and recipients must resolve to known peers unless `peer send` is given
+`--allow-unknown`, which marks the message with `unknown_peer: true`. `--from`
+can be omitted when `--as` or `CCTRL_PEER` identifies the sender; JSON sends
+without an identity fail instead of silently defaulting. Mailbox writes use an
+exclusive lock and atomic rewrites for state transitions; stale fallback lock
+directories record their holder PID and are reclaimed automatically.
+
 ## Remote Hosts
 
 Run any cctrl command on a named host over SSH. The `--host` flag transparently forwards the command — no manual SSH required.

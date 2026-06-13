@@ -1,13 +1,16 @@
 ---
 id: 003
 title: Add atomic mailbox and message lifecycle
-status: in-progress
+status: done
 blocked-by: [002]
 priority: 3
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-08
+completed: 2026-06-13
+reviewed: false
+qa: automated,verified
 ---
 
 ## Requirements
@@ -139,3 +142,17 @@ Checks:
 | Eng Review | `/plan-eng-review` | Message state and locking are shared foundations for every delivery path | 1 | CLEAR | 0 issues; lifecycle, locking, and ID generation validated against codebase idioms |
 
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Implemented durable peer mailbox storage in `${CCTRL_DATA_DIR}/messages.jsonl` with exclusive mailbox locking, stale fallback lock reclamation, collision-resistant message IDs, queued/delivered/acked lifecycle metadata, and atomic JSONL rewrites for state changes. Added `peer send`, `inbox`, `outbox`, `show`, and `ack`, including unknown-peer handling via `--allow-unknown`, sender identity fallback through `--as`/`CCTRL_PEER`, authorization checks for ack, and no-op success for already-acked messages. Updated README, help text, zsh completions, and tests covering send/list/show, ack validation, unknown peers, JSON identity failure, concurrent send/ack operations, and stale lock recovery.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `completions/_cctrl` (modified)
+- `README.md` (modified)
+- `docs/plans/003-atomic-mailbox-and-lifecycle.md` (modified)
+
+**Commit:** `PENDING` — `PENDING`

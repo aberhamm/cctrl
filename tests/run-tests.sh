@@ -535,6 +535,149 @@ test_peer_tmux_missing_still_resolves_manual() {
     assert_contains "$out" '"polling"'
 }
 
+setup_mailbox_peers() {
+    local data="$1"
+    mkdir -p "$TMPDIR/comet" "$TMPDIR/orchestrator" "$TMPDIR/wrong-peer"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent codex >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orchestrator --dir "$TMPDIR/orchestrator" --agent codex >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register wrong-peer --dir "$TMPDIR/wrong-peer" --agent codex >/dev/null
+}
+
+mark_message_delivered() {
+    local file="$1" id="$2"
+    jq -c --arg id "$id" '
+        if .id == $id then
+            .status = "delivered"
+            | .updated_at = "2026-06-13T00:00:00Z"
+            | .delivered_at = "2026-06-13T00:00:00Z"
+            | .history = ((.history // []) + [{at:"2026-06-13T00:00:00Z", status:"delivered", by:"comet"}])
+        else . end
+    ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
+test_peer_mailbox_send_list_show() {
+    local data="$TMPDIR/mailbox-send-data"
+    setup_mailbox_peers "$data"
+
+    local out id inbox outbox shown
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --subject "Check" --json -- "Please check XYZ")"
+    assert_contains "$out" '"status": "queued"'
+    assert_contains "$out" '"body": "Please check XYZ"'
+    id="$(printf '%s\n' "$out" | jq -r '.id')"
+    [[ "$id" == msg_* ]] || fail "expected stable msg_ id, got $id"
+    assert_contains "$(cat "$data/messages.jsonl")" '"status":"queued"'
+
+    inbox="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer inbox --as comet --json)"
+    assert_contains "$inbox" '"to": "comet"'
+    assert_contains "$inbox" '"status": "queued"'
+
+    outbox="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer outbox --as orchestrator --json)"
+    assert_contains "$outbox" '"from": "orchestrator"'
+    assert_contains "$outbox" "$id"
+
+    shown="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json)"
+    assert_contains "$shown" '"subject": "Check"'
+    assert_contains "$shown" '"nudge_count": 0'
+    assert_contains "$shown" '"last_nudge_error": null'
+}
+
+test_peer_mailbox_ack_authorization_and_states() {
+    local data="$TMPDIR/mailbox-ack-data"
+    setup_mailbox_peers "$data"
+
+    local id out rc status
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "queued message" | jq -r '.id')"
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected ack of queued message to fail"
+    assert_contains "$out" "receive it first (cctrl peer recv)"
+    status="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json | jq -r '.status')"
+    [[ "$status" == "queued" ]] || fail "expected queued status to remain queued"
+
+    mark_message_delivered "$data/messages.jsonl" "$id"
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as wrong-peer 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected wrong-peer ack to fail"
+    assert_contains "$out" "not addressed to 'wrong-peer'"
+    status="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json | jq -r '.status')"
+    [[ "$status" == "delivered" ]] || fail "expected wrong-peer ack to leave delivered state unchanged"
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet)"
+    assert_contains "$out" "Acked message"
+    status="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json | jq -r '.status')"
+    [[ "$status" == "acked" ]] || fail "expected message to be acked"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet)"
+    assert_contains "$out" "Acked message"
+}
+
+test_peer_mailbox_unknowns_and_identity() {
+    local data="$TMPDIR/mailbox-unknown-data"
+    mkdir -p "$TMPDIR/comet" "$TMPDIR/orchestrator"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent codex >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orchestrator --dir "$TMPDIR/orchestrator" --agent codex >/dev/null
+
+    local out rc
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send missing --from orchestrator -- "hello" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected unknown recipient to fail"
+    assert_contains "$out" "Unknown recipient"
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from missing -- "hello" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected unknown sender to fail"
+    assert_contains "$out" "Unknown sender"
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --json -- "hello" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected JSON send without sender to fail"
+    assert_contains "$out" "No sender identity"
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send missing --from missing --allow-unknown --json -- "hello")"
+    assert_contains "$out" '"unknown_peer": true'
+
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_PEER=orchestrator "$ROOT/cctrl" peer send comet --json -- "from env")"
+    assert_contains "$out" '"from": "orchestrator"'
+}
+
+test_peer_mailbox_concurrency_and_stale_lock() {
+    local data="$TMPDIR/mailbox-concurrency-data"
+    setup_mailbox_peers "$data"
+
+    local delivered_id
+    delivered_id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "to ack" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$delivered_id"
+
+    local -a pids=()
+    local i pid failed=0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "parallel $i" >/dev/null &
+        pids+=("$!")
+    done
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$delivered_id" --as comet >/dev/null &
+    pids+=("$!")
+
+    for pid in "${pids[@]}"; do
+        wait "$pid" || failed=1
+    done
+    [[ "$failed" -eq 0 ]] || fail "parallel mailbox operations failed"
+
+    jq empty "$data/messages.jsonl" >/dev/null
+    local count acked_count
+    count="$(jq -s 'length' "$data/messages.jsonl")"
+    [[ "$count" -eq 11 ]] || fail "expected 11 mailbox records after parallel operations, got $count"
+    acked_count="$(jq -s --arg id "$delivered_id" '[.[] | select(.id == $id and .status == "acked")] | length' "$data/messages.jsonl")"
+    [[ "$acked_count" -eq 1 ]] || fail "expected delivered message to be acked after parallel operations"
+
+    local stale_data="$TMPDIR/mailbox-stale-lock-data"
+    mkdir -p "$stale_data/messages.jsonl.lock"
+    printf '999999\n' > "$stale_data/messages.jsonl.lock/pid"
+    out="$(CCTRL_MAILBOX_LOCK_KIND=dir CCTRL_DATA_DIR="$stale_data" "$ROOT/cctrl" peer send ghost --from phantom --allow-unknown --json -- "stale lock")"
+    assert_contains "$out" '"status": "queued"'
+    [[ ! -d "$stale_data/messages.jsonl.lock" ]] || fail "expected stale lock directory to be reclaimed and released"
+}
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"
@@ -692,6 +835,10 @@ test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors
 test_peer_alias_derived_requires_manual_registration
 test_peer_tmux_missing_still_resolves_manual
+test_peer_mailbox_send_list_show
+test_peer_mailbox_ack_authorization_and_states
+test_peer_mailbox_unknowns_and_identity
+test_peer_mailbox_concurrency_and_stale_lock
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
