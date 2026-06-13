@@ -295,10 +295,71 @@ oldest delivered-but-unacked message without changing it, which lets a crashed
 agent retry before calling `ack`. JSON errors use
 `{"ok":false,"error":{"code":"...","message":"..."}}`.
 
+The preferred setup is an idle doorbell: launch the session with a peer
+identity, then let the agent check its mailbox at natural pause points.
+
+```bash
+cctrl start -d --peer comet ~/projects/comet-automation
+cctrl start --foreground --peer comet --agent codex
+```
+
+`--peer` exports `CCTRL_PEER` into the agent process and stores the peer in
+session metadata. Commands such as `cctrl peer recv --json`, `cctrl peer ack
+<id> --json`, and `cctrl peer mcp` can then resolve the identity without
+manual `--as` flags. Detached launches may use a new valid peer name because
+the tmux session metadata makes it discoverable; direct foreground launches
+should use an already registered peer name.
+
+Claude Code can use the blocking hook:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/cctrl/hooks/peer-doorbell.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/cctrl/hooks/peer-doorbell.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The hook exits 0 when `CCTRL_PEER` is unset, the inbox is empty, dependencies
+are missing, or only delivered-but-unacked messages remain. It exits 2 only
+for queued messages, printing the same doorbell text as tmux nudges so Claude
+immediately sees the instruction to run `peer recv`.
+
+Codex has notification-only `notify` semantics, so it cannot force the model to
+run `peer recv`, but it can surface the same doorbell:
+
+```toml
+notify = ["/path/to/cctrl/hooks/peer-doorbell.sh", "codex"]
+```
+
+If you already use a Codex `notify` command, wrap both notifications in a small
+local script and configure `notify` to call that wrapper.
+
 Tmux-backed peers can also be nudged when they have queued messages. This is a
-doorbell, not message transport: the pasted text is a fixed one-line command
-that tells the agent to poll its mailbox, and message bodies stay in
-`peer recv`.
+fallback for sessions without hooks, not message transport: the pasted text is
+a fixed one-line command that tells the agent to poll its mailbox, and message
+bodies stay in `peer recv`.
 
 ```bash
 cctrl peer deliver comet --dry-run       # show the nudge without mutation

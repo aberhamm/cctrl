@@ -13,10 +13,16 @@ SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
 HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
-PEER_DATA_DIR="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}"
-PEERS_FILE="$PEER_DATA_DIR/peers.json"
-MESSAGES_FILE="$PEER_DATA_DIR/messages.jsonl"
-SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
+_peer_refresh_paths() {
+    PEER_DATA_DIR="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}"
+    PEERS_FILE="$PEER_DATA_DIR/peers.json"
+    MESSAGES_FILE="$PEER_DATA_DIR/messages.jsonl"
+}
+_peer_refresh_paths
+_session_refresh_paths() {
+    SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
+}
+_session_refresh_paths
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -377,23 +383,47 @@ _target_slug() {
     printf '%s' "$name"
 }
 
+
+_device_tag() {
+    # Explicit remote host aliases win. For direct local launches, recognize the
+    # two personal machines so tmux session names stay machine-scoped.
+    local tag host
+    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
+        tag="$(_slugify "$CCTRL_HOST_PREFIX")"
+        [[ -n "$tag" ]] && printf '%s' "$tag"
+        return 0
+    fi
+
+    if [[ -n "${CCTRL_DEVICE_TAG:-}" ]]; then
+        tag="$(_slugify "$CCTRL_DEVICE_TAG")"
+        [[ -n "$tag" ]] && printf '%s' "$tag"
+        return 0
+    fi
+
+    host="$(hostname 2>/dev/null || true)"
+    host="$(printf '%s' "${host%.local}" | tr '[:upper:]' '[:lower:]')"
+    case "$host" in
+        ms-*|ms) printf 'ms' ;;
+        mattbook-pro|macbook-pro|mbp|mbp-*) printf 'mbp' ;;
+    esac
+}
+
 _context_slug() {
     # Canonical context names use stable segments:
-    #   <host>--<target>             for foreground remote agent/bridge names
-    #   TMUX--<host>--<target>       for detached tmux-backed agent names
-    # The host segment is present only for --host launches.
+    #   <device>--<target>           for foreground agent/bridge names
+    #   TMUX--<device>--<target>     for detached tmux-backed agent names
+    # The device segment comes from --host aliases, CCTRL_DEVICE_TAG, or known
+    # local hostnames. Unknown hosts keep the historic untagged names.
     local include_tmux="${1:-false}" input="${2:-$PWD}"
-    local name host out=""
+    local name device out=""
     name="$(_target_slug "$input")"
     if [[ "$include_tmux" == "true" ]]; then
         out="TMUX"
     fi
-    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
-        host="$(_slugify "$CCTRL_HOST_PREFIX")"
-        if [[ -n "$host" ]]; then
-            [[ -n "$out" ]] && out+="--"
-            out+="$host"
-        fi
+    device="$(_device_tag)"
+    if [[ -n "$device" ]]; then
+        [[ -n "$out" ]] && out+="--"
+        out+="$device"
     fi
     [[ -n "$out" ]] && out+="--"
     out+="$name"
@@ -704,6 +734,42 @@ with open('$SPENDING_LOG', 'w') as f:
     echo -e "${GREEN}Renamed: ${BOLD}$old${RESET}${GREEN} -> ${BOLD}$new${RESET}"
 }
 
+_start_args_have_explicit_target() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --)
+                return 1
+                ;;
+            -d|--detach|--foreground|--no-tmux|--tmux|--yolo|--dangerously-bypass-approvals-and-sandbox|--no-bridge)
+                shift
+                ;;
+            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m)
+                [[ $# -ge 2 ]] || return 1
+                shift 2
+                ;;
+            --resume|-r)
+                shift
+                if [[ $# -gt 0 && "$1" != -* && "$1" != @* ]]; then
+                    shift
+                fi
+                ;;
+            @*)
+                return 0
+                ;;
+            -*)
+                return 1
+                ;;
+            *)
+                local candidate="$1"
+                candidate="${candidate/#\~/$HOME}"
+                [[ -d "$candidate" ]] && return 0
+                shift
+                ;;
+        esac
+    done
+    return 1
+}
+
 cmd_start() {
     # Unified launch verb. Interactive starts are tmux-backed by default so
     # local and remote sessions are durable and addressable. Use
@@ -729,9 +795,7 @@ cmd_start() {
     fi
 
     if ! $foreground; then
-        if [[ "${1:-}" == @* ]]; then
-            _launch_detached "$@"
-        elif [[ -n "${1:-}" && "${1:-}" != -* && -d "${1/#\~/$HOME}" ]]; then
+        if _start_args_have_explicit_target "$@"; then
             CCTRL_ATTACH_AFTER_START=1 _launch_detached "$@"
         else
             CCTRL_ATTACH_AFTER_START=1 _launch_detached "$PWD" "$@"
@@ -755,6 +819,7 @@ cmd_start() {
     local cli_prompt_set=false
     local agent="$(_default_agent)"
     local launch_name=""
+    local peer_identity=""
     local full_bypass=false
     local access_explicit=false
     local permission_mode=""
@@ -826,6 +891,10 @@ cmd_start() {
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
                 launch_name="$2"; shift 2
                 ;;
+            --peer)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--peer needs a peer name${RESET}"; return 1; }
+                peer_identity="$2"; shift 2
+                ;;
             --)
                 shift
                 if [[ $# -gt 0 ]]; then
@@ -858,6 +927,28 @@ cmd_start() {
         fi
     fi
     _apply_profile_overlay "$agent" "$pf"
+    _peer_refresh_paths
+    _session_refresh_paths
+    if [[ -n "$peer_identity" ]]; then
+        local peer_json="" peer_name="" allowed_session="" resolved_peer=false
+        if peer_json="$(_peer_resolve_json "$peer_identity" 2>/dev/null)"; then
+            peer_name="$(jq -r '.name' <<< "$peer_json")"
+            resolved_peer=true
+        elif [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" && "${CCTRL_PEER:-}" == "$peer_identity" ]]; then
+            _peer_validate_label "name" "$peer_identity" || return 64
+            peer_name="$peer_identity"
+        else
+            _peer_resolve_json "$peer_identity" || return 66
+        fi
+        [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]] && allowed_session="${CCTRL_SESSION_NAME:-}"
+        if $resolved_peer && _peer_live_identity_conflict_exists "$peer_json" "$allowed_session"; then
+            echo -e "${RED}Peer '$peer_name' already has a live tmux session.${RESET}" >&2
+            echo -e "${DIM}Close that session before launching another with the same --peer identity.${RESET}" >&2
+            return 65
+        fi
+        export CCTRL_PEER
+        CCTRL_PEER="$peer_name"
+    fi
 
     local final_prompt=""
     $cli_prompt_set && final_prompt="$cli_prompt"
@@ -884,10 +975,10 @@ _session_metadata_field() {
 }
 
 _session_write_metadata() {
-    local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8"
-    mkdir -p "$SESSION_METADATA_DIR"
+    local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8" peer="${9:-}"
+    mkdir -p "$SESSION_METADATA_DIR" || return 1
     local tmp created_at host_label
-    tmp="$(mktemp)"
+    tmp="$(mktemp)" || return 1
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     host_label="${CCTRL_HOST_PREFIX:-local}"
     jq -n \
@@ -900,6 +991,7 @@ _session_write_metadata() {
         --arg purpose "$purpose" \
         --arg initial_prompt "$initial_prompt" \
         --arg launch_command "$launch_command" \
+        --arg peer "$peer" \
         --arg host "$host_label" \
         '{
             name: $name,
@@ -910,6 +1002,7 @@ _session_write_metadata() {
             display_label: $display_label,
             purpose: (if $purpose == "" then null else $purpose end),
             initial_prompt: (if $initial_prompt == "" then null else $initial_prompt end),
+            peer: (if $peer == "" then null else $peer end),
             launch_command: $launch_command,
             host: $host,
             cctrl_managed: true
@@ -960,7 +1053,11 @@ _launch_detached() {
     # Session management lives under `cctrl session`.
 
     local target="" target_kind=""   # kind: dir | shortcut
-    local purpose="" purpose_set=false initial_prompt=""
+    local purpose="" purpose_set=false initial_prompt="" peer_identity="" peer_name=""
+    local profile="" detach_agent="" agent_explicit=false
+    local shortcut_canonical=""
+    detach_agent="$(_default_agent)"
+    local passthrough_count=0
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -970,6 +1067,7 @@ _launch_detached() {
                 shift
                 [[ $# -gt 0 ]] && initial_prompt="$*"
                 passthrough+=("--" "$@")
+                passthrough_count=$((passthrough_count + 1 + $#))
                 break
                 ;;
             --purpose)
@@ -988,14 +1086,45 @@ _launch_detached() {
                 fi
                 initial_prompt="$2"
                 passthrough+=("$1" "$2")
+                passthrough_count=$((passthrough_count + 2))
                 shift 2
                 ;;
-            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
+            --agent)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--agent needs a value${RESET}" >&2
+                    return 1
+                fi
+                detach_agent="$2"
+                agent_explicit=true
+                passthrough+=("$1" "$2")
+                passthrough_count=$((passthrough_count + 2))
+                shift 2
+                ;;
+            --profile)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--profile needs a value${RESET}" >&2
+                    return 1
+                fi
+                profile="$2"
+                passthrough+=("$1" "$2")
+                passthrough_count=$((passthrough_count + 2))
+                shift 2
+                ;;
+            --model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
                 if [[ $# -lt 2 ]]; then
                     echo -e "${RED}$1 needs a value${RESET}" >&2
                     return 1
                 fi
                 passthrough+=("$1" "$2")
+                passthrough_count=$((passthrough_count + 2))
+                shift 2
+                ;;
+            --peer)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--peer needs a peer name${RESET}" >&2
+                    return 1
+                fi
+                peer_identity="$2"
                 shift 2
                 ;;
             --foreground|--no-tmux|--tmux)
@@ -1003,8 +1132,10 @@ _launch_detached() {
                 ;;
             --resume|-r)
                 passthrough+=("$1")
+                passthrough_count=$((passthrough_count + 1))
                 if [[ $# -gt 1 && "$2" != -* && "$2" != @* ]]; then
                     passthrough+=("$2")
+                    passthrough_count=$((passthrough_count + 1))
                     shift
                 fi
                 shift
@@ -1012,6 +1143,7 @@ _launch_detached() {
             @*)
                 if [[ -n "$target" ]]; then
                     passthrough+=("$1")
+                    passthrough_count=$((passthrough_count + 1))
                 else
                     target="${1#@}"
                     target_kind="shortcut"
@@ -1020,11 +1152,13 @@ _launch_detached() {
                 ;;
             -*)
                 passthrough+=("$1")
+                passthrough_count=$((passthrough_count + 1))
                 shift
                 ;;
             *)
                 if [[ -n "$target" ]]; then
                     passthrough+=("$1")
+                    passthrough_count=$((passthrough_count + 1))
                 else
                     target="$1"
                     target_kind="dir"
@@ -1046,17 +1180,88 @@ _launch_detached() {
         echo -e "${DIM}to \$HOME would drop a full-access agent into ~/.ssh, ~/.aws, etc.${RESET}" >&2
         return 1
     fi
+    if [[ "$target_kind" == "shortcut" ]]; then
+        shortcut_canonical="$(_shortcut_lookup_key "$target")"
+        if [[ -z "$shortcut_canonical" ]]; then
+            echo -e "${RED}Shortcut not found: @$target${RESET}" >&2
+            echo -e "${DIM}List with: cctrl @${RESET}" >&2
+            return 1
+        fi
+        local shortcut_profile="" shortcut_agent=""
+        { IFS= read -r shortcut_profile; IFS= read -r shortcut_agent; } < <(jq -r --arg k "$shortcut_canonical" '
+            .[$k] | (.profile // ""), (.agent // "")
+        ' "$SHORTCUTS_FILE")
+        [[ -z "$profile" && -n "$shortcut_profile" ]] && profile="$shortcut_profile"
+        if [[ "$agent_explicit" != "true" && -n "$shortcut_agent" ]]; then
+            detach_agent="$shortcut_agent"
+        fi
+    fi
+    if [[ -n "$peer_identity" ]]; then
+        local effective_profile="$profile" profile_agent pf=""
+        [[ -n "$effective_profile" ]] || effective_profile="$(_active_profile)"
+        if [[ -n "$effective_profile" ]] && _profile_exists "$effective_profile"; then
+            profile_agent="$(_normalize_agent "$detach_agent")" || return 1
+            pf="$(_profile_path "$effective_profile")"
+            _apply_profile_overlay "$profile_agent" "$pf"
+            _peer_refresh_paths
+            _session_refresh_paths
+        fi
+    fi
+    if [[ -n "$peer_identity" ]]; then
+        local peer_json
+        if peer_json="$(_peer_resolve_json "$peer_identity" 2>/dev/null)"; then
+            peer_name="$(jq -r '.name' <<< "$peer_json")"
+            if _peer_live_identity_conflict_exists "$peer_json" ""; then
+                echo -e "${RED}Peer '$peer_name' already has a live tmux session.${RESET}" >&2
+                echo -e "${DIM}Close that session before launching another with the same --peer identity.${RESET}" >&2
+                return 65
+            fi
+        else
+            if _peer_derived_name_exists "$peer_identity"; then
+                echo -e "${RED}Peer '$peer_identity' already has a live tmux session.${RESET}" >&2
+                echo -e "${DIM}Close that session before launching another with the same --peer identity.${RESET}" >&2
+                return 65
+            fi
+            _peer_validate_label "name" "$peer_identity" || return 64
+            peer_name="$peer_identity"
+        fi
+    fi
 
     local cctrl_q extras_q="" env_q="" base_env_q="CCTRL_TMUX_CONTEXT=1" shell_cmd session_name display_label context_name
+    local -a child_args=()
     local metadata_cwd="" metadata_target=""
     cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
     local env_name env_val
-    for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX; do
+    for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_DEVICE_TAG CCTRL_DATA_DIR CCTRL_SESSION_METADATA_DIR; do
         env_val="${!env_name:-}"
         [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(printf '%q' "$env_val")"
     done
-    if [[ ${#passthrough[@]} -gt 0 ]]; then
-        for a in "${passthrough[@]}"; do
+    [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(printf '%q' "$peer_name")"
+    if [[ -n "$peer_name" ]]; then
+        if [[ "$passthrough_count" -gt 0 ]]; then
+            local inserted_peer=false
+            for a in "${passthrough[@]}"; do
+                if [[ "$inserted_peer" == "false" && "$a" == "--" ]]; then
+                    child_args+=("--peer" "$peer_name")
+                    inserted_peer=true
+                fi
+                child_args+=("$a")
+            done
+            if [[ "$inserted_peer" == "false" ]]; then
+                child_args+=("--peer" "$peer_name")
+            fi
+        else
+            child_args+=("--peer" "$peer_name")
+        fi
+    else
+        if [[ "$passthrough_count" -gt 0 ]]; then
+            child_args=("${passthrough[@]}")
+        fi
+    fi
+    if [[ "$peer_name" == "" && "$passthrough_count" -eq 0 ]]; then
+        :
+    else
+        for a in "${child_args[@]}"; do
             extras_q+=" $(printf '%q' "$a")"
         done
     fi
@@ -1065,12 +1270,7 @@ _launch_detached() {
     # slug: TMUX--<host>--<target>.
     if [[ "$target_kind" == "shortcut" ]]; then
         local canonical
-        canonical="$(_shortcut_lookup_key "$target")"
-        if [[ -z "$canonical" ]]; then
-            echo -e "${RED}Shortcut not found: @$target${RESET}" >&2
-            echo -e "${DIM}List with: cctrl @${RESET}" >&2
-            return 1
-        fi
+        canonical="$shortcut_canonical"
         context_name="$(_tmux_session_slug "$canonical")"
         session_name="$context_name"
         display_label="@$canonical"
@@ -1133,9 +1333,18 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
-    tmux new-session -d -s "$session_name" "$shell_cmd"
+    if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" 2>/dev/null; then
+        if [[ -n "$peer_name" ]]; then
+            echo -e "${RED}Failed to write session metadata for peer '$peer_name'.${RESET}" >&2
+            echo -e "${DIM}Metadata path: $(_session_metadata_file "$session_name")${RESET}" >&2
+            return 1
+        fi
+    fi
+    if ! tmux new-session -d -s "$session_name" "$shell_cmd"; then
+        rm -f "$(_session_metadata_file "$session_name")" 2>/dev/null || true
+        return 1
+    fi
     tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
-    _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" 2>/dev/null || true
 
     echo -e "${GREEN}✓${RESET} detached session started — ${BOLD}$display_label${RESET}"
     echo -e "${DIM}  Attach:  cctrl session attach $session_name${RESET}"
@@ -1245,7 +1454,35 @@ _peer_manual_collision_owner() {
 _peer_derived_name_exists() {
     local label="$1" doc
     doc="$(_peer_derived_json)" || return 1
-    jq -e --arg n "$label" '.peers[]? | select(.name == $n)' <<< "$doc" >/dev/null 2>&1
+    jq -e --arg n "$label" '.peers[]? | select(.name == $n or ((.aliases // []) | index($n)))' <<< "$doc" >/dev/null 2>&1
+}
+
+_peer_derived_identity_exists() {
+    _peer_derived_identity_conflict_exists "${1:-}" ""
+}
+
+_peer_derived_identity_conflict_exists() {
+    local name="$1" doc
+    local allowed_session="${2:-}"
+    doc="$(_peer_derived_json)" || return 1
+    jq -e --arg n "$name" --arg allowed "$allowed_session" '
+        .peers[]?
+        | select(.name == $n)
+        | select($allowed == "" or (.session // "") != $allowed)
+    ' <<< "$doc" >/dev/null 2>&1
+}
+
+_peer_live_identity_conflict_exists() {
+    local peer_json="$1" allowed_session="${2:-}" name session
+    name="$(jq -r '.name // empty' <<< "$peer_json")"
+    session="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+    if [[ -n "$session" && "$session" != "$allowed_session" ]] && command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "$session"; then
+        return 0
+    fi
+    if [[ -n "$name" ]] && _peer_derived_identity_conflict_exists "$name" "$allowed_session"; then
+        return 0
+    fi
+    return 1
 }
 
 _peer_derived_json() {
@@ -1271,9 +1508,10 @@ _peer_derived_json() {
           peers: [
             $sessions[]
             | select(.managed == true)
+            | (.peer // .name) as $peer_name
             | {
-                name: .name,
-                aliases: [],
+                name: $peer_name,
+                aliases: (if ((.peer // "") != "" and .peer != .name) then [.name] else [] end),
                 host: $host,
                 dir: .dir,
                 agent: .agent,
@@ -1300,19 +1538,26 @@ _peer_all_json() {
           if ((.session // "") != "") then . + {tmux_target: .session} else . end;
 
         ($derived.peers // []) as $derived_peers
-        | ($manual | to_entries | map(
+        | ($manual | to_entries) as $manual_entries
+        | ($manual_entries | (map(.key) + map((.value.aliases // [])[]))) as $manual_labels
+        | ($manual_entries | map(
             .key as $k
             | .value as $v
-            | ([ $derived_peers[] | select(.name == $k) | (.session // .name) ][0] // "") as $shadow
+            | ([ $derived_peers[] | select(.name == $k) ][0] // null) as $derived_name_match
+            | ([ $derived_peers[] | select((.aliases // []) | index($k)) ][0] // null) as $derived_alias_match
+            | ($derived_name_match // null) as $derived_merge
+            | ($derived_name_match // $derived_alias_match // null) as $derived_shadow
+            | (($derived_merge.aliases // []) | map(. as $alias | select(($manual_labels | index($alias)) | not))) as $derived_aliases
+            | (($derived_shadow.session // $derived_shadow.name // "") // "") as $shadow
             | ({
                 name: ($v.name // $k),
-                aliases: ($v.aliases // []),
+                aliases: ((($v.aliases // []) + $derived_aliases) | unique),
                 host: ($v.host // "local"),
-                dir: ($v.dir // null),
-                agent: ($v.agent // null),
-                session: ($v.session // null),
-                purpose: ($v.purpose // null),
-                capabilities: ($v.capabilities // []),
+                dir: ($v.dir // $derived_merge.dir // null),
+                agent: ($v.agent // $derived_merge.agent // null),
+                session: ($derived_merge.session // $v.session // null),
+                purpose: ($v.purpose // $derived_merge.purpose // null),
+                capabilities: ((($v.capabilities // []) + ($derived_merge.capabilities // [])) | unique),
                 registered_at: ($v.registered_at // null),
                 source: "manual"
               }
@@ -1320,13 +1565,17 @@ _peer_all_json() {
               | if $shadow != "" then . + {shadows: $shadow} else . end
               | clean)
           )) as $manual_peers
-        | ($manual_peers | map(.name)) as $manual_names
         | {
             derived_skipped: ($derived.skipped // false),
             derived_skip_reason: ($derived.reason // null),
             peers: (
               $manual_peers
-              + [ $derived_peers[] | . as $p | select(($manual_names | index($p.name)) | not) ]
+              + [
+                  $derived_peers[]
+                  | . as $p
+                  | select(($manual_labels | index($p.name)) | not)
+                  | .aliases = ((.aliases // []) | map(. as $alias | select(($manual_labels | index($alias)) | not)))
+                ]
             )
           }'
 }
@@ -1494,7 +1743,7 @@ _peer_cmd_alias() {
     key="$(_peer_lookup_manual_key "$name")"
     if [[ -z "$key" ]]; then
         doc="$(_peer_all_json)" || return 1
-        derived_count="$(jq -r --arg n "$name" '[.peers[] | select(.source == "derived" and .name == $n)] | length' <<< "$doc")"
+        derived_count="$(jq -r --arg n "$name" '[.peers[] | select(.source == "derived" and (.name == $n or ((.aliases // []) | index($n))))] | length' <<< "$doc")"
         if (( derived_count > 0 )); then
             echo -e "${RED}Peer '$name' is derived from tmux; register this peer first before adding aliases.${RESET}" >&2
         else
@@ -3452,8 +3701,90 @@ _peer_doctor_mcp_check() {
     fi
 }
 
+_peer_doorbell_hook_path() {
+    printf '%s/hooks/peer-doorbell.sh' "$SCRIPT_DIR"
+}
+
+_peer_codex_notify_references_hook() {
+    local config="$1" hook_name="$2" hook_path="$3"
+    [[ -f "$config" ]] || return 1
+    grep -F "$hook_name" "$config" >/dev/null 2>&1 && return 0
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$config" "$hook_name" "$hook_path" <<'PY'
+import os
+import shutil
+import sys
+
+config_path, hook_name, hook_path = sys.argv[1:4]
+try:
+    import tomllib
+except Exception:
+    sys.exit(1)
+
+try:
+    with open(config_path, "rb") as fh:
+        config = tomllib.load(fh)
+except Exception:
+    sys.exit(1)
+
+notify = config.get("notify")
+values = []
+if isinstance(notify, str):
+    values.append(notify)
+elif isinstance(notify, list):
+    values.extend(item for item in notify if isinstance(item, str))
+
+config_dir = os.path.dirname(config_path)
+needles = [hook_name.encode(), hook_path.encode()]
+seen = set()
+
+for value in values:
+    expanded = os.path.expanduser(os.path.expandvars(value))
+    paths = []
+    if os.path.isabs(expanded):
+        paths.append(expanded)
+    else:
+        found = shutil.which(expanded)
+        if found:
+            paths.append(found)
+        paths.append(os.path.join(config_dir, expanded))
+
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                content = fh.read(1024 * 1024)
+        except OSError:
+            continue
+        if any(needle in content for needle in needles):
+            sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
+_peer_doorbell_registered() {
+    local agent="${1:-}" config hook_name="peer-doorbell.sh" hook_path
+    hook_path="$(_peer_doorbell_hook_path)"
+    if [[ -z "$agent" || "$agent" == "claude" ]]; then
+        for config in "$SETTINGS" "$HOME/.claude.json"; do
+            [[ -f "$config" ]] || continue
+            grep -F "$hook_name" "$config" >/dev/null 2>&1 && return 0
+        done
+    fi
+    if [[ -z "$agent" || "$agent" == "codex" ]]; then
+        config="$CODEX_DIR/config.toml"
+        _peer_codex_notify_references_hook "$config" "$hook_name" "$hook_path" && return 0
+    fi
+    return 1
+}
+
 _peer_cmd_doctor() {
-    local target="" json=false peers_doc messages peer_json checks="[]" check ok target_session
+    local target="" json=false peers_doc messages peer_json checks="[]" check ok target_session target_agent="" hook_path
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3486,6 +3817,13 @@ _peer_cmd_doctor() {
     fi
     check="$(jq -n --arg name stale_mailbox_lock --argjson ok "$(_peer_json_bool "$([[ "$lock_stale" != "true" ]] && echo true || echo false)")" --arg pid "$lock_pid" '{name:$name,ok:$ok,pid:($pid // "")}')"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    hook_path="$(_peer_doorbell_hook_path)"
+    ok="$([[ -f "$hook_path" ]] && echo true || echo false)"
+    check="$(jq -n --arg name doorbell_hook_present --argjson ok "$ok" --arg path "$hook_path" '{name:$name,ok:$ok,path:$path}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    ok="$([[ -x "$hook_path" ]] && echo true || echo false)"
+    check="$(jq -n --arg name doorbell_hook_executable --argjson ok "$ok" --arg path "$hook_path" '{name:$name,ok:$ok,path:$path}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     peers_doc="$(_peer_all_json)" || return 1
     if [[ -n "$target" ]]; then
         if ! peer_json="$(_peer_resolve_json "$target" 2>/dev/null)"; then
@@ -3493,6 +3831,7 @@ _peer_cmd_doctor() {
             checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
         else
             target="$(jq -r '.name' <<< "$peer_json")"
+            target_agent="$(jq -r '.agent // empty' <<< "$peer_json")"
             check="$(jq -n --arg name peer_resolves --argjson ok true --arg target "$target" '{name:$name,ok:$ok,target:$target}')"
             checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
             if _peer_has_capability "$peer_json" "tmux"; then
@@ -3512,6 +3851,9 @@ _peer_cmd_doctor() {
         check="$(jq -n --arg name peers_registered --argjson ok "$(jq -r '(.peers // []) | length > 0' <<< "$peers_doc")" '{name:$name,ok:$ok}')"
         checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     fi
+    ok="$(_peer_doorbell_registered "$target_agent" && echo true || echo false)"
+    check="$(jq -n --arg name doorbell_hook_registered --argjson ok "$ok" --arg agent "$target_agent" '{name:$name,ok:$ok,agent:(if $agent == "" then null else $agent end)}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
@@ -3681,13 +4023,15 @@ _session_list() {
 
     local -a json_items=()
     $json || echo -e "${DIM}✦ = cctrl-managed agent session${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at purpose_display
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
         purpose="$(_session_metadata_field "$name" purpose)"
         created_at="$(_session_metadata_field "$name" created_at)"
+        peer="$(_session_metadata_field "$name" peer)"
+        metadata_managed="$(_session_metadata_field "$name" cctrl_managed)"
         if [[ "$cmd" == *claude* || "$cmd" == *codex* ]]; then
             [[ "$cmd" == *codex* ]] && agent="codex" || agent="claude"
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
@@ -3695,13 +4039,14 @@ _session_list() {
             model="${model#claude-}"; model="${model%%\[*}"
             [[ -z "$model" ]] && model="?"
             kind="$agent ($model)"
-            if [[ "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
+            if [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
                 managed=true
             else
                 managed=false
             fi
         else
-            claude_yes=false; managed=false; model=""; agent=""
+            claude_yes=false; model=""; agent=""
+            [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" ]] && managed=true || managed=false
             base="${cmd%% *}"; base="${base##*/}"; base="${base#-}"
             kind="shell (${base:-sh})"
         fi
@@ -3713,8 +4058,9 @@ _session_list() {
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" --arg agent "$agent" \
                 --arg purpose "$purpose" --arg created_at "$created_at" \
+                --arg peer "$peer" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end)}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -4077,6 +4423,7 @@ cmd_help() {
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
     echo "    -n, --name NAME           Set the session display name"
+    echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
     echo "    --yolo                    Full bypass alias (Codex) / bypassPermissions (Claude)"
@@ -4119,6 +4466,7 @@ cmd_help() {
     echo "  cctrl @<name> --foreground  Launch directly without tmux"
     echo "  cctrl @<name> -m TEXT   Open with an initial prompt (alias: --message, --prompt)"
     echo "  cctrl @<name> --purpose TEXT  Set cleanup/review metadata without prompting"
+    echo "  cctrl @<name> --peer NAME  Export CCTRL_PEER for peer mailbox identity"
     echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
     echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
     echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
@@ -4626,7 +4974,7 @@ _remote_exec() {
                     ((i+=2))
                     continue
                     ;;
-                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
+                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer)
                     ((i+=2))
                     continue
                     ;;
@@ -5024,6 +5372,7 @@ _shortcut_help() {
     echo "  cctrl @<name>                     Jump: cd, switch profile, launch tmux-backed agent"
     echo "  cctrl @<name> -m \"TEXT\"            Launch with an initial prompt"
     echo "  cctrl @<name> --purpose TEXT      Set cleanup/review metadata without prompting"
+    echo "  cctrl @<name> --peer NAME         Export CCTRL_PEER for peer mailbox identity"
     echo "  cctrl @<name> --foreground        Launch directly without tmux"
     echo "  cctrl @<name> -- TEXT...          Same; everything after -- is the prompt"
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
@@ -5282,6 +5631,7 @@ _shortcut_jump() {
     local cli_model=""
     local agent="${shortcut_agent:-$(_default_agent)}"
     local launch_name=""
+    local peer_identity=""
     local full_bypass=false
     local access_explicit=false
     local permission_mode=""
@@ -5322,6 +5672,9 @@ _shortcut_jump() {
             --name|-n)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--name needs a value${RESET}"; return 1; }
                 launch_name="$2"; shift 2 ;;
+            --peer)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--peer needs a peer name${RESET}"; return 1; }
+                peer_identity="$2"; shift 2 ;;
             --model)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--model needs a value${RESET}"; return 1; }
                 cli_model="$2"; shift 2 ;;
@@ -5350,6 +5703,28 @@ _shortcut_jump() {
         fi
     fi
     _apply_profile_overlay "$agent" "$pf"
+    _peer_refresh_paths
+    _session_refresh_paths
+    if [[ -n "$peer_identity" ]]; then
+        local peer_json="" peer_name="" allowed_session="" resolved_peer=false
+        if peer_json="$(_peer_resolve_json "$peer_identity" 2>/dev/null)"; then
+            peer_name="$(jq -r '.name' <<< "$peer_json")"
+            resolved_peer=true
+        elif [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" && "${CCTRL_PEER:-}" == "$peer_identity" ]]; then
+            _peer_validate_label "name" "$peer_identity" || return 64
+            peer_name="$peer_identity"
+        else
+            _peer_resolve_json "$peer_identity" || return 66
+        fi
+        [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]] && allowed_session="${CCTRL_SESSION_NAME:-}"
+        if $resolved_peer && _peer_live_identity_conflict_exists "$peer_json" "$allowed_session"; then
+            echo -e "${RED}Peer '$peer_name' already has a live tmux session.${RESET}" >&2
+            echo -e "${DIM}Close that session before launching another with the same --peer identity.${RESET}" >&2
+            return 65
+        fi
+        export CCTRL_PEER
+        CCTRL_PEER="$peer_name"
+    fi
 
     # Prompt: CLI overrides config. Goes last (claude treats final positional as prompt).
     local final_prompt=""

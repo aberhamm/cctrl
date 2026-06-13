@@ -6,9 +6,22 @@ TMPDIR="$(mktemp -d)"
 export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
 trap 'rm -rf "$TMPDIR"' EXIT
 
+cat > "$TMPDIR/hostname" <<'SH'
+#!/usr/bin/env bash
+host="${CCTRL_TEST_HOSTNAME:-test-host.local}"
+if [[ "${1:-}" == "-s" ]]; then
+    printf '%s
+' "${host%%.*}"
+else
+    printf '%s
+' "$host"
+fi
+SH
+chmod +x "$TMPDIR/hostname"
+
 # Tests may be run from inside a cctrl tmux session; don't let its context
 # leak in (CCTRL_TMUX_CONTEXT flips `cctrl start` into foreground mode).
-unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER
+unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
 
 fail() {
@@ -31,6 +44,9 @@ make_fake_agent() {
     cat > "$path" <<SH
 #!/usr/bin/env bash
 echo "CMD=$name"
+if [[ -n "\${CCTRL_PEER:-}" ]]; then
+    printf 'ENV_CCTRL_PEER=%s\n' "\$CCTRL_PEER"
+fi
 i=0
 for arg in "\$@"; do
     printf 'ARG[%d]=%s\n' "\$i" "\$arg"
@@ -105,7 +121,13 @@ case "${1:-}" in
         exit 1
         ;;
     list-sessions)
-        printf 'demo\n'
+        if [[ -n "${TMUX_FAKE_SESSIONS:-}" ]]; then
+            for session in $TMUX_FAKE_SESSIONS; do
+                printf '%s\n' "$session"
+            done
+        else
+            printf 'demo\n'
+        fi
         exit 0
         ;;
     list-panes)
@@ -171,6 +193,7 @@ test_syntax() {
     bash -n "$ROOT/cctrl"
     bash -n "$ROOT/tests/run-tests.sh"
     bash -n "$ROOT/hooks/notify.sh"
+    bash -n "$ROOT/hooks/peer-doorbell.sh"
     bash -n "$ROOT/hooks/statusline.sh"
     bash -n "$ROOT/install.sh"
     zsh -n "$ROOT/completions/_cctrl"
@@ -181,7 +204,7 @@ test_launch_args() {
     make_fake_agent "$TMPDIR/codex" codex
     make_fake_agent "$TMPDIR/claude" claude
 
-    local out
+    local out rc
     out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent codex --model gpt-5.5 --sandbox workspace-write --ask-for-approval on-request -m "fix bug")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--model"
@@ -227,7 +250,7 @@ test_detached_arg_parsing() {
     mkdir -p "$project"
 
     : > "$log"
-    local out
+    local out rc
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex -m "line one" "$project")"
     assert_contains "$out" "detached session started"
     assert_contains "$out" "CCTRL_SESSION=TMUX--project"
@@ -270,6 +293,14 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "start --foreground"
 
     : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_TEST_HOSTNAME=mattbook-pro.local CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex "$project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--mbp--project"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--mbp--project"
+    assert_contains "$(cat "$log")" "--name TMUX--mbp--project"
+    assert_contains "$(cat "$log")" "start --foreground"
+
+    : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 \
         TMUX_FAKE_HAS_SESSION="TMUX--project" "$ROOT/cctrl" start -d "$project")"
     assert_contains "$out" "CCTRL_SESSION=TMUX--project--2"
@@ -293,18 +324,184 @@ test_start_defaults_to_tmux() {
     assert_contains "$(cat "$log")" "start --foreground --name TMUX--default-project"
     assert_contains "$(cat "$log")" "--agent\\ codex"
     assert_contains "$(cat "$log")" "-m default\\ tmux"
+
+    local input_dir="$TMPDIR/agent-input-dir"
+    mkdir -p "$input_dir"
+    : > "$log"
+    out="$(cd "$project" && PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start --agent codex --some-agent-flag "$input_dir")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--default-project"
+    assert_contains "$(cat "$log")" "SHELL_CMD=cd $project &&"
+    assert_contains "$(cat "$log")" "--some-agent-flag $input_dir"
+    assert_not_contains "$(cat "$log")" "new-session -d -s TMUX--agent-input-dir"
+}
+
+test_start_peer_env_and_metadata() {
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_ps "$TMPDIR/ps"
+    local data="$TMPDIR/start-peer-data"
+    local project="$TMPDIR/start-peer-project"
+    local log="$TMPDIR/start-peer-tmux.log"
+    mkdir -p "$project" "$TMPDIR/comet"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent codex >/dev/null
+
+    local out rc
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --foreground --agent codex --peer comet -m "peer launch")"
+    assert_contains "$out" "ENV_CCTRL_PEER=comet"
+
+    local profile_root="$TMPDIR/cctrl-profile-peer-copy"
+    local profile_data="$TMPDIR/profile-peer-data"
+    local profile_meta="$TMPDIR/profile-peer-meta"
+    mkdir -p "$profile_root/profiles" "$profile_root/data" "$profile_data" "$profile_meta"
+    cp "$ROOT/cctrl" "$profile_root/cctrl"
+    chmod +x "$profile_root/cctrl"
+    printf '{"comet":{"name":"comet","aliases":["c"],"agent":"codex"}}\n' > "$profile_data/peers.json"
+    cat > "$profile_root/profiles/team.json" <<JSON
+{"agents":{"codex":{"env":{"CCTRL_PEER":"wrong","CCTRL_DATA_DIR":"$profile_data"}}}}
+JSON
+    cat > "$profile_root/profiles/team-live.json" <<JSON
+{"agents":{"codex":{"env":{"CCTRL_DATA_DIR":"$profile_data","CCTRL_SESSION_METADATA_DIR":"$profile_meta"}}}}
+JSON
+    out="$(PATH="$TMPDIR:$PATH" "$profile_root/cctrl" start --foreground --agent codex --profile team --peer c -m "profile peer")"
+    assert_contains "$out" "ENV_CCTRL_PEER=comet"
+    assert_not_contains "$out" "ENV_CCTRL_PEER=wrong"
+    cat > "$profile_meta/TMUX--profile-live.json" <<'JSON'
+{"purpose":"profile live peer","created_at":"2026-06-11T10:00:00Z","peer":"comet","cctrl_managed":true}
+JSON
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_SESSIONS="TMUX--profile-live" "$profile_root/cctrl" start --foreground --agent codex --profile team-live --peer c -m "profile live duplicate" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected foreground profile metadata --peer duplicate to fail"
+    assert_contains "$out" "already has a live tmux session"
+
+    local profile_project="$TMPDIR/profile-detached-project"
+    local profile_log="$TMPDIR/profile-detached-tmux.log"
+    mkdir -p "$profile_project"
+    : > "$profile_log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$profile_log" CCTRL_EMIT_SESSION=1 "$profile_root/cctrl" start -d --profile team --peer c --agent codex "$profile_project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$(cat "$profile_log")" "--profile\\ team"
+    assert_contains "$(cat "$profile_log")" "--peer\\ comet"
+    assert_contains "$(cat "$profile_log")" "CCTRL_PEER=comet"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--profile-detached-project.json")" '"peer": "comet"'
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start -d --peer comet --agent codex "$project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$(cat "$log")" "CCTRL_PEER=comet"
+    assert_contains "$(cat "$log")" "CCTRL_DATA_DIR=$data"
+    assert_contains "$(cat "$log")" "CCTRL_SESSION_METADATA_DIR=$CCTRL_SESSION_METADATA_DIR"
+    assert_contains "$(cat "$log")" "--peer\\ comet"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--start-peer-project.json")" '"peer": "comet"'
+
+    local ordered_project="$TMPDIR/start-peer-ordered-project"
+    mkdir -p "$ordered_project"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --peer comet --agent codex "$ordered_project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--start-peer-ordered-project"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--start-peer-ordered-project"
+    assert_contains "$(cat "$log")" "SHELL_CMD=cd $ordered_project &&"
+    assert_contains "$(cat "$log")" "--peer\\ comet"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--start-peer-ordered-project.json")" '"target": "'"$ordered_project"'"'
+
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" TMUX_FAKE_SESSIONS="TMUX--start-peer-project" "$ROOT/cctrl" start --foreground --agent codex --peer comet -m "duplicate foreground" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected foreground duplicate live --peer launch to fail"
+    assert_contains "$out" "already has a live tmux session"
+
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--start-peer-project TMUX_FAKE_SESSIONS="TMUX--start-peer-project" "$ROOT/cctrl" start --foreground --agent codex --peer comet -m "same tmux peer")"
+    assert_contains "$out" "ENV_CCTRL_PEER=comet"
+
+    local prompt_project="$TMPDIR/start-peer-prompt-project"
+    mkdir -p "$prompt_project"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" CCTRL_DEVICE_TAG=peerhost "$ROOT/cctrl" start -d --peer comet --agent codex "$prompt_project" -- "do task")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--peerhost--start-peer-prompt-project"
+    assert_contains "$(cat "$log")" "CCTRL_DEVICE_TAG=peerhost"
+    assert_contains "$(cat "$log")" "--peer comet -- do\\ task"
+
+    local registered_duplicate_project="$TMPDIR/start-peer-registered-duplicate-project"
+    rc=0
+    mkdir -p "$registered_duplicate_project"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" TMUX_FAKE_SESSIONS="TMUX--start-peer-project" "$ROOT/cctrl" start -d --peer comet --agent codex "$registered_duplicate_project" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected registered duplicate live --peer launch to fail"
+    assert_contains "$out" "already has a live tmux session"
+
+    local manual_session_data="$TMPDIR/start-peer-manual-session-data"
+    local manual_session_project="$TMPDIR/start-peer-manual-session-project"
+    mkdir -p "$manual_session_project"
+    CCTRL_DATA_DIR="$manual_session_data" "$ROOT/cctrl" peer register comet --agent codex --session TMUX--comet >/dev/null
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$manual_session_data" TMUX_FAKE_HAS_SESSION="TMUX--comet" "$ROOT/cctrl" start --foreground --agent codex --peer comet -m "manual session duplicate" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected foreground manual-session --peer launch to fail"
+    assert_contains "$out" "already has a live tmux session"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$manual_session_data" TMUX_FAKE_HAS_SESSION="TMUX--comet" "$ROOT/cctrl" start -d --peer comet --agent codex "$manual_session_project" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected detached manual-session --peer launch to fail"
+    assert_contains "$out" "already has a live tmux session"
+
+    local stale_session_data="$TMPDIR/start-peer-stale-session-data"
+    local stale_session_project="$TMPDIR/start-peer-stale-session-project"
+    mkdir -p "$stale_session_project"
+    CCTRL_DATA_DIR="$stale_session_data" "$ROOT/cctrl" peer register comet --agent codex --session TMUX--old >/dev/null
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$stale_session_data" "$ROOT/cctrl" start -d --peer comet --agent codex "$stale_session_project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--start-peer-stale-session-project"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$stale_session_data" TMUX_FAKE_SESSIONS="TMUX--start-peer-stale-session-project" "$ROOT/cctrl" peer resolve comet --json)"
+    assert_contains "$out" '"session": "TMUX--start-peer-stale-session-project"'
+    assert_contains "$out" '"tmux_target": "TMUX--start-peer-stale-session-project"'
+    assert_not_contains "$out" 'TMUX--old'
+
+    local bad_meta="$TMPDIR/start-peer-bad-meta"
+    local bad_meta_data="$TMPDIR/start-peer-bad-meta-data"
+    local bad_meta_project="$TMPDIR/start-peer-bad-meta-project"
+    mkdir -p "$bad_meta_project"
+    printf 'not a directory\n' > "$bad_meta"
+    : > "$log"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$bad_meta_data" CCTRL_SESSION_METADATA_DIR="$bad_meta" "$ROOT/cctrl" start -d --peer scout --agent codex "$bad_meta_project" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected --peer launch with bad metadata path to fail"
+    assert_contains "$out" "Failed to write session metadata for peer 'scout'"
+    assert_not_contains "$(cat "$log")" "new-session"
+
+    local new_data="$TMPDIR/start-peer-new-data"
+    local new_project="$TMPDIR/start-peer-new-project"
+    mkdir -p "$new_project"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$new_data" "$ROOT/cctrl" start -d --peer rover --agent codex "$new_project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--start-peer-new-project"
+    assert_contains "$(cat "$log")" "CCTRL_PEER=rover"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--start-peer-new-project.json")" '"peer": "rover"'
+
+    local duplicate_project="$TMPDIR/start-peer-duplicate-project"
+    rc=0
+    mkdir -p "$duplicate_project"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$new_data" TMUX_FAKE_SESSIONS="TMUX--start-peer-new-project" "$ROOT/cctrl" start -d --peer rover --agent codex "$duplicate_project" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected duplicate live --peer launch to fail"
+    assert_contains "$out" "already has a live tmux session"
 }
 
 test_shortcut_no_args_defaults_to_tmux() {
     make_fake_tmux "$TMPDIR/tmux"
     local rootcopy="$TMPDIR/cctrl-shortcut-copy"
     local project="$TMPDIR/mstack"
+    local peer_project="$TMPDIR/shortcut-peer-project"
+    local peer_live_project="$TMPDIR/shortcut-peer-live-project"
+    local profile_data="$TMPDIR/shortcut-profile-peer-data"
+    local profile_meta="$TMPDIR/shortcut-profile-peer-meta"
     local log="$TMPDIR/shortcut-tmux.log"
-    mkdir -p "$rootcopy/data" "$project"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project" "$peer_project" "$peer_live_project" "$profile_data" "$profile_meta"
     cp "$ROOT/cctrl" "$rootcopy/cctrl"
     chmod +x "$rootcopy/cctrl"
-    printf '{"mstack":{"dir":"%s","agent":"codex"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"mstack":{"dir":"%s","agent":"codex"},"peerproj":{"dir":"%s","profile":"team","agent":"codex"},"peerlive":{"dir":"%s","profile":"live","agent":"codex"}}\n' "$project" "$peer_project" "$peer_live_project" > "$rootcopy/data/shortcuts.json"
     printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+    printf '{"comet":{"name":"comet","aliases":["c"],"agent":"codex"}}\n' > "$profile_data/peers.json"
+    cat > "$rootcopy/profiles/team.json" <<JSON
+{"agents":{"codex":{"env":{"CCTRL_DATA_DIR":"$profile_data"}}}}
+JSON
+    cat > "$rootcopy/profiles/live.json" <<JSON
+{"agents":{"codex":{"env":{"CCTRL_DATA_DIR":"$profile_data","CCTRL_SESSION_METADATA_DIR":"$profile_meta"}}}}
+JSON
 
     : > "$log"
     local out
@@ -313,6 +510,21 @@ test_shortcut_no_args_defaults_to_tmux() {
     assert_contains "$out" "CCTRL_SESSION=TMUX--mstack"
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--mstack"
     assert_contains "$(cat "$log")" "@mstack --foreground --name TMUX--mstack"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$rootcopy/cctrl" @peerproj --peer c)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--peerproj"
+    assert_contains "$(cat "$log")" "CCTRL_PEER=comet"
+    assert_contains "$(cat "$log")" "--peer\\ comet"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--peerproj.json")" '"peer": "comet"'
+
+    cat > "$profile_meta/TMUX--shortcut-live.json" <<'JSON'
+{"purpose":"shortcut live peer","created_at":"2026-06-11T10:00:00Z","peer":"comet","cctrl_managed":true}
+JSON
+    local rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_SESSIONS="TMUX--shortcut-live" "$rootcopy/cctrl" @peerlive --foreground --peer c 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected shortcut foreground profile metadata --peer duplicate to fail"
+    assert_contains "$out" "already has a live tmux session"
 }
 
 test_purpose_prompt_uses_controlling_tty() {
@@ -359,6 +571,17 @@ test_remote_shortcut_injects_purpose() {
     assert_contains "$ssh_log" "CCTRL_HOST_PREFIX=ms\\ cctrl\\ @homelab"
     assert_contains "$ssh_log" "--agent\\ claude"
     assert_contains "$ssh_log" "--purpose\\ @homelab"
+
+    local remote_project="$TMPDIR/remote-peer-project"
+    mkdir -p "$remote_project"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" SSH_LOG="$log" CCTRL_PURPOSE_PROMPT=never \
+        "$rootcopy/cctrl" --host ms start -d --peer comet "$remote_project" >/dev/null 2>&1 || true
+
+    ssh_log="$(cat "$log")"
+    assert_contains "$ssh_log" "--peer\\ comet"
+    assert_contains "$ssh_log" "--purpose\\ remote-peer-project"
+    assert_not_contains "$ssh_log" "--purpose\\ comet"
 }
 
 test_attach_prompt_after_start() {
@@ -496,6 +719,13 @@ JSON
     assert_contains "$out" '"capabilities": ['
     assert_contains "$out" '"tmux"'
 
+    cat > "$CCTRL_SESSION_METADATA_DIR/bootstrap.json" <<'JSON'
+{"purpose":"bootstrapping peer","created_at":"2026-06-11T10:00:00Z","peer":"rover","cctrl_managed":true}
+JSON
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" TMUX_FAKE_SESSIONS="bootstrap" TMUX_FAKE_PANE_PID=99999 "$ROOT/cctrl" peer resolve rover --json)"
+    assert_contains "$out" '"name": "rover"'
+    assert_contains "$out" '"source": "derived"'
+
     local rc=0
     out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --alias demo 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected alias collision with derived peer to fail"
@@ -510,6 +740,66 @@ JSON
     out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve demo --json)"
     assert_contains "$out" '"dir": "/manual/demo"'
     assert_contains "$out" '"source": "manual"'
+
+    local peer_data="$TMPDIR/peer-derived-metadata-data"
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"peer session","created_at":"2026-06-11T10:00:00Z","peer":"comet"}
+JSON
+    CCTRL_DATA_DIR="$peer_data" "$ROOT/cctrl" peer register comet --dir /manual/comet --agent codex --capability polling >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$peer_data" "$ROOT/cctrl" peer resolve comet --json)"
+    assert_contains "$out" '"name": "comet"'
+    assert_contains "$out" '"source": "manual"'
+    assert_contains "$out" '"session": "demo"'
+    assert_contains "$out" '"tmux_target": "demo"'
+    assert_contains "$out" '"tmux"'
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$peer_data" "$ROOT/cctrl" peer resolve demo --json)"
+    assert_contains "$out" '"name": "comet"'
+
+    local backfill_data="$TMPDIR/peer-derived-agent-backfill-data"
+    CCTRL_DATA_DIR="$backfill_data" "$ROOT/cctrl" peer register comet --dir /manual/comet >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$backfill_data" "$ROOT/cctrl" peer resolve comet --json)"
+    assert_contains "$out" '"name": "comet"'
+    assert_contains "$out" '"source": "manual"'
+    assert_contains "$out" '"agent": "codex"'
+
+    CCTRL_DATA_DIR="$peer_data" "$ROOT/cctrl" peer register demo --dir /manual/demo --agent other >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$peer_data" "$ROOT/cctrl" peer resolve demo --json)"
+    assert_contains "$out" '"name": "demo"'
+    assert_contains "$out" '"dir": "/manual/demo"'
+    assert_contains "$out" '"source": "manual"'
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$peer_data" "$ROOT/cctrl" peer resolve comet --json)"
+    assert_contains "$out" '"name": "comet"'
+    printf '%s\n' "$out" | jq -e '(.aliases // []) | index("demo") | not' >/dev/null || fail "expected manual demo to shadow derived demo alias"
+
+    local alias_data="$TMPDIR/peer-derived-manual-alias-data"
+    local quiet_tmux_dir="$TMPDIR/quiet-tmux-bin"
+    mkdir -p "$quiet_tmux_dir"
+    cat > "$quiet_tmux_dir/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    list-sessions) exit 0 ;;
+    *) exit 1 ;;
+esac
+SH
+    chmod +x "$quiet_tmux_dir/tmux"
+    PATH="$quiet_tmux_dir:$PATH" CCTRL_DATA_DIR="$alias_data" "$ROOT/cctrl" peer register reviewer --alias demo --agent codex >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$alias_data" "$ROOT/cctrl" peer resolve demo --json)"
+    assert_contains "$out" '"name": "reviewer"'
+    assert_contains "$out" '"source": "manual"'
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$alias_data" "$ROOT/cctrl" peer resolve comet --json)"
+    assert_contains "$out" '"name": "comet"'
+    printf '%s\n' "$out" | jq -e '(.aliases // []) | index("demo") | not' >/dev/null || fail "expected manual demo alias to shadow derived demo alias"
+
+    local alias_name_data="$TMPDIR/peer-derived-manual-alias-name-data"
+    PATH="$quiet_tmux_dir:$PATH" CCTRL_DATA_DIR="$alias_name_data" "$ROOT/cctrl" peer register comet --alias c --agent codex >/dev/null
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"alias-name session","created_at":"2026-06-11T10:00:00Z","peer":"c"}
+JSON
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$alias_name_data" "$ROOT/cctrl" peer resolve c --json)"
+    assert_contains "$out" '"name": "comet"'
+    assert_contains "$out" '"source": "manual"'
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$alias_name_data" "$ROOT/cctrl" peer ls --json)"
+    printf '%s\n' "$out" | jq -e '[.peers[] | select(.source == "derived" and .name == "c")] | length == 0' >/dev/null || fail "expected manual alias c to shadow derived peer name c"
 }
 
 test_peer_validation_and_errors() {
@@ -541,6 +831,10 @@ test_peer_alias_derived_requires_manual_registration() {
     make_fake_ps "$TMPDIR/ps"
     local data="$TMPDIR/peer-derived-alias-data"
     local out rc=0
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"review stale session cleanup","created_at":"2026-06-11T10:00:00Z"}
+JSON
 
     out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias demo demo-agent 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected derived-only alias to fail"
@@ -1083,16 +1377,16 @@ test_peer_orchestrator_status_nudge_watch() {
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:20:00Z" "$ROOT/cctrl" peer watch --once --dry-run --json --renudge-after 1m --backoff 10m)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "dry-run"' >/dev/null || fail "expected watch to re-enable after backoff window"
 
-	    data="$TMPDIR/watch-interval-data"
-	    log="$TMPDIR/watch-interval-tmux.log"
-	    : > "$log"
-	    setup_delivery_peers "$data"
+    data="$TMPDIR/watch-interval-data"
+    log="$TMPDIR/watch-interval-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
     rc=0
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --interval 0 --json 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected watch --interval 0 to fail validation"
     printf '%s\n' "$out" | jq -e '.ok == false and .error.message == "interval must be positive"' >/dev/null || fail "expected watch --interval 0 JSON validation error"
-	    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --interval 1 --max-passes 2 --dry-run --json)"
-	    printf '%s\n' "$out" | jq -s -e 'length == 2 and .[0].pass == 1 and .[1].pass == 2' >/dev/null || fail "expected bounded watch interval to emit two pass summaries"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --interval 1 --max-passes 2 --dry-run --json)"
+    printf '%s\n' "$out" | jq -s -e 'length == 2 and .[0].pass == 1 and .[1].pass == 2' >/dev/null || fail "expected bounded watch interval to emit two pass summaries"
 }
 
 test_peer_gc_retention_and_doctor() {
@@ -1102,7 +1396,7 @@ test_peer_gc_retention_and_doctor() {
     : > "$log"
     setup_delivery_peers "$data"
 
-    local old_id queued_id delivered_id out active_count archive_count
+    local old_id queued_id delivered_id out active_count archive_count codex_home wrapper
     old_id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "old acked" | jq -r '.id')"
     CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:01Z" "$ROOT/cctrl" peer recv --as comet --json >/dev/null
     CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:02Z" "$ROOT/cctrl" peer ack "$old_id" --as comet --json >/dev/null
@@ -1137,13 +1431,89 @@ test_peer_gc_retention_and_doctor() {
     assert_contains "$(cat "$data/messages.jsonl")" "$queued_id"
     assert_contains "$(cat "$data/messages.jsonl")" "$delivered_id"
 
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer doctor comet --json)"
+    codex_home="$TMPDIR/codex-home"
+    wrapper="$TMPDIR/codex-notify-wrapper.sh"
+    mkdir -p "$codex_home"
+    cat > "$wrapper" <<SH
+#!/usr/bin/env bash
+exec "$ROOT/hooks/peer-doorbell.sh" codex "\$@"
+SH
+    chmod +x "$wrapper"
+    printf 'notify = ["%s"]\n' "$wrapper" > "$codex_home/config.toml"
+
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CODEX_HOME="$codex_home" "$ROOT/cctrl" peer doctor comet --json)"
     printf '%s\n' "$out" | jq -e '
-      .target == "comet"
-      and (.checks | map(select(.name == "jq" and .ok == true)) | length) == 1
-      and (.checks | map(select(.name == "mcp_bridge" and .ok == true)) | length) == 1
-      and (.checks | map(select(.name == "tmux_session_live" and .ok == true)) | length) == 1
-    ' >/dev/null || fail "expected peer doctor to check jq, tmux, and MCP bridge"
+        .target == "comet"
+        and (.checks | map(select(.name == "jq" and .ok == true)) | length) == 1
+        and (.checks | map(select(.name == "mcp_bridge" and .ok == true)) | length) == 1
+        and (.checks | map(select(.name == "tmux_session_live" and .ok == true)) | length) == 1
+        and (.checks | map(select(.name == "doorbell_hook_present" and .ok == true)) | length) == 1
+        and (.checks | map(select(.name == "doorbell_hook_executable" and .ok == true)) | length) == 1
+        and (.checks | map(select(.name == "doorbell_hook_registered" and .ok == true and .agent == "codex")) | length) == 1
+    ' >/dev/null || fail "expected peer doctor to check jq, tmux, MCP bridge, and Codex doorbell wrapper"
+}
+
+test_peer_doorbell_hook() {
+    local fake="$TMPDIR/fake-cctrl-doorbell"
+    cat > "$fake" <<'SH'
+#!/usr/bin/env bash
+case "${CCTRL_FAKE_CHECK:-empty}" in
+    queued)
+        printf '{"peer":"%s","queued":2,"delivered_unacked":0,"oldest_queued_age_seconds":1}\n' "${CCTRL_PEER:-}"
+        exit 0
+        ;;
+    delivered)
+        printf '{"peer":"%s","queued":0,"delivered_unacked":1,"oldest_queued_age_seconds":null}\n' "${CCTRL_PEER:-}"
+        exit 0
+        ;;
+    error)
+        echo "boom" >&2
+        exit 65
+        ;;
+    *)
+        printf '{"peer":"%s","queued":0,"delivered_unacked":0,"oldest_queued_age_seconds":null}\n' "${CCTRL_PEER:-}"
+        exit 2
+        ;;
+esac
+SH
+    chmod +x "$fake"
+
+    local out rc=0
+    out="$(CCTRL_BIN="$fake" CCTRL_FAKE_CHECK=queued "$ROOT/hooks/peer-doorbell.sh" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected unset CCTRL_PEER doorbell to exit 0"
+    [[ -z "$out" ]] || fail "expected unset CCTRL_PEER doorbell to be silent"
+
+    local stdin_capture="$TMPDIR/doorbell.stdin" wrapper="$TMPDIR/doorbell-stdin-wrapper.sh"
+    cat > "$wrapper" <<SH
+#!/usr/bin/env bash
+"$ROOT/hooks/peer-doorbell.sh" codex >/dev/null 2>&1 || true
+cat > "$stdin_capture"
+SH
+    chmod +x "$wrapper"
+    printf '{"hook":"notify"}' | CCTRL_BIN="$fake" CCTRL_PEER=comet CCTRL_FAKE_CHECK=queued "$wrapper"
+    assert_contains "$(cat "$stdin_capture")" '{"hook":"notify"}'
+
+    local stdout="$TMPDIR/doorbell.stdout" stderr="$TMPDIR/doorbell.stderr"
+    rc=0
+    CCTRL_BIN="$fake" CCTRL_PEER=comet CCTRL_FAKE_CHECK=queued "$ROOT/hooks/peer-doorbell.sh" >"$stdout" 2>"$stderr" || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "expected queued Claude doorbell to exit 2, got $rc"
+    [[ -z "$(cat "$stdout")" ]] || fail "expected queued Claude doorbell stdout to be empty"
+    assert_contains "$(cat "$stderr")" "[cctrl] 2 new peer message(s) for comet. Run: cctrl peer recv --as comet --json"
+
+    rc=0
+    out="$(CCTRL_BIN="$fake" CCTRL_PEER=comet CCTRL_FAKE_CHECK=delivered "$ROOT/hooks/peer-doorbell.sh" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected delivered-only doorbell to exit 0"
+    [[ -z "$out" ]] || fail "expected delivered-only doorbell to be silent"
+
+    rc=0
+    out="$(CCTRL_BIN="$fake" CCTRL_PEER=comet CCTRL_FAKE_CHECK=error "$ROOT/hooks/peer-doorbell.sh" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected errored doorbell to fail open"
+    [[ -z "$out" ]] || fail "expected errored doorbell to be silent"
+
+    rc=0
+    out="$(CCTRL_BIN="$fake" CCTRL_PEER=comet CCTRL_FAKE_CHECK=queued "$ROOT/hooks/peer-doorbell.sh" codex 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected Codex notify doorbell to exit 0"
+    assert_contains "$out" "cctrl peer recv --as comet --json"
 }
 
 test_session_close_self_graceful() {
@@ -1291,6 +1661,7 @@ test_syntax
 test_launch_args
 test_detached_arg_parsing
 test_start_defaults_to_tmux
+test_start_peer_env_and_metadata
 test_shortcut_no_args_defaults_to_tmux
 test_purpose_prompt_uses_controlling_tty
 test_remote_shortcut_injects_purpose
@@ -1315,6 +1686,7 @@ test_peer_deliver_busy_no_submit_and_inline
 test_peer_deliver_failures_all_and_concurrency
 test_peer_orchestrator_status_nudge_watch
 test_peer_gc_retention_and_doctor
+test_peer_doorbell_hook
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json

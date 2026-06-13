@@ -183,6 +183,7 @@ _cctrl() {
             _arguments \
                 '--resume[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
+                '--peer[Peer mailbox identity]:peer:_cctrl_peers' \
                 '--purpose[Session purpose metadata]:purpose:' \
                 '--foreground[Launch directly without tmux]' \
                 '--no-tmux[Launch directly without tmux]' \
@@ -210,6 +211,7 @@ _cctrl() {
                 {--resume,-r}'[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
                 {--name,-n}'[Session display name]:name:' \
+                '--peer[Peer mailbox identity]:peer:_cctrl_peers' \
                 '--purpose[Session purpose metadata]:purpose:' \
                 '--yolo[Full bypass mode]' \
                 '--permission-mode[Claude permission mode]:mode:' \

@@ -1,13 +1,16 @@
 ---
 id: 008
 title: Add idle-hook doorbell for peer messages
-status: in-progress
+status: done
 blocked-by: [004, 005]
 priority: 8
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-11
+completed: 2026-06-13
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -95,3 +98,38 @@ Checks:
 | Eng Review | `/plan-eng-review` | Hook blocking semantics must never break normal agent stop flow | 1 | CLEAR | 0 issues; resolver linkage clarified, doctor doorbell checks added |
 
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Added a fail-open peer doorbell hook for Claude Code blocking hook feedback
+and Codex notification-only flows. The hook checks queued mailbox counts via
+`cctrl peer check`, preserves stdin for wrapper composition, ignores
+delivered-only messages, and exits 2 only for Claude-style queued-message
+feedback.
+
+Wired `--peer` through foreground, detached, and shortcut launches so the
+canonical peer identity is exported as `CCTRL_PEER`, stored in session
+metadata, and resolved safely across profile overlays. Extended derived/manual
+peer resolution to handle metadata-backed identities, alias shadowing, live
+manual-session duplicate checks, and stale manual sessions that should yield
+to a live derived session.
+
+Documented Claude and Codex setup, added completions, and extended `peer
+doctor` with doorbell presence, executable, and registration checks.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `README.md` (modified)
+- `completions/_cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `hooks/peer-doorbell.sh` (added)
+- `docs/plans/008-idle-hook-doorbell.md` (modified)
+
+**Verification:**
+
+- `bash -n cctrl && bash -n hooks/peer-doorbell.sh && bash -n tests/run-tests.sh && zsh -n completions/_cctrl && git diff --check && bash tests/run-tests.sh < /dev/null` -> PASS
+- `PLAN_ID=008 bash /Users/matthew/dev/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
+- `codex exec` review pass -> no findings
+
+**Commit:** PENDING
