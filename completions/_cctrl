@@ -274,6 +274,11 @@ _cctrl() {
                     'check:Check unread mailbox counts'
                     'recv:Receive the next mailbox message'
                     'deliver:Nudge tmux peers with queued messages'
+                    'status:Summarize peer mailbox state'
+                    'nudge:Re-nudge queued peer messages'
+                    'gc:Archive retained mailbox messages'
+                    'watch:Run orchestrator watch loop'
+                    'doctor:Check peer messaging health'
                     'mcp:Run stdio MCP peer messaging server'
                     'show:Show a mailbox message'
                     'ack:Acknowledge a delivered message'
@@ -369,6 +374,54 @@ _cctrl() {
                                 '--no-submit[Paste the nudge without pressing Enter]' \
                                 '--inline[Paste a full message body without submitting]:message:_cctrl_message_ids' \
                                 '--force-busy[Paste even when readiness cannot be proven]'
+                        fi
+                        ;;
+                    status)
+                        _arguments \
+                            '--json[Machine-readable output]' \
+                            '--fail-threshold[Consecutive failed nudges before failing]:count:' \
+                            '--backoff[Backoff window]:duration:(10m 1h)'
+                        ;;
+                    nudge)
+                        if (( CURRENT == 4 )); then
+                            _arguments \
+                                '--stale[Re-nudge stale queued messages]' \
+                                '*:peer:_cctrl_peers'
+                        else
+                            _arguments \
+                                '--stale[Re-nudge stale queued messages]' \
+                                '--older-than[Staleness threshold]:duration:(15m 1h)' \
+                                '--dry-run[Report without pasting or mutating]' \
+                                '--json[Machine-readable output]' \
+                                '--no-submit[Paste without pressing Enter]' \
+                                '--force-busy[Paste even when readiness cannot be proven]'
+                        fi
+                        ;;
+                    gc)
+                        _arguments \
+                            '--older-than[Retention age]:duration:(7d 30d)' \
+                            '--status[Status filter]:status:(acked delivered queued)' \
+                            '--dry-run[Report without archiving]' \
+                            '--json[Machine-readable output]'
+                        ;;
+                    watch)
+                        _arguments \
+                            '--once[Run one pass]' \
+                            '--force[Bypass singleton lock for --once]' \
+                            '--interval[Loop interval seconds]:seconds:' \
+                            '--max-passes[Stop after N passes]:count:' \
+                            '--renudge-after[Re-nudge threshold]:duration:(15m 1h)' \
+                            '--backoff[Backoff window]:duration:(10m 1h)' \
+                            '--fail-threshold[Consecutive failed nudges before backoff]:count:' \
+                            '--dry-run[Report without pasting or mutating]' \
+                            '--json[Machine-readable output]' \
+                            '--force-busy[Paste even when readiness cannot be proven]'
+                        ;;
+                    doctor)
+                        if (( CURRENT == 4 )); then
+                            _cctrl_peers
+                        else
+                            _arguments '--json[Machine-readable output]'
                         fi
                         ;;
                     mcp)

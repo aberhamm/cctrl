@@ -1,13 +1,16 @@
 ---
 id: 007
 title: Add orchestrator watch workflow for peer messaging
-status: in-progress
+status: done
 blocked-by: [004, 005, 006]
 priority: 7
 goal: cctrl-agent-peer-messaging
 allows-migrations: false
 needs-review: none
 created: 2026-06-08
+completed: 2026-06-13
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -138,3 +141,28 @@ Checks:
 | Eng Review | `/plan-eng-review` | Orchestration loop concurrency and retention semantics need review | 1 | CLEAR | 0 issues; doctor gains jq check; trust model added to README scope |
 
 - **VERDICT:** ENG CLEARED. Ready to implement.
+
+## Implementation Notes
+
+Added the orchestrator-facing peer messaging workflow: status summaries,
+manual and stale nudges, bounded and continuous watch passes with singleton
+locking and backoff, archive-only mailbox GC, and a doctor command for local
+peer messaging health. The watch path leaves polling-only peers queued,
+reuses tmux nudges only for tmux-capable peers, and validates edge cases found
+in review: GC preserves the active mailbox when archive writes fail, explicit
+nudge target typos fail, and zero-second watch intervals are rejected.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `README.md` (modified)
+- `completions/_cctrl` (modified)
+- `docs/plans/007-orchestrator-watch-workflow.md` (modified)
+
+**Verification:**
+
+- `PLAN_ID=007 bash /Users/matthew/dev/projects/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
+- `codex review --uncommitted` -> 3 findings, all fixed
+
+**Commit:** `PENDING` — `feat(peer): add orchestrator watch workflow`

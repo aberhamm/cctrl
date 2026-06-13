@@ -2826,6 +2826,699 @@ _peer_cmd_deliver() {
     return $rc
 }
 
+_duration_to_seconds() {
+    local value="$1" number unit
+    if [[ "$value" =~ ^([0-9]+)([smhd]?)$ ]]; then
+        number="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]:-s}"
+        case "$unit" in
+            s|"") DURATION_SECONDS="$number" ;;
+            m) DURATION_SECONDS=$((number * 60)) ;;
+            h) DURATION_SECONDS=$((number * 60 * 60)) ;;
+            d) DURATION_SECONDS=$((number * 24 * 60 * 60)) ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+_peer_now_epoch() {
+    jq -nr --arg ts "$(_peer_now_utc)" '$ts | fromdateiso8601 | floor'
+}
+
+_peer_json_bool() {
+    [[ "${1:-false}" == "true" ]] && printf 'true' || printf 'false'
+}
+
+_peer_backoff_state_json() {
+    local messages="$1" peer="$2" fail_threshold="$3" backoff_seconds="$4" now_epoch="$5"
+    jq -n \
+      --argjson messages "$messages" \
+      --arg peer "$peer" \
+      --argjson threshold "$fail_threshold" \
+      --argjson backoff "$backoff_seconds" \
+      --argjson now "$now_epoch" '
+        def epoch($ts): if $ts == null or $ts == "" then null else try ($ts | fromdateiso8601 | floor) catch null end;
+        ([ $messages[]
+          | select(.to == $peer and .status == "queued")
+          | (.history // [])[]?
+          | select(.event == "nudge")
+          | {at, ok}
+        ] | sort_by(.at) | reverse) as $events
+        | ($events | reduce .[] as $event (
+            {count: 0, last_failed_at: null, stopped: false};
+            if .stopped then .
+            elif $event.ok == false then
+              .count = (.count + 1)
+              | .last_failed_at = (.last_failed_at // $event.at)
+            elif $event.ok == true then
+              .stopped = true
+            else .
+            end
+          )) as $state
+        | (epoch($state.last_failed_at)) as $last_failed_epoch
+        | {
+            consecutive_failed_nudges: $state.count,
+            last_failed_nudge_at: $state.last_failed_at,
+            backoff_active: (
+              $state.count >= $threshold
+              and $last_failed_epoch != null
+              and (($now - $last_failed_epoch) < $backoff)
+            )
+          }'
+}
+
+_peer_status_summary_json() {
+    local peers_doc="$1" messages="$2" fail_threshold="$3" backoff_seconds="$4" now_epoch="$5"
+    jq -n \
+      --argjson doc "$peers_doc" \
+      --argjson messages "$messages" \
+      --argjson threshold "$fail_threshold" \
+      --argjson backoff "$backoff_seconds" \
+      --argjson now "$now_epoch" \
+      --arg mailbox "$MESSAGES_FILE" '
+        def epoch($ts): if $ts == null or $ts == "" then null else try ($ts | fromdateiso8601 | floor) catch null end;
+        def transports($peer):
+          ([ if (($peer.capabilities // []) | index("tmux")) then "tmux" else empty end,
+             if (($peer.capabilities // []) | index("polling")) then "polling" else empty end,
+             "mcp"
+          ] | unique);
+        def fail_state($name):
+          ([ $messages[]
+            | select(.to == $name and .status == "queued")
+            | (.history // [])[]?
+            | select(.event == "nudge")
+            | {at, ok}
+          ] | sort_by(.at) | reverse) as $events
+          | ($events | reduce .[] as $event (
+              {count: 0, last_failed_at: null, stopped: false};
+              if .stopped then .
+              elif $event.ok == false then
+                .count = (.count + 1)
+                | .last_failed_at = (.last_failed_at // $event.at)
+              elif $event.ok == true then
+                .stopped = true
+              else .
+              end
+            )) as $state
+          | (epoch($state.last_failed_at)) as $last_failed_epoch
+          | {
+              consecutive_failed_nudges: $state.count,
+              last_failed_nudge_at: $state.last_failed_at,
+              backoff_active: (
+                $state.count >= $threshold
+                and $last_failed_epoch != null
+                and (($now - $last_failed_epoch) < $backoff)
+              )
+            };
+        def peer_summary($peer):
+          ($peer.name) as $name
+          | ([ $messages[] | select(.to == $name and .status == "queued") ]) as $queued
+          | ([ $messages[] | select(.to == $name and .status == "delivered") ]) as $delivered
+          | (fail_state($name)) as $fail
+          | {
+              name: $name,
+              source: ($peer.source // null),
+              agent: ($peer.agent // null),
+              host: ($peer.host // null),
+              dir: ($peer.dir // null),
+              session: ($peer.session // null),
+              tmux_target: ($peer.tmux_target // null),
+              capabilities: ($peer.capabilities // []),
+              transports: transports($peer),
+              queued: ($queued | length),
+              delivered_unacked: ($delivered | length),
+              oldest_queued_age_seconds: (
+                [ $queued[] | epoch(.created_at) | select(. != null) ]
+                | if length == 0 then null else ($now - min) end
+              ),
+              last_nudge_at: ([ $queued[] | .last_nudge_at // empty ] | max // null),
+              last_nudge_error: ([ $queued[] | .last_nudge_error // empty ] | last // null),
+              consecutive_failed_nudges: $fail.consecutive_failed_nudges,
+              last_failed_nudge_at: $fail.last_failed_nudge_at,
+              nudge_failing: $fail.backoff_active
+            };
+        ([ ($doc.peers // [])[] | peer_summary(.) ]) as $peers
+        | {
+            checked_at: (now | todateiso8601),
+            mailbox: $mailbox,
+            totals: {
+              queued: ([ $messages[] | select(.status == "queued") ] | length),
+              delivered_unacked: ([ $messages[] | select(.status == "delivered") ] | length)
+            },
+            transports: {
+              tmux: ([ $peers[] | select((.transports | index("tmux")) != null) ] | length),
+              polling: ([ $peers[] | select((.transports | index("polling")) != null) ] | length),
+              mcp: ($peers | length)
+            },
+            nudge_failing: [ $peers[] | select(.nudge_failing) | .name ],
+            peers: $peers
+          }'
+}
+
+_peer_cmd_status() {
+    local json=false fail_threshold=3 backoff_seconds=600 backoff_arg="10m" peers_doc messages now_epoch summary
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)
+                json=true; shift ;;
+            --fail-threshold)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--fail-threshold needs a value" || echo -e "${RED}--fail-threshold needs a value${RESET}" >&2; return 64; }
+                fail_threshold="$2"; shift 2 ;;
+            --backoff)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--backoff needs a duration" || echo -e "${RED}--backoff needs a duration${RESET}" >&2; return 64; }
+                backoff_arg="$2"; shift 2 ;;
+            *)
+                $json && _json_error "validation" "Unknown peer status flag: $1" || echo -e "${RED}Unknown peer status flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+    [[ "$fail_threshold" =~ ^[0-9]+$ ]] || { $json && _json_error "validation" "fail threshold must be a number" || echo -e "${RED}fail threshold must be a number${RESET}" >&2; return 64; }
+    _duration_to_seconds "$backoff_arg" || { $json && _json_error "validation" "Invalid duration: $backoff_arg" || echo -e "${RED}Invalid duration: $backoff_arg${RESET}" >&2; return 64; }
+    backoff_seconds="$DURATION_SECONDS"
+    unset DURATION_SECONDS
+    peers_doc="$(_peer_all_json)" || return 1
+    _mailbox_read_json_or_error "$json" || return $?
+    messages="$MAILBOX_MESSAGES"
+    now_epoch="$(_peer_now_epoch)"
+    summary="$(_peer_status_summary_json "$peers_doc" "$messages" "$fail_threshold" "$backoff_seconds" "$now_epoch")"
+    if $json; then
+        jq '.' <<< "$summary"
+    else
+        jq -r '
+          "Queued: \(.totals.queued)",
+          "Delivered unacked: \(.totals.delivered_unacked)",
+          "Transports: tmux=\(.transports.tmux) polling=\(.transports.polling) mcp=\(.transports.mcp)",
+          "Nudge failing: \((.nudge_failing | join(", ")) // "")",
+          "",
+          (.peers[] | "\(.name): queued=\(.queued) delivered=\(.delivered_unacked) transports=\(.transports | join(","))")
+        ' <<< "$summary"
+    fi
+}
+
+_peer_stale_recipients_json() {
+    local messages="$1" older_seconds="$2" now_epoch="$3"
+    jq -c --argjson older "$older_seconds" --argjson now "$now_epoch" '
+        [ .[]
+          | select(.status == "queued")
+          | select(
+              (.last_nudge_at // "") == ""
+              or ((try ((.last_nudge_at | fromdateiso8601 | floor)) catch 0) as $last | ($now - $last) >= $older)
+            )
+          | .to
+        ] | unique
+    ' <<< "$messages"
+}
+
+_peer_delivered_stale_json() {
+    local messages="$1" older_seconds="$2" now_epoch="$3"
+    jq -c --argjson older "$older_seconds" --argjson now "$now_epoch" '
+        [ .[]
+          | select(.status == "delivered")
+          | ((.delivered_at // .updated_at // .created_at // "") | try fromdateiso8601 catch null) as $seen
+          | select($seen != null and (($now - ($seen | floor)) >= $older))
+        ]
+    ' <<< "$messages"
+}
+
+_peer_manual_result_json() {
+    jq -n \
+      --arg peer "${PEER_DELIVER_PEER:-}" \
+      --arg status "${PEER_DELIVER_STATUS:-skipped}" \
+      --arg reason "${PEER_DELIVER_REASON:-}" \
+      --argjson queued "${PEER_DELIVER_QUEUED:-0}" \
+      --argjson dry_run "${PEER_DELIVER_DRY_RUN:-false}" \
+      '{peer:$peer,status:$status,queued:$queued,dry_run:$dry_run}
+       + (if $reason != "" then {reason:$reason} else {} end)'
+}
+
+_peer_orchestrate_recipients_locked() {
+    local messages="$1" recipients_json="$2" dry_run="$3" no_submit="$4" force_busy="$5" respect_backoff="$6" fail_threshold="$7" backoff_seconds="$8" polling_skip="$9"
+    local results="[]" result target peer_json state now_epoch queued rc=0
+    now_epoch="$(_peer_now_epoch)"
+    while IFS= read -r target; do
+        [[ -n "$target" ]] || continue
+        if ! peer_json="$(_peer_resolve_json "$target" 2>/dev/null)"; then
+            PEER_DELIVER_PEER="$target"
+            PEER_DELIVER_STATUS="skipped"
+            PEER_DELIVER_REASON="unknown-peer"
+            PEER_DELIVER_QUEUED="$(jq -r --arg peer "$target" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
+            PEER_DELIVER_DRY_RUN="$dry_run"
+            result="$(_peer_manual_result_json)"
+        else
+            target="$(jq -r '.name' <<< "$peer_json")"
+            queued="$(jq -r --arg peer "$target" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
+            if [[ "$polling_skip" == "true" ]] && ! _peer_has_capability "$peer_json" "tmux"; then
+                PEER_DELIVER_PEER="$target"
+                PEER_DELIVER_STATUS="polling"
+                PEER_DELIVER_REASON="no-tmux-capability"
+                PEER_DELIVER_QUEUED="$queued"
+                PEER_DELIVER_DRY_RUN="$dry_run"
+                result="$(_peer_manual_result_json)"
+            elif [[ "$respect_backoff" == "true" ]]; then
+                state="$(_peer_backoff_state_json "$messages" "$target" "$fail_threshold" "$backoff_seconds" "$now_epoch")"
+                if [[ "$(jq -r '.backoff_active' <<< "$state")" == "true" ]]; then
+                    PEER_DELIVER_PEER="$target"
+                    PEER_DELIVER_STATUS="backoff"
+                    PEER_DELIVER_REASON="consecutive nudge failures: $(jq -r '.consecutive_failed_nudges' <<< "$state")"
+                    PEER_DELIVER_QUEUED="$queued"
+                    PEER_DELIVER_DRY_RUN="$dry_run"
+                    result="$(_peer_manual_result_json)"
+                else
+                    result="$(_peer_deliver_one_locked "$peer_json" "$messages" "$dry_run" true "$no_submit" "$force_busy" "")" || rc=1
+                    messages="$(_mailbox_read_json)"
+                fi
+            else
+                result="$(_peer_deliver_one_locked "$peer_json" "$messages" "$dry_run" true "$no_submit" "$force_busy" "")" || rc=1
+                messages="$(_mailbox_read_json)"
+            fi
+        fi
+        results="$(jq --argjson r "$result" '. + [$r]' <<< "$results")"
+    done < <(jq -r '.[]' <<< "$recipients_json")
+    PEER_ORCH_RESULTS="$results"
+    PEER_ORCH_MESSAGES="$messages"
+    PEER_ORCH_RC="$rc"
+}
+
+_peer_cmd_nudge() {
+    local target="" stale=false older_arg="15m" older_seconds=900 dry_run=false json=false no_submit=false force_busy=false target_peer_json=""
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --stale)
+                stale=true; shift ;;
+            --older-than)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--older-than needs a duration" || echo -e "${RED}--older-than needs a duration${RESET}" >&2; return 64; }
+                older_arg="$2"; shift 2 ;;
+            --dry-run)
+                dry_run=true; shift ;;
+            --json)
+                json=true; shift ;;
+            --no-submit)
+                no_submit=true; shift ;;
+            --force-busy)
+                force_busy=true; shift ;;
+            -*)
+                $json && _json_error "validation" "Unknown peer nudge flag: $1" || echo -e "${RED}Unknown peer nudge flag: $1${RESET}" >&2
+                return 64 ;;
+            *)
+                if [[ -n "$target" ]]; then
+                    $json && _json_error "validation" "Only one peer target is allowed" || echo -e "${RED}Only one peer target is allowed.${RESET}" >&2
+                    return 64
+                fi
+                target="$1"; shift ;;
+        esac
+    done
+    if [[ -z "$target" && "$stale" != "true" ]]; then
+        $json && _json_error "validation" "Usage: cctrl peer nudge <peer>|--stale [--older-than 15m]" || echo -e "${RED}Usage: cctrl peer nudge <peer>|--stale [--older-than 15m]${RESET}" >&2
+        return 64
+    fi
+    _duration_to_seconds "$older_arg" || { $json && _json_error "validation" "Invalid duration: $older_arg" || echo -e "${RED}Invalid duration: $older_arg${RESET}" >&2; return 64; }
+    older_seconds="$DURATION_SECONDS"
+    unset DURATION_SECONDS
+    if [[ -n "$target" ]]; then
+        if ! target_peer_json="$(_peer_resolve_json "$target" 2>/dev/null)"; then
+            $json && _json_error "unknown-peer" "Unknown peer: $target" || _mailbox_require_peer "peer" "$target" false
+            return 66
+        fi
+        target="$(jq -r '.name' <<< "$target_peer_json")"
+    fi
+
+    local messages recipients delivered results rc=0 lock_rc=0 now_epoch json_ok=true
+    now_epoch="$(_peer_now_epoch)"
+    _mailbox_lock_acquire || return 1
+    if ! {
+        _mailbox_read_json_or_error "$json" || lock_rc=$?
+        if [[ $lock_rc -eq 0 ]]; then
+            messages="$MAILBOX_MESSAGES"
+            if [[ "$stale" == "true" ]]; then
+                recipients="$(_peer_stale_recipients_json "$messages" "$older_seconds" "$now_epoch")"
+                if [[ -n "$target" ]]; then
+                    recipients="$(jq -c --arg t "$target" '[ .[] | select(. == $t) ]' <<< "$recipients")"
+                fi
+            else
+                recipients="$(jq -cn --arg t "$target" '[$t]')"
+            fi
+            delivered="$(_peer_delivered_stale_json "$messages" "$older_seconds" "$now_epoch")"
+            _peer_orchestrate_recipients_locked "$messages" "$recipients" "$dry_run" "$no_submit" "$force_busy" false 3 600 false
+            results="$PEER_ORCH_RESULTS"
+            messages="$PEER_ORCH_MESSAGES"
+            rc="$PEER_ORCH_RC"
+            unset PEER_ORCH_RESULTS PEER_ORCH_MESSAGES PEER_ORCH_RC
+        else
+            rc=$lock_rc
+        fi
+    }; then
+        rc=1
+    fi
+    _mailbox_lock_release
+    [[ $rc -eq 66 ]] && return 66
+    [[ $rc -eq 65 ]] && return 65
+    [[ $rc -ne 0 ]] && json_ok=false
+    if $json; then
+        jq -n --argjson ok "$json_ok" --argjson results "${results:-[]}" --argjson delivered "${delivered:-[]}" --argjson older "$older_seconds" \
+            '{ok:$ok,older_than_seconds:$older,results:$results,delivered_unacked_stale:$delivered}'
+    else
+        jq -c '.[]' <<< "${results:-[]}" | while IFS= read -r result; do
+            _peer_print_delivery_human "$result"
+        done
+        if [[ "$(jq -r 'length' <<< "${delivered:-[]}")" != "0" ]]; then
+            echo -e "${YELLOW}Delivered but unacked messages past threshold:${RESET}"
+            jq '.' <<< "$delivered" | _mailbox_print_messages_human
+        fi
+    fi
+    return $rc
+}
+
+_watch_lock_path() {
+    printf '%s/watch.lock.d' "$PEER_DATA_DIR"
+}
+
+_watch_lock_acquire() {
+    mkdir -p "$PEER_DATA_DIR"
+    local lock_path pid
+    lock_path="$(_watch_lock_path)"
+    if mkdir "$lock_path" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lock_path/pid"
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$lock_path/created_at" 2>/dev/null || true
+        WATCH_LOCK_HELD="$lock_path"
+        return 0
+    fi
+    if [[ -f "$lock_path/pid" ]]; then
+        pid="$(cat "$lock_path/pid" 2>/dev/null || true)"
+        if _pid_alive "$pid"; then
+            WATCH_LOCK_PID="$pid"
+            return 2
+        fi
+    fi
+    rm -rf "$lock_path" 2>/dev/null || true
+    if mkdir "$lock_path" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lock_path/pid"
+        date -u +"%Y-%m-%dT%H:%M:%SZ" > "$lock_path/created_at" 2>/dev/null || true
+        WATCH_LOCK_HELD="$lock_path"
+        return 0
+    fi
+    WATCH_LOCK_PID="unknown"
+    return 2
+}
+
+_watch_lock_release() {
+    [[ -n "${WATCH_LOCK_HELD:-}" ]] || return 0
+    rm -rf "$WATCH_LOCK_HELD" 2>/dev/null || true
+    unset WATCH_LOCK_HELD
+}
+
+_peer_watch_pass() {
+    local pass="$1" renudge_seconds="$2" backoff_seconds="$3" fail_threshold="$4" dry_run="$5" force_busy="$6"
+    local messages recipients delivered results rc=0 lock_rc=0 now_epoch summary
+    now_epoch="$(_peer_now_epoch)"
+    _mailbox_lock_acquire || return 1
+    if ! {
+        _mailbox_read_json_or_error true || lock_rc=$?
+        if [[ $lock_rc -eq 0 ]]; then
+            messages="$MAILBOX_MESSAGES"
+            recipients="$(_peer_stale_recipients_json "$messages" "$renudge_seconds" "$now_epoch")"
+            delivered="$(_peer_delivered_stale_json "$messages" "$renudge_seconds" "$now_epoch")"
+            _peer_orchestrate_recipients_locked "$messages" "$recipients" "$dry_run" false "$force_busy" true "$fail_threshold" "$backoff_seconds" true
+            results="$PEER_ORCH_RESULTS"
+            messages="$PEER_ORCH_MESSAGES"
+            rc="$PEER_ORCH_RC"
+            unset PEER_ORCH_RESULTS PEER_ORCH_MESSAGES PEER_ORCH_RC
+        else
+            rc=$lock_rc
+        fi
+    }; then
+        rc=1
+    fi
+    _mailbox_lock_release
+    [[ $rc -ne 0 ]] && PEER_WATCH_OK=false || PEER_WATCH_OK=true
+    summary="$(jq -n \
+        --argjson pass "$pass" \
+        --arg checked_at "$(_peer_now_utc)" \
+        --argjson ok "$(_peer_json_bool "$PEER_WATCH_OK")" \
+        --argjson dry_run "$(_peer_json_bool "$dry_run")" \
+        --argjson results "${results:-[]}" \
+        --argjson delivered "${delivered:-[]}" \
+        '{ok:$ok,pass:$pass,checked_at:$checked_at,dry_run:$dry_run,results:$results,delivered_unacked_stale:$delivered}')"
+    PEER_WATCH_PASS="$summary"
+    return $rc
+}
+
+_peer_cmd_watch() {
+    local once=false force=false interval="" max_passes="" renudge_arg="15m" backoff_arg="10m" dry_run=false json=false force_busy=false fail_threshold=3
+    local renudge_seconds=900 backoff_seconds=600 pass=0 lock_rc rc=0 summary
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --once)
+                once=true; shift ;;
+            --force)
+                force=true; shift ;;
+            --interval)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--interval needs seconds" || echo -e "${RED}--interval needs seconds${RESET}" >&2; return 64; }
+                interval="$2"; shift 2 ;;
+            --max-passes)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--max-passes needs a number" || echo -e "${RED}--max-passes needs a number${RESET}" >&2; return 64; }
+                max_passes="$2"; shift 2 ;;
+            --renudge-after)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--renudge-after needs a duration" || echo -e "${RED}--renudge-after needs a duration${RESET}" >&2; return 64; }
+                renudge_arg="$2"; shift 2 ;;
+            --backoff)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--backoff needs a duration" || echo -e "${RED}--backoff needs a duration${RESET}" >&2; return 64; }
+                backoff_arg="$2"; shift 2 ;;
+            --fail-threshold)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--fail-threshold needs a number" || echo -e "${RED}--fail-threshold needs a number${RESET}" >&2; return 64; }
+                fail_threshold="$2"; shift 2 ;;
+            --dry-run)
+                dry_run=true; shift ;;
+            --json)
+                json=true; shift ;;
+            --force-busy)
+                force_busy=true; shift ;;
+            *)
+                $json && _json_error "validation" "Unknown peer watch flag: $1" || echo -e "${RED}Unknown peer watch flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+    [[ -z "$interval" || "$interval" =~ ^[0-9]+$ ]] || { $json && _json_error "validation" "interval must be seconds" || echo -e "${RED}interval must be seconds${RESET}" >&2; return 64; }
+    [[ -z "$interval" || "$interval" -gt 0 ]] || { $json && _json_error "validation" "interval must be positive" || echo -e "${RED}interval must be positive${RESET}" >&2; return 64; }
+    [[ -z "$max_passes" || "$max_passes" =~ ^[0-9]+$ ]] || { $json && _json_error "validation" "max-passes must be a number" || echo -e "${RED}max-passes must be a number${RESET}" >&2; return 64; }
+    [[ "$fail_threshold" =~ ^[0-9]+$ ]] || { $json && _json_error "validation" "fail threshold must be a number" || echo -e "${RED}fail threshold must be a number${RESET}" >&2; return 64; }
+    _duration_to_seconds "$renudge_arg" || { $json && _json_error "validation" "Invalid duration: $renudge_arg" || echo -e "${RED}Invalid duration: $renudge_arg${RESET}" >&2; return 64; }
+    renudge_seconds="$DURATION_SECONDS"
+    _duration_to_seconds "$backoff_arg" || { $json && _json_error "validation" "Invalid duration: $backoff_arg" || echo -e "${RED}Invalid duration: $backoff_arg${RESET}" >&2; return 64; }
+    backoff_seconds="$DURATION_SECONDS"
+    unset DURATION_SECONDS
+    if [[ "$once" != "true" && -z "$interval" ]]; then
+        once=true
+    fi
+    if [[ "$force" == "true" && "$once" != "true" ]]; then
+        $json && _json_error "validation" "--force is only valid with --once" || echo -e "${RED}--force is only valid with --once${RESET}" >&2
+        return 64
+    fi
+    if [[ ! ( "$force" == "true" && "$once" == "true" ) ]]; then
+        if _watch_lock_acquire; then
+            lock_rc=0
+        else
+            lock_rc=$?
+        fi
+        if [[ $lock_rc -eq 2 ]]; then
+            echo "already running (pid ${WATCH_LOCK_PID:-unknown})" >&2
+            return 1
+        elif [[ $lock_rc -ne 0 ]]; then
+            echo "could not acquire watch lock" >&2
+            return 1
+        fi
+        trap '_watch_lock_release' INT TERM EXIT
+    fi
+    while true; do
+        pass=$((pass + 1))
+        _peer_watch_pass "$pass" "$renudge_seconds" "$backoff_seconds" "$fail_threshold" "$dry_run" "$force_busy" || rc=1
+        summary="$PEER_WATCH_PASS"
+        unset PEER_WATCH_PASS
+        if $json; then
+            if $once; then jq '.' <<< "$summary"; else jq -c '.' <<< "$summary"; fi
+        else
+            jq -c '.results[]?' <<< "$summary" | while IFS= read -r result; do
+                _peer_print_delivery_human "$result"
+            done
+        fi
+        if $once; then
+            break
+        fi
+        if [[ -n "$max_passes" && "$pass" -ge "$max_passes" ]]; then
+            break
+        fi
+        sleep "$interval"
+    done
+    _watch_lock_release
+    trap - INT TERM EXIT
+    return $rc
+}
+
+_peer_cmd_gc() {
+    local older_arg="" older_seconds=0 status_csv="acked" dry_run=false json=false archive_file="$PEER_DATA_DIR/messages-archive.jsonl"
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --older-than)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--older-than needs a duration" || echo -e "${RED}--older-than needs a duration${RESET}" >&2; return 64; }
+                older_arg="$2"; shift 2 ;;
+            --status)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--status needs a value" || echo -e "${RED}--status needs a value${RESET}" >&2; return 64; }
+                status_csv="$2"; shift 2 ;;
+            --dry-run)
+                dry_run=true; shift ;;
+            --json)
+                json=true; shift ;;
+            *)
+                $json && _json_error "validation" "Unknown peer gc flag: $1" || echo -e "${RED}Unknown peer gc flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+    [[ -n "$older_arg" ]] || { $json && _json_error "validation" "--older-than is required" || echo -e "${RED}--older-than is required${RESET}" >&2; return 64; }
+    _duration_to_seconds "$older_arg" || { $json && _json_error "validation" "Invalid duration: $older_arg" || echo -e "${RED}Invalid duration: $older_arg${RESET}" >&2; return 64; }
+    older_seconds="$DURATION_SECONDS"
+    unset DURATION_SECONDS
+    local statuses messages eligible remaining now_epoch count rc=0 lock_rc=0 error=""
+    statuses="$(_mailbox_status_filter_json "$status_csv" "")"
+    now_epoch="$(_peer_now_epoch)"
+    _mailbox_lock_acquire || return 1
+    if ! {
+        _mailbox_read_json_or_error "$json" || lock_rc=$?
+        if [[ $lock_rc -eq 0 ]]; then
+            messages="$MAILBOX_MESSAGES"
+            eligible="$(jq -c --argjson statuses "$statuses" --argjson now "$now_epoch" --argjson older "$older_seconds" '
+                [ .[]
+                  | .status as $status
+                  | ((.acked_at // .delivered_at // .updated_at // .created_at // "") | try fromdateiso8601 catch null) as $seen
+                  | select(($statuses | index($status)) and $seen != null and (($now - ($seen | floor)) >= $older))
+                ]
+            ' <<< "$messages")"
+            count="$(jq -r 'length' <<< "$eligible")"
+            if [[ "$dry_run" != "true" && "$count" -gt 0 ]]; then
+                mkdir -p "$(dirname "$archive_file")"
+                if ! { jq -c '.[]' <<< "$eligible" >> "$archive_file"; } 2>/dev/null; then
+                    error="failed to append archive: $archive_file"
+                    rc=1
+                else
+                    remaining="$(jq -c --argjson statuses "$statuses" --argjson now "$now_epoch" --argjson older "$older_seconds" '
+                        [ .[]
+                          | .status as $status
+                          | ((.acked_at // .delivered_at // .updated_at // .created_at // "") | try fromdateiso8601 catch null) as $seen
+                          | select((($statuses | index($status)) and $seen != null and (($now - ($seen | floor)) >= $older)) | not)
+                        ]
+                    ' <<< "$messages")"
+                    if ! _mailbox_rewrite_json_locked "$remaining"; then
+                        error="failed to rewrite mailbox: $MESSAGES_FILE"
+                        rc=1
+                    fi
+                fi
+            fi
+        else
+            rc=$lock_rc
+        fi
+    }; then
+        rc=1
+    fi
+    _mailbox_lock_release
+    [[ $rc -eq 65 ]] && return 65
+    if $json; then
+        jq -n --argjson ok "$(_peer_json_bool "$([[ $rc -eq 0 ]] && echo true || echo false)")" --arg error "$error" --argjson dry_run "$(_peer_json_bool "$dry_run")" --argjson older "$older_seconds" --argjson statuses "$statuses" --arg archive "$archive_file" --argjson eligible "${eligible:-[]}" \
+            '{ok:$ok,dry_run:$dry_run,older_than_seconds:$older,statuses:$statuses,archive:$archive,eligible_count:($eligible|length),eligible:$eligible}
+             + (if $ok then {} else {error:$error} end)'
+    else
+        if [[ $rc -ne 0 ]]; then
+            echo -e "${RED}${error:-peer gc failed}${RESET}" >&2
+        else
+            echo "Eligible messages: ${count:-0}"
+        fi
+        if [[ "$dry_run" != "true" && $rc -eq 0 ]]; then
+            echo "Archive: $archive_file"
+        fi
+    fi
+    return $rc
+}
+
+_peer_doctor_mcp_check() {
+    local peer="$1" out
+    out="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | "$SCRIPT_DIR/cctrl" peer mcp --as "$peer" 2>/dev/null || true)"
+    if jq -e 'select(.id == 1 and .result.capabilities.tools != null)' <<< "$out" >/dev/null 2>&1; then
+        printf 'true'
+    else
+        printf 'false'
+    fi
+}
+
+_peer_cmd_doctor() {
+    local target="" json=false peers_doc messages peer_json checks="[]" check ok target_session
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json)
+                json=true; shift ;;
+            -*)
+                $json && _json_error "validation" "Unknown peer doctor flag: $1" || echo -e "${RED}Unknown peer doctor flag: $1${RESET}" >&2
+                return 64 ;;
+            *)
+                if [[ -n "$target" ]]; then
+                    $json && _json_error "validation" "Only one peer target is allowed" || echo -e "${RED}Only one peer target is allowed.${RESET}" >&2
+                    return 64
+                fi
+                target="$1"; shift ;;
+        esac
+    done
+    ok="$(command -v jq >/dev/null 2>&1 && echo true || echo false)"
+    check="$(jq -n --arg name jq --argjson ok "$ok" '{name:$name,ok:$ok}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    ok="$(command -v tmux >/dev/null 2>&1 && echo true || echo false)"
+    check="$(jq -n --arg name tmux --argjson ok "$ok" '{name:$name,ok:$ok}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    if messages="$(_mailbox_read_json 2>/dev/null)"; then ok=true; else ok=false; fi
+    check="$(jq -n --arg name mailbox_parseable --argjson ok "$ok" --arg path "$MESSAGES_FILE" '{name:$name,ok:$ok,path:$path}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    local lock_path="$(_mailbox_lock_path)" lock_stale=false lock_pid=""
+    if [[ -d "$lock_path" && -f "$lock_path/pid" ]]; then
+        lock_pid="$(cat "$lock_path/pid" 2>/dev/null || true)"
+        _pid_alive "$lock_pid" || lock_stale=true
+    fi
+    check="$(jq -n --arg name stale_mailbox_lock --argjson ok "$(_peer_json_bool "$([[ "$lock_stale" != "true" ]] && echo true || echo false)")" --arg pid "$lock_pid" '{name:$name,ok:$ok,pid:($pid // "")}')"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    peers_doc="$(_peer_all_json)" || return 1
+    if [[ -n "$target" ]]; then
+        if ! peer_json="$(_peer_resolve_json "$target" 2>/dev/null)"; then
+            check="$(jq -n --arg name peer_resolves --argjson ok false --arg target "$target" '{name:$name,ok:$ok,target:$target}')"
+            checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+        else
+            target="$(jq -r '.name' <<< "$peer_json")"
+            check="$(jq -n --arg name peer_resolves --argjson ok true --arg target "$target" '{name:$name,ok:$ok,target:$target}')"
+            checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+            if _peer_has_capability "$peer_json" "tmux"; then
+                target_session="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+                if [[ -n "$target_session" ]] && command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "$target_session"; then ok=true; else ok=false; fi
+                check="$(jq -n --arg name tmux_session_live --argjson ok "$ok" --arg session "$target_session" '{name:$name,ok:$ok,session:$session}')"
+                checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+                if [[ "$ok" == "true" ]] && _tmux_run_with_timeout capture-pane -p -S -1 -t "$target_session"; then ok=true; else ok=false; fi
+                check="$(jq -n --arg name pane_reachable --argjson ok "$ok" --arg session "$target_session" '{name:$name,ok:$ok,session:$session}')"
+                checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+            fi
+            ok="$(_peer_doctor_mcp_check "$target")"
+            check="$(jq -n --arg name mcp_bridge --argjson ok "$ok" --arg peer "$target" '{name:$name,ok:$ok,peer:$peer}')"
+            checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+        fi
+    else
+        check="$(jq -n --arg name peers_registered --argjson ok "$(jq -r '(.peers // []) | length > 0' <<< "$peers_doc")" '{name:$name,ok:$ok}')"
+        checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    fi
+    if $json; then
+        jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
+    else
+        jq -r '.[] | "\(.name): \(if .ok then "ok" else "FAIL" end)"' <<< "$checks"
+    fi
+}
+
 _peer_cmd_mcp() {
     local as_identity="" identity peer_json
     while [[ $# -gt 0 ]]; do
@@ -2871,6 +3564,11 @@ cmd_peer() {
         check) _peer_cmd_check "$@" ;;
         recv) _peer_cmd_recv "$@" ;;
         deliver) _peer_cmd_deliver "$@" ;;
+        status) _peer_cmd_status "$@" ;;
+        nudge) _peer_cmd_nudge "$@" ;;
+        gc) _peer_cmd_gc "$@" ;;
+        watch) _peer_cmd_watch "$@" ;;
+        doctor) _peer_cmd_doctor "$@" ;;
         mcp) _peer_cmd_mcp "$@" ;;
         help|-h|--help)
             echo -e "${BOLD}cctrl peer${RESET} — Addressable agent registry"
@@ -2886,6 +3584,11 @@ cmd_peer() {
             echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]"
             echo "  cctrl peer recv [--as NAME] [--status queued,delivered] [--json] [--exit-on-empty]"
             echo "  cctrl peer deliver <peer|--all> [--dry-run] [--json] [--no-submit] [--inline ID] [--force-busy]"
+            echo "  cctrl peer status [--json]"
+            echo "  cctrl peer nudge <peer>|--stale [--older-than 15m] [--json] [--dry-run]"
+            echo "  cctrl peer gc --older-than 7d [--status acked] [--dry-run] [--json]"
+            echo "  cctrl peer watch [--once|--interval N] [--max-passes N] [--dry-run] [--json]"
+            echo "  cctrl peer doctor [peer] [--json]"
             echo "  cctrl peer mcp [--as NAME]"
             echo "  cctrl peer show <message-id> [--json]"
             echo "  cctrl peer ack <message-id> [--as NAME] [--json]"
@@ -3402,6 +4105,11 @@ cmd_help() {
     echo "  cctrl peer inbox [--as NAME]        List queued/delivered messages for a peer"
     echo "  cctrl peer outbox [--as NAME]       List messages sent by a peer"
     echo "  cctrl peer deliver <peer|--all>     Nudge tmux peers with queued messages"
+    echo "  cctrl peer status [--json]          Summarize mailbox and transport state"
+    echo "  cctrl peer nudge <peer>|--stale     Re-nudge queued messages"
+    echo "  cctrl peer gc --older-than 7d       Archive retained mailbox messages"
+    echo "  cctrl peer watch --once             Run one orchestrator pass"
+    echo "  cctrl peer doctor [peer]            Check peer messaging dependencies"
     echo "  cctrl peer mcp [--as NAME]          Run stdio MCP tools for one peer identity"
     echo "  cctrl peer show <id> [--json]       Show a full message envelope"
     echo "  cctrl peer ack <id> [--as NAME]     Acknowledge a delivered message"

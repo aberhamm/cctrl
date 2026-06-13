@@ -323,6 +323,62 @@ message history without changing message status.
 body. It never presses Enter and should not be used for unattended sessions,
 because it pastes arbitrary message content into the target pane.
 
+### Peer Orchestrator Workflow
+
+An orchestrator can queue work for peers, watch who needs attention, and nudge
+only the peers that can receive tmux doorbells. Polling-only or MCP-only peers
+stay queued for their own `peer check`/`peer recv` loop.
+
+```bash
+cctrl peer status --json
+cctrl peer send comet --from orchestrator --subject "Check" -- "Please check XYZ"
+cctrl peer nudge comet
+cctrl peer nudge --stale --older-than 15m --json
+cctrl peer watch --once --dry-run --json
+cctrl peer watch --interval 5 --renudge-after 15m --backoff 10m
+cctrl peer gc --older-than 7d --status acked --dry-run --json
+cctrl peer doctor comet --json
+```
+
+A durable orchestrator session can run with a short operating prompt:
+
+```text
+You are the peer-message orchestrator. Periodically run cctrl peer status
+--json, send concise work requests with cctrl peer send, use cctrl peer watch
+--once --json to nudge tmux peers, and leave polling-only peers queued. Do not
+paste message bodies into tmux sessions unless explicitly asked.
+```
+
+`peer watch` is singleton-locked per peer data directory. If another watcher is
+running, a second watcher exits instead of double-nudging. `--once --force`
+bypasses the lock for manual inspection. Backoff is based on consecutive failed
+nudge history so a dead tmux target is not hammered on every pass.
+
+Cross-host usage composes with the normal host forwarding layer:
+
+```bash
+cctrl --host studio peer status --json
+cctrl --host studio peer send comet --from orchestrator -- "Check the deploy log"
+cctrl --host studio peer watch --once --json
+```
+
+Peer mailboxes are machine-local and are not replicated across hosts. A
+`--host studio` command reads and writes the Studio's `data/messages.jsonl`;
+the same command without `--host` uses this machine's mailbox. Register peers
+on the host where their mailbox and tmux session live.
+
+Retention is explicit. `peer gc` only archives statuses you name, defaults to
+`acked`, and writes archived JSONL records to `data/messages-archive.jsonl`
+before removing them from the active mailbox. Use `--dry-run` first for
+retention jobs. If the archive append fails, GC leaves the active mailbox
+unchanged and exits non-zero.
+
+Trust model and limitations: cctrl authenticates peers by local registry name,
+not cryptographic identity. The mailbox is local filesystem state protected by
+normal file permissions. Tmux nudges are only doorbells; they do not prove the
+agent read or completed the work. Full-body inline paste is intentionally
+manual-only because it sends arbitrary text into an interactive shell.
+
 Polling exit codes:
 
 | Code | Meaning |

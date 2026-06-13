@@ -985,6 +985,167 @@ test_peer_deliver_failures_all_and_concurrency() {
     printf '%s\n' "$messages" | jq -e '.[0].status == "queued" and .[0].nudge_count == 1' >/dev/null || fail "expected concurrent deliver to record one nudge"
 }
 
+test_peer_orchestrator_status_nudge_watch() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/orchestrator-data"
+    local log="$TMPDIR/orchestrator-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+
+    local out messages id delivered_id count rc
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "tmux wake" >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send offline --from orchestrator --json -- "polling wake" >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet halley >/dev/null
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer status --json)"
+	    printf '%s\n' "$out" | jq -e '
+	      .totals.queued == 2
+	      and (.peers | map(select(.name == "comet" and .queued == 1 and (.transports | index("tmux")))) | length) == 1
+	      and (.peers | map(select(.name == "offline" and .queued == 1 and ((.transports | index("tmux")) | not))) | length) == 1
+	    ' >/dev/null || fail "expected peer status to summarize queued messages and transports"
+
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer nudge missing --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected explicit nudge target typo to fail"
+    printf '%s\n' "$out" | jq -e '.ok == false and .error.code == "unknown-peer"' >/dev/null || fail "expected explicit nudge typo to return JSON unknown-peer"
+
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer nudge halley --dry-run --json)"
+    printf '%s\n' "$out" | jq -e '
+      (.results | length) == 1
+      and .results[0].peer == "comet"
+      and .results[0].status == "dry-run"
+    ' >/dev/null || fail "expected nudge to resolve explicit alias targets"
+
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --dry-run --json)"
+    printf '%s\n' "$out" | jq -e '
+      .pass == 1
+      and (.results | map(select(.peer == "comet" and .status == "dry-run")) | length) == 1
+      and (.results | map(select(.peer == "offline" and .status == "polling")) | length) == 1
+    ' >/dev/null || fail "expected watch dry-run to report tmux and polling peers"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    messages="$(jq -s '.' "$data/messages.jsonl")"
+    printf '%s\n' "$messages" | jq -e 'all(.[]; .status == "queued" and .last_nudge_at == null)' >/dev/null || fail "expected watch dry-run to leave queued messages unchanged"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:20:00Z" "$ROOT/cctrl" peer nudge --stale --older-than 15m --json)"
+    printf '%s\n' "$out" | jq -e '
+      (.results | map(select(.peer == "comet" and .status == "nudged")) | length) == 1
+      and (.results | map(select(.peer == "offline" and .status == "skipped")) | length) == 1
+    ' >/dev/null || fail "expected stale nudge to nudge tmux peer and skip polling peer through adapter"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+
+    delivered_id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "delivered stale" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$delivered_id"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:20:00Z" "$ROOT/cctrl" peer nudge --stale --older-than 15m --json)"
+    printf '%s\n' "$out" | jq -e --arg id "$delivered_id" '.delivered_unacked_stale | map(select(.id == $id)) | length == 1' >/dev/null || fail "expected stale nudge to surface delivered-unacked messages"
+
+    data="$TMPDIR/watch-lock-data"
+    log="$TMPDIR/watch-lock-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "lock" >/dev/null
+    mkdir -p "$data/watch.lock.d"
+    printf '%s\n' "$$" > "$data/watch.lock.d/pid"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected second watch to fail while lock owner is alive"
+    assert_contains "$out" "already running (pid"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --force --dry-run --json)"
+    printf '%s\n' "$out" | jq -e '.pass == 1' >/dev/null || fail "expected --once --force to bypass singleton lock"
+    rm -rf "$data/watch.lock.d"
+    mkdir -p "$data/watch.lock.d"
+    printf '999999\n' > "$data/watch.lock.d/pid"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --dry-run --json)"
+    printf '%s\n' "$out" | jq -e '.pass == 1' >/dev/null || fail "expected watch to reclaim dead PID lock"
+    [[ ! -d "$data/watch.lock.d" ]] || fail "expected watch lock to be released after once pass"
+
+    data="$TMPDIR/watch-backoff-data"
+    log="$TMPDIR/watch-backoff-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+    id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "backoff" | jq -r '.id')"
+    jq -c --arg id "$id" '
+      if .id == $id then
+        .nudge_count = 3
+        | .last_nudge_at = "2026-06-13T00:05:00Z"
+        | .last_nudge_error = "tmux failed"
+        | .history = ((.history // []) + [
+            {at:"2026-06-13T00:03:00Z", event:"nudge", ok:false, by:"cctrl", adapter:"tmux", error:"tmux failed"},
+            {at:"2026-06-13T00:04:00Z", event:"nudge", ok:false, by:"cctrl", adapter:"tmux", error:"tmux failed"},
+            {at:"2026-06-13T00:05:00Z", event:"nudge", ok:false, by:"cctrl", adapter:"tmux", error:"tmux failed"}
+          ])
+      else . end
+    ' "$data/messages.jsonl" > "$data/messages.jsonl.tmp" && mv "$data/messages.jsonl.tmp" "$data/messages.jsonl"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:06:00Z" "$ROOT/cctrl" peer status --json)"
+    printf '%s\n' "$out" | jq -e '(.nudge_failing | index("comet")) != null' >/dev/null || fail "expected status to show backoff-active peer as nudge failing"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:06:00Z" "$ROOT/cctrl" peer watch --once --dry-run --json --renudge-after 1m --backoff 10m)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "backoff"' >/dev/null || fail "expected watch to skip recipient during backoff"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:20:00Z" "$ROOT/cctrl" peer watch --once --dry-run --json --renudge-after 1m --backoff 10m)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "dry-run"' >/dev/null || fail "expected watch to re-enable after backoff window"
+
+	    data="$TMPDIR/watch-interval-data"
+	    log="$TMPDIR/watch-interval-tmux.log"
+	    : > "$log"
+	    setup_delivery_peers "$data"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --interval 0 --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected watch --interval 0 to fail validation"
+    printf '%s\n' "$out" | jq -e '.ok == false and .error.message == "interval must be positive"' >/dev/null || fail "expected watch --interval 0 JSON validation error"
+	    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --interval 1 --max-passes 2 --dry-run --json)"
+	    printf '%s\n' "$out" | jq -s -e 'length == 2 and .[0].pass == 1 and .[1].pass == 2' >/dev/null || fail "expected bounded watch interval to emit two pass summaries"
+}
+
+test_peer_gc_retention_and_doctor() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/gc-data"
+    local log="$TMPDIR/gc-tmux.log"
+    : > "$log"
+    setup_delivery_peers "$data"
+
+    local old_id queued_id delivered_id out active_count archive_count
+    old_id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "old acked" | jq -r '.id')"
+    CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:01Z" "$ROOT/cctrl" peer recv --as comet --json >/dev/null
+    CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:02Z" "$ROOT/cctrl" peer ack "$old_id" --as comet --json >/dev/null
+    queued_id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "old queued" | jq -r '.id')"
+    delivered_id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-01T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "old delivered" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$delivered_id"
+
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:00Z" "$ROOT/cctrl" peer gc --older-than 7d --status acked --dry-run --json)"
+    printf '%s\n' "$out" | jq -e --arg id "$old_id" '.dry_run == true and .eligible_count == 1 and (.eligible | map(select(.id == $id)) | length == 1)' >/dev/null || fail "expected gc dry-run to report eligible acked message"
+    active_count="$(jq -s 'length' "$data/messages.jsonl")"
+    [[ "$active_count" -eq 3 ]] || fail "expected gc dry-run to leave active mailbox unchanged"
+
+    : > "$data/messages-archive.jsonl"
+    chmod 400 "$data/messages-archive.jsonl"
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:00Z" "$ROOT/cctrl" peer gc --older-than 7d --status acked --json 2>&1)" || rc=$?
+    chmod 600 "$data/messages-archive.jsonl"
+    [[ "$rc" -ne 0 ]] || fail "expected gc to fail when archive append fails"
+    printf '%s\n' "$out" | jq -e '.ok == false and (.error | contains("failed to append archive"))' >/dev/null || fail "expected gc archive failure to return JSON error"
+    active_count="$(jq -s 'length' "$data/messages.jsonl")"
+    archive_count="$(jq -s 'length' "$data/messages-archive.jsonl")"
+    [[ "$active_count" -eq 3 ]] || fail "expected failed gc to leave active mailbox unchanged"
+    [[ "$archive_count" -eq 0 ]] || fail "expected failed gc to leave archive unchanged"
+    rm -f "$data/messages-archive.jsonl"
+
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:00Z" "$ROOT/cctrl" peer gc --older-than 7d --status acked --json)"
+    printf '%s\n' "$out" | jq -e '.eligible_count == 1' >/dev/null || fail "expected gc to archive one acked message"
+    active_count="$(jq -s 'length' "$data/messages.jsonl")"
+    archive_count="$(jq -s 'length' "$data/messages-archive.jsonl")"
+    [[ "$active_count" -eq 2 ]] || fail "expected gc to keep queued and delivered active messages"
+    [[ "$archive_count" -eq 1 ]] || fail "expected gc archive to contain one message"
+    assert_contains "$(cat "$data/messages.jsonl")" "$queued_id"
+    assert_contains "$(cat "$data/messages.jsonl")" "$delivered_id"
+
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer doctor comet --json)"
+    printf '%s\n' "$out" | jq -e '
+      .target == "comet"
+      and (.checks | map(select(.name == "jq" and .ok == true)) | length) == 1
+      and (.checks | map(select(.name == "mcp_bridge" and .ok == true)) | length) == 1
+      and (.checks | map(select(.name == "tmux_session_live" and .ok == true)) | length) == 1
+    ' >/dev/null || fail "expected peer doctor to check jq, tmux, and MCP bridge"
+}
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"
@@ -1152,6 +1313,8 @@ test_peer_mcp_bridge_stdio
 test_peer_deliver_tmux_nudge_lifecycle
 test_peer_deliver_busy_no_submit_and_inline
 test_peer_deliver_failures_all_and_concurrency
+test_peer_orchestrator_status_nudge_watch
+test_peer_gc_retention_and_doctor
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
