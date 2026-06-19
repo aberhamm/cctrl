@@ -647,6 +647,92 @@ test_context_names() {
     assert_contains "$out" "TMUX--ms--context-project-"
 }
 
+test_bridge_prefix_matches_explicit_name() {
+    # Name reconciliation: when an explicit --name is passed (as every detached
+    # tmux launch does), the remote-control prefix must derive from that name,
+    # NOT from the cwd/repo slug — so the Claude Code app session matches tmux.
+    make_fake_agent "$TMPDIR/claude" claude
+    local project="$TMPDIR/unstructured-data-portal"
+    mkdir -p "$project"
+
+    local out
+    out="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 "$ROOT/cctrl" start --agent claude --name TMUX--ms--portal -m "hi")"
+    assert_contains "$out" "--remote-control-session-name-prefix"
+    assert_contains "$out" "TMUX--ms--portal-"
+    # The old cwd-derived prefix must NOT appear.
+    assert_not_contains "$out" "TMUX--ms--unstructured-data-portal-"
+}
+
+test_session_doctor_classifies_bridge() {
+    # session doctor reads bridgeSessionId from the Claude session file to decide
+    # live vs dead, and flags app/tmux name-prefix mismatches.
+    local bin="$TMPDIR/doctorbin" sdir="$TMPDIR/claude-sessions"
+    mkdir -p "$bin" "$sdir"
+    make_fake_tmux "$bin/tmux"
+
+    # live + name-aligned
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--portal --remote-control --remote-control-session-name-prefix TMUX--ms--portal-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--portal","status":"idle","bridgeSessionId":"session_live123"}
+JSON
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"session": "TMUX--ms--portal"'
+    assert_contains "$out" '"remote_control": "live"'
+    assert_contains "$out" '"bridge": "session_live123"'
+    assert_contains "$out" '"name_aligned": true'
+
+    # dead (no bridgeSessionId) + name mismatch (old cwd-derived prefix)
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--portal --remote-control --remote-control-session-name-prefix TMUX--ms--unstructured-data-portal-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--portal","status":"idle"}
+JSON
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"remote_control": "dead"'
+    assert_contains "$out" '"name_aligned": false'
+}
+
+test_session_doctor_detects_collision() {
+    # Two sessions reporting the same bridgeSessionId = a bridge collision from a
+    # shared name prefix. Both read "live" individually; only cross-checking ids
+    # reveals it.
+    local bin="$TMPDIR/colbin" sdir="$TMPDIR/col-sessions"
+    mkdir -p "$bin" "$sdir"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --remote-control --remote-control-session-name-prefix TMUX--ms--homelab-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"status":"idle","bridgeSessionId":"session_shared"}
+JSON
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--homelab--3 TMUX--ms--homelab--5" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"remote_control": "collision"'
+}
+
 test_session_list_codex_default_model() {
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"
@@ -1668,6 +1754,9 @@ test_remote_shortcut_injects_purpose
 test_attach_prompt_after_start
 test_codex_statusline_tui_config
 test_context_names
+test_bridge_prefix_matches_explicit_name
+test_session_doctor_classifies_bridge
+test_session_doctor_detects_collision
 test_session_list_codex_default_model
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing

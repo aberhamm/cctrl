@@ -30,6 +30,10 @@ PROJECTS_DIR="$CLAUDE_DIR/projects"
 ACTIVE_FILE="$SCRIPT_DIR/.active-profile"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 CODEX_SESSIONS_DIR="$CODEX_DIR/sessions"
+# Claude Code writes one <pid>.json per live session here; bridgeSessionId in
+# that file is the authoritative remote-control liveness signal (null = not
+# bridged). Honors CLAUDE_CONFIG_DIR; CCTRL_CLAUDE_SESSIONS_DIR overrides (tests).
+CLAUDE_SESSIONS_DIR="${CCTRL_CLAUDE_SESSIONS_DIR:-${CLAUDE_CONFIG_DIR:-$CLAUDE_DIR}/sessions}"
 CODEX_ARCHIVED_SESSIONS_DIR="$CODEX_DIR/archived_sessions"
 
 # Colors
@@ -303,7 +307,19 @@ _launch_exec_agent() {
         fi
         [[ -n "$launch_name" ]] && LAUNCH_FLAGS+=("--name" "$launch_name")
         if [[ "$no_bridge" != "true" ]]; then
-            LAUNCH_FLAGS+=("--remote-control" "--remote-control-session-name-prefix" "$(_remote_prefix "$bridge_dir")")
+            # Bridge name reconciliation: when an explicit session name is set
+            # (detached/tmux-managed launches always pass --name), derive the
+            # remote-control prefix from that exact name so the Claude Code app
+            # session lines up with the tmux session name and disambiguates
+            # same-repo sessions (homelab--3 vs --4). Only fall back to the
+            # cwd-derived slug for nameless foreground launches.
+            local rc_prefix
+            if [[ -n "$launch_name" ]]; then
+                rc_prefix="${launch_name}-"
+            else
+                rc_prefix="$(_remote_prefix "$bridge_dir")"
+            fi
+            LAUNCH_FLAGS+=("--remote-control" "--remote-control-session-name-prefix" "$rc_prefix")
         fi
 
         if [[ "$resume" == "true" ]]; then
@@ -3950,10 +3966,11 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | attach | close | kill>"
+            echo "Usage: cctrl session <ls | doctor | attach | close | kill>"
             echo ""
-            echo "  cctrl session ls               List sessions (dir, agent/shell, model, state)"
+            echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
+            echo "  cctrl session doctor [--fix]   Audit/repair remote-control bridges (--json, --yes)"
             echo "  cctrl session current [--json] Show this process/session identity"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session close [name]     Gracefully close a session; with no name,"
@@ -3967,6 +3984,7 @@ cmd_session() {
             return 0
             ;;
         ls|list)   _session_list "$@" ;;
+        doctor|reconcile) _session_doctor "$@" ;;
         current|whoami|identity) _session_current "$@" ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
         close|stop) _session_close "$@" ;;
@@ -4002,6 +4020,41 @@ _session_agent_cmd() {
     printf '%s' "$cmd"
 }
 
+_session_claude_pid() {
+    # Resolve the claude process pid backing a session. cctrl detaches with
+    # `exec claude`, so the pane pid usually IS the claude process; otherwise
+    # fall back to the first descendant that owns a Claude session file.
+    local sess="$1" pid child
+    pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    [[ -n "$pid" ]] || return 0
+    [[ -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]] && { printf '%s' "$pid"; return 0; }
+    for child in $(pgrep -P "$pid" 2>/dev/null); do
+        [[ -f "$CLAUDE_SESSIONS_DIR/$child.json" ]] && { printf '%s' "$child"; return 0; }
+    done
+    printf '%s' "$pid"
+}
+
+_session_bridge_field() {
+    # Echo a field from a session's Claude session file, or empty if absent.
+    local pid="$1" field="$2"
+    [[ -n "$pid" && -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]] || return 0
+    jq -r --arg f "$field" '.[$f] // empty' "$CLAUDE_SESSIONS_DIR/$pid.json" 2>/dev/null
+}
+
+_session_rc_state() {
+    # Classify a session's remote-control bridge: live | dead | off | - .
+    #   off  = launched with --no-bridge (no --remote-control in argv)
+    #   live = --remote-control present AND bridgeSessionId set in session file
+    #   dead = --remote-control present but bridgeSessionId null/missing
+    #   -    = not a claude session
+    local sess="$1" cmd="$2" pid bridge
+    [[ "$cmd" == *claude* ]] || { printf '%s' '-'; return 0; }
+    if [[ "$cmd" != *--remote-control* ]]; then printf '%s' 'off'; return 0; fi
+    pid="$(_session_claude_pid "$sess")"
+    bridge="$(_session_bridge_field "$pid" bridgeSessionId)"
+    [[ -n "$bridge" ]] && printf '%s' 'live' || printf '%s' 'dead'
+}
+
 _session_list() {
     _session_require_tmux || return 1
     local json=false a
@@ -4022,8 +4075,8 @@ _session_list() {
     fi
 
     local -a json_items=()
-    $json || echo -e "${DIM}✦ = cctrl-managed agent session${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display
+    $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
@@ -4053,25 +4106,199 @@ _session_list() {
         [[ "$attached" == "1" ]] && state="attached" || state="detached"
         disp_dir="${dir/#$HOME/~}"
 
+        # Remote-control bridge state (claude only): live | dead | off | - .
+        rc_state="-"; bridge_id=""
+        if [[ "$cmd" == *claude* ]]; then
+            if [[ "$cmd" != *--remote-control* ]]; then
+                rc_state="off"
+            else
+                cpid="$(_session_claude_pid "$name")"
+                bridge_id="$(_session_bridge_field "$cpid" bridgeSessionId)"
+                [[ -n "$bridge_id" ]] && rc_state="live" || rc_state="dead"
+            fi
+        fi
+
         if $json; then
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" --arg agent "$agent" \
                 --arg purpose "$purpose" --arg created_at "$created_at" \
-                --arg peer "$peer" \
+                --arg peer "$peer" --arg rc "$rc_state" --arg bridge "$bridge_id" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
             if [[ ${#purpose_display} -gt 42 ]]; then
                 purpose_display="${purpose_display:0:39}..."
             fi
-            printf '%s %-15s %-18s %-34s %-9s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state" "$purpose_display"
+            printf '%s %-15s %-18s %-30s %-9s %-5s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state" "$rc_state" "$purpose_display"
         fi
     done
 
     $json && printf '%s\n' "${json_items[@]}" | jq -s '.'
+    return 0
+}
+
+_session_repair_bridge() {
+    # Re-establish a dead remote-control bridge by injecting the /rc slash
+    # command into the session. Must leave copy-mode first (it silently
+    # swallows keystrokes) and clear any partial input. Returns the new
+    # bridgeSessionId on success, non-zero if it never registers.
+    local sess="$1" pid after i
+    pid="$(_session_claude_pid "$sess")"
+    tmux send-keys -t "$sess" -X cancel 2>/dev/null || true
+    tmux send-keys -t "$sess" C-u 2>/dev/null || true
+    tmux send-keys -t "$sess" -l "/rc" 2>/dev/null || true
+    tmux send-keys -t "$sess" Enter 2>/dev/null || true
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        sleep 1
+        after="$(_session_bridge_field "$pid" bridgeSessionId)"
+        [[ -n "$after" ]] && { printf '%s' "$after"; return 0; }
+    done
+    return 1
+}
+
+_session_doctor() {
+    # Audit (and optionally repair) remote-control bridges for live Claude
+    # sessions. Authoritative liveness = bridgeSessionId in the session file;
+    # the on-screen "/rc active" footer is a rotating hint and unreliable.
+    _session_require_tmux || return 1
+    local json=false fix=false assume_yes=false a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            --fix) fix=true ;;
+            --yes|-y) assume_yes=true ;;
+            -h|--help|help)
+                echo "Usage: cctrl session doctor [--fix] [--yes] [--json]"
+                echo ""
+                echo "  Audit remote-control bridges for live Claude sessions. A session is"
+                echo "  'dead' when it launched with --remote-control but its Claude session"
+                echo "  file has no bridgeSessionId. Also flags app/tmux name mismatches and"
+                echo "  panes stuck in copy-mode (which blocks keystroke repair)."
+                echo ""
+                echo "    --fix     Re-establish dead bridges by injecting /rc."
+                echo "              Skips busy sessions; confirms each (unless --yes)."
+                echo "    --yes     Repair without per-session confirmation."
+                echo "    --json    Machine-readable output."
+                return 0 ;;
+            -*) echo -e "${RED}Unknown doctor flag: $a${RESET}" >&2; return 64 ;;
+        esac
+    done
+
+    local -a names=()
+    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
+        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    # Pre-pass: collect every live bridgeSessionId so we can detect collisions —
+    # two sessions sharing one id means they fought over the same bridge name
+    # (the shared-prefix bug). The session file reads "live" for both, so this
+    # is the only way to surface the conflict.
+    local all_bridges="" _pname _pcmd _ppid _pb
+    for _pname in "${names[@]}"; do
+        _pcmd="$(_session_agent_cmd "$_pname")"
+        [[ "$_pcmd" == *claude* && "$_pcmd" == *--remote-control* ]] || continue
+        _ppid="$(_session_claude_pid "$_pname")"
+        _pb="$(_session_bridge_field "$_ppid" bridgeSessionId)"
+        [[ -n "$_pb" ]] && all_bridges+="$_pb"$'\n'
+    done
+
+    local -a json_items=()
+    local name cmd pid bridge prefix expected aligned copy_mode st verdict repaired detail do_fix ans newid
+    local n_total=0 n_live=0 n_dead=0 n_off=0 n_misnamed=0 n_fixed=0 n_skipped=0 n_collision=0
+    $json || printf '%-22s %-6s %-8s %-9s %s\n' "SESSION" "RC" "STATE" "NAME" "DETAIL"
+    for name in "${names[@]}"; do
+        cmd="$(_session_agent_cmd "$name")"
+        [[ "$cmd" == *claude* ]] || continue
+        n_total=$((n_total+1))
+        pid="$(_session_claude_pid "$name")"
+        st="$(_session_bridge_field "$pid" status)"; [[ -n "$st" ]] || st="?"
+        copy_mode="$(tmux display -p -t "$name" '#{pane_in_mode}' 2>/dev/null || true)"
+        prefix="$(printf '%s' "$cmd" | grep -oE -- '--remote-control-session-name-prefix[= ][^ ]+' | head -1 | sed -E 's/^--remote-control-session-name-prefix[= ]//' || true)"
+        expected="${name}-"
+        bridge=""; repaired=""; aligned="n/a"
+        if [[ "$cmd" != *--remote-control* ]]; then
+            verdict="off"; n_off=$((n_off+1))
+        else
+            bridge="$(_session_bridge_field "$pid" bridgeSessionId)"
+            [[ "$prefix" == "$expected" ]] && aligned="ok" || aligned="MISMATCH"
+            [[ "$aligned" == "MISMATCH" ]] && n_misnamed=$((n_misnamed+1))
+            if [[ -n "$bridge" ]]; then
+                if [[ "$(grep -Fxc -- "$bridge" <<< "$all_bridges" || true)" -gt 1 ]]; then
+                    verdict="collision"; n_collision=$((n_collision+1))
+                else
+                    verdict="live"; n_live=$((n_live+1))
+                fi
+            else
+                verdict="dead"; n_dead=$((n_dead+1))
+            fi
+        fi
+
+        # Only dead bridges are repairable by /rc. Collisions need a relaunch
+        # under the unique-prefix code — re-injecting /rc just re-contends.
+        if $fix && [[ "$verdict" == "dead" ]]; then
+            if [[ "$st" == "busy" ]]; then
+                repaired="skipped-busy"; n_skipped=$((n_skipped+1))
+            else
+                do_fix=true
+                if ! $assume_yes; then
+                    if _prompt_tty_available; then
+                        printf 'Re-establish bridge for %s? [y/N] ' "$name" > /dev/tty
+                        ans=""; IFS= read -r ans < /dev/tty || true
+                        [[ "$ans" == [yY]* ]] || { do_fix=false; repaired="declined"; n_skipped=$((n_skipped+1)); }
+                    else
+                        do_fix=false; repaired="skipped-no-tty"; n_skipped=$((n_skipped+1))
+                    fi
+                fi
+                if $do_fix; then
+                    if newid="$(_session_repair_bridge "$name")"; then
+                        repaired="fixed"; bridge="$newid"; verdict="live"; n_fixed=$((n_fixed+1))
+                    else
+                        repaired="repair-failed"
+                    fi
+                fi
+            fi
+        fi
+
+        if $json; then
+            json_items+=("$(jq -n \
+                --arg s "$name" --arg pid "$pid" --arg rc "$verdict" \
+                --arg bridge "$bridge" --arg prefix "$prefix" --arg expected "$expected" \
+                --arg aligned "$aligned" --arg cm "${copy_mode:-0}" --arg st "$st" \
+                --arg repaired "$repaired" \
+                '{session:$s, pid:$pid, remote_control:$rc, bridge:(if $bridge=="" then null else $bridge end), app_name_prefix:(if $prefix=="" then null else $prefix end), expected_prefix:$expected, name_aligned:($aligned=="ok"), copy_mode:($cm=="1"), status:$st, action:(if $repaired=="" then null else $repaired end)}')")
+        else
+            detail=""
+            [[ "$verdict" == "collision" ]] && detail="shares bridge ${bridge} with another session — relaunch to fix"
+            [[ "$aligned" == "MISMATCH" ]] && detail="${detail:+$detail; }app-name=${prefix:-<none>} (want ${expected})"
+            [[ "${copy_mode:-0}" == "1" ]] && detail="${detail:+$detail; }copy-mode"
+            [[ -n "$repaired" ]] && detail="${detail:+$detail; }$repaired"
+            printf '%-22s %-6s %-8s %-9s %s\n' "$name" "$verdict" "$st" "$aligned" "$detail"
+        fi
+    done
+
+    if $json; then
+        if [[ ${#json_items[@]} -eq 0 ]]; then echo "[]"; else printf '%s\n' "${json_items[@]}" | jq -s '.'; fi
+        return 0
+    fi
+
+    echo ""
+    local summary="${n_total} claude session(s): ${n_live} live, ${n_dead} dead, ${n_off} off"
+    [[ "$n_collision" -gt 0 ]] && summary+=", ${n_collision} collision"
+    [[ "$n_fixed" -gt 0 ]] && summary+=", ${n_fixed} fixed"
+    [[ "$n_skipped" -gt 0 ]] && summary+=", ${n_skipped} skipped"
+    [[ "$n_misnamed" -gt 0 ]] && summary+="; ${n_misnamed} app/tmux name mismatch(es)"
+    echo -e "${BOLD}${summary}${RESET}"
+    if [[ "$n_dead" -gt 0 && "$fix" != true ]]; then
+        echo -e "${DIM}Repair dead bridges with: cctrl session doctor --fix${RESET}"
+    fi
+    if [[ "$n_collision" -gt 0 ]]; then
+        echo -e "${DIM}Collisions share one bridge (shared name prefix); relaunch the affected sessions to give each a unique prefix.${RESET}"
+    fi
+    if [[ "$n_misnamed" -gt 0 ]]; then
+        echo -e "${DIM}Name mismatches are fixed for newly-launched sessions; relaunch to realign existing ones.${RESET}"
+    fi
     return 0
 }
 
@@ -4433,7 +4660,8 @@ cmd_help() {
     echo "                              Extra flags are appended to the selected agent"
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
     echo ""
-    echo "  cctrl session ls            List sessions (dir, agent/shell, model, state; --json)"
+    echo "  cctrl session ls            List sessions (dir, agent/shell, model, state, rc; --json)"
+    echo "  cctrl session doctor [--fix] Audit/repair remote-control bridges (--json, --yes)"
     echo "  cctrl session current       Show this process/session identity; --json for agents"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
     echo "  cctrl session close [name]  Gracefully close a session (alias: cctrl close);"
