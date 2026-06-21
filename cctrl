@@ -1503,11 +1503,20 @@ _launch_detached() {
     fi
     tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
 
+    # When this launch is driven from a remote `--host <alias>` invocation, the
+    # session lives on THIS machine but the user is sitting at their local shell.
+    # Carry the `--host <alias>` prefix into the hint commands so they target the
+    # right machine; otherwise they'd run locally where the session doesn't exist.
+    local hint_prefix="cctrl"
+    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
+        hint_prefix="cctrl --host $CCTRL_HOST_PREFIX"
+    fi
+
     echo -e "${GREEN}✓${RESET} detached session started — ${BOLD}$display_label${RESET}"
-    echo -e "${DIM}  Attach:  cctrl session attach $session_name${RESET}"
-    echo -e "${DIM}  List:    cctrl session ls${RESET}"
-    echo -e "${DIM}  Close:   cctrl session close $session_name  (or 'cctrl close' from inside)${RESET}"
-    echo -e "${DIM}  Kill:    cctrl session kill $session_name${RESET}"
+    echo -e "${DIM}  Attach:  $hint_prefix session attach $session_name${RESET}"
+    echo -e "${DIM}  List:    $hint_prefix session ls${RESET}"
+    echo -e "${DIM}  Close:   $hint_prefix session close $session_name  (or 'cctrl close' from inside)${RESET}"
+    echo -e "${DIM}  Kill:    $hint_prefix session kill $session_name${RESET}"
 
     # Machine-readable line so a remote launch can attach to the exact session
     # name (including any auto-increment suffix). See _remote_exec.
@@ -1543,7 +1552,9 @@ _prompt_attach_session() {
     case "$answer" in
         y|yes) exec tmux attach-session -t "$session_name" ;;
         *)
-            echo -e "${DIM}Not connected. Attach later: cctrl session attach $session_name${RESET}"
+            local hint_prefix="cctrl"
+            [[ -n "${CCTRL_HOST_PREFIX:-}" ]] && hint_prefix="cctrl --host $CCTRL_HOST_PREFIX"
+            echo -e "${DIM}Not connected. Attach later: $hint_prefix session attach $session_name${RESET}"
             ;;
     esac
 }
