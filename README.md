@@ -1,6 +1,6 @@
 # cctrl
 
-A CLI for managing local coding-agent sessions, profiles, costs, and developer environment. Claude Code is the default runtime; Codex can be selected per launch. Built for power users who run multiple projects, track token spend, and sometimes SSH into their Mac to kick off sessions remotely.
+A CLI for managing local coding-agent sessions, profiles, costs, and developer environment. The default runtime is configurable, and `cctrl` prompts for an agent when no default is set. Built for power users who run multiple projects, track token spend, and sometimes SSH into their Mac to kick off sessions remotely.
 
 ## What it does
 
@@ -74,6 +74,17 @@ block exists; `agents.<agent>.env`, `agents.<agent>.model`, and
 }
 ```
 
+Profiles can also override the global agent default. Set `defaultAgent` to
+`"claude"` or `"codex"` to choose automatically for that profile, or set it to
+`null` to prompt every time that profile is active:
+
+```json
+{
+  "defaultAgent": null,
+  "env": {}
+}
+```
+
 Legacy profiles with no `agents` block keep their old Claude behavior: top-level
 `env` and `model` apply to Claude. When launching Codex with a legacy profile,
 CCTRL ignores Claude-looking top-level models such as `sonnet`, `opus`, and
@@ -101,13 +112,13 @@ A launch is described by three independent axes:
 | --- | --- | --- |
 | **Location** | which machine runs it? | `--host <alias>` (default: local) |
 | **Durability** | does it survive disconnect? | tmux-backed by default; `--foreground` for direct one-offs; `-d` / `--detach` to start detached and return |
-| **Agent** | which CLI runs? | `--agent codex` (default for now) or `--agent claude` |
+| **Agent** | which CLI runs? | `--agent codex`, `--agent claude`, or the configured default |
 | **Bridge** | can the phone app drive it? | Claude only, on by default; `--no-bridge` to disable |
 
 There's **one launch verb — `start`** — and the flags above pick the behavior. Interactive starts are tmux-backed by default so local and remote agents are durable and addressable. Managing tmux sessions (list/attach/kill) lives under `cctrl session`.
 
 ```bash
-cctrl start                       # tmux-backed, current dir, Codex by default
+cctrl start                       # tmux-backed, current dir, configured default or prompt
 cctrl start --agent claude        # launch Claude instead of Codex
 cctrl --agent claude start        # same, useful with global flags
 cctrl start --foreground          # direct one-off launch without tmux
@@ -120,7 +131,7 @@ cctrl start --no-bridge           # launch without the phone-control bridge
 cctrl start --agent codex --remote unix://  # connect Codex TUI to local app-server
 ```
 
-`cctrl start` launches the default agent from `data/config.json`; it is currently set to `codex`. Use `--agent claude` when you want Claude Code and its phone-control bridge. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
+`cctrl start` uses `--agent` first, then `CCTRL_AGENT`, then the active profile's `defaultAgent`, then `defaultAgent` from `data/config.json`. If no agent is selected and the command has a TTY, it prompts with the available agents; non-interactive launches should pass `--agent claude|codex` or configure a default. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
 
 ### Tmux sessions
 

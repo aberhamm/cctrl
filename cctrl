@@ -62,22 +62,17 @@ _profile_exists() {
     [[ -f "$(_profile_path "$1")" ]]
 }
 
-_default_agent() {
-    if [[ -n "${CCTRL_AGENT:-}" ]]; then
-        printf '%s' "$CCTRL_AGENT"
-        return
-    fi
+_supported_agents() {
+    printf '%s\n' claude codex
+}
 
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
-        local configured
-        configured="$(jq -r '.defaultAgent // .default_agent // empty' "$CONFIG_FILE" 2>/dev/null || true)"
-        case "$(printf '%s' "$configured" | tr '[:upper:]' '[:lower:]')" in
-            claude|claude-code) printf 'claude'; return ;;
-            codex|openai)       printf 'codex'; return ;;
-        esac
-    fi
-
-    printf 'claude'
+_supported_agents_display() {
+    local agent joined=""
+    while IFS= read -r agent; do
+        [[ -n "$joined" ]] && joined+=", "
+        joined+="$agent"
+    done < <(_supported_agents)
+    printf '%s' "$joined"
 }
 
 _normalize_agent() {
@@ -88,10 +83,154 @@ _normalize_agent() {
         codex|openai) printf 'codex' ;;
         *)
             echo -e "${RED}Unknown agent: $1${RESET}" >&2
-            echo -e "${DIM}Supported agents: claude, codex${RESET}" >&2
+            echo -e "${DIM}Supported agents: $(_supported_agents_display)${RESET}" >&2
             return 1
             ;;
     esac
+}
+
+_config_default_agent() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+
+    local configured
+    configured="$(jq -r '.defaultAgent // .default_agent // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    [[ -n "$configured" ]] || return 1
+
+    case "$(printf '%s' "$configured" | tr '[:upper:]' '[:lower:]')" in
+        claude|claude-code) printf 'claude' ;;
+        codex|openai)       printf 'codex' ;;
+        *)                  return 1 ;;
+    esac
+}
+
+_configured_default_agent() {
+    if [[ -n "${CCTRL_AGENT:-}" ]]; then
+        _normalize_agent "$CCTRL_AGENT"
+        return
+    fi
+
+    _config_default_agent
+}
+
+_default_agent() {
+    _configured_default_agent
+}
+
+_default_agent_label() {
+    local agent pref active
+    active="$(_active_profile)"
+    if pref="$(_profile_agent_preference "$active" 2>/dev/null)"; then
+        if [[ "$pref" == "prompt" ]]; then
+            printf 'prompt (profile %s)' "$active"
+        else
+            printf '%s (profile %s)' "$pref" "$active"
+        fi
+        return
+    fi
+
+    if agent="$(_configured_default_agent 2>/dev/null)"; then
+        printf '%s' "$agent"
+    else
+        printf 'none configured'
+    fi
+}
+
+_profile_agent_preference() {
+    local profile="$1" pf value
+    [[ -n "$profile" ]] || return 1
+    _profile_exists "$profile" || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+
+    pf="$(_profile_path "$profile")"
+    value="$(jq -r '
+        if has("defaultAgent") then
+            if .defaultAgent == null then "__cctrl_prompt__" else (.defaultAgent | tostring) end
+        elif has("default_agent") then
+            if .default_agent == null then "__cctrl_prompt__" else (.default_agent | tostring) end
+        else
+            "__cctrl_missing__"
+        end
+    ' "$pf" 2>/dev/null || true)"
+
+    case "$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')" in
+        ""|__cctrl_missing__)
+            return 1
+            ;;
+        __cctrl_prompt__|prompt|ask|choose|none|null|false)
+            printf 'prompt'
+            ;;
+        *)
+            _normalize_agent "$value"
+            ;;
+    esac
+}
+
+_prompt_agent_choice() {
+    local prompt="${1:-Choose agent runtime}" answer agent normalized i
+    local -a agents=()
+
+    while IFS= read -r agent; do
+        agents+=("$agent")
+    done < <(_supported_agents)
+
+    if ! _prompt_tty_available; then
+        echo -e "${RED}No agent selected and prompting is unavailable.${RESET}" >&2
+        echo -e "${DIM}Pass --agent <agent> ($(_supported_agents_display)) or set defaultAgent in ${CONFIG_FILE/#$HOME/~}.${RESET}" >&2
+        return 1
+    fi
+
+    while true; do
+        printf '%s:\n' "$prompt" > /dev/tty
+        i=1
+        for agent in "${agents[@]}"; do
+            printf '  %d) %s\n' "$i" "$agent" > /dev/tty
+            ((i++))
+        done
+        printf '> ' > /dev/tty
+        IFS= read -r answer < /dev/tty || answer=""
+
+        if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#agents[@]} )); then
+            printf '%s' "${agents[$((answer - 1))]}"
+            return 0
+        fi
+
+        if [[ -n "$answer" ]] && normalized="$(_normalize_agent "$answer" 2>/dev/null)"; then
+            printf '%s' "$normalized"
+            return 0
+        fi
+
+        printf 'Please choose one of: %s\n' "$(_supported_agents_display)" > /dev/tty
+    done
+}
+
+_resolve_agent_or_prompt() {
+    local selected="${1:-}" prompt="${2:-Choose agent runtime}" profile="${3:-}" configured pref
+    if [[ -n "$selected" ]]; then
+        _normalize_agent "$selected"
+        return
+    fi
+
+    if [[ -n "${CCTRL_AGENT:-}" ]]; then
+        _normalize_agent "$CCTRL_AGENT"
+        return
+    fi
+
+    if pref="$(_profile_agent_preference "$profile" 2>/dev/null)"; then
+        if [[ "$pref" == "prompt" ]]; then
+            _prompt_agent_choice "$prompt"
+        else
+            printf '%s' "$pref"
+        fi
+        return
+    fi
+
+    if configured="$(_config_default_agent)"; then
+        printf '%s' "$configured"
+        return
+    fi
+
+    _prompt_agent_choice "$prompt"
 }
 
 _agent_bin() {
@@ -833,7 +972,7 @@ cmd_start() {
     local cli_model=""
     local cli_prompt=""
     local cli_prompt_set=false
-    local agent="$(_default_agent)"
+    local agent=""
     local launch_name=""
     local peer_identity=""
     local full_bypass=false
@@ -926,14 +1065,13 @@ cmd_start() {
         esac
     done
 
-    agent="$(_normalize_agent "$agent")" || return 1
-
     # Resolve profile: explicit --profile wins; else fall back to the last
     # `cctrl use` profile if recorded. Empty = no overlay (agent's own default).
     # Explicit --profile is concurrency-safe: it never touches global state.
     if [[ -z "$profile" ]]; then
         profile="$(_active_profile)"
     fi
+    agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$profile")" || return 1
     local pf=""
     if [[ -n "$profile" ]]; then
         if _profile_exists "$profile"; then
@@ -1072,7 +1210,6 @@ _launch_detached() {
     local purpose="" purpose_set=false initial_prompt="" peer_identity="" peer_name=""
     local profile="" detach_agent="" agent_explicit=false
     local shortcut_canonical=""
-    detach_agent="$(_default_agent)"
     local passthrough_count=0
     local passthrough=()
     while [[ $# -gt 0 ]]; do
@@ -1212,6 +1349,10 @@ _launch_detached() {
             detach_agent="$shortcut_agent"
         fi
     fi
+    local agent_profile="$profile"
+    [[ -n "$agent_profile" ]] || agent_profile="$(_active_profile)"
+    detach_agent="$(_resolve_agent_or_prompt "$detach_agent" "Choose agent runtime" "$agent_profile")" || return 1
+    export CCTRL_AGENT="$detach_agent"
     if [[ -n "$peer_identity" ]]; then
         local effective_profile="$profile" profile_agent pf=""
         [[ -n "$effective_profile" ]] || effective_profile="$(_active_profile)"
@@ -3727,23 +3868,47 @@ _peer_codex_notify_references_hook() {
     grep -F "$hook_name" "$config" >/dev/null 2>&1 && return 0
     command -v python3 >/dev/null 2>&1 || return 1
     python3 - "$config" "$hook_name" "$hook_path" <<'PY'
+import ast
 import os
+import re
 import shutil
 import sys
 
 config_path, hook_name, hook_path = sys.argv[1:4]
+notify = None
 try:
     import tomllib
 except Exception:
-    sys.exit(1)
+    tomllib = None
 
-try:
-    with open(config_path, "rb") as fh:
-        config = tomllib.load(fh)
-except Exception:
-    sys.exit(1)
+if tomllib is not None:
+    try:
+        with open(config_path, "rb") as fh:
+            config = tomllib.load(fh)
+        notify = config.get("notify")
+    except Exception:
+        sys.exit(1)
+else:
+    try:
+        text = open(config_path, "r", encoding="utf-8").read()
+    except OSError:
+        sys.exit(1)
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("["):
+            break
+        match = re.match(r"notify\s*=\s*(.+)$", stripped)
+        if not match:
+            continue
+        value = match.group(1).split("#", 1)[0].strip()
+        try:
+            notify = ast.literal_eval(value)
+        except Exception:
+            notify = value.strip("\"'")
+        break
 
-notify = config.get("notify")
 values = []
 if isinstance(notify, str):
     values.append(notify)
@@ -4645,7 +4810,7 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Session${RESET} ${DIM}(tmux-backed by default; --foreground for one-offs)${RESET}"
     echo "  cctrl start [@name]         Launch selected agent in tmux and attach when interactive"
-    echo "    --agent claude|codex      Select runtime (default: $(_default_agent))"
+    echo "    --agent claude|codex      Select runtime (default: $(_default_agent_label))"
     echo "    --foreground, --no-tmux   Launch directly without tmux"
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
@@ -4759,8 +4924,9 @@ cmd_statusline() {
             ;;
         install|show|-h|--help|help|"")
             action="${agent:-help}"
-            agent="$(_default_agent)"
-            agent="$(_normalize_agent "$agent")" || return 1
+            if [[ "$action" != "help" && "$action" != "-h" && "$action" != "--help" ]]; then
+                agent="$(_resolve_agent_or_prompt "" "Choose statusline target" "$(_active_profile)")" || return 1
+            fi
             ;;
         *)
             echo -e "${RED}Unknown statusline target: $agent${RESET}" >&2
@@ -5364,7 +5530,7 @@ cmd_host() {
                 return 1
             fi
             shift 2>/dev/null || true
-            local doctor_agent="$(_default_agent)"
+            local doctor_agent=""
             while [[ $# -gt 0 ]]; do
                 case "$1" in
                     --agent)
@@ -5376,6 +5542,7 @@ cmd_host() {
                         return 1 ;;
                 esac
             done
+            doctor_agent="$(_resolve_agent_or_prompt "$doctor_agent" "Choose agent runtime to check" "$(_active_profile)")" || return 1
             local lookup
             lookup="$(_host_lookup "$name")"
             if [[ -z "$lookup" ]]; then
@@ -5857,7 +6024,7 @@ _shortcut_jump() {
     local cli_prompt_set=false
     local no_bridge=false
     local cli_model=""
-    local agent="${shortcut_agent:-$(_default_agent)}"
+    local agent="${shortcut_agent:-}"
     local launch_name=""
     local peer_identity=""
     local full_bypass=false
@@ -5917,7 +6084,9 @@ _shortcut_jump() {
                 passthrough+=("$1"); shift ;;
         esac
     done
-    agent="$(_normalize_agent "$agent")" || return 1
+    local agent_profile="$profile"
+    [[ -n "$agent_profile" ]] || agent_profile="$(_active_profile)"
+    agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$agent_profile")" || return 1
 
     # Apply the shortcut's profile as a per-process overlay (env + model). No
     # global-settings mutation: concurrent shortcuts with different profiles stay

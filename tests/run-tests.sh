@@ -230,7 +230,7 @@ test_launch_args() {
     assert_contains "$out" "ARG[3]=sonnet"
     assert_contains "$out" "ARG[4]=fix bug"
 
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground -m "default agent")"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_AGENT=codex "$ROOT/cctrl" start --foreground -m "default agent")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=default agent"
@@ -241,6 +241,99 @@ test_launch_args() {
     assert_contains "$out" "ARG[1]=--remote"
     assert_contains "$out" "ARG[2]=unix://"
     assert_contains "$out" "ARG[3]=remote prompt"
+}
+
+test_agent_prompt_without_default() {
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_agent "$TMPDIR/claude" claude
+
+    local rootcopy="$TMPDIR/cctrl-agent-prompt-copy"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" start --foreground -m "needs agent" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected missing default agent to fail without a TTY"
+    assert_contains "$out" "No agent selected and prompting is unavailable"
+    assert_contains "$out" "Pass --agent <agent>"
+
+    command -v script >/dev/null 2>&1 || return 0
+    script -q /dev/null true >/dev/null 2>&1 || return 0
+
+    local out_file="$TMPDIR/agent-prompt-output.log"
+    printf '2\n' | env PATH="$TMPDIR:$PATH" \
+        script -q /dev/null "$rootcopy/cctrl" start --foreground -m "prompted agent" \
+        > "$out_file" 2>&1
+
+    out="$(cat "$out_file")"
+    assert_contains "$out" "Choose agent runtime:"
+    assert_contains "$out" "1) claude"
+    assert_contains "$out" "2) codex"
+    assert_contains "$out" "CMD=codex"
+    assert_contains "$out" "ARG[0]=--yolo"
+    assert_contains "$out" "ARG[1]=prompted agent"
+}
+
+test_profile_prompt_overrides_global_default() {
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_agent "$TMPDIR/claude" claude
+
+    local rootcopy="$TMPDIR/cctrl-profile-agent-prompt-copy"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+    printf 'personal\n' > "$rootcopy/.active-profile"
+    printf '{"defaultAgent":null,"env":{}}\n' > "$rootcopy/profiles/personal.json"
+
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" start --foreground --no-bridge -m "personal prompt" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected profile prompt override to fail without a TTY"
+    assert_contains "$out" "No agent selected and prompting is unavailable"
+
+    command -v script >/dev/null 2>&1 || return 0
+    script -q /dev/null true >/dev/null 2>&1 || return 0
+
+    local out_file="$TMPDIR/profile-agent-prompt-output.log"
+    printf '1\n' | env PATH="$TMPDIR:$PATH" \
+        script -q /dev/null "$rootcopy/cctrl" start --foreground --no-bridge -m "profile picked claude" \
+        > "$out_file" 2>&1
+
+    out="$(cat "$out_file")"
+    assert_contains "$out" "Choose agent runtime:"
+    assert_contains "$out" "CMD=claude"
+    assert_contains "$out" "ARG[0]=--permission-mode"
+    assert_contains "$out" "ARG[2]=profile picked claude"
+}
+
+test_detached_agent_prompt_exports_selection() {
+    command -v script >/dev/null 2>&1 || return 0
+    script -q /dev/null true >/dev/null 2>&1 || return 0
+
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-detached-agent-prompt-copy"
+    local project="$TMPDIR/detached-agent-prompt-project"
+    local log="$TMPDIR/detached-agent-prompt-tmux.log"
+    local out_file="$TMPDIR/detached-agent-prompt-output.log"
+    mkdir -p "$rootcopy/data" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    : > "$log"
+    printf '2\n' | env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
+        CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never CCTRL_EMIT_SESSION=1 \
+        script -q /dev/null "$rootcopy/cctrl" start -d "$project" \
+        > "$out_file" 2>&1
+
+    out="$(cat "$out_file")"
+    assert_contains "$out" "Choose agent runtime:"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--detached-agent-prompt-project"
+    assert_contains "$(cat "$log")" "CCTRL_AGENT=codex"
 }
 
 test_detached_arg_parsing() {
@@ -264,14 +357,14 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"initial_prompt": "line one"'
 
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
     assert_contains "$(cat "$log")" "start --foreground"
     assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "literal prompt words"'
 
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --purpose "cleanup context" "$project")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --purpose "cleanup context" "$project")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "start --foreground"
     assert_not_contains "$(cat "$log")" "--purpose"
@@ -301,7 +394,7 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "start --foreground"
 
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 \
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 \
         TMUX_FAKE_HAS_SESSION="TMUX--project" "$ROOT/cctrl" start -d "$project")"
     assert_contains "$out" "CCTRL_SESSION=TMUX--project--2"
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--project--2"
@@ -592,18 +685,18 @@ test_attach_prompt_after_start() {
 
     : > "$log"
     local out
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "")"
     assert_contains "$out" "Connect to session TMUX--prompt-project now? [y/N]"
     assert_contains "$out" "Not connected. Attach later: cctrl session attach TMUX--prompt-project"
     assert_not_contains "$(cat "$log")" "attach-session"
 
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "y")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "y")"
     assert_contains "$out" "Connect to session TMUX--prompt-project now? [y/N]"
     assert_contains "$(cat "$log")" "attach-session -t TMUX--prompt-project"
 
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start "$project" <<< "")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start "$project" <<< "")"
     assert_contains "$out" "Connect to session TMUX--prompt-project now? [Y/n]"
     assert_contains "$(cat "$log")" "attach-session -t TMUX--prompt-project"
 }
@@ -1745,6 +1838,9 @@ JSONL
 
 test_syntax
 test_launch_args
+test_agent_prompt_without_default
+test_profile_prompt_overrides_global_default
+test_detached_agent_prompt_exports_selection
 test_detached_arg_parsing
 test_start_defaults_to_tmux
 test_start_peer_env_and_metadata
