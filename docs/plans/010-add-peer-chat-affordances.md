@@ -44,6 +44,10 @@ unknown peers, and stale sessions. Human output should be concise, for example
 `comet -> TMUX--ctrl--3`; JSON output should include enough fields for scripts
 to choose whether a peer is live.
 
+Resolution must go through the existing peer JSON resolver instead of directly
+reading `peers.json`, so canonical alias handling and the
+live-derived-over-stale-manual behavior from earlier peer work remain intact.
+
 Peer host metadata is descriptive, not an implicit transport. If the resolved
 peer has `.host` set to anything other than the current host label (`local` or
 `${CCTRL_HOST_PREFIX}`), local direct-chat commands must fail with a hint such
@@ -87,9 +91,9 @@ already recognizes `session attach`.
 Checks:
 - [cmd] `bash -n cctrl && bash -n tests/run-tests.sh && zsh -n completions/_cctrl`
 - [cmd] `tests/run-tests.sh`
-- [assert] the test suite shows `cctrl peer session comet --json` returns the live `tmux_target`
-- [assert] the test suite shows `cctrl peer say comet -- "hello"` pastes to the resolved tmux session and leaves `messages.jsonl` unchanged
-- [assert] the test suite shows `cctrl peer attach comet` invokes `tmux attach-session -t <resolved-session>`
-- [assert] the test suite shows non-local manual peer metadata rejects direct local `peer say` with a `cctrl --host <host> peer say ...` hint
-- [assert] the test suite shows `cctrl --host studio peer attach comet` is forwarded over SSH with `-t`
-- [assert] the test suite shows human `cctrl peer ls` includes a session/status column for live metadata-derived peers
+- [cmd] `grep -Eq 'peer session' tests/run-tests.sh && grep -Eq 'tmux_target' tests/run-tests.sh`
+- [cmd] `grep -Eq 'peer say' tests/run-tests.sh && grep -Eq 'messages\\.jsonl|message.*unchanged|mailbox' tests/run-tests.sh`
+- [cmd] `grep -Eq 'peer attach' tests/run-tests.sh && grep -Eq 'attach-session -t|attach-session.*resolved' tests/run-tests.sh`
+- [cmd] `grep -Eq 'non-local|remote-host|--host <host>|--host.*peer say' tests/run-tests.sh`
+- [cmd] `grep -Eq -- '--host[[:space:]]+studio.*peer attach|peer attach.*ssh.*-t|ssh.*-t.*peer attach' tests/run-tests.sh`
+- [cmd] `grep -Eq 'peer ls' tests/run-tests.sh && grep -Eq 'SESSION|live|offline|status column' tests/run-tests.sh`

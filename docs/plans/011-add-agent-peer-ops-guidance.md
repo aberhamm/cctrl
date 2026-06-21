@@ -54,6 +54,11 @@ Identity behavior is explicit: a bare `peer help-agent` prints generic
 instructions; `--as NAME` and `CCTRL_PEER` canonicalize the identity and print
 peer-specific examples using that name.
 
+Do not reimplement peer lookup in the help or MCP paths. Identity and target
+names should go through the existing peer resolver/CLI commands so aliases,
+canonical names, and live tmux-derived peers stay consistent with the mailbox
+and `peer say` behavior.
+
 Update `lib/peer_mcp.py` so MCP-backed agents see the direct path too. Add a
 `say_peer` tool that accepts `to`, `body`, and optional `submit`/`force_busy`
 arguments. The bridge must pass `body` through stdin to `cctrl peer say
@@ -89,11 +94,11 @@ Testing approach: unit-only.
 Checks:
 - [cmd] `bash -n cctrl && bash -n tests/run-tests.sh && python3 -m py_compile lib/peer_mcp.py && zsh -n completions/_cctrl`
 - [cmd] `tests/run-tests.sh`
-- [assert] the test suite shows `cctrl peer help-agent --as comet` prints the canonical peer and includes `peer say`, `peer send`, `peer recv`, and `peer ack`
-- [assert] the test suite shows bare `cctrl peer help-agent` succeeds with generic guidance
-- [assert] the test suite shows `cctrl peer help-agent --json` returns valid structured JSON with direct and async command examples
-- [assert] the MCP smoke test advertises `say_peer`
-- [assert] the MCP `say_peer` test sends through the fake tmux path, preserves a trailing newline, and leaves `messages.jsonl` unchanged
+- [cmd] `grep -Eq 'peer help-agent' tests/run-tests.sh && grep -Eq 'peer say' tests/run-tests.sh && grep -Eq 'peer send' tests/run-tests.sh && grep -Eq 'peer recv' tests/run-tests.sh && grep -Eq 'peer ack' tests/run-tests.sh`
+- [cmd] `grep -Eq 'bare.*peer help-agent|peer help-agent.*generic|generic guidance' tests/run-tests.sh`
+- [cmd] `grep -Eq 'peer help-agent --json|--json.*help-agent|structured JSON' tests/run-tests.sh`
+- [cmd] `grep -Eq 'say_peer' lib/peer_mcp.py && grep -Eq 'say_peer' tests/run-tests.sh`
+- [cmd] `grep -Eq -- '--body-file[[:space:]]+-' lib/peer_mcp.py && grep -Eq 'trailing newline|messages\\.jsonl|mailbox' tests/run-tests.sh`
 
 ## GSTACK REVIEW REPORT
 

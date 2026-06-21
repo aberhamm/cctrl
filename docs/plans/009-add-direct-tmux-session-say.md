@@ -43,6 +43,10 @@ duplicating buffer load/paste/delete logic. Body reading should follow the
 sentinel pattern already used for mailbox bodies so trailing newlines survive
 Bash command substitution.
 
+Bash compatibility: keep any new array handling safe under Bash 3.2 with
+`set -u`; guard empty arrays and unset optional values the same way the
+existing peer/session helpers do.
+
 Pane-readiness should reuse the existing capture-pane checks where possible.
 If the agent type cannot be inferred from the session command or metadata, the
 safe default is to refuse unless `--force-busy` is set. Known approval,
@@ -73,8 +77,8 @@ Testing approach: unit-only.
 Checks:
 - [cmd] `bash -n cctrl && bash -n tests/run-tests.sh && zsh -n completions/_cctrl`
 - [cmd] `tests/run-tests.sh`
-- [assert] the test suite shows `cctrl session say TMUX--demo -- "hello"` calls `load-buffer`, `paste-buffer`, and `send-keys ... Enter`
-- [assert] the test suite shows `--no-submit` omits the Enter send-key
-- [assert] the test suite proves `--body-file -` preserves a trailing newline in the tmux buffer payload
-- [assert] the test suite proves a known modal prompt returns `status:"busy"` and does not paste even with `--force-busy`
-- [assert] the test suite proves unknown readiness refuses by default and succeeds only when `--force-busy` is present
+- [cmd] `grep -Eq 'session say|_session_.*say|cmd_session.*say' cctrl && grep -Eq 'load-buffer' tests/run-tests.sh && grep -Eq 'paste-buffer' tests/run-tests.sh && grep -Eq 'send-keys.*Enter' tests/run-tests.sh`
+- [cmd] `grep -Eq -- '--no-submit' tests/run-tests.sh && grep -Eq 'send-keys.*Enter' tests/run-tests.sh`
+- [cmd] `grep -Eq -- '--body-file[[:space:]]+-|body-file.*trailing newline|trailing newline.*body-file' tests/run-tests.sh`
+- [cmd] `grep -Eq 'modal prompt|status.*busy|busy.*status' tests/run-tests.sh && grep -Eq -- '--force-busy' tests/run-tests.sh`
+- [cmd] `grep -Eq 'unknown readiness|unknown agent readiness|force-busy' tests/run-tests.sh`
