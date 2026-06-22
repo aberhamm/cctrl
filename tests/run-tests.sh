@@ -228,7 +228,8 @@ test_launch_args() {
     assert_contains "$out" "ARG[1]=bypassPermissions"
     assert_contains "$out" "ARG[2]=--model"
     assert_contains "$out" "ARG[3]=sonnet"
-    assert_contains "$out" "ARG[4]=fix bug"
+    assert_contains "$out" "ARG[4]=--chrome"
+    assert_contains "$out" "ARG[5]=fix bug"
 
     out="$(PATH="$TMPDIR:$PATH" CCTRL_AGENT=codex "$ROOT/cctrl" start --foreground -m "default agent")"
     assert_contains "$out" "CMD=codex"
@@ -304,7 +305,8 @@ test_profile_prompt_overrides_global_default() {
     assert_contains "$out" "Choose agent runtime:"
     assert_contains "$out" "CMD=claude"
     assert_contains "$out" "ARG[0]=--permission-mode"
-    assert_contains "$out" "ARG[2]=profile picked claude"
+    assert_contains "$out" "ARG[2]=--chrome"
+    assert_contains "$out" "ARG[3]=profile picked claude"
 }
 
 test_detached_agent_prompt_exports_selection() {

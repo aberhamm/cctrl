@@ -468,6 +468,19 @@ _launch_exec_agent() {
                 LAUNCH_FLAGS+=("--resume")
             fi
         fi
+
+        # Enable Claude in Chrome integration by default for Claude Code
+        # sessions. Skip if the caller already specified --chrome/--no-chrome
+        # via passthrough so an explicit --no-chrome still wins.
+        local _chrome_flag_set=false
+        if [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]]; then
+            local _pf
+            for _pf in "${LAUNCH_PASSTHROUGH[@]}"; do
+                case "$_pf" in --chrome|--no-chrome) _chrome_flag_set=true; break ;; esac
+            done
+        fi
+        $_chrome_flag_set || LAUNCH_FLAGS+=("--chrome")
+
         [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
         [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
 
