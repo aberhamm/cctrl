@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""
+cctrl-ports — port tracker plugin for cctrl.
+
+Usage:
+  cctrl ports                        Scan current ports, update history, show free ranges
+  cctrl ports --free [options]       Suggest free port ranges (no scan)
+  cctrl ports --history              Show all ports ever seen
+  cctrl ports --reset                Clear port history
+
+Options:
+  --count N        Number of free ports to suggest (default: 10)
+  --min PORT       Minimum port for suggestions (default: 3000)
+  --max PORT       Maximum port for suggestions (default: 9999)
+  --ranges         Group suggestions as contiguous ranges instead of individual ports
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# ── Well-known ports to avoid (beyond 0–1023 system range) ───────────────────
+
+WELL_KNOWN_PORTS: dict[int, str] = {
+    1433:  "SQL Server",
+    1521:  "Oracle DB",
+    3000:  "React/Rails dev server",
+    3001:  "Dev server",
+    3306:  "MySQL/MariaDB",
+    4200:  "Angular dev server",
+    4567:  "Sinatra",
+    5000:  "Flask/Sinatra",
+    5173:  "Vite dev server",
+    5432:  "PostgreSQL",
+    5672:  "RabbitMQ",
+    6379:  "Redis",
+    6380:  "Redis alt",
+    8000:  "Django/Python HTTP",
+    8080:  "Alt HTTP/Tomcat/Jenkins",
+    8443:  "Alt HTTPS",
+    8888:  "Jupyter Notebook",
+    9000:  "MinIO",
+    9090:  "Prometheus",
+    9200:  "Elasticsearch",
+    9300:  "Elasticsearch cluster",
+    27017: "MongoDB",
+}
+
+# ── Colors (matching cctrl style) ─────────────────────────────────────────────
+
+BOLD   = '\033[1m'
+DIM    = '\033[2m'
+RED    = '\033[0;31m'
+GREEN  = '\033[0;32m'
+YELLOW = '\033[0;33m'
+CYAN   = '\033[0;36m'
+RESET  = '\033[0m'
+
+# ── Project port discovery ────────────────────────────────────────────────────
+
+# Directories never descended into during project scanning
+SKIP_DIRS = {
+    'node_modules', '.git', '__pycache__', '.next', 'dist', 'build',
+    'vendor', '.expo', '.cache', 'coverage', '.tox', 'venv', '.venv',
+    'target', '.gradle', 'tmp', 'temp', '.terraform',
+}
+
+# Max file size to scan (bytes) — skip large generated files
+MAX_FILE_BYTES = 512 * 1024  # 512 KB
+
+# File names / extensions that are worth scanning
+SCAN_NAMES = {
+    '.env', 'Dockerfile', 'Procfile', 'docker-compose.yml',
+    'docker-compose.yaml', 'docker-compose.override.yml',
+}
+SCAN_EXTENSIONS = {
+    '.env', '.yml', '.yaml', '.toml', '.conf', '.cfg', '.ini',
+    '.json', '.jsonc', '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
+    '.py', '.rb', '.go', '.rs', '.sh', '.bash', '.zsh',
+}
+
+# (pattern, group_index) — group_index is the capture group holding the port number
+PORT_PATTERNS: list[tuple[re.Pattern, int, str]] = [
+    # .env style:  PORT=3000  DB_PORT=5432
+    (re.compile(r'(?:^|[\s,;\'"(])(?:[A-Z_]*PORT[A-Z_]*)\s*=\s*(\d{4,5})', re.IGNORECASE), 1, 'env var'),
+    # Dockerfile EXPOSE
+    (re.compile(r'\bEXPOSE\s+(\d{4,5})\b'), 1, 'EXPOSE'),
+    # docker-compose port mapping: "3000:3000" or - 3000:8080
+    (re.compile(r'["\'\s\-](\d{4,5}):\d{2,5}["\'\s]'), 1, 'docker port map'),
+    # YAML/TOML/INI:  port: 3000  port = 3000  port=3000
+    (re.compile(r'^\s*ports?\s*[=:]\s*["\']?(\d{4,5})["\']?\s*$', re.MULTILINE), 1, 'config port'),
+    # localhost / 127.0.0.1 / 0.0.0.0
+    (re.compile(r'(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{4,5})\b'), 1, 'localhost url'),
+    # --port 3000  --port=3000
+    (re.compile(r'--port[=\s]+(\d{4,5})\b'), 1, '--port flag'),
+    # listen(3000)  .listen(3000,  app.listen(3000)
+    (re.compile(r'\.listen\(\s*(\d{4,5})\s*[,)]'), 1, '.listen()'),
+]
+
+# Full userspace port range (0–1023 require root)
+PORT_MIN = 1024
+PORT_MAX = 65535
+
+
+def _is_text_file(path: str) -> bool:
+    """Quick heuristic: read first 512 bytes and check for null bytes."""
+    try:
+        with open(path, 'rb') as f:
+            chunk = f.read(512)
+        return b'\x00' not in chunk
+    except OSError:
+        return False
+
+
+def _should_scan(path: str) -> bool:
+    """Return True if this file is worth scanning for ports."""
+    name = os.path.basename(path)
+    # Exact name matches (e.g. 'Dockerfile', '.env')
+    if name in SCAN_NAMES:
+        return True
+    # .env.local, .env.production, etc.
+    if name.startswith('.env'):
+        return True
+    # Dockerfile.dev, etc.
+    if name.startswith('Dockerfile'):
+        return True
+    ext = os.path.splitext(name)[1].lower()
+    return ext in SCAN_EXTENSIONS
+
+
+def scan_file_for_ports(path: str) -> list[dict]:
+    """
+    Scan a single file for port references.
+    Returns list of {port, line_num, line, pattern_label} dicts.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return []
+    if size > MAX_FILE_BYTES:
+        return []
+    if not _is_text_file(path):
+        return []
+
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+
+    findings = []
+    seen_ports_in_file: set[int] = set()
+
+    for line_num, line in enumerate(lines, 1):
+        for pattern, group, label in PORT_PATTERNS:
+            for m in pattern.finditer(line):
+                try:
+                    port = int(m.group(group))
+                except (IndexError, ValueError):
+                    continue
+                if port < PORT_MIN or port > PORT_MAX:
+                    continue
+                if port in seen_ports_in_file:
+                    continue
+                seen_ports_in_file.add(port)
+                findings.append({
+                    'port': port,
+                    'line_num': line_num,
+                    'line': line.rstrip(),
+                    'label': label,
+                })
+
+    return findings
+
+
+def discover_ports_in_dir(root: str) -> list[dict]:
+    """
+    Walk `root` recursively, scan eligible files, return all findings.
+    Each finding: {port, file (relative path), line_num, line, label}
+    """
+    all_findings = []
+    root = os.path.realpath(root)
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune skip dirs in-place
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            if not _should_scan(fpath):
+                continue
+            findings = scan_file_for_ports(fpath)
+            rel = os.path.relpath(fpath, root)
+            for f in findings:
+                f['file'] = rel
+            all_findings.extend(findings)
+
+    return all_findings
+
+
+# ── Storage ───────────────────────────────────────────────────────────────────
+
+_SELF_DIR   = os.path.dirname(os.path.realpath(__file__))
+_CCTRL_DIR  = os.path.dirname(_SELF_DIR)
+DATA_DIR    = os.path.join(_CCTRL_DIR, 'data')
+PORTS_FILE  = os.path.join(DATA_DIR, 'ports-seen.json')
+
+def _load_db() -> dict:
+    """Load the ports database, returning a fresh one if it doesn't exist."""
+    if os.path.exists(PORTS_FILE):
+        try:
+            with open(PORTS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"seen": [], "scans": []}
+
+
+def _save_db(db: dict) -> None:
+    """Persist the ports database."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PORTS_FILE, 'w') as f:
+        json.dump(db, f, separators=(',', ':'))
+
+
+def _merge_seen(db: dict, new_ports: list[int]) -> set[int]:
+    """Add new_ports to db['seen'], return the full seen set."""
+    seen = set(db.get('seen', []))
+    seen.update(new_ports)
+    db['seen'] = sorted(seen)
+    return seen
+
+# ── Port scanning ─────────────────────────────────────────────────────────────
+
+def get_listening_ports() -> list[dict]:
+    """
+    Return a list of dicts describing currently listening ports via lsof.
+    Each dict has: port (int), proto (str), process (str), pid (int).
+    Falls back to an empty list on any failure.
+    """
+    try:
+        result = subprocess.run(
+            ['lsof', '-iTCP', '-iUDP', '-P', '-n', '-sTCP:LISTEN'],
+            capture_output=True, text=True, timeout=10
+        )
+        lines = result.stdout.strip().splitlines()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+    ports = []
+    seen_ports = set()
+
+    for line in lines[1:]:  # skip header
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        process = parts[0]
+        pid_str = parts[1]
+        name_field = parts[8]  # e.g. "*:8080" or "127.0.0.1:5432"
+
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            pid = 0
+
+        # Extract port from name field (last colon-separated segment)
+        if ':' not in name_field:
+            continue
+        port_str = name_field.rsplit(':', 1)[-1]
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+
+        if port in seen_ports:
+            continue
+        seen_ports.add(port)
+
+        proto = 'TCP'
+        ports.append({'port': port, 'proto': proto, 'process': process, 'pid': pid})
+
+    return sorted(ports, key=lambda p: p['port'])
+
+
+# ── Free range generation ─────────────────────────────────────────────────────
+
+def find_free_ports(seen: set[int], min_port: int, max_port: int, count: int) -> list[int]:
+    """Return up to `count` ports in [min_port, max_port] never seen and not well-known.
+    Ports below 1024 are always excluded (require root)."""
+    excluded = seen | set(WELL_KNOWN_PORTS)
+    lo = max(min_port, PORT_MIN)
+    free = []
+    for p in range(lo, max_port + 1):
+        if p not in excluded:
+            free.append(p)
+            if len(free) >= count:
+                break
+    return free
+
+
+def find_consecutive_runs(
+    seen: set[int], min_port: int, max_port: int, run_length: int, num_options: int
+) -> list[list[int]]:
+    """
+    Find up to `num_options` non-overlapping runs of `run_length` consecutive
+    free ports in [min_port, max_port], avoiding seen and well-known ports.
+    Ports below 1024 are always excluded (require root).
+    """
+    excluded = seen | set(WELL_KNOWN_PORTS)
+    lo = max(min_port, PORT_MIN)
+    options = []
+    p = lo
+    while p <= max_port - run_length + 1 and len(options) < num_options:
+        run = list(range(p, p + run_length))
+        if all(port not in excluded for port in run):
+            options.append(run)
+            p += run_length  # skip past this run so options don't overlap
+        else:
+            p += 1
+    return options
+
+
+def group_into_ranges(ports: list[int]) -> list[tuple[int, int]]:
+    """Convert a sorted list of integers into contiguous ranges (start, end)."""
+    if not ports:
+        return []
+    ranges = []
+    start = ports[0]
+    end = ports[0]
+    for p in ports[1:]:
+        if p == end + 1:
+            end = p
+        else:
+            ranges.append((start, end))
+            start = end = p
+    ranges.append((start, end))
+    return ranges
+
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+
+def cmd_scan(args) -> None:
+    """Scan current ports, update history, display results + free suggestions."""
+    print(f"{DIM}Scanning listening ports...{RESET}")
+    active = get_listening_ports()
+
+    db = _load_db()
+    new_ports = [p['port'] for p in active]
+    seen = _merge_seen(db, new_ports)
+
+    # Record this scan
+    db.setdefault('scans', []).append({
+        'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'ports': sorted(new_ports),
+    })
+
+    _save_db(db)
+
+    # ── Active ports table ──
+    if active:
+        print()
+        COL_PORT = 8
+        COL_PROC = 20
+        print(f"{CYAN}{'Port':<{COL_PORT}} {'Process':<{COL_PROC}} PID{RESET}")
+        print(DIM + '─' * 40 + RESET)
+        for p in active:
+            print(f"{BOLD}{p['port']:<{COL_PORT}}{RESET} {p['process']:<{COL_PROC}} {DIM}{p['pid']}{RESET}")
+        print(DIM + '─' * 40 + RESET)
+        print(f"{DIM}{len(active)} listening port{'s' if len(active) != 1 else ''} · "
+              f"{len(seen)} total ever seen{RESET}")
+    else:
+        print(f"{DIM}No listening ports found.{RESET}")
+
+    # ── Free suggestions ──
+    _print_free(seen, args.min, args.max, args.count, args.ranges,
+                consecutive=args.consecutive, options=args.options)
+
+
+def cmd_free(args) -> None:
+    """Suggest free ports without scanning."""
+    db = _load_db()
+    seen = set(db.get('seen', []))
+    if not seen:
+        print(f"{DIM}No port history yet. Run 'cctrl ports' first to build history.{RESET}")
+        seen = set()
+    _print_free(seen, args.min, args.max, args.count, args.ranges,
+                consecutive=args.consecutive, options=args.options)
+
+
+def _print_free(seen: set[int], min_port: int, max_port: int, count: int, as_ranges: bool,
+                consecutive: int = 0, options: int = 5) -> None:
+    """Print free port suggestions, or consecutive run options if consecutive > 0."""
+    if consecutive > 0:
+        runs = find_consecutive_runs(seen, min_port, max_port, consecutive, options)
+        if not runs:
+            print(f"\n{YELLOW}No {consecutive} consecutive free ports found in {min_port}–{max_port}.{RESET}")
+            return
+        print(f"\n{BOLD}{consecutive} consecutive free ports{RESET} "
+              f"{DIM}({len(runs)} option{'s' if len(runs) != 1 else ''}, {min_port}–{max_port}){RESET}")
+        print(DIM + '─' * 40 + RESET)
+        for i, run in enumerate(runs, 1):
+            ports_str = '  '.join(str(p) for p in run)
+            range_str = f"{run[0]}–{run[-1]}"
+            print(f"  {CYAN}[{i}]{RESET}  {GREEN}{range_str}{RESET}  {DIM}{ports_str}{RESET}")
+        return
+
+    free = find_free_ports(seen, min_port, max_port, count)
+    if not free:
+        print(f"\n{YELLOW}No free ports found in {min_port}–{max_port}.{RESET}")
+        return
+
+    print(f"\n{BOLD}Free ports{RESET} {DIM}(never seen, {min_port}–{max_port}){RESET}")
+    print(DIM + '─' * 40 + RESET)
+
+    if as_ranges:
+        ranges = group_into_ranges(free)
+        for start, end in ranges:
+            if start == end:
+                print(f"  {GREEN}{start}{RESET}")
+            else:
+                print(f"  {GREEN}{start}–{end}{RESET}  {DIM}({end - start + 1} ports){RESET}")
+    else:
+        print('  ' + '  '.join(str(p) for p in free))
+
+
+def cmd_history(args) -> None:
+    """Show all ports ever seen."""
+    db = _load_db()
+    seen = sorted(db.get('seen', []))
+    scans = db.get('scans', [])
+
+    if not seen:
+        print(f"{DIM}No port history yet. Run 'cctrl ports' to start tracking.{RESET}")
+        return
+
+    print(f"{BOLD}Port History{RESET}  {DIM}({len(seen)} unique ports across {len(scans)} scan{'s' if len(scans) != 1 else ''}){RESET}")
+    print()
+
+    # Show as ranges for compactness
+    ranges = group_into_ranges(seen)
+    parts = []
+    for start, end in ranges:
+        if start == end:
+            parts.append(str(start))
+        else:
+            parts.append(f"{start}–{end}")
+
+    # Print in wrapped rows
+    line = ''
+    for part in parts:
+        candidate = (line + '  ' + part).lstrip()
+        if len(candidate) > 72:
+            print('  ' + line)
+            line = part
+        else:
+            line = candidate
+    if line:
+        print('  ' + line)
+
+    # Recent scans
+    if scans:
+        print()
+        print(f"{BOLD}Recent Scans{RESET}")
+        for scan in scans[-8:]:
+            ts = scan.get('ts', '?')
+            ports = scan.get('ports', [])
+            port_str = ', '.join(str(p) for p in ports[:12])
+            if len(ports) > 12:
+                port_str += f', … +{len(ports) - 12} more'
+            print(f"  {DIM}{ts}{RESET}  {port_str if port_str else DIM + 'none' + RESET}")
+
+
+def cmd_discover(args) -> None:
+    """Scan a directory recursively for port references and add to history."""
+    scan_dir = os.path.realpath(args.discover if args.discover else os.getcwd())
+
+    if not os.path.isdir(scan_dir):
+        print(f"{RED}Error: '{scan_dir}' is not a directory.{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"{DIM}Scanning {scan_dir} for port references...{RESET}")
+    findings = discover_ports_in_dir(scan_dir)
+
+    if not findings:
+        print(f"{DIM}No port references found.{RESET}")
+        return
+
+    # Group by file for display
+    by_file: dict[str, list[dict]] = {}
+    for f in findings:
+        by_file.setdefault(f['file'], []).append(f)
+
+    all_ports: set[int] = {f['port'] for f in findings}
+
+    # Display
+    print()
+    for rel_path in sorted(by_file):
+        file_findings = sorted(by_file[rel_path], key=lambda x: x['line_num'])
+        print(f"{BOLD}{rel_path}{RESET}")
+        for f in file_findings:
+            snippet = f['line'].strip()[:60]
+            print(f"  {GREEN}{f['port']:<6}{RESET} {DIM}:{f['line_num']:<4}  {snippet}{RESET}")
+        print()
+
+    # Summary
+    print(DIM + '─' * 60 + RESET)
+    print(f"{BOLD}{len(all_ports)} unique port{'s' if len(all_ports) != 1 else ''}{RESET} "
+          f"{DIM}found across {len(by_file)} file{'s' if len(by_file) != 1 else ''}{RESET}")
+    print(f"  {' '.join(str(p) for p in sorted(all_ports))}")
+    print()
+
+    # Load existing history to show what's new
+    db = _load_db()
+    existing = set(db.get('seen', []))
+    new_ports = all_ports - existing
+
+    if not new_ports:
+        print(f"{DIM}All discovered ports are already in history. Nothing to add.{RESET}")
+        return
+
+    print(f"{YELLOW}{len(new_ports)} new{RESET} "
+          f"(not yet in history): {' '.join(str(p) for p in sorted(new_ports))}")
+    print()
+
+    if args.yes:
+        answer = 'y'
+    else:
+        answer = input(f"Add to port history? [Y/n] ").strip().lower()
+
+    if answer in ('', 'y'):
+        _merge_seen(db, list(all_ports))
+        db.setdefault('scans', []).append({
+            'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'source': f'discover:{os.path.basename(scan_dir)}',
+            'ports': sorted(all_ports),
+        })
+        _save_db(db)
+        print(f"{GREEN}Added {len(new_ports)} new port{'s' if len(new_ports) != 1 else ''} to history.{RESET}")
+    else:
+        print(f"{DIM}Skipped.{RESET}")
+
+
+def cmd_known() -> None:
+    """List well-known ports that are always excluded from suggestions."""
+    print(f"{BOLD}Well-known ports{RESET}  {DIM}(always excluded from suggestions){RESET}")
+    print()
+    COL_PORT = 7
+    COL_SVC  = 40
+    print(f"{CYAN}{'Port':<{COL_PORT}} Service{RESET}")
+    print(DIM + '─' * (COL_PORT + COL_SVC) + RESET)
+    for port in sorted(WELL_KNOWN_PORTS):
+        print(f"{BOLD}{port:<{COL_PORT}}{RESET} {WELL_KNOWN_PORTS[port]}")
+    print(DIM + '─' * (COL_PORT + COL_SVC) + RESET)
+    print(f"{DIM}{len(WELL_KNOWN_PORTS)} ports  ·  0–1023 reserved (root only) · userspace: 1024–65535{RESET}")
+
+
+def _parse_port_spec(spec: str) -> list[int]:
+    """
+    Parse a port specification into a sorted list of port numbers.
+    Accepts:  3000          single port
+              3000-3003     inclusive range
+              3000,3001     comma-separated list
+              3000-3003,3010  mixed
+    """
+    ports = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, _, hi = part.partition('-')
+            try:
+                lo_i, hi_i = int(lo.strip()), int(hi.strip())
+            except ValueError:
+                raise ValueError(f"Invalid port range: '{part}'")
+            if lo_i > hi_i:
+                lo_i, hi_i = hi_i, lo_i
+            ports.update(range(lo_i, hi_i + 1))
+        else:
+            try:
+                ports.add(int(part))
+            except ValueError:
+                raise ValueError(f"Invalid port: '{part}'")
+    return sorted(ports)
+
+
+def _pids_on_ports(ports: list[int]) -> dict[int, list[dict]]:
+    """
+    Return {port: [{pid, process}]} for each port that has a listener.
+    Uses lsof; ports with no listener are omitted.
+    """
+    if not ports:
+        return {}
+    port_args = [str(p) for p in ports]
+    try:
+        result = subprocess.run(
+            ['lsof', '-iTCP', '-iUDP', '-P', '-n', '-sTCP:LISTEN']
+            + [f'-i:{p}' for p in ports],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+
+    listeners: dict[int, list[dict]] = {}
+    for line in result.stdout.strip().splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 9:
+            continue
+        process, pid_str, name_field = parts[0], parts[1], parts[8]
+        if ':' not in name_field:
+            continue
+        port_str = name_field.rsplit(':', 1)[-1]
+        try:
+            port = int(port_str)
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if port not in ports:
+            continue
+        entry = {'pid': pid, 'process': process}
+        if port not in listeners:
+            listeners[port] = []
+        if not any(e['pid'] == pid for e in listeners[port]):
+            listeners[port].append(entry)
+    return listeners
+
+
+def cmd_kill(args) -> None:
+    """Kill processes listening on specified port(s)."""
+    try:
+        ports = _parse_port_spec(args.kill)
+    except ValueError as e:
+        print(f"{RED}Error: {e}{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    listeners = _pids_on_ports(ports)
+
+    # Report ports with nothing listening
+    silent = set(ports) - set(listeners)
+    for p in sorted(silent):
+        print(f"{DIM}  {p}  nothing listening{RESET}")
+
+    if not listeners:
+        print(f"{DIM}No listening processes found on the specified port(s).{RESET}")
+        return
+
+    # Build kill list, deduplicating PIDs (one process may own multiple ports)
+    # pid -> {process, ports}
+    pid_map: dict[int, dict] = {}
+    for port in sorted(listeners):
+        for entry in listeners[port]:
+            pid = entry['pid']
+            if pid not in pid_map:
+                pid_map[pid] = {'process': entry['process'], 'ports': []}
+            pid_map[pid]['ports'].append(port)
+
+    sig_name = 'SIGKILL' if args.force else 'SIGTERM'
+    sig = signal.SIGKILL if args.force else signal.SIGTERM
+
+    # Show what will be killed
+    print()
+    COL_PORT = 20
+    COL_PROC = 18
+    print(f"{CYAN}{'Port(s)':<{COL_PORT}} {'Process':<{COL_PROC}} {'PID':>6}  Signal{RESET}")
+    print(DIM + '─' * 54 + RESET)
+    for pid, info in sorted(pid_map.items(), key=lambda x: x[1]['ports'][0]):
+        ports_str = ', '.join(str(p) for p in info['ports'])
+        print(f"{YELLOW}{ports_str:<{COL_PORT}}{RESET} {info['process']:<{COL_PROC}} {pid:>6}  {DIM}{sig_name}{RESET}")
+    print()
+
+    if args.yes:
+        answer = 'y'
+    else:
+        noun = f"{len(pid_map)} process{'es' if len(pid_map) != 1 else ''}"
+        answer = input(f"Kill {noun}? [y/N] ").strip().lower()
+
+    if answer != 'y':
+        print(f"{DIM}Aborted.{RESET}")
+        return
+
+    print()
+    for pid, info in sorted(pid_map.items()):
+        ports_str = ', '.join(str(p) for p in info['ports'])
+        try:
+            os.kill(pid, sig)
+            print(f"{GREEN}✓{RESET}  {info['process']}  {DIM}pid {pid}  port{'s' if len(info['ports']) > 1 else ''} {ports_str}{RESET}")
+        except ProcessLookupError:
+            print(f"{DIM}✓  {info['process']}  pid {pid}  already gone{RESET}")
+        except PermissionError:
+            print(f"{RED}✗  {info['process']}  pid {pid}  permission denied — try sudo{RESET}")
+
+    # If SIGTERM, wait briefly and report survivors
+    if sig == signal.SIGTERM:
+        time.sleep(0.5)
+        survivors = []
+        for pid in pid_map:
+            try:
+                os.kill(pid, 0)   # signal 0 = existence check
+                survivors.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                survivors.append(pid)  # still alive, just unreadable
+
+        if survivors:
+            procs = ', '.join(
+                f"{pid_map[p]['process']} ({p})" for p in survivors
+            )
+            print(f"\n{YELLOW}Still running: {procs}{RESET}")
+            print(f"{DIM}Tip: use --force for SIGKILL{RESET}")
+
+
+def cmd_check(args) -> None:
+    """Check whether specific ports are safe to use."""
+    try:
+        ports = _parse_port_spec(args.check)
+    except ValueError as e:
+        print(f"{RED}Error: {e}{RESET}", file=sys.stderr)
+        sys.exit(1)
+
+    db = _load_db()
+    seen_history = set(db.get('seen', []))
+    listeners = _pids_on_ports(ports)
+
+    COL_PORT = 7
+    COL_STATUS = 10
+    COL_REASON = 42
+    print()
+    print(f"{CYAN}{'Port':<{COL_PORT}} {'Status':<{COL_STATUS}} Reason{RESET}")
+    print(DIM + '─' * (COL_PORT + COL_STATUS + COL_REASON) + RESET)
+
+    all_clear = True
+    for port in ports:
+        issues = []
+
+        if port < PORT_MIN:
+            issues.append(f"root-only (0–1023)")
+        if port in WELL_KNOWN_PORTS:
+            issues.append(f"well-known: {WELL_KNOWN_PORTS[port]}")
+        if port in seen_history:
+            issues.append("seen in history")
+        if port in listeners:
+            procs = ', '.join(f"{e['process']} ({e['pid']})" for e in listeners[port])
+            issues.append(f"in use: {procs}")
+
+        if issues:
+            all_clear = False
+            status = f"{RED}avoid{RESET}"
+            reason = f"{DIM}" + '  ·  '.join(issues) + f"{RESET}"
+        else:
+            status = f"{GREEN}clear{RESET}"
+            reason = f"{DIM}not in use, history, or well-known list{RESET}"
+
+        print(f"{BOLD}{port:<{COL_PORT}}{RESET} {status:<{COL_STATUS + 9}} {reason}")
+
+    print(DIM + '─' * (COL_PORT + COL_STATUS + COL_REASON) + RESET)
+    if all_clear:
+        print(f"{GREEN}All ports clear.{RESET}")
+    else:
+        print(f"{DIM}Flags: root-only · well-known · seen in history · in use{RESET}")
+    print()
+
+
+def cmd_reset(args) -> None:
+    """Clear port history after confirmation."""
+    if not os.path.exists(PORTS_FILE):
+        print(f"{DIM}No port history to clear.{RESET}")
+        return
+
+    db = _load_db()
+    count = len(db.get('seen', []))
+    scans = len(db.get('scans', []))
+
+    answer = input(
+        f"Clear {count} seen ports across {scans} scans? [y/N] "
+    ).strip().lower()
+    if answer != 'y':
+        print(f"{DIM}Aborted.{RESET}")
+        return
+
+    os.remove(PORTS_FILE)
+    print(f"{GREEN}Port history cleared.{RESET}")
+
+
+# ── Argument parsing & dispatch ───────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog='cctrl ports',
+        description='Track ports in use over time and suggest free port ranges.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  cctrl ports                          scan active ports, update history, show 10 free ports
+  cctrl ports --consecutive 4          find 4 consecutive free ports (5 options shown)
+  cctrl ports --consecutive 6 --options 3 --min 4000 --max 9000
+  cctrl ports --free --ranges          suggest free ports as contiguous ranges (no live scan)
+  cctrl ports --free --count 20 --min 8000 --max 8999
+  cctrl ports --check 3000             check if port 3000 is safe to use
+  cctrl ports --check 3000-3003        check a range
+  cctrl ports --check 3000,5432,8080   check specific ports
+  cctrl ports --kill 3000              kill process on port 3000 (SIGTERM, confirms first)
+  cctrl ports --kill 3000-3003         kill processes on ports 3000 through 3003
+  cctrl ports --kill 3000,3001,4321 -y kill specific ports, skip confirmation
+  cctrl ports --kill 3000 --force      SIGKILL instead of SIGTERM
+  cctrl ports --discover ~/_projects  scan project files for port refs, add to history
+  cctrl ports --discover . -y         same, skip confirmation
+  cctrl ports --history               show all ports ever seen, compact range notation
+  cctrl ports --known                 list well-known ports always excluded from suggestions
+
+port sources:
+  live scan     lsof (listening TCP/UDP)
+  --discover    .env files, Dockerfiles, docker-compose, YAML/TOML configs, source files
+  well-known    22 common service ports (always excluded regardless of history)
+  system        0–1023 reserved (require root) — always excluded
+  userspace     1024–65535 (default suggestion range: --min 3000 --max 65535)
+
+history is stored in data/ports-seen.json and grows across invocations.
+""",
+        add_help=True,
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        '--check', metavar='PORTS',
+        help='Check if port(s) are safe to use: 3000  3000-3003  3000,3001',
+    )
+    mode_group.add_argument(
+        '--kill', metavar='PORTS',
+        help='Kill process(es) on port(s): 3000  3000-3003  3000,3001,3005',
+    )
+    mode_group.add_argument(
+        '--discover', nargs='?', const='', metavar='DIR',
+        help='Scan a directory recursively for port references (default: cwd)',
+    )
+    mode_group.add_argument(
+        '--free', action='store_true',
+        help='Suggest free ports from history (no live scan)',
+    )
+    mode_group.add_argument(
+        '--history', action='store_true',
+        help='Show all ports ever seen',
+    )
+    mode_group.add_argument(
+        '--known', action='store_true',
+        help='List well-known ports that are always excluded from suggestions',
+    )
+    mode_group.add_argument(
+        '--reset', action='store_true',
+        help='Clear port history',
+    )
+
+    parser.add_argument(
+        '--yes', '-y', action='store_true',
+        help='Skip confirmation prompts',
+    )
+    parser.add_argument(
+        '--force', action='store_true',
+        help='Use SIGKILL instead of SIGTERM (use with --kill)',
+    )
+    parser.add_argument(
+        '--consecutive', type=int, default=0, metavar='N',
+        help='Find runs of N consecutive free ports instead of individual ports',
+    )
+    parser.add_argument(
+        '--options', type=int, default=5, metavar='K',
+        help='Number of consecutive-run options to show (default: 5)',
+    )
+    parser.add_argument(
+        '--count', type=int, default=10, metavar='N',
+        help='Number of free ports to suggest (default: 10)',
+    )
+    parser.add_argument(
+        '--min', type=int, default=3000, metavar='PORT',
+        help='Minimum port for suggestions (default: 3000, userspace starts at 1024)',
+    )
+    parser.add_argument(
+        '--max', type=int, default=65535, metavar='PORT',
+        help='Maximum port for suggestions (default: 65535)',
+    )
+    parser.add_argument(
+        '--ranges', action='store_true',
+        help='Show free ports grouped as contiguous ranges',
+    )
+
+    args = parser.parse_args()
+
+    if args.check:
+        cmd_check(args)
+    elif args.kill:
+        cmd_kill(args)
+    elif args.discover is not None:
+        cmd_discover(args)
+    elif args.free or args.consecutive:
+        cmd_free(args)
+    elif args.history:
+        cmd_history(args)
+    elif args.known:
+        cmd_known()
+    elif args.reset:
+        cmd_reset(args)
+    else:
+        cmd_scan(args)
+
+
+if __name__ == '__main__':
+    main()

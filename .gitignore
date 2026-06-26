@@ -41,7 +41,5 @@ data/
 # Local-only artifacts (post drafts, scratch, personal exports)
 drafts/
 
-# Built plugins
-plugins/cctrl-ports
 .mstack/
 .mstack-*
