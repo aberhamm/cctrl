@@ -1,7 +1,7 @@
 ---
 id: 019
 title: cctrl session prune — stale + never-prompted detection with --dry-run
-status: pending
+status: in-progress
 blocked-by: [013, 014]
 priority: 19
 goal: cctrl-fleet-staleness
