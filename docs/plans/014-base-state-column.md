@@ -1,7 +1,7 @@
 ---
 id: 014
 title: Add a base STATE column to session ls from the per-pid status field
-status: pending
+status: in-progress
 blocked-by: [013]
 priority: 14
 goal: cctrl-fleet-staleness
