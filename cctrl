@@ -23,6 +23,16 @@ _session_refresh_paths() {
     SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
 }
 _session_refresh_paths
+_autoheal_refresh_paths() {
+    # Paths for the opt-in dead-bridge autoheal timer (plan 021). The launchd
+    # agent dir is overridable (CCTRL_LAUNCH_AGENTS_DIR) so tests write a plist to
+    # a scratch dir instead of the real ~/Library/LaunchAgents.
+    AUTOHEAL_DATA_DIR="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}"
+    AUTOHEAL_LOG="${CCTRL_AUTOHEAL_LOG:-$AUTOHEAL_DATA_DIR/autoheal.log}"
+    AUTOHEAL_LAUNCH_AGENTS_DIR="${CCTRL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+    AUTOHEAL_PLIST_LABEL="com.cctrl.session-autoheal"
+}
+_autoheal_refresh_paths
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -4194,6 +4204,10 @@ cmd_session() {
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session doctor [--fix]   Audit/repair remote-control bridges (--json, --yes)"
+            echo "  cctrl session autoheal         Heal DEAD bridges non-interactively (safety-gated)"
+            echo "    --dry-run                    Report what would be healed; act on none"
+            echo "    install [--interval SECONDS] Install a launchd timer (opt-in; default 900s)"
+            echo "    uninstall                    Remove the launchd timer"
             echo "  cctrl session current [--json] Show this process/session identity"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
             echo "  cctrl session prune            Propose stale / never-prompted sessions to close"
@@ -4214,6 +4228,7 @@ cmd_session() {
             ;;
         ls|list)   _session_list "$@" ;;
         doctor|reconcile) _session_doctor "$@" ;;
+        autoheal)  _session_autoheal "$@" ;;
         current|whoami|identity) _session_current "$@" ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
         prune)     _session_prune "$@" ;;
@@ -4938,6 +4953,215 @@ _session_doctor() {
     fi
     if [[ "$n_misnamed" -gt 0 && "$fix" != true ]]; then
         echo -e "${DIM}Name mismatches are fixed for new launches; realign existing ones with: cctrl session doctor --fix (guided relaunch, --resume-s the conversation), or run the per-row realign hint.${RESET}"
+    fi
+    return 0
+}
+
+_autoheal_log() {
+    # Append one heal/skip record to the predictable autoheal log for
+    # after-the-fact inspection. Best-effort: never fails a heal pass.
+    local action="$1" sess="$2" reason="${3:-}" ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)"
+    mkdir -p "$(dirname "$AUTOHEAL_LOG")" 2>/dev/null || true
+    printf '%s %s %s%s\n' "$ts" "$action" "$sess" "${reason:+ ($reason)}" \
+        >> "$AUTOHEAL_LOG" 2>/dev/null || true
+}
+
+_session_autoheal_install() {
+    # Install an opt-in launchd agent that runs `cctrl session autoheal` on an
+    # interval. Mirrors the user's existing local agent style
+    # (com.matthew.proxy-orphan-guard): a per-user LaunchAgent plist with a
+    # StartInterval. Never installed automatically. The plist dir is overridable
+    # (CCTRL_LAUNCH_AGENTS_DIR) so tests never touch ~/Library/LaunchAgents.
+    local interval=900
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval) interval="${2:-}"; shift 2 ;;
+            -h|--help)  echo "Usage: cctrl session autoheal install [--interval SECONDS]"; return 0 ;;
+            *) echo -e "${RED}Unknown install flag: $1${RESET}" >&2; return 64 ;;
+        esac
+    done
+    [[ "$interval" =~ ^[0-9]+$ && "$interval" -gt 0 ]] || {
+        echo -e "${RED}--interval must be a positive integer (seconds).${RESET}" >&2; return 64; }
+
+    local self plist
+    self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    mkdir -p "$AUTOHEAL_LAUNCH_AGENTS_DIR"
+    mkdir -p "$(dirname "$AUTOHEAL_LOG")" 2>/dev/null || true
+    plist="$AUTOHEAL_LAUNCH_AGENTS_DIR/$AUTOHEAL_PLIST_LABEL.plist"
+    cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$AUTOHEAL_PLIST_LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$self</string>
+        <string>session</string>
+        <string>autoheal</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>$interval</integer>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>$AUTOHEAL_LOG</string>
+    <key>StandardErrorPath</key>
+    <string>$AUTOHEAL_LOG</string>
+</dict>
+</plist>
+PLIST
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl unload "$plist" 2>/dev/null || true
+        launchctl load "$plist" 2>/dev/null || true
+    fi
+    echo -e "${GREEN}Installed autoheal timer${RESET} (every ${interval}s): $plist"
+    echo -e "${DIM}Heal log: $AUTOHEAL_LOG · Remove with: cctrl session autoheal uninstall${RESET}"
+}
+
+_session_autoheal_uninstall() {
+    local plist="$AUTOHEAL_LAUNCH_AGENTS_DIR/$AUTOHEAL_PLIST_LABEL.plist"
+    if [[ -f "$plist" ]]; then
+        command -v launchctl >/dev/null 2>&1 && { launchctl unload "$plist" 2>/dev/null || true; }
+        rm -f "$plist"
+        echo -e "${GREEN}Uninstalled autoheal timer${RESET}: $plist"
+    else
+        echo -e "${DIM}autoheal timer not installed ($plist).${RESET}"
+    fi
+}
+
+_session_autoheal() {
+    # Opt-in, scheduled self-heal for DEAD remote-control bridges (plan 021).
+    # Detects dead bridges (same classification as `doctor --fix`) and
+    # re-establishes them via the same /rc injection path — but ONLY behind a
+    # strict per-session SAFETY GATE, because the repair starts with C-u which
+    # clears the input line:
+    #   skip busy      — never inject into a working agent
+    #   skip copy-mode — keystrokes are silently swallowed there
+    #   skip unsent-draft — a non-empty input line means typed-but-unsent text
+    #                    that C-u would erase (reuses plan 016's draft detector);
+    #                    an unverifiable (empty) capture also skips, fail-safe.
+    # Only `dead` bridges are ever touched (never `live`/`off`), so the pass is
+    # idempotent and safe to run on a timer alongside active sessions. Runs fully
+    # NON-INTERACTIVELY (assume-yes) — launchd has no TTY, so it never prompts.
+    # Every heal and every gate-skip is appended to $AUTOHEAL_LOG.
+    #
+    # Test seam: when CCTRL_AUTOHEAL_REPAIR_LOG is set, an eligible session's name
+    # is appended to it and the real keystroke repair is NOT run, so the harness
+    # can assert whether a repair fired without injecting into a live pane.
+    _autoheal_refresh_paths
+    case "${1:-}" in
+        install)   shift; _session_autoheal_install "$@"; return $? ;;
+        uninstall) shift; _session_autoheal_uninstall "$@"; return $? ;;
+        -h|--help|help)
+            echo "Usage: cctrl session autoheal [--dry-run] [--json]"
+            echo "       cctrl session autoheal install [--interval SECONDS]"
+            echo "       cctrl session autoheal uninstall"
+            echo ""
+            echo "  Heal DEAD remote-control bridges by re-injecting /rc, but only for"
+            echo "  sessions that pass the safety gate (not busy, not in copy-mode, and"
+            echo "  with an empty input line). Runs non-interactively; only touches dead"
+            echo "  bridges, never live ones. Logs every action to:"
+            echo "    $AUTOHEAL_LOG"
+            echo ""
+            echo "    --dry-run   Report what WOULD be healed; act on none."
+            echo "    install     Install an opt-in launchd timer (default every 900s)."
+            echo "    uninstall   Remove the launchd timer."
+            return 0 ;;
+    esac
+
+    _session_require_tmux || return 1
+    local dry_run=false json=false a
+    for a in "$@"; do
+        case "$a" in
+            --dry-run|-n) dry_run=true ;;
+            --json) json=true ;;
+            -*) echo -e "${RED}Unknown autoheal flag: $a${RESET}" >&2; return 64 ;;
+        esac
+    done
+
+    local -a names=() json_items=()
+    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
+        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    local name cmd rc pid st copy_mode capture action reason
+    local scanned=0 healed=0 skipped=0 would=0 failed=0
+    $json || printf '%-22s %-14s %s\n' "SESSION" "ACTION" "DETAIL"
+    for name in "${names[@]}"; do
+        cmd="$(_session_agent_cmd "$name")"
+        [[ "$cmd" == *claude* ]] || continue
+        rc="$(_session_rc_state "$name" "$cmd")"
+        # Only DEAD bridges are /rc-repairable; live/off/collision are left alone.
+        [[ "$rc" == "dead" ]] || continue
+        scanned=$((scanned+1))
+        pid="$(_session_claude_pid "$name")"
+        st="$(_session_bridge_field "$pid" status)"; [[ -n "$st" ]] || st="?"
+
+        # SAFETY GATE — order matters; any failed gate skips (never repairs).
+        action=""; reason=""
+        if [[ "$st" == "busy" ]]; then
+            action="skipped"; reason="busy"
+        else
+            copy_mode="$(tmux display -p -t "$name" '#{pane_in_mode}' 2>/dev/null || true)"
+            if [[ "${copy_mode:-0}" == "1" ]]; then
+                action="skipped"; reason="copy-mode"
+            else
+                capture="$(tmux capture-pane -p -S -40 -t "$name" 2>/dev/null || true)"
+                if [[ -z "$capture" ]]; then
+                    # Can't confirm the input line is empty — fail safe, never heal.
+                    action="skipped"; reason="unverifiable-input"
+                elif _session_pane_has_draft "$capture"; then
+                    action="skipped"; reason="unsent-draft"
+                else
+                    action="eligible"
+                fi
+            fi
+        fi
+
+        if [[ "$action" == "eligible" ]]; then
+            if $dry_run; then
+                action="would-heal"; reason=""; would=$((would+1))
+            elif [[ -n "${CCTRL_AUTOHEAL_REPAIR_LOG:-}" ]]; then
+                printf '%s\n' "$name" >> "$CCTRL_AUTOHEAL_REPAIR_LOG"
+                action="healed"; reason="stub"; healed=$((healed+1))
+                _autoheal_log "$action" "$name" "$reason"
+            elif _session_repair_bridge "$name" >/dev/null; then
+                action="healed"; reason=""; healed=$((healed+1))
+                _autoheal_log "$action" "$name" "$reason"
+            else
+                action="repair-failed"; reason=""; failed=$((failed+1))
+                _autoheal_log "$action" "$name" "$reason"
+            fi
+        else
+            skipped=$((skipped+1))
+            $dry_run || _autoheal_log "$action" "$name" "$reason"
+        fi
+
+        if $json; then
+            json_items+=("$(jq -n --arg s "$name" --arg rc "$rc" --arg st "$st" \
+                --arg action "$action" --arg reason "$reason" \
+                '{session:$s, remote_control:$rc, status:$st, action:$action, reason:(if $reason=="" then null else $reason end)}')")
+        else
+            printf '%-22s %-14s %s\n' "$name" "$action" "$reason"
+        fi
+    done
+
+    if $json; then
+        if [[ ${#json_items[@]} -eq 0 ]]; then echo "[]"; else printf '%s\n' "${json_items[@]}" | jq -s '.'; fi
+        return 0
+    fi
+
+    echo ""
+    if $dry_run; then
+        echo -e "${BOLD}autoheal (dry-run): ${scanned} dead bridge(s), ${would} would heal, ${skipped} gated${RESET}"
+    else
+        local summary="autoheal: ${scanned} dead bridge(s), ${healed} healed, ${skipped} skipped"
+        [[ "$failed" -gt 0 ]] && summary+=", ${failed} repair-failed"
+        echo -e "${BOLD}${summary}${RESET}"
+        [[ "$healed" -gt 0 || "$skipped" -gt 0 || "$failed" -gt 0 ]] && \
+            echo -e "${DIM}Log: $AUTOHEAL_LOG${RESET}"
     fi
     return 0
 }

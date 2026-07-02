@@ -1,13 +1,16 @@
 ---
 id: 021
 title: Auto-heal dead remote-control bridges on a timer
-status: in-progress
+status: done
 blocked-by: [016]
 priority: 21
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -90,3 +93,21 @@ real bridges or system agents touched in tests.
   input line (unsent draft) is skipped, not repaired
 - [assert] install test asserts the plist file exists in the test dir after
   `install` and is gone after `uninstall`
+
+## Implementation Notes
+
+Added `_session_autoheal`: selects only DEAD bridges (via `_session_rc_state`)
+and repairs them through `_session_repair_bridge`, behind a strict per-session
+safety gate — skip busy, skip copy-mode, skip any non-empty input line
+(unsent-draft, reusing plan 016's `_session_pane_has_draft`), and fail-safe skip
+when the capture can't confirm an empty input. Runs non-interactively (no TTY),
+`--dry-run` reports without acting, and `autoheal install|uninstall` write/remove
+a launchd plist under a test-overridable `CCTRL_LAUNCH_AGENTS_DIR`. Every skip/heal
+is logged under the cctrl data dir. 7 tests stub the repair path + launchctl.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `6f3c343` — `feat(session): add opt-in autoheal for dead RC bridges with unsent-draft guard`

@@ -150,6 +150,14 @@ case "${1:-}" in
         fi
         exit 0
         ;;
+    display)
+        if [[ "$*" == *pane_in_mode* ]]; then
+            printf '%s\n' "${TMUX_FAKE_PANE_IN_MODE:-0}"
+        else
+            printf '0\n'
+        fi
+        exit 0
+        ;;
     show-option)
         printf '1\n'
         exit 0
@@ -1019,6 +1027,194 @@ JSON
     assert_contains "$tmuxlog" "--resume sess_uuid_1"
     # It relaunches as claude (only claude carries the app-name prefix).
     assert_contains "$tmuxlog" "--agent claude"
+}
+
+# --- plan 021: opt-in autoheal of DEAD remote-control bridges ---------------
+# All autoheal tests stub the repair path (CCTRL_AUTOHEAL_REPAIR_LOG captures
+# whether a repair fired, instead of injecting real keystrokes) and stub
+# launchctl + the LaunchAgents dir (CCTRL_LAUNCH_AGENTS_DIR), so no real bridge,
+# keystroke, or system agent is ever touched.
+_autoheal_fixture() {
+    # args: bindir sessdir status  -> a DEAD-bridge claude session (argv carries
+    # --remote-control but the session file has no bridgeSessionId), named
+    # TMUX--ms--portal and backed by pane pid 4242. Also drops a launchctl stub.
+    local bin="$1" sdir="$2" status="$3"
+    mkdir -p "$bin" "$sdir"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--portal --remote-control --remote-control-session-name-prefix TMUX--ms--portal-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<JSON
+{"pid":4242,"name":"TMUX--ms--portal","status":"${status}"}
+JSON
+    cat > "$bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+    chmod +x "$bin/launchctl"
+}
+
+test_session_autoheal_dry_run_selects_dead_and_no_repair() {
+    # --dry-run selects the dead bridge (reports would-heal) but fires NO repair
+    # and writes NO heal log: it acts on nothing.
+    local bin="$TMPDIR/ah-dry-bin" sdir="$TMPDIR/ah-dry-sessions"
+    local rlog="$TMPDIR/ah-dry-repair.log" hlog="$TMPDIR/ah-dry-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "idle"
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE='⏺ Done. Ready for next task.' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --dry-run --json)"
+    assert_contains "$out" '"session": "TMUX--ms--portal"'
+    assert_contains "$out" '"remote_control": "dead"'
+    assert_contains "$out" '"action": "would-heal"'
+    # No repair fired and no heal log written — dry-run acts on none.
+    [[ -s "$rlog" ]] && fail "dry-run must NOT fire a repair (repair log non-empty)"
+    [[ -e "$hlog" ]] && fail "dry-run must NOT write the heal log"
+    echo "ok: autoheal --dry-run selects dead bridge, fires no repair"
+}
+
+test_session_autoheal_skips_unsent_draft() {
+    # SAFETY GATE: a dead bridge whose input line holds an unsent draft is
+    # SKIPPED (never repaired) — /rc begins with C-u, which would erase the draft.
+    local bin="$TMPDIR/ah-draft-bin" sdir="$TMPDIR/ah-draft-sessions"
+    local rlog="$TMPDIR/ah-draft-repair.log" hlog="$TMPDIR/ah-draft-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "idle"
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE='> explain the autoheal plan in detail' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"action": "skipped"'
+    assert_contains "$out" '"reason": "unsent-draft"'
+    # The repair must NOT have fired, and the skip is logged.
+    [[ -s "$rlog" ]] && fail "unsent-draft session must NOT be repaired (repair log non-empty)"
+    assert_contains "$(cat "$hlog")" "skipped TMUX--ms--portal (unsent-draft)"
+    echo "ok: autoheal skips (never repairs) a dead bridge with an unsent draft"
+}
+
+test_session_autoheal_skips_busy() {
+    # A busy dead-bridge session is skipped — never inject into a working agent.
+    local bin="$TMPDIR/ah-busy-bin" sdir="$TMPDIR/ah-busy-sessions"
+    local rlog="$TMPDIR/ah-busy-repair.log" hlog="$TMPDIR/ah-busy-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "busy"
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE='⏺ working...' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"reason": "busy"'
+    [[ -s "$rlog" ]] && fail "busy session must NOT be repaired"
+    echo "ok: autoheal skips a busy dead bridge"
+}
+
+test_session_autoheal_skips_copy_mode() {
+    # A dead-bridge session in copy-mode is skipped — keystrokes are swallowed.
+    local bin="$TMPDIR/ah-copy-bin" sdir="$TMPDIR/ah-copy-sessions"
+    local rlog="$TMPDIR/ah-copy-repair.log" hlog="$TMPDIR/ah-copy-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "idle"
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_PANE_IN_MODE=1 TMUX_FAKE_CAPTURE_PANE='⏺ Done.' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"reason": "copy-mode"'
+    [[ -s "$rlog" ]] && fail "copy-mode session must NOT be repaired"
+    echo "ok: autoheal skips a copy-mode dead bridge"
+}
+
+test_session_autoheal_heals_clean_dead_bridge() {
+    # A dead bridge that passes every gate (idle, not copy-mode, empty input) is
+    # healed via the (stubbed) repair path, and the action is logged.
+    local bin="$TMPDIR/ah-heal-bin" sdir="$TMPDIR/ah-heal-sessions"
+    local rlog="$TMPDIR/ah-heal-repair.log" hlog="$TMPDIR/ah-heal-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "idle"
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE='⏺ Done. Ready for next task.' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"action": "healed"'
+    # The repair fired (session name captured in the stub log) and was logged.
+    assert_contains "$(cat "$rlog")" "TMUX--ms--portal"
+    assert_contains "$(cat "$hlog")" "healed TMUX--ms--portal"
+    echo "ok: autoheal repairs a clean dead bridge and logs it"
+}
+
+test_session_autoheal_ignores_live_bridge() {
+    # Only DEAD bridges are touched: a live bridge is never selected or repaired
+    # (idempotency — re-running over healthy sessions is a no-op).
+    local bin="$TMPDIR/ah-live-bin" sdir="$TMPDIR/ah-live-sessions"
+    local rlog="$TMPDIR/ah-live-repair.log" hlog="$TMPDIR/ah-live-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "idle"
+    # Promote to a live bridge.
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--portal","status":"idle","bridgeSessionId":"session_live999"}
+JSON
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE='⏺ Done.' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    # No dead bridges -> empty selection, no repair.
+    [[ "$out" == "[]" ]] || fail "live bridge must not be selected (got: $out)"
+    [[ -s "$rlog" ]] && fail "live bridge must NOT be repaired"
+    echo "ok: autoheal never touches a live bridge"
+}
+
+test_session_autoheal_install_uninstall_plist() {
+    # install writes a launchd plist to the (test-overridable) LaunchAgents dir;
+    # uninstall removes it. launchctl is stubbed, so no real agent is loaded.
+    local bin="$TMPDIR/ah-inst-bin" pdir="$TMPDIR/ah-launch-agents"
+    local hlog="$TMPDIR/ah-inst-heal.log"
+    local plist="$pdir/com.cctrl.session-autoheal.plist"
+    mkdir -p "$bin"
+    cat > "$bin/launchctl" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+    chmod +x "$bin/launchctl"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_LAUNCH_AGENTS_DIR="$pdir" CCTRL_AUTOHEAL_LOG="$hlog" \
+        "$ROOT/cctrl" session autoheal install --interval 600)"
+    [[ -f "$plist" ]] || fail "install must write the plist to $plist"
+    local plist_body
+    plist_body="$(cat "$plist")"
+    assert_contains "$plist_body" "<string>session</string>"
+    assert_contains "$plist_body" "<string>autoheal</string>"
+    assert_contains "$plist_body" "<integer>600</integer>"
+    assert_contains "$plist_body" "com.cctrl.session-autoheal"
+
+    out="$(PATH="$bin:$PATH" CCTRL_LAUNCH_AGENTS_DIR="$pdir" CCTRL_AUTOHEAL_LOG="$hlog" \
+        "$ROOT/cctrl" session autoheal uninstall)"
+    [[ -e "$plist" ]] && fail "uninstall must remove the plist"
+    assert_contains "$out" "Uninstalled autoheal timer"
+    echo "ok: autoheal install writes plist to test dir; uninstall removes it"
 }
 
 test_session_list_codex_default_model() {
@@ -2880,6 +3076,13 @@ test_session_doctor_realign_fix_emits_relaunch
 test_session_doctor_realign_skips_busy
 test_session_doctor_realign_idempotent
 test_session_doctor_realign_real_relaunch
+test_session_autoheal_dry_run_selects_dead_and_no_repair
+test_session_autoheal_skips_unsent_draft
+test_session_autoheal_skips_busy
+test_session_autoheal_skips_copy_mode
+test_session_autoheal_heals_clean_dead_bridge
+test_session_autoheal_ignores_live_bridge
+test_session_autoheal_install_uninstall_plist
 test_session_list_codex_default_model
 test_session_list_last_active_from_updated_at
 test_session_list_last_active_from_transcript_mtime
