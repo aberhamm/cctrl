@@ -1,7 +1,7 @@
 ---
 id: 015
 title: Surface each session's recap (goal + next action) in session ls --recap
-status: pending
+status: in-progress
 blocked-by: [013]
 priority: 15
 goal: cctrl-fleet-staleness
