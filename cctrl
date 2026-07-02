@@ -4189,13 +4189,19 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | doctor | attach | close | kill>"
+            echo "Usage: cctrl session <ls | doctor | current | attach | prune | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session doctor [--fix]   Audit/repair remote-control bridges (--json, --yes)"
             echo "  cctrl session current [--json] Show this process/session identity"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
+            echo "  cctrl session prune            Propose stale / never-prompted sessions to close"
+            echo "                                 (DRY-RUN by default — closes nothing)"
+            echo "    --older-than DURATION        Staleness threshold (default 72h; e.g. 7d/48h)"
+            echo "    --yes, --close               Actually close the proposed candidates"
+            echo "    --force                      Also consider attached sessions"
+            echo "    --json                       Machine-readable candidate list"
             echo "  cctrl session close [name]     Gracefully close a session; with no name,"
             echo "                                 closes the session you are running inside"
             echo "                                 (delayed kill so the caller can finish output)"
@@ -4210,6 +4216,7 @@ cmd_session() {
         doctor|reconcile) _session_doctor "$@" ;;
         current|whoami|identity) _session_current "$@" ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
+        prune)     _session_prune "$@" ;;
         close|stop) _session_close "$@" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
         *)
@@ -5264,6 +5271,218 @@ _session_close() {
     fi
 }
 
+_duration_to_ms() {
+    # Parse a compact duration (Nd / Nh / Nm / Ns) to epoch-milliseconds.
+    # Echo the ms value; return non-zero on an unparseable input.
+    local d="$1" num unit
+    [[ "$d" =~ ^([0-9]+)([smhdSMHD])$ ]] || return 1
+    num="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        s|S) printf '%s' "$(( num * 1000 ))" ;;
+        m|M) printf '%s' "$(( num * 60 * 1000 ))" ;;
+        h|H) printf '%s' "$(( num * 3600 * 1000 ))" ;;
+        d|D) printf '%s' "$(( num * 86400 * 1000 ))" ;;
+    esac
+}
+
+_session_created_at_ms() {
+    # Echo a session's metadata created_at (ISO-8601 UTC) as epoch-ms, or empty.
+    # Used as the staleness age floor when no accurate last-active is available.
+    local sess="$1" ts epoch
+    ts="$(_session_metadata_field "$sess" created_at)"
+    [[ -n "$ts" ]] || return 0
+    epoch="$(date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null)"
+    [[ -n "$epoch" ]] && printf '%s' "$(( epoch * 1000 ))"
+    return 0
+}
+
+_session_codex_rollout_path() {
+    # Resolve a codex session's rollout log under $CODEX_SESSIONS_DIR by
+    # correlating the session_meta cwd (first line of each rollout) against the
+    # tmux session's current path (or its recorded metadata cwd). Rollout file
+    # names embed a zero-padded timestamp, so a reverse lexical sort yields the
+    # newest match first. Echo the single best match, or empty if none.
+    local sess="$1" cwd f meta_cwd
+    cwd="$(tmux list-panes -t "$sess" -F '#{pane_current_path}' 2>/dev/null | head -1)"
+    [[ -n "$cwd" ]] || cwd="$(_session_metadata_field "$sess" cwd)"
+    [[ -n "$cwd" && -d "$CODEX_SESSIONS_DIR" ]] || return 0
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        meta_cwd="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.cwd // empty' 2>/dev/null)"
+        [[ "$meta_cwd" == "$cwd" ]] && { printf '%s' "$f"; return 0; }
+    done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
+    return 0
+}
+
+_session_never_prompted() {
+    # Agent-aware "never-prompted" detector. Returns 0 (true) only when the
+    # session's AGENT-APPROPRIATE log exists but carries zero user-input turns.
+    # An ABSENT log is never treated as never-prompted (guards a just-launched
+    # session, and prevents a busy codex session's lack of a *Claude* transcript
+    # from being read as never-prompted — the false-positive bug).
+    #   $1 session name, $2 agent (claude|codex|''), $3 (codex) rollout path
+    local sess="$1" agent="$2" rollout="${3:-}" tpath
+    case "$agent" in
+        claude)
+            tpath="$(_session_transcript_path "$sess")"
+            [[ -n "$tpath" && -e "$tpath" ]] || return 1   # absent -> not flagged
+            # Bounded head scan: the first genuine user turn sits at the very top
+            # of a transcript, so any user entry within the window means prompted.
+            head -n 500 "$tpath" 2>/dev/null | grep -qE '"(type|role)":"user"' && return 1
+            return 0
+            ;;
+        codex)
+            [[ -n "$rollout" && -e "$rollout" ]] || return 1  # absent -> not flagged
+            grep -q '"type":"user_message"' "$rollout" 2>/dev/null && return 1
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_session_prune() {
+    # Propose stale and/or never-prompted sessions for closing. DRY-RUN by
+    # default: it lists candidates + reason and closes NOTHING. --yes/--close
+    # routes each candidate through the graceful _session_close path. Self and
+    # (by default) attached sessions are never proposed.
+    _session_require_tmux || return 1
+
+    local json=false do_close=false force=false older_than="72h" a threshold_ms
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --yes|--close) do_close=true; shift ;;
+            --dry-run) do_close=false; shift ;;
+            --force|-f) force=true; shift ;;
+            --older-than)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--older-than needs a duration (e.g. 72h, 7d)${RESET}" >&2
+                    return 1
+                fi
+                older_than="$2"; shift 2 ;;
+            -h|--help)
+                echo "Usage: cctrl session prune [--older-than DURATION] [--yes] [--force] [--json]"
+                echo ""
+                echo "  Proposes sessions to close: those idle longer than the staleness"
+                echo "  threshold, and 'never-prompted' ones (launched but never given a"
+                echo "  user turn). DRY-RUN by default — closes nothing until --yes."
+                echo ""
+                echo "  --older-than DURATION   Staleness threshold (default 72h; Nd/Nh/Nm/Ns)"
+                echo "  --yes, --close          Close the proposed candidates"
+                echo "  --force                 Also consider attached sessions"
+                echo "  --json                  Machine-readable candidate list"
+                return 0
+                ;;
+            -*)
+                echo -e "${RED}Unknown flag: $1${RESET}" >&2
+                echo -e "${DIM}Usage: cctrl session prune [--older-than DURATION] [--yes] [--force] [--json]${RESET}" >&2
+                return 1
+                ;;
+            *)
+                echo -e "${RED}Unexpected argument: $1${RESET}" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if ! threshold_ms="$(_duration_to_ms "$older_than")"; then
+        echo -e "${RED}Invalid duration: $older_than${RESET} ${DIM}(use Nd/Nh/Nm/Ns, e.g. 72h)${RESET}" >&2
+        return 1
+    fi
+
+    local current now_ms
+    current="$(_session_current_name || true)"
+    now_ms=$(( $(date +%s) * 1000 ))
+
+    local -a names=()
+    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
+        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+
+    local -a cand_names=() cand_reasons=() cand_ms=() json_items=()
+    local name cmd agent attached rollout last_active_ms mtime age_ms stale np reason last_iso
+    for name in "${names[@]}"; do
+        # Never propose the session we're running inside.
+        [[ -n "$current" && "$name" == "$current" ]] && continue
+        # Attached sessions are excluded unless explicitly forced.
+        attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
+        [[ "$attached" == "1" && $force == false ]] && continue
+
+        cmd="$(_session_agent_cmd "$name")"
+        if [[ "$cmd" == *codex* ]]; then agent="codex"
+        elif [[ "$cmd" == *claude* ]]; then agent="claude"
+        else agent=""; fi
+
+        rollout=""
+        [[ "$agent" == "codex" ]] && rollout="$(_session_codex_rollout_path "$name")"
+
+        # Effective last-active: accurate signal (plan 013), else codex rollout
+        # mtime, else the metadata created_at age floor.
+        last_active_ms="$(_session_last_active_ms "$name")"
+        if [[ -z "$last_active_ms" && "$agent" == "codex" && -n "$rollout" ]]; then
+            mtime="$(stat -f %m "$rollout" 2>/dev/null)"
+            [[ -n "$mtime" ]] && last_active_ms="$(( mtime * 1000 ))"
+        fi
+        [[ -z "$last_active_ms" ]] && last_active_ms="$(_session_created_at_ms "$name")"
+
+        stale=false
+        if [[ -n "$last_active_ms" ]]; then
+            age_ms=$(( now_ms - last_active_ms ))
+            (( age_ms > threshold_ms )) && stale=true
+        fi
+
+        np=false
+        _session_never_prompted "$name" "$agent" "$rollout" && np=true
+
+        $stale || $np || continue
+
+        reason=""
+        $stale && reason="stale (idle $(_fmt_age_ms "$last_active_ms"))"
+        if $np; then
+            [[ -n "$reason" ]] && reason="$reason, never-prompted" || reason="never-prompted"
+        fi
+        last_iso=""
+        [[ -n "$last_active_ms" ]] && last_iso="$(date -r "$(( last_active_ms / 1000 ))" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+
+        cand_names+=("$name")
+        cand_reasons+=("$reason")
+        cand_ms+=("$last_active_ms")
+        if $json; then
+            json_items+=("$(jq -n --arg name "$name" --arg reason "$reason" --arg la "$last_iso" \
+                '{name:$name, reason:$reason, last_active:(if $la=="" then null else $la end)}')")
+        fi
+    done
+
+    if $json; then
+        if [[ ${#json_items[@]} -eq 0 ]]; then echo "[]"; else printf '%s\n' "${json_items[@]}" | jq -s '.'; fi
+        return 0
+    fi
+
+    if [[ ${#cand_names[@]} -eq 0 ]]; then
+        echo -e "${DIM}No prune candidates.${RESET}"
+        return 0
+    fi
+
+    local i
+    if $do_close; then
+        echo -e "${BOLD}Closing ${#cand_names[@]} prune candidate(s)${RESET}"
+        for i in "${!cand_names[@]}"; do
+            echo -e "  ${DIM}${cand_reasons[i]}${RESET}"
+            _session_close "${cand_names[i]}"
+        done
+    else
+        echo -e "${DIM}Prune candidates (dry-run — nothing closed). Close with: cctrl session prune --yes${RESET}"
+        printf '  %-20s %-11s %s\n' "NAME" "LAST-ACTIVE" "REASON"
+        for i in "${!cand_names[@]}"; do
+            printf '  %-20s %-11s %s\n' "${cand_names[i]}" "$(_fmt_age_ms "${cand_ms[i]}")" "${cand_reasons[i]}"
+        done
+        echo -e "${DIM}${#cand_names[@]} candidate(s). Re-run with --yes to close them.${RESET}"
+    fi
+    return 0
+}
+
 cmd_help() {
     echo -e "${BOLD}cctrl${RESET} — agent session controller"
     echo ""
@@ -5297,6 +5516,8 @@ cmd_help() {
     echo "  cctrl session doctor [--fix] Audit/repair remote-control bridges (--json, --yes)"
     echo "  cctrl session current       Show this process/session identity; --json for agents"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
+    echo "  cctrl session prune         Propose stale / never-prompted sessions (dry-run;"
+    echo "                              --older-than DURATION, --yes to close, --json)"
     echo "  cctrl session close [name]  Gracefully close a session (alias: cctrl close);"
     echo "                              no name = the session you're inside, killed after"
     echo "                              a short grace period (--in N, --now, --force)"

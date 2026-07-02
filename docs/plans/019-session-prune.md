@@ -1,13 +1,16 @@
 ---
 id: 019
 title: cctrl session prune — stale + never-prompted detection with --dry-run
-status: in-progress
+status: done
 blocked-by: [013, 014]
 priority: 19
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -91,3 +94,21 @@ host-local here) and auto-scheduling prune. Default must be non-destructive.
 - [assert] a test asserts a fresh active fixture is NOT a candidate
 - [assert] a bug-guard test asserts a codex session lacking a Claude transcript
   is NOT flagged never-prompted
+
+## Implementation Notes
+
+Added `cctrl session prune`: dry-run by default (lists candidates + reason,
+closes nothing); `--yes`/`--close` routes each candidate through `_session_close`;
+`--older-than DURATION` (default 72h), `--force`, `--json`. Staleness uses plan
+013's last-active with a codex-rollout-mtime then metadata `created_at` fallback.
+Never-prompted is agent-aware: Claude → transcript exists but zero user turns;
+codex → rollout log exists but zero user_message events; an ABSENT
+agent-appropriate log is never flagged (the codex-no-Claude-transcript bug-guard).
+Self + attached excluded by default. 6 tests including the bug-guard.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `1592590` — `feat(session): add session prune (accurate staleness + agent-aware never-prompted)`

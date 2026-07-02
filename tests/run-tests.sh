@@ -2415,6 +2415,228 @@ test_session_close_outside_requires_name() {
     assert_contains "$out" "Could not verify that this process is inside a cctrl tmux session"
 }
 
+# --- plan 019: session prune -----------------------------------------------
+
+# Write a codex rollout-log fixture under a CODEX_HOME override. session_meta.cwd
+# must match the session's tmux pane path (fake tmux reports /tmp/demo) so
+# _session_codex_rollout_path correlates it. $3=yes appends a user_message event.
+make_codex_rollout() {
+    local codex_home="$1" cwd="$2" with_user="$3" dir f
+    dir="$codex_home/sessions/2026/06/30"
+    mkdir -p "$dir"
+    f="$dir/rollout-2026-06-30T10-00-00-fixture-$RANDOM.jsonl"
+    {
+        printf '{"timestamp":"2026-06-30T10:00:00.000Z","type":"session_meta","payload":{"id":"cx-%s","cwd":"%s"}}\n' "$RANDOM" "$cwd"
+        printf '{"timestamp":"2026-06-30T10:00:01.000Z","type":"turn_context","payload":{"cwd":"%s","model":"gpt-5.5"}}\n' "$cwd"
+        if [[ "$with_user" == "yes" ]]; then
+            printf '{"timestamp":"2026-06-30T10:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}\n'
+        fi
+    } > "$f"
+    touch "$f"   # recent mtime -> not stale, isolates the never-prompted signal
+    printf '%s' "$f"
+}
+
+test_session_prune_never_prompted_claude() {
+    # A claude session whose transcript EXISTS but has zero user turns is flagged
+    # never-prompted. Recent updatedAt keeps it out of the staleness bucket, so
+    # the sole reason is never-prompted.
+    local bin="$TMPDIR/npc-bin" sdir="$TMPDIR/npc-sess" pdir="$TMPDIR/npc-proj"
+    mkdir -p "$bin" "$sdir" "$pdir/p"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then echo "claude"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    local now_ms; now_ms=$(( $(date +%s) * 1000 ))
+    cat > "$sdir/4242.json" <<JSON
+{"pid":4242,"sessionId":"np-uuid","updatedAt":$now_ms}
+JSON
+    cat > "$pdir/p/np-uuid.jsonl" <<'JSON'
+{"type":"summary","summary":"New session"}
+JSON
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--np" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session prune --json)"
+    assert_contains "$out" '"name": "TMUX--np"'
+    assert_contains "$out" '"reason": "never-prompted"'
+    assert_not_contains "$out" 'stale'
+    echo "ok: claude never-prompted flagged as prune candidate"
+}
+
+test_session_prune_fresh_active_not_candidate() {
+    # A recently-active claude session with a real user turn is neither stale
+    # nor never-prompted -> not a candidate.
+    local bin="$TMPDIR/fa-bin" sdir="$TMPDIR/fa-sess" pdir="$TMPDIR/fa-proj"
+    mkdir -p "$bin" "$sdir" "$pdir/p"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4343* ]]; then echo "claude"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    local now_ms; now_ms=$(( $(date +%s) * 1000 ))
+    cat > "$sdir/4343.json" <<JSON
+{"pid":4343,"sessionId":"fa-uuid","updatedAt":$now_ms}
+JSON
+    cat > "$pdir/p/fa-uuid.jsonl" <<'JSON'
+{"type":"user","message":{"role":"user","content":"do the thing"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+JSON
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--fresh" TMUX_FAKE_PANE_PID=4343 "$ROOT/cctrl" session prune --json)"
+    [[ "$out" == "[]" ]] || fail "expected no candidates for a fresh active session; got: $out"
+    echo "ok: fresh active session is not a prune candidate"
+}
+
+test_session_prune_codex_no_claude_transcript_bug_guard() {
+    # BUG-GUARD: a busy codex session (rollout has a user_message) that simply
+    # lacks a *Claude* transcript must NOT be flagged never-prompted. Recent
+    # rollout mtime keeps it out of the staleness bucket too -> not a candidate.
+    local bin="$TMPDIR/bg-bin" ch="$TMPDIR/bg-codex"
+    mkdir -p "$bin" "$ch"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4444* ]]; then echo "codex --yolo"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    make_codex_rollout "$ch" "/tmp/demo" yes >/dev/null
+
+    local out
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/bg-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/bg-nope" \
+        TMUX_FAKE_SESSIONS="TMUX--busycx" TMUX_FAKE_PANE_PID=4444 "$ROOT/cctrl" session prune --json)"
+    [[ "$out" == "[]" ]] || fail "bug-guard: busy codex session without a Claude transcript must not be flagged; got: $out"
+    echo "ok: codex session lacking a Claude transcript is not flagged never-prompted"
+}
+
+test_session_prune_codex_never_prompted() {
+    # A codex session whose rollout log carries zero user_message events IS
+    # flagged never-prompted (resolved via the CODEX_HOME override).
+    local bin="$TMPDIR/cnp-bin" ch="$TMPDIR/cnp-codex"
+    mkdir -p "$bin" "$ch"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4545* ]]; then echo "codex --yolo"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    make_codex_rollout "$ch" "/tmp/demo" no >/dev/null
+
+    local out
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/cnp-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/cnp-nope" \
+        TMUX_FAKE_SESSIONS="TMUX--emptycx" TMUX_FAKE_PANE_PID=4545 "$ROOT/cctrl" session prune --json)"
+    assert_contains "$out" '"name": "TMUX--emptycx"'
+    assert_contains "$out" '"reason": "never-prompted"'
+    echo "ok: codex never-prompted (rollout fixture) flagged as prune candidate"
+}
+
+test_session_prune_dry_run_closes_nothing() {
+    # Default is a dry run: candidates are listed but no kill/run-shell fires.
+    # --yes routes each candidate through _session_close (tmux kill-session).
+    local bin="$TMPDIR/dr-bin" sdir="$TMPDIR/dr-sess" pdir="$TMPDIR/dr-proj"
+    mkdir -p "$bin" "$sdir" "$pdir/p"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4646* ]]; then echo "claude"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    local now_ms; now_ms=$(( $(date +%s) * 1000 ))
+    cat > "$sdir/4646.json" <<JSON
+{"pid":4646,"sessionId":"dr-uuid","updatedAt":$now_ms}
+JSON
+    cat > "$pdir/p/dr-uuid.jsonl" <<'JSON'
+{"type":"summary","summary":"New session"}
+JSON
+
+    local log="$TMPDIR/prune-dry.log"; : > "$log"
+    local out
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--drname" TMUX_FAKE_PANE_PID=4646 "$ROOT/cctrl" session prune)"
+    assert_contains "$out" "TMUX--drname"
+    assert_contains "$out" "dry-run"
+    assert_not_contains "$(cat "$log")" "kill-session"
+    assert_not_contains "$(cat "$log")" "run-shell"
+
+    local log2="$TMPDIR/prune-yes.log"; : > "$log2"
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log2" TMUX_FAKE_HAS_SESSION=1 \
+        CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--drname" TMUX_FAKE_PANE_PID=4646 "$ROOT/cctrl" session prune --yes)"
+    assert_contains "$(cat "$log2")" "kill-session -t TMUX--drname"
+    echo "ok: prune dry-run closes nothing; --yes closes candidates"
+}
+
+test_session_prune_excludes_self_and_attached() {
+    # Self (the current session) is never proposed; attached sessions are
+    # excluded by default and only appear with --force.
+    local bin="$TMPDIR/ex-bin" meta="$TMPDIR/ex-meta"
+    mkdir -p "$bin" "$meta"
+    # tmux stub: two sessions. TMUX--self is the current one (pane pid == our
+    # pid via __current__); TMUX--attach reports session_attached=1.
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+if [[ -n "${TMUX_LOG:-}" ]]; then printf 'TMUX %s\n' "$*" >> "$TMUX_LOG"; fi
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) printf 'TMUX--self\nTMUX--attach\n'; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        if [[ "$target" == "TMUX--self" ]]; then echo "${CCTRL_CURRENT_PID:-5151}"; else echo 5252; fi
+        exit 0;;
+    display-message)
+        if [[ "$*" == *session_name* ]]; then echo "TMUX--self"; exit 0; fi
+        if [[ "$*" == *session_attached* && "$target" == "TMUX--attach" ]]; then echo 1; else echo 0; fi
+        exit 0;;
+    show-option) echo 1; exit 0;;
+    has-session) exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+echo "-zsh"; exit 0
+SH
+    chmod +x "$bin/ps"
+    # Both sessions look stale via an old created_at (shell sessions, no
+    # accurate last-active) so absent exclusion they WOULD be candidates.
+    cat > "$meta/TMUX--self.json" <<'JSON'
+{"created_at":"2023-11-14T00:00:00Z"}
+JSON
+    cat > "$meta/TMUX--attach.json" <<'JSON'
+{"created_at":"2023-11-14T00:00:00Z"}
+JSON
+
+    local out
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/ex-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/ex-nope" \
+        "$ROOT/cctrl" session prune --json)"
+    assert_not_contains "$out" 'TMUX--self'
+    assert_not_contains "$out" 'TMUX--attach'
+
+    # --force lifts the attached exclusion (self stays excluded).
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/ex-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/ex-nope" \
+        "$ROOT/cctrl" session prune --force --json)"
+    assert_contains "$out" 'TMUX--attach'
+    assert_not_contains "$out" 'TMUX--self'
+    echo "ok: prune excludes self and (by default) attached sessions"
+}
+
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
     local claude_dir="$base/claude/projects/-Users-matthew--projects-demo"
@@ -2538,6 +2760,12 @@ test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
 test_session_close_named_immediate
 test_session_close_outside_requires_name
+test_session_prune_never_prompted_claude
+test_session_prune_fresh_active_not_candidate
+test_session_prune_codex_no_claude_transcript_bug_guard
+test_session_prune_codex_never_prompted
+test_session_prune_dry_run_closes_nothing
+test_session_prune_excludes_self_and_attached
 test_usage_cost_fixtures
 
 echo "ok"
