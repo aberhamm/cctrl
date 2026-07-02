@@ -887,6 +887,140 @@ JSON
     assert_contains "$out" '"remote_control": "collision"'
 }
 
+# --- plan 018: guided-relaunch realign of app/tmux name mismatches ---------
+# Shared fabricator: a mismatched claude session whose tmux name is
+# TMUX--ms--portal but whose app-name prefix is the old cwd-derived slug, with a
+# plan-013 sessionId and metadata pointing at a real target dir so the guided
+# relaunch can be built. The realign relaunch path is stubbed via
+# CCTRL_DOCTOR_RELAUNCH_LOG so no real session is ever killed or launched.
+_doctor_realign_fixture() {
+    # args: bindir sessdir prefix status
+    local bin="$1" sdir="$2" prefix="$3" status="$4"
+    mkdir -p "$bin" "$sdir" "$CCTRL_SESSION_METADATA_DIR" "$TMPDIR/rl-proj"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--portal --remote-control --remote-control-session-name-prefix ${prefix}"
+    exit 0
+fi
+exec /bin/ps "\$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<JSON
+{"pid":4242,"name":"TMUX--ms--portal","status":"${status}","sessionId":"sess_uuid_1","bridgeSessionId":"session_live1"}
+JSON
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json" <<JSON
+{"target":"$TMPDIR/rl-proj","cwd":"$TMPDIR/rl-proj","purpose":"realign me"}
+JSON
+}
+
+test_session_doctor_realign_reports_hint() {
+    # Report-only (no --fix): a MISMATCH is flagged AND carries a copy-pasteable
+    # relaunch hint with --resume <sessionId> and the corrected --name. Nothing
+    # is mutated or relaunched.
+    local bin="$TMPDIR/rl1bin" sdir="$TMPDIR/rl1-sessions"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"name_aligned": false'
+    assert_contains "$out" '"realign_hint"'
+    assert_contains "$out" '--resume sess_uuid_1'
+    assert_contains "$out" '--name TMUX--ms--portal'
+    # Report-only must never record an action.
+    assert_contains "$out" '"action": null'
+}
+
+test_session_doctor_realign_fix_emits_relaunch() {
+    # --fix --yes on a MISMATCH emits the correct guided-relaunch command
+    # (carrying --resume <sessionId> and the corrected --name) and flips the
+    # session to aligned. The relaunch is captured, not executed.
+    local bin="$TMPDIR/rl2bin" sdir="$TMPDIR/rl2-sessions" relog="$TMPDIR/rl2-relaunch.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+    : > "$relog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
+    assert_contains "$out" '"action": "realigned'
+    assert_contains "$out" '"name_aligned": true'
+
+    local cmd
+    cmd="$(cat "$relog")"
+    assert_contains "$cmd" 'cctrl start -d'
+    assert_contains "$cmd" '--resume sess_uuid_1'
+    assert_contains "$cmd" '--name TMUX--ms--portal'
+}
+
+test_session_doctor_realign_skips_busy() {
+    # A BUSY MISMATCH session is never relaunched mid-work.
+    local bin="$TMPDIR/rl3bin" sdir="$TMPDIR/rl3-sessions" relog="$TMPDIR/rl3-relaunch.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "busy"
+    : > "$relog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
+    assert_contains "$out" '"action": "skipped-busy"'
+    assert_contains "$out" '"name_aligned": false'
+    [[ ! -s "$relog" ]] || fail "busy MISMATCH session must not emit a relaunch"
+}
+
+test_session_doctor_realign_idempotent() {
+    # Second --fix on an already-aligned fleet: no relaunch, no action.
+    local bin="$TMPDIR/rl4bin" sdir="$TMPDIR/rl4-sessions" relog="$TMPDIR/rl4-relaunch.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--portal-" "idle"
+    : > "$relog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
+    assert_contains "$out" '"name_aligned": true'
+    assert_contains "$out" '"action": null'
+    assert_contains "$out" '"realign_hint": null'
+    [[ ! -s "$relog" ]] || fail "aligned fleet must not relaunch"
+}
+
+test_session_doctor_realign_real_relaunch() {
+    # End-to-end (no capture seam): --fix --yes actually routes the realign
+    # through the detached-launch path (plan 017 picker + fake tmux), so nothing
+    # real is killed but the emitted tmux new-session carries the corrected name
+    # and --resume. The target dir slug (host=ms, basename=portal) equals the
+    # tmux name TMUX--ms--portal, so the relaunch reproduces that exact aligned
+    # name with app-prefix TMUX--ms--portal-.
+    local bin="$TMPDIR/rl5bin" sdir="$TMPDIR/rl5-sessions" log="$TMPDIR/rl5-tmux.log"
+    local proj="$TMPDIR/portal"
+    mkdir -p "$bin" "$sdir" "$CCTRL_SESSION_METADATA_DIR" "$proj"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--portal --remote-control --remote-control-session-name-prefix TMUX--ms--unstructured-data-portal-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--portal","status":"idle","sessionId":"sess_uuid_1","bridgeSessionId":"session_live1"}
+JSON
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json" <<JSON
+{"target":"$proj","cwd":"$proj","purpose":"realign me"}
+JSON
+
+    : > "$log"
+    local out
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
+    assert_contains "$out" '"action": "realigned'
+
+    # The real detached-launch fired through the picker with the corrected name.
+    local tmuxlog
+    tmuxlog="$(cat "$log")"
+    assert_contains "$tmuxlog" "new-session -d -s TMUX--ms--portal"
+    assert_contains "$tmuxlog" "--name TMUX--ms--portal"
+    assert_contains "$tmuxlog" "--resume sess_uuid_1"
+    # It relaunches as claude (only claude carries the app-name prefix).
+    assert_contains "$tmuxlog" "--agent claude"
+}
+
 test_session_list_codex_default_model() {
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"
@@ -2368,6 +2502,11 @@ test_context_names
 test_bridge_prefix_matches_explicit_name
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision
+test_session_doctor_realign_reports_hint
+test_session_doctor_realign_fix_emits_relaunch
+test_session_doctor_realign_skips_busy
+test_session_doctor_realign_idempotent
+test_session_doctor_realign_real_relaunch
 test_session_list_codex_default_model
 test_session_list_last_active_from_updated_at
 test_session_list_last_active_from_transcript_mtime

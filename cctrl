@@ -4693,6 +4693,46 @@ _session_repair_bridge() {
     return 1
 }
 
+_session_realign_cmd() {
+    # Build the copy-pasteable relaunch command that realigns a mismatched
+    # session: relaunch detached at the same target with the corrected --name
+    # (the tmux session name, from which the app-name prefix is derived) and
+    # --resume-ing the same Claude conversation so nothing is lost. This is the
+    # only way to change the app-name prefix — it is baked into the launch argv,
+    # so there is NO in-session rename (see plan 018 / the relaunch comment in
+    # the name-mismatch hint below).
+    local name="$1" target="$2" sid="$3" purpose="$4" cmd
+    cmd="cctrl start -d $(printf '%q' "$target") --agent claude --name $(printf '%q' "$name") --resume $(printf '%q' "$sid")"
+    [[ -n "$purpose" ]] && cmd+=" --purpose $(printf '%q' "$purpose")"
+    printf '%s' "$cmd"
+}
+
+_session_realign() {
+    # Guided relaunch that realigns a mismatched session (plan 018). Kills the
+    # old (mis-prefixed) session, then relaunches it detached with the corrected
+    # --name and --resume <sessionId>, routed through the safe detached-launch
+    # path (plan 017's live-index picker) so the corrected app-name prefix is
+    # derived from the tmux name. Name mismatches only occur on claude sessions
+    # (only claude carries --remote-control-session-name-prefix), so the relaunch
+    # pins --agent claude. In the normal case the tmux name equals the target
+    # slug, so relaunching from target reproduces that exact name and the app
+    # prefix (${name}-) lines up. Returns non-zero on relaunch failure.
+    #
+    # Test/preview seam: when CCTRL_DOCTOR_RELAUNCH_LOG is set the resolved
+    # relaunch command is appended to it and NOTHING is killed or relaunched, so
+    # the harness can assert on the exact argv without touching a real session.
+    local name="$1" target="$2" sid="$3" purpose="$4"
+    if [[ -n "${CCTRL_DOCTOR_RELAUNCH_LOG:-}" ]]; then
+        _session_realign_cmd "$name" "$target" "$sid" "$purpose" >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
+        printf '\n' >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
+        return 0
+    fi
+    tmux kill-session -t "$name" 2>/dev/null || true
+    local -a rl=("$target" --agent claude --name "$name" --resume "$sid")
+    [[ -n "$purpose" ]] && rl+=(--purpose "$purpose")
+    _launch_detached "${rl[@]}"
+}
+
 _session_doctor() {
     # Audit (and optionally repair) remote-control bridges for live Claude
     # sessions. Authoritative liveness = bridgeSessionId in the session file;
@@ -4712,9 +4752,12 @@ _session_doctor() {
                 echo "  file has no bridgeSessionId. Also flags app/tmux name mismatches and"
                 echo "  panes stuck in copy-mode (which blocks keystroke repair)."
                 echo ""
-                echo "    --fix     Re-establish dead bridges by injecting /rc."
-                echo "              Skips busy sessions; confirms each (unless --yes)."
-                echo "    --yes     Repair without per-session confirmation."
+                echo "    --fix     Re-establish dead bridges by injecting /rc, and REALIGN"
+                echo "              app/tmux name mismatches via a guided relaunch (kill +"
+                echo "              relaunch detached with the corrected --name, --resume-ing"
+                echo "              the same conversation). Skips busy/copy-mode sessions;"
+                echo "              confirms each (unless --yes)."
+                echo "    --yes     Repair/realign without per-session confirmation."
                 echo "    --json    Machine-readable output."
                 return 0 ;;
             -*) echo -e "${RED}Unknown doctor flag: $a${RESET}" >&2; return 64 ;;
@@ -4740,7 +4783,8 @@ _session_doctor() {
 
     local -a json_items=()
     local name cmd pid bridge prefix expected aligned copy_mode st verdict repaired detail do_fix ans newid
-    local n_total=0 n_live=0 n_dead=0 n_off=0 n_misnamed=0 n_fixed=0 n_skipped=0 n_collision=0
+    local sid mtarget mpurpose realign_cmd
+    local n_total=0 n_live=0 n_dead=0 n_off=0 n_misnamed=0 n_fixed=0 n_realigned=0 n_skipped=0 n_collision=0
     $json || printf '%-22s %-6s %-8s %-9s %s\n' "SESSION" "RC" "STATE" "NAME" "DETAIL"
     for name in "${names[@]}"; do
         cmd="$(_session_agent_cmd "$name")"
@@ -4769,9 +4813,57 @@ _session_doctor() {
             fi
         fi
 
-        # Only dead bridges are repairable by /rc. Collisions need a relaunch
-        # under the unique-prefix code — re-injecting /rc just re-contends.
-        if $fix && [[ "$verdict" == "dead" ]]; then
+        # For a MISMATCH, resolve the plan-013 sessionId and the launch target
+        # from metadata so we can build the guided-relaunch command (report-only
+        # hint) and, under --fix, actually realign. There is NO in-session
+        # rename: the app-name prefix is baked into the launch argv, so realign
+        # is a kill+relaunch that --resume-s the same conversation.
+        sid=""; mtarget=""; mpurpose=""; realign_cmd=""
+        if [[ "$aligned" == "MISMATCH" ]]; then
+            sid="$(_session_id "$name")"
+            mtarget="$(_session_metadata_field "$name" target)"
+            [[ -n "$mtarget" ]] || mtarget="$(_session_metadata_field "$name" cwd)"
+            mpurpose="$(_session_metadata_field "$name" purpose)"
+            [[ -n "$sid" && -n "$mtarget" ]] && \
+                realign_cmd="$(_session_realign_cmd "$name" "$mtarget" "$sid" "$mpurpose")"
+        fi
+
+        # Exactly one repair action per session under --fix: a MISMATCH is fixed
+        # by a guided relaunch (which also re-establishes the bridge cleanly);
+        # otherwise a dead bridge is repaired in place by injecting /rc. Only
+        # dead bridges are /rc-repairable — collisions need a unique-prefix
+        # relaunch, so re-injecting /rc just re-contends.
+        if $fix && [[ "$aligned" == "MISMATCH" ]]; then
+            if [[ -z "$sid" ]]; then
+                repaired="skipped-no-session-id"; n_skipped=$((n_skipped+1))
+            elif [[ -z "$mtarget" ]]; then
+                repaired="skipped-no-target"; n_skipped=$((n_skipped+1))
+            elif [[ "$st" == "busy" ]]; then
+                repaired="skipped-busy"; n_skipped=$((n_skipped+1))
+            elif [[ "${copy_mode:-0}" == "1" ]]; then
+                repaired="skipped-copy-mode"; n_skipped=$((n_skipped+1))
+            else
+                do_fix=true
+                if ! $assume_yes; then
+                    if _prompt_tty_available; then
+                        printf 'Relaunch %s to realign its app-name (--resume %s)? [y/N] ' "$name" "$sid" > /dev/tty
+                        ans=""; IFS= read -r ans < /dev/tty || true
+                        [[ "$ans" == [yY]* ]] || { do_fix=false; repaired="declined"; n_skipped=$((n_skipped+1)); }
+                    else
+                        do_fix=false; repaired="skipped-no-tty"; n_skipped=$((n_skipped+1))
+                    fi
+                fi
+                if $do_fix; then
+                    if _session_realign "$name" "$mtarget" "$sid" "$mpurpose"; then
+                        # By construction the relaunch derives prefix "${name}-",
+                        # so the realigned session reports aligned=ok.
+                        repaired="realigned→${expected}"; aligned="ok"; n_realigned=$((n_realigned+1))
+                    else
+                        repaired="realign-failed"
+                    fi
+                fi
+            fi
+        elif $fix && [[ "$verdict" == "dead" ]]; then
             if [[ "$st" == "busy" ]]; then
                 repaired="skipped-busy"; n_skipped=$((n_skipped+1))
             else
@@ -4795,19 +4887,25 @@ _session_doctor() {
             fi
         fi
 
+        # The relaunch hint is only meaningful while the session is still
+        # mismatched (a successful realign flips aligned→ok and clears it).
+        local hint_out=""
+        [[ "$aligned" == "MISMATCH" ]] && hint_out="$realign_cmd"
+
         if $json; then
             json_items+=("$(jq -n \
                 --arg s "$name" --arg pid "$pid" --arg rc "$verdict" \
                 --arg bridge "$bridge" --arg prefix "$prefix" --arg expected "$expected" \
                 --arg aligned "$aligned" --arg cm "${copy_mode:-0}" --arg st "$st" \
-                --arg repaired "$repaired" \
-                '{session:$s, pid:$pid, remote_control:$rc, bridge:(if $bridge=="" then null else $bridge end), app_name_prefix:(if $prefix=="" then null else $prefix end), expected_prefix:$expected, name_aligned:($aligned=="ok"), copy_mode:($cm=="1"), status:$st, action:(if $repaired=="" then null else $repaired end)}')")
+                --arg repaired "$repaired" --arg hint "$hint_out" \
+                '{session:$s, pid:$pid, remote_control:$rc, bridge:(if $bridge=="" then null else $bridge end), app_name_prefix:(if $prefix=="" then null else $prefix end), expected_prefix:$expected, name_aligned:($aligned=="ok"), copy_mode:($cm=="1"), status:$st, action:(if $repaired=="" then null else $repaired end), realign_hint:(if $hint=="" then null else $hint end)}')")
         else
             detail=""
             [[ "$verdict" == "collision" ]] && detail="shares bridge ${bridge} with another session — relaunch to fix"
             [[ "$aligned" == "MISMATCH" ]] && detail="${detail:+$detail; }app-name=${prefix:-<none>} (want ${expected})"
             [[ "${copy_mode:-0}" == "1" ]] && detail="${detail:+$detail; }copy-mode"
             [[ -n "$repaired" ]] && detail="${detail:+$detail; }$repaired"
+            [[ -n "$hint_out" ]] && detail="${detail:+$detail; }realign: $hint_out"
             printf '%-22s %-6s %-8s %-9s %s\n' "$name" "$verdict" "$st" "$aligned" "$detail"
         fi
     done
@@ -4821,6 +4919,7 @@ _session_doctor() {
     local summary="${n_total} claude session(s): ${n_live} live, ${n_dead} dead, ${n_off} off"
     [[ "$n_collision" -gt 0 ]] && summary+=", ${n_collision} collision"
     [[ "$n_fixed" -gt 0 ]] && summary+=", ${n_fixed} fixed"
+    [[ "$n_realigned" -gt 0 ]] && summary+=", ${n_realigned} realigned"
     [[ "$n_skipped" -gt 0 ]] && summary+=", ${n_skipped} skipped"
     [[ "$n_misnamed" -gt 0 ]] && summary+="; ${n_misnamed} app/tmux name mismatch(es)"
     echo -e "${BOLD}${summary}${RESET}"
@@ -4830,8 +4929,8 @@ _session_doctor() {
     if [[ "$n_collision" -gt 0 ]]; then
         echo -e "${DIM}Collisions share one bridge (shared name prefix); relaunch the affected sessions to give each a unique prefix.${RESET}"
     fi
-    if [[ "$n_misnamed" -gt 0 ]]; then
-        echo -e "${DIM}Name mismatches are fixed for newly-launched sessions; relaunch to realign existing ones.${RESET}"
+    if [[ "$n_misnamed" -gt 0 && "$fix" != true ]]; then
+        echo -e "${DIM}Name mismatches are fixed for new launches; realign existing ones with: cctrl session doctor --fix (guided relaunch, --resume-s the conversation), or run the per-row realign hint.${RESET}"
     fi
     return 0
 }

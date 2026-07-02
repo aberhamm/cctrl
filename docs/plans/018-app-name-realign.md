@@ -1,13 +1,16 @@
 ---
 id: 018
 title: Realign existing tmux/app-name MISMATCH rows in session doctor
-status: in-progress
+status: done
 blocked-by: [013]
 priority: 18
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -105,3 +108,25 @@ constraint above). Do not change bridge-collision detection.
   `--resume <sessionId>` and the corrected `--name`
 - [assert] a busy-session test asserts the MISMATCH session is skipped
 - [assert] an idempotency test asserts a second `--fix` reports no changes
+
+## Implementation Notes
+
+Extended `_session_doctor --fix` with a guided-relaunch realign for MISMATCH
+rows: `_session_realign_cmd` builds the copy-paste command; `_session_realign`
+kills the mis-prefixed session and relaunches it via `_launch_detached`
+(`--agent claude --name <name> --resume <sid>`), routing through plan 017's safe
+picker so the corrected prefix derives from the tmux name. The fix arm skips
+busy/copy-mode/sessionId-less sessions, confirms per session (respects `--yes`;
+no-TTY-no-yes skips), and takes precedence over the /rc dead-bridge repair.
+Report-only mode adds a `realign:` hint (human) / `realign_hint` (JSON) and never
+mutates; idempotent because the branch only runs on MISMATCH. Tests use a
+`CCTRL_DOCTOR_RELAUNCH_LOG` capture seam plus one end-to-end relaunch against
+fake tmux. Deviation: realign pins `--agent claude` (name mismatches are
+claude-only).
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `bb6eb99` — `feat(doctor): realign app/tmux MISMATCH sessions via guided relaunch`
