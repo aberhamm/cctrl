@@ -1,7 +1,7 @@
 ---
 id: 018
 title: Realign existing tmux/app-name MISMATCH rows in session doctor
-status: pending
+status: in-progress
 blocked-by: [013]
 priority: 18
 goal: cctrl-fleet-staleness
