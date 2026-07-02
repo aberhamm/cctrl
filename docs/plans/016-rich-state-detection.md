@@ -1,13 +1,16 @@
 ---
 id: 016
 title: Rich STATE detection — waiting-input, blocked-dialog, unsent-draft, idle-done
-status: in-progress
+status: done
 blocked-by: [014]
 priority: 16
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -101,3 +104,20 @@ digest that consumes these states is plan 022.
   `state` == `waiting-input`
 - [assert] a test driving an ambiguous fixture asserts `state` falls back to the
   base value (no misclassification)
+
+## Implementation Notes
+
+Added `_session_rich_state` layering four fail-safe detectors over the base
+state (014) in documented precedence blocked-dialog > unsent-draft >
+waiting-input > idle-done > base. Transcript detectors use a bounded `tail -n 50`
+(malformed-line safe); pane detectors do one `#{pane_in_mode}`-guarded
+`capture-pane` (read-only), matching stable Claude dialog/draft signatures. Each
+detector is disableable via `CCTRL_STATE_DETECT_*`. 10 tests cover every
+detector plus ambiguous fallback and the copy-mode guard.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `ed23f18` — `feat(session): rich STATE detection (waiting-input/blocked-dialog/unsent-draft/idle-done)`

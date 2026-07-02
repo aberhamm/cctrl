@@ -4325,6 +4325,151 @@ _session_base_state() {
     esac
 }
 
+_session_transcript_last_turn() {
+    # Classify the last *conversational* turn in a session's transcript tail,
+    # for the transcript-driven rich-state detectors (plan 016). Echoes one of:
+    #   assistant-question — last turn is an assistant text message that ends
+    #                        with a question (agent is awaiting a user answer)
+    #   assistant          — last turn is a finished assistant text message
+    #   assistant-empty    — last assistant turn carries no text (tool_use only,
+    #                        i.e. mid-tool) — treated as ambiguous by callers
+    #   user               — last turn is a user message (incl. tool_result)
+    #   ''                 — no transcript / no parseable turn (ambiguous)
+    #
+    # Reads only a BOUNDED tail (tail -n 50), never the whole file. Each line is
+    # parsed with `fromjson?` so a single malformed jsonl line can't abort the
+    # scan. tool_use / tool_result and summary lines without a message.role are
+    # skipped, so an in-progress tool call reads as ambiguous rather than a
+    # false "finished" signal. Fail-safe: any doubt yields '' → base state.
+    local sess="$1" tpath
+    tpath="$(_session_transcript_path "$sess")"
+    [[ -n "$tpath" && -e "$tpath" ]] || return 0
+    tail -n 50 "$tpath" 2>/dev/null | jq -Rrn '
+        [ inputs
+          | fromjson?
+          | select(.message.role == "user" or .message.role == "assistant")
+        ] as $t
+        | if ($t | length) == 0 then ""
+          else ($t[-1]) as $last
+            | ($last.message.role) as $role
+            | if $role == "assistant" then
+                ( $last.message.content
+                  | if type == "array"
+                    then (map(select(.type == "text") | .text) | join(" "))
+                    else (. // "") end
+                ) as $tx
+                | if ($tx | test("\\?[[:space:]]*$")) then "assistant-question"
+                  elif (($tx | gsub("[[:space:]]"; "") | length) > 0) then "assistant"
+                  else "assistant-empty" end
+              else "user" end
+          end' 2>/dev/null
+    return 0
+}
+
+_session_pane_has_dialog() {
+    # True (exit 0) when the captured pane text carries a STABLE, SPECIFIC
+    # Claude Code modal-dialog signature — a permission/trust prompt or the
+    # selected numbered option of its fullscreen renderer. Deliberately matches
+    # fixed prompt strings, not loose heuristics: an unmatched pane is NOT a
+    # dialog. Read-only; never injects keystrokes. This is the fragile pane
+    # detector flagged in eng review — keep the signature list tight.
+    local capture="$1"
+    printf '%s\n' "$capture" \
+        | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes' \
+        >/dev/null 2>&1
+}
+
+_session_pane_has_draft() {
+    # True (exit 0) when the captured pane shows a non-empty Claude Code input
+    # line — a prompt '>' followed by typed, unsubmitted text. Anchored to the
+    # start of the line (optionally inside the input box border) so it doesn't
+    # match a stray '>' elsewhere. Known placeholder / hint text (the dimmed
+    # "Try ..." prompt, shortcut hints) is excluded so an EMPTY input box never
+    # reads as a draft. Fragile pane detector (eng-flagged); read-only.
+    local capture="$1"
+    printf '%s\n' "$capture" \
+        | grep -E '^[[:space:]│|]*>[[:space:]]+[^[:space:]]' \
+        | grep -Eiv 'Try "|for shortcuts|for commands|for newline|esc to (interrupt|cancel)|/ for' \
+        >/dev/null 2>&1
+}
+
+_session_rich_state() {
+    # Resolve a session's rich STATE (plan 016) by layering fragile detectors
+    # onto the confident base state (plan 014). Detectors are applied in this
+    # DOCUMENTED PRECEDENCE (highest wins):
+    #
+    #   blocked-dialog > unsent-draft > waiting-input > idle-done > base
+    #
+    #   blocked-dialog  a modal prompt is visible in the pane (permission/trust/
+    #                   fullscreen renderer). Overrides any base — a live modal
+    #                   blocks the session regardless of the status field.
+    #   unsent-draft    the input line holds typed-but-unsent text. Only refines
+    #                   an idle base (never overrides a confident 'working').
+    #   waiting-input   the transcript's last turn is an assistant question, so
+    #                   the agent is awaiting a user answer. Idle base only.
+    #   idle-done       idle base AND the last turn is a finished assistant
+    #                   message (done, nothing pending) — distinct from bare idle.
+    #   base            fallback: whatever plan 014 resolved.
+    #
+    # FAIL-SAFE: every detector falls back to the base state when its signal is
+    # ambiguous or unavailable. An unmatched pane / indeterminate transcript
+    # yields the base state, never a guess — no false positive may override a
+    # confident base state incorrectly (eng-review decision). Pane capture is
+    # skipped in copy-mode (#{pane_in_mode}) since capture-pane then shows the
+    # scrollback, not live input (plan 012 learning). Read-only throughout: no
+    # keystroke injection, ever.
+    #
+    # BOUNDED COST: at most one `tmux display` + one `tmux capture-pane` and one
+    # bounded transcript tail read per session; no full-file reads.
+    #
+    # Each detector is individually disableable via an env guard (default on) so
+    # a flaky one can be turned off without removing the STATE column:
+    #   CCTRL_STATE_DETECT_BLOCKED_DIALOG / _UNSENT_DRAFT / _WAITING_INPUT /
+    #   _IDLE_DONE = 0 to disable.
+    local sess="$1" base
+    base="$(_session_base_state "$sess")"
+
+    local en_blocked="${CCTRL_STATE_DETECT_BLOCKED_DIALOG:-1}"
+    local en_draft="${CCTRL_STATE_DETECT_UNSENT_DRAFT:-1}"
+    local en_waiting="${CCTRL_STATE_DETECT_WAITING_INPUT:-1}"
+    local en_idledone="${CCTRL_STATE_DETECT_IDLE_DONE:-1}"
+
+    # Pane detectors (blocked-dialog, unsent-draft). Skip for plain shells (no
+    # Claude dialog to find) and when in copy-mode. Capture the pane at most
+    # once and share it across both detectors to stay within the cost bound.
+    if [[ "$base" != "shell" ]] && { [[ "$en_blocked" == "1" ]] || { [[ "$en_draft" == "1" && "$base" == "idle" ]]; }; }; then
+        local copy_mode capture
+        copy_mode="$(tmux display -p -t "$sess" '#{pane_in_mode}' 2>/dev/null || true)"
+        if [[ "${copy_mode:-0}" != "1" ]]; then
+            capture="$(tmux capture-pane -p -S -40 -t "$sess" 2>/dev/null || true)"
+            if [[ -n "$capture" ]]; then
+                if [[ "$en_blocked" == "1" ]] && _session_pane_has_dialog "$capture"; then
+                    printf '%s' 'blocked-dialog'; return 0
+                fi
+                if [[ "$en_draft" == "1" && "$base" == "idle" ]] && _session_pane_has_draft "$capture"; then
+                    printf '%s' 'unsent-draft'; return 0
+                fi
+            fi
+        fi
+    fi
+
+    # Transcript detectors (waiting-input, idle-done). Only refine a confident
+    # idle base — a working/shell/unknown base is left untouched.
+    if [[ "$base" == "idle" ]] && { [[ "$en_waiting" == "1" ]] || [[ "$en_idledone" == "1" ]]; }; then
+        local turn
+        turn="$(_session_transcript_last_turn "$sess")"
+        case "$turn" in
+            assistant-question)
+                [[ "$en_waiting" == "1" ]] && { printf '%s' 'waiting-input'; return 0; } ;;
+            assistant)
+                [[ "$en_idledone" == "1" ]] && { printf '%s' 'idle-done'; return 0; } ;;
+        esac
+    fi
+
+    printf '%s' "$base"
+    return 0
+}
+
 _session_recap() {
     # Echo a one-line recap for a session: goal + next action, the single best
     # answer to "what is this session". Sourced from the transcript's dedicated
@@ -4437,9 +4582,12 @@ _session_list() {
         # Sort key: epoch-ms desc; unknown (empty) sorts last via -1.
         sort_keys+=("${last_active_ms:--1}")
 
-        # Base activity state from the per-pid status field: working|idle|shell|-.
+        # STATE column: rich state (plan 016) layers waiting-input /
+        # blocked-dialog / unsent-draft / idle-done onto the base activity state
+        # (plan 014, from the per-pid status field), falling back to the base
+        # state whenever a detector's signal is ambiguous or unavailable.
         # Distinct from attached/detached (which is retained separately).
-        base_state="$(_session_base_state "$name")"
+        base_state="$(_session_rich_state "$name")"
 
         # Recap (opt-in via --recap): costs a bounded transcript read per
         # session, so it's computed only when requested. Empty when none.
@@ -4469,9 +4617,9 @@ _session_list() {
                 if [[ ${#recap_display} -gt 50 ]]; then
                     recap_display="${recap_display:0:47}..."
                 fi
-                human_lines+=("$(printf '%s %-15s %-18s %-30s %-8s %-9s %-6s %-5s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display" "$recap_display")")
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display" "$recap_display")")
             else
-                human_lines+=("$(printf '%s %-15s %-18s %-30s %-8s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
             fi
         fi
     done

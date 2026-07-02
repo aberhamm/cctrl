@@ -1117,6 +1117,187 @@ Summary:
     echo "ok: session ls --recap surfaces compact-summary recap; null/absent otherwise"
 }
 
+test_session_list_rich_state() {
+    # Rich STATE (plan 016) layers detectors onto the base state (plan 014) in a
+    # documented precedence: blocked-dialog > unsent-draft > waiting-input >
+    # idle-done > base. Every detector is fail-safe: an ambiguous/unavailable
+    # signal falls back to the base state, never a guess. The fake tmux returns
+    # REALISTIC captured-pane fixtures (a permission dialog; an unsent input
+    # line) and per-target #{pane_in_mode}, so the fragile pane signatures are
+    # exercised against real-shaped output rather than empty stubs.
+    local bin="$TMPDIR/richbin" sdir="$TMPDIR/rich-sessions" pdir="$TMPDIR/rich-projects"
+    mkdir -p "$bin" "$sdir" "$pdir/some-proj"
+
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        case "$target" in
+            TMUX--waiting)  echo 9201;;
+            TMUX--done)     echo 9202;;
+            TMUX--bareidle) echo 9203;;
+            TMUX--ambig)    echo 9204;;
+            TMUX--dialog)   echo 9205;;
+            TMUX--draft)    echo 9206;;
+            TMUX--copymode) echo 9207;;
+            *) echo 92999;;
+        esac
+        exit 0;;
+    display-message) echo 0; exit 0;;
+    display)
+        # #{pane_in_mode}: only the copy-mode session reports 1.
+        if [[ "$*" == *pane_in_mode* ]]; then
+            [[ "$target" == "TMUX--copymode" ]] && echo 1 || echo 0
+        else
+            echo 0
+        fi
+        exit 0;;
+    capture-pane)
+        # Realistic captured-pane fixtures per target. Others render empty.
+        case "$target" in
+            TMUX--dialog)
+                cat <<'PANE'
+● I'll remove the old build artifacts now.
+
+╭──────────────────────────────────────────────────╮
+│ Do you want to proceed?                          │
+│ ❯ 1. Yes                                         │
+│   2. No, and tell Claude what to do differently  │
+╰──────────────────────────────────────────────────╯
+PANE
+                ;;
+            TMUX--draft)
+                cat <<'PANE'
+● All done — the refactor is complete.
+
+╭──────────────────────────────────────────────────╮
+│ > wait, use the other approach instead           │
+╰──────────────────────────────────────────────────╯
+  ? for shortcuts
+PANE
+                ;;
+            TMUX--copymode)
+                # Same draft-shaped line, but this pane is in copy-mode, so the
+                # detector must skip it and fall back to base (idle).
+                cat <<'PANE'
+╭──────────────────────────────────────────────────╮
+│ > half-typed reply that should be ignored        │
+╰──────────────────────────────────────────────────╯
+PANE
+                ;;
+        esac
+        exit 0;;
+    show-option) echo 1; exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+    *9201*|*9202*|*9203*|*9204*|*9205*|*9206*|*9207*) echo "claude"; exit 0;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+
+    # Per-pid session files (status drives the base state).
+    cat > "$sdir/9201.json" <<'JSON'
+{"pid":9201,"sessionId":"waiting-uuid","status":"idle"}
+JSON
+    cat > "$sdir/9202.json" <<'JSON'
+{"pid":9202,"sessionId":"done-uuid","status":"idle"}
+JSON
+    cat > "$sdir/9203.json" <<'JSON'
+{"pid":9203,"sessionId":"bareidle-uuid","status":"idle"}
+JSON
+    cat > "$sdir/9204.json" <<'JSON'
+{"pid":9204,"sessionId":"ambig-uuid","status":"idle"}
+JSON
+    # The dialog session is busy: proves blocked-dialog overrides a confident
+    # non-idle base (a live modal blocks regardless of the status field).
+    cat > "$sdir/9205.json" <<'JSON'
+{"pid":9205,"sessionId":"dialog-uuid","status":"busy"}
+JSON
+    cat > "$sdir/9206.json" <<'JSON'
+{"pid":9206,"sessionId":"draft-uuid","status":"idle"}
+JSON
+    cat > "$sdir/9207.json" <<'JSON'
+{"pid":9207,"sessionId":"copymode-uuid","status":"idle"}
+JSON
+
+    # Transcript tails. waiting: last turn is an assistant question (awaiting a
+    # user answer). done: last turn is a finished assistant message. ambig: last
+    # turn is a user message (tool_result) — indeterminate → must fall back.
+    {
+        jq -cn '{type:"user",message:{role:"user",content:"run the migration"}}'
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"The migration touches production data. Do you want me to run it now?"}]}}'
+    } > "$pdir/some-proj/waiting-uuid.jsonl"
+    {
+        jq -cn '{type:"user",message:{role:"user",content:"run the migration"}}'
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"Done. The migration applied cleanly and all checks passed."}]}}'
+    } > "$pdir/some-proj/done-uuid.jsonl"
+    {
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"Let me inspect the schema."}]}}'
+        jq -cn '{type:"user",message:{role:"user",content:[{type:"tool_result",content:"3 tables"}]}}'
+    } > "$pdir/some-proj/ambig-uuid.jsonl"
+    # bareidle/dialog/draft/copymode sessions resolve no transcript.
+
+    local sessions="TMUX--waiting TMUX--done TMUX--bareidle TMUX--ambig TMUX--dialog TMUX--draft TMUX--copymode"
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls --json)"
+    st() { printf '%s' "$out" | jq -r --arg n "$1" '.[] | select(.name==$n) | .state'; }
+
+    # (a) transcript: last turn = assistant question → waiting-input.
+    [[ "$(st TMUX--waiting)" == "waiting-input" ]] \
+        || fail "expected waiting-input; got: $(st TMUX--waiting)"
+    # idle-done: idle base + finished assistant turn (distinct from bare idle).
+    [[ "$(st TMUX--done)" == "idle-done" ]] \
+        || fail "expected idle-done; got: $(st TMUX--done)"
+    # bare idle: idle base, no transcript signal → stays idle.
+    [[ "$(st TMUX--bareidle)" == "idle" ]] \
+        || fail "expected bare idle; got: $(st TMUX--bareidle)"
+    # (b) ambiguous transcript (last turn = user) → falls back to base (idle),
+    # never a misclassification.
+    [[ "$(st TMUX--ambig)" == "idle" ]] \
+        || fail "expected ambiguous fixture to fall back to base idle; got: $(st TMUX--ambig)"
+    # pane: known dialog signature → blocked-dialog (overrides busy base).
+    [[ "$(st TMUX--dialog)" == "blocked-dialog" ]] \
+        || fail "expected blocked-dialog; got: $(st TMUX--dialog)"
+    # pane: non-empty input line → unsent-draft.
+    [[ "$(st TMUX--draft)" == "unsent-draft" ]] \
+        || fail "expected unsent-draft; got: $(st TMUX--draft)"
+    # copy-mode guard: pane in copy-mode is not inspected → falls back to idle.
+    [[ "$(st TMUX--copymode)" == "idle" ]] \
+        || fail "expected copy-mode session to fall back to idle; got: $(st TMUX--copymode)"
+
+    # Precedence: with the blocked-dialog detector disabled, the dialog pane no
+    # longer overrides — proving detectors are individually disableable and the
+    # column degrades gracefully to the base state.
+    local out2
+    out2="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        CCTRL_STATE_DETECT_BLOCKED_DIALOG=0 TMUX_FAKE_SESSIONS="TMUX--dialog" \
+        "$ROOT/cctrl" session ls --json)"
+    [[ "$(printf '%s' "$out2" | jq -r '.[0].state')" == "working" ]] \
+        || fail "expected disabled blocked-dialog detector to fall back to base working"
+
+    # Human output carries the refined STATE value.
+    local human
+    human="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls)"
+    assert_contains "$human" "blocked-dialog"
+    assert_contains "$human" "waiting-input"
+    echo "ok: session ls STATE surfaces rich states with fail-safe fallback to base"
+}
+
 test_peer_registry_manual_alias_and_identity() {
     local data="$TMPDIR/peer-manual-data"
     local project="$TMPDIR/comet-automation"
@@ -2134,6 +2315,7 @@ test_session_list_unresolvable_session
 test_session_list_sorts_by_last_active
 test_session_list_base_state
 test_session_list_recap
+test_session_list_rich_state
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors
