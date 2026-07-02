@@ -34,6 +34,10 @@ CODEX_SESSIONS_DIR="$CODEX_DIR/sessions"
 # that file is the authoritative remote-control liveness signal (null = not
 # bridged). Honors CLAUDE_CONFIG_DIR; CCTRL_CLAUDE_SESSIONS_DIR overrides (tests).
 CLAUDE_SESSIONS_DIR="${CCTRL_CLAUDE_SESSIONS_DIR:-${CLAUDE_CONFIG_DIR:-$CLAUDE_DIR}/sessions}"
+# Claude Code writes transcripts as $CLAUDE_PROJECTS_DIR/<cwd-slug>/<sessionId>.jsonl.
+# The sessionId uuid is globally unique, so we glob it across all project dirs
+# rather than reconstructing the cwd slug. CCTRL_CLAUDE_PROJECTS_DIR overrides (tests).
+CLAUDE_PROJECTS_DIR="${CCTRL_CLAUDE_PROJECTS_DIR:-${CLAUDE_CONFIG_DIR:-$CLAUDE_DIR}/projects}"
 CODEX_ARCHIVED_SESSIONS_DIR="$CODEX_DIR/archived_sessions"
 
 # Colors
@@ -4224,10 +4228,73 @@ _session_claude_pid() {
 }
 
 _session_bridge_field() {
-    # Echo a field from a session's Claude session file, or empty if absent.
+    # Echo a field from a session's Claude session file (keyed by PID), or
+    # empty if absent. Pid-based; callers already hold a resolved pid.
     local pid="$1" field="$2"
     [[ -n "$pid" && -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]] || return 0
     jq -r --arg f "$field" '.[$f] // empty' "$CLAUDE_SESSIONS_DIR/$pid.json" 2>/dev/null
+}
+
+_session_claude_field() {
+    # Session-keyed convenience: resolve the backing claude pid for a tmux
+    # session, then read a field (sessionId, updatedAt, status, ...) from its
+    # per-pid Claude session file. Empty for non-claude/absent sessions.
+    local sess="$1" field="$2" pid
+    pid="$(_session_claude_pid "$sess")"
+    _session_bridge_field "$pid" "$field"
+}
+
+_session_id() {
+    # Echo a session's Claude sessionId (transcript uuid), or empty.
+    _session_claude_field "$1" sessionId
+}
+
+_session_transcript_path() {
+    # Resolve a session's transcript file by globbing the (globally-unique)
+    # sessionId uuid across all project dirs. Echo the single match, or empty.
+    local sess="$1" sid f
+    sid="$(_session_id "$sess")"
+    [[ -n "$sid" ]] || return 0
+    for f in "$CLAUDE_PROJECTS_DIR"/*/"$sid".jsonl; do
+        [[ -e "$f" ]] && { printf '%s' "$f"; return 0; }
+    done
+    return 0
+}
+
+_session_last_active_ms() {
+    # Echo a session's last-active epoch-ms: prefer the per-pid file's
+    # updatedAt (already epoch-ms), else the transcript file mtime
+    # (stat -f %m, epoch-seconds → ×1000). Empty if neither resolves.
+    local sess="$1" upd tpath mtime
+    upd="$(_session_claude_field "$sess" updatedAt)"
+    if [[ -n "$upd" ]]; then
+        printf '%s' "$upd"
+        return 0
+    fi
+    tpath="$(_session_transcript_path "$sess")"
+    [[ -n "$tpath" ]] || return 0
+    mtime="$(stat -f %m "$tpath" 2>/dev/null)"
+    [[ -n "$mtime" ]] && printf '%s' "$(( mtime * 1000 ))"
+    return 0
+}
+
+_fmt_age_ms() {
+    # Format an epoch-ms timestamp as a relative age from now: Ns/Nm/Nh/Nd.
+    # Echo '-' for empty input.
+    local ms="$1" now_ms delta_s
+    [[ -n "$ms" ]] || { printf '%s' '-'; return 0; }
+    now_ms=$(( $(date +%s) * 1000 ))
+    delta_s=$(( (now_ms - ms) / 1000 ))
+    (( delta_s < 0 )) && delta_s=0
+    if (( delta_s < 60 )); then
+        printf '%ds' "$delta_s"
+    elif (( delta_s < 3600 )); then
+        printf '%dm' "$(( delta_s / 60 ))"
+    elif (( delta_s < 86400 )); then
+        printf '%dh' "$(( delta_s / 3600 ))"
+    else
+        printf '%dd' "$(( delta_s / 86400 ))"
+    fi
 }
 
 _session_rc_state() {
@@ -4263,9 +4330,10 @@ _session_list() {
         return 0
     fi
 
-    local -a json_items=()
+    local -a json_items=() human_lines=() sort_keys=() order=()
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
+    local session_id transcript last_active_ms last_active_disp last_active_iso i idx
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
@@ -4307,25 +4375,56 @@ _session_list() {
             fi
         fi
 
+        # Recency: sessionId + transcript path + last-active (epoch-ms). Live
+        # read from the per-pid Claude session file; empty for non-claude sessions.
+        session_id="$(_session_id "$name")"
+        transcript="$(_session_transcript_path "$name")"
+        last_active_ms="$(_session_last_active_ms "$name")"
+        last_active_iso=""
+        if [[ -n "$last_active_ms" ]]; then
+            last_active_iso="$(date -r "$(( last_active_ms / 1000 ))" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+        fi
+        # Sort key: epoch-ms desc; unknown (empty) sorts last via -1.
+        sort_keys+=("${last_active_ms:--1}")
+
         if $json; then
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" --arg agent "$agent" \
                 --arg purpose "$purpose" --arg created_at "$created_at" \
                 --arg peer "$peer" --arg rc "$rc_state" --arg bridge "$bridge_id" \
+                --arg session_id "$session_id" --arg transcript "$transcript" \
+                --arg last_active "$last_active_iso" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
             if [[ ${#purpose_display} -gt 42 ]]; then
                 purpose_display="${purpose_display:0:39}..."
             fi
-            printf '%s %-15s %-18s %-30s %-9s %-5s %s\n' "$marker" "$name" "$kind" "$disp_dir" "$state" "$rc_state" "$purpose_display"
+            last_active_disp="$(_fmt_age_ms "$last_active_ms")"
+            human_lines+=("$(printf '%s %-15s %-18s %-30s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
         fi
     done
 
-    $json && printf '%s\n' "${json_items[@]}" | jq -s '.'
+    # Sort rows by last-active epoch-ms descending; unknown (-1) sorts last.
+    while IFS=$'\t' read -r _ idx; do order+=("$idx"); done < <(
+        for i in "${!sort_keys[@]}"; do printf '%s\t%s\n' "${sort_keys[i]}" "$i"; done \
+            | sort -t $'\t' -k1,1nr -s
+    )
+
+    if $json; then
+        local -a ordered_json=()
+        for idx in "${order[@]}"; do ordered_json+=("${json_items[idx]}"); done
+        if [[ ${#ordered_json[@]} -eq 0 ]]; then
+            echo "[]"
+        else
+            printf '%s\n' "${ordered_json[@]}" | jq -s '.'
+        fi
+    else
+        for idx in "${order[@]}"; do printf '%s\n' "${human_lines[idx]}"; done
+    fi
     return 0
 }
 

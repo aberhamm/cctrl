@@ -845,6 +845,123 @@ JSON
     assert_contains "$out" '"created_at": "2026-06-11T10:00:00Z"'
 }
 
+test_session_list_last_active_from_updated_at() {
+    # A claude session whose per-pid file carries sessionId + updatedAt reports
+    # both session_id and last_active (ISO-8601 derived from updatedAt epoch-ms).
+    local bin="$TMPDIR/labin" sdir="$TMPDIR/la-sessions" pdir="$TMPDIR/la-projects"
+    mkdir -p "$bin" "$sdir" "$pdir"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *5555* ]]; then echo "claude --remote-control"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/5555.json" <<'JSON'
+{"pid":5555,"sessionId":"abc-123-uuid","updatedAt":1700000000000,"bridgeSessionId":"session_live"}
+JSON
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_PANE_PID=5555 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"session_id": "abc-123-uuid"'
+    assert_contains "$out" '"last_active": "2023-11-14T22:13:20Z"'
+    echo "ok: session ls --json exposes session_id + last_active"
+}
+
+test_session_list_last_active_from_transcript_mtime() {
+    # No updatedAt in the per-pid file: last_active falls back to the transcript
+    # file's mtime (resolved by globbing the sessionId across project dirs).
+    local bin="$TMPDIR/mtbin" sdir="$TMPDIR/mt-sessions" pdir="$TMPDIR/mt-projects"
+    mkdir -p "$bin" "$sdir" "$pdir/some-proj"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *6666* ]]; then echo "claude"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/6666.json" <<'JSON'
+{"pid":6666,"sessionId":"mtime-uuid-999"}
+JSON
+    local tfile="$pdir/some-proj/mtime-uuid-999.jsonl"
+    : > "$tfile"
+    touch -t 202306301200.00 "$tfile"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--mt" TMUX_FAKE_PANE_PID=6666 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"session_id": "mtime-uuid-999"'
+    assert_contains "$out" 'mtime-uuid-999.jsonl'
+    # updatedAt absent, but mtime fallback resolves -> last_active is not null.
+    assert_not_contains "$out" '"last_active": null'
+}
+
+test_session_list_unresolvable_session() {
+    # A session with no per-pid Claude file still lists, with null session_id /
+    # last_active, and never errors.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/empty-sessions" \
+        CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/empty-projects" \
+        TMUX_FAKE_SESSIONS="TMUX--unresolved" "$ROOT/cctrl" session ls --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "session ls must not error on an unresolvable session"
+    assert_contains "$out" '"name": "TMUX--unresolved"'
+    assert_contains "$out" '"session_id": null'
+    assert_contains "$out" '"last_active": null'
+}
+
+test_session_list_sorts_by_last_active() {
+    # Rows sort most-recently-active first; unknown last_active sorts last.
+    local bin="$TMPDIR/sortbin" sdir="$TMPDIR/sort-sessions" pdir="$TMPDIR/sort-projects"
+    mkdir -p "$bin" "$sdir" "$pdir"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        case "$target" in
+            TMUX--recent) echo 7001;;
+            TMUX--older) echo 7002;;
+            *) echo 79999;;
+        esac
+        exit 0;;
+    display-message) echo 0; exit 0;;
+    show-option) echo 1; exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+    *7001*|*7002*) echo "claude"; exit 0;;
+    *79999*) echo "-zsh"; exit 0;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/7001.json" <<'JSON'
+{"pid":7001,"sessionId":"recent-uuid","updatedAt":1751000000000}
+JSON
+    cat > "$sdir/7002.json" <<'JSON'
+{"pid":7002,"sessionId":"older-uuid","updatedAt":1700000000000}
+JSON
+
+    local out order
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--older TMUX--noresolve TMUX--recent" "$ROOT/cctrl" session ls --json)"
+    order="$(printf '%s' "$out" | jq -r '.[].name' | tr '\n' ',')"
+    [[ "$order" == "TMUX--recent,TMUX--older,TMUX--noresolve," ]] \
+        || fail "expected sort order recent,older,noresolve; got: $order"
+}
+
 test_peer_registry_manual_alias_and_identity() {
     local data="$TMPDIR/peer-manual-data"
     local project="$TMPDIR/comet-automation"
@@ -1856,6 +1973,10 @@ test_bridge_prefix_matches_explicit_name
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision
 test_session_list_codex_default_model
+test_session_list_last_active_from_updated_at
+test_session_list_last_active_from_transcript_mtime
+test_session_list_unresolvable_session
+test_session_list_sorts_by_last_active
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors

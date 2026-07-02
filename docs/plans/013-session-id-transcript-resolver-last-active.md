@@ -1,13 +1,16 @@
 ---
 id: 013
 title: Resolve Claude session-id + transcript path, add real last-active column to session ls
-status: in-progress
+status: done
 blocked-by: []
 priority: 13
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -119,3 +122,30 @@ empty.
 - [cmd] `tests/run-tests.sh < /dev/null`
 - [assert] `tests/run-tests.sh < /dev/null` output contains `session_id`
 - [assert] `bash -c 'CCTRL_CLAUDE_SESSIONS_DIR=... cctrl session ls --json' ` (in-harness) produces JSON containing `last_active` — covered by a new test case asserting the field is present.
+
+## Implementation Notes
+
+Added a `$CLAUDE_PROJECTS_DIR` constant (with `CCTRL_CLAUDE_PROJECTS_DIR` test
+override) next to `$CLAUDE_SESSIONS_DIR`, plus five helpers beside
+`_session_bridge_field`: `_session_claude_field` (session-keyed field read,
+delegating to the still-intact pid-based `_session_bridge_field`), `_session_id`,
+`_session_transcript_path` (globs the unique sessionId across project dirs — no
+cwd-slug reconstruction), `_session_last_active_ms` (prefers `updatedAt` epoch-ms,
+falls back to transcript `stat -f %m` ×1000), and `_fmt_age_ms` (Ns/Nm/Nh/Nd, `-`
+for empty). `_session_list` now computes recency per row, adds a `last-active`
+human column after `state` plus `session_id`/`transcript`/`last_active` JSON
+fields, and sorts rows by last-active epoch-ms descending (unknowns last via a
+`-1` sort key). Four tests cover the updatedAt path, mtime fallback, an
+unresolvable session (null, no error), and sort ordering.
+
+Deviation: the Design said "refactor `_session_bridge_field` to delegate to
+`_session_claude_field`"; instead `_session_bridge_field` stays the pid-based
+core and the new session-keyed `_session_claude_field` delegates to it,
+preserving all existing pid-based callers.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `81a7bdd` — `feat(session): add sessionId/transcript resolver + real last-active column`
