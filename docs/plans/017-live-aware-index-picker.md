@@ -1,13 +1,16 @@
 ---
 id: 017
 title: Live-aware session index picker — never assign an index that clobbers a live session
-status: in-progress
+status: done
 blocked-by: []
 priority: 17
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -83,3 +86,24 @@ reconciliation (that is plan 012) and realigning already-mismatched sessions
   live session name
 - [assert] normal-case test asserts `base--2` is still chosen when only the bare
   base is live
+
+## Implementation Notes
+
+Added `_pick_safe_session_index <base_name>`: returns the lowest session name
+with no LIVE tmux session (index "taken" only when `tmux has-session` is true —
+stale metadata never reserves an index, so freed indices are reused with no
+`--N` sprawl), and returns non-zero if 2-999 are all live so the caller refuses
+instead of colliding. All detached-launch name derivation converges in
+`_launch_detached` (the sole `tmux new-session` site); its ad-hoc
+`while tmux has-session` loop is replaced by the helper + a refuse-on-no-slot
+guard. Root cause of the original clobber: `_launch_detached`'s
+write-metadata-then-`rm`-on-dup-failure stole a live session's identity when the
+`@shortcut` path settled on a live name; the old guard only checked the bare
+base. 3 tests: clobber regression, normal increment, freed-index reuse.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `3d38c73` — `fix(session): never assign a detached-launch index that clobbers a live session`

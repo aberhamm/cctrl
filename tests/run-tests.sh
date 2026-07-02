@@ -404,6 +404,65 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "--name TMUX--project--2"
 }
 
+test_live_aware_index_picker() {
+    # Plan 017: a detached launch must NEVER assign a name whose tmux session is
+    # currently live (that clobbers the running session's metadata). The picker
+    # is tmux-live-only: dead sessions with stale metadata do NOT reserve an
+    # index, so freed indices are reused instead of sprawling --N.
+    make_fake_tmux "$TMPDIR/tmux"
+
+    # (a) REGRESSION — reproduce the `@shortcut` reuse-clobber path: the base
+    # index AND --2 are both live tmux sessions, so the picker must skip both
+    # and land on --3, never colliding with a live session.
+    local rootcopy="$TMPDIR/cctrl-picker-copy"
+    local obs_project="$TMPDIR/obsproj"
+    local log="$TMPDIR/picker-tmux.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$obs_project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"obs":{"dir":"%s","agent":"codex"}}\n' "$obs_project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 \
+        TMUX_FAKE_HAS_SESSION="TMUX--obs TMUX--obs--2" "$rootcopy/cctrl" @obs)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--obs--3"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--obs--3"
+    # The chosen name differs from every live session — no clobber.
+    assert_not_contains "$out" "CCTRL_SESSION=TMUX--obs
+"
+    assert_not_contains "$(cat "$log")" "new-session -d -s TMUX--obs--2 "
+
+    # (b) normal increment — only the bare base is live → picker chooses --2.
+    local incr_project="$TMPDIR/incrproj"
+    mkdir -p "$incr_project"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 \
+        TMUX_FAKE_HAS_SESSION="TMUX--incrproj" "$rootcopy/cctrl" start -d -m "incr" "$incr_project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--incrproj--2"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--incrproj--2"
+
+    # (c) freed-index reuse — the bare base is live and --2 has leftover metadata
+    # for a DEAD session (no live tmux). Metadata must NOT reserve the index, so
+    # the picker REUSES --2 (no sprawl to --3) and the stale record is refreshed.
+    local reuse_project="$TMPDIR/reuseproj"
+    mkdir -p "$reuse_project" "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--reuseproj--2.json" <<'JSON'
+{"name":"TMUX--reuseproj--2","purpose":"stale dead session","cctrl_managed":true}
+JSON
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 \
+        TMUX_FAKE_HAS_SESSION="TMUX--reuseproj" "$rootcopy/cctrl" start -d -m "fresh" "$reuse_project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--reuseproj--2"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--reuseproj--2"
+    assert_not_contains "$out" "CCTRL_SESSION=TMUX--reuseproj--3"
+    # Stale metadata was refreshed for the new session, not preserved.
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--reuseproj--2.json")" '"purpose": "fresh"'
+
+    echo "ok: live-aware index picker skips live sessions, reuses freed indices"
+}
+
 test_start_defaults_to_tmux() {
     make_fake_tmux "$TMPDIR/tmux"
     local project="$TMPDIR/default-project"
@@ -2297,6 +2356,7 @@ test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
 test_detached_agent_prompt_exports_selection
 test_detached_arg_parsing
+test_live_aware_index_picker
 test_start_defaults_to_tmux
 test_start_peer_env_and_metadata
 test_shortcut_no_args_defaults_to_tmux

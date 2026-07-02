@@ -1215,6 +1215,33 @@ _prompt_session_purpose() {
     printf '%s' "${answer:-$default_purpose}"
 }
 
+_pick_safe_session_index() {
+    # Pick the lowest session name that has NO live tmux session, given a base.
+    #
+    # An index is "taken" ONLY if `tmux has-session` reports it live — a live
+    # session is never overwritten. A stale metadata record for a DEAD session
+    # does not reserve the index, so freed indices are reused (no --N sprawl);
+    # any leftover metadata at a reused index is refreshed by the caller.
+    #
+    # Tries the bare base first, then base--2, base--3, ... Prints the chosen
+    # name and returns 0. Prints nothing and returns 1 if no free slot exists
+    # within a sane bound, so the caller can refuse rather than collide.
+    local base_name="$1"
+    if ! tmux has-session -t "$base_name" 2>/dev/null; then
+        printf '%s\n' "$base_name"
+        return 0
+    fi
+    local n=2
+    while (( n <= 999 )); do
+        if ! tmux has-session -t "${base_name}--${n}" 2>/dev/null; then
+            printf '%s\n' "${base_name}--${n}"
+            return 0
+        fi
+        ((n++))
+    done
+    return 1
+}
+
 _launch_detached() {
     # Launch a cctrl session in a detached tmux session (survives SSH
     # disconnect). Invoked by `cctrl start -d`. No GUI — just tmux.
@@ -1466,15 +1493,18 @@ _launch_detached() {
         metadata_cwd="$dir"
     fi
 
-    # Auto-increment if session name already exists (homelab, homelab--2, ...)
-    local base_name="$session_name"
-    if tmux has-session -t "$session_name" 2>/dev/null; then
-        local n=2
-        while tmux has-session -t "${base_name}--${n}" 2>/dev/null; do
-            ((n++))
-        done
-        session_name="${base_name}--${n}"
+    # Never assign a name whose tmux session is currently live — that would
+    # clobber the running session (its metadata is overwritten and, if
+    # new-session then fails, deleted). Route every detached-name derivation
+    # (start -d, @shortcut jump, metadata-name) through one live-aware picker:
+    # it reuses freed/dead indices (homelab, homelab--2, ...) but skips any
+    # live one, and refuses if no safe slot is available.
+    local base_name="$session_name" picked_name
+    if ! picked_name="$(_pick_safe_session_index "$base_name")"; then
+        echo -e "${RED}Refusing to launch: no free session index for '$base_name' (indices 2-999 all have live tmux sessions).${RESET}" >&2
+        return 1
     fi
+    session_name="$picked_name"
 
     local default_purpose final_purpose
     if $purpose_set; then
