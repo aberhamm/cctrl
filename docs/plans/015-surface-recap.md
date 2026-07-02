@@ -1,13 +1,16 @@
 ---
 id: 015
 title: Surface each session's recap (goal + next action) in session ls --recap
-status: in-progress
+status: done
 blocked-by: [013]
 priority: 15
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -79,6 +82,42 @@ STATE column. Bound the transcript read (no full-file loads).
    when set.
 4. Add tests for the chosen signal and the no-recap fallback.
 
+## Implementation Notes
+
+Investigation of live transcripts (`~/.claude/projects/<slug>/<uuid>.jsonl`):
+
+- There is **no** dedicated top-level `"type":"summary"` entry. Enumerating
+  `"type":"…"` values across ~20 recent transcripts yielded `message`,
+  `assistant`, `user`, `tool_use`, `tool_result`, `text`, `thinking`, `system`,
+  etc. — none named `summary`.
+- The `※ recap:` string the live pane shows is **generated/rendered only** — it
+  is not persisted verbatim. `grep -o 'recap:…'` across all transcripts found it
+  solely as incidental message text (inside plan discussions), never as a
+  structured field.
+- The one reliable, dedicated recap-bearing signal on disk is the
+  **compact-summary entry**: a line with `"isCompactSummary": true`. Its shape
+  (verified via jq) is `type:"user"`, `message.role:"user"`,
+  `message.content` = a string beginning
+  `"This session is being continued from a previous conversation … Summary:\n1. Primary Request and Intent: …"`.
+
+**Chosen source & extraction:** `_session_recap` reads a bounded tail
+(`tail -n 200`), greps for `isCompactSummary`, takes the last such line, and
+feeds *only that single line* to `jq` (so malformed unrelated lines can't break
+it). jq selects `.isCompactSummary == true`, takes `message.content` (string, or
+array-of-`text` blocks joined), strips the `^This session is being continued…Summary:`
+boilerplate (jq `sub` with the `m` flag so `.` spans newlines), and collapses
+whitespace to a single line. Result e.g. `"1. Primary Request and Intent: …"`.
+
+**Fallback (eng-review decision):** if no compact-summary entry exists in the
+tail window (or no transcript), render `-` / `null`. It deliberately does **not**
+fall back to the last assistant `text` line — an honest blank beats a misleading
+preamble for the "what is this" column.
+
+**Opt-in:** `--recap` gates the per-session transcript read; without it the
+transcript is never read and both `--json` and human output are byte-for-byte
+unchanged (the `recap` JSON key is absent, added only via `+ {recap:…}` when
+requested).
+
 ## Verification
 
 - [cmd] `bash -n cctrl`
@@ -87,3 +126,5 @@ STATE column. Bound the transcript read (no full-file loads).
   `session ls --recap --json` contains the expected recap text
 - [assert] a new test asserts a transcript-less session yields `recap` null /
   `-` under `--recap`
+
+**Commit:** `f514c3c` — `feat(session): add opt-in --recap column to session ls`

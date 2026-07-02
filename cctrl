@@ -4325,12 +4325,48 @@ _session_base_state() {
     esac
 }
 
+_session_recap() {
+    # Echo a one-line recap for a session: goal + next action, the single best
+    # answer to "what is this session". Sourced from the transcript's dedicated
+    # compact-summary entry (a type:user line flagged isCompactSummary, whose
+    # message.content holds Claude Code's auto-generated conversation summary).
+    #
+    # An investigation of live transcripts found the `※ recap:` string is
+    # rendered into the live pane only — it is NOT persisted as a dedicated
+    # entry type. The compact-summary entry is the one reliable recap-bearing
+    # signal on disk. Per the eng-review decision we deliberately do NOT fall
+    # back to the last assistant text line: for a "what is this" column an
+    # honest blank beats a misleading preamble ("Let me check that").
+    #
+    # Reads only a bounded tail of the transcript (never the whole file) and
+    # extracts the most recent compact-summary within that window. Echoes the
+    # recap text, or empty when none is derivable (no transcript / no summary).
+    local sess="$1" tpath line recap
+    tpath="$(_session_transcript_path "$sess")"
+    [[ -n "$tpath" && -e "$tpath" ]] || return 0
+    # Last compact-summary line within the bounded tail window (if any). Only
+    # this single line is fed to jq, so unrelated malformed lines can't break it.
+    line="$(tail -n 200 "$tpath" 2>/dev/null | grep 'isCompactSummary' | tail -1)"
+    [[ -n "$line" ]] || return 0
+    recap="$(printf '%s' "$line" | jq -r '
+        select(.isCompactSummary == true)
+        | (.message.content)
+        | (if type == "array" then (map(.text // "") | join(" ")) else (. // "") end)
+        | sub("^This session is being continued.*?Summary:"; ""; "m")
+        | gsub("\\s+"; " ")
+        | sub("^ +"; "") | sub(" +$"; "")
+    ' 2>/dev/null)"
+    [[ -n "$recap" ]] || return 0
+    printf '%s' "$recap"
+}
+
 _session_list() {
     _session_require_tmux || return 1
-    local json=false a
+    local json=false recap=false a
     for a in "$@"; do
         case "$a" in
-            --json) json=true ;;
+            --json)  json=true ;;
+            --recap) recap=true ;;
         esac
     done
 
@@ -4347,7 +4383,7 @@ _session_list() {
     local -a json_items=() human_lines=() sort_keys=() order=()
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
-    local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state
+    local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
@@ -4405,6 +4441,11 @@ _session_list() {
         # Distinct from attached/detached (which is retained separately).
         base_state="$(_session_base_state "$name")"
 
+        # Recap (opt-in via --recap): costs a bounded transcript read per
+        # session, so it's computed only when requested. Empty when none.
+        recap_text=""
+        $recap && recap_text="$(_session_recap "$name")"
+
         if $json; then
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
@@ -4413,8 +4454,9 @@ _session_list() {
                 --arg peer "$peer" --arg rc "$rc_state" --arg bridge "$bridge_id" \
                 --arg session_id "$session_id" --arg transcript "$transcript" \
                 --arg last_active "$last_active_iso" --arg base "$base_state" \
+                --arg recap "$recap_text" --argjson want_recap "$recap" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -4422,7 +4464,15 @@ _session_list() {
                 purpose_display="${purpose_display:0:39}..."
             fi
             last_active_disp="$(_fmt_age_ms "$last_active_ms")"
-            human_lines+=("$(printf '%s %-15s %-18s %-30s %-8s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
+            if $recap; then
+                recap_display="${recap_text:--}"
+                if [[ ${#recap_display} -gt 50 ]]; then
+                    recap_display="${recap_display:0:47}..."
+                fi
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-8s %-9s %-6s %-5s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display" "$recap_display")")
+            else
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-8s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
+            fi
         fi
     done
 

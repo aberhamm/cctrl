@@ -1031,6 +1031,92 @@ JSON
     echo "ok: session ls exposes base state (working/idle/shell/-)"
 }
 
+test_session_list_recap() {
+    # --recap (opt-in) surfaces a one-line recap per session, sourced from the
+    # transcript's compact-summary entry (isCompactSummary). Sessions with no
+    # transcript / no summary render null under --recap and never error.
+    # Without --recap the recap key is absent (output byte-for-byte unchanged).
+    local bin="$TMPDIR/recapbin" sdir="$TMPDIR/recap-sessions" pdir="$TMPDIR/recap-projects"
+    mkdir -p "$bin" "$sdir" "$pdir/some-proj"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        case "$target" in
+            TMUX--recap)   echo 9101;;
+            TMUX--norecap) echo 9102;;
+            *) echo 91999;;
+        esac
+        exit 0;;
+    display-message) echo 0; exit 0;;
+    show-option) echo 1; exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+    *9101*|*9102*) echo "claude"; exit 0;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/9101.json" <<'JSON'
+{"pid":9101,"sessionId":"recap-uuid"}
+JSON
+    cat > "$sdir/9102.json" <<'JSON'
+{"pid":9102,"sessionId":"norecap-uuid"}
+JSON
+
+    # Transcript for the recap session: an assistant preamble, the dedicated
+    # compact-summary entry, then a later assistant line. The recap must come
+    # from the summary entry — never the last assistant text line.
+    local tfile="$pdir/some-proj/recap-uuid.jsonl"
+    local content='This session is being continued from a previous conversation that ran out of context.
+Summary:
+1. Primary Request and Intent: Build the widget dashboard for acceptance.'
+    {
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"Let me check that first."}]}}'
+        jq -cn --arg c "$content" '{type:"user",isCompactSummary:true,message:{role:"user",content:$c}}'
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"On it now."}]}}'
+    } > "$tfile"
+    # The norecap session's sessionId resolves no transcript at all.
+
+    local sessions="TMUX--recap TMUX--norecap"
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls --recap --json)"
+    # (a) recap extracted from the compact-summary entry (not the last line).
+    [[ "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--recap") | .recap')" \
+        == "1. Primary Request and Intent: Build the widget dashboard for acceptance." ]] \
+        || fail "expected recap from compact-summary; got: $(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--recap") | .recap')"
+    assert_not_contains "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--recap") | .recap')" "On it now"
+    # (b) transcript-less session yields recap null, no error.
+    [[ "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--norecap") | .recap')" == "null" ]] \
+        || fail "expected null recap for transcript-less session"
+
+    # (c) Without --recap the recap key is absent (default output unchanged).
+    local out_default
+    out_default="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls --json)"
+    [[ "$(printf '%s' "$out_default" | jq '[.[] | has("recap")] | any')" == "false" ]] \
+        || fail "default session ls --json must not include a recap key"
+
+    # Human --recap output carries the recap text.
+    local human
+    human="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls --recap)"
+    assert_contains "$human" "Primary Request and Intent"
+    echo "ok: session ls --recap surfaces compact-summary recap; null/absent otherwise"
+}
+
 test_peer_registry_manual_alias_and_identity() {
     local data="$TMPDIR/peer-manual-data"
     local project="$TMPDIR/comet-automation"
@@ -2047,6 +2133,7 @@ test_session_list_last_active_from_transcript_mtime
 test_session_list_unresolvable_session
 test_session_list_sorts_by_last_active
 test_session_list_base_state
+test_session_list_recap
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors
