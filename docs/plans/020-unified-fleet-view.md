@@ -1,7 +1,7 @@
 ---
 id: 020
 title: cctrl fleet — unified cross-host session view
-status: pending
+status: in-progress
 blocked-by: [013, 014]
 priority: 20
 goal: cctrl-fleet-staleness
