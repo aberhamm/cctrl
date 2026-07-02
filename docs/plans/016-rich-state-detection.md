@@ -1,7 +1,7 @@
 ---
 id: 016
 title: Rich STATE detection — waiting-input, blocked-dialog, unsent-draft, idle-done
-status: pending
+status: in-progress
 blocked-by: [014]
 priority: 16
 goal: cctrl-fleet-staleness
