@@ -962,6 +962,75 @@ JSON
         || fail "expected sort order recent,older,noresolve; got: $order"
 }
 
+test_session_list_base_state() {
+    # Base STATE column derives from the per-pid `status` field:
+    # busy→working, idle→idle, shell→shell, unresolvable→'-'. The attached/
+    # detached fact is retained separately (attached boolean in --json).
+    local bin="$TMPDIR/statebin" sdir="$TMPDIR/state-sessions" pdir="$TMPDIR/state-projects"
+    mkdir -p "$bin" "$sdir" "$pdir"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        case "$target" in
+            TMUX--busy)  echo 8001;;
+            TMUX--idle)  echo 8002;;
+            TMUX--shell) echo 8003;;
+            *) echo 89999;;
+        esac
+        exit 0;;
+    display-message) echo 0; exit 0;;
+    show-option) echo 1; exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+    *8001*|*8002*|*8003*) echo "claude"; exit 0;;
+    *89999*) echo "-zsh"; exit 0;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/8001.json" <<'JSON'
+{"pid":8001,"sessionId":"busy-uuid","status":"busy"}
+JSON
+    cat > "$sdir/8002.json" <<'JSON'
+{"pid":8002,"sessionId":"idle-uuid","status":"idle"}
+JSON
+    cat > "$sdir/8003.json" <<'JSON'
+{"pid":8003,"sessionId":"shell-uuid","status":"shell"}
+JSON
+
+    local sessions="TMUX--busy TMUX--idle TMUX--shell TMUX--noresolve"
+    local out human
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls --json)"
+    # Per-pid status maps to the base state in --json.
+    assert_contains "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--busy")  | .state')" "working"
+    assert_contains "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--idle")  | .state')" "idle"
+    assert_contains "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--shell") | .state')" "shell"
+    # Unresolvable session renders '-' and never errors.
+    [[ "$(printf '%s' "$out" | jq -r '.[] | select(.name=="TMUX--noresolve") | .state')" == "-" ]] \
+        || fail "expected unresolvable session state to be '-'"
+    # attached boolean retained alongside the new base state field.
+    assert_contains "$out" '"attached": false'
+
+    # Human output carries the base state column (e.g. 'working').
+    human="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" session ls)"
+    assert_contains "$human" "working"
+    echo "ok: session ls exposes base state (working/idle/shell/-)"
+}
+
 test_peer_registry_manual_alias_and_identity() {
     local data="$TMPDIR/peer-manual-data"
     local project="$TMPDIR/comet-automation"
@@ -1977,6 +2046,7 @@ test_session_list_last_active_from_updated_at
 test_session_list_last_active_from_transcript_mtime
 test_session_list_unresolvable_session
 test_session_list_sorts_by_last_active
+test_session_list_base_state
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors

@@ -1,13 +1,16 @@
 ---
 id: 014
 title: Add a base STATE column to session ls from the per-pid status field
-status: in-progress
+status: done
 blocked-by: [013]
 priority: 14
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -73,3 +76,22 @@ panes here; base state comes solely from the per-pid `status` field.
 - [assert] `tests/run-tests.sh < /dev/null` output contains `working`
 - [assert] a new test asserting an `idle` per-pid fixture yields `state` ==
   `idle` in `session ls --json`
+
+## Implementation Notes
+
+Added `_session_base_state <sess>` mapping the per-pid Claude `status` (via
+`_session_claude_field` from plan 013) to `busy→working`, `idle→idle`,
+`shell→shell`, else `-`. Wired into `_session_list`: a new base STATE column
+(`%-8s`) sits immediately before the retained attached/detached column, so both
+facts show side-by-side; `--json` gains a `state` field and keeps the existing
+`attached` boolean. The pre-existing `state` variable still drives
+attached/detached; the new `base_state` carries working/idle/shell.
+`test_session_list_base_state` covers busy/idle/shell/unresolvable in both human
+and JSON output, reusing plan 013's per-pid fixture machinery. No deviations.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `5f54946` — `feat(session): add base STATE column (working/idle/shell) to session ls`

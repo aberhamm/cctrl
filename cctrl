@@ -4311,6 +4311,20 @@ _session_rc_state() {
     [[ -n "$bridge" ]] && printf '%s' 'live' || printf '%s' 'dead'
 }
 
+_session_base_state() {
+    # Map a session's per-pid Claude status to a base activity state:
+    # busy→working, idle→idle, shell→shell, anything else/empty→'-'.
+    # Base state only (per-pid status field); richer states are plan 016.
+    local sess="$1" status
+    status="$(_session_claude_field "$sess" status)"
+    case "$status" in
+        busy)  printf '%s' 'working' ;;
+        idle)  printf '%s' 'idle' ;;
+        shell) printf '%s' 'shell' ;;
+        *)     printf '%s' '-' ;;
+    esac
+}
+
 _session_list() {
     _session_require_tmux || return 1
     local json=false a
@@ -4333,7 +4347,7 @@ _session_list() {
     local -a json_items=() human_lines=() sort_keys=() order=()
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
-    local session_id transcript last_active_ms last_active_disp last_active_iso i idx
+    local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
@@ -4387,6 +4401,10 @@ _session_list() {
         # Sort key: epoch-ms desc; unknown (empty) sorts last via -1.
         sort_keys+=("${last_active_ms:--1}")
 
+        # Base activity state from the per-pid status field: working|idle|shell|-.
+        # Distinct from attached/detached (which is retained separately).
+        base_state="$(_session_base_state "$name")"
+
         if $json; then
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
@@ -4394,9 +4412,9 @@ _session_list() {
                 --arg purpose "$purpose" --arg created_at "$created_at" \
                 --arg peer "$peer" --arg rc "$rc_state" --arg bridge "$bridge_id" \
                 --arg session_id "$session_id" --arg transcript "$transcript" \
-                --arg last_active "$last_active_iso" \
+                --arg last_active "$last_active_iso" --arg base "$base_state" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)}')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -4404,7 +4422,7 @@ _session_list() {
                 purpose_display="${purpose_display:0:39}..."
             fi
             last_active_disp="$(_fmt_age_ms "$last_active_ms")"
-            human_lines+=("$(printf '%s %-15s %-18s %-30s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
+            human_lines+=("$(printf '%s %-15s %-18s %-30s %-8s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
         fi
     done
 
