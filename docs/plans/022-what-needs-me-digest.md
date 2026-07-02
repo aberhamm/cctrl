@@ -1,7 +1,7 @@
 ---
 id: 022
 title: "What needs me" digest — sessions newly waiting, errored, or finished
-status: pending
+status: in-progress
 blocked-by: [014, 016]
 priority: 22
 goal: cctrl-fleet-staleness
