@@ -1,13 +1,16 @@
 ---
 id: 022
 title: "What needs me" digest — sessions newly waiting, errored, or finished
-status: in-progress
+status: done
 blocked-by: [014, 016]
 priority: 22
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -76,3 +79,23 @@ produces the digest text only) and cross-host aggregation. Strictly read-only.
   the prior snapshot is NOT reported as new on the second run
 - [assert] a test asserts a session that transitioned idle→waiting-input IS
   reported, with `from_state`/`to_state` in `--json`
+
+## Implementation Notes
+
+Added top-level `cctrl needs-me`: computes each live session's rich STATE (via
+`_session_rich_state` through `session ls --json`), diffs against the prior
+snapshot, and reports only sessions that NEWLY transitioned INTO an attention
+state (`waiting-input`, `blocked-dialog`, `idle-done`; rich-state has no distinct
+errored signal, documented in-code). An already-attention session is not
+re-flagged; a missing/corrupt snapshot is an empty baseline (first-run flags all
+current attention sessions with `from_state` `-`). Snapshot at
+`data/needs-me-snapshot.json` (override `CCTRL_NEEDS_ME_SNAPSHOT`), written
+atomically after render. Strictly read-only. `--json` carries
+name/from_state/to_state/last_active.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `3c642b0` — `feat(session): add needs-me digest of newly-attention sessions`

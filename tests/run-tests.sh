@@ -1687,6 +1687,114 @@ JSON
     echo "ok: session ls STATE surfaces rich states with fail-safe fallback to base"
 }
 
+test_needs_me_digest() {
+    # needs-me (plan 022) diffs each session's rich STATE (plan 016) against a
+    # snapshot from the previous run and reports only sessions that NEWLY entered
+    # an attention state. Reuses the plan 016 fixture machinery (fake tmux +
+    # per-pid session files + transcript tails). Snapshot path is test-overridden.
+    local bin="$TMPDIR/needbin" sdir="$TMPDIR/need-sessions" pdir="$TMPDIR/need-projects"
+    local snap="$TMPDIR/need-snapshot.json"
+    mkdir -p "$bin" "$sdir" "$pdir/some-proj"
+    rm -f "$snap"
+
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        case "$target" in
+            TMUX--needwait) echo 9301;;
+            TMUX--trans)    echo 9302;;
+            *) echo 93999;;
+        esac
+        exit 0;;
+    display-message) echo 0; exit 0;;
+    display) echo 0; exit 0;;
+    capture-pane) exit 0;;
+    show-option) echo 1; exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in *9301*|*9302*) echo "claude"; exit 0;; esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+
+    # Both sessions idle at the status level; the rich state is refined by the
+    # transcript tail. needwait always resolves to waiting-input; trans starts
+    # with no transcript (bare idle) and gains an assistant-question before run 2.
+    cat > "$sdir/9301.json" <<'JSON'
+{"pid":9301,"sessionId":"needwait-uuid","status":"idle"}
+JSON
+    cat > "$sdir/9302.json" <<'JSON'
+{"pid":9302,"sessionId":"trans-uuid","status":"idle"}
+JSON
+    {
+        jq -cn '{type:"user",message:{role:"user",content:"run the migration"}}'
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"Do you want me to proceed now?"}]}}'
+    } > "$pdir/some-proj/needwait-uuid.jsonl"
+
+    local sessions="TMUX--needwait TMUX--trans"
+    run_needs_me() {
+        PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+            CCTRL_NEEDS_ME_SNAPSHOT="$snap" TMUX_FAKE_SESSIONS="$sessions" "$ROOT/cctrl" needs-me "$@"
+    }
+
+    # (c) First run, no prior snapshot: reports current attention-state sessions
+    # (needwait) as new, without error. (d) writes the snapshot file.
+    local run1
+    run1="$(run_needs_me)"
+    assert_contains "$run1" "TMUX--needwait"
+    assert_contains "$run1" "waiting-input"
+    [[ -f "$snap" ]] || fail "expected needs-me to write a snapshot file"
+    # trans (bare idle) is not an attention state, so it is not flagged.
+    assert_not_contains "$run1" "TMUX--trans"
+    # Snapshot records the full current state of every session for the next diff.
+    [[ "$(jq -r '."TMUX--needwait"' "$snap")" == "waiting-input" ]] \
+        || fail "snapshot should record needwait=waiting-input; got: $(cat "$snap")"
+    [[ "$(jq -r '."TMUX--trans"' "$snap")" == "idle" ]] \
+        || fail "snapshot should record trans=idle; got: $(cat "$snap")"
+
+    # Now flip trans idle→waiting-input by giving it an assistant-question tail.
+    {
+        jq -cn '{type:"user",message:{role:"user",content:"which option?"}}'
+        jq -cn '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:"Which approach do you prefer?"}]}}'
+    } > "$pdir/some-proj/trans-uuid.jsonl"
+
+    # (a) needwait was already waiting-input in the snapshot → NOT re-flagged.
+    # (b) trans transitioned idle→waiting-input → reported with from/to states.
+    local run2
+    run2="$(run_needs_me --json)"
+    local names
+    names="$(printf '%s' "$run2" | jq -c 'map(.name) | sort')"
+    [[ "$names" == '["TMUX--trans"]' ]] \
+        || fail "expected only the newly-transitioned session; got: $names"
+    [[ "$(printf '%s' "$run2" | jq -r '.[0].from_state')" == "idle" ]] \
+        || fail "expected from_state idle; got: $(printf '%s' "$run2" | jq -r '.[0].from_state')"
+    [[ "$(printf '%s' "$run2" | jq -r '.[0].to_state')" == "waiting-input" ]] \
+        || fail "expected to_state waiting-input; got: $(printf '%s' "$run2" | jq -r '.[0].to_state')"
+    printf '%s' "$run2" | jq -e '.[0] | has("last_active")' >/dev/null \
+        || fail "expected --json entry to carry last_active"
+
+    # (a, continued) A third run with no further changes flags nothing — both
+    # sessions are already waiting-input in the snapshot.
+    local run3
+    run3="$(run_needs_me --json)"
+    [[ "$(printf '%s' "$run3" | jq 'length')" == "0" ]] \
+        || fail "expected no new attention transitions on a stable run; got: $run3"
+
+    echo "ok: needs-me flags only newly-attention sessions, diffs a snapshot, first-run safe"
+}
+
 test_peer_registry_manual_alias_and_identity() {
     local data="$TMPDIR/peer-manual-data"
     local project="$TMPDIR/comet-automation"
@@ -3091,6 +3199,7 @@ test_session_list_sorts_by_last_active
 test_session_list_base_state
 test_session_list_recap
 test_session_list_rich_state
+test_needs_me_digest
 test_fleet_merges_multiple_hosts
 test_fleet_sorts_by_recency_across_hosts
 test_fleet_offline_host_non_fatal

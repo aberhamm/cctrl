@@ -33,6 +33,12 @@ _autoheal_refresh_paths() {
     AUTOHEAL_PLIST_LABEL="com.cctrl.session-autoheal"
 }
 _autoheal_refresh_paths
+_needs_me_refresh_paths() {
+    # State file backing the `needs-me` digest (plan 022). Overridable so tests
+    # point it at a scratch path instead of the real data dir.
+    NEEDS_ME_SNAPSHOT="${CCTRL_NEEDS_ME_SNAPSHOT:-$SCRIPT_DIR/data/needs-me-snapshot.json}"
+}
+_needs_me_refresh_paths
 
 CLAUDE_DIR="$HOME/.claude"
 SETTINGS="$CLAUDE_DIR/settings.json"
@@ -5800,6 +5806,7 @@ cmd_help() {
     echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
     echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
     echo "  cctrl fleet [--json]                   Aggregate sessions across local + all hosts, by recency"
+    echo "  cctrl needs-me [--json]                Digest of sessions that NEWLY need you since last run"
     echo ""
     echo -e "${BOLD}Chrome CDP${RESET}"
     echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
@@ -6475,6 +6482,129 @@ cmd_fleet() {
         else
             [ .host, (.name // "-"), (.state // "-"), (if .attached then "yes" else "no" end), (.last_active // "-"), (.dir // "-") ]
         end | @tsv')
+}
+
+# Attention-state set for the needs-me digest (plan 022): states in which a
+# session is waiting on the human. Rich-state (plan 016) has no distinct
+# "errored" signal, so we map the plan's "errored/finished" intent onto the
+# states that actually exist — blocked-dialog and waiting-input both need an
+# answer; idle-done is the "finished, nothing pending" (finished) signal.
+NEEDS_ME_ATTENTION_STATES="waiting-input blocked-dialog idle-done"
+
+_needs_me_write_snapshot() {
+    # Persist the CURRENT state of every session (name → state) so the next run
+    # can diff any transition, not just attention ones. Atomic replace; the only
+    # thing this command ever writes — it never touches a session.
+    local cur="$1" dir tmp
+    dir="$(dirname "$NEEDS_ME_SNAPSHOT")"
+    mkdir -p "$dir" 2>/dev/null || true
+    tmp="$(mktemp "${NEEDS_ME_SNAPSHOT}.XXXXXX" 2>/dev/null)" || tmp="${NEEDS_ME_SNAPSHOT}.tmp.$$"
+    if printf '%s' "$cur" | jq 'map({(.name): (.state // "-")}) | add // {}' > "$tmp" 2>/dev/null; then
+        mv -f "$tmp" "$NEEDS_ME_SNAPSHOT" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+        rm -f "$tmp" 2>/dev/null
+    fi
+}
+
+cmd_needs_me() {
+    # "What needs me" digest (plan 022): diff each live session's rich STATE
+    # (plan 016) against the snapshot from the previous run and report only the
+    # sessions that NEWLY entered an attention state (waiting-input,
+    # blocked-dialog, idle-done). A session already in that attention state last
+    # run is NOT re-flagged. First run (no snapshot) reports every current
+    # attention-state session as new (its from_state is '-'). Strictly
+    # read-only: it inspects sessions and rewrites only its own snapshot file.
+    _needs_me_refresh_paths
+    local json=false a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            -h|--help|help)
+                echo "Usage: cctrl needs-me [--json]"
+                echo ""
+                echo "  Digest of sessions that NEWLY need you since the last run: ones that"
+                echo "  just went waiting-input, blocked-dialog, or idle-done (finished)."
+                echo "  Diffs current rich STATE against a stored snapshot so already-waiting"
+                echo "  sessions are not re-flagged. First run reports all current attention"
+                echo "  sessions. Read-only: never closes, repairs, or mutates a session."
+                echo ""
+                echo "    --json   Machine-readable {name, from_state, to_state, last_active}"
+                return 0
+                ;;
+        esac
+    done
+
+    # Current sessions with their rich state (reuses session ls). Degrade to an
+    # empty set rather than failing when tmux is unavailable.
+    local current
+    current="$(_session_list --json 2>/dev/null)" || current="[]"
+    [[ -n "$current" ]] || current="[]"
+    if ! printf '%s' "$current" | jq -e 'type=="array"' >/dev/null 2>&1; then
+        current="[]"
+    fi
+
+    # Prior snapshot (name → state). A missing or corrupt file is treated as an
+    # empty baseline, which is exactly the first-run behavior: every current
+    # attention-state session shows up as new (from_state '-').
+    local prior
+    if [[ -f "$NEEDS_ME_SNAPSHOT" ]]; then
+        prior="$(cat "$NEEDS_ME_SNAPSHOT" 2>/dev/null || true)"
+        printf '%s' "$prior" | jq -e 'type=="object"' >/dev/null 2>&1 || prior="{}"
+    else
+        prior="{}"
+    fi
+
+    # Select transitions INTO an attention state: to_state is an attention state
+    # AND it differs from the snapshotted from_state (so a session already in
+    # that state is skipped). Absent from the snapshot → from_state '-'.
+    local changed
+    changed="$(jq -n \
+        --argjson cur "$current" \
+        --argjson prior "$prior" \
+        --arg attention "$NEEDS_ME_ATTENTION_STATES" \
+        '($attention | split(" ")) as $att
+         | $cur
+         | map({ name,
+                 from_state: ($prior[.name] // "-"),
+                 to_state: (.state // "-"),
+                 last_active })
+         | map(.to_state as $t
+                | select(($att | index($t)) != null and (.from_state != $t)))
+         | sort_by(.last_active) | reverse')"
+    [[ -n "$changed" ]] || changed="[]"
+
+    if $json; then
+        printf '%s\n' "$changed" | jq 'map({name, from_state, to_state, last_active})'
+        _needs_me_write_snapshot "$current"
+        return 0
+    fi
+
+    local count
+    count="$(printf '%s' "$changed" | jq 'length')"
+    if [[ "${count:-0}" -eq 0 ]]; then
+        echo -e "${DIM}Nothing needs you.${RESET}"
+    else
+        echo -e "${BOLD}Needs you (${count}):${RESET}"
+        local state rows nm frm la age epoch
+        for state in $NEEDS_ME_ATTENTION_STATES; do
+            rows="$(printf '%s' "$changed" | jq -r --arg s "$state" \
+                '.[] | select(.to_state==$s) | [.name, .from_state, (.last_active // "")] | @tsv')"
+            [[ -n "$rows" ]] || continue
+            echo -e "  ${BOLD}${state}${RESET}"
+            while IFS=$'\t' read -r nm frm la; do
+                [[ -n "$nm" ]] || continue
+                age="-"
+                if [[ -n "$la" ]]; then
+                    epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$la" +%s 2>/dev/null || true)"
+                    [[ -n "$epoch" ]] && age="$(_fmt_age_ms "$(( epoch * 1000 ))")"
+                fi
+                printf '    %-16s %s → %s  %s\n' "$nm" "$frm" "$state" "$age"
+            done <<< "$rows"
+        done
+    fi
+
+    _needs_me_write_snapshot "$current"
+    return 0
 }
 
 cmd_whoami() {
@@ -7301,6 +7431,7 @@ _dispatch() {
         start|s) cmd_start "$@" ;;
         session|sess) cmd_session "$@" ;;
         fleet) cmd_fleet "$@" ;;
+        needs-me|needsme|needs_me) cmd_needs_me "$@" ;;
         close) cmd_session close "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
