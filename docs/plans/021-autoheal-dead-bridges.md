@@ -1,7 +1,7 @@
 ---
 id: 021
 title: Auto-heal dead remote-control bridges on a timer
-status: pending
+status: in-progress
 blocked-by: [016]
 priority: 21
 goal: cctrl-fleet-staleness
