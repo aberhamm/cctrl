@@ -1,13 +1,16 @@
 ---
 id: 020
 title: cctrl fleet — unified cross-host session view
-status: in-progress
+status: done
 blocked-by: [013, 014]
 priority: 20
 goal: cctrl-fleet-staleness
 allows-migrations: false
 needs-review: none
 created: 2026-06-30
+completed: 2026-07-02
+reviewed: false
+qa: automated
 ---
 
 ## Requirements
@@ -78,3 +81,24 @@ doctor stays per-host). `fleet` is read-only aggregation.
   than one distinct `host`
 - [assert] an unreachable-host test asserts the command still exits 0 and marks
   that host offline
+
+## Implementation Notes
+
+Added `cmd_fleet` + `fleet` dispatch + help. `cctrl fleet` queries local
+in-process via `_session_list --json` (label `local`) and each non-local
+data/hosts.json alias via `_fleet_remote_sessions` (captures `cctrl session ls
+--json` over SSH; self-aliases skipped). Rows are host-tagged and defaulted via
+`_fleet_tag` (`last_active // null`, `state // null`) so an older remote cctrl
+never crashes the merge; merged + sorted by last_active desc (nulls last);
+offline hosts appended as non-fatal markers. Fixed a real `set -euo pipefail`
+bug where an unguarded remote command-sub aborted on ssh non-zero (now `|| rc=$?`
+so overall exit stays 0). Test seam: a fake `ssh` on PATH emitting canned
+per-host fixtures. 4 tests: merge/labels, cross-host sort, offline non-fatal,
+version-skew defaulting. `_remote_exec`/`--host` untouched.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `c7e6075` — `feat(fleet): add cctrl fleet unified cross-host session view`

@@ -5575,6 +5575,7 @@ cmd_help() {
     echo "  cctrl host doctor <alias>             Check SSH, tmux, selected agent, cctrl on remote"
     echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
     echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
+    echo "  cctrl fleet [--json]                   Aggregate sessions across local + all hosts, by recency"
     echo ""
     echo -e "${BOLD}Chrome CDP${RESET}"
     echo "  cctrl chrome                    Kill Chrome, relaunch with CDP on :9222"
@@ -6131,6 +6132,125 @@ _remote_exec() {
 
     echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
     exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "source ~/.zprofile 2>/dev/null; $env_prefix cctrl$quoted_args"
+}
+
+# ── Fleet (cross-host aggregation) ───────────────────────────────────
+# Read-only: aggregates `session ls --json` across local + registered hosts.
+# Cross-host prune/repair stays out of scope (prune/doctor remain per-host).
+
+_fleet_remote_sessions() {
+    # Capture `cctrl session ls --json` from a remote host over SSH and echo the
+    # remote JSON array on stdout. Non-zero exit => host is unreachable. This is
+    # a dedicated, non-exec path (distinct from _remote_exec, which replaces the
+    # process) so fleet can collect output; the interactive --host path is
+    # unchanged. The remote invocation itself is what tests stub (fake `ssh`).
+    local host_alias="$1" lookup hostname user ssh_target
+    lookup="$(_host_lookup "$host_alias")"
+    [[ -z "$lookup" ]] && return 1
+    hostname="${lookup%% *}"
+    user="${lookup#* }"
+    if [[ -n "$user" ]]; then
+        ssh_target="${user}@${hostname}"
+    else
+        ssh_target="$hostname"
+    fi
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
+        "source ~/.zprofile 2>/dev/null; cctrl session ls --json" 2>/dev/null
+}
+
+_fleet_tag() {
+    # Tag every session object in a JSON array with its host and default the
+    # recency/state fields. `// null` keeps a remote running an OLDER cctrl
+    # (whose `session ls --json` lacks last_active/state) from crashing the
+    # merge or the sort — those cells simply become null (rendered '-').
+    # Echoes '[]' for anything that isn't a JSON array.
+    local raw="$1" label="$2"
+    printf '%s' "$raw" | jq -c --arg host "$label" \
+        'if type == "array" then map(. + {host: $host, last_active: (.last_active // null), state: (.state // null)}) else [] end' \
+        2>/dev/null || echo '[]'
+}
+
+cmd_fleet() {
+    # Aggregate `session ls` across local + every registered host into one
+    # host-labeled view, sorted by last-active (most recent first). An
+    # unreachable host is reported inline (offline marker) without failing the
+    # whole command (overall exit stays 0).
+    local json=false a
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            -h|--help|help)
+                echo "Usage: cctrl fleet [--json]"
+                echo ""
+                echo "  Aggregate 'cctrl session ls' across local + every host in data/hosts.json,"
+                echo "  label each row with its host, and sort by last-active (most recent first)."
+                echo "  Unreachable hosts are marked 'offline' without failing the command;"
+                echo "  a host on an older cctrl (missing last-active/state) renders those as '-'."
+                return 0
+                ;;
+        esac
+    done
+
+    local -a arrays=() offline=()
+    local host_json rc alias hostname
+
+    # Local host: query in-process (reuses local tmux inspection).
+    host_json="$(_session_list --json 2>/dev/null)" || host_json="[]"
+    [[ -n "$host_json" ]] || host_json="[]"
+    arrays+=("$(_fleet_tag "$host_json" "local")")
+
+    # Registered hosts, skipping any alias that resolves to THIS machine (it is
+    # already represented by the local entry above).
+    if [[ -f "$HOSTS_FILE" ]]; then
+        while IFS=$'\t' read -r alias hostname; do
+            [[ -n "$alias" ]] || continue
+            _host_is_local "$hostname" && continue
+            # `|| rc=$?` keeps `set -e` from aborting when a host is offline;
+            # a non-zero ssh exit is exactly how we detect unreachable.
+            rc=0
+            host_json="$(_fleet_remote_sessions "$alias")" || rc=$?
+            if [[ $rc -eq 0 && -n "$host_json" ]] \
+                && printf '%s' "$host_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
+                arrays+=("$(_fleet_tag "$host_json" "$alias")")
+            else
+                offline+=("$alias")
+            fi
+        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.hostname)"' "$HOSTS_FILE" 2>/dev/null)
+    fi
+
+    # Merge tagged arrays; sort sessions by last_active desc (nulls last), then
+    # append one offline marker object per unreachable host.
+    local sessions_sorted offline_json merged
+    sessions_sorted="$(printf '%s\n' "${arrays[@]}" | jq -s '
+        (add // [])
+        | sort_by(if (.last_active | type) == "string" then .last_active else "" end)
+        | reverse')"
+    offline_json="[]"
+    if [[ ${#offline[@]} -gt 0 ]]; then
+        offline_json="$(printf '%s\n' "${offline[@]}" | jq -R . | jq -s 'map({host: ., offline: true})')"
+    fi
+    merged="$(jq -n --argjson sessions "$sessions_sorted" --argjson offline "$offline_json" '$sessions + $offline')"
+
+    if $json; then
+        printf '%s\n' "$merged"
+        return 0
+    fi
+
+    printf '%-8s %-16s %-14s %-7s %-8s %s\n' HOST NAME STATE ATTACH LAST DIR
+    local h n st at la dir epoch disp_dir
+    while IFS=$'\t' read -r h n st at la dir; do
+        if [[ "$la" != "-" ]]; then
+            epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$la" +%s 2>/dev/null || true)"
+            [[ -n "$epoch" ]] && la="$(_fmt_age_ms "$(( epoch * 1000 ))")"
+        fi
+        disp_dir="${dir/#$HOME/~}"
+        printf '%-8s %-16s %-14s %-7s %-8s %s\n' "$h" "$n" "$st" "$at" "$la" "$disp_dir"
+    done < <(printf '%s' "$merged" | jq -r '.[] |
+        if .offline == true then
+            [ .host, "-", "offline", "-", "-", "-" ]
+        else
+            [ .host, (.name // "-"), (.state // "-"), (if .attached then "yes" else "no" end), (.last_active // "-"), (.dir // "-") ]
+        end | @tsv')
 }
 
 cmd_whoami() {
@@ -6956,6 +7076,7 @@ _dispatch() {
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
         session|sess) cmd_session "$@" ;;
+        fleet) cmd_fleet "$@" ;;
         close) cmd_session close "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;

@@ -2706,6 +2706,157 @@ JSONL
     assert_contains "$out" "codex:"
 }
 
+# ── Fleet aggregation ────────────────────────────────────────────────
+# `cctrl fleet` shells out to each remote host's `cctrl session ls --json`.
+# We stub that per-host invocation by putting a fake `ssh` on PATH that emits a
+# canned fixture keyed by the target hostname (or fails, to model an offline
+# host) — so NO real SSH ever happens. The local host is queried in-process via
+# the fake tmux/ps already used by the session-ls tests.
+make_fleet_ssh() {
+    # Fake ssh: last positional arg is the remote command, the one before it is
+    # the target. Emits $FLEET_FIXTURES/<target>.json when present; a target
+    # containing "offline" exits non-zero (unreachable); otherwise emits [].
+    local path="$1"
+    cat > "$path" <<'SH'
+#!/usr/bin/env bash
+target="${@:(-2):1}"
+case "$target" in
+    *offline*)
+        echo "ssh: connect to host $target port 22: Connection refused" >&2
+        exit 255
+        ;;
+esac
+fixture="${FLEET_FIXTURES:-}/$target.json"
+if [[ -n "${FLEET_FIXTURES:-}" && -f "$fixture" ]]; then
+    cat "$fixture"
+    exit 0
+fi
+echo "[]"
+exit 0
+SH
+    chmod +x "$path"
+}
+
+fleet_rootcopy() {
+    # Copy cctrl into an isolated root so HOSTS_FILE (=<root>/data/hosts.json)
+    # can be controlled per test without touching the repo's data/hosts.json.
+    local root="$1" hosts_json="$2"
+    mkdir -p "$root/data"
+    cp "$ROOT/cctrl" "$root/cctrl"
+    chmod +x "$root/cctrl"
+    printf '%s\n' "$hosts_json" > "$root/data/hosts.json"
+}
+
+test_fleet_merges_multiple_hosts() {
+    local bin="$TMPDIR/fleet-multi-bin"
+    local root="$TMPDIR/fleet-multi-root"
+    local fix="$TMPDIR/fleet-multi-fix"
+    mkdir -p "$bin" "$fix"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    make_fleet_ssh "$bin/ssh"
+    fleet_rootcopy "$root" '{"hA":{"hostname":"a.invalid","user":""},"hB":{"hostname":"b.invalid","user":""}}'
+    printf '[{"name":"recent","dir":"/r","state":"working","attached":false,"last_active":"2026-06-30T00:00:00Z"}]\n' > "$fix/a.invalid.json"
+    printf '[{"name":"old","dir":"/o","state":"idle","attached":false,"last_active":"2025-01-01T00:00:00Z"}]\n' > "$fix/b.invalid.json"
+
+    local out
+    out="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
+        "$root/cctrl" fleet --json)"
+    # Rows from more than one distinct host (local + hA + hB).
+    local distinct
+    distinct="$(printf '%s' "$out" | jq -r '[.[].host] | unique | length')"
+    [[ "$distinct" -ge 2 ]] || fail "fleet --json should merge >1 distinct host (got $distinct)"
+    assert_contains "$out" '"host": "hA"'
+    assert_contains "$out" '"host": "hB"'
+    assert_contains "$out" '"host": "local"'
+    echo "ok: fleet merges + labels multiple hosts"
+}
+
+test_fleet_sorts_by_recency_across_hosts() {
+    local bin="$TMPDIR/fleet-sort-bin"
+    local root="$TMPDIR/fleet-sort-root"
+    local fix="$TMPDIR/fleet-sort-fix"
+    mkdir -p "$bin" "$fix"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    make_fleet_ssh "$bin/ssh"
+    fleet_rootcopy "$root" '{"hA":{"hostname":"a.invalid","user":""},"hB":{"hostname":"b.invalid","user":""}}'
+    printf '[{"name":"newest","dir":"/n","state":"working","attached":false,"last_active":"2026-06-30T00:00:00Z"}]\n' > "$fix/a.invalid.json"
+    printf '[{"name":"older","dir":"/o","state":"idle","attached":false,"last_active":"2025-01-01T00:00:00Z"}]\n' > "$fix/b.invalid.json"
+
+    local out first second
+    out="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
+        "$root/cctrl" fleet --json)"
+    # Sessions with a real last_active sort first, most-recent first.
+    first="$(printf '%s' "$out" | jq -r '[.[] | select(.last_active != null)][0].host')"
+    second="$(printf '%s' "$out" | jq -r '[.[] | select(.last_active != null)][1].host')"
+    [[ "$first" == "hA" ]] || fail "most-recent host should sort first (got $first)"
+    [[ "$second" == "hB" ]] || fail "older host should sort after newer (got $second)"
+    echo "ok: fleet sorts by last-active across hosts"
+}
+
+test_fleet_offline_host_non_fatal() {
+    local bin="$TMPDIR/fleet-offline-bin"
+    local root="$TMPDIR/fleet-offline-root"
+    local fix="$TMPDIR/fleet-offline-fix"
+    mkdir -p "$bin" "$fix"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    make_fleet_ssh "$bin/ssh"
+    fleet_rootcopy "$root" '{"ms":{"hostname":"offline.invalid","user":""}}'
+
+    local out rc=0
+    out="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
+        "$root/cctrl" fleet --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "fleet must exit 0 even when a host is unreachable (rc=$rc)"
+    local offhost
+    offhost="$(printf '%s' "$out" | jq -r '.[] | select(.offline == true) | .host')"
+    [[ "$offhost" == "ms" ]] || fail "unreachable host should be marked offline (got '$offhost')"
+
+    # Human table also shows the offline marker and still exits 0.
+    local human
+    human="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
+        "$root/cctrl" fleet)" || fail "fleet (human) must exit 0 with an offline host"
+    assert_contains "$human" "offline"
+    echo "ok: fleet tolerates an offline host (exit 0, marked offline)"
+}
+
+test_fleet_version_skew_missing_fields() {
+    local bin="$TMPDIR/fleet-skew-bin"
+    local root="$TMPDIR/fleet-skew-root"
+    local fix="$TMPDIR/fleet-skew-fix"
+    mkdir -p "$bin" "$fix"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    make_fleet_ssh "$bin/ssh"
+    fleet_rootcopy "$root" '{"hOld":{"hostname":"old.invalid","user":""}}'
+    # Older cctrl: rows lack last_active AND state entirely.
+    printf '[{"name":"legacy","dir":"/legacy"}]\n' > "$fix/old.invalid.json"
+
+    local out rc=0
+    out="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
+        "$root/cctrl" fleet --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "fleet must not crash on version-skew rows (rc=$rc)"
+    # Missing fields defaulted to null (never absent -> never crash the merge).
+    local la st
+    la="$(printf '%s' "$out" | jq -r '.[] | select(.host == "hOld") | .last_active')"
+    st="$(printf '%s' "$out" | jq -r '.[] | select(.host == "hOld") | .state')"
+    [[ "$la" == "null" ]] || fail "missing last_active should default to null (got '$la')"
+    [[ "$st" == "null" ]] || fail "missing state should default to null (got '$st')"
+
+    # Human table renders those cells as '-'.
+    local human
+    human="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
+        "$root/cctrl" fleet)" || fail "fleet (human) must render skew rows without crashing"
+    assert_contains "$human" "legacy"
+    assert_contains "$human" "hOld"
+    # The legacy row's state/last-active columns are '-'.
+    local legacy_line
+    legacy_line="$(printf '%s\n' "$human" | grep legacy || true)"
+    assert_contains "$legacy_line" "-"
+    echo "ok: fleet tolerates version-skew (missing last_active/state -> '-')"
+}
+
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -2737,6 +2888,10 @@ test_session_list_sorts_by_last_active
 test_session_list_base_state
 test_session_list_recap
 test_session_list_rich_state
+test_fleet_merges_multiple_hosts
+test_fleet_sorts_by_recency_across_hosts
+test_fleet_offline_host_non_fatal
+test_fleet_version_skew_missing_fields
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors
