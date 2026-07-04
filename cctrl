@@ -1258,6 +1258,151 @@ _pick_safe_session_index() {
     return 1
 }
 
+# ── Local resource health (start guardrail + fleet line) ───────────────
+# Best-effort, macOS-first, POSIX-ish. Every accessor prints nothing when the
+# platform tool is missing so callers just skip that dimension. Numbers are
+# integers (percent / MB) except load, which is a bare average.
+
+_res_mem_free_pct() {
+    # Integer "free memory percentage". On macOS this is exactly what the fleet
+    # monitor keys off of: memory_pressure's "System-wide memory free
+    # percentage" (accounts for compression/purgeable, so it reads far higher
+    # than a naive free/total). Falls back to vm_stat math if memory_pressure is
+    # unavailable; Linux uses MemAvailable. Empty if undeterminable.
+    if [[ -n "${CCTRL_FAKE_MEM_FREE_PCT:-}" ]]; then
+        printf '%d' "$CCTRL_FAKE_MEM_FREE_PCT"; return 0
+    fi
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local pct
+        pct="$(memory_pressure 2>/dev/null \
+            | sed -n 's/.*free percentage: \([0-9][0-9]*\)%.*/\1/p' | tail -1)"
+        if [[ "$pct" =~ ^[0-9]+$ ]]; then
+            printf '%d' "$pct"
+            return 0
+        fi
+        local total vm pgsize free inactive spec
+        total="$(sysctl -n hw.memsize 2>/dev/null)" || return 0
+        [[ -n "$total" && "$total" -gt 0 ]] || return 0
+        vm="$(vm_stat 2>/dev/null)" || return 0
+        [[ -n "$vm" ]] || return 0
+        pgsize="$(printf '%s' "$vm" | sed -n 's/.*page size of \([0-9]*\) bytes.*/\1/p')"
+        [[ -n "$pgsize" ]] || pgsize=4096
+        free="$(printf '%s\n' "$vm" | awk '/Pages free/{gsub(/[^0-9]/,"",$3); print $3}')"
+        inactive="$(printf '%s\n' "$vm" | awk '/Pages inactive/{gsub(/[^0-9]/,"",$3); print $3}')"
+        spec="$(printf '%s\n' "$vm" | awk '/Pages speculative/{gsub(/[^0-9]/,"",$3); print $3}')"
+        [[ -n "$free" ]] || return 0
+        printf '%d' $(( ( ${free:-0} + ${inactive:-0} + ${spec:-0} ) * pgsize * 100 / total ))
+        return 0
+    fi
+    if [[ -r /proc/meminfo ]]; then
+        local total avail
+        total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo)"
+        avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)"
+        [[ -n "$total" && -n "$avail" && "$total" -gt 0 ]] || return 0
+        printf '%d' $(( avail * 100 / total ))
+    fi
+}
+
+_res_swap_used_mb() {
+    # Integer MB of swap currently in use. Empty if undeterminable.
+    if [[ -n "${CCTRL_FAKE_SWAP_MB:-}" ]]; then
+        printf '%d' "$CCTRL_FAKE_SWAP_MB"; return 0
+    fi
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # vm.swapusage: "total = 2048.00M  used = 512.00M  free = 1536.00M"
+        sysctl -n vm.swapusage 2>/dev/null \
+            | sed -n 's/.*used = \([0-9]*\)\..*M.*/\1/p'
+        return 0
+    fi
+    if [[ -r /proc/meminfo ]]; then
+        local st sf
+        st="$(awk '/^SwapTotal:/{print $2}' /proc/meminfo)"
+        sf="$(awk '/^SwapFree:/{print $2}' /proc/meminfo)"
+        [[ -n "$st" && -n "$sf" ]] || return 0
+        printf '%d' $(( (st - sf) / 1024 ))
+    fi
+}
+
+_res_load1() {
+    # 1-minute load average as a bare number. Empty if undeterminable.
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        # vm.loadavg: "{ 1.23 1.45 1.67 }"
+        sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'
+        return 0
+    fi
+    [[ -r /proc/loadavg ]] && awk '{print $1}' /proc/loadavg
+}
+
+_active_session_count() {
+    # Count of live cctrl-managed tmux sessions on THIS machine.
+    local n
+    n="$(_session_list --json 2>/dev/null | jq 'length' 2>/dev/null)"
+    [[ "$n" =~ ^[0-9]+$ ]] && printf '%d' "$n" || printf '0'
+}
+
+_res_health_line() {
+    # One-line at-a-glance summary for `cctrl fleet` / guardrail context.
+    local mf sw ld sc
+    mf="$(_res_mem_free_pct)"; sw="$(_res_swap_used_mb)"
+    ld="$(_res_load1)"; sc="$(_active_session_count)"
+    printf 'mem %s%% free · swap %sMB used · load %s · %s sessions' \
+        "${mf:-?}" "${sw:-?}" "${ld:-?}" "${sc:-?}"
+}
+
+_launch_resource_guardrail() {
+    # Before adding another heavy session, warn (and require confirmation or
+    # --force) ONLY when the box is genuinely low on memory. We deliberately do
+    # NOT gate on session count: idle/parked keeps (e.g. ~8 dormant obsidian
+    # sessions) cost almost nothing, so a raw count wrongly blocks launches
+    # while memory is fine. The memory metric is the same one the fleet monitor
+    # reads (macOS memory_pressure "free percentage"). Session count is shown as
+    # context only. Thresholds overridable for testing. Bypass with --force or
+    # CCTRL_FORCE=1.
+    local force="$1"
+    [[ "$force" == "true" || "${CCTRL_FORCE:-}" == "1" ]] && return 0
+
+    local mem_min="${CCTRL_MEM_FREE_MIN_PCT:-15}"     # hard floor: refuse below this
+    local mem_soft="${CCTRL_MEM_FREE_SOFT_PCT:-20}"   # low-ish band ...
+    local swap_hi="${CCTRL_SWAP_USED_HI_MB:-8192}"    # ... + heavy swap = pressure
+    local mem_free sess_count swap_used
+    mem_free="$(_res_mem_free_pct)"
+    sess_count="$(_active_session_count)"
+    swap_used="$(_res_swap_used_mb)"
+
+    # Undeterminable memory reading: don't block (best-effort, never a hard stop
+    # on a platform we can't measure).
+    [[ "$mem_free" =~ ^[0-9]+$ ]] || return 0
+
+    local -a reasons=()
+    if [[ "$mem_free" -lt "$mem_min" ]]; then
+        reasons+=("free memory ${mem_free}% is below ${mem_min}%")
+    elif [[ "$mem_free" -lt "$mem_soft" && "$swap_used" =~ ^[0-9]+$ && "$swap_used" -ge "$swap_hi" ]]; then
+        reasons+=("free memory ${mem_free}% low and swap filling (${swap_used}MB used)")
+    fi
+    [[ ${#reasons[@]} -eq 0 ]] && return 0
+
+    echo -e "${YELLOW}⚠  Resource guardrail:${RESET} another session may thrash this machine." >&2
+    local r
+    for r in "${reasons[@]}"; do
+        echo -e "${YELLOW}   • ${r}${RESET}" >&2
+    done
+    echo -e "${DIM}   $(_res_health_line)${RESET}" >&2
+
+    # No TTY (autonomous driver): refuse without --force rather than silently
+    # piling on. Interactive: let the human decide.
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        echo -e "${RED}Refusing to launch under pressure without --force (no TTY to confirm).${RESET}" >&2
+        return 1
+    fi
+    local answer
+    printf '%s' "Launch anyway? [y/N] " >&2
+    IFS= read -r answer || return 1
+    case "$(printf '%s' "${answer:-n}" | tr '[:upper:]' '[:lower:]')" in
+        y|yes) return 0 ;;
+        *) echo -e "${DIM}Aborted.${RESET}" >&2; return 1 ;;
+    esac
+}
+
 _launch_detached() {
     # Launch a cctrl session in a detached tmux session (survives SSH
     # disconnect). Invoked by `cctrl start -d`. No GUI — just tmux.
@@ -1270,11 +1415,17 @@ _launch_detached() {
     local purpose="" purpose_set=false initial_prompt="" peer_identity="" peer_name=""
     local profile="" detach_agent="" agent_explicit=false
     local shortcut_canonical=""
+    local force=false
     local passthrough_count=0
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -d|--detach)
+                shift ;;
+            --force|-f)
+                # Skip the resource guardrail (low free memory / high session
+                # count). Consumed here so it never reaches the agent CLI.
+                force=true
                 shift ;;
             --)
                 shift
@@ -1323,7 +1474,29 @@ _launch_detached() {
                 passthrough_count=$((passthrough_count + 2))
                 shift 2
                 ;;
-            --model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n)
+            --name|-n)
+                # A friendly session name/label is metadata only — it must NOT
+                # reach claude as --name. The launch forces the tmux session id
+                # (TMUX--...) as claude's --name (leading with the purpose when
+                # one exists), so a friendly -n becomes the human description
+                # shown in `cctrl session ls`, unless --purpose already set one
+                # (explicit --purpose always wins, regardless of arg order).
+                #
+                # Exception: a value that already looks like a tmux session id
+                # (TMUX--...) is a realign/relaunch artifact (see _session_realign),
+                # not a human label — the tmux name is re-derived from the target
+                # and the display name is forced downstream, so ignore it here
+                # rather than poisoning the purpose with an id.
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}$1 needs a value${RESET}" >&2
+                    return 1
+                fi
+                if [[ "$2" != TMUX--* && "$purpose_set" != true ]]; then
+                    purpose="$2"; purpose_set=true
+                fi
+                shift 2
+                ;;
+            --model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env)
                 if [[ $# -lt 2 ]]; then
                     echo -e "${RED}$1 needs a value${RESET}" >&2
                     return 1
@@ -1393,6 +1566,13 @@ _launch_detached() {
         echo -e "${DIM}to \$HOME would drop a full-access agent into ~/.ssh, ~/.aws, etc.${RESET}" >&2
         return 1
     fi
+
+    # Bail out before doing any work if the machine is genuinely low on memory
+    # (2026-07-04 incident: too many heavy sessions exhausted RAM, filled swap
+    # and wedged the fleet). Gates on free memory only, not session count.
+    # --force / CCTRL_FORCE=1 overrides.
+    _launch_resource_guardrail "$force" || return 1
+
     if [[ "$target_kind" == "shortcut" ]]; then
         shortcut_canonical="$(_shortcut_lookup_key "$target")"
         if [[ -z "$shortcut_canonical" ]]; then
@@ -5731,10 +5911,12 @@ cmd_help() {
     echo "    --foreground, --no-tmux   Launch directly without tmux"
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
-    echo "    -n, --name NAME           Set the session display name"
+    echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
+    echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
+    echo "    -f, --force               Skip the low-memory launch guardrail"
     echo "    --yolo                    Full bypass alias (Codex) / bypassPermissions (Claude)"
     echo "    --no-bridge               Disable the phone-control bridge (on by default)"
     echo "    --remote ADDR             Codex: connect TUI to app-server (e.g. unix://)"
@@ -6467,6 +6649,9 @@ cmd_fleet() {
         return 0
     fi
 
+    # At-a-glance local health so the operator can spot memory/load pressure
+    # before spawning more sessions (companion to the start guardrail).
+    echo -e "${DIM}local: $(_res_health_line)${RESET}"
     printf '%-8s %-16s %-14s %-7s %-8s %s\n' HOST NAME STATE ATTACH LAST DIR
     local h n st at la dir epoch disp_dir
     while IFS=$'\t' read -r h n st at la dir; do
@@ -7450,4 +7635,6 @@ _dispatch() {
     esac
 }
 
-main "$@"
+# CCTRL_NO_MAIN lets tests source this file to exercise individual functions
+# without running the CLI. Normal invocation is unaffected.
+[[ -n "${CCTRL_NO_MAIN:-}" ]] || main "$@"
