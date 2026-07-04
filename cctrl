@@ -447,6 +447,30 @@ _launch_exec_agent() {
         unset CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
     fi
 
+    # Inside a tmux-managed session the pane/terminal title MUST carry the tmux
+    # session id (TMUX--...) so the fleet can map a Claude Code title back to its
+    # session. Claude renders its title as "<summary> (<--name>)" (collapsing to
+    # just "<--name>" before any summary exists), and --name is the only slot we
+    # control — the summary is Claude's own and cannot be seeded.
+    #
+    # So force --name to the tmux session id, and when a purpose exists lead with
+    # it: --name = "<purpose> (<tmux id>)". That renders as the desired
+    # "<purpose> (TMUX--...)" in the common no-summary state; if Claude later
+    # auto-summarizes it nests, but the tmux id stays present/greppable.
+    #
+    # launch_name stays the BARE id: it drives the remote-control prefix and the
+    # doctor's name-alignment, which must equal the tmux session name exactly.
+    # launch_display_name is what actually reaches claude's --name flag.
+    local launch_display_name="$launch_name"
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
+        launch_name="$CCTRL_SESSION_NAME"
+        if [[ -n "${CCTRL_SESSION_PURPOSE:-}" ]]; then
+            launch_display_name="${CCTRL_SESSION_PURPOSE} (${CCTRL_SESSION_NAME})"
+        else
+            launch_display_name="$CCTRL_SESSION_NAME"
+        fi
+    fi
+
     LAUNCH_FLAGS=()
     LAUNCH_PROFILE_ARGS=()
     _launch_apply_profile_args "$agent" "$pf" || return 1
@@ -464,7 +488,7 @@ _launch_exec_agent() {
         else
             LAUNCH_FLAGS=("--permission-mode" "${LAUNCH_PERMISSION_MODE:-bypassPermissions}")
         fi
-        [[ -n "$launch_name" ]] && LAUNCH_FLAGS+=("--name" "$launch_name")
+        [[ -n "$launch_display_name" ]] && LAUNCH_FLAGS+=("--name" "$launch_display_name")
         if [[ "$no_bridge" != "true" ]]; then
             # Bridge name reconciliation: when an explicit session name is set
             # (detached/tmux-managed launches always pass --name), derive the

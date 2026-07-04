@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 2026-07-04
+
+Session-title enforcement and a launch-time memory guardrail, both from a
+fleet-management incident where friendly names hid the tmux session id and
+too many heavy sessions exhausted RAM.
+
+### Added
+- `cctrl start` now enforces the tmux session id in every Claude Code pane
+  title. The `--name` that reaches the agent is always the resolved tmux
+  session id (`TMUX--…`); when a `--purpose`/`-n` description exists the title
+  leads with it, e.g. `Plan: reference mstack plans by name (TMUX--ms--mstack)`,
+  falling back to the bare id otherwise. The remote-control prefix and
+  `session doctor` name-alignment continue to use the bare id.
+- A friendly `-n`/`--name` on `cctrl start -d` is now recorded as the session
+  **purpose** (shown in `session ls`) instead of leaking as the agent's
+  `--name` — it no longer diverges from the tmux session id.
+- `cctrl start` checks free memory before launching and refuses (with a clear
+  warning, current numbers, and a `-f`/`--force` or `CCTRL_FORCE=1` override)
+  when the machine is genuinely low on RAM. It uses the same metric as the
+  fleet monitor (macOS `memory_pressure` free percentage); it gates on memory
+  only, not session count, and factors swap when free RAM is already low.
+- `cctrl fleet` prints a `local: mem …% free · swap …MB used · load … · N
+  sessions` line for at-a-glance local health.
+
 ## [Unreleased] - 2026-07-02
 
 Fleet management: accurate session recency, real per-session state, and
