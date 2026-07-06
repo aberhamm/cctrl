@@ -25,9 +25,10 @@ coordinated — open/close/inspect sessions, relay decisions between the human a
 agents, sequence commits/pushes on shared worktrees, and independently verify
 agents' claims before reporting them done.
 
-This skill is **generic doctrine only** — no hostnames, URLs, IPs, tokens, ports,
-or repo names. Load your environment's private brief (probe endpoints, service
-inventory, SSH map, session naming) separately before acting.
+This skill is a **reference role**, not a turnkey command — **generic doctrine
+only**, no hostnames, URLs, IPs, tokens, ports, or repo names. Pair it with your own
+private environment brief (probe endpoints, service inventory, SSH map, session
+naming) and load that separately before acting.
 
 ## Core rule: you MANAGE, you do not do hands-on work
 
@@ -77,7 +78,7 @@ Auto-pilot buys speed on *reversible, inward* actions. It never buys a one-way d
 independently verified, surface it and leave it OPEN:
 > `[session] done — [one-line summary]. Review (attach) or close?`
 It stays open until the human says close. **Exemption:** ephemeral throwaways with
-no work product (Gatekeeper/liveness probes, read-only scout/validator sub-agents)
+no work product (liveness/health probes, read-only scout/validator sub-agents)
 are NOT gated — close them freely.
 
 **Monitoring is always on:** manual mode does not pause resource/health/prod
@@ -122,15 +123,16 @@ session hangs at startup).
 - Hand off heavy sessions at ~200k context — big contexts are the memory hogs.
 - Don't burst-spawn into a loaded machine; add incrementally, re-check between.
 
-## Startup-hang lesson (Gatekeeper)
+## Startup-hang lesson
 
 If **every** new session hangs at startup — alive but ~0% CPU/memory, UI never
-renders, even `--version` never returns — right after an auto-update: it's likely
-an OS quarantine modal ("downloaded from the internet…") on the **physical screen**,
-invisible to the CLI. The tell is **0% memory** (blocks pre-runtime). Fix is
-GUI-only — ask the human to check the screen / strip the quarantine attribute. Don't
-rabbit-hole on browser/memory/Docker. Corollary: avoid unattended auto-upgrades of
-the agent binary (that's what re-applies quarantine).
+renders, even `--version` never returns — especially right after an auto-update:
+suspect an **OS-level gate blocking the binary** (a security/permission or
+quarantine dialog the process is stuck behind), not your own config. The tell is
+**~0% memory** — the process is blocked pre-runtime, so it never allocates. It's
+usually a host-level fix the CLI can't see or perform itself; surface it to the
+human rather than rabbit-holing on browser/memory/Docker. Corollary: avoid
+unattended auto-upgrades of the agent binary, which can re-trigger such a gate.
 
 ## Session handoff at ~200k
 
@@ -141,7 +143,10 @@ message; cross-machine, hand the human the block to paste). Don't hand off mid-t
 Verify the spawn auto-submits rather than just pre-filling.
 
 ## See also
-- `cctrl-fleet-watcher` skill — the hourly stack-health sentinel you supervise.
+- You may pair this with a **stack-watcher** role — a periodic health sentinel that
+  investigates failures and dispatches cctrl fixer agents but never self-fixes prod.
+  That role is environment-specific, so keep it in your own private infra repo, not
+  here.
 - This skill is version-controlled in the **cctrl** repo at
   `skills/cctrl-fleet-manager/SKILL.md` (symlinked into skillshare); `docs/cctrl-fleet-manager.md`
   is a short pointer to it. Concrete environment config (endpoints, service

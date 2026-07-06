@@ -1,18 +1,17 @@
 
 ## Fleet roles
 
-Two reusable orchestration roles ship as generic skills (single source of truth;
-see also [AGENTS.md](./AGENTS.md)):
+cctrl ships one reusable orchestration role as a generic skill (single source of
+truth; see also [AGENTS.md](./AGENTS.md)):
 - **[skills/cctrl-fleet-manager/SKILL.md](./skills/cctrl-fleet-manager/SKILL.md)** — orchestrate
   a fleet of concurrent cctrl sessions (monitor → decide → sequence; delegate all
   hands-on work; two-mode autonomy model; session-close gate).
-- **[skills/cctrl-fleet-watcher/SKILL.md](./skills/cctrl-fleet-watcher/SKILL.md)** — hourly
-  stack-health sentinel that dispatches fixers but never self-fixes prod.
 
-`docs/cctrl-fleet-{manager,watcher}.md` are thin pointers; `skills/README.md` covers the
-symlink setup. The skills carry **no environment specifics** (cctrl is public);
+`docs/cctrl-fleet-manager.md` is a thin pointer; `skills/README.md` covers the
+symlink setup. The skill carries **no environment specifics** (cctrl is public);
 concrete probe endpoints, service inventory, and SSH map live only in the operator's
-private infra repo.
+private infra repo. A companion stack-watcher (sentinel) role is environment-specific
+and kept private, not here.
 
 ## Skill routing
 
