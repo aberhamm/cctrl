@@ -6,8 +6,8 @@ reference are the same file, so there is nothing to keep in sync.
 
 | Skill | Role |
 |---|---|
-| [`fleet-manager`](./fleet-manager/SKILL.md) | Orchestrate a fleet of concurrent cctrl sessions: monitor → decide → sequence, delegate all hands-on work, a two-mode autonomy model (auto-pilot / manual) with an always-confirm set and session-close gate. |
-| [`fleet-watcher`](./fleet-watcher/SKILL.md) | An hourly stack-health sentinel that investigates and dispatches fixer agents but never self-fixes prod. |
+| [`cctrl-fleet-manager`](./cctrl-fleet-manager/SKILL.md) | Orchestrate a fleet of concurrent cctrl sessions: monitor → decide → sequence, delegate all hands-on work, a two-mode autonomy model (auto-pilot / manual) with an always-confirm set and session-close gate. |
+| [`cctrl-fleet-watcher`](./cctrl-fleet-watcher/SKILL.md) | An hourly stack-health sentinel that investigates and dispatches fixer agents but never self-fixes prod. |
 
 ## How these load as skills
 
@@ -15,15 +15,15 @@ These directories are the source. To make them live as agent skills, symlink eac
 into your skill host — e.g. skillshare:
 
 ```sh
-ln -s ~/dev/cctrl/skills/fleet-manager ~/.config/skillshare/skills/fleet-manager
-ln -s ~/dev/cctrl/skills/fleet-watcher ~/.config/skillshare/skills/fleet-watcher
+ln -s ~/dev/cctrl/skills/cctrl-fleet-manager ~/.config/skillshare/skills/cctrl-fleet-manager
+ln -s ~/dev/cctrl/skills/cctrl-fleet-watcher ~/.config/skillshare/skills/cctrl-fleet-watcher
 ```
 
 (This mirrors how mstack skills are symlinked from `~/dev/mstack/skills/`.) The
 symlink is a filesystem artifact; the version-controlled copy lives here. Edit the
 doctrine here and every symlinked host picks it up instantly.
 
-`docs/fleet-manager.md` and `docs/fleet-watcher.md` are thin pointers back to these
+`docs/cctrl-fleet-manager.md` and `docs/cctrl-fleet-watcher.md` are thin pointers back to these
 files, so the `docs/` reference path still resolves.
 
 ## The public/private boundary

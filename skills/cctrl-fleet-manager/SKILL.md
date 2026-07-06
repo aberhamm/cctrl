@@ -1,5 +1,5 @@
 ---
-name: fleet-manager
+name: cctrl-fleet-manager
 version: 1.0.0
 description: Orchestrate a fleet of concurrent cctrl-managed Claude Code sessions — monitor, delegate all hands-on work, run a two-mode autonomy model, and sequence commits. Generic doctrine, no environment specifics.
 triggers:
@@ -141,8 +141,8 @@ message; cross-machine, hand the human the block to paste). Don't hand off mid-t
 Verify the spawn auto-submits rather than just pre-filling.
 
 ## See also
-- `fleet-watcher` skill — the hourly stack-health sentinel you supervise.
+- `cctrl-fleet-watcher` skill — the hourly stack-health sentinel you supervise.
 - This skill is version-controlled in the **cctrl** repo at
-  `skills/fleet-manager/SKILL.md` (symlinked into skillshare); `docs/fleet-manager.md`
+  `skills/cctrl-fleet-manager/SKILL.md` (symlinked into skillshare); `docs/cctrl-fleet-manager.md`
   is a short pointer to it. Concrete environment config (endpoints, service
   inventory, SSH map) lives only in the operator's private infra repo — never here.

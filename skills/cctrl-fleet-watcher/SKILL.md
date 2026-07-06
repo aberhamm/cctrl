@@ -1,5 +1,5 @@
 ---
-name: fleet-watcher
+name: cctrl-fleet-watcher
 version: 1.0.0
 description: Run a periodic stack-health watch that investigates failures and dispatches fixer agents but never self-fixes prod. Generic sentinel doctrine, no environment specifics.
 triggers:
@@ -116,9 +116,9 @@ One compact block every tick, even all-green: probes (health / security regressi
 (fixers spawned/closed), escalations, next wake-up.
 
 ## See also
-- `fleet-manager` skill — the orchestrator that supervises you.
+- `cctrl-fleet-manager` skill — the orchestrator that supervises you.
 - This skill is version-controlled in the **cctrl** repo at
-  `skills/fleet-watcher/SKILL.md` (symlinked into skillshare); `docs/fleet-watcher.md`
+  `skills/cctrl-fleet-watcher/SKILL.md` (symlinked into skillshare); `docs/cctrl-fleet-watcher.md`
   is a short pointer to it. Concrete environment config (probe endpoints, service
   inventory, SSH map, channels) lives only in the operator's private infra repo —
   never here.
