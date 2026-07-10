@@ -7,6 +7,7 @@ reference are the same file, so there is nothing to keep in sync.
 | Skill | Role |
 |---|---|
 | [`cctrl-fleet-manager`](./cctrl-fleet-manager/SKILL.md) | Orchestrate a fleet of concurrent cctrl sessions: monitor → decide → sequence, delegate all hands-on work, a two-mode autonomy model (auto-pilot / manual) with an always-confirm set and session-close gate. |
+| [`cctrl-session-end`](./cctrl-session-end/SKILL.md) | Gracefully wind down a session from the inside: check for uncommitted work, save context/handoff, report completion, then self-close. Counterpart to `cctrl-spawn`. |
 
 ## How these load as skills
 
@@ -15,6 +16,7 @@ into your skill host — e.g. skillshare:
 
 ```sh
 ln -s ~/dev/cctrl/skills/cctrl-fleet-manager ~/.config/skillshare/skills/cctrl-fleet-manager
+ln -s ~/dev/cctrl/skills/cctrl-session-end   ~/.config/skillshare/skills/cctrl-session-end
 ```
 
 (This mirrors how mstack skills are symlinked from `~/dev/mstack/skills/`.) The

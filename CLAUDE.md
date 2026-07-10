@@ -1,17 +1,7 @@
 
 ## Fleet roles
 
-cctrl ships one reusable orchestration role as a generic skill (single source of
-truth; see also [AGENTS.md](./AGENTS.md)):
-- **[skills/cctrl-fleet-manager/SKILL.md](./skills/cctrl-fleet-manager/SKILL.md)** — orchestrate
-  a fleet of concurrent cctrl sessions (monitor → decide → sequence; delegate all
-  hands-on work; two-mode autonomy model; session-close gate).
-
-`docs/cctrl-fleet-manager.md` is a thin pointer; `skills/README.md` covers the
-symlink setup. The skill carries **no environment specifics** (cctrl is public);
-concrete probe endpoints, service inventory, and SSH map live only in the operator's
-private infra repo. A companion stack-watcher (sentinel) role is environment-specific
-and kept private, not here.
+See [AGENTS.md](./AGENTS.md) for the fleet role skills shipped with cctrl.
 
 ## Skill routing
 

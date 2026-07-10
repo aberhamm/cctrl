@@ -5,18 +5,22 @@ state, profiles, costs, peer messaging). See [README.md](./README.md).
 
 ## Fleet roles
 
-cctrl ships one reusable orchestration role as a generic, environment-agnostic
-**skill** (single source of truth — the invocable skill *is* the doctrine):
+cctrl ships reusable, environment-agnostic **skills** (single source of truth —
+the invocable skill *is* the doctrine):
 
 - **[skills/cctrl-fleet-manager/SKILL.md](./skills/cctrl-fleet-manager/SKILL.md)** — orchestrate
   a fleet of concurrent cctrl sessions: monitor → decide → sequence, delegate all
   hands-on work (incl. validation), the two-mode autonomy model (auto-pilot /
   manual) with its always-confirm set and session-close gate, tmux driving gotchas,
   resource gating, and the handoff/startup-hang lessons.
+- **[skills/cctrl-session-end/SKILL.md](./skills/cctrl-session-end/SKILL.md)** — gracefully
+  wind down a session from the inside: pre-close checklist (uncommitted work, unsent
+  drafts, context save), completion reporting, self-close via `cctrl close`.
+  Counterpart to `cctrl-spawn`.
 
-`docs/cctrl-fleet-manager.md` is a thin pointer to it; `skills/README.md` explains
-the symlink-into-skillshare setup. The skill contains **no environment specifics**
-(no hostnames, URLs, IPs, tokens, ports, or repo names) — cctrl is public. The
+`docs/` has thin pointers to each; `skills/README.md` explains the
+symlink-into-skillshare setup. Skills contain **no environment specifics** (no
+hostnames, URLs, IPs, tokens, ports, or repo names) — cctrl is public. The
 concrete per-environment config (probe endpoints, service inventory, SSH map) and
 the standing role brief live only in the operator's private infra repo.
 
