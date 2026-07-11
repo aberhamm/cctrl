@@ -3106,7 +3106,13 @@ _peer_pane_ready_for_delivery() {
     capture="$TMUX_RUN_OUTPUT"
     case "$agent" in
         claude)
-            if printf '%s\n' "$capture" | grep -E 'Do you want|Do you trust|. 1\.' >/dev/null 2>&1; then
+            # Anchor on the modal's highlighted selection line "❯ 1." — present in
+            # every Claude proceed/trust/permission modal, but never in a plain
+            # markdown numbered list ("  1. ...") nor the empty "❯ " input prompt.
+            # The old heuristic used ". 1\." (any-char, matched any numbered list)
+            # plus bare "Do you want"/"Do you trust" prose, which false-flagged
+            # normal output and silently deferred peer messages.
+            if printf '%s\n' "$capture" | grep -E '❯ 1\.' >/dev/null 2>&1; then
                 PEER_DELIVER_READY_REASON="modal prompt visible"
                 return 1
             fi

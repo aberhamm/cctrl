@@ -2362,6 +2362,55 @@ test_peer_deliver_busy_no_submit_and_inline() {
     assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
 }
 
+test_peer_deliver_claude_modal_detection() {
+    # Regression: the claude) modal-detector must anchor on the real modal's
+    # highlighted selection line ("❯ 1."), not on any markdown numbered list or
+    # benign "Do you want ... proceed" prose. The old heuristic ('. 1\.' plus
+    # bare 'Do you want'/'Do you trust') false-flagged normal Claude output and
+    # silently DEFERRED peer messages forever.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/deliver-claude-modal-data"
+    local log="$TMPDIR/deliver-claude-modal-tmux.log"
+    : > "$log"
+    # setup_delivery_peers registers the "orchestrator" sender; add a claude
+    # target peer with its own tmux session so the claude) branch is exercised.
+    setup_delivery_peers "$data"
+    mkdir -p "$TMPDIR/claudepeer"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register cq --dir "$TMPDIR/claudepeer" --agent claude --session TMUX--cq >/dev/null
+
+    local out modal_pane benign_pane
+    modal_pane="$(printf '%s\n' \
+        '● Ready to remove the old build artifacts.' \
+        '' \
+        '╭──────────────────────────────────────────────────╮' \
+        '│ Do you want to proceed?                          │' \
+        '│ ❯ 1. Yes                                         │' \
+        '│   2. No, and tell Claude what to do differently  │' \
+        '╰──────────────────────────────────────────────────╯')"
+    benign_pane="$(printf '%s\n' \
+        '● Here is the fleet plan:' \
+        '  1. First item' \
+        '  2. Second item' \
+        '' \
+        'Earlier you asked: Do you want to proceed with the old approach?')"
+
+    # (a) A real Claude modal ("❯ 1. Yes") must still DEFER.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --json -- "hold for modal" >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$modal_pane" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver cq --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected real Claude modal (❯ 1.) to defer"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    # (b) A markdown numbered list plus benign "Do you want ... proceed" prose,
+    # with no "❯ 1." selection line, must NOT defer — it should nudge normally.
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:05Z" "$ROOT/cctrl" peer deliver cq --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected markdown list + prose (no ❯ 1.) to nudge, not defer"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-cq-"
+    assert_contains "$(cat "$log")" "send-keys -t TMUX--cq Enter"
+
+    echo "ok: claude modal-detector anchors on ❯ 1. (no false-positive deferral)"
+}
+
 test_peer_deliver_failures_all_and_concurrency() {
     make_fake_tmux "$TMPDIR/tmux"
     local data="$TMPDIR/deliver-failure-data"
@@ -3218,6 +3267,7 @@ test_peer_polling_identity_and_errors
 test_peer_mcp_bridge_stdio
 test_peer_deliver_tmux_nudge_lifecycle
 test_peer_deliver_busy_no_submit_and_inline
+test_peer_deliver_claude_modal_detection
 test_peer_deliver_failures_all_and_concurrency
 test_peer_orchestrator_status_nudge_watch
 test_peer_gc_retention_and_doctor
