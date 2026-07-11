@@ -28,6 +28,16 @@ too many heavy sessions exhausted RAM.
 - `cctrl fleet` prints a `local: mem …% free · swap …MB used · load … · N
   sessions` line for at-a-glance local health.
 
+### Fixed
+- `cctrl peer deliver` no longer silently defers messages to Claude sessions
+  that are emitting normal output. The claude modal-detector grepped the pane
+  for `. 1\.` — whose `.` is a regex any-char, not the intended `❯` arrow — so
+  it matched any markdown numbered list (which fleet-manager sessions emit
+  constantly), plus bare `Do you want`/`Do you trust` prose. It now anchors on
+  the modal's highlighted selection line `❯ 1.`, precise for all three Claude
+  proceed/trust/permission modals. (The codex branch has the same class of
+  looseness and is left for a follow-up.)
+
 ## [Unreleased] - 2026-07-02
 
 Fleet management: accurate session recency, real per-session state, and
