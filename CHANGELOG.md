@@ -35,8 +35,14 @@ too many heavy sessions exhausted RAM.
   it matched any markdown numbered list (which fleet-manager sessions emit
   constantly), plus bare `Do you want`/`Do you trust` prose. It now anchors on
   the modal's highlighted selection line `❯ 1.`, precise for all three Claude
-  proceed/trust/permission modals. (The codex branch has the same class of
-  looseness and is left for a follow-up.)
+  proceed/trust/permission modals.
+- The same guard's codex branch is fixed too. Its markers
+  (`Allow command`/`Approve`/`y/N`) were doubly wrong: `Allow command` never
+  matched a real Codex modal (the header is ``Allow Codex to run `…` ``), while
+  bare `Approve`/`y/N` false-flagged normal prose and shell `[y/N]` prompts.
+  Verified against the Codex CLI TUI, it now anchors on real modal text:
+  `Allow Codex to …`, the network-access prompt, and the `tell Codex what to do
+  differently` option line (Codex modals have no `❯` cursor to key off).
 
 ## [Unreleased] - 2026-07-02
 

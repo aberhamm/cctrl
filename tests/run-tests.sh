@@ -2339,9 +2339,22 @@ test_peer_deliver_busy_no_submit_and_inline() {
     : > "$log"
     setup_delivery_peers "$data"
 
-    local out id inline_id messages
+    local out id inline_id messages codex_modal
+    # A real Codex exec-approval modal (Codex CLI TUI): the "Allow Codex to run"
+    # header plus the "tell Codex what to do differently" option line. No "❯"
+    # cursor — Codex renders the selection in reverse-video.
+    codex_modal="$(printf '%s\n' \
+        '● Running the test suite next.' \
+        '' \
+        '╭──────────────────────────────────────────────────╮' \
+        '│ Allow Codex to run `npm test`?                   │' \
+        '│                                                  │' \
+        '│ > Yes, proceed                                   │' \
+        "│   Yes, and don't ask again for this command      │" \
+        '│   No, and tell Codex what to do differently      │' \
+        '╰──────────────────────────────────────────────────╯')"
     id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "queued for nudge" | jq -r '.id')"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="Allow command? y/N" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json)"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$codex_modal" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected busy pane deferral"
     assert_not_contains "$(cat "$log")" "paste-buffer"
     messages="$(jq -s '.' "$data/messages.jsonl")"
@@ -2409,6 +2422,57 @@ test_peer_deliver_claude_modal_detection() {
     assert_contains "$(cat "$log")" "send-keys -t TMUX--cq Enter"
 
     echo "ok: claude modal-detector anchors on ❯ 1. (no false-positive deferral)"
+}
+
+test_peer_deliver_codex_modal_detection() {
+    # Regression: the codex) modal-detector must anchor on real Codex
+    # approval-modal text (verified against Codex CLI 0.142.5), not on bare
+    # "Approve"/"y/N" prose. The old markers ('Allow command|Approve|y/N') both
+    # missed real modals (the header is "Allow Codex to run", never "Allow
+    # command") and false-flagged normal output containing "Approve" or a shell
+    # "[y/N]" prompt — the same silent-deferral bug as the claude branch.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/deliver-codex-modal-data"
+    local log="$TMPDIR/deliver-codex-modal-tmux.log"
+    : > "$log"
+    # comet is registered --agent codex with session TMUX--comet.
+    setup_delivery_peers "$data"
+
+    local out modal_pane benign_pane
+    modal_pane="$(printf '%s\n' \
+        '● Applying the proposed patch next.' \
+        '' \
+        '╭──────────────────────────────────────────────────╮' \
+        '│ Allow Codex to apply proposed code changes?      │' \
+        '│                                                  │' \
+        '│ > Yes, proceed                                   │' \
+        '│   No, and tell Codex what to do differently      │' \
+        '╰──────────────────────────────────────────────────╯')"
+    # Benign output the OLD regex would have wrongly deferred on: prose with
+    # "Approve", a shell "[y/N]" prompt, and a markdown numbered list — but no
+    # real Codex approval-modal marker.
+    benign_pane="$(printf '%s\n' \
+        '● Next steps for the PR:' \
+        '  1. Approve the upstream change' \
+        '  2. Rerun CI' \
+        '' \
+        'I ran `git clean -n` (the tool would normally ask y/N before deleting).')"
+
+    # (a) A real Codex approval modal must DEFER.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "hold for codex modal" >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$modal_pane" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected real Codex approval modal to defer"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    # (b) Benign output with "Approve"/"y/N"/numbered list but no Codex modal
+    # marker must NOT defer — it should nudge normally.
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:06Z" "$ROOT/cctrl" peer deliver comet --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected benign Approve/y/N prose (no Codex modal) to nudge, not defer"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+    assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+
+    echo "ok: codex modal-detector anchors on real Codex modal text (no false-positive deferral)"
 }
 
 test_peer_deliver_failures_all_and_concurrency() {
@@ -3268,6 +3332,7 @@ test_peer_mcp_bridge_stdio
 test_peer_deliver_tmux_nudge_lifecycle
 test_peer_deliver_busy_no_submit_and_inline
 test_peer_deliver_claude_modal_detection
+test_peer_deliver_codex_modal_detection
 test_peer_deliver_failures_all_and_concurrency
 test_peer_orchestrator_status_nudge_watch
 test_peer_gc_retention_and_doctor

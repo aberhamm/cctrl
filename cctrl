@@ -3118,7 +3118,17 @@ _peer_pane_ready_for_delivery() {
             fi
             ;;
         codex)
-            if printf '%s\n' "$capture" | grep -E 'Allow command|Approve|y/N' >/dev/null 2>&1; then
+            # Anchor on real Codex approval-modal text (verified against the
+            # Codex CLI 0.142.5 TUI). Codex modals use no "❯" cursor (the
+            # selection is reverse-video, so no reliable glyph appears in a
+            # capture), which rules out the Claude-style arrow anchor — so match
+            # the modal's own strings instead: the "Allow Codex to …" header
+            # (run/apply/edit/access/create), the network-access prompt, and the
+            # always-present "tell Codex what to do differently" option line.
+            # The old markers were doubly wrong: "Allow command" never matched a
+            # real modal (the header is "Allow Codex to run"), while bare
+            # "Approve"/"y/N" false-flagged normal prose and shell [y/N] prompts.
+            if printf '%s\n' "$capture" | grep -E 'Allow Codex to |approve network access|tell Codex what to do differently' >/dev/null 2>&1; then
                 PEER_DELIVER_READY_REASON="modal prompt visible"
                 return 1
             fi
