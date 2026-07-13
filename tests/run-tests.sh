@@ -2005,6 +2005,27 @@ setup_delivery_peers() {
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register offline --dir "$TMPDIR/offline" --agent codex >/dev/null
 }
 
+# Shared body for the per-agent modal-detector regression tests. Asserts that a
+# real approval modal DEFERS delivery (no paste) while benign output that merely
+# resembles one still NUDGES (pastes + submits). The two callers differ only in
+# peer/session and the modal/benign pane fixtures.
+assert_modal_detection() {
+    local data="$1" log="$2" peer="$3" session="$4" modal_pane="$5" benign_pane="$6"
+    local out
+    # (a) A real modal must DEFER: message stays queued, nothing is pasted.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send "$peer" --from orchestrator --json -- "hold for modal" >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="$session" TMUX_FAKE_CAPTURE_PANE="$modal_pane" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver "$peer" --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected real $peer modal to defer"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    # (b) Benign output with no real modal marker must NOT defer — it nudges.
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="$session" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:05Z" "$ROOT/cctrl" peer deliver "$peer" --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected benign $peer output (no modal marker) to nudge, not defer"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-$peer-"
+    assert_contains "$(cat "$log")" "send-keys -t $session Enter"
+}
+
 mark_message_delivered() {
     local file="$1" id="$2"
     jq -c --arg id "$id" '
@@ -2391,7 +2412,11 @@ test_peer_deliver_claude_modal_detection() {
     mkdir -p "$TMPDIR/claudepeer"
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register cq --dir "$TMPDIR/claudepeer" --agent claude --session TMUX--cq >/dev/null
 
-    local out modal_pane benign_pane
+    # modal_pane: a real Claude proceed dialog ("❯ 1. Yes") must DEFER.
+    # benign_pane: a markdown numbered list plus "Do you want ... proceed" prose
+    # (no "❯ 1." selection line) must NOT defer — the old '. 1\.'/prose heuristic
+    # wrongly did.
+    local modal_pane benign_pane
     modal_pane="$(printf '%s\n' \
         '● Ready to remove the old build artifacts.' \
         '' \
@@ -2407,19 +2432,7 @@ test_peer_deliver_claude_modal_detection() {
         '' \
         'Earlier you asked: Do you want to proceed with the old approach?')"
 
-    # (a) A real Claude modal ("❯ 1. Yes") must still DEFER.
-    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --json -- "hold for modal" >/dev/null
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$modal_pane" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver cq --json)"
-    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected real Claude modal (❯ 1.) to defer"
-    assert_not_contains "$(cat "$log")" "paste-buffer"
-
-    # (b) A markdown numbered list plus benign "Do you want ... proceed" prose,
-    # with no "❯ 1." selection line, must NOT defer — it should nudge normally.
-    : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:05Z" "$ROOT/cctrl" peer deliver cq --json)"
-    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected markdown list + prose (no ❯ 1.) to nudge, not defer"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-cq-"
-    assert_contains "$(cat "$log")" "send-keys -t TMUX--cq Enter"
+    assert_modal_detection "$data" "$log" cq TMUX--cq "$modal_pane" "$benign_pane"
 
     echo "ok: claude modal-detector anchors on ❯ 1. (no false-positive deferral)"
 }
@@ -2438,7 +2451,12 @@ test_peer_deliver_codex_modal_detection() {
     # comet is registered --agent codex with session TMUX--comet.
     setup_delivery_peers "$data"
 
-    local out modal_pane benign_pane
+    # modal_pane: a real Codex approval modal ("Allow Codex to …" + the "tell
+    # Codex what to do differently" option) must DEFER.
+    # benign_pane: prose with "Approve", a shell "[y/N]" prompt, and a markdown
+    # numbered list — but no real modal marker — must NOT defer (the old
+    # 'Approve'/'y/N' markers wrongly did).
+    local modal_pane benign_pane
     modal_pane="$(printf '%s\n' \
         '● Applying the proposed patch next.' \
         '' \
@@ -2448,9 +2466,6 @@ test_peer_deliver_codex_modal_detection() {
         '│ > Yes, proceed                                   │' \
         '│   No, and tell Codex what to do differently      │' \
         '╰──────────────────────────────────────────────────╯')"
-    # Benign output the OLD regex would have wrongly deferred on: prose with
-    # "Approve", a shell "[y/N]" prompt, and a markdown numbered list — but no
-    # real Codex approval-modal marker.
     benign_pane="$(printf '%s\n' \
         '● Next steps for the PR:' \
         '  1. Approve the upstream change' \
@@ -2458,19 +2473,7 @@ test_peer_deliver_codex_modal_detection() {
         '' \
         'I ran `git clean -n` (the tool would normally ask y/N before deleting).')"
 
-    # (a) A real Codex approval modal must DEFER.
-    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "hold for codex modal" >/dev/null
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$modal_pane" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json)"
-    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected real Codex approval modal to defer"
-    assert_not_contains "$(cat "$log")" "paste-buffer"
-
-    # (b) Benign output with "Approve"/"y/N"/numbered list but no Codex modal
-    # marker must NOT defer — it should nudge normally.
-    : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:06Z" "$ROOT/cctrl" peer deliver comet --json)"
-    printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected benign Approve/y/N prose (no Codex modal) to nudge, not defer"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
-    assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+    assert_modal_detection "$data" "$log" comet TMUX--comet "$modal_pane" "$benign_pane"
 
     echo "ok: codex modal-detector anchors on real Codex modal text (no false-positive deferral)"
 }
