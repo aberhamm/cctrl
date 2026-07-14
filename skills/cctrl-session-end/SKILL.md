@@ -52,9 +52,41 @@ If the session was drafting an email, PR, message, or any outward-facing
 artifact that hasn't been sent/created yet — surface it to the user before
 closing. Don't let drafts evaporate with the session.
 
-### 3. Save context (if there is follow-on work)
+### 3. Harvest the session (soft dependency — skip silently if absent)
 
-If there is remaining work or the session was part of a larger effort:
+Steps 1 and 2 catch what is *visible* in the tree. They cannot catch what only
+this session knows: scaffolding it created that should now be deleted, work it
+obsoleted, docs its own changes made wrong, a pitfall it hit and worked around,
+a decision the user made that a future session would otherwise re-litigate. That
+knowledge is about to be destroyed — a closing session is the last moment it
+exists.
+
+If an end-of-session harvest skill is installed, invoke it now. Probe for it;
+**if it is not installed, skip this step silently** — never error, never mention
+it. It is optional by design.
+
+```bash
+for _base in "${HOME}/.config/skillshare/skills" "${HOME}/.agents/skills" \
+             "${HOME}/.codex/skills" "${HOME}/.claude/skills"; do
+  [ -f "${_base}/mstack-wrap-up/SKILL.md" ] && { echo "harvest=available"; break; }
+done
+```
+
+If it reports `harvest=available`, invoke `/mstack-wrap-up` and let it run to its
+verdict. It is report-only: it never deletes, commits, or pushes, so it cannot
+damage the tree you just cleaned in step 1.
+
+**If the harvest routed a handoff, step 4 is already done — do not ask twice.**
+The harvest skill offers a handoff as its own ending when it finds follow-on
+work. A session that accepts that offer has already persisted its context, and
+re-running `/context-save` or `/mstack-handoff` in step 4 would prompt the user
+a second time for the same thing.
+
+### 4. Save context (if there is follow-on work)
+
+Skip this entirely if step 3's harvest already routed a handoff (see above).
+
+Otherwise, if there is remaining work or the session was part of a larger effort:
 - Use `/context-save` (if available) or `/mstack-handoff` to persist a
   resumable summary.
 - If neither is available, print a concise handoff block to the console so the
@@ -63,7 +95,7 @@ If there is remaining work or the session was part of a larger effort:
 If the session is truly done (all work complete, nothing to hand off), skip
 this.
 
-### 4. Report completion
+### 5. Report completion
 
 State clearly what was accomplished and what (if anything) remains:
 > Done — [one-line summary of what shipped/changed]. [Any follow-up needed.]
@@ -71,7 +103,7 @@ State clearly what was accomplished and what (if anything) remains:
 Keep it to one or two sentences. The user reads this in the pane capture after
 the session is gone.
 
-### 5. Self-close
+### 6. Self-close
 
 ```
 cctrl close
@@ -95,7 +127,7 @@ When running under a fleet manager, the **session-close gate** applies:
 - **Ephemeral throwaways** (health probes, read-only scouts, validators with no
   work product): close freely — no gate needed.
 
-If you are a fleet-managed work session that has finished: run steps 1–4 of the
+If you are a fleet-managed work session that has finished: run steps 1–5 of the
 checklist, report done, then **wait**. Do not `cctrl close` until the fleet
 manager or human says to.
 
@@ -104,7 +136,7 @@ manager or human says to.
 When context is approaching ~200k and there is follow-on work:
 
 1. Finish the current atomic unit of work (don't stop mid-task).
-2. Run the pre-close checklist (steps 1–4).
+2. Run the pre-close checklist (steps 1–5).
 3. Note that you are handing off due to context length.
 4. `cctrl close` — the fleet manager or user spawns the continuation session
    with the handoff as its first prompt.

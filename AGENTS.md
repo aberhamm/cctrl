@@ -15,7 +15,8 @@ the invocable skill *is* the doctrine):
   resource gating, and the handoff/startup-hang lessons.
 - **[skills/cctrl-session-end/SKILL.md](./skills/cctrl-session-end/SKILL.md)** — gracefully
   wind down a session from the inside: pre-close checklist (uncommitted work, unsent
-  drafts, context save), completion reporting, self-close via `cctrl close`.
+  drafts, session harvest, context save), completion reporting, self-close via
+  `cctrl close`.
   Counterpart to `cctrl-spawn`.
 
 `docs/` has thin pointers to each; `skills/README.md` explains the

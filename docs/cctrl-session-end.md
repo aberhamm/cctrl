@@ -5,7 +5,8 @@ is the skill itself — a single source of truth, no duplicated copy to drift:
 
 ➡️ **[`skills/cctrl-session-end/SKILL.md`](../skills/cctrl-session-end/SKILL.md)**
 
-It covers the pre-close checklist (uncommitted work, unsent drafts, context save),
+It covers the pre-close checklist (uncommitted work, unsent drafts, session harvest,
+context save),
 completion reporting, the `cctrl close` self-close command, fleet-manager integration
 (session-close gate), and the handoff-then-close pattern for context-limit sessions.
 
