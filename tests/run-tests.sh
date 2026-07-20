@@ -365,6 +365,9 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "-m line\\ one"
     assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "line one"'
     assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"initial_prompt": "line one"'
+    # Plan 031: the resolved agent is persisted so display/registry read it back
+    # instead of re-sniffing the pane argv.
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"agent": "codex"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
@@ -1232,6 +1235,54 @@ JSON
     assert_contains "$out" '"model": "?"'
     assert_contains "$out" '"purpose": "review stale session cleanup"'
     assert_contains "$out" '"created_at": "2026-06-11T10:00:00Z"'
+}
+
+test_session_list_agent_not_mislabelled_by_prompt() {
+    # Regression (plan 031): a Claude session whose seed prompt mentions "codex"
+    # or a ~/.codex path must still classify as claude. The old whole-argv
+    # substring test tagged it codex, which then selected the Codex
+    # modal-detection regex at delivery and pasted into an open Claude modal.
+    # Detection now keys on argv[0]'s basename, not the trailing prompt text.
+    local bin="$TMPDIR/agbin"
+    mkdir -p "$bin"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *7777* ]]; then
+    echo "claude --model claude-opus-4-8[1m] -m DEFECT 2 AGENT MISLABELED AS codex see ~/.codex/config.toml"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    local out
+    out="$(PATH="$bin:$PATH" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_PANE_PID=7777 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"agent": "claude"'
+    assert_not_contains "$out" '"agent": "codex"'
+    assert_contains "$out" '"model": "opus-4-8"'
+    echo "ok: claude session with 'codex' in its prompt is not mislabelled codex"
+}
+
+test_session_list_agent_prefers_recorded_metadata() {
+    # Plan 031: when session metadata records the agent (written at spawn from
+    # the explicit --agent flag), the display prefers it over the pane sniff.
+    local bin="$TMPDIR/agmetabin"
+    mkdir -p "$bin"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *8888* ]]; then echo "claude --model claude-opus-4-8[1m]"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--metademo.json" <<'JSON'
+{"name":"TMUX--metademo","agent":"claude","created_at":"2026-07-20T10:00:00Z","cctrl_managed":true}
+JSON
+    local out
+    out="$(PATH="$bin:$PATH" TMUX_FAKE_SESSIONS="TMUX--metademo" TMUX_FAKE_PANE_PID=8888 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"agent": "claude"'
+    echo "ok: session ls prefers the agent recorded in metadata"
 }
 
 test_session_list_last_active_from_updated_at() {
@@ -3308,6 +3359,8 @@ test_session_autoheal_heals_clean_dead_bridge
 test_session_autoheal_ignores_live_bridge
 test_session_autoheal_install_uninstall_plist
 test_session_list_codex_default_model
+test_session_list_agent_not_mislabelled_by_prompt
+test_session_list_agent_prefers_recorded_metadata
 test_session_list_last_active_from_updated_at
 test_session_list_last_active_from_transcript_mtime
 test_session_list_unresolvable_session

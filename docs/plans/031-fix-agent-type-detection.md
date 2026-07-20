@@ -1,7 +1,7 @@
 ---
 id: 031
 title: Record agent type at spawn and stop sniffing it from the whole argv
-status: pending
+status: done
 blocked-by: []
 priority: 31
 goal: cctrl-peer-identity-integrity
@@ -139,3 +139,22 @@ empty string would shadow the fallback with a falsy-but-present value.
 **Verification.** The bug is reproducible on demand: spawn a Claude session
 whose `-m` text contains the word `codex` and assert `cctrl session ls` reports
 `claude`. That is exactly how it was found.
+
+## Implementation Notes (done 2026-07-21)
+
+- New shared helper `_agent_from_cmd` (near `_normalize_agent`) classifies by
+  argv[0] basename via an exhaustive `case`. Verified empirically: every live
+  cctrl pane (incl. the mislabelled `obsidian-vault--5` and this session) reports
+  argv[0] basename `claude` — cctrl launches via `exec claude`/`exec codex`.
+- Both sniff sites now route through it: the display classifier in `_session_list`
+  and the child-fallback gate in `_session_agent_cmd`. `_session_prune`'s
+  duplicate `*codex*`-first test is replaced with metadata-then-`_agent_from_cmd`.
+- `_session_write_metadata` gained a 10th `agent` param (normalized, null when
+  empty); passed `$detach_agent` at the sole call site. Display + prune prefer
+  the recorded value, falling back to the sniff for the live fleet (no restart).
+- argv[0]-basename only, deliberately: a token-scan would re-match a bare `codex`
+  in prompt prose. The rare wrapper case (`node …/codex.js`) resolves to shell,
+  which is harmless (not a peer) and covered by metadata for future sessions.
+- Tests: `test_session_list_agent_not_mislabelled_by_prompt` (the regression),
+  `test_session_list_agent_prefers_recorded_metadata`, and an `agent` assertion
+  added to `test_detached_arg_parsing`. Full suite green.

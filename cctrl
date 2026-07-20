@@ -109,6 +109,25 @@ _normalize_agent() {
     esac
 }
 
+_agent_from_cmd() {
+    # Classify a pane's agent from its command by argv[0]'s BASENAME, never a
+    # substring of the whole argv. cctrl always launches via `exec claude` /
+    # `exec codex` (see _launch_exec_agent), so argv[0] is the bare binary. A
+    # substring test over the full command misfires whenever the trailing prompt
+    # argument mentions the other agent (a prompt discussing "codex", a
+    # ~/.codex/... path), which is the mislabel bug this replaces — a Claude
+    # session tagged codex then gets the wrong modal-detection regex at delivery.
+    # Exhaustive case, no ordering bias, so a future third agent cannot
+    # reintroduce codex-wins-first. Empty output when the binary is neither.
+    local cmd="$1" bin
+    bin="${cmd%% *}"; bin="${bin##*/}"
+    case "$bin" in
+        claude) printf 'claude' ;;
+        codex)  printf 'codex' ;;
+        *)      ;;
+    esac
+}
+
 _config_default_agent() {
     [[ -f "$CONFIG_FILE" ]] || return 1
     command -v jq >/dev/null 2>&1 || return 1
@@ -1186,12 +1205,19 @@ _session_metadata_field() {
 }
 
 _session_write_metadata() {
-    local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8" peer="${9:-}"
+    local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8" peer="${9:-}" agent="${10:-}"
     mkdir -p "$SESSION_METADATA_DIR" || return 1
     local tmp created_at host_label
     tmp="$(mktemp)" || return 1
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     host_label="${CCTRL_HOST_PREFIX:-local}"
+    # Persist the agent runtime so display/registry read it back rather than
+    # re-sniffing the pane argv (see _agent_from_cmd). Normalize to the canonical
+    # vocabulary; an unrecognized or empty value stores null so the reader falls
+    # back to the sniff instead of shadowing it with a falsy-but-present string.
+    if [[ -n "$agent" ]]; then
+        agent="$(_normalize_agent "$agent" 2>/dev/null || printf '')"
+    fi
     jq -n \
         --arg name "$session_name" \
         --arg created_at "$created_at" \
@@ -1203,6 +1229,7 @@ _session_write_metadata() {
         --arg initial_prompt "$initial_prompt" \
         --arg launch_command "$launch_command" \
         --arg peer "$peer" \
+        --arg agent "$agent" \
         --arg host "$host_label" \
         '{
             name: $name,
@@ -1214,6 +1241,7 @@ _session_write_metadata() {
             purpose: (if $purpose == "" then null else $purpose end),
             initial_prompt: (if $initial_prompt == "" then null else $initial_prompt end),
             peer: (if $peer == "" then null else $peer end),
+            agent: (if $agent == "" then null else $agent end),
             launch_command: $launch_command,
             host: $host,
             cctrl_managed: true
@@ -1757,7 +1785,7 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
-    if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" 2>/dev/null; then
+    if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" 2>/dev/null; then
         if [[ -n "$peer_name" ]]; then
             echo -e "${RED}Failed to write session metadata for peer '$peer_name'.${RESET}" >&2
             echo -e "${DIM}Metadata path: $(_session_metadata_file "$session_name")${RESET}" >&2
@@ -4481,11 +4509,11 @@ _session_agent_cmd() {
     pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
     [[ -n "$pid" ]] || return 0
     cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
-    if [[ "$cmd" != *claude* && "$cmd" != *codex* ]]; then
+    if [[ -z "$(_agent_from_cmd "$cmd")" ]]; then
         child="$(pgrep -P "$pid" 2>/dev/null | head -1)"
         if [[ -n "$child" ]]; then
             ccmd="$(ps -o command= -p "$child" 2>/dev/null)"
-            [[ "$ccmd" == *claude* || "$ccmd" == *codex* ]] && cmd="$ccmd"
+            [[ -n "$(_agent_from_cmd "$ccmd")" ]] && cmd="$ccmd"
         fi
     fi
     printf '%s' "$cmd"
@@ -4805,7 +4833,7 @@ _session_list() {
 
     local -a json_items=() human_lines=() sort_keys=() order=()
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
@@ -4815,8 +4843,16 @@ _session_list() {
         created_at="$(_session_metadata_field "$name" created_at)"
         peer="$(_session_metadata_field "$name" peer)"
         metadata_managed="$(_session_metadata_field "$name" cctrl_managed)"
-        if [[ "$cmd" == *claude* || "$cmd" == *codex* ]]; then
-            [[ "$cmd" == *codex* ]] && agent="codex" || agent="claude"
+        # Agent type: prefer the value recorded at spawn (authoritative — the
+        # explicit --agent flag), fall back to the argv[0] sniff for sessions
+        # that predate metadata-agent (the whole live fleet, until relaunched).
+        # Gating the "is this an agent session" branch on the sniff/metadata
+        # (not a whole-argv substring) is what stops a Claude prompt mentioning
+        # codex from being classified codex.
+        agent="$(_agent_from_cmd "$cmd")"
+        agent_meta="$(_session_metadata_field "$name" agent)"
+        [[ -n "$agent_meta" ]] && agent="$agent_meta"
+        if [[ -n "$agent" ]]; then
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
             model="$(printf '%s' "$cmd" | grep -oE -- '--model(=| )[^ ]+' | head -1 | sed -E 's/^--model[= ]//' || true)"
             model="${model#claude-}"; model="${model%%\[*}"
@@ -5861,9 +5897,8 @@ _session_prune() {
         [[ "$attached" == "1" && $force == false ]] && continue
 
         cmd="$(_session_agent_cmd "$name")"
-        if [[ "$cmd" == *codex* ]]; then agent="codex"
-        elif [[ "$cmd" == *claude* ]]; then agent="claude"
-        else agent=""; fi
+        agent="$(_session_metadata_field "$name" agent)"
+        [[ -n "$agent" ]] || agent="$(_agent_from_cmd "$cmd")"
 
         rollout=""
         [[ "$agent" == "codex" ]] && rollout="$(_session_codex_rollout_path "$name")"
