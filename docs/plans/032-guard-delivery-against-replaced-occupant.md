@@ -71,9 +71,17 @@ not the intended recipient is a safety issue.
       for a prior occupant was withheld. It must never see the body.
 - [ ] Messages already queued in `data/messages.jsonl` right now are covered
       retroactively, with no rewrite of stored records and no migration.
+- [ ] The guard is **fail-closed on ambiguity, fail-open only on absence**
+      (the ambiguity policy; see the design section). Concretely: when the peer
+      carries a `created_at` but the comparison cannot be made cleanly (equal
+      timestamps, or an unparseable/non-fixed-format message timestamp), the
+      message is **blocked** as `addressee-ambiguous`, not delivered. When the
+      peer carries **no** `created_at` at all (a manual peer — name was always
+      its only identity), the message **delivers**, because blocking gains
+      nothing there and would break legitimate manual-peer traffic.
 - [ ] Manual peers (`cctrl peer register`, `cctrl:2057`) that carry no
-      `created_at` are **not** blocked — the guard fails open when it cannot
-      prove replacement.
+      `created_at` are **not** blocked — this is the absence case above, the one
+      place the guard fails open.
 - [ ] Mail sent to a not-yet-spawned name via `--allow-unknown` (`cctrl:2649`)
       is **not** blocked. The message already carries a top-level
       `unknown_peer: true` (`cctrl:2686`) — but that flag is **ambiguous**: it
@@ -113,19 +121,38 @@ ordering equals chronological ordering. Do not parse to epoch;
 which is macOS-specific and already a portability seam. **Caveat:**
 `_peer_now_utc` honours a `CCTRL_NOW_UTC` override (`cctrl:1836-1841`) that the
 metadata writer does not; a message stamped through a non-fixed or non-UTC
-override breaks the lexical assumption. Treat a message timestamp that does not
-match the fixed `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$` shape as
-**uncomparable** and fail open, rather than string-comparing it.
+override breaks the lexical assumption. A message timestamp that does not match
+the fixed `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$` shape is **uncomparable** —
+and per the ambiguity policy below, uncomparable-against-a-peer-that-has-a-stamp
+means **block**, not deliver.
 
-**Fail open, deliberately — and note the one-second blind spot.** Block only on
-a *proven* strict inequality `message.created_at < peer.created_at`. Missing
-either timestamp, an unparseable one, or **equal** values all deliver as today.
-Both stamps are seconds-only, so a message sent and an occupant spawned in the
-same wall-clock second compare equal and are **not** blocked. That is a real
-false-negative, not "seed mail" as an earlier draft claimed — do not encode the
-seed-mail rationalization. It is an accepted residual (a one-second recycle race
-is vanishingly rare and is closed exactly by plan 034's per-message stamp);
-state it in Implementation Notes rather than pretending equality is safe.
+**Ambiguity policy: fail closed on ambiguity, fail open only on absence.** This
+is the load-bearing decision of the plan (operator-settled 2026-07-21, after a
+Codex strategic review argued the guard's worst outcome is a false negative that
+delivers to the wrong occupant anyway). An earlier draft failed *open* on every
+uncertain case; that merely narrows the leak instead of closing it. The settled
+rule, applied to a resolved recipient:
+
+| Case | Action | Why |
+|---|---|---|
+| `unknown_peer: true` on the message | **deliver** | pre-seed / `--allow-unknown`; never had a verified occupant (see below) |
+| peer has **no** `created_at` (manual peer) | **deliver** | name was always the only identity; blocking gains nothing, breaks legit traffic |
+| message has **no** `created_at` (legacy record) | **deliver** | nothing to compare; matches today's behavior for fieldless old records |
+| proven `message.created_at > peer.created_at` | **deliver** | normal case: the occupant predates the message, so it is the addressee |
+| proven `message.created_at < peer.created_at` | **block** `addressee-replaced` | occupant born after the message was sent — provably not the addressee |
+| peer **has** `created_at`, but timestamps **equal** | **block** `addressee-ambiguous` | seconds-granularity tie could be a same-second recycle; cannot prove same-identity |
+| peer **has** `created_at`, but message stamp **unparseable** | **block** `addressee-ambiguous` | e.g. a `CCTRL_NOW_UTC` override; cannot prove same-identity |
+
+The distinction is **absence vs ambiguity**. Absence (no stamp on either side)
+means name was never anything but the address, so the guard has no better
+signal than today and delivers. Ambiguity (a peer that *does* carry a stamp, but
+the comparison ties or won't parse) means the name has demonstrably churned and
+we simply cannot prove the current occupant is the addressee — there, misroute
+is worse than a bounced message, so block and notify the sender. This costs a
+false block on the vanishingly rare legitimate same-second send, but that fails
+*loud* (the sender is told `addressee-ambiguous`) and is recoverable, whereas a
+false deliver is silent and is exactly the defect. Plan 034's exact stamp
+removes the tie entirely; until then the fleet is protected, not merely warned.
 
 **The false-positive that matters: `--allow-unknown`.** A message may be queued
 for a name *before* that session exists (`cctrl:2641` permits sending to an
