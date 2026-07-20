@@ -92,9 +92,10 @@ persist**, addressed to a name that is now free for anyone to take.
 
 Yes, and cctrl already resolves it:
 
-- `cctrl:5486-5492` — `_session_bridge_field <pid> <field>` reads Claude's
+- `cctrl:4508-4513` — `_session_bridge_field <pid> <field>` reads Claude's
   per-PID session file.
-- `_session_id "$sess"` → the Claude conversation `sessionId` (transcript UUID).
+- `_session_id "$sess"` (`cctrl:4525`) → the Claude conversation `sessionId`
+  (transcript UUID).
 - `_session_transcript_path` globs `$CLAUDE_PROJECTS_DIR/*/<sid>.jsonl`.
 - Codex has a parallel resolver, `_session_codex_rollout_path`.
 
@@ -156,7 +157,7 @@ the nudge text.** This defeats commits `3a148c7` / `64bc712`, which exist
 specifically to prevent that. The inverse holds for real Codex sessions.
 
 Secondary consumers of the same bad value: `cctrl:4254` routes `peer doctor` hook
-validation on `agent == codex`; `_session_prune` (`cctrl:5864-5876`) repeats the
+validation on `agent == codex`; `_session_prune` (`cctrl:5863-5869`) repeats the
 `*codex*`-first substring test and picks the wrong log source for staleness.
 
 ### Fix direction (small, low-risk)

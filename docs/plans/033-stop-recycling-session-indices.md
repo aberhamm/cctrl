@@ -2,7 +2,7 @@
 id: 033
 title: Stop handing a freed session index to the next spawn
 status: pending
-blocked-by: []
+blocked-by: [031]
 priority: 33
 goal: cctrl-peer-identity-integrity
 allows-migrations: false
@@ -32,10 +32,21 @@ pick is `base--4`; kill `base--2` and the next pick is immediately `base--2`.
       `base--4`, not `base--2`.
 - [ ] Retention is bounded and explicitly documented — names become reusable
       again only through a stated, operator-visible policy, never silently.
-- [ ] `cctrl session prune` / the existing prune path is the sanctioned way to
-      release retained names, and releasing a name is reported, not silent.
+- [ ] A retained (dead-metadata) name is actually reachable by the release
+      mechanism. **Codex flagged the gap:** `_session_prune` enumerates *live
+      tmux sessions* only (`cctrl:5851-5852`), so as written it can never see a
+      retained dead-metadata record. The release path must scan the metadata
+      directory, not `tmux list-sessions`. State the chosen mechanism.
+- [ ] The launch-failure error text is corrected. Today it reads "indices 2-999
+      all have live tmux sessions" (`cctrl:1723-1725`); once retained metadata
+      can also block a slot, that message is wrong and must reflect both causes.
+- [ ] The picker comment that documents intentional reuse (`cctrl:1718-1721`,
+      and the picker's own header at `cctrl:1258-1266`) is updated — leaving it
+      in place would tell the next reader the opposite of the new behavior.
 - [ ] The picker still refuses rather than colliding when no free slot exists,
-      preserving today's `cctrl:1279-1282` behavior and its error message.
+      preserving today's refuse-path behavior (the `return 1` at the end of
+      `_pick_safe_session_index`, surfaced as the launch error at
+      `cctrl:1723-1725`).
 - [ ] A live session is never overwritten. This property is load-bearing and
       must not regress — it is the reason the picker exists.
 - [ ] Behavior is verified against a real multi-session fleet, not only the
@@ -57,13 +68,21 @@ behavior it enables is a misrouting hazard. Accepting bounded ugliness to remove
 a safety failure is the right trade, but it must come with a release valve or
 the fleet degrades into unreadable names over months.
 
-**Release valve.** Wire retention release into the existing prune path
-(`_session_prune`, `cctrl:5852+`) rather than inventing a second lifecycle:
-pruning a long-dead session is exactly the moment its name becomes safe to
-reissue. Note the ordering dependency — `_session_prune` currently classifies
-sessions using the same defective `*codex*`-first test that plan **031** fixes
-(`cctrl:5864-5876`), so land 031 first or the release valve inherits the
-misclassification and prunes against the wrong log source.
+**Release valve — but prune must be taught to see dead names first.**
+`_session_prune` (starts at `cctrl:5796`) is the natural home for release:
+pruning a long-dead session is exactly when its name becomes safe to reissue.
+But as Codex flagged, prune currently iterates `tmux list-sessions`
+(`cctrl:5851-5852`) and so only ever sees *live* sessions — the retained records
+this plan creates are dead metadata files with no tmux session, invisible to it.
+So the release valve is not free: prune must gain a pass over the metadata
+directory (the same directory `_session_metadata_file` addresses) to find
+retained-but-dead names and release them. Without that pass, retention is a
+one-way ratchet and names never come back.
+
+Ordering dependency: `_session_prune` also classifies agent type with the same
+defective `*codex*`-first test that plan **031** fixes (`cctrl:5863-5869`), so
+land 031 first or the release valve inherits the misclassification and prunes
+against the wrong log source.
 
 **Do not tie release to a short timer.** A name is safe to reissue only when no
 queued mail still references it. A time-based rule that expires a name while

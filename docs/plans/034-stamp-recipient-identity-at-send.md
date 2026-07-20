@@ -30,15 +30,25 @@ read-side precisely so the safety fix did not have to wait for this.
 
 - [ ] A message records the recipient identity resolved at send time, alongside
       the existing `to` name. `_peer_cmd_send` already computes `to_peer_json`
-      via `_peer_resolve_json` (`cctrl:2628-2650`) and currently discards
-      everything but `.name` — stop discarding it.
-- [ ] The stamp carries the recipient's `created_at`, and its `sessionId` where
-      one is resolvable (`_session_id`, `cctrl:5504`).
+      via `_peer_resolve_json` (`cctrl:2628-2650`) and currently reduces it to
+      `.name` (`cctrl:2630`) — stop discarding the rest.
+- [ ] The stamp carries the recipient's `created_at`. It carries `sessionId`
+      **only** where actually resolvable — and note the gap: `to_peer_json` comes
+      from `_peer_derived_json`, which does **not** emit `session_id`
+      (`cctrl:1948-1958`); only `_session_list --json` carries it
+      (`cctrl:4853-4885`). So stamping `sessionId` requires either resolving it
+      separately at send (`_session_id`, defined at `cctrl:4525`) or teaching
+      `_peer_derived_json` to carry it. Pick one and state it; do not assume the
+      field is already on the peer object.
 - [ ] 032's guard prefers the stamp when present: replacement is then an exact
-      mismatch, not a timestamp inequality.
-- [ ] The `--allow-unknown` exemption becomes explicit — an unresolved recipient
-      records no stamp, so the guard has positive evidence that no occupant was
-      ever verified, rather than inferring it from history.
+      mismatch, not a timestamp inequality. Because 032 ships with the ambiguous
+      `unknown_peer` exemption, this plan must **replace** that logic where a
+      stamp exists, not merely layer on top of it — a stamped message is judged
+      by the stamp alone.
+- [ ] The `--allow-unknown` exemption becomes precise — an unresolved *recipient*
+      records no recipient stamp (positive evidence no occupant was verified),
+      which disambiguates the recipient-vs-sender conflation that 032's
+      top-level `unknown_peer` flag (`cctrl:2686`) cannot distinguish.
 - [ ] Messages without a stamp (everything queued before this lands) keep
       resolving through 032's heuristic exactly as today. No stored message is
       rewritten.
@@ -69,11 +79,14 @@ second addressing path would create two ways to be wrong.
 **Why `created_at` and not `sessionId` alone.** The conversation UUID is the
 stronger identity, but it is not available at spawn — Claude mints it after
 boot — so a session's `sessionId` may be unresolvable at the moment mail is
-sent to it, and codex resolves through a different mechanism entirely
-(`_session_codex_rollout_path`). `created_at` is always present for a derived
-peer. Record both, prefer `sessionId` when both sides have it, fall back to
-`created_at`, and fall back again to 032's inequality. Three tiers, degrading
-safely.
+sent. On the codex side there is **no equivalent stable id at all**:
+`_session_codex_rollout_path` (`cctrl:5750-5765`) returns a rollout *file path*
+correlated by cwd, not a durable session identity, so do not treat it as a
+codex `sessionId` — for codex peers the stamp is `created_at`-only until 029
+provides a real stable id. `created_at` is always present for a derived peer.
+Record `sessionId` when resolvable, else `created_at`, and fall back again to
+032's inequality. Tiers degrade safely; do not claim a codex UUID that does not
+exist.
 
 **Do not gate delivery on the stamp's presence.** A missing stamp must mean
 "fall back", never "block" — otherwise this plan silently strands every message

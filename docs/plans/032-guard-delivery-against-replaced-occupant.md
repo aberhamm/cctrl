@@ -48,9 +48,22 @@ not the intended recipient is a safety issue.
 **Acceptance criteria:**
 
 - [ ] Mail addressed to a name whose current occupant demonstrably post-dates
-      the message is **not delivered** — not by nudge, and not by `recv`.
+      the message is **not delivered** — not by nudge, not by `recv`, and not by
+      the other read paths that expose the body (see the disclosure-surface note
+      below; `inbox --json` at `cctrl:2724` and `peer show <id>` at `cctrl:2767`
+      also render full message objects).
 - [ ] `_peer_cmd_recv` applies the guard. A guard on the nudge path alone is
-      insufficient and must not be accepted as done.
+      insufficient and must not be accepted as done. **Plumbing gap:**
+      `_mailbox_resolve_identity_for_mode` (`cctrl:2532-2541`) discards the
+      resolved peer JSON and keeps only `.name`, so `recv` has no
+      `peer.created_at` today — the implementer must resolve the current
+      occupant's `created_at` (via `_peer_resolve_json` or
+      `_session_metadata_field`) inside the guard.
+- [ ] Blocking mail must actually change what a reader selects. `recv` selects
+      on status `queued`/`delivered` (`cctrl:2947-2966`); a guard that leaves
+      status untouched still lets the body through. Either the selection filter
+      excludes guarded messages, or their status is moved to a terminal
+      `blocked` value — decide and state which.
 - [ ] Blocked mail is marked with an explicit, greppable reason
       (`addressee-replaced`) and surfaced to the **sender** via `outbox`, so the
       sender learns the instruction never landed.
@@ -61,9 +74,15 @@ not the intended recipient is a safety issue.
 - [ ] Manual peers (`cctrl peer register`, `cctrl:2057`) that carry no
       `created_at` are **not** blocked — the guard fails open when it cannot
       prove replacement.
-- [ ] Mail legitimately sent to a not-yet-spawned name via `--allow-unknown`
-      (`cctrl:2641`) is **not** blocked. See the false-positive analysis below;
-      this case inverts the comparison and is the main correctness risk.
+- [ ] Mail sent to a not-yet-spawned name via `--allow-unknown` (`cctrl:2649`)
+      is **not** blocked. The message already carries a top-level
+      `unknown_peer: true` (`cctrl:2686`) — but that flag is **ambiguous**: it
+      is set when the *recipient* was unresolved OR a non-user *sender* was
+      unresolved (`cctrl:2648-2649`). Exempting on it alone fails open in the
+      right direction (never a false block) but under-blocks a genuinely
+      recycled name whose original send happened to have an unresolved sender.
+      That residual is accepted here and closed exactly by plan 034's per-message
+      recipient stamp. See the false-positive analysis below.
 - [ ] No change to the message JSON schema, and no edit to `_peer_cmd_send`'s
       `jq -cn` construction at `cctrl:2663-2686` — plan 023 is rewriting that
       block. Send-side stamping is plan **034**.
@@ -83,18 +102,30 @@ creation), a live session's `created_at` is stable for its whole life, and a
 > was born after the message was sent, and is not the addressee.
 
 This is sound for every message sitting in the queue today, which is why the
-retroactive criterion above is achievable without touching stored records.
+retroactive criterion above is achievable without touching stored records — with
+the granularity and override caveats below.
 
-**Comparison is a string compare.** Both timestamps are ISO-8601 UTC with fixed
-width (`_peer_now_utc` and the metadata writer both emit `%Y-%m-%dT%H:%M:%SZ`),
-so lexical ordering equals chronological ordering. Do not parse to epoch;
-`_session_created_at_ms` (`cctrl:5745`) exists but drags in `date -u -j -f`,
-which is macOS-specific and already a portability seam elsewhere in the file.
+**Comparison is a string compare, but only under the default format.** Both
+timestamps are ISO-8601 UTC, fixed width (`_peer_now_utc` at `cctrl:1841` and
+the metadata writer at `cctrl:1193` both emit `%Y-%m-%dT%H:%M:%SZ`), so lexical
+ordering equals chronological ordering. Do not parse to epoch;
+`_session_created_at_ms` (`cctrl:5744`) exists but drags in `date -u -j -f`,
+which is macOS-specific and already a portability seam. **Caveat:**
+`_peer_now_utc` honours a `CCTRL_NOW_UTC` override (`cctrl:1836-1841`) that the
+metadata writer does not; a message stamped through a non-fixed or non-UTC
+override breaks the lexical assumption. Treat a message timestamp that does not
+match the fixed `^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$` shape as
+**uncomparable** and fail open, rather than string-comparing it.
 
-**Fail open, deliberately.** Block only on a *proven* inequality. Missing
-`peer.created_at`, missing `message.created_at`, or equal values all deliver as
-today. Equality means the session was created in the same second the message
-was sent — that is a session receiving its own seed mail, not a recycle.
+**Fail open, deliberately — and note the one-second blind spot.** Block only on
+a *proven* strict inequality `message.created_at < peer.created_at`. Missing
+either timestamp, an unparseable one, or **equal** values all deliver as today.
+Both stamps are seconds-only, so a message sent and an occupant spawned in the
+same wall-clock second compare equal and are **not** blocked. That is a real
+false-negative, not "seed mail" as an earlier draft claimed — do not encode the
+seed-mail rationalization. It is an accepted residual (a one-second recycle race
+is vanishingly rare and is closed exactly by plan 034's per-message stamp);
+state it in Implementation Notes rather than pretending equality is safe.
 
 **The false-positive that matters: `--allow-unknown`.** A message may be queued
 for a name *before* that session exists (`cctrl:2641` permits sending to an
@@ -103,24 +134,40 @@ correctly **later** than the message — the exact signature of a recycle. A nai
 guard would block legitimate pre-seeded mail.
 
 Resolve it by distinguishing *never resolved* from *resolved then replaced*.
-At minimum: exempt messages whose history shows they were accepted while
-unresolved. `_peer_cmd_send`'s `unknown_peer` flag (`cctrl:2628-2650`) already
-computes this; if it is not currently recorded, record it in the message
-`history` array — an **append**, which does not touch the 023 construction block
-— rather than adding a top-level field. Plan 034's send-time stamp removes the
-ambiguity entirely; this plan must be correct without it.
+The message **already carries** `unknown_peer: true` at the top level when sent
+via `--allow-unknown` (`cctrl:2686`) — an earlier draft wrongly claimed this was
+an unrecorded local and proposed writing it into `history`; that was both
+unnecessary and self-contradictory, since `history` is built inside the same
+`jq -cn` block (`cctrl:2663-2686`) the plan forbids editing. **Read** the
+existing `unknown_peer` field; do not write anything new. Exempt any message
+with `unknown_peer: true` from the guard.
 
-**Where to enforce.** Two call sites, one shared predicate:
+The known imprecision (the flag also fires for an unresolved *sender*) is
+accepted per the acceptance criteria above: it can only cause under-blocking
+(fail-open), never a false block, and plan 034's recipient-specific stamp
+removes it. This plan must be correct — never misroute — without 034; it simply
+tolerates the occasional missed block until 034 lands.
 
-1. `_peer_cmd_recv` — extend the `select(.to == $who …)` filter. This is the
-   content gate and the one that actually prevents disclosure.
-2. `_peer_deliver_one_locked` / `_peer_tmux_target_for_delivery`
-   (`cctrl:3068`, `cctrl:3295-3330`) — so a recycled name does not even get
-   nudged, and the queued count reported to the sender excludes blocked mail.
+**Where to enforce.** One shared predicate, applied at every surface that can
+disclose a body — Codex's review flagged that `recv` is not the only one:
+
+1. `_peer_cmd_recv` (`cctrl:2947-2966`) — the primary read-out. Also the
+   plumbing gap: it must gain access to `peer.created_at`, which
+   `_mailbox_resolve_identity_for_mode` (`cctrl:2532-2541`) currently discards.
+2. `_peer_cmd_inbox` (`cctrl:2724-2728`) and `_peer_cmd_show` (`cctrl:2767-2791`)
+   — both render full message objects including the body. A guard that covers
+   only `recv` still leaks here. Either filter guarded messages out of these, or
+   redact their body, and state which.
+3. `_peer_deliver_one_locked` / delivery nudge (`cctrl:3068`, `cctrl:3295-3330`)
+   — so a recycled name is not nudged and the sender's queued count excludes
+   blocked mail. Note `_peer_record_nudge_json` (`cctrl:3173-3188`) only records
+   nudge metadata and leaves status `queued`; blocking at the nudge does **not**
+   stop `recv` on its own, which is why the status/selection change in the
+   acceptance criteria is load-bearing.
 
 Implement the predicate once (e.g. `_peer_message_addressee_current`) and call
-it from both, so the two paths cannot drift — the nudge and the read-out
-disagreeing is how a partial fix would present.
+it from every surface above, so they cannot drift — one surface disagreeing is
+how a partial fix leaks.
 
 **Do not auto-reroute.** When the guard fires, the correct action is to withhold
 and report, never to guess a successor. Misrouting is worse than failing: a

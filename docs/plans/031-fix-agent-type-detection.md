@@ -26,6 +26,13 @@ the full argv including the seed prompt, which is passed as a trailing
 positional argument. So **any Claude session whose prompt contains the string
 `codex` is labelled `codex`**, including `~/.codex/...` paths and prose.
 
+**Second sniff site, same defect.** `_session_agent_cmd` itself (`cctrl:4485`)
+decides whether to fall back to the pane's child process using the *same*
+`*claude*`/`*codex*` substring test on the parent argv. A wrapper whose parent
+argv contains `codex` in a non-binary token satisfies the test and suppresses
+the child lookup. This plan must fix that site too, not only the display-time
+classifier at `cctrl:4818`.
+
 Confirmed live on two sessions. `TMUX--ms--cctrl` was spawned with an explicit
 `--agent claude` and registered as `codex`, because its briefing text contained
 the word `codex`. `TMUX--ms--obsidian-vault--5` matches because its prompt cites
@@ -44,17 +51,25 @@ the nudge and presses Enter — answering the modal. This defeats commits
 
 **Acceptance criteria:**
 
-- [ ] `_session_write_metadata` persists an `agent` field. The value is already
+- [ ] `_session_write_metadata` persists an `agent` field. This is a
+      **signature change** to a function with one call site (`cctrl:1760`); the
+      implementer must add the parameter to the `jq -n` object at
+      `cctrl:1188-1220` and pass `$detach_agent` at the call site. The value is
       available at launch: `CCTRL_AGENT` is exported at `cctrl:444` and
       `cctrl:1619` (`$detach_agent`), and `--agent` is parsed at `cctrl:1480`.
 - [ ] `_session_list` prefers the recorded metadata `agent` over any sniff.
 - [ ] The sniff **fallback** matches on `argv[0]`'s basename, not a substring of
       the full command string, and does not privilege `codex` over `claude`.
+      **Both** sniff sites are fixed: the display classifier (`cctrl:4818`) and
+      the child-fallback gate inside `_session_agent_cmd` (`cctrl:4485`). Route
+      both through one shared helper so they cannot diverge.
 - [ ] A Claude session whose prompt/argv contains the string `codex` (including
       `~/.codex/...`) reports `agent=claude`. Regression-test this literal case.
 - [ ] A real Codex session still reports `agent=codex`.
-- [ ] `_session_prune`'s duplicate `*codex*`-first test (`cctrl:5864-5876`) is
-      fixed via the same shared helper, not patched independently.
+- [ ] `_session_prune`'s duplicate `*codex*`-first test (`cctrl:5863-5869`) is
+      fixed via the same shared helper, not patched independently. (This is a
+      hard ordering dependency for plan 033, which routes name-release through
+      prune.)
 - [ ] `cctrl peer doctor`'s hook routing (`cctrl:4254`, gated on
       `[[ -z "$agent" || "$agent" == "codex" ]]`) resolves correctly for a
       mislabelled-today Claude session.
@@ -113,7 +128,8 @@ write the matcher as an exhaustive `case` rather than two sequential `[[ ]]`
 tests, so a future third agent cannot reintroduce the ordering bug.
 
 **Metadata shape.** Add `agent` to the `jq -n` object literal at
-`cctrl:1189-1220`, normalized through `_normalize_agent` (`cctrl:129`) so the
+`cctrl:1189-1220`, normalized through `_normalize_agent` (defined at
+`cctrl:98`; the call sites at `cctrl:129`/`cctrl:235` show its use) so the
 stored value matches the vocabulary `_session_list` and `_peer_derived_json`
 already expect. Follow the existing empty→null convention in that block so an
 unset agent stores `null`, not `""` — `_peer_derived_json`'s
