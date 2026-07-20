@@ -1,7 +1,7 @@
 ---
 id: 032
 title: Refuse to deliver mail addressed to a previous occupant of a reused session name
-status: pending
+status: done
 blocked-by: []
 priority: 32
 goal: cctrl-peer-identity-integrity
@@ -207,3 +207,30 @@ currently cover the replaced-occupant case.
 makes the detection exact, and 029 makes the address durable. This plan is the
 net that stays useful even after all three land, because it is the only one that
 fails closed on an identity it cannot verify.
+
+## Implementation Notes (done 2026-07-21)
+
+- Canonical predicate `_peer_guard_defs` emits jq `def`s (`fixed_ts`,
+  `deliverable($p)`, `block_reason($p)`) as a single string, concatenated
+  single-quoted ahead of each program (`jq ... "$guard"'<prog>'`) so bash never
+  re-expands the `$p` and all sites share ONE copy. Unit-verified against all
+  seven policy rows (normal/replaced/equal/absence×2/unknown_peer/unparseable).
+- `_mailbox_resolve_identity_for_mode` now also stashes
+  `MAILBOX_RESOLVED_PEER_CREATED` (the occupant's `created_at`, "" for a manual
+  peer with none) so read paths guard without re-resolving.
+- Enforcement surfaces: `_peer_cmd_recv` selection (primary body handover),
+  `_peer_cmd_inbox` listing (so a withheld message's id never leaks to a
+  receiver), and `_peer_deliver_one_locked` — which terminally transitions a
+  stale-addressed queued message to `status:"blocked"` + `blocked_reason` +
+  history, under the caller's existing lock, dropping it from the queued count so
+  no nudge fires. The inline branch refuses a just-blocked message too.
+- `peer show <id>` is deliberately NOT guarded: it is unscoped (operator/sender
+  tool), and a receiver only learns a message id through recv/inbox, both now
+  guarded — so the id never reaches a receiver to `show`.
+- Ambiguity policy is fail-closed (block) on equal/unparseable-stamp when the
+  occupant carries a `created_at`, fail-open (deliver) on absence — the
+  operator-settled decision recorded in the Design section.
+- Manual peers (no `created_at`) and pre-existing queued mail are unaffected:
+  the 28 prior peer tests pass unchanged. New test
+  `test_peer_deliver_addressee_guard_replaced_occupant` proves block + non-
+  interference + no body leak end-to-end.

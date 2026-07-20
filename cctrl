@@ -1869,6 +1869,39 @@ _peer_now_utc() {
     date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+_peer_guard_defs() {
+    # Canonical addressee-guard predicate, emitted as jq `def`s so every
+    # enforcement site (recv, inbox, delivery) shares ONE copy and cannot drift.
+    # Injected by concatenating this (single-quoted, so bash never re-expands the
+    # `$p` inside) ahead of each program: jq ... "$GUARD"'<program>'.
+    #
+    # $p is the CURRENT occupant's created_at for the message's `to` name ("" if
+    # the occupant carries no stamp). A tmux session name doubles as a mailbox
+    # address and freed indices are recycled, so a name can be re-held by a
+    # different session; delivering mail queued for the prior occupant to the new
+    # one is silent misrouting. Policy — fail OPEN on absence, CLOSED on
+    # ambiguity:
+    #   deliver  = pre-seed (unknown_peer), or no stamp on either side (name was
+    #              always the only identity), or the occupant PROVABLY predates
+    #              the message (message.created_at > peer.created_at)
+    #   block    = everything else where the occupant carries a stamp: message
+    #              newer (replaced), equal-second tie, or an unparseable message
+    #              stamp (e.g. a CCTRL_NOW_UTC override). Misroute is worse than a
+    #              bounce; a block fails loud and the sender is told.
+    # Timestamps are fixed-width ISO-8601 UTC, so lexical compare == chronological.
+    cat <<'JQ'
+def fixed_ts: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
+def deliverable($p):
+  (.unknown_peer == true)
+  or ($p == null or $p == "")
+  or ((.created_at // "") == "")
+  or (((.created_at | fixed_ts) and ($p | fixed_ts)) and (.created_at > $p));
+def block_reason($p):
+  if ((.created_at | fixed_ts) and ($p | fixed_ts) and (.created_at < $p))
+  then "addressee-replaced" else "addressee-ambiguous" end;
+JQ
+}
+
 _peer_validate_label() {
     local kind="$1" value="${2:-}"
     if [[ -z "$value" ]]; then
@@ -2567,6 +2600,10 @@ _mailbox_resolve_identity_for_mode() {
         return 1
     fi
     MAILBOX_RESOLVED_IDENTITY="$(jq -r '.name' <<< "$peer_json")"
+    # Stash the current occupant's created_at so read paths (recv, inbox) can
+    # apply the addressee guard without re-resolving. Empty when the peer carries
+    # no stamp (manual peer) — the guard treats that as absence and delivers.
+    MAILBOX_RESOLVED_PEER_CREATED="$(jq -r '.created_at // ""' <<< "$peer_json")"
 }
 
 _peer_cmd_send() {
@@ -2746,11 +2783,15 @@ _peer_cmd_inbox() {
     done
     _mailbox_resolve_identity_for_mode "$as_identity" "$json" || return $?
     identity="$MAILBOX_RESOLVED_IDENTITY"
+    local peer_created="$MAILBOX_RESOLVED_PEER_CREATED" guard
+    guard="$(_peer_guard_defs)"
     _mailbox_read_json_or_error "$json" || return $?
     messages="$MAILBOX_MESSAGES"
     statuses="$(_mailbox_status_filter_json "$status_csv" "queued,delivered")"
-    messages="$(jq --arg who "$identity" --argjson statuses "$statuses" '
-        [ .[] | .status as $status | select(.to == $who and ($statuses | index($status))) ]
+    # Addressee guard: a listing must not reveal mail (or its id) queued for a
+    # previous occupant of this name, or a receiver could then `peer show` it.
+    messages="$(jq --arg who "$identity" --arg peer "$peer_created" --argjson statuses "$statuses" "$guard"'
+        [ .[] | .status as $status | select(.to == $who and ($statuses | index($status)) and deliverable($peer)) ]
     ' <<< "$messages")"
     if $json; then
         jq '.' <<< "$messages"
@@ -2965,6 +3006,8 @@ _peer_cmd_recv() {
     done
     _mailbox_resolve_identity_for_mode "$as_identity" "$json" || return $?
     identity="$MAILBOX_RESOLVED_IDENTITY"
+    local peer_created="$MAILBOX_RESOLVED_PEER_CREATED" guard
+    guard="$(_peer_guard_defs)"
     statuses="$(_mailbox_status_filter_json "$status_csv" "queued,delivered")"
 
     _mailbox_lock_acquire || return 1
@@ -2972,10 +3015,13 @@ _peer_cmd_recv() {
         _mailbox_read_json_or_error "$json" || rc=$?
         if [[ $rc -eq 0 ]]; then
             messages="$MAILBOX_MESSAGES"
-            selected_id="$(jq -r --arg who "$identity" --argjson statuses "$statuses" '
+            # Addressee guard: never read out a message whose current occupant
+            # post-dates it (a recycled name). recv is the primary body-handover
+            # path, so this is the load-bearing disclosure gate.
+            selected_id="$(jq -r --arg who "$identity" --arg peer "$peer_created" --argjson statuses "$statuses" "$guard"'
                 def allowed($s): ($statuses | index($s)) != null;
-                ([.[] | select(.to == $who and .status == "queued" and allowed("queued"))][0].id)
-                // ([.[] | select(.to == $who and .status == "delivered" and allowed("delivered"))][0].id)
+                ([.[] | select(.to == $who and .status == "queued" and allowed("queued") and deliverable($peer))][0].id)
+                // ([.[] | select(.to == $who and .status == "delivered" and allowed("delivered") and deliverable($peer))][0].id)
                 // empty
             ' <<< "$messages")"
             if [[ -z "$selected_id" ]]; then
@@ -3287,8 +3333,10 @@ _peer_print_delivery_human() {
 _peer_deliver_one_locked() {
     local peer_json="$1" messages="$2" dry_run="$3" json="$4" no_submit="$5" force_busy="$6" inline_id="$7"
     local peer agent target queued now nudge buffer submit payload result message_body message_to updated recent
+    local peer_created guard blocked_now msg_status
     peer="$(jq -r '.name' <<< "$peer_json")"
     agent="$(jq -r '.agent // empty' <<< "$peer_json")"
+    peer_created="$(jq -r '.created_at // ""' <<< "$peer_json")"
     PEER_DELIVER_PEER="$peer"
     PEER_DELIVER_TARGET=""
     PEER_DELIVER_REASON=""
@@ -3297,6 +3345,28 @@ _peer_deliver_one_locked() {
     PEER_DELIVER_DRY_RUN="$dry_run"
     PEER_DELIVER_INLINE=false
     PEER_DELIVER_SUBMITTED=false
+
+    # Addressee guard (plan 032): before nudging or counting, terminally block
+    # any queued message whose CURRENT occupant of this name post-dates it — a
+    # recycled tmux name now held by a different session. Marking blocked (not
+    # deleting) leaves an audit trail the sender sees in `outbox`, and drops the
+    # message from the queued count so no nudge fires. Runs inside the caller's
+    # mailbox lock, like the failure-record rewrite below.
+    guard="$(_peer_guard_defs)"
+    blocked_now="$(jq --arg who "$peer" --arg peer "$peer_created" --arg now "$(_peer_now_utc)" "$guard"'
+        map(
+          if (.to == $who and .status == "queued" and (deliverable($peer) | not)) then
+            .status = "blocked"
+            | .updated_at = $now
+            | .blocked_reason = block_reason($peer)
+            | .history = ((.history // []) + [{at: $now, status: "blocked", reason: block_reason($peer), by: "cctrl"}])
+          else . end
+        )
+    ' <<< "$messages")"
+    if [[ "$blocked_now" != "$messages" ]]; then
+        _mailbox_rewrite_json_locked "$blocked_now"
+        messages="$blocked_now"
+    fi
 
     if [[ -n "$inline_id" ]]; then
         PEER_DELIVER_INLINE=true
@@ -3311,6 +3381,16 @@ _peer_deliver_one_locked() {
         if [[ "$message_to" != "$peer" ]]; then
             PEER_DELIVER_STATUS="failed"
             PEER_DELIVER_REASON="message $inline_id is addressed to $message_to"
+            PEER_DELIVER_QUEUED=0
+            _peer_delivery_result_json
+            return 1
+        fi
+        # Addressee guard: if the transition above blocked this specific message,
+        # do not hand its body to the current (wrong) occupant.
+        msg_status="$(jq -r --arg id "$inline_id" '[.[] | select(.id == $id)][0].status // empty' <<< "$messages")"
+        if [[ "$msg_status" == "blocked" ]]; then
+            PEER_DELIVER_STATUS="failed"
+            PEER_DELIVER_REASON="$(jq -r --arg id "$inline_id" '[.[] | select(.id == $id)][0].blocked_reason // "addressee-replaced"' <<< "$messages")"
             PEER_DELIVER_QUEUED=0
             _peer_delivery_result_json
             return 1

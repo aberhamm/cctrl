@@ -2404,6 +2404,45 @@ test_peer_deliver_tmux_nudge_lifecycle() {
     ' >/dev/null || fail "expected successful nudge metadata without status transition"
 }
 
+test_peer_deliver_addressee_guard_replaced_occupant() {
+    # plan 032: a name's tmux slot can be recycled to a different session. Mail
+    # queued for the PRIOR occupant must never reach the new one. The current
+    # occupant (metadata created_at 13:00) post-dates a stale message (12:00) but
+    # not a fresh one (14:00): the stale is blocked (addressee-replaced), the
+    # fresh still delivers. Absence and unknown_peer fail open; ambiguity blocks.
+    local bin="$TMPDIR/guardbin" data="$TMPDIR/guard-data"
+    mkdir -p "$bin" "$data"
+    make_fake_tmux "$bin/tmux"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--recycled.json" <<'JSON'
+{"name":"TMUX--recycled","agent":"claude","created_at":"2026-07-20T13:00:00Z","cctrl_managed":true,"host":"local","cwd":"/tmp/x","target":"/tmp/x","target_kind":"dir"}
+JSON
+    cat > "$data/messages.jsonl" <<'JSON'
+{"id":"msg_stale","from":"orchestrator","to":"TMUX--recycled","status":"queued","subject":"hold","body":"SECRET do NOT run against corp","created_at":"2026-07-20T12:00:00Z","updated_at":"2026-07-20T12:00:00Z","history":[]}
+{"id":"msg_fresh","from":"orchestrator","to":"TMUX--recycled","status":"queued","subject":"ok","body":"fresh body ok","created_at":"2026-07-20T14:00:00Z","updated_at":"2026-07-20T14:00:00Z","history":[]}
+JSON
+    local out log="$TMPDIR/guard-tmux.log"; : > "$log"
+
+    # Delivery: stale -> blocked (addressee-replaced), fresh -> nudged. Nudge
+    # must not leak the stale body.
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--recycled" TMUX_FAKE_HAS_SESSION="TMUX--recycled" TMUX_FAKE_PANE_PID=9001 CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-07-20T15:00:00Z" "$ROOT/cctrl" peer deliver TMUX--recycled --json)"
+    jq -s -e 'any(.[]; .id=="msg_stale" and .status=="blocked" and .blocked_reason=="addressee-replaced")' "$data/messages.jsonl" >/dev/null || fail "expected stale message blocked as addressee-replaced"
+    jq -s -e 'any(.[]; .id=="msg_fresh" and .status=="queued")' "$data/messages.jsonl" >/dev/null || fail "expected fresh message to stay deliverable"
+    printf '%s\n' "$out" | jq -e '.results[0].queued == 1' >/dev/null || fail "expected queued count to exclude the blocked message"
+    assert_not_contains "$(cat "$log")" "SECRET do NOT run against corp"
+
+    # recv as the current occupant returns ONLY the fresh message, never the
+    # stale one meant for the previous occupant of this name.
+    out="$(PATH="$bin:$PATH" TMUX_FAKE_SESSIONS="TMUX--recycled" TMUX_FAKE_HAS_SESSION="TMUX--recycled" TMUX_FAKE_PANE_PID=9001 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as TMUX--recycled --json)"
+    assert_contains "$out" '"id": "msg_fresh"'
+    assert_not_contains "$out" "SECRET do NOT run against corp"
+
+    # inbox as the occupant must not list the withheld message either.
+    out="$(PATH="$bin:$PATH" TMUX_FAKE_SESSIONS="TMUX--recycled" TMUX_FAKE_HAS_SESSION="TMUX--recycled" TMUX_FAKE_PANE_PID=9001 CCTRL_DATA_DIR="$data" CCTRL_PEER=TMUX--recycled "$ROOT/cctrl" peer inbox --as TMUX--recycled --status blocked,queued,delivered --json 2>/dev/null || true)"
+    assert_not_contains "$out" "msg_stale"
+    echo "ok: replaced-occupant mail is blocked; fresh mail for the new occupant still flows"
+}
+
 test_peer_deliver_busy_no_submit_and_inline() {
     make_fake_tmux "$TMPDIR/tmux"
     local data="$TMPDIR/deliver-busy-data"
@@ -3386,6 +3425,7 @@ test_peer_polling_json_contracts
 test_peer_polling_identity_and_errors
 test_peer_mcp_bridge_stdio
 test_peer_deliver_tmux_nudge_lifecycle
+test_peer_deliver_addressee_guard_replaced_occupant
 test_peer_deliver_busy_no_submit_and_inline
 test_peer_deliver_claude_modal_detection
 test_peer_deliver_codex_modal_detection
