@@ -29,6 +29,24 @@ too many heavy sessions exhausted RAM.
   sessions` line for at-a-glance local health.
 
 ### Fixed
+- `cctrl peer deliver` no longer silently misroutes a queued message to a
+  different session that has taken over the recipient's tmux session name. A
+  tmux name doubles as a mailbox address and freed name slots are reused, so a
+  resumed or brand-new session can inherit a name and receive mail meant for the
+  name's previous occupant — including hard-holds and corrections meant for
+  someone else. Delivery, `peer recv`, and `peer inbox` now withhold a message
+  whose current occupant was created after the message was sent: it is marked
+  `addressee-replaced` (or `addressee-ambiguous` when the timestamps tie or the
+  message stamp can't be parsed) and the sender is told, instead of the wrong
+  session silently acting on it. Sessions with no recorded creation time (manual
+  peers) and already-queued mail are unaffected.
+- `cctrl session ls` and `cctrl peer ls` now identify a session's agent by its
+  process name rather than scanning the whole command line, so a Claude session
+  whose prompt happens to mention `codex` (or a `~/.codex/...` path) is no
+  longer mislabeled `codex`. This was not cosmetic: the agent field selects
+  which approval-modal pattern `peer deliver` scans for, so a mislabeled Claude
+  session could have a delivery nudge pasted into an open modal. The agent
+  runtime is now also recorded in session metadata at spawn.
 - `cctrl peer deliver` no longer silently defers messages to Claude sessions
   that are emitting normal output. The claude modal-detector grepped the pane
   for `. 1\.` — whose `.` is a regex any-char, not the intended `❯` arrow — so
