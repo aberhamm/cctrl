@@ -1,7 +1,8 @@
 ---
 id: 033
 title: Stop handing a freed session index to the next spawn
-status: pending
+status: superseded
+superseded-by: 029
 blocked-by: [031]
 priority: 33
 goal: cctrl-peer-identity-integrity
@@ -102,3 +103,30 @@ fail-closed guard.
 persisting the conversation UUID→name mapping, which is plan 029's territory;
 once identity is UUID-keyed, reclaiming is nearly free and this plan's retention
 set becomes the lookup table for it.
+
+## Decision — superseded, folded into 029 (2026-07-21)
+
+Not implemented as a standalone plan. Operator decision after 031/032 landed:
+
+1. **The safety hole it defended is already closed.** Plan 032 blocks delivery
+   to a replaced occupant, so recycling a name can no longer misroute mail. 033
+   was the source-removal complement to a live defect that 032 now contains.
+
+2. **Blast radius vs. value.** Measured on the live fleet: `data/sessions/` held
+   83 metadata files, 68 for names with no live tmux session. Under this plan's
+   "a metadata file reserves the name" mechanism, all 68 idle names would be
+   reserved the instant it lands, jumping new spawns to higher indices
+   fleet-wide — a visible naming change for defense-in-depth that 032 already
+   covers.
+
+3. **It belongs in the durable design.** Plan 029 re-keys peer identity onto a
+   stable session id, tmux name as display alias only. Once identity no longer
+   rides the tmux name, name-recycling is *moot*, not merely patched — there is
+   nothing to collide. Folding "don't recycle" into 029 (as a property of the
+   stable-id design, e.g. a retention/high-water map keyed on the stable id)
+   subsumes this plan cleanly.
+
+**Action for 029's owner:** carry forward one requirement from here — the
+retention set 029 needs for stable-id→name mapping is the same structure that
+would let `--resume` reclaim its original name, so build it once. The Design
+section below is preserved as input to that work; do not implement it separately.
