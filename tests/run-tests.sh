@@ -1738,6 +1738,111 @@ JSON
     echo "ok: session ls STATE surfaces rich states with fail-safe fallback to base"
 }
 
+# --- plan 030: unsent-draft detector must fire on the real ❯ (U+276F) glyph ---
+# The detector anchored on ASCII '>' but Claude Code's input line begins with
+# '❯', so it never fired on a real pane. These tests exercise the fixed detector
+# against fixtures MODELED ON real `tmux capture-pane` output (committed under
+# tests/fixtures/), through the pure function, the rich-state path, and the
+# autoheal safety gate.
+test_session_pane_has_draft_glyph_fixtures() {
+    # Unit test: source the pure detector out of cctrl and assert it against the
+    # committed real-pane fixtures. A draft line beginning with '❯' (and the
+    # legacy ASCII '>') must be detected; an empty box showing only placeholder /
+    # hint text must NOT be — the glyph-independent exclusion filter still holds.
+    local fn="$TMPDIR/pane-draft-fn.sh"
+    awk '/^_session_pane_has_draft\(\) \{/,/^}/' "$ROOT/cctrl" > "$fn"
+    # shellcheck source=/dev/null
+    source "$fn"
+
+    local fx="$ROOT/tests/fixtures"
+    # (a) real ❯ draft pane → detected.
+    _session_pane_has_draft "$(cat "$fx/pane-draft.txt")" \
+        || fail "expected ❯ (U+276F) draft fixture to be detected as a draft"
+    # legacy ASCII '>' form → still detected (no regression).
+    _session_pane_has_draft "> commit the plans" \
+        || fail "expected ASCII '>' draft to remain detected"
+    # (b) empty box with placeholder/hint text → NOT a draft.
+    ! _session_pane_has_draft "$(cat "$fx/pane-empty-hint.txt")" \
+        || fail "expected empty/hint fixture to NOT read as a draft"
+    # A bare placeholder line under the ❯ glyph is excluded too.
+    ! _session_pane_has_draft '❯ Try "write a test for the parser"' \
+        || fail "expected ❯ placeholder 'Try ...' line to be excluded"
+    echo "ok: _session_pane_has_draft fires on ❯ and > drafts, ignores hint text"
+}
+
+test_session_rich_state_detects_glyph_draft() {
+    # A pane holding a real ❯ (U+276F) input line must surface as unsent-draft
+    # through the full `session ls` rich-state path — proving the glyph fix
+    # reaches the fleet view, not just the unit detector.
+    local bin="$TMPDIR/glyphdraft-bin" sdir="$TMPDIR/glyphdraft-sessions"
+    mkdir -p "$bin" "$sdir"
+
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+target=""
+for ((i=1;i<=$#;i++)); do
+    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
+done
+case "${1:-}" in
+    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
+    list-panes)
+        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
+        echo 9310; exit 0;;
+    display-message) echo 0; exit 0;;
+    display) echo 0; exit 0;;
+    capture-pane) cat "$DRAFT_FIXTURE"; exit 0;;
+    show-option) echo 1; exit 0;;
+    *) exit 0;;
+esac
+SH
+    chmod +x "$bin/tmux"
+
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+    *9310*) echo "claude"; exit 0;;
+esac
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+
+    cat > "$sdir/9310.json" <<'JSON'
+{"pid":9310,"sessionId":"glyphdraft-uuid","status":"idle"}
+JSON
+
+    local out state
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        DRAFT_FIXTURE="$ROOT/tests/fixtures/pane-draft.txt" \
+        TMUX_FAKE_SESSIONS="TMUX--glyphdraft" "$ROOT/cctrl" session ls --json)"
+    state="$(printf '%s' "$out" | jq -r '.[0].state')"
+    [[ "$state" == "unsent-draft" ]] \
+        || fail "expected ❯ draft pane to surface as unsent-draft; got: $state"
+    echo "ok: rich-state surfaces a ❯ (U+276F) input line as unsent-draft"
+}
+
+test_session_autoheal_skips_glyph_draft() {
+    # SAFETY GATE (plan 030): a dead bridge whose input line holds a real ❯
+    # (U+276F) draft must be SKIPPED — /rc begins with C-u, which would erase it.
+    # Before the glyph fix this gate never fired against a real pane, so the
+    # scheduled C-u ran unguarded. Proven here against the real-pane fixture.
+    local bin="$TMPDIR/ah-glyph-bin" sdir="$TMPDIR/ah-glyph-sessions"
+    local rlog="$TMPDIR/ah-glyph-repair.log" hlog="$TMPDIR/ah-glyph-heal.log"
+    _autoheal_fixture "$bin" "$sdir" "idle"
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE="$(cat "$ROOT/tests/fixtures/pane-draft.txt")" \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"action": "skipped"'
+    assert_contains "$out" '"reason": "unsent-draft"'
+    [[ -s "$rlog" ]] && fail "❯ draft session must NOT be repaired (repair log non-empty)"
+    assert_contains "$(cat "$hlog")" "skipped TMUX--ms--portal (unsent-draft)"
+    echo "ok: autoheal safety gate skips a ❯ (U+276F) real-pane draft"
+}
+
 test_needs_me_digest() {
     # needs-me (plan 022) diffs each session's rich STATE (plan 016) against a
     # snapshot from the previous run and reports only sessions that NEWLY entered
@@ -3642,6 +3747,7 @@ test_session_doctor_realign_idempotent
 test_session_doctor_realign_real_relaunch
 test_session_autoheal_dry_run_selects_dead_and_no_repair
 test_session_autoheal_skips_unsent_draft
+test_session_autoheal_skips_glyph_draft
 test_session_autoheal_skips_busy
 test_session_autoheal_skips_copy_mode
 test_session_autoheal_heals_clean_dead_bridge
@@ -3657,6 +3763,8 @@ test_session_list_sorts_by_last_active
 test_session_list_base_state
 test_session_list_recap
 test_session_list_rich_state
+test_session_pane_has_draft_glyph_fixtures
+test_session_rich_state_detects_glyph_draft
 test_needs_me_digest
 test_fleet_merges_multiple_hosts
 test_fleet_sorts_by_recency_across_hosts

@@ -1,7 +1,7 @@
 ---
 id: 030
 title: Fix the unsent-draft detector so its safety gates actually work
-status: blocked
+status: done
 blocked-by: []
 priority: 30
 goal: cctrl-peer-messaging-discoverable-models
@@ -9,6 +9,7 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-07-19
+completed: 2026-07-22
 ---
 
 ## Requirements

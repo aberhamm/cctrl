@@ -1,0 +1,6 @@
+● All done — the refactor is complete and the suite is green.
+
+╭──────────────────────────────────────────────────────────────╮
+│ ❯ commit the plans                                           │
+╰──────────────────────────────────────────────────────────────╯
+  ? for shortcuts

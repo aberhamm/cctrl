@@ -1,0 +1,6 @@
+● Ready for the next task.
+
+╭──────────────────────────────────────────────────────────────╮
+│ ❯ Try "fix the failing parser test"                          │
+╰──────────────────────────────────────────────────────────────╯
+  ? for shortcuts · / for commands · ⏎ for newline · esc to interrupt

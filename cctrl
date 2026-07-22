@@ -4979,14 +4979,16 @@ _session_pane_has_dialog() {
 
 _session_pane_has_draft() {
     # True (exit 0) when the captured pane shows a non-empty Claude Code input
-    # line — a prompt '>' followed by typed, unsubmitted text. Anchored to the
-    # start of the line (optionally inside the input box border) so it doesn't
-    # match a stray '>' elsewhere. Known placeholder / hint text (the dimmed
-    # "Try ..." prompt, shortcut hints) is excluded so an EMPTY input box never
-    # reads as a draft. Fragile pane detector (eng-flagged); read-only.
+    # line — a prompt glyph ('>' or Claude Code's '❯' U+276F) followed by typed,
+    # unsubmitted text. Anchored to the start of the line (optionally inside the
+    # input box border) so it doesn't match a stray glyph elsewhere. Both glyphs
+    # are accepted because the real Claude Code input line begins with '❯', not
+    # ASCII '>' (plan 030). Known placeholder / hint text (the dimmed "Try ..."
+    # prompt, shortcut hints) is excluded so an EMPTY input box never reads as a
+    # draft. Fragile pane detector (eng-flagged); read-only.
     local capture="$1"
     printf '%s\n' "$capture" \
-        | grep -E '^[[:space:]│|]*>[[:space:]]+[^[:space:]]' \
+        | grep -E '^[[:space:]│|]*[>❯][[:space:]]+[^[:space:]]' \
         | grep -Eiv 'Try "|for shortcuts|for commands|for newline|esc to (interrupt|cancel)|/ for' \
         >/dev/null 2>&1
 }
