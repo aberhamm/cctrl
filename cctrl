@@ -4533,7 +4533,7 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | doctor | current | attach | prune | close | kill>"
+            echo "Usage: cctrl session <ls | doctor | current | attach | say | prune | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
@@ -4544,6 +4544,12 @@ cmd_session() {
             echo "    uninstall                    Remove the launchd timer"
             echo "  cctrl session current [--json] Show this process/session identity"
             echo "  cctrl session attach [name]    Reattach (interactive picker if no name)"
+            echo "  cctrl session say <name> -- <msg>  Paste a direct chat message into a live"
+            echo "                                 tmux session (Enter by default); no mailbox state"
+            echo "    --no-submit                  Paste the message without pressing Enter"
+            echo "    --body-file PATH|-           Read the body from a file or stdin (keeps newlines)"
+            echo "    --force-busy                 Paste when readiness is unknown (never a known modal)"
+            echo "    --json                       Machine-readable result (ok, session, submitted, status)"
             echo "  cctrl session prune            Propose stale / never-prompted sessions to close"
             echo "                                 (DRY-RUN by default — closes nothing)"
             echo "    --older-than DURATION        Staleness threshold (default 72h; e.g. 7d/48h)"
@@ -4565,6 +4571,7 @@ cmd_session() {
         autoheal)  _session_autoheal "$@" ;;
         current|whoami|identity) _session_current "$@" ;;
         attach|a)  _session_attach "${1:-__picker__}" ;;
+        say)       _session_say "$@" ;;
         prune)     _session_prune "$@" ;;
         close|stop) _session_close "$@" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
@@ -4597,6 +4604,157 @@ _session_agent_cmd() {
         fi
     fi
     printf '%s' "$cmd"
+}
+
+_session_tmux_paste() {
+    # Generic tmux buffer paste (+ optional Enter). A session-scoped twin of
+    # _peer_tmux_paste, kept deliberately separate: `session say` shares no
+    # mailbox state and none of the PEER_DELIVER_* globals with peer delivery.
+    # Sets SESSION_SAY_REASON on failure. Same fail-fast buffer lifecycle as
+    # peer delivery: always delete the buffer, even on the paste/submit error path.
+    local target="$1" buffer="$2" payload="$3" submit="${4:-true}"
+    SESSION_SAY_REASON=""
+    if ! _tmux_run_stdin_with_timeout "$payload" load-buffer -b "$buffer" -; then
+        SESSION_SAY_REASON="${TMUX_RUN_ERROR:-tmux load-buffer failed}"
+        [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux load-buffer failed"
+        return 1
+    fi
+    if ! _tmux_run_with_timeout paste-buffer -b "$buffer" -t "$target"; then
+        SESSION_SAY_REASON="${TMUX_RUN_ERROR:-tmux paste-buffer failed}"
+        [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux paste-buffer failed"
+        _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+        return 1
+    fi
+    if [[ "$submit" == "true" ]]; then
+        if ! _tmux_run_with_timeout send-keys -t "$target" Enter; then
+            SESSION_SAY_REASON="${TMUX_RUN_ERROR:-tmux send-keys failed}"
+            [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux send-keys failed"
+            _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+            return 1
+        fi
+    fi
+    _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
+    return 0
+}
+
+_session_say_json() {
+    # Machine-readable `session say` result. Always emits ok/session/submitted/
+    # status; reason only when non-empty.
+    local ok="$1" session="$2" submitted="$3" status="$4" reason="${5:-}"
+    jq -n --argjson ok "$ok" --arg session "$session" --argjson submitted "$submitted" \
+        --arg status "$status" --arg reason "$reason" \
+        '{ok:$ok, session:$session, submitted:$submitted, status:$status}
+         + (if $reason != "" then {reason:$reason} else {} end)'
+}
+
+_session_say() {
+    # Direct live-tmux chat: paste an exact message into a named tmux session
+    # (Enter by default). Intentionally session-first and mailbox-free — it does
+    # not read or write data/messages.jsonl and never records nudge metadata.
+    local sess="${1:-}"
+    if [[ -z "$sess" || "$sess" == -* ]]; then
+        if _arg_has_json "$@"; then
+            _session_say_json false "" false validation "session name required"
+        else
+            echo -e "${RED}Usage: cctrl session say <session> [--no-submit] [--force-busy] [--body-file PATH|-] [--json] -- <message>${RESET}" >&2
+        fi
+        return 64
+    fi
+    shift
+
+    local submit=true json=false force_busy=false body="" body_file="" saw_body=false
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --no-submit)  submit=false; shift ;;
+            --force-busy) force_busy=true; shift ;;
+            --json)       json=true; shift ;;
+            --body-file)
+                [[ $# -ge 2 ]] || { $json && _session_say_json false "$sess" false validation "--body-file needs a value" || echo -e "${RED}--body-file needs a value${RESET}" >&2; return 64; }
+                body_file="$2"; shift 2 ;;
+            --)
+                shift; body="$*"; saw_body=true; break ;;
+            *)
+                $json && _session_say_json false "$sess" false validation "Unknown session say flag: $1" || echo -e "${RED}Unknown session say flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+
+    if [[ -n "$body_file" ]]; then
+        if $saw_body; then
+            $json && _session_say_json false "$sess" false validation "Use either --body-file or -- <message>, not both." || echo -e "${RED}Use either --body-file or -- <message>, not both.${RESET}" >&2
+            return 64
+        fi
+        if [[ "$body_file" == "-" ]]; then
+            _read_body_file -
+            body="$MAILBOX_BODY"
+        elif [[ -f "$body_file" ]]; then
+            _read_body_file "$body_file"
+            body="$MAILBOX_BODY"
+        else
+            $json && _session_say_json false "$sess" false validation "Body file not found: $body_file" || echo -e "${RED}Body file not found: $body_file${RESET}" >&2
+            return 64
+        fi
+        unset MAILBOX_BODY
+        saw_body=true
+    fi
+    if ! $saw_body; then
+        $json && _session_say_json false "$sess" false validation "session say needs --body-file or a message after --." || echo -e "${RED}session say needs --body-file or a message after --.${RESET}" >&2
+        return 64
+    fi
+    if [[ -z "$body" ]]; then
+        $json && _session_say_json false "$sess" false validation "Empty message body." || echo -e "${RED}Empty message body.${RESET}" >&2
+        return 64
+    fi
+
+    if ! command -v tmux >/dev/null 2>&1; then
+        $json && _session_say_json false "$sess" false no-tmux "tmux unavailable" || echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
+        return 69
+    fi
+    if ! _tmux_run_with_timeout has-session -t "$sess"; then
+        local hs_reason="${TMUX_RUN_ERROR:-tmux session not found: $sess}"
+        [[ -n "$hs_reason" ]] || hs_reason="tmux session not found: $sess"
+        $json && _session_say_json false "$sess" false unknown-session "$hs_reason" || echo -e "${RED}Unknown tmux session: $sess${RESET}" >&2
+        return 66
+    fi
+
+    # Infer the agent from the pane's argv[0] (via _agent_from_cmd); may be empty
+    # when the pane runs neither claude nor codex, in which case readiness is
+    # unknown and pasting requires --force-busy.
+    local agent cmd
+    cmd="$(_session_agent_cmd "$sess")"
+    agent="$(_agent_from_cmd "$cmd")"
+
+    # Reuse peer delivery's pane-readiness check. Contract: 0 ready, 1 not ready
+    # (a known modal — never overridden by --force-busy — or unknown readiness
+    # without --force-busy), 2 capture failure.
+    local rc=0
+    _peer_pane_ready_for_delivery "$sess" "$agent" "$force_busy" || rc=$?
+    if (( rc == 1 )); then
+        local busy_reason="${PEER_DELIVER_READY_REASON:-not ready}"
+        $json && _session_say_json false "$sess" false busy "$busy_reason" || echo -e "${YELLOW}Not sent to $sess:${RESET} $busy_reason" >&2
+        return 75
+    elif (( rc == 2 )); then
+        local cap_reason="${PEER_DELIVER_READY_REASON:-capture-pane failed}"
+        $json && _session_say_json false "$sess" false capture-failed "$cap_reason" || echo -e "${RED}Readiness check failed for $sess:${RESET} $cap_reason" >&2
+        return 1
+    fi
+
+    local buffer="cctrl-say-${sess}-$(date +%s)"
+    if ! _session_tmux_paste "$sess" "$buffer" "$body" "$submit"; then
+        local paste_reason="${SESSION_SAY_REASON:-tmux paste failed}"
+        $json && _session_say_json false "$sess" false paste-failed "$paste_reason" || echo -e "${RED}Failed to send to $sess:${RESET} $paste_reason" >&2
+        return 1
+    fi
+
+    if $json; then
+        _session_say_json true "$sess" "$submit" ok ""
+    elif $submit; then
+        echo -e "${GREEN}Sent to $sess${RESET}"
+    else
+        echo -e "${GREEN}Pasted to $sess${RESET} ${DIM}(not submitted)${RESET}"
+    fi
+    return 0
 }
 
 _session_claude_pid() {

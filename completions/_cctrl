@@ -232,6 +232,7 @@ _cctrl() {
                 local -a session_cmds=(
                     'ls:List sessions (dir, agent/shell, model, state)'
                     'attach:Reattach to a session'
+                    'say:Paste a direct chat message into a live tmux session'
                     'close:Gracefully close a session (default: the one you are inside)'
                     'kill:Kill a detached session'
                 )
@@ -239,6 +240,13 @@ _cctrl() {
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == ls ]]; then
                 _arguments \
                     '--json[Machine-readable output]'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == say ]]; then
+                _arguments \
+                    '--no-submit[Paste without pressing Enter]' \
+                    '--body-file[Read body from a file or stdin]:file:_files' \
+                    '--force-busy[Paste when readiness is unknown (never a known modal)]' \
+                    '--json[Machine-readable result]' \
+                    '*:session:_cctrl_tmux_sessions'
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == (close|stop) ]]; then
                 _arguments \
                     '--in[Grace period in seconds]:seconds:' \

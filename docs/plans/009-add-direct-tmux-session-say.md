@@ -1,7 +1,9 @@
 ---
 id: 009
 title: Add direct tmux session say command
-status: pending
+status: done
+completed: 2026-07-22
+qa: automated
 blocked-by: []
 priority: 9
 goal: tmux-peer-direct-chat

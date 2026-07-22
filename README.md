@@ -182,6 +182,30 @@ explicit session name only when you intentionally want to close another session.
 The default grace period is 5 seconds (override per call with `--in`, or
 globally with `CCTRL_CLOSE_GRACE`).
 
+#### Talking to a live session directly
+
+`cctrl session say` is the direct way to chat with an agent that is **already
+running** in a known tmux session. It pastes the exact message into the session's
+pane and presses Enter, the same way you would type into it yourself — no mailbox,
+no queue, no delivery state. Reach for it when the session is live and you just
+want it to act now; use `cctrl peer send` (below) for durable, async work that
+should survive the recipient being away.
+
+```bash
+cctrl session say TMUX--myapp -- "run the test suite and report back"
+cctrl session say TMUX--myapp --no-submit -- "draft reply, I'll hit enter"
+printf 'multi\nline\nbody\n' | cctrl session say TMUX--myapp --body-file -
+cctrl session say TMUX--myapp --json -- "status?"   # {ok, session, submitted, status}
+```
+
+Before pasting, `say` checks the pane is ready: if a Claude/Codex approval or
+trust **modal** is on screen it refuses (`status: busy`, non-zero exit) rather
+than injecting keystrokes into a dialog — and `--force-busy` does **not** override
+a detected modal. `--force-busy` only permits pasting when the agent (and thus its
+readiness) cannot be inferred from the pane. Unknown sessions, empty bodies,
+body-file read errors, and tmux paste failures all fail loudly with a non-zero
+exit. `session say` never reads or writes the peer mailbox.
+
 When a tmux-backed launch runs in an interactive terminal, `cctrl` asks for a
 session purpose before creating the session. Press Enter to accept the inferred
 default, usually the initial `-m` prompt, shortcut name, or project folder. The

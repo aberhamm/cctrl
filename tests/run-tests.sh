@@ -3367,6 +3367,142 @@ test_fleet_version_skew_missing_fields() {
     echo "ok: fleet tolerates version-skew (missing last_active/state -> '-')"
 }
 
+test_session_say_submit_and_no_submit() {
+    # `session say` pastes an exact body into a live tmux session and submits
+    # with Enter by default; --no-submit pastes without pressing Enter. It never
+    # touches mailbox state. The pane runs codex (fake ps, pane pid 12345) with a
+    # benign capture, so readiness passes without --force-busy.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local log="$TMPDIR/say-submit.log" out
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --json -- "hello there")"
+    printf '%s\n' "$out" | jq -e '.ok == true and .session == "TMUX--demo" and .submitted == true and .status == "ok"' >/dev/null \
+        || fail "expected session say submit ok result"
+    assert_contains "$(cat "$log")" "BUFFER hello there"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    assert_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
+    # No mailbox file is created or touched by a direct say.
+    [[ ! -e "$TMPDIR/data/messages.jsonl" ]] || fail "session say must not write messages.jsonl"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --no-submit --json -- "no enter please")"
+    printf '%s\n' "$out" | jq -e '.ok == true and .submitted == false and .status == "ok"' >/dev/null \
+        || fail "expected session say --no-submit result"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    assert_not_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
+
+    echo "ok: session say pastes with Enter by default and honors --no-submit"
+}
+
+test_session_say_body_file_preserves_newlines() {
+    # --body-file PATH and --body-file - preserve multi-line bodies including the
+    # trailing newline (sentinel-guarded read, same as mailbox bodies).
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local log="$TMPDIR/say-body.log" bf="$TMPDIR/say-body.txt" out
+    printf 'line one\nline two\n' > "$bf"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --body-file "$bf" --no-submit --json)"
+    printf '%s\n' "$out" | jq -e '.ok == true' >/dev/null || fail "expected --body-file paste ok"
+    assert_contains "$(cat "$log")" "BUFFER line one"
+    assert_contains "$(cat "$log")" "line two"
+
+    : > "$log"
+    out="$(printf 'from stdin\ntrailing newline kept\n' | PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
+        TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --body-file - --no-submit --json)"
+    printf '%s\n' "$out" | jq -e '.ok == true' >/dev/null || fail "expected stdin body paste ok"
+    assert_contains "$(cat "$log")" "BUFFER from stdin"
+
+    echo "ok: session say --body-file (PATH and -) preserves multi-line bodies and trailing newline"
+}
+
+test_session_say_modal_deferral_not_overridden_by_force_busy() {
+    # A known modal (codex approval dialog visible in the pane) is a hard stop:
+    # status busy, non-zero exit, no paste — and --force-busy must NOT override it.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local log="$TMPDIR/say-modal.log" out rc=0 codex_modal
+    codex_modal="$(printf '%s\n' \
+        '● Applying the proposed patch next.' \
+        '' \
+        '│ Allow Codex to apply proposed code changes?      │' \
+        '│   No, and tell Codex what to do differently      │')"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_CAPTURE_PANE="$codex_modal" \
+        "$ROOT/cctrl" session say TMUX--demo --force-busy --json -- "should be blocked")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit when a modal prompt is visible"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "busy" and .reason == "modal prompt visible"' >/dev/null \
+        || fail "expected status busy for visible modal even with --force-busy"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    echo "ok: session say never overrides a known modal, even with --force-busy"
+}
+
+test_session_say_unknown_readiness_requires_force_busy() {
+    # When the agent can't be inferred (pane runs neither claude nor codex),
+    # readiness is unknown: refuse by default, permit only with --force-busy.
+    make_fake_tmux "$TMPDIR/tmux"   # no fake ps -> pane pid 55555 resolves to no agent
+    local log="$TMPDIR/say-unknown.log" out rc=0
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_PANE_PID=55555 \
+        "$ROOT/cctrl" session say TMUX--demo --json -- "hi")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for unknown agent readiness without --force-busy"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "busy" and .reason == "unknown agent readiness"' >/dev/null \
+        || fail "expected unknown agent readiness refusal"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_PANE_PID=55555 \
+        "$ROOT/cctrl" session say TMUX--demo --force-busy --json -- "hi")"
+    printf '%s\n' "$out" | jq -e '.ok == true and .status == "ok"' >/dev/null \
+        || fail "expected --force-busy to permit paste under unknown readiness"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    echo "ok: session say gates unknown readiness behind --force-busy"
+}
+
+test_session_say_errors() {
+    # Unknown session, empty body, missing body, and tmux paste failure all
+    # produce clear errors and non-zero exits.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local log="$TMPDIR/say-err.log" out rc=0
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="" \
+        "$ROOT/cctrl" session say TMUX--nope --json -- "hi")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for unknown session"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "unknown-session"' >/dev/null || fail "expected unknown-session status"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --json --)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for empty body"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "validation"' >/dev/null || fail "expected validation status for empty body"
+
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --json)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for missing body"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "validation"' >/dev/null || fail "expected validation status for missing body"
+
+    : > "$log"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_PASTE_FAIL=1 \
+        "$ROOT/cctrl" session say TMUX--demo --json -- "boom")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for tmux paste failure"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "paste-failed"' >/dev/null || fail "expected paste-failed status"
+
+    echo "ok: session say reports unknown session, empty/missing body, and tmux paste failures"
+}
+
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -3436,6 +3572,11 @@ test_peer_doorbell_hook
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
+test_session_say_submit_and_no_submit
+test_session_say_body_file_preserves_newlines
+test_session_say_modal_deferral_not_overridden_by_force_busy
+test_session_say_unknown_readiness_requires_force_busy
+test_session_say_errors
 test_session_close_named_immediate
 test_session_close_outside_requires_name
 test_session_prune_never_prompted_claude
