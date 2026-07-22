@@ -2013,6 +2013,7 @@ _peer_derived_json() {
                 agent: .agent,
                 session: .name,
                 purpose: .purpose,
+                display_label: .display_label,
                 capabilities: ["mailbox", "tmux"],
                 source: "derived",
                 tmux_target: .name,
@@ -2053,6 +2054,7 @@ _peer_all_json() {
                 agent: ($v.agent // $derived_merge.agent // null),
                 session: ($derived_merge.session // $v.session // null),
                 purpose: ($v.purpose // $derived_merge.purpose // null),
+                display_label: ($v.display_label // $derived_merge.display_label // null),
                 capabilities: ((($v.capabilities // []) + ($derived_merge.capabilities // [])) | unique),
                 registered_at: ($v.registered_at // null),
                 source: "manual"
@@ -2104,14 +2106,31 @@ _peer_resolve_json() {
 }
 
 _peer_print_human() {
+    # Shared by `peer show` (message envelopes), `peer whoami`, and `peer resolve`
+    # (peer identity objects). Must be generically object-safe: a nested object
+    # (message `sender`, plan 023) or an array of objects (message `.history`)
+    # must never crash or dump raw JSON as an unreadable line. `value` renders
+    # scalars via tostring, arrays of scalars via join (unchanged for peer
+    # objects' aliases/capabilities), and anything nested compactly. `sender`
+    # gets a dedicated readable line.
     jq -r '
         def value:
-          if type == "array" then join(", ")
+          if type == "array" then
+            (map(if type == "object" or type == "array" then tojson else tostring end) | join(", "))
+          elif type == "object" then tojson
           else tostring
           end;
         to_entries[]
         | select(.value != null)
-        | "  \(.key): \(.value | value)"
+        | if .key == "sender" and (.value | type) == "object" then
+            .value as $s
+            | ($s.label // $s.name) as $lbl
+            | ([$s.tmux_target, $s.agent] | map(select(. != null))) as $extra
+            | "  sender: " + $lbl
+              + (if ($extra | length) > 0 then " (" + ($extra | join(", ")) + ")" else "" end)
+          else
+            "  \(.key): \(.value | value)"
+          end
     '
 }
 
@@ -2525,9 +2544,12 @@ _mailbox_status_filter_json() {
 }
 
 _mailbox_print_messages_human() {
+    # Fixed template (inbox/outbox). Show the human sender label when the durable
+    # snapshot carries one (plan 023), falling back to the bare `from` address for
+    # legacy messages that predate the `sender` field.
     jq -r '
         .[]
-        | "\(.id)  \(.status)  \(.from) -> \(.to)  \(.subject // "")"
+        | "\(.id)  \(.status)  \(.sender.label // .from) -> \(.to)  \(.subject // "")"
     '
 }
 
@@ -2719,6 +2741,36 @@ _peer_cmd_send() {
         fi
     fi
 
+    # Durable sender snapshot (plan 023): capture who sent this at send time so a
+    # receiver keeps unambiguous identity even after the sender's ephemeral tmux
+    # session closes. Purely additive — `from` above is untouched. Field presence
+    # is per sender class: a fully resolved peer carries the full object; `user`
+    # carries only name+label; an unresolved --allow-unknown sender carries name.
+    local sender_json
+    if [[ "$from" == "user" ]]; then
+        sender_json="$(jq -cn --arg name "$from" '{name: $name, label: $name}')"
+    elif [[ -n "$from_peer_json" ]]; then
+        # Prefer the host recorded in the sender's session metadata (the host the
+        # session was created on) over the peer object's `host`, which is stamped
+        # from the ambient CCTRL_HOST_PREFIX of whoever runs this command.
+        local sender_session meta_host=""
+        sender_session="$(jq -r '.session // .tmux_target // empty' <<< "$from_peer_json")"
+        [[ -n "$sender_session" ]] && meta_host="$(_session_metadata_field "$sender_session" host 2>/dev/null)"
+        sender_json="$(jq -cn --argjson peer "$from_peer_json" --arg name "$from" --arg meta_host "$meta_host" '
+            {
+              name: $name,
+              label: (($peer.display_label | select(. != null and . != ""))
+                      // ($peer.purpose | select(. != null and . != ""))
+                      // $name),
+              tmux_target: $peer.tmux_target,
+              agent: $peer.agent,
+              host: (($meta_host | select(. != "")) // $peer.host)
+            }
+            | with_entries(select(.value != null))')"
+    else
+        sender_json="$(jq -cn --arg name "$from" '{name: $name}')"
+    fi
+
     _mailbox_lock_acquire || return 1
     local now id message rc=0
     if ! {
@@ -2733,6 +2785,7 @@ _peer_cmd_send() {
             --arg body "$body" \
             --arg now "$now" \
             --argjson unknown "$unknown_peer" \
+            --argjson sender "$sender_json" \
             '{
               id: $id,
               from: $from,
@@ -2740,6 +2793,7 @@ _peer_cmd_send() {
               status: "queued",
               subject: $subject,
               body: $body,
+              sender: $sender,
               created_at: $now,
               updated_at: $now,
               delivered_at: null,
@@ -5071,7 +5125,7 @@ _session_list() {
 
     local -a json_items=() human_lines=() sort_keys=() order=()
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
-    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid
+    local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
@@ -5080,6 +5134,7 @@ _session_list() {
         purpose="$(_session_metadata_field "$name" purpose)"
         created_at="$(_session_metadata_field "$name" created_at)"
         peer="$(_session_metadata_field "$name" peer)"
+        display_label="$(_session_metadata_field "$name" display_label)"
         metadata_managed="$(_session_metadata_field "$name" cctrl_managed)"
         # Agent type: prefer the value recorded at spawn (authoritative — the
         # explicit --agent flag), fall back to the argv[0] sniff for sessions
@@ -5155,8 +5210,9 @@ _session_list() {
                 --arg session_id "$session_id" --arg transcript "$transcript" \
                 --arg last_active "$last_active_iso" --arg base "$base_state" \
                 --arg recap "$recap_text" --argjson want_recap "$recap" \
+                --arg display_label "$display_label" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"

@@ -1,7 +1,8 @@
 ---
 id: 023
 title: Persist a sender snapshot on peer send
-status: pending
+status: done
+completed: 2026-07-22
 blocked-by: []
 priority: 23
 goal: cctrl-peer-messaging-discoverable-models

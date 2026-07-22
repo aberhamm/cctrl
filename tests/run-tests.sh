@@ -2123,6 +2123,120 @@ test_peer_mailbox_send_list_show() {
     assert_contains "$inbox" '"body": "via alias"'
 }
 
+test_peer_sender_snapshot() {
+    # Plan 023: peer send persists an additive `sender` snapshot so a receiver
+    # keeps unambiguous identity after the sender's ephemeral tmux session closes.
+    local data="$TMPDIR/sender-snapshot-data"
+    local quiet="$TMPDIR/quiet-tmux-bin"
+    mkdir -p "$TMPDIR/comet" "$TMPDIR/orchestrator" "$quiet"
+    cat > "$quiet/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    list-sessions) exit 0 ;;
+    *) exit 1 ;;
+esac
+SH
+    chmod +x "$quiet/tmux"
+    PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent codex >/dev/null
+    PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orchestrator --dir "$TMPDIR/orchestrator" --agent codex --purpose "fleet orchestration" >/dev/null
+
+    local out
+    # (1) resolved manual sender: full object, label from purpose, no invented tmux_target.
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "hi")"
+    printf '%s\n' "$out" | jq -e '.sender.name == "orchestrator"' >/dev/null || fail "expected sender.name == orchestrator"
+    printf '%s\n' "$out" | jq -e '.sender.label == "fleet orchestration"' >/dev/null || fail "expected sender.label from purpose"
+    printf '%s\n' "$out" | jq -e '.sender.agent == "codex"' >/dev/null || fail "expected sender.agent codex"
+    printf '%s\n' "$out" | jq -e '.sender.host == "local"' >/dev/null || fail "expected sender.host local"
+    printf '%s\n' "$out" | jq -e '(.sender | has("tmux_target")) | not' >/dev/null || fail "manual-only sender must not invent tmux_target"
+    # (2) top-level `from` byte-identical (no field removed/renamed).
+    printf '%s\n' "$out" | jq -e '.from == "orchestrator"' >/dev/null || fail "top-level from must be unchanged"
+    printf '%s\n' "$out" | jq -e '.sender.name == .from' >/dev/null || fail "sender.name must equal canonical from"
+
+    # (3) --from user: name + label only, no invented tmux/agent/host.
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from user --allow-unknown --json -- "hi")"
+    printf '%s\n' "$out" | jq -e '.sender == {name:"user",label:"user"}' >/dev/null || fail "user sender must be name+label only"
+
+    # (4) unresolved --allow-unknown sender: name only, still succeeds.
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send ghost --from phantom --allow-unknown --json -- "hi")"
+    printf '%s\n' "$out" | jq -e '.sender == {name:"phantom"}' >/dev/null || fail "unresolved sender must carry name only"
+    printf '%s\n' "$out" | jq -e '.from == "phantom"' >/dev/null || fail "from preserved for unresolved sender"
+
+    # (5)+(7guard) legacy message without `sender` still renders, and `peer show`
+    # emits NOTHING on stderr (regression pin for the .history jq join bug).
+    printf '%s\n' '{"id":"msg_legacy_no_sender","from":"orchestrator","to":"comet","status":"queued","subject":"legacy","body":"old body","created_at":"2026-06-13T00:00:00Z","updated_at":"2026-06-13T00:00:00Z","delivered_at":null,"acked_at":null,"nudge_count":0,"last_nudge_at":null,"last_nudge_error":null,"history":[{"at":"2026-06-13T00:00:00Z","status":"queued","by":"orchestrator"}]}' >> "$data/messages.jsonl"
+    PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show msg_legacy_no_sender 1>"$TMPDIR/legacy-show.out" 2>"$TMPDIR/legacy-show.err"
+    assert_contains "$(cat "$TMPDIR/legacy-show.out")" "from: orchestrator"
+    assert_contains "$(cat "$TMPDIR/legacy-show.out")" "body: old body"
+    [[ -s "$TMPDIR/legacy-show.err" ]] && fail "peer show must emit nothing on stderr (join bug), got: $(cat "$TMPDIR/legacy-show.err")"
+
+    # legacy-shape message parses without error via the sender fallback.
+    printf '%s\n' '{"from":"a","to":"b"}' | jq -e '(.sender // "absent") == "absent"' >/dev/null || fail "legacy message without sender must parse"
+
+    # (6) `sender` renders on ONE readable line in human `peer show` (not a blob).
+    local sid
+    sid="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "render me" | jq -r '.id')"
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$sid")"
+    assert_contains "$out" "sender: fleet orchestration (codex)"
+    assert_not_contains "$out" '"tmux_target"'
+
+    # inbox/outbox human template shows the sender label, falling back to bare from.
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer inbox --as comet)"
+    assert_contains "$out" "fleet orchestration -> comet"
+
+    # (8a) renderer edits do not reshape whoami / resolve output.
+    PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register cap --dir "$TMPDIR/comet" --agent codex --capability polling --capability review >/dev/null
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" CCTRL_PEER=cap "$ROOT/cctrl" peer whoami --json)"
+    printf '%s\n' "$out" | jq -e '.name == "cap"' >/dev/null || fail "whoami --json must be unchanged"
+    printf '%s\n' "$out" | jq -e '(has("sender")) | not' >/dev/null || fail "peer identity must not gain a sender key"
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve cap)"
+    assert_contains "$out" "  name: cap"
+    assert_contains "$out" "  capabilities: mailbox, polling, review"
+    assert_not_contains "$out" "  sender:"
+
+    # (8) empty display_label + no purpose must fall through to name, never "".
+    local empty_data="$TMPDIR/sender-empty-label-data"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"peer":"rover","display_label":"","created_at":"2026-06-11T10:00:00Z","cctrl_managed":true}
+JSON
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$empty_data" "$ROOT/cctrl" peer send rover --from rover --allow-unknown --json -- "hi")"
+    printf '%s\n' "$out" | jq -e '.sender.label == "rover"' >/dev/null || fail "empty display_label must fall through to name"
+    printf '%s\n' "$out" | jq -e '.sender.label != ""' >/dev/null || fail "sender.label must never be empty string"
+
+    # display_label surfaces additively in `_session_list --json`.
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"demo work","display_label":"@demo","created_at":"2026-06-11T10:00:00Z","cctrl_managed":true}
+JSON
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$empty_data" "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"display_label": "@demo"'
+
+    # (7) a peer that is BOTH manually registered AND has a live session resolves a
+    # real label via the _peer_all_json merge block (not purpose//name fallback).
+    local live_data="$TMPDIR/sender-live-session-data"
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"peer":"comet","display_label":"@comet","created_at":"2026-06-11T10:00:00Z","cctrl_managed":true}
+JSON
+    PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$live_data" "$ROOT/cctrl" peer register comet --dir /manual/comet --agent codex >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$live_data" "$ROOT/cctrl" peer resolve comet --json)"
+    printf '%s\n' "$out" | jq -e '.source == "manual"' >/dev/null || fail "expected registered comet to merge with live demo session"
+    printf '%s\n' "$out" | jq -e '.display_label == "@comet"' >/dev/null || fail "expected _peer_all_json to carry display_label from live session"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$live_data" "$ROOT/cctrl" peer send comet --from comet --json -- "self")"
+    printf '%s\n' "$out" | jq -e '.sender.label == "@comet"' >/dev/null || fail "expected sender.label to resolve display_label via _peer_all_json merge"
+    printf '%s\n' "$out" | jq -e '.sender.tmux_target == "demo"' >/dev/null || fail "expected tmux_target for live-session sender"
+
+    # Restore the SHARED session-metadata dir to a benign state. This test
+    # overwrote demo.json with peer=comet; left in place, a later test whose
+    # fake tmux surfaces the default "demo" session would derive a peer named
+    # "comet" that merges with the manual "comet" and rewrites its session to
+    # "demo" — breaking `peer deliver comet` in test_peer_deliver_tmux_nudge_lifecycle.
+    # Matches the benign content the prior derived-peer tests leave behind.
+    cat > "$CCTRL_SESSION_METADATA_DIR/demo.json" <<'JSON'
+{"purpose":"review stale session cleanup","created_at":"2026-06-11T10:00:00Z"}
+JSON
+}
+
 test_peer_mailbox_ack_authorization_and_states() {
     local data="$TMPDIR/mailbox-ack-data"
     setup_mailbox_peers "$data"
@@ -3554,6 +3668,7 @@ test_peer_validation_and_errors
 test_peer_alias_derived_requires_manual_registration
 test_peer_tmux_missing_still_resolves_manual
 test_peer_mailbox_send_list_show
+test_peer_sender_snapshot
 test_peer_mailbox_ack_authorization_and_states
 test_peer_mailbox_unknowns_and_identity
 test_peer_mailbox_concurrency_and_stale_lock
