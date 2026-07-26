@@ -284,6 +284,39 @@ test_agent_prompt_without_default() {
     assert_contains "$out" "ARG[1]=prompted agent"
 }
 
+test_profile_writes_are_owner_only() {
+    # Profiles hold credentials, so every write path must land at mode 600 —
+    # a plain redirect or `mv` would otherwise inherit the ambient umask.
+    local rootcopy="$TMPDIR/cctrl-profile-perms-copy"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    local settings="$rootcopy/settings.json"
+    printf '{"model":"claude-opus-5","env":{"PORTKEY_API_KEY":"secret-value"}}\n' > "$settings"
+
+    # save: the umask is deliberately permissive so an unfixed write shows as 644
+    ( umask 022; CCTRL_SETTINGS="$settings" CCTRL_ROOT="$rootcopy" \
+        "$rootcopy/cctrl" save permtest >/dev/null 2>&1 ) || true
+    [[ -f "$rootcopy/profiles/permtest.json" ]] || return 0   # save unsupported in this harness
+
+    local mode
+    mode="$(stat -f '%Lp' "$rootcopy/profiles/permtest.json" 2>/dev/null \
+            || stat -c '%a' "$rootcopy/profiles/permtest.json")"
+    [[ "$mode" == "600" ]] || fail "saved profile is mode $mode, expected 600"
+
+    # rename must not carry a permissive mode across
+    chmod 644 "$rootcopy/profiles/permtest.json"
+    ( CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" rename permtest permtest2 >/dev/null 2>&1 ) || true
+    if [[ -f "$rootcopy/profiles/permtest2.json" ]]; then
+        mode="$(stat -f '%Lp' "$rootcopy/profiles/permtest2.json" 2>/dev/null \
+                || stat -c '%a' "$rootcopy/profiles/permtest2.json")"
+        [[ "$mode" == "600" ]] || fail "renamed profile is mode $mode, expected 600"
+    fi
+
+    echo "ok: profile writes land at mode 600 (credentials are not world-readable)"
+}
+
 test_profile_prompt_overrides_global_default() {
     make_fake_agent "$TMPDIR/codex" codex
     make_fake_agent "$TMPDIR/claude" claude
@@ -3726,6 +3759,7 @@ test_syntax
 test_launch_args
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
+test_profile_writes_are_owner_only
 test_detached_agent_prompt_exports_selection
 test_detached_arg_parsing
 test_live_aware_index_picker

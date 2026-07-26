@@ -82,6 +82,16 @@ _profile_exists() {
     [[ -f "$(_profile_path "$1")" ]]
 }
 
+# Profiles hold credentials (PORTKEY_API_KEY, ANTHROPIC_CUSTOM_HEADERS, …), so
+# they must never be group- or world-readable. Shell redirects and $EDITOR both
+# create files at the ambient umask (commonly 0644), and `mv` carries whatever
+# mode the source had — so every write path calls this, not just the first one.
+_profile_secure_perms() {
+    local pf="$1"
+    [[ -f "$pf" ]] || return 0
+    chmod 600 "$pf" 2>/dev/null || true
+}
+
 _supported_agents() {
     printf '%s\n' claude codex
 }
@@ -814,6 +824,7 @@ cmd_save() {
     # Capture only the overlay-relevant Claude keys, not the whole
     # settings.json — profiles are auth/model overlays, not full snapshots.
     jq '{agents: {claude: {model: (.model // null), env: (.env // {})}}}' "$SETTINGS" > "$(_profile_path "$name")"
+    _profile_secure_perms "$(_profile_path "$name")"
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved current Claude model + env as profile: ${BOLD}$name${RESET}"
 }
@@ -853,6 +864,7 @@ cmd_edit() {
     fi
 
     "${EDITOR:-vim}" "$(_profile_path "$name")"
+    _profile_secure_perms "$(_profile_path "$name")"
 }
 
 cmd_costs() {
@@ -926,6 +938,7 @@ cmd_rename() {
             return 1
         fi
         mv "$(_profile_path "$old")" "$(_profile_path "$new")"
+        _profile_secure_perms "$(_profile_path "$new")"
         # Update active profile tracking if needed
         if [[ "$(_active_profile)" == "$old" ]]; then
             echo "$new" > "$ACTIVE_FILE"
