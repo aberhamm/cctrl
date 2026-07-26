@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 2026-07-26
+
+Direct session messaging, durable sender identity on peer mail, bundled role
+skills, and a cost-reporting correction.
+
+### Added
+- `cctrl session say <session> -- "message"` pastes an exact message straight
+  into a live tmux session and submits it, without touching peer mailbox state
+  — the direct live-chat path alongside `peer send`'s durable async mailbox.
+  `--no-submit` skips the Enter, `--body-file PATH|-` sends multi-line bodies,
+  and `--json` reports `{ok, session, submitted, status}`. A visible
+  Claude/Codex approval modal is a hard stop that `--force-busy` won't override.
+- Peer messages now carry a `sender` snapshot (name, label, tmux target, agent,
+  host), so you can still tell who wrote a message after the sending session
+  has closed — previously `from:` held only an ephemeral tmux name that became
+  unresolvable. `peer show` and the inbox render the sender's label; legacy
+  messages without the snapshot still display.
+- Three bundled skills, invocable from any repo: `cctrl-spawn` (launch a
+  managed session properly — runtime choice, detached-create then attach, brief
+  seeding, boot verification, resource gate), `cctrl-session-end` (wind a
+  session down cleanly: pre-close checklist, harvest what only that session
+  knows, then self-close), and `cctrl-fleet-manager` (orchestrate many
+  concurrent sessions under a two-mode autonomy model). All are
+  environment-agnostic; pair them with a private brief for host specifics.
+
+### Fixed
+- `cctrl` now actually detects an unsent draft in a Claude Code pane. The
+  detector anchored on ASCII `>` while Claude Code's input line starts with `❯`
+  (U+276F), so it never fired on a real pane — leaving two consumers silently
+  inert: `session autoheal`'s draft safety gate ran unguarded (a scheduled
+  `C-u` could wipe typed-but-unsent text), and the `unsent-draft` state never
+  appeared in `session ls`. An empty input box still never reads as a draft.
+- Cost reporting no longer overstates Opus spend by ~3x. The pricing table was
+  still on Opus 4.1-era rates ($15/$75 per M tokens); Opus 4.5 through Opus 5
+  are all $5/$25, with cache at $6.25/$0.50. Haiku was likewise still on Haiku
+  3.5 rates and is now Haiku 4.5 ($1/$5, cache $1.25/$0.10). Because the rate
+  keys match on model-name prefix, historical Opus 4.x rows are repriced too.
+
+<!-- commits: 805299d, 42b097f, 943df6a, 8fa8086, 128854b, 1b10a29, e81c290, 9895abb, d7e539e, 7f7cd1e -->
+
 ## [Unreleased] - 2026-07-04
 
 Session-title enforcement and a launch-time memory guardrail, both from a
