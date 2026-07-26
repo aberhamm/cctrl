@@ -97,6 +97,12 @@ and of each other — bumping one does not bump the rest, and a gateway may not 
 a version the first-party API already has. Verify the id against the gateway before
 changing it.
 
+**Profiles are gitignored and machine-local.** `profiles/*.json` is not tracked, so
+a profile edit — switching the model, adding an env var — reaches only the machine
+you made it on. Pushing does not carry it. To run the same profile elsewhere, copy
+the file across (as with `data/hosts.json`, each machine is its own source of
+truth).
+
 ```bash
 cctrl ls                  # list profiles (* = active default)
 cctrl use <profile>       # set the CCTRL default profile; also merges Claude model+env for compatibility
