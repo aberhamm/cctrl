@@ -37,6 +37,15 @@ Uses Anthropic published API pricing as a proxy:
 | Sonnet | $3/M     | $15/M    | $3.75/M     | $0.30/M    |
 | Haiku  | $1/M     | $5/M     | $1.25/M     | $0.10/M    |
 
+**Rates are per family, not per model.** `anthropic_price_key()` in
+`lib/usage_costs.py` matches the model name by substring (`opus`/`sonnet`/`haiku`),
+so every generation of a family shares one row — there is no per-version pricing.
+Two consequences: the table must track the *current* tier (Opus 4.5 through Opus 5
+are all $5/$25; the pre-4.5 $15/$75 rates are gone), and editing a row reprices
+historical sessions in `costs/spending.jsonl` retroactively. Drift is silent —
+nothing errors when Anthropic changes prices, the reports just quietly go wrong.
+Re-check when a new tier ships.
+
 **Important:** Cache reads dominate cost. A typical session is 90%+ cache reads, which are cheap. The input/output numbers in the table look small; the large cache_read counts are where most of the API-equivalent value lives.
 
 ### Billing periods

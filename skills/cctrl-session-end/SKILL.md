@@ -46,6 +46,10 @@ If there are uncommitted changes in the working directory:
   cheap and reversible.
 - **Not your repo / read-only session:** skip this step.
 
+If the harvest in step 3 is available, it drives its own commit/stash/defer
+disposition over this same tree. Looking here is still worth it, but you need
+not resolve everything before step 3.
+
 ### 2. Check for unsent drafts or pending actions
 
 If the session was drafting an email, PR, message, or any outward-facing
@@ -73,8 +77,9 @@ done
 ```
 
 If it reports `harvest=available`, invoke `/mstack-wrap-up` and let it run to its
-verdict. It is report-only: it never deletes, commits, or pushes, so it cannot
-damage the tree you just cleaned in step 1.
+verdict. It never deletes and never pushes. It may commit exactly once — a
+git-hygiene disposition over an explicit, displayed file list, and only on your
+approval — so it finishes the job step 1 starts rather than undoing it.
 
 **If the harvest routed a handoff, step 4 is already done — do not ask twice.**
 The harvest skill offers a handoff as its own ending when it finds follow-on

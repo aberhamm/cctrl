@@ -90,6 +90,13 @@ Legacy profiles with no `agents` block keep their old Claude behavior: top-level
 CCTRL ignores Claude-looking top-level models such as `sonnet`, `opus`, and
 `haiku`, and does not export the legacy top-level env.
 
+**Provider-prefixed model ids don't move with `model`.** A profile routing through
+Bedrock or an API gateway pins full provider ids in `env` (`ANTHROPIC_MODEL`,
+`ANTHROPIC_DEFAULT_OPUS_MODEL`, …). These are independent of the top-level `model`
+and of each other — bumping one does not bump the rest, and a gateway may not carry
+a version the first-party API already has. Verify the id against the gateway before
+changing it.
+
 ```bash
 cctrl ls                  # list profiles (* = active default)
 cctrl use <profile>       # set the CCTRL default profile; also merges Claude model+env for compatibility
