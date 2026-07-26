@@ -231,7 +231,7 @@ machine-readable output:
 ```
 $ cctrl session ls
 ✦ = cctrl-managed agent session
-✦ TMUX--homelab    claude (opus-4-6)  ~/_projects/homelab   detached
+✦ TMUX--homelab    claude (opus-5)    ~/_projects/homelab   detached
 ✦ TMUX--cctrl      codex (?)          ~/_projects/cctrl      detached
   scratch          shell (zsh)        ~/tmp                 attached
 ```

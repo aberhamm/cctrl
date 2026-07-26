@@ -33,9 +33,9 @@ Uses Anthropic published API pricing as a proxy:
 
 | Model  | Input    | Output   | Cache Write | Cache Read |
 |--------|----------|----------|-------------|------------|
-| Opus   | $15/M    | $75/M    | $18.75/M    | $1.50/M    |
+| Opus   | $5/M     | $25/M    | $6.25/M     | $0.50/M    |
 | Sonnet | $3/M     | $15/M    | $3.75/M     | $0.30/M    |
-| Haiku  | $0.80/M  | $4/M     | $1/M        | $0.08/M    |
+| Haiku  | $1/M     | $5/M     | $1.25/M     | $0.10/M    |
 
 **Important:** Cache reads dominate cost. A typical session is 90%+ cache reads, which are cheap. The input/output numbers in the table look small; the large cache_read counts are where most of the API-equivalent value lives.
 

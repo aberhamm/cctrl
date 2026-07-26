@@ -23,38 +23,40 @@ HOME = str(Path.home())
 LONG_CONTEXT_THRESHOLD = 272_000
 
 
+# USD per 1M tokens. Opus rates are the Opus 5 / Opus 4.x tier ($5/$25);
+# Haiku rates are Haiku 4.5. Cache write is 1.25x input, cache read 0.1x input.
 ANTHROPIC_PRICING = {
     "input": {
-        "opus": 15.0,
-        "claude-opus": 15.0,
+        "opus": 5.0,
+        "claude-opus": 5.0,
         "sonnet": 3.0,
         "claude-sonnet": 3.0,
-        "haiku": 0.80,
-        "claude-haiku": 0.80,
-    },
-    "output": {
-        "opus": 75.0,
-        "claude-opus": 75.0,
-        "sonnet": 15.0,
-        "claude-sonnet": 15.0,
-        "haiku": 4.0,
-        "claude-haiku": 4.0,
-    },
-    "cache_write": {
-        "opus": 18.75,
-        "claude-opus": 18.75,
-        "sonnet": 3.75,
-        "claude-sonnet": 3.75,
         "haiku": 1.0,
         "claude-haiku": 1.0,
     },
+    "output": {
+        "opus": 25.0,
+        "claude-opus": 25.0,
+        "sonnet": 15.0,
+        "claude-sonnet": 15.0,
+        "haiku": 5.0,
+        "claude-haiku": 5.0,
+    },
+    "cache_write": {
+        "opus": 6.25,
+        "claude-opus": 6.25,
+        "sonnet": 3.75,
+        "claude-sonnet": 3.75,
+        "haiku": 1.25,
+        "claude-haiku": 1.25,
+    },
     "cache_read": {
-        "opus": 1.50,
-        "claude-opus": 1.50,
+        "opus": 0.50,
+        "claude-opus": 0.50,
         "sonnet": 0.30,
         "claude-sonnet": 0.30,
-        "haiku": 0.08,
-        "claude-haiku": 0.08,
+        "haiku": 0.10,
+        "claude-haiku": 0.10,
     },
 }
 
