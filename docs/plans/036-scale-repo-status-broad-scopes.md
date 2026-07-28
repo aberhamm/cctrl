@@ -9,6 +9,8 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-07-26
+reviews:
+  - type=eng verdict=changes-requested date=2026-07-28 by=mstack-review
 ---
 
 ## Requirements
@@ -221,3 +223,144 @@ repos buries the signal, so:
   run through `--jobs 8`
 - `[manual]` `time cctrl repo status --root ~/dev --dirty-only` on the live tree:
   under 3s, and the reported set matches a hand-run `git status` loop.
+
+## Eng review — 2026-07-28
+
+Reviewed by an independent session (not the author). Verdict:
+**changes-requested** — one blocking defect, plus one specification ambiguity
+that no current test can catch.
+
+Scores: clarity 9 · testability 8 · scope-fit 8 · autonomy 6 · trap-resistance 7
+→ composite **7.6/10**.
+
+Environment claims verified 2026-07-28: bash **3.2.57** ✓, Darwin `PIPE_BUF`
+**512** ✓, **58** depth-1 git repos under the operator's tree ✓ (88 dirs, plan
+said 89), cctrl startup ~25ms ✓. Measured timings differ from the plan's table —
+serial **8.2s** (plan: 13.0s), `xargs -P 8` **1.2s** (plan: 1.9s) — but both
+acceptance targets (<3s all-scope, <1s session-scope) remain comfortably
+reachable.
+
+### BLOCKER: `xargs -P` aborts the entire scan under `set -euo pipefail`
+
+**What the plan currently specifies.** Design § "Parallel probing" drives
+`_repo_probe_json` as a subprocess pool via `xargs -P N`, each worker
+re-entering the cctrl binary as `cctrl repo _probe <path>` and writing to
+`$TMPDIR_SCAN/<n>.json`. Worker failure is handled only at the *output* layer:
+"If a worker's output file is missing or unparseable, synthesize a fail-closed
+`verdict: "unknown"` row with the path and an error."
+
+**The exact failure mode.** `cctrl` runs `set -euo pipefail` (`cctrl:2`).
+`xargs` exits non-zero when **any** worker exits non-zero — status 123 for
+worker statuses 1–125, and on status 255 it *aborts remaining input entirely*.
+Under `set -e` plus `pipefail`, that non-zero status kills the parent **before
+it ever reaches the collection step**, so the synthesized-unknown logic never
+executes. The command produces no output at all, instead of a table with one
+`unknown` row.
+
+Trigger: any single probe failing. Realistically — a repo whose `.git` is
+unreadable, a path that vanishes mid-scan, a `jq` parse failure inside the
+probe, or the probe itself tripping `set -e`. That is not an edge case; it is
+precisely the condition the `unknown` verdict was invented for.
+
+Demonstrated on this machine, 2026-07-28:
+
+    $ bash -c 'set -euo pipefail
+      run() { printf "a\nb\n" | xargs -P 2 -I{} sh -c "exit 1"; echo AFTER-XARGS; }
+      run; echo FUNCTION-RETURNED'
+    outer rc=1        # neither AFTER-XARGS nor FUNCTION-RETURNED ever printed
+
+    $ printf 'a\nb\nc\n' | xargs -P 2 -I{} sh -c 'exit 255'
+    xargs: sh: exited with status 255; aborting     # remaining input dropped
+
+**The guarantee this breaks**, quoted from this plan's Design § "Parallel
+probing": *"**A crashed worker is `unknown`, not a gap.** If a worker's output
+file is missing or unparseable, synthesize a fail-closed `verdict: "unknown"`
+row with the path and an error. Fail closed applies to the harness, not just to
+git."* As specified, a crashed worker is neither `unknown` nor a gap — it is a
+dead command with no output. It also breaks this plan's Acceptance Criterion
+*"Still strictly read-only. All of plan 035's guarantees hold unchanged"*, by way
+of 035's *"**Fails closed.** A repo whose `git status` cannot be read is
+reported `unknown` with the error, never 'clean'."*
+
+**Why the plan's own test does not catch it.** Task 7(c) reads: *"a worker that
+produces no output yields an `unknown` row rather than a missing one."* The
+cheapest fixture satisfying that wording — and the way it naturally reads — is a
+worker that **succeeds while printing nothing** (exit 0, empty file). That
+passes against the broken implementation, because exit 0 never trips `set -e`.
+The test only fails if the fixture worker exits **non-zero**, which the task
+text does not require. The determinism check (`--jobs 1` vs `--jobs 8`) does not
+catch it either: both paths behave identically on a healthy fixture set, and
+neither is ever exercised with a failing probe.
+
+**Concrete fix** — make all three explicit in the plan rather than leaving them
+to discovery:
+
+1. Guard the pool invocation so a worker's status cannot kill the parent:
+
+       set +e
+       printf '%s\n' "${paths[@]}" | xargs -P "$jobs" -I{} "$CCTRL_SELF" repo _probe {}
+       set -e
+       # or: ... | xargs ... || true   — note pipefail: the guard must cover the
+       # whole pipeline, not just the last command.
+
+2. Require in Task 3 that `cctrl repo _probe` **always exits 0**, emitting a
+   `verdict: "unknown"` object carrying `error` on any internal failure, and
+   **never** exits 255 (which would abort the remaining input rather than
+   degrading one row).
+
+3. Restate Task 7(c) so the fixture worker **exits non-zero**, not merely
+   silent:
+
+       (c) a worker that exits non-zero, AND a worker that exits 0 with no
+           output, each yield an `unknown` row — and the scan still reports
+           every other repo in the scope.
+
+### MUST DECIDE: does `--root` add to, or replace, the default session scope?
+
+The Acceptance Criteria say `--root DIR` "**adds** every git repository that is
+a depth-1 child of `DIR`", and separately that "Default scope stays
+sessions-only". So does `cctrl repo status --root <tree>` return that tree's
+repos, or that tree's repos **plus** every live session's repo? The two readings
+give different output for the primary invocation in this plan's own `[manual]`
+check.
+
+Neither verification check disambiguates: both use `--root "$FIXTURES"` in a
+test environment where the session set is empty, so both readings pass. The same
+ambiguity applies to `CCTRL_REPO_ROOTS`, which the AC calls "default roots" but
+then only reaches via `--all`.
+
+Fix: state the chosen semantics in the AC for both, and add a test with a
+**non-empty** fake session set that asserts the resulting row count.
+
+### Non-blocking notes
+
+- **The 5s performance gate will flake.** It would be the only wall-clock
+  assertion in `tests/run-tests.sh` (verified: there are none today); building
+  ≥50 fixture repos costs real time before the gate even starts; and this
+  machine routinely runs 25 concurrent agent sessions. Recommend warn-only, or
+  gate it behind an env var (`CCTRL_TEST_PERF=1`). Keep the `--jobs 1` vs
+  `--jobs 8` determinism diff as the hard gate — that one is excellent and is
+  the genuinely load-bearing check for this plan.
+- **The "I/O-bound" rationale is wrong.** The plan states "0.18s user against
+  13s wall serial". Measured over the same 58 repos, `-P 8` burns **7.00s user /
+  1.47s sys at 695% CPU** — the plan measured only the driving shell's own user
+  time, not its children's. The conclusion (parallelism buys ~7×) is unaffected,
+  but do not let that number survive into a source comment.
+- **`_shortcut_list` does not expose a dir extractor.** The plan says to read
+  shortcuts "exactly as `_shortcut_list` does: `jq -r 'to_entries[] |
+  .value.dir'`". `_shortcut_list` is a human renderer whose jq is
+  `to_entries[] | .key, (.value.dir // ""), …`. The plan's expression is correct
+  against the *file*, but this is new code, not reuse — the citation misleads.
+  Also: shortcut dirs carry trailing slashes (`/…/cctrl/`); `rev-parse
+  --show-toplevel` normalizes them, so dedup is safe.
+- **`--jobs 1` as a separate in-process path** doubles the code that must stay
+  byte-identical to the parallel path. `xargs -P 1` through the same path would
+  make the determinism test tautological but eliminate the drift risk. Either is
+  defensible; the current choice is the more testable one.
+
+### Kept as-is
+
+`PIPE_BUF`-driven per-worker temp files, parent-side ordering, binary re-entry
+over a second `lib/` file, depth-1 `--root`, refusing a `data/repo-roots.json`,
+refusing to auto-promote a non-repo shortcut into a root, refusing a cache, and
+refusing `--fetch` at 58 repos. All checked; all correct.
