@@ -41,7 +41,7 @@ Two roles need it, at two different moments:
 
 There is one thing this plan must be at least as loud about as the command
 itself: **the view informs, it never fixes.** `~/dev/matthew-aberham-resume`
-carries 71 dirty entries including unreviewed `.tex` content. Doctrine that says
+carries 89 dirty entries including unreviewed `.tex` content. Doctrine that says
 "check repo status" without saying "and never auto-commit what you find" is
 worse than no doctrine, because it puts a sweeping tool in front of an agent
 with commit rights.
@@ -60,10 +60,11 @@ with commit rights.
       with no live session, surface it to the human. Never `git add .`, never
       commit another session's tree.
 - [ ] `skills/cctrl-session-end/SKILL.md`'s pre-close checklist uses
-      `cctrl repo status` for the uncommitted-work step, and names the shared
-      working tree hazard: sibling sessions in the same repo mean *"the tree is
-      dirty"* is not the same as *"my work is uncommitted"* — stage explicit
-      paths, never `git add .`, never `git add -A`.
+      **`cctrl repo status --here`** for the uncommitted-work step (see the
+      resolved scope decision below), and names the shared working tree hazard:
+      sibling sessions in the same repo mean *"the tree is dirty"* is not the
+      same as *"my work is uncommitted"* — stage explicit paths, never
+      `git add .`, never `git add -A`.
 - [ ] The `local-refs-only` caveat is carried into doctrine so neither role
       reads `ahead 0` as "pushed", and the livesync branch-switch hazard is
       named where it bites: check the branch before committing.
@@ -71,7 +72,7 @@ with commit rights.
       names, no `--root` value that leaks this operator's layout (AGENTS.md).
       Concrete roots are the caller's to supply, or live in the operator's
       private infra brief.
-- [ ] `README.md` and `cmd_help` (`cctrl:6267`) present the command as the
+- [ ] `README.md` and `cmd_help` present the command as the
       answer to the question, not just as a flag list.
 - [ ] `docs/` gains or updates its thin pointer, consistent with how the other
       skills are referenced from AGENTS.md.
@@ -82,11 +83,38 @@ with commit rights.
 
 | Sink | Content |
 |---|---|
-| `skills/cctrl-fleet-manager/SKILL.md` | New short subsection under the monitoring/decide material: run `cctrl repo status` (session scope) each monitoring pass; run `--all --dirty-only` on the wider cadence; read the verdict column; **route, do not fix**. |
-| `skills/cctrl-session-end/SKILL.md` | Pre-close checklist step rewritten around `cctrl repo status`, plus the shared-tree staging rule. |
+| `skills/cctrl-fleet-manager/SKILL.md` | New short subsection under the monitoring/decide material: run `cctrl repo status` (session scope) each monitoring pass; run `--all --attention-only` on the wider cadence; read the verdict column; **route, do not fix**. |
+| `skills/cctrl-session-end/SKILL.md` | `### 1. Check for uncommitted work` (today: a bare `git status`) rewritten around `cctrl repo status --here`, plus the shared-tree staging rule. |
 | `README.md` | Command reference + a one-line "answers: does any repo have uncommitted or unpushed changes, and who is responsible". |
-| `cctrl` `cmd_help` | The `Repos` block from plan 035, extended with the `--all --dirty-only` habitual form. |
+| `cctrl` `cmd_help` | The `Repos` block from plan 035, extended with the `--all --attention-only` habitual form. |
 | `docs/` | Thin pointer only, per AGENTS.md. |
+
+### Resolved: a closing session uses `--here` (decided 2026-07-28)
+
+The eng review raised, correctly, that this plan wired doctrine to a command
+shape that did not fit one of its two consumers. `cctrl-session-end` runs
+**inside** the session being closed and asks "is *my* work uncommitted?", but
+plan 035's default scope is fleet-wide — a closing session would be handed a
+7-row table and left to locate itself in it.
+
+**Decision (Matthew, 2026-07-28): Option A — add a `--here` scope to plan 035.**
+Session-end's step 1 becomes `cctrl repo status --here`: one row, the session's
+own repo, listing every sibling session in that tree with the caller marked
+`← you`. That is exactly the attribution the explicit-paths staging rule
+depends on — "3 siblings share this tree" is what turns *never `git add .`* from
+a rule into an obvious consequence.
+
+The two alternatives were rejected: prescribing a `jq` filter in doctrine puts a
+rotting incantation in a skill (and `$PWD` is not the toplevel, so it needs a
+`rev-parse` first) for identical output; accepting the fleet-wide table makes a
+closing session read N rows to answer a 1-row question and degrades as the fleet
+grows.
+
+Consequence for this plan's boundary: **"no behavior change to the command"
+moves by exactly one flag.** `--here` is specified in plan 035 (Design §
+Discovery, and its acceptance criteria), not here — this plan still only edits
+doctrine. Plan 035 already required `_repo_discover_json` to take its scope as
+arguments, so `--here` is a new scope source on an existing seam, ~5 lines.
 
 ### The routing table doctrine must encode
 
@@ -104,8 +132,9 @@ noise. Keep it this short in the skill:
 
 ### Hazards doctrine must name (not soften)
 
-- **Shared working trees.** Multiple sessions per repo is normal here — three in
-  one repo, eight in another. A closing session must stage **explicit paths**;
+- **Shared working trees.** Multiple sessions per repo is normal here — on
+  2026-07-28: 3 sessions in one repo, 6 in another, and 10 in a directory that is
+  not a repo at all. A closing session must stage **explicit paths**;
   `git add .` in a shared tree commits a sibling's in-flight work. This exact
   rule is already in force for this planning session and belongs in the skill.
 - **`local-refs-only`.** No fetch means `ahead` is derived from local
@@ -124,7 +153,7 @@ noise. Keep it this short in the skill:
 
 A tempting fourth plan — a launchd timer or a `peer watch` hook that runs
 `repo status` and nags — is deliberately **not** proposed. cctrl already carries
-an opt-in timer pattern (`session autoheal install`, `cctrl:5528`) so the
+an opt-in timer pattern (`session autoheal install`) so the
 machinery exists, and that is exactly why the restraint is worth writing down:
 the fleet's periodic monitor already has a human or a manager in the loop, and
 an unattended nagger for a condition whose correct resolution is almost always
@@ -141,8 +170,11 @@ demonstrably fails to stick.
 
 **Out of scope:**
 
-- Any behavior change to the command itself. If doctrine wants something the
-  command cannot do, that is a new plan, not a widened one here.
+- Any behavior change to the command itself, **with one resolved exception**:
+  `--here`, which the eng review surfaced and which is specified in **plan 035**,
+  not here (see "Resolved" above). That carve-out is closed — if doctrine wants
+  anything further the command cannot do, it is a new plan, not a widened one
+  here.
 - Automated/scheduled scanning, notifications, or a `peer watch` integration.
 - Any doctrine that authorizes an agent to commit, stage, stash, or push on
   another session's behalf. The whole point is the opposite.
@@ -156,9 +188,10 @@ demonstrably fails to stick.
    existing voice and density; do not append a bolt-on section.
 2. Add the verdict routing table and the inform-never-fix rule, with the
    concrete unreviewed-content failure mode stated once, plainly.
-3. Update `skills/cctrl-session-end/SKILL.md`'s pre-close checklist to use
-   `cctrl repo status`, including the explicit-paths staging rule for shared
-   trees.
+3. Rewrite `skills/cctrl-session-end/SKILL.md`'s `### 1. Check for uncommitted
+   work` step (currently a bare `git status`) around `cctrl repo status --here`,
+   including the explicit-paths staging rule for shared trees and what the
+   `← you` marker means.
 4. Add the `local-refs-only`, branch-switch, and snapshot-not-a-lock caveats to
    both skills, in one or two sentences each — enough to prevent the misread,
    short enough to survive editing.
@@ -175,8 +208,8 @@ demonstrably fails to stick.
   `cmd_help` edit)*
 - `[assert]` `grep -c 'cctrl repo status' skills/cctrl-fleet-manager/SKILL.md`
   is at least 1
-- `[assert]` `grep -c 'cctrl repo status' skills/cctrl-session-end/SKILL.md`
-  is at least 1
+- `[assert]` `grep -c 'cctrl repo status --here' skills/cctrl-session-end/SKILL.md`
+  is at least 1, and the bare `git status` it replaces is gone from step 1
 - `[assert]` both skills contain the never-auto-commit rule —
   `grep -Eic 'never (auto-)?commit|never .*git add' skills/cctrl-fleet-manager/SKILL.md skills/cctrl-session-end/SKILL.md`
   is non-zero for each
@@ -187,7 +220,7 @@ demonstrably fails to stick.
   and `skills/cctrl-spawn/SKILL.md` legitimately carry `~/dev/...` example paths
   in install instructions and a private-brief pointer, and must not be flagged.
 - `[assert]` `cctrl repo status --help` and `cctrl help` both mention
-  `--dirty-only`
+  `--attention-only`
 - `[assert]` `grep -c 'local-refs-only\|no fetch' skills/cctrl-fleet-manager/SKILL.md`
   is at least 1
 - `[manual]` A fresh reader of `cctrl-fleet-manager` can, from the skill alone,
@@ -270,3 +303,20 @@ The inform-never-fix rule stated with a concrete failure mode rather than as an
 abstraction; the explicit-paths staging rule for shared trees; carrying
 `local-refs-only` and the livesync branch-switch hazard into doctrine; and
 scoping the environment-agnostic gate to only the two files this plan edits.
+
+### Author response — 2026-07-28 (revised, awaiting re-review)
+
+- **OPEN QUESTION — resolved by Matthew, 2026-07-28: Option A (`--here`).** The
+  review was right that this plan wired doctrine to a command shape that did not
+  fit its second consumer. A new Design section records the decision and why B
+  (a jq incantation in a skill) and C (read N rows for a 1-row question) lost.
+  `--here` is specified in **plan 035**, so this plan still edits doctrine only;
+  the "no behavior change" boundary moved by exactly one flag and is now closed.
+- Session-end's step 1 is named precisely (`### 1. Check for uncommitted work`,
+  today a bare `git status`) rather than described, and the `← you` marker is
+  part of what doctrine must explain.
+- Verified facts refreshed: 89 dirty entries in the resume repo, and 3/6/10
+  sessions across two repos and one non-repo.
+- Flag name synced to `--attention-only` following plan 035's rename.
+- The three "Kept as-is" items (routing table, "Why not automate it", the
+  `[manual]` fresh-reader test) are untouched.

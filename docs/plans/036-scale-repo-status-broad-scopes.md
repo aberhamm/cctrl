@@ -25,19 +25,27 @@ Plan 035 answers the question for repos that currently have a live session
   having a session and stops being looked at.
 
 So the command needs a scope that covers repos with no session. The operator's
-tree has **89 directories under `~/dev`, 58 of them git repos** (measured
-2026-07-26). At that size the serial probe from 035 is too slow to run
-habitually — measured on this machine, warm cache:
+tree has **88 directories under `~/dev`, 58 of them git repos at depth 1**
+(re-measured 2026-07-28). At that size the serial probe from 035 is too slow to
+run habitually — measured on this machine, warm cache, in two independent runs:
 
-| scan                                    | wall time |
-|-----------------------------------------|-----------|
-| 58 repos, serial                        | **13.0s** |
-| 58 repos, `xargs -P 8`                  | **1.9s**  |
-| 58 repos, `xargs -P 16`                 | **1.2s**  |
+| scan                     | wall (author) | wall (reviewer) |
+|--------------------------|---------------|-----------------|
+| 58 repos, serial         | 13.0s         | **8.2s**        |
+| 58 repos, `xargs -P 8`   | 1.9s          | **1.2s**        |
+| 58 repos, `xargs -P 16`  | 1.2s          | —               |
 
-13 seconds is a command you stop running. ~2 seconds is one you run on reflex.
-The work is I/O-bound (0.18s user against 13s wall serial), so parallelism is
-close to free.
+Treat the slower column as the budget and the faster as the likely case; the two
+runs differ by machine load (this box routinely runs ~25 concurrent agent
+sessions). Either way the conclusion is the same: **~8-13s is a command you stop
+running; ~1-2s is one you run on reflex**, and parallelism buys ~7×.
+
+*Do not repeat the draft's "the work is I/O-bound, 0.18s user against 13s wall"
+claim, in this plan or in a source comment — it is wrong.* That measured only
+the driving shell's own user time, not its children's. The same 58 repos at
+`-P 8` burn **7.00s user / 1.47s sys at 695% CPU**: the work is genuinely CPU-
+and syscall-heavy, and parallelism helps because there are cores to spread it
+across, not because the cores are idle waiting on disk.
 
 Crucially, cctrl must **not learn about `~/dev`**. It is a public,
 environment-agnostic CLI (AGENTS.md: skills and code carry "no environment
@@ -46,17 +54,41 @@ must come from data cctrl already owns or from the caller.
 
 **Acceptance criteria:**
 
-- [ ] `--shortcuts` adds the target dir of every entry in `data/shortcuts.json`
-      to the scope. This is the operator's own declared list of repos-that-matter
-      and requires no new configuration surface.
-- [ ] `--root DIR` (repeatable) adds every git repository that is a **depth-1
-      child** of `DIR`. `cctrl repo status --root ~/dev` is how the 58-repo sweep
-      is expressed — `~/dev` is supplied by the caller, never by cctrl.
-- [ ] `CCTRL_REPO_ROOTS` (colon-separated, like `PATH`) supplies default roots
-      so the habitual invocation is a bare `cctrl repo status --all` with no
-      arguments to remember.
+- [ ] **Scope flags REPLACE the session default; they do not add to it.** Stated
+      once, precisely, because the draft left it ambiguous and no test caught it:
+      the session scope applies **only when no scope flag is given**. So
+      `cctrl repo status --root <tree>` lists that tree's repos and *nothing
+      else*, even when live sessions sit outside it. `--all` is the explicit
+      union. Rationale: a caller who names a scope asked for that scope, and
+      silently appending unrelated repos makes the row count unpredictable and
+      the command hard to script against. `--all` exists precisely so the union
+      is available by asking for it.
+- [ ] **The session→repo join is orthogonal to scope and always runs.** Scope
+      decides which repos are *listed*; the join decides what `sessions[]`
+      contains for a listed repo. A repo reached only via `--root` still shows
+      the sessions working in it — otherwise the feature's whole value-add
+      disappears at exactly the scope where the operator sweeps.
+- [ ] `--shortcuts` scopes to the target dir of every entry in
+      `data/shortcuts.json`. This is the operator's own declared list of
+      repos-that-matter and requires no new configuration surface.
+- [ ] `--root DIR` (repeatable) scopes to every git repository that is a
+      **depth-1 child** of `DIR` (plus `DIR` itself if it is a repo).
+      `cctrl repo status --root ~/dev` is how the 58-repo sweep is expressed —
+      `~/dev` is supplied by the caller, never by cctrl.
+- [ ] `CCTRL_REPO_ROOTS` (colon-separated, like `PATH`) supplies default roots.
+      Its entries behave exactly as if passed via `--root`, but **only when a
+      scope flag asks for them** — that is, under `--all`, or under a bare
+      `--root` with no argument if that form is offered. A no-flag invocation
+      stays sessions-only **even when the env var is set**. Stated explicitly
+      because the alternative — an env var that silently redefines the default
+      scope — would make `cctrl repo status` mean different things on two
+      machines, which is the one property a habitual command cannot afford.
 - [ ] `--all` = sessions ∪ shortcuts ∪ `CCTRL_REPO_ROOTS` ∪ every `--root`.
       Default scope stays sessions-only: the fast, always-relevant answer.
+- [ ] Scope composition is covered by a test with a **non-empty** fake session
+      set, asserting exact row counts for `--root` alone vs `--all`. The draft's
+      checks all ran with an empty session set, where replace and add are
+      indistinguishable.
 - [ ] Repos are deduplicated by resolved toplevel; `sources` accumulates every
       origin (`["session","shortcut","root"]`) so the human output can show *why*
       a repo is in the list.
@@ -82,8 +114,16 @@ cctrl already knows two sets of directories, and neither needs new state:
 1. **Session cwds** (plan 035's default) — where work is happening *now*.
 2. **Shortcut targets** — `data/shortcuts.json`, the operator's hand-curated
    "repos I jump to". Today: 16 entries covering cctrl, homelab, mstack,
-   agent-hub, finance-hub, the scraper, and so on. Read it exactly as
-   `_shortcut_list` does (`cctrl:7501-7529`): `jq -r 'to_entries[] | .value.dir'`.
+   agent-hub, finance-hub, the scraper, and so on. Extract dirs with
+   `jq -r 'to_entries[] | .value.dir // empty'` against `SHORTCUTS_FILE`.
+
+   *This is new code, not reuse — do not go looking for a helper to call.*
+   `_shortcut_list` is a human renderer whose jq emits interleaved fields
+   (`to_entries[] | .key, (.value.dir // ""), …`) for its read loop; it exposes
+   no dir extractor. The expression above is correct against the *file*, which is
+   the actual contract. Also: shortcut dirs carry trailing slashes
+   (`/…/cctrl/`), which `rev-parse --show-toplevel` normalizes away, so dedup by
+   toplevel is safe without pre-trimming.
 
 Everything else comes from the caller via `--root` / `CCTRL_REPO_ROOTS`. A new
 `data/repo-roots.json` was considered and rejected: it duplicates what shortcuts
@@ -91,10 +131,10 @@ already express, adds a file to keep in sync across two machines under livesync,
 and needs its own CRUD verbs. An env var plus a flag is the whole feature.
 
 *Gotcha to handle:* `SHORTCUTS_FILE` is hardcoded to `$SCRIPT_DIR/data/shortcuts.json`
-at `cctrl:13` and, unlike the peer/session/needs-me paths, is **not** overridable
-via `CCTRL_DATA_DIR` (`cctrl:16-41`). Testing `--shortcuts` therefore requires
+as a top-level assignment and, unlike the peer/session/needs-me paths, is **not** overridable
+via `CCTRL_DATA_DIR`. Testing `--shortcuts` therefore requires
 either adding a `_repo_refresh_paths`-style override (preferred: follow the
-existing four-function convention at `cctrl:16-41`) or running against a copied
+existing four-function `*_refresh_paths` convention) or running against a copied
 script dir as `test_profile_*` already does. Pick the override; it is three
 lines and removes a real testability gap.
 
@@ -112,6 +152,17 @@ worktrees is both slow and surprising. A repo nested deeper is added with its
 own `--root` or by having a session in it. If a recursive mode is ever wanted it
 arrives as an explicit `--depth N`, not as a default. `DIR` itself is also
 checked: a `--root` that is itself a repo contributes itself.
+
+**Depth-1 has a real, live cost — document it rather than discovering it.**
+On 2026-07-28 a live session is working in
+`~/dev/repo-audits/natively-cluely-audit` — depth **2**. So
+`cctrl repo status --root ~/dev` does **not** cover every repo the fleet is
+working in, and under the replace-not-add semantics decided above it would omit
+that session's repo entirely. This is not an argument for recursion; it is the
+argument for `--all` (the union with session scope catches exactly this) and for
+the human footer's `SRC` column, which makes "why is this repo here / where did
+it go" answerable at a glance. Say so in `--help`: `--root` is a *tree sweep*,
+`--all` is *everything cctrl knows about*.
 
 ### Parallel probing
 
@@ -140,15 +191,57 @@ required this). Drive it as a subprocess pool:
 - **A crashed worker is `unknown`, not a gap.** If a worker's output file is
   missing or unparseable, synthesize a fail-closed `verdict: "unknown"` row with
   the path and an error. Fail closed applies to the harness, not just to git.
+  **This guarantee does not hold for free — see the next section, which is the
+  single most important part of this plan.**
 - `--jobs` is clamped to `[1, 32]`; a non-numeric value is a usage error.
+
+### `xargs -P` under `set -euo pipefail` — the trap that voids fail-closed
+
+`cctrl` runs `set -euo pipefail` on line 2. **`xargs` exits non-zero when any
+worker exits non-zero** (status 123 for worker statuses 1–125), and on a worker
+status of **255 it aborts the remaining input entirely**. Under `set -e` plus
+`pipefail`, that non-zero status kills the parent **before it ever reaches the
+collection step** — so the synthesize-an-`unknown`-row logic above never runs.
+The command emits *nothing at all* instead of a table with one `unknown` row.
+
+The trigger is not exotic; it is exactly the condition `unknown` exists for: an
+unreadable `.git`, a path that vanishes mid-scan, a `jq` failure inside a probe,
+or the probe tripping `set -e` on its own. Demonstrated on this machine:
+
+    $ bash -c 'set -euo pipefail
+      run() { printf "a\nb\n" | xargs -P 2 -I{} sh -c "exit 1"; echo AFTER-XARGS; }
+      run; echo FUNCTION-RETURNED'
+    outer rc=1        # neither AFTER-XARGS nor FUNCTION-RETURNED ever printed
+
+    $ printf 'a\nb\nc\n' | xargs -P 2 -I{} sh -c 'exit 255'
+    xargs: sh: exited with status 255; aborting     # remaining input dropped
+
+Three defenses, all mandatory — any one alone is insufficient:
+
+1. **Guard the pool invocation** so a worker's status cannot kill the parent.
+   Note `pipefail`: the guard must cover the **whole pipeline**, not just the
+   last command.
+
+       set +e
+       printf '%s\n' "${paths[@]}" | xargs -P "$jobs" -I{} "$CCTRL_SELF" repo _probe {}
+       set -e
+
+2. **`cctrl repo _probe` always exits 0.** On any internal failure it emits a
+   `verdict: "unknown"` object carrying `error` and returns 0. It must **never**
+   exit 255, which would abort the remaining input and silently truncate the
+   scan rather than degrading one row. Belt and braces: defense 1 keeps a rogue
+   status from killing the parent, defense 2 keeps it from being produced.
+3. **The collection step treats a missing/unparseable file as `unknown`** — the
+   original bullet above, which is now genuinely reachable.
 
 ### Human output at 58 repos
 
 At session scope every repo prints. At `--all` scope, 58 rows of mostly-clean
 repos buries the signal, so:
 
-- `--dirty-only` (already added in plan 035) becomes the recommended pairing and
-  is mentioned in `--help`.
+- `--attention-only` (added in plan 035; renamed there from the draft's
+  `--dirty-only` precisely because this plan makes it the habitual pairing)
+  becomes the recommended form and is mentioned in `--help`.
 - The footer gains scope accounting:
   `58 repos (12 session · 16 shortcut · 58 root) · 9 need attention · 48 clean · 1 unknown`.
 - A `SRC` column (`s`/`c`/`r` letters, or `sc` for both) shows why each repo is
@@ -162,7 +255,9 @@ repos buries the signal, so:
   `sources` accumulation; new `_repo_scan_parallel`; `cmd_repo` gains
   `--shortcuts`, `--root`, `--all`, `--jobs`, and the hidden `_probe`;
   `_repo_refresh_paths` added next to the existing path-refresh functions
-  (`cctrl:16-41`) to make `SHORTCUTS_FILE` overridable; `cmd_help` updated.
+  (`_peer_refresh_paths` / `_session_refresh_paths` / `_autoheal_refresh_paths` /
+  `_needs_me_refresh_paths`) to make `SHORTCUTS_FILE` overridable; `cmd_help`
+  updated.
 - `tests/run-tests.sh`: `test_repo_status_scopes` and
   `test_repo_status_parallel_determinism`.
 - `CHANGELOG.md`, `README.md`.
@@ -171,13 +266,13 @@ repos buries the signal, so:
 
 - Recursive root scanning (`--depth`), repo-exclude patterns, and any
   `.cctrlignore`. Add them when a real case demands it.
-- Caching or incremental scans. 1.9s does not need a cache, and a cache would
+- Caching or incremental scans. 1-2s does not need a cache, and a cache would
   introduce staleness into a tool whose entire value is being current.
 - Any form of `--fetch` — see plan 035's Design. Broadening the scope makes the
   argument stronger, not weaker: 58 network round-trips is not a habitual
   command.
 - Multi-host aggregation; `cctrl --host <alias> repo status --all` already
-  works through the global flag (`cctrl:7943-7957`).
+  works through the global flag.
 - Changing the default scope. Sessions-only stays the default precisely because
   it is sub-second and always relevant.
 
@@ -188,18 +283,32 @@ repos buries the signal, so:
 2. Extend `_repo_discover_json` with shortcut, `--root`, and `CCTRL_REPO_ROOTS`
    sources; dedupe by resolved toplevel; accumulate `sources`.
 3. Add the hidden `cctrl repo _probe <path>` arm (single existing path only;
-   absent from `--help`).
-4. Implement `_repo_scan_parallel`: `mktemp -d`, `xargs -P "$jobs"`, per-worker
-   output files, `jq -s` collection, missing/unparseable file ⇒ synthesized
-   `unknown` row, cleanup trap. `--jobs 1` takes the in-process serial path.
+   absent from `--help`). **It always exits 0**, emitting a `verdict: "unknown"`
+   object with `error` on any internal failure, and never exits 255.
+4. Implement `_repo_scan_parallel`: `mktemp -d`, `set +e`-guarded
+   `xargs -P "$jobs"` pipeline (the guard must span the whole pipeline —
+   `pipefail`), per-worker output files, `jq -s` collection,
+   missing/unparseable file ⇒ synthesized `unknown` row, cleanup trap.
+   `--jobs 1` takes the in-process serial path.
 5. Wire `--shortcuts`, `--root DIR` (repeatable), `--all`, `--jobs N` into
-   `cmd_repo`; clamp and validate `--jobs`; warn-not-fail on a bad `--root`.
+   `cmd_repo`; implement **replace-not-add** scope semantics; clamp and validate
+   `--jobs`; warn-not-fail on a bad `--root`.
 6. Add the `SRC` column and the scope-accounting footer.
-7. Tests: (a) scope composition against temp repos and a fake shortcuts file;
-   (b) `--jobs 8` output byte-identical to `--jobs 1` over ≥12 fixture repos;
-   (c) a worker that produces no output yields an `unknown` row rather than a
-   missing one; (d) plan 035's read-only invariance re-run through the parallel
-   path.
+7. Tests:
+   (a) **scope composition with a NON-EMPTY fake session set** — assert exact row
+       counts for `--root` alone (fixture repos only, no session repos) vs
+       `--all` (the union). An empty session set makes replace and add
+       indistinguishable, which is how the draft's ambiguity survived review.
+   (b) `--jobs 8` output byte-identical to `--jobs 1` over ≥12 fixture repos.
+   (c) **a worker that exits NON-ZERO**, *and* separately a worker that exits 0
+       with no output, each yield an `unknown` row — **and the scan still
+       reports every other repo in the scope.** The non-zero case is the one
+       that matters: the draft's wording ("produces no output") is satisfied by
+       an exit-0-and-silent fixture, which passes against the broken
+       implementation because exit 0 never trips `set -e`. Include a
+       worker that exits 255 if it can be arranged cheaply, since that status
+       aborts remaining input rather than degrading one row.
+   (d) plan 035's read-only invariance re-run through the parallel path.
 8. Update `CHANGELOG.md` and `README.md`.
 
 ## Verification
@@ -212,17 +321,31 @@ repos buries the signal, so:
   exits 0. This is the load-bearing check for the whole plan.
 - `[assert]` `cctrl repo status --root "$FIXTURES" --json | jq -e '[.[] | .sources[]] | index("root") != null'`
   prints `true`
+- `[assert]` **fail-closed through the pool** — with one fixture repo rigged so
+  its probe exits **non-zero**, the scan exits 0, emits an `unknown` row for that
+  repo, **and still reports every other repo in the scope**. This is the
+  regression test for the `set -euo pipefail` × `xargs` blocker; without the
+  non-zero exit it proves nothing.
+- `[assert]` **scope semantics** — with a non-empty fake session set,
+  `cctrl repo status --root "$FIXTURES" --json | jq 'length'` equals the fixture
+  repo count (session repos excluded), while `--all` returns the union count
 - `[assert]` a `--root` pointing at a nonexistent path exits 0, writes a warning
   to stderr, and still reports the other scopes' repos
 - `[assert]` `--jobs 0` and `--jobs abc` exit non-zero with a usage message
-- `[cmd]` performance gate — a scan of ≥50 fixture repos at default `--jobs`
-  completes in under 5s wall (generous headroom over the measured 1.9s; the gate
-  exists to catch an accidental serialization regression, not to benchmark CI
-  hardware)
+- `[cmd]` performance gate — **opt-in, gated behind `CCTRL_TEST_PERF=1`**: a scan
+  of ≥50 fixture repos at default `--jobs` completes in under 5s wall. Not a
+  default gate: it would be the only wall-clock assertion in `tests/run-tests.sh`
+  (there are none today), building ≥50 fixture repos costs real time before the
+  gate even starts, and this machine routinely runs ~25 concurrent agent
+  sessions — it would flake. The `--jobs 1` vs `--jobs 8` determinism diff stays
+  the hard gate; it is the genuinely load-bearing check for this plan.
 - `[assert]` read-only invariance (plan 035's fixture check) still passes when
   run through `--jobs 8`
-- `[manual]` `time cctrl repo status --root ~/dev --dirty-only` on the live tree:
-  under 3s, and the reported set matches a hand-run `git status` loop.
+- `[manual]` `time cctrl repo status --root ~/dev --attention-only` on the live
+  tree: under 3s, and the reported set matches a hand-run `git status` loop.
+- `[manual]` `cctrl repo status --all` includes the live session working in
+  `~/dev/repo-audits/…` (depth 2) that `--root ~/dev` alone necessarily misses —
+  confirming `--all` is the union and depth-1 is a documented boundary, not a bug.
 
 ## Eng review — 2026-07-28
 
@@ -364,3 +487,35 @@ Fix: state the chosen semantics in the AC for both, and add a test with a
 over a second `lib/` file, depth-1 `--root`, refusing a `data/repo-roots.json`,
 refusing to auto-promote a non-repo shortcut into a root, refusing a cache, and
 refusing `--fetch` at 58 repos. All checked; all correct.
+
+### Author response — 2026-07-28 (revised, awaiting re-review)
+
+- **BLOCKER — accepted in full and fixed.** The `set -euo pipefail` × `xargs`
+  interaction is real and would have voided the fail-closed guarantee entirely.
+  A new Design section states the failure mode, reproduces it, and mandates
+  three defenses: a `set +e` guard spanning the whole pipeline (`pipefail`),
+  `_probe` always exiting 0 and never 255, and the collection-step fallback
+  (now genuinely reachable). The review's point that the *test wording* was the
+  root cause is the sharper half: Task 7(c) and a new Verification check now
+  require a fixture worker that **exits non-zero**, since an exit-0-and-silent
+  fixture passes against the broken implementation.
+- **MUST DECIDE — decided: scope flags REPLACE the session default.** `--all` is
+  the explicit union. Rationale in the AC. Also made explicit that the
+  session→repo join is orthogonal to scope and always runs, and that
+  `CCTRL_REPO_ROOTS` never silently redefines the default scope. Scope
+  composition is now tested with a **non-empty** fake session set.
+- **Perf gate — now opt-in behind `CCTRL_TEST_PERF=1`.** Agreed it would be the
+  only wall-clock assertion in the suite and would flake on a box running ~25
+  concurrent sessions. The `--jobs 1` vs `--jobs 8` determinism diff stays the
+  hard gate.
+- **"I/O-bound" claim — corrected.** The plan now carries the real numbers
+  (7.00s user / 1.47s sys at 695% CPU) and an explicit instruction not to let
+  the wrong figure reach a source comment. Timing table shows both runs.
+- **`_shortcut_list` citation — corrected** to "this is new code, not reuse",
+  with the actual jq expression against the file and the trailing-slash note.
+- **`--jobs 1` as a separate path — kept**, per the review's own framing that it
+  is the more testable of the two defensible options.
+- **New (author, not from review): depth-1 has a live cost.** A session is
+  currently working in `~/dev/repo-audits/natively-cluely-audit` — depth 2 — so
+  `--root ~/dev` provably does not cover the fleet. Documented as the argument
+  for `--all` and the `SRC` column, not as an argument for recursion.

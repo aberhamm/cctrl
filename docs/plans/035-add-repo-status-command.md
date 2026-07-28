@@ -20,17 +20,20 @@ have uncommitted or unpushed changes?"* without shelling out a `git status` loop
 by hand. Four incidents in one week:
 
 1. **Unattributable changes.** Multiple sessions share one working tree — three
-   live in `~/dev/cctrl`, two in `~/dev/homelab`, eight in `~/dev/obsidian-vault`
-   (verified from `cctrl session ls`, 2026-07-26). A mixed dirty tree could not
+   live in `~/dev/cctrl`, six in `~/dev/homelab`, ten in `~/dev/obsidian-vault`
+   (re-verified from `cctrl session ls`, 2026-07-28; 25 live sessions resolve to
+   6 distinct git toplevels plus one non-repo). A mixed dirty tree could not
    be attributed to a session, because plain `git status` knows nothing about
    sessions. **This join is the feature's actual value-add**; the git half is
    commodity.
 2. **Content that must never be auto-committed.** `~/dev/matthew-aberham-resume`
-   carries 71 dirty entries including unreviewed `.tex` content. Any tool that
+   carries 89 dirty entries including unreviewed `.tex` content. Any tool that
    sweeps repos and "helpfully" stages or commits is actively dangerous. The
    command **informs; it never fixes**.
 3. **Silent drift.** Untracked plan files sat unnoticed in three repos for days;
-   unpushed commits accumulated with nobody aware.
+   unpushed commits accumulated with nobody aware. Still true on 2026-07-28:
+   `benedikt-thesis-audit` has 3 commits on a branch with no remote at all, and
+   `next-chat-umbrella-app` has two such branches carrying 1 each.
 4. **Cost of asking.** Because the answer required a manual loop, it was asked
    rarely. It must be cheap enough to run habitually.
 
@@ -42,25 +45,31 @@ fan-out are plan 036; teaching the fleet-manager role to use it is plan 037.
 **Acceptance criteria:**
 
 - [ ] `cctrl repo status` exists as a new top-level command, dispatched from
-      `_dispatch` (`cctrl:7963-8007`), with `repos` as an alias and a bare
-      `cctrl repo` defaulting to `status` (mirroring `cmd_session`'s
-      `local action="${1:-ls}"`, `cctrl:4586`).
+      `_dispatch`, with `repos` as an alias and a bare `cctrl repo` defaulting
+      to `status` (mirroring `cmd_session`'s `local action="${1:-ls}"`).
 - [ ] Default scope = the distinct `git rev-parse --show-toplevel` of every live
-      session's `dir` from `_session_list --json` (`cctrl:5108`). A session dir
-      that is not in a git repo (`~/dev/obsidian-vault` today — verified not a
-      repo, yet home to 8 live sessions) is reported as its own row with
-      `vcs: null`, never silently dropped: 8 sessions producing unversioned work
-      is a finding, not a non-event.
+      session's `dir` from `_session_list --json`. A session dir that is not in a
+      git repo (`~/dev/obsidian-vault` today — verified not a repo, yet home to
+      **10** live sessions) is reported as its own row with `vcs: null`, never
+      silently dropped: 10 sessions producing unversioned work is a finding, not
+      a non-event.
+- [ ] `--here` scopes the scan to the caller's own repo — one row, still carrying
+      the full session list for that repo, with the calling session marked. This
+      is the form `cctrl-session-end` uses (plan 037); a closing session asking
+      "is *my* work uncommitted?" must not have to read a fleet-wide table.
 - [ ] Per repo it reports: absolute path, basename, current branch (and whether
       HEAD is detached), staged / unstaged / untracked counts, an advisory
       untracked-artifact count, stash count, per-branch unpushed commit counts
-      (**every** local branch, not just HEAD), branches with no upstream, and
+      (**every** local branch, not just HEAD), and
       **the live sessions whose cwd resolves into that repo** (name, purpose,
       state, agent).
+- [ ] A local branch with **no upstream at all** reports a real commit count, not
+      `null`. A never-pushed branch *is* founding incident #3; reporting it as
+      unknown loses exactly the signal the plan exists to surface.
 - [ ] Human table by default; `--json` emits a JSON array following the
-      `_session_list --json` conventions (`cctrl:5206-5217`): built with
-      `jq -n --arg/--argjson`, empty strings normalized to `null`, `[]` when the
-      scope is empty, deterministic ordering.
+      `_session_list --json` conventions: built with `jq -n --arg/--argjson`,
+      empty strings normalized to `null`, `[]` when the scope is empty,
+      deterministic ordering.
 - [ ] **Read-only, enforced by test.** No code path in this subsystem may invoke
       a mutating git verb. There is no `--fetch` (see Design). A fixture repo's
       git state is byte-identical before and after a scan.
@@ -71,10 +80,16 @@ fan-out are plan 036; teaching the fleet-manager role to use it is plan 037.
       session count descending, then by name — stable and deterministic.
 - [ ] Exits 0 whenever the scan ran, including when findings exist. Non-zero
       only for a usage error or a missing dependency (`git`, `jq`).
-- [ ] `cctrl repo --help` and the `Session`/new `Repos` block in `cmd_help`
-      (`cctrl:6267`) document it.
-- [ ] Covered by `tests/run-tests.sh` in the style of `test_needs_me_digest`
-      (`tests/run-tests.sh:1846`): fake tmux + real temporary git repos.
+- [ ] `cctrl repo --help` and a new `Repos` block in `cmd_help` document it.
+- [ ] Covered by `tests/run-tests.sh` in the style of `test_needs_me_digest`:
+      fake tmux + real temporary git repos.
+
+**Citation convention for this plan and its siblings:** refer to cctrl internals
+by **function name, never by line number**. The original draft's line citations
+were already stale two days later — a single unrelated commit (`f7db9ab`) shifted
+`cctrl` by 13 lines, moving `_dispatch` 7963→7976, `cmd_help` 6267→6280,
+`_session_list` 5108→5121, `_target_slug` 607→612. Function names are stable;
+line numbers are a trap for an autonomous implementer.
 
 ## Design
 
@@ -99,8 +114,8 @@ alongside `peer`, `host`, `session`, `fleet`, matching `_dispatch`'s existing
 shape, and leaves room for later verbs (`repo ls`) without another rename.
 `status` is the git-native word for exactly this question.
 
-*Namespace note:* `_dispatch` tries builtins before `_try_plugin`
-(`cctrl:7999`), so adding `repo` shadows any user plugin named `cctrl-repo`.
+*Namespace note:* `_dispatch` tries its builtin arms before falling through to
+`_try_plugin`, so adding `repo` shadows any user plugin named `cctrl-repo`.
 Call this out in the changelog entry; it is the price of claiming a top-level
 noun and is acceptable — but do not also claim `git` or `status`.
 
@@ -155,15 +170,32 @@ _repo_discover_json  →  [{path, sources:["session"], sessions:[…]}, …]
 
 Read `_session_list --json` once. For each entry take `.dir`, resolve
 `git -C "$dir" rev-parse --show-toplevel` (the same resolution `_target_slug`
-already does at `cctrl:607`), and group sessions by the resulting toplevel. A
-`dir` that resolves to nothing becomes a `vcs: null` row keyed on the dir itself.
+already does), and group sessions by the resulting toplevel. A `dir` that
+resolves to nothing becomes a `vcs: null` row keyed on the dir itself.
 Degrade to an empty scope rather than failing when tmux is unavailable, exactly
-as `cmd_needs_me` does (`cctrl:7096-7100`).
+as `cmd_needs_me` does.
 
 `_repo_discover_json` must take its scope as arguments so plan 036 can add
 `--shortcuts` / `--root` / `--all` by extending the source set and the `sources`
 array, without touching the probe or the renderer. **Build the seam; do not
 build the flags.**
+
+**`--here` is the second scope source this plan ships**, and it exercises the
+seam rather than bypassing it: resolve `git -C "$PWD" rev-parse --show-toplevel`,
+scope to that single repo, and still run the full session join so the row lists
+every sibling session in that tree. Two details make it worth its ~5 lines:
+
+- The calling session is **marked** in the session list (`← you`), resolved from
+  `CCTRL_SESSION_NAME` / `_session_current_name`. Knowing three siblings share
+  the tree is the fact that makes "stage explicit paths, never `git add .`"
+  land; knowing which one is *you* is what makes it actionable.
+- Outside a repo, `--here` reports the `not-a-repo` row for `$PWD` — the same
+  fail-visible shape as any other scope, not an error. A session in
+  `~/dev/obsidian-vault` running it before close must be told its work is
+  unversioned, which is precisely when that matters most.
+
+`--here` is mutually exclusive with plan 036's scope flags; combining them is a
+usage error, not a union.
 
 *Worktrees:* `--show-toplevel` inside a `git worktree` returns the worktree path,
 so an agent worktree under `.claude/worktrees/` correctly appears as its own row
@@ -193,10 +225,10 @@ additively, never repurpose a key):
   "artifacts": 1,
   "stashes": 1,
   "unpushed": [
-    {"branch": "main", "upstream": "origin/main", "ahead": 2},
-    {"branch": "wip",  "upstream": null,          "ahead": null}
+    {"branch": "main", "upstream": "origin/main", "ahead": 2, "basis": "upstream"},
+    {"branch": "wip",  "upstream": null,          "ahead": 3, "basis": "no-upstream"}
   ],
-  "ahead_total": 2,
+  "ahead_total": 5,
   "no_upstream": 1,
   "refs_scope": "local-refs-only",
   "sources": ["session"],
@@ -214,6 +246,22 @@ additively, never repurpose a key):
   the untracked-plans incident is an `untracked > 0` story, the resume incident
   an `unstaged > 0` story.
 - `artifacts` ⊆ `untracked`; advisory only.
+- **`ahead` is never `null`, including for a branch with no upstream.** For an
+  upstream-tracking branch it is `rev-list --count "$up..$b"` (`basis:
+  "upstream"`). For a branch with no upstream it is
+  `git rev-list --count "$b" --not --remotes` (`basis: "no-upstream"`) — the
+  commits that exist on no remote at all. Both are read-only, both stay
+  local-refs-only, both cost nothing.
+  `basis` exists so a reader can tell the two kinds of count apart: `ahead: 3`
+  against an upstream means "pushed somewhere, 3 newer here"; against
+  `no-upstream` it means "this branch has never been pushed anywhere". Rolling
+  them into one number without the discriminator would be worse than the `null`
+  it replaces.
+  `ahead_total` sums both kinds — a never-pushed branch is unpushed work, and a
+  total that silently excludes it is the false all-clear this plan exists to
+  prevent. (Live example on 2026-07-28: `benedikt-thesis-audit` `main` carries 3
+  commits and has no remote; the original `null` design reported that repo's
+  `ahead_total` as `0`.)
 - `verdict` ∈ `clean | dirty | unpushed | dirty+unpushed | not-a-repo | unknown`.
   `unknown` is the fail-closed value and carries `error`.
 - `refs_scope` is always the literal `"local-refs-only"`. It exists so no reader
@@ -262,36 +310,44 @@ cctrl                    main     0/1/2    2   1      3     dirty+unpushed
     ✦ TMUX--ms--cctrl--2   working   fleet-manager
     ✦ TMUX--ms--cctrl--3   idle-done backlog runner
     ✦ TMUX--ms--cctrl--4   working   plan repo-status command
-obsidian-vault           -        -        -   -      8     not-a-repo
-homelab                  main     0/0/0    0   0      3     clean
+obsidian-vault           -        -        -   -     10     not-a-repo
+homelab                  main     0/0/0    0   0      6     clean
 ```
 
 - One row per repo; the indented session lines print **only for repos whose
   verdict is not `clean`** (and for `not-a-repo`), so the table stays glanceable
-  while attribution is right where the problem is.
+  while attribution is right where the problem is. Under `--here` the session
+  lines always print — that row *is* the output — and the calling session is
+  marked `← you`.
 - `S/U/?` is staged/unstaged/untracked. `-` for non-repos.
-- Colors follow existing conventions (`RED`/`YELLOW`/`DIM`, `cctrl:60-67`).
-  Reuse the `✦` managed marker from `_session_list` (`cctrl:5219`).
+- Colors follow existing conventions (`RED`/`YELLOW`/`DIM`). Reuse the `✦`
+  managed marker from `_session_list`.
 - Footer: `N repos · M need attention · K clean` and, when any repo is
   `unknown`, a loud line naming them.
 
 ### Flags (this plan)
 
 ```
-cctrl repo status [--json] [--files] [--dirty-only] [-h|--help]
+cctrl repo status [--json] [--files] [--attention-only] [--here] [-h|--help]
 ```
 
-`--dirty-only` omits clean repos. `--files` adds the capped sample paths.
-Parsed with the same simple `for a in "$@"` loop used by `_session_list`
-(`cctrl:5110-5116`) and `cmd_needs_me` (`cctrl:7075`).
+`--attention-only` omits `clean` repos. It is deliberately **not** named
+`--dirty-only`: it retains `unpushed`, `unknown`, and `not-a-repo` rows, so
+"dirty" would misdescribe it — and plan 036 makes it the habitual pairing for
+the wide scope, which is exactly where a lying flag name does the most damage.
+The name also matches the footer's own wording ("N need attention").
+
+`--files` adds the capped sample paths. Flags are parsed with the same simple
+`for a in "$@"` loop used by `_session_list` and `cmd_needs_me`.
 
 **Files expected to change:**
 
 - `cctrl`: new `_repo_*` function block (place it near `cmd_needs_me`, the
   closest analogue: a read-only aggregate that consumes `_session_list --json`);
-  `cmd_repo` dispatcher with `-h/--help`; `repo|repos` arm in `_dispatch`
-  (`cctrl:7976-7997`); a `Repos` block in `cmd_help`.
-- `tests/run-tests.sh`: `test_repo_status` (+ registration near line 3768).
+  `cmd_repo` dispatcher with `-h/--help`; `repo|repos` arm in `_dispatch`;
+  a `Repos` block in `cmd_help`.
+- `tests/run-tests.sh`: `test_repo_status` (+ registration alongside the other
+  `test_*` calls at the foot of the file).
 - `CHANGELOG.md`: entry noting the new command **and** the `cctrl-repo` plugin
   shadowing.
 - `README.md`: command reference entry.
@@ -304,9 +360,8 @@ Parsed with the same simple `for a in "$@"` loop used by `_session_list`
 - Any `--fetch`, `--fix`, `--commit`, `--stash`, or interactive disposition.
   Permanently out of scope for this goal.
 - Multi-host aggregation. It already works: `repo status` is local-only by
-  design, and the global `--host` flag (`cctrl:7943-7957`) makes
-  `cctrl --host mbp repo status` work for free. Do **not** build a `fleet`-style
-  SSH aggregator here.
+  design, and the global `--host` flag makes `cctrl --host <alias> repo status`
+  work for free. Do **not** build a `fleet`-style SSH aggregator here.
 - Special-casing plan files, `docs/plans/`, or any mstack concept. cctrl is
   generic; `untracked` + `--files` covers that incident without coupling.
 
@@ -317,8 +372,17 @@ Parsed with the same simple `for a in "$@"` loop used by `_session_list`
    list).
 2. Implement `_repo_probe_json <path>`: NUL-safe porcelain parse with `R`/`C`
    two-token handling, artifact basename match on untracked only, stash count,
-   branch/detached, per-branch ahead + `upstream: null`, verdict, fail-closed
-   `unknown` + `error`. No shared state — it must be safe to run as a subprocess.
+   branch/detached, per-branch ahead with `basis` (`upstream` via
+   `rev-list --count "$up..$b"`, `no-upstream` via
+   `rev-list --count "$b" --not --remotes`), verdict, fail-closed `unknown` +
+   `error`. No shared state — it must be safe to run as a subprocess.
+
+   **`set -e` hazard, read this before writing the fail-closed paths.** `cctrl`
+   runs `set -euo pipefail`. `local x="$(git …)"` **masks** a non-zero exit
+   status (the `local` builtin's own status wins), while bare `x="$(git …)"`
+   propagates it and will kill the function. Fail-closed correctness here depends
+   entirely on getting that distinction right: declare `local` first, assign on a
+   separate line, and check `$?` explicitly — or guard with `|| return`.
 3. Implement `_repo_discover_json`: read `_session_list --json` once, resolve
    toplevels, group sessions per repo, emit `not-a-repo` rows for unresolvable
    dirs, degrade to `[]` when tmux is absent. Take the scope as arguments.
@@ -326,12 +390,22 @@ Parsed with the same simple `for a in "$@"` loop used by `_session_list`
    session count desc → name.
 5. Add `cmd_repo` with `status` (default), `-h|--help`; wire `repo|repos` into
    `_dispatch`; add the `Repos` block to `cmd_help`.
-6. Add `--files` (capped at 5 per list, `truncated` flag) and `--dirty-only`.
-7. Write `test_repo_status` in `tests/run-tests.sh`: build three real temp git
-   repos (clean / dirty-with-untracked / ahead-of-a-local-bare-remote), plus a
-   non-repo dir; fake tmux maps session names to those dirs; assert the JSON
+6. Add `--files` (capped at 5 per list, `truncated` flag) and `--attention-only`.
+7. Add `--here`: resolve `$PWD`'s toplevel, scope to it, run the full session
+   join, mark the calling session `← you`, and report `not-a-repo` when `$PWD`
+   is outside a repo. Reject `--here` combined with any other scope flag.
+8. Write `test_repo_status` in `tests/run-tests.sh`: build four real temp git
+   repos (clean / dirty-with-untracked / ahead-of-a-local-bare-remote /
+   commits-on-a-branch-with-no-remote), plus a non-repo dir; assert the JSON
    shape, the session join, the fail-closed path, and read-only invariance.
-8. Update `CHANGELOG.md` and `README.md`.
+
+   **The fake tmux needs a real extension, not a copy.** `test_needs_me_digest`'s
+   fake answers `list-panes … pane_current_path` with one hardcoded
+   `echo /tmp/demo` for every session; this plan needs a **per-session dir
+   mapping**, since the entire session→repo join is what is under test. The `-t`
+   target extraction already exists in that fake, so the change is small — but
+   budget for it rather than assuming "in the style of" is free.
+9. Update `CHANGELOG.md` and `README.md`.
 
 ## Verification
 
@@ -347,9 +421,18 @@ Parsed with the same simple `for a in "$@"` loop used by `_session_list`
   `git status --porcelain -uall`, `git stash list`, `git for-each-ref`, and the
   existence of `.git/FETCH_HEAD` before and after `cctrl repo status`; assert
   every one is identical. This is the acceptance test for "informs, never fixes".
-- `[assert]` **static mutation guard** — the `_repo_*` source block contains no
-  occurrence of `git .*\b(add|commit|stash push|stash save|checkout|switch|reset|fetch|pull|push|clean|restore|rm|mv)\b`.
-  A cheap regression net that survives future edits by other agents.
+- `[assert]` **static mutation guard** — the `_repo_*` source block, **with
+  comment lines stripped first**, contains no occurrence of
+  `git .*\b(add|commit|stash push|stash save|checkout|switch|reset|fetch|pull|push|clean|restore|rm|mv)\b`:
+
+      sed 's/#.*//' <block> | grep -Eq 'git .*\b(add|commit|…)\b' && fail
+
+  **Stripping comments is mandatory, not incidental.** Task 1 requires a header
+  comment naming `wrapup-scan.sh` as prior art, and the natural read-only
+  disclaimer — "never runs `git add`, `git commit`, `git fetch`, or `git push`"
+  — matches this regex verbatim. Without the strip, the plan's own guard rejects
+  the plan's own mandated comment, and the implementer's likely "fix" is to
+  delete the comment. Guard the code, not the prose.
 - `[assert]` a repo with an unreadable `.git` yields `verdict: unknown` and a
   non-null `error`, and the string `clean` does not appear for it (fail closed).
 - `[assert]` a session dir that is not a git repo yields one row with
@@ -357,9 +440,18 @@ Parsed with the same simple `for a in "$@"` loop used by `_session_list`
 - `[assert]` a repo containing a commit on a **non-HEAD** local branch that is
   ahead of its upstream is reported in `unpushed` (guards the side-branch
   false-all-clear that wrapup-scan.sh's per-branch loop exists to prevent).
-- `[manual]` Run against the live fleet: `~/dev/matthew-aberham-resume` (71
-  dirty entries) is reported and untouched; `~/dev/obsidian-vault` shows as
-  not-a-repo with its 8 sessions attributed.
+- `[assert]` a repo whose only commits sit on a branch with **no upstream and no
+  remote** reports `ahead > 0`, `basis: "no-upstream"`, and a non-zero
+  `ahead_total` — never `ahead: null` and never `ahead_total: 0`. This is
+  founding incident #3's regression test.
+- `[assert]` `cctrl repo status --here` run inside a fixture repo returns exactly
+  one row whose `path` is that repo's toplevel, carrying every session in that
+  tree; run outside a repo it returns one `not-a-repo` row and exits 0.
+- `[assert]` `--here` combined with a plan-036 scope flag exits non-zero with a
+  usage message.
+- `[manual]` Run against the live fleet: `~/dev/matthew-aberham-resume` (89
+  dirty entries as of 2026-07-28) is reported and untouched; `~/dev/obsidian-vault`
+  shows as not-a-repo with its 10 sessions attributed.
 
 ## Eng review — 2026-07-28
 
@@ -443,3 +535,34 @@ The refusals are the strongest part of the plan and each was checked against the
 codebase: no `--fetch`; no shared library with `wrapup-scan.sh`;
 reimplement-and-cite; the narrowed artifact list; not folding into `session ls`;
 and the session→repo join as the actual value-add rather than the git plumbing.
+
+### Author response — 2026-07-28 (revised, awaiting re-review)
+
+Both required/recommended edits applied, plus every non-blocking note.
+
+- **Edit 1 (required) — applied.** The static mutation guard now strips comment
+  lines (`sed 's/#.*//'`) before matching, and Verification says *why*, so the
+  implementer does not "fix" the conflict by deleting the mandated header
+  comment. Good catch: the guard as drafted rejected the comment the plan itself
+  requires.
+- **Edit 2 (recommended) — applied, and promoted to an acceptance criterion.**
+  `ahead` is now never `null`; no-upstream branches count via
+  `rev-list --count "$b" --not --remotes` and carry `basis: "no-upstream"` to
+  distinguish the two kinds of count. `ahead_total` sums both. Re-verified the
+  three live instances independently (`benedikt-thesis-audit` main ×3,
+  `next-chat-umbrella-app` ×2 branches ×1) — the draft would have reported that
+  repo's `ahead_total` as `0`, which is exactly incident #3.
+- **Line numbers — removed everywhere**, and a stated citation convention added
+  (function names only) so the next draft does not reintroduce them.
+- **Test fixture — Task 8 now spells out** that the fake tmux needs a per-session
+  dir mapping, since the session→repo join is the thing under test.
+- **`set -e` masking — added to Task 2** as an explicit warning about
+  `local x="$(…)"` vs bare assignment, since fail-closed correctness depends on it.
+- **`--dirty-only` → `--attention-only`.** Agreed it was misnaming a flag that
+  retains `unpushed`/`unknown`/`not-a-repo`; free to fix pre-implementation.
+- **New: `--here`** (from plan 037's escalated scope question; Matthew chose
+  Option A on 2026-07-28). One row, the caller's own repo, sibling sessions
+  listed, caller marked `← you`. Specified here because it is a command
+  behavior; 037 remains doctrine-only.
+
+Nothing in the "Kept as-is" list was touched.
