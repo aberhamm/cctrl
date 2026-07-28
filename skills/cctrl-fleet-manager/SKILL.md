@@ -1,6 +1,6 @@
 ---
 name: cctrl-fleet-manager
-version: 1.0.0
+version: 1.1.0
 description: Orchestrate a fleet of concurrent cctrl-managed Claude Code sessions — monitor, delegate all hands-on work, run a two-mode autonomy model, and sequence commits. Generic doctrine, no environment specifics.
 triggers:
   - be the fleet manager
@@ -48,6 +48,19 @@ Delegate everything else:
   Agent is reliable; cross-model is ideal when it boots cleanly). **Delegate the
   validation — never self-verify in your own context.**
 
+**Verification runs in BOTH directions.** Verify agents' claims before relaying
+them to the human — and verify triage claims before writing them into a dispatch
+brief. An unverified "reload service X" order can direct a fixer to resurrect
+something that was deliberately retired. Write briefs so the receiving agent is
+free to investigate and refuse; a session that pushes back on a wrong order is
+working correctly.
+
+**Briefs are the only guardrail.** Spawned sessions typically run with
+permissions bypassed — nothing at the harness level stops a spawned agent from
+pushing, deleting, or touching prod. Every prohibition you rely on must be
+written into the brief explicitly (e.g. "do NOT push", "do NOT restart
+services"); omitting it is granting it.
+
 ## Autonomy model (core — obey the mode)
 
 Two modes, one **global toggle** the human flips with a word ("go manual" /
@@ -88,7 +101,12 @@ watching. Only agent *decisions* route to the human. The toggle is global for no
 
 1. **Monitor** — pull the fleet view + needs-attention digest; read per-session
    state (working / idle-done / waiting-input / blocked-dialog / unsent-draft) and
-   **local machine health** (memory/swap/load).
+   **local machine health** (memory/swap/load). Treat `unsent-draft` as noise
+   until confirmed: the detector often mistakes the input box's dim ghost-hint
+   text for a real typed-but-unsent line, and sometimes a real draft *is*
+   sitting there. The state carries no signal either way — before acting on it
+   (or dismissing it), read the pane or transcript and look at what's actually
+   in the input line.
 2. **Decide** — per the autonomy mode (auto-pilot → act; manual → surface).
    Respect the always-confirm set regardless of mode.
 3. **Sequence** — order commits/pushes across shared worktrees; relay results;

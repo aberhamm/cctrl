@@ -29,6 +29,16 @@ skills, and a cost-reporting correction.
   concurrent sessions under a two-mode autonomy model). All are
   environment-agnostic; pair them with a private brief for host specifics.
 
+### Changed
+- `cctrl-fleet-manager` doctrine (1.1.0) folds in three operational lessons:
+  verification runs in both directions (verify triage claims before writing
+  them into a dispatch brief, and write briefs so the receiving agent may
+  refuse a wrong order); the brief is the only guardrail, since spawned
+  sessions typically run with permissions bypassed, so every prohibition must
+  be written in explicitly; and the `unsent-draft` session state carries no
+  signal in either direction — only a pane or transcript read confirms whether
+  a real draft is sitting in the input line.
+
 ### Fixed
 - `cctrl` now actually detects an unsent draft in a Claude Code pane. The
   detector anchored on ASCII `>` while Claude Code's input line starts with `❯`
