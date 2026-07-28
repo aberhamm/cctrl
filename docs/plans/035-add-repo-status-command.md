@@ -9,6 +9,8 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-07-26
+reviews:
+  - type=eng verdict=changes-requested date=2026-07-28 by=mstack-review
 ---
 
 ## Requirements
@@ -358,3 +360,86 @@ Parsed with the same simple `for a in "$@"` loop used by `_session_list`
 - `[manual]` Run against the live fleet: `~/dev/matthew-aberham-resume` (71
   dirty entries) is reported and untouched; `~/dev/obsidian-vault` shows as
   not-a-repo with its 8 sessions attributed.
+
+## Eng review — 2026-07-28
+
+Reviewed by an independent session (not the author), at the fleet manager's
+request. Verdict: **changes-requested** — approve once the two edits below land.
+Both are small. The plan is otherwise sound and unusually well-argued.
+
+Scores: clarity 9 · testability 9 · scope-fit 8 · autonomy 9 · trap-resistance 8
+→ composite **8.7/10**.
+
+Verified against the working tree on 2026-07-28: bash 3.2.57; `_dispatch` tries
+builtins before `_try_plugin`, so the `cctrl-repo` plugin shadowing this plan
+calls out is real; `~/dev/obsidian-vault` is not a git repo and now holds **10**
+live sessions (plan said 8); 25 live sessions resolve to 6 distinct toplevels
+plus that one non-repo. `~/dev/matthew-aberham-resume` now carries **89** dirty
+entries (plan said 71) — the incident is if anything stronger than written.
+
+### Edit 1 (required): the static mutation guard contradicts the mandated header comment
+
+Task 1 requires a header comment naming `wrapup-scan.sh` as prior art and
+stating the divergence. Verification asserts the `_repo_*` block contains no
+match for:
+
+    git .*\b(add|commit|stash push|stash save|checkout|switch|reset|fetch|pull|push|clean|restore|rm|mv)\b
+
+The natural header comment — "read-only: never runs `git add`, `git commit`,
+`git fetch`, or `git push`" — **matches that regex and fails the plan's own
+guard**. So does any prose in the block naming a mutating verb after the word
+`git`.
+
+Fix: specify that the guard strips comment lines before matching, e.g.
+
+    sed 's/#.*//' <block> | grep -Eq 'git .*\b(add|commit|...)\b' && fail
+
+State this in the Verification bullet, so the implementer does not rediscover it
+the hard way and then "fix" it by deleting the comment Task 1 requires.
+
+### Edit 2 (recommended): no-upstream branches make founding incident #3 invisible
+
+The pinned contract reports a branch with no upstream as
+`{"branch":"wip","upstream":null,"ahead":null}`, and `ahead_total` excludes it.
+But a local branch that has **never been pushed** is exactly incident #3
+("unpushed commits accumulated with nobody aware") — and the design reports its
+count as unknown rather than as a number.
+
+Real instances in this operator's tree on 2026-07-28:
+
+    benedikt-thesis-audit    main                        3 commits on no remote
+    next-chat-umbrella-app   feat/org-rate-limiting      1
+    next-chat-umbrella-app   feat/seed-wine-collection   1
+
+`git rev-list --count "$b" --not --remotes` gives the true count, stays
+read-only, stays local-refs-only, and costs nothing. Recommend: make `ahead`
+non-null for no-upstream branches and add a `basis` field
+(`"upstream"` | `"no-upstream"`) so a reader can tell the two kinds of count
+apart — rather than reporting `null` and losing the signal.
+
+### Non-blocking notes
+
+- **Line-number citations are already stale.** Commit `f7db9ab` alone added 13
+  lines to `cctrl`. Actual as of 2026-07-28: `_dispatch` 7976 (cited 7963),
+  `cmd_help` 6280 (6267), `_session_list` 5121 (5108), `_target_slug` 612 (607),
+  colors 59-66 (60-67), `test_needs_me_digest` 1879 (1846), test registration
+  3802 (3768). Cite function names, not line numbers.
+- **The test fixture needs more than "in the style of `test_needs_me_digest`".**
+  That fake tmux returns one hardcoded `pane_current_path` (`echo /tmp/demo`)
+  for every session; this plan needs a per-session dir mapping. The `-t` target
+  extraction is already present in the fake, so it is a small extension — but it
+  is not free, and Task 7 reads as though it were.
+- **`set -e` and command substitution.** `local x="$(git …)"` masks a failing
+  exit status; bare `x="$(git …)"` trips `set -e`. Fail-closed correctness in
+  `_repo_probe_json` depends on getting this distinction right.
+- **`--dirty-only` is misnamed.** It is defined here as "omits clean repos", so
+  it retains `unpushed` / `unknown` / `not-a-repo`. Plan 036 makes it the
+  habitual pairing, where the name matters most. `--attention-only` matches this
+  plan's own footer wording ("N need attention"). Taste, not a blocker.
+
+### Kept as-is — do not "improve" these
+
+The refusals are the strongest part of the plan and each was checked against the
+codebase: no `--fetch`; no shared library with `wrapup-scan.sh`;
+reimplement-and-cite; the narrowed artifact list; not folding into `session ls`;
+and the session→repo join as the actual value-add rather than the git plumbing.
