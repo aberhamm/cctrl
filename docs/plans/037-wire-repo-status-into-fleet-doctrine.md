@@ -9,6 +9,8 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-07-26
+reviews:
+  - type=eng verdict=changes-requested date=2026-07-28 by=mstack-review
 ---
 
 ## Requirements
@@ -191,3 +193,80 @@ demonstrably fails to stick.
 - `[manual]` A fresh reader of `cctrl-fleet-manager` can, from the skill alone,
   answer "a repo is dirty and two sessions live in it — what do I do?" without
   reaching for the command's `--help`.
+
+## Eng review — 2026-07-28
+
+Reviewed by an independent session (not the author). Verdict:
+**changes-requested**, on one open question only. Decide the scope question
+below and this plan is ready — everything else in it checks out.
+
+Scores: clarity 9 · testability 7 · scope-fit 9 · autonomy 7 · trap-resistance 9
+→ composite **8.0/10**.
+
+Premises verified 2026-07-28: `skills/cctrl-fleet-manager/SKILL.md` has
+`## The monitor → decide → sequence loop` (the monitoring-inputs location this
+plan targets); `skills/cctrl-session-end/SKILL.md` has `### 1. Check for
+uncommitted work`, which today says simply `git status`; and this plan's
+environment-agnostic grep gate **currently passes clean** on both files. The
+shared-working-tree hazard is real and current: 4 live sessions in one repo, 6
+in another, and 10 in a directory that is not a repo at all.
+
+### OPEN QUESTION (for Matthew): what scope does a closing session use?
+
+`cctrl-session-end` runs **inside** the session being closed. Its step 1 today
+is `git status` — implicitly *"my own working directory's repo"*. This plan
+replaces that with `cctrl repo status`, whose default scope (per plan 035) is
+*every repo the whole fleet is working in* — 7 rows on the current fleet. A
+closing session would be handed a fleet-wide table and left to locate itself in
+it. Plans 035 and 036 provide no single-repo scope, and this plan's own
+"Out of scope" forbids adding one: *"Any behavior change to the command itself.
+If doctrine wants something the command cannot do, that is a new plan."*
+
+So as written, this plan wires doctrine to a command shape that does not fit the
+second of its two consumers. Pick one:
+
+**Option A — add a `--here` scope to plan 035.** *(recommended)*
+Session-end's step 1 becomes `cctrl repo status --here`: one row, the session's
+own repo, with its sibling sessions listed — which is exactly the attribution
+the shared-tree staging rule needs. Plan 035 already requires
+`_repo_discover_json` to take its scope as arguments, so this is a new scope
+source, not a new seam.
+*Consequence:* a small edit to plan 035 (already changes-requested, so it is
+being touched anyway), and this plan's "no behavior change" boundary moves by
+exactly one flag. Cost ~5 lines.
+
+**Option B — prescribe a filter in the doctrine.** Step 1 becomes
+`cctrl repo status --json | jq …` selecting the row whose `path` matches the
+session's repo toplevel.
+*Consequence:* no code change anywhere; this plan's boundary holds exactly as
+written. But doctrine now carries a jq incantation, which is the kind of thing
+that rots, and `$PWD` is not the repo toplevel, so it needs a `rev-parse` first.
+Strictly worse ergonomics for the same result.
+
+**Option C — accept the fleet-wide table.** Doctrine says "run `cctrl repo
+status`, find your repo's row".
+*Consequence:* free, and defensible — the sibling-session attribution is visible
+either way. But it makes a closing session read 7 rows to answer a 1-row
+question, and it degrades as the fleet grows.
+
+Recommendation: **A**. The command's whole value is attribution, and `--here` is
+the form that delivers attribution to the one role guaranteed to want it.
+
+### Non-blocking notes
+
+- The verdict routing table is the best part of this plan and should survive
+  editing intact. Its `not-a-repo` ⇒ "those sessions' work is unversioned" row
+  is live and true right now (10 sessions in a non-repo).
+- The "Why not automate it" section is correct restraint and worth keeping as
+  written — including the observation that `session autoheal install` proves the
+  machinery already exists. That is what makes it a decision rather than an
+  oversight.
+- Verification is grep-shaped by nature (this is a docs plan), which is fine.
+  The real acceptance is the `[manual]` fresh-reader test; keep it.
+
+### Kept as-is
+
+The inform-never-fix rule stated with a concrete failure mode rather than as an
+abstraction; the explicit-paths staging rule for shared trees; carrying
+`local-refs-only` and the livesync branch-switch hazard into doctrine; and
+scoping the environment-agnostic gate to only the two files this plan edits.
