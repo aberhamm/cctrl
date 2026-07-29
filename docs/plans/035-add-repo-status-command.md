@@ -53,7 +53,8 @@ fan-out are plan 036; teaching the fleet-manager role to use it is plan 037.
       **10** live sessions) is reported as its own row with `vcs: null`, never
       silently dropped: 10 sessions producing unversioned work is a finding, not
       a non-event.
-- [ ] `--here` scopes the scan to the caller's own repo — one row, still carrying
+- [ ] **[PARKED — not a gate until the open human decision lands; see Design.]**
+      `--here` scopes the scan to the caller's own repo — one row, still carrying
       the full session list for that repo, with the calling session marked. This
       is the form `cctrl-session-end` uses (plan 037); a closing session asking
       "is *my* work uncommitted?" must not have to read a fleet-wide table.
@@ -180,8 +181,21 @@ as `cmd_needs_me` does.
 array, without touching the probe or the renderer. **Build the seam; do not
 build the flags.**
 
-**`--here` is the second scope source this plan ships**, and it exercises the
-seam rather than bypassing it: resolve `git -C "$PWD" rev-parse --show-toplevel`,
+> **PARKED — do not implement `--here` yet (2026-07-29).** Two questions are open
+> with the human and **must not be inferred from silence**: (1) does `--here`
+> survive on the strength of an `AskUserQuestion` selector pick on an
+> agent-authored, agent-`(Recommended)`-labeled option, and (2) fix-in-place vs
+> park. The eng re-review's findings **035-5** (four specification gaps: `--host`
+> + `--here` undefined; the tmux-absent contradiction; the `sources` value for a
+> `--here` row; `← you` rendering plus its unresolvable-session fallback and the
+> `--here --attention-only`-on-a-clean-repo case) and **035-6** (no owner for the
+> mutual-exclusion guarantee — plan 036 mentions `--here` zero times) are
+> **deliberately unfixed** pending that answer. The block below is the shape as
+> selected, not an approved specification. Everything else in plans 035/036/037
+> is independent of the outcome.
+
+**`--here` would be the second scope source this plan ships**, and it exercises
+the seam rather than bypassing it: resolve `git -C "$PWD" rev-parse --show-toplevel`,
 scope to that single repo, and still run the full session join so the row lists
 every sibling session in that tree. Two details make it worth its ~5 lines:
 
@@ -198,9 +212,35 @@ every sibling session in that tree. Two details make it worth its ~5 lines:
 usage error, not a union.
 
 *Worktrees:* `--show-toplevel` inside a `git worktree` returns the worktree path,
-so an agent worktree under `.claude/worktrees/` correctly appears as its own row
-rather than merging into the parent. That is the desired behavior — worktree
-dirt is separately attributable — but note it so it is not later "fixed".
+so an agent worktree under `.claude/worktrees/` appears as its own row rather
+than merging into the parent. Keep that — worktree dirt is separately
+attributable — **but only the status half of the row is per-worktree, and the
+draft blessed the other half while telling future readers not to change it.**
+
+**`refs/heads`, `refs/remotes`, and the stash are SHARED across every worktree of
+a repository.** Only the working tree and index are per-worktree. Verified on a
+purpose-built fixture (2026-07-29): `git -C <linked-worktree> for-each-ref
+refs/heads` returns the **whole repository's** branches, and the stash is one
+shared list. Consequence if left unqualified: with N agent worktrees, the same
+unpushed commits are reported N+1 times, every worktree row inherits the parent's
+`unpushed[]` / `ahead_total` / `stashes`, and both the footer's "M need
+attention" and 037's routing table consume that inflated number as if it were N+1
+independent findings.
+
+**Required contract change** — the row must say which kind of row it is:
+
+- `worktree: true|false` and `main_worktree: <path>|null`.
+- **Ref-derived fields are repo-wide, not row-wide**, and the JSON contract says
+  so. For a linked worktree (`worktree: true`), scope `unpushed[]` to **its own
+  HEAD branch only**, and carry the repo-wide figures on the main worktree's row
+  where they belong. `staged`/`unstaged`/`untracked`/`dirty` stay genuinely
+  per-worktree and are unaffected.
+- The human renderer must not sum `ahead` across rows that share a
+  `main_worktree`.
+
+No worktrees are live in the fleet right now, so this is not currently firing —
+which is exactly why it must be pinned before implementation rather than
+discovered by an operator reading a tripled unpushed count during an incident.
 
 ### Per-repo probe
 
@@ -229,7 +269,10 @@ additively, never repurpose a key):
     {"branch": "wip",  "upstream": null,          "ahead": 3, "basis": "no-upstream"}
   ],
   "ahead_total": 5,
+  "unpushed_distinct": 4,
   "no_upstream": 1,
+  "worktree": false,
+  "main_worktree": null,
   "refs_scope": "local-refs-only",
   "sources": ["session"],
   "sessions": [
@@ -262,6 +305,33 @@ additively, never repurpose a key):
   prevent. (Live example on 2026-07-28: `benedikt-thesis-audit` `main` carries 3
   commits and has no remote; the original `null` design reported that repo's
   `ahead_total` as `0`.)
+- **`ahead_total` is a SUM OVER BRANCHES and is NOT a distinct-commit count.**
+  Pinned in the contract because it over-reports whenever branches stack: every
+  unpushed branch re-counts the unpushed ancestry it shares with its base.
+  Reproduced on a purpose-built fixture (2026-07-29) — `child`=4, `dup`=3,
+  `main`=2 by the per-branch formula, so `ahead_total` = **9**, while the true
+  number of distinct unpushed commits is **5**. Both numbers are defensible; a
+  number that is silently one while being read as the other is not.
+  So the contract carries **both**, and neither is derived from the other:
+
+  - `ahead_total` — the sum, unchanged. Fine as an at-a-glance "is there
+    unpushed work here" signal, which is all the human table uses it for.
+  - `unpushed_distinct` — the true figure, one command:
+    `git rev-list --count $(git for-each-ref --format='%(refname)' refs/heads) --not --remotes`.
+
+  **037's routing table consumes this**, so the discriminator has to exist at
+  the contract level rather than being explained in prose. Per-branch `ahead`
+  values stay exactly as specified — they are already correct per branch; only
+  the aggregate was ambiguous.
+- **`--not --remotes` does not false-alarm on pushed-but-untracked branches**,
+  which is the property that makes it the right formula rather than a hack.
+  Verified independently on 2026-07-29: `next-chat-umbrella-app` has a third
+  no-upstream branch, `knowlege-base`, carrying 29 commits, and the formula
+  correctly reports **0** because `refs/remotes/origin/knowlege-base` exists.
+  The error direction is also safe: more remote refs strictly excludes more
+  commits, so the formula can only **under**-count, never over-count. A branch
+  tracking a non-origin remote takes the `upstream` basis and never reaches this
+  path at all.
 - `verdict` ∈ `clean | dirty | unpushed | dirty+unpushed | not-a-repo | unknown`.
   `unknown` is the fail-closed value and carries `error`.
 - `refs_scope` is always the literal `"local-refs-only"`. It exists so no reader
@@ -367,15 +437,20 @@ The name also matches the footer's own wording ("N need attention").
 
 ## Tasks
 
-1. Add the `_repo_*` block with a header comment citing `wrapup-scan.sh` as
-   prior art and stating the divergence (packaging boundary + narrowed artifact
-   list).
+1. Add the `_repo_*` block, delimited by the two literal sentinel comments the
+   static guard extracts between, with a header comment citing `wrapup-scan.sh`
+   as prior art and stating the divergence (packaging boundary + narrowed
+   artifact list). Write the read-only disclaimer freely — the whitelist guard
+   reads git *invocations*, not prose, so it no longer collides with it.
 2. Implement `_repo_probe_json <path>`: NUL-safe porcelain parse with `R`/`C`
    two-token handling, artifact basename match on untracked only, stash count,
    branch/detached, per-branch ahead with `basis` (`upstream` via
    `rev-list --count "$up..$b"`, `no-upstream` via
-   `rev-list --count "$b" --not --remotes`), verdict, fail-closed `unknown` +
-   `error`. No shared state — it must be safe to run as a subprocess.
+   `rev-list --count "$b" --not --remotes`), `ahead_total` (sum) **plus**
+   `unpushed_distinct` (one `rev-list` over all of `refs/heads --not --remotes`),
+   `worktree` / `main_worktree` with `unpushed[]` scoped to HEAD's branch on a
+   linked worktree, verdict, fail-closed `unknown` + `error`. No shared state —
+   it must be safe to run as a subprocess.
 
    **`set -e` hazard, read this before writing the fail-closed paths.** `cctrl`
    runs `set -euo pipefail`. `local x="$(git …)"` **masks** a non-zero exit
@@ -391,13 +466,17 @@ The name also matches the footer's own wording ("N need attention").
 5. Add `cmd_repo` with `status` (default), `-h|--help`; wire `repo|repos` into
    `_dispatch`; add the `Repos` block to `cmd_help`.
 6. Add `--files` (capped at 5 per list, `truncated` flag) and `--attention-only`.
-7. Add `--here`: resolve `$PWD`'s toplevel, scope to it, run the full session
+7. **[PARKED — do not start; see the PARKED note in Design.]** Add `--here`:
+   resolve `$PWD`'s toplevel, scope to it, run the full session
    join, mark the calling session `← you`, and report `not-a-repo` when `$PWD`
    is outside a repo. Reject `--here` combined with any other scope flag.
-8. Write `test_repo_status` in `tests/run-tests.sh`: build four real temp git
-   repos (clean / dirty-with-untracked / ahead-of-a-local-bare-remote /
-   commits-on-a-branch-with-no-remote), plus a non-repo dir; assert the JSON
-   shape, the session join, the fail-closed path, and read-only invariance.
+8. Write `test_repo_status` in `tests/run-tests.sh`: build **seven** real temp git
+   repos — clean / dirty-with-untracked / ahead-of-a-local-bare-remote /
+   commits-on-a-branch-with-no-remote / pushed-but-untracked-branch /
+   stacked-branches / a repo with a linked worktree — plus a non-repo dir; assert
+   the JSON shape, the session join, the fail-closed path, and read-only
+   invariance. Add `test_repo_readonly_guard` for the sentinel-delimited
+   whitelist check.
 
    **The fake tmux needs a real extension, not a copy.** `test_needs_me_digest`'s
    fake answers `list-panes … pane_current_path` with one hardcoded
@@ -421,18 +500,45 @@ The name also matches the footer's own wording ("N need attention").
   `git status --porcelain -uall`, `git stash list`, `git for-each-ref`, and the
   existence of `.git/FETCH_HEAD` before and after `cctrl repo status`; assert
   every one is identical. This is the acceptance test for "informs, never fixes".
-- `[assert]` **static mutation guard** — the `_repo_*` source block, **with
-  comment lines stripped first**, contains no occurrence of
-  `git .*\b(add|commit|stash push|stash save|checkout|switch|reset|fetch|pull|push|clean|restore|rm|mv)\b`:
+- `[assert]` **static mutation guard — a WHITELIST, not a blacklist.** Extract
+  every `git ` invocation in the repo subsystem and assert each one's first
+  argument-after-options is in the permitted set:
 
-      sed 's/#.*//' <block> | grep -Eq 'git .*\b(add|commit|…)\b' && fail
+      status | stash list | for-each-ref | rev-list | rev-parse | symbolic-ref | worktree list
 
-  **Stripping comments is mandatory, not incidental.** Task 1 requires a header
-  comment naming `wrapup-scan.sh` as prior art, and the natural read-only
-  disclaimer — "never runs `git add`, `git commit`, `git fetch`, or `git push`"
-  — matches this regex verbatim. Without the strip, the plan's own guard rejects
-  the plan's own mandated comment, and the implementer's likely "fix" is to
-  delete the comment. Guard the code, not the prose.
+  (`-C <path>` is permitted anywhere and is not itself a verb.) Any verb outside
+  that set fails the check.
+
+  **Why a whitelist, after two failed blacklists.** The original blacklist
+  rejected the header comment Task 1 mandates. The revision's fix —
+  `sed 's/#.*//'` — did not close the hole, it *relocated* it: the same phrase
+  survives in non-comment text, and the most likely home for it is the
+  `cmd_repo -h|--help` usage heredoc, because this plan's own Verification
+  requires `--help` output to contain "read-only". So the implementer is
+  instructed to write a read-only disclaimer into a *string*, where `sed` cannot
+  reach it, and the predicted bad fix — delete the prose — returns one layer
+  down. A blacklist also fails open on any verb nobody thought of. A whitelist
+  fails **closed** on a new verb, which is the correct direction for a guard whose
+  whole job is "this subsystem never mutates".
+
+  **Block boundary — mandated, because it was previously undefined.** "The
+  `_repo_*` source block" had no extraction rule, and the only mechanical
+  alternatives were a line range (reintroducing the stale line numbers this plan
+  just swept out) or markers the plan never required. Delimit the subsystem with
+  literal sentinels and extract between them:
+
+      # >>> cctrl repo subsystem — read-only, guarded by test_repo_readonly_guard
+      # <<< end cctrl repo subsystem
+
+  The test extracts with `awk` between those sentinels and **fails if either
+  sentinel is missing** (a deleted sentinel must not silently empty the check).
+
+  **This guard is a LINT, not the gate.** It is defeatable — `msg="fix #123";
+  git add -A` on one line survives any comment-aware processing, and string
+  context defeats naive extraction generally. The **read-only invariance test
+  above is the actual gate**; the static guard exists to catch a careless edit
+  early and to make the intent legible in the source. Do not let its presence
+  justify weakening the invariance test.
 - `[assert]` a repo with an unreadable `.git` yields `verdict: unknown` and a
   non-null `error`, and the string `clean` does not appear for it (fail closed).
 - `[assert]` a session dir that is not a git repo yields one row with
@@ -444,7 +550,20 @@ The name also matches the footer's own wording ("N need attention").
   remote** reports `ahead > 0`, `basis: "no-upstream"`, and a non-zero
   `ahead_total` — never `ahead: null` and never `ahead_total: 0`. This is
   founding incident #3's regression test.
-- `[assert]` `cctrl repo status --here` run inside a fixture repo returns exactly
+- `[assert]` **no false alarm on pushed-but-untracked** — a branch with no
+  upstream whose commits *are* all reachable from some `refs/remotes/*` reports
+  `ahead: 0`. Guards the formula against the opposite failure.
+- `[assert]` **`ahead_total` vs `unpushed_distinct`** — in a stacked-branch
+  fixture (base branch unpushed, two children off it) the two fields differ, and
+  `unpushed_distinct` equals the output of
+  `git rev-list --count $(git for-each-ref --format='%(refname)' refs/heads) --not --remotes`.
+  Pins the documented over-report instead of leaving it latent.
+- `[assert]` **worktree rows do not inherit repo-wide unpushed** — with a linked
+  worktree added to a fixture repo, the worktree's row carries `worktree: true`,
+  a non-null `main_worktree`, and an `unpushed[]` containing **only its own HEAD
+  branch**; the two rows' `ahead` values are not both the repo-wide figure.
+- `[assert]` **[PARKED with Task 7 — not part of this plan's gate until the open
+  human decision lands.]** `cctrl repo status --here` run inside a fixture repo returns exactly
   one row whose `path` is that repo's toplevel, carrying every session in that
   tree; run outside a repo it returns one `not-a-repo` row and exits 0.
 - `[assert]` `--here` combined with a plan-036 scope flag exits non-zero with a
@@ -560,9 +679,55 @@ Both required/recommended edits applied, plus every non-blocking note.
   `local x="$(…)"` vs bare assignment, since fail-closed correctness depends on it.
 - **`--dirty-only` → `--attention-only`.** Agreed it was misnaming a flag that
   retains `unpushed`/`unknown`/`not-a-repo`; free to fix pre-implementation.
-- **New: `--here`** (from plan 037's escalated scope question; Matthew chose
-  Option A on 2026-07-28). One row, the caller's own repo, sibling sessions
-  listed, caller marked `← you`. Specified here because it is a command
-  behavior; 037 remains doctrine-only.
+- **New: `--here`** — from plan 037's escalated scope question. **Provenance
+  corrected 2026-07-29:** this originally read *"Matthew chose Option A"*, which
+  overstated the evidence. The input was an `AskUserQuestion` **selector pick**
+  on 2026-07-28, on an option the planning agent authored and labeled
+  `(Recommended)`; the tool payload names no human, and the interaction leaves no
+  artifact inspectable outside the answering pane. One row, the caller's own
+  repo, sibling sessions listed, caller marked `← you`. Specified here because it
+  is a command behavior; 037 remains doctrine-only.
+  **`--here` is NOT settled** — see the PARKED note under Design.
 
 Nothing in the "Kept as-is" list was touched.
+
+## Eng re-review — 2026-07-28 · author response 2026-07-29
+
+Re-review verdict: **CHANGES REQUESTED** (035-1, -3, -4 HIGH/MEDIUM-HIGH;
+035-5, -6 MEDIUM). Findings are numbered with no 035-2; the fleet manager
+checked the artifact as sent and confirmed that is a gap in the reviewer's
+draft, not a finding lost in transit. Coverage is complete.
+
+- **035-1 (guard relocates, not closes) — accepted; guard inverted to a
+  WHITELIST.** The reviewer's point is sharper than the original finding: the
+  `sed 's/#.*//'` fix left the same phrase reachable in a `--help` heredoc, and
+  this plan's own Verification *requires* a read-only disclaimer in that string —
+  so the plan instructed the implementer to write the thing that trips its own
+  guard, one layer down from where I fixed it. Now a whitelist of permitted verbs
+  (fails closed on anything new), a mandated sentinel-delimited block boundary
+  (the check was previously not implementable without invention), and an explicit
+  statement that the static guard is a **lint** while the read-only invariance
+  test is the gate.
+- **035-3 (`ahead_total` double-counts) — accepted; contract now carries both
+  numbers.** Reproduced on my own fixture before editing: stacked branches gave
+  sum **9** vs true distinct **5**. Took the "pin it *and* compute it" branch
+  rather than either alone, because 037's routing table consumes this figure.
+  Also recorded the reviewer's third data point, which is evidence *for* the
+  formula: `next-chat-umbrella-app`'s `knowlege-base` (29 commits, no upstream)
+  correctly reports 0 because a matching remote ref exists — so `--not --remotes`
+  does not false-alarm on pushed-but-untracked branches, and its error direction
+  is under-count, never over-count.
+- **035-4 (worktrees) — accepted; this was the worst-placed defect in the plan.**
+  Verified on a fixture: a linked worktree's `for-each-ref refs/heads` returns the
+  whole repository's branches. I had blessed half-wrong data *and* told future
+  readers not to change it. Contract now carries `worktree` / `main_worktree`,
+  scopes `unpushed[]` to HEAD on a linked worktree, and states that ref-derived
+  fields are repo-wide.
+- **035-5 and 035-6 — PARKED, not fixed.** Both concern `--here`, whose
+  provenance is an `AskUserQuestion` selector pick on an agent-authored,
+  agent-`(Recommended)`-labeled option. Two questions are open with the human
+  (does `--here` survive on that basis; fix-in-place vs park) and **must not be
+  inferred from silence**. The `--here` acceptance criterion, task, and
+  verification bullets are marked PARKED; the Design block is labelled "the shape
+  as selected, not an approved specification". 035-6 additionally needs a line in
+  plan 036, which is noted in 036's Task 6 and stays open for the same reason.

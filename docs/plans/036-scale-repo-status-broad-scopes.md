@@ -103,7 +103,16 @@ must come from data cctrl already owns or from the caller.
       now also exercised through the parallel path.
 - [ ] A `--root` that does not exist, or contains no repos, is a warning on
       stderr and an empty contribution — never a hard failure that voids an
-      otherwise good scan.
+      otherwise good scan. **This includes the empty-array case**: on bash 3.2 a
+      bare `"${paths[@]}"` on an empty array aborts under `set -u`, and `set +e`
+      does not suppress it, so the pool invocation must use
+      `${paths[@]+"${paths[@]}"}` or short-circuit on zero length.
+- [ ] **Truncation is impossible to miss**: collection iterates the scope's input
+      path list (never a temp-dir glob) and the row count always equals the scope
+      count. Required because BSD `xargs` returns `1` for both "a worker failed"
+      and "input was truncated", so the exit status can never detect the
+      difference — and a worker killed by a signal drops the remaining input no
+      matter what exit codes `_probe` promises.
 
 ## Design
 
@@ -198,15 +207,12 @@ required this). Drive it as a subprocess pool:
 ### `xargs -P` under `set -euo pipefail` — the trap that voids fail-closed
 
 `cctrl` runs `set -euo pipefail` on line 2. **`xargs` exits non-zero when any
-worker exits non-zero** (status 123 for worker statuses 1–125), and on a worker
-status of **255 it aborts the remaining input entirely**. Under `set -e` plus
-`pipefail`, that non-zero status kills the parent **before it ever reaches the
-collection step** — so the synthesize-an-`unknown`-row logic above never runs.
-The command emits *nothing at all* instead of a table with one `unknown` row.
-
-The trigger is not exotic; it is exactly the condition `unknown` exists for: an
-unreadable `.git`, a path that vanishes mid-scan, a `jq` failure inside a probe,
-or the probe tripping `set -e` on its own. Demonstrated on this machine:
+worker exits non-zero, and on certain worker terminations it aborts the remaining
+input entirely** — dropping repos from the scan. Under `set -e` plus `pipefail`,
+that non-zero status kills the parent **before it ever reaches the collection
+step**, so the synthesize-an-`unknown`-row logic never runs and the command emits
+*nothing at all*. Reproduced on this machine (2026-07-28, and independently
+re-verified 2026-07-29):
 
     $ bash -c 'set -euo pipefail
       run() { printf "a\nb\n" | xargs -P 2 -I{} sh -c "exit 1"; echo AFTER-XARGS; }
@@ -216,23 +222,115 @@ or the probe tripping `set -e` on its own. Demonstrated on this machine:
     $ printf 'a\nb\nc\n' | xargs -P 2 -I{} sh -c 'exit 255'
     xargs: sh: exited with status 255; aborting     # remaining input dropped
 
-Three defenses, all mandatory — any one alone is insufficient:
+The trigger is exactly the condition `unknown` exists for: an unreadable `.git`,
+a path that vanishes mid-scan, a `jq` failure inside a probe, or the probe
+tripping `set -e` on its own.
 
-1. **Guard the pool invocation** so a worker's status cannot kill the parent.
-   Note `pipefail`: the guard must cover the **whole pipeline**, not just the
-   last command.
+#### Two corrections to the previous revision — both were load-bearing and wrong
 
-       set +e
-       printf '%s\n' "${paths[@]}" | xargs -P "$jobs" -I{} "$CCTRL_SELF" repo _probe {}
-       set -e
+**BSD `xargs` has no distinct status codes.** The earlier text claimed "status
+123 for worker statuses 1–125", which is **GNU** behavior. On macOS, measured:
 
-2. **`cctrl repo _probe` always exits 0.** On any internal failure it emits a
-   `verdict: "unknown"` object carrying `error` and returns 0. It must **never**
-   exit 255, which would abort the remaining input and silently truncate the
-   scan rather than degrading one row. Belt and braces: defense 1 keeps a rogue
-   status from killing the parent, defense 2 keeps it from being produced.
-3. **The collection step treats a missing/unparseable file as `unknown`** — the
-   original bullet above, which is now genuinely reachable.
+    worker exit 1 → rc=1 · exit 42 → rc=1 · exit 125 → rc=1 · exit 255 → rc=1
+
+BSD's man page: *"if any other error occurs, xargs exits with a value of 1."*
+There is no 123/124/125. **Consequence: `rc=1` cannot distinguish "one worker
+failed" from "input was truncated by an abort."** Any implementation branching on
+123 is dead code, and — critically — **the exit status can never be used to
+detect truncation.** That is the whole reason defense 3 below must iterate the
+input path list.
+
+**`|| true` does bind to the whole pipeline; the previous justification for
+`set +e` was false.** The earlier text asserted "the guard must cover the whole
+pipeline, not just the last command." `||` binds to the entire pipeline in shell
+grammar; `pipefail` only changes which status the pipeline *reports*. Measured:
+
+    $ set -euo pipefail; printf "a\nb\n" | xargs -P 2 -I{} sh -c "exit 1" || true
+    REACHED-COLLECTION
+
+And `set +e` is strictly **worse**, because it is shell-global rather than
+function-scoped — any `return` on an error branch between `set +e` and `set -e`
+silently disables `errexit` for the rest of the process. Measured: `f(){ set +e;
+false; return 0; }; f; false; echo LEAKED` → prints `LEAKED`. **Mandate `|| true`
+(or an explicit `PIPESTATUS` capture) and delete the false claim.** This matters
+beyond tidiness: this plan explicitly instructs its prose to reach source
+comments, so a wrong rule here propagates into the code.
+
+#### Three defenses — only the third actually closes the hole
+
+1. **Guard the pool invocation with `|| true`** so a worker's status cannot kill
+   the parent. Note the empty-scope guard, which is not optional:
+
+       printf '%s\0' ${paths[@]+"${paths[@]}"} \
+         | xargs -0 -P "$jobs" -n 1 "$CCTRL_SELF" repo _probe \
+         || true
+
+   **`${paths[@]+"${paths[@]}"}` is mandatory.** On bash 3.2 a bare
+   `"${paths[@]}"` on an **empty** array is an unbound-variable error under
+   `set -u`, and `set +e` does **not** suppress it — measured:
+   `a=(); set +e; printf "%s\n" "${a[@]}"` → `a[@]: unbound variable`. An empty
+   scope is reachable via an empty `--root`, `--shortcuts` against an empty
+   `shortcuts.json`, or a nonexistent `--root`, and an abort there directly
+   voids this plan's own AC (*"a `--root` that does not exist… never a hard
+   failure"*). Every other array expansion in `cctrl` is already guarded this
+   way; this must not be the one exception. An explicit zero-length
+   short-circuit before the pipeline is equally acceptable and clearer.
+
+   **`-0 -n 1`, not `-I{}`.** NUL-delimited input, with the path appended as the
+   final argument. This fixes two BSD-specific defects at once: `xargs -I` has a
+   hard **254-byte** replstr limit (255 fails with *"command line cannot be
+   assembled, too long"* and aborts the whole scan), and BSD `xargs` **parses
+   quotes and backslashes in its input** — a path containing a double quote kills
+   the scan with *"unterminated quote"*, and a newline in a directory name splits
+   one path into two. `--root` sweeps whatever is on disk, so neither is
+   hypothetical. Dropping `-I` removes the replstr limit entirely rather than
+   merely leaving headroom under it.
+
+   **`CCTRL_SELF` must be defined** — it does not exist in `cctrl` today (grep:
+   zero matches), so the previous revision's mandated line was itself an
+   unbound-variable abort under `set -u`. Define it once near `SCRIPT_DIR` as the
+   resolved path to the running script.
+
+2. **`cctrl repo _probe` always exits 0**, emitting a `verdict: "unknown"` object
+   carrying `error` on any internal failure. Useful hygiene — but **this defense
+   is insufficient by construction and must not be relied on.** A worker killed
+   by a *signal* aborts remaining input identically: SIGKILL, SIGTERM and SIGPIPE
+   all produce `aborting`, `rc=1`, and survivors dropped. `_probe` can promise its
+   own exit code; it cannot promise not to be OOM-killed on a box running ~25
+   concurrent agent sessions, that `jq` will not SIGSEGV, or that it will not take
+   SIGPIPE when a downstream reader closes. Left here alone, the failure mode is
+   *worse* than the original blocker: the scan reports 7 of 39 repos **and exits
+   0**, which looks like success.
+
+3. **Collection iterates the SCOPE'S INPUT PATH LIST — never a glob of the temp
+   dir.** This is the only defense that actually closes the hole, and the only
+   sound truncation detector (per the BSD exit-status correction above). For each
+   path in the scope list, read its expected output file; if the file is missing,
+   empty, or unparseable, synthesize a fail-closed `verdict: "unknown"` row for
+   **that path**. Globbing the temp dir cannot detect truncation, because a
+   dropped repo leaves no file to find.
+
+   **This requires a deterministic path → filename mapping**, which also fixes
+   the previous revision's `"$TMPDIR_SCAN/<n>.json"` — where `<n>` had no source
+   (`-n 1` hands the worker a path, not an index) and `TMPDIR_SCAN` was a parent
+   variable a separate process never sees. Use a **hash of the absolute path**
+   (e.g. `cksum`/`shasum` of the path string) as the filename, computed
+   identically by parent and worker, and **export** `TMPDIR_SCAN` before the pool
+   runs. The worker redirects its own stdout to that file — which is also what
+   satisfies the "never share stdout" bullet above, since the previous revision's
+   snippet had **no redirection at all** and would have had every worker writing
+   JSON into one shared pipe, reproducing the >512-byte `PIPE_BUF` interleaving
+   corruption that bullet exists to prevent.
+
+   **Assert `row-count == scope-count`.** Unconditionally, in the implementation
+   and in the tests. It is the one invariant that makes silent truncation
+   impossible.
+
+**All path overrides must be exported before the pool runs.** `_probe` is a
+separate process and re-resolves `CCTRL_DATA_DIR` / `CCTRL_SESSION_METADATA_DIR`
+/ `TMPDIR_SCAN` from its own environment. A test that sets one without `export`
+configures only the parent — and the `--jobs 1` vs `--jobs 8` determinism diff
+would then be comparing two different data dirs while appearing to pass.
 
 ### Human output at 58 repos
 
@@ -284,32 +382,53 @@ repos buries the signal, so:
    sources; dedupe by resolved toplevel; accumulate `sources`.
 3. Add the hidden `cctrl repo _probe <path>` arm (single existing path only;
    absent from `--help`). **It always exits 0**, emitting a `verdict: "unknown"`
-   object with `error` on any internal failure, and never exits 255.
-4. Implement `_repo_scan_parallel`: `mktemp -d`, `set +e`-guarded
-   `xargs -P "$jobs"` pipeline (the guard must span the whole pipeline —
-   `pipefail`), per-worker output files, `jq -s` collection,
-   missing/unparseable file ⇒ synthesized `unknown` row, cleanup trap.
-   `--jobs 1` takes the in-process serial path.
-5. Wire `--shortcuts`, `--root DIR` (repeatable), `--all`, `--jobs N` into
+   object with `error` on any internal failure. It writes its JSON to
+   `$TMPDIR_SCAN/<hash-of-path>.json`, not to stdout. Treat its exit-code
+   discipline as hygiene, not as a guarantee — signals bypass it entirely.
+4. Define `CCTRL_SELF` (resolved path to the running script) near `SCRIPT_DIR`;
+   it does not exist today and the pool line cannot work without it.
+5. Implement `_repo_scan_parallel`: `mktemp -d`; **export** `TMPDIR_SCAN` and all
+   path overrides; `printf '%s\0' ${paths[@]+"${paths[@]}"} | xargs -0 -P "$jobs"
+   -n 1 "$CCTRL_SELF" repo _probe || true`; then **collect by iterating the scope
+   path list** (never a temp-dir glob), synthesizing `unknown` for any path whose
+   file is missing/empty/unparseable; assert `row-count == scope-count`; cleanup
+   trap. `--jobs 1` takes the in-process serial path.
+   Do **not** write `set +e` (shell-global, leaks errexit past a `return`) and do
+   **not** branch on exit status 123 (GNU-only; BSD returns 1 for everything).
+6. Wire `--shortcuts`, `--root DIR` (repeatable), `--all`, `--jobs N` into
    `cmd_repo`; implement **replace-not-add** scope semantics; clamp and validate
-   `--jobs`; warn-not-fail on a bad `--root`.
-6. Add the `SRC` column and the scope-accounting footer.
-7. Tests:
+   `--jobs`; warn-not-fail on a bad `--root`. Preserve plan 035's `--here`
+   mutual-exclusion when those flags appear — **but note 035's `--here` is
+   currently PARKED pending an open human decision; if it has not landed, this
+   task has nothing to preserve and finding 035-6 stays open.**
+7. Add the `SRC` column and the scope-accounting footer.
+8. Tests:
    (a) **scope composition with a NON-EMPTY fake session set** — assert exact row
        counts for `--root` alone (fixture repos only, no session repos) vs
        `--all` (the union). An empty session set makes replace and add
        indistinguishable, which is how the draft's ambiguity survived review.
    (b) `--jobs 8` output byte-identical to `--jobs 1` over ≥12 fixture repos.
-   (c) **a worker that exits NON-ZERO**, *and* separately a worker that exits 0
-       with no output, each yield an `unknown` row — **and the scan still
-       reports every other repo in the scope.** The non-zero case is the one
-       that matters: the draft's wording ("produces no output") is satisfied by
-       an exit-0-and-silent fixture, which passes against the broken
-       implementation because exit 0 never trips `set -e`. Include a
-       worker that exits 255 if it can be arranged cheaply, since that status
-       aborts remaining input rather than degrading one row.
+   (c) **The truncation test — the one that actually guards the blocker.**
+       The previous revision's exit-1 fixture still passes against a broken
+       implementation: exit 1 is precisely the case `|| true` already fixes, and
+       since BSD xargs returns 1 for *both* "worker failed" and "input
+       truncated", an exit-1 fixture never exercises the abort path where the
+       data loss lives. Required shape instead:
+       - **≥16 fixture repos**, `--jobs 8`, and the rigged repo named to sort
+         **EARLY** (e.g. `00-boom`) so an abort has survivors left to eat. A
+         2-repo fixture with the rigged repo scheduled last passes trivially.
+       - **Three mandatory rigged variants**, each run separately: `exit 1`,
+         `exit 255`, and `kill -9 $$`. 255 is no longer "if it can be arranged
+         cheaply" — it is `sh -c 'exit 255'`, and it is the **only** variant that
+         proves defense 3. `kill -9` covers the signal path that defense 2
+         provably cannot close.
+       - Assert for each: `jq 'length'` **== the exact scope count**,
+         `[.[]|select(.verdict=="unknown")]|length == 1`, and that row's `path`
+         == the rigged repo's path.
    (d) plan 035's read-only invariance re-run through the parallel path.
-8. Update `CHANGELOG.md` and `README.md`.
+   (e) empty scope: `--root <empty-dir>` and `--shortcuts` against an empty
+       shortcuts file each exit 0 with `[]` — the `set -u` unbound-array guard.
+9. Update `CHANGELOG.md` and `README.md`.
 
 ## Verification
 
@@ -321,11 +440,23 @@ repos buries the signal, so:
   exits 0. This is the load-bearing check for the whole plan.
 - `[assert]` `cctrl repo status --root "$FIXTURES" --json | jq -e '[.[] | .sources[]] | index("root") != null'`
   prints `true`
-- `[assert]` **fail-closed through the pool** — with one fixture repo rigged so
-  its probe exits **non-zero**, the scan exits 0, emits an `unknown` row for that
-  repo, **and still reports every other repo in the scope**. This is the
-  regression test for the `set -euo pipefail` × `xargs` blocker; without the
-  non-zero exit it proves nothing.
+- `[assert]` **fail-closed through the pool — the truncation gate.** ≥16 fixture
+  repos, `--jobs 8`, rigged repo named to sort EARLY (`00-boom`). Run three
+  variants separately — `exit 1`, `exit 255`, `kill -9 $$` — and for each assert:
+  the scan exits 0; `jq 'length'` **== the exact scope count**;
+  `[.[]|select(.verdict=="unknown")]|length == 1`; that row's `path` == the
+  rigged repo. The `exit 255` and `kill -9` variants are the load-bearing ones —
+  `exit 1` is the case `|| true` already fixes, and BSD xargs returns 1 for both
+  "worker failed" and "input truncated", so an exit-1 fixture never reaches the
+  abort path where the data loss lives.
+- `[assert]` **empty scope does not abort** — `--root <empty-dir>` and
+  `--shortcuts` against an empty shortcuts file each exit 0 and print `[]`.
+  Guards the `set -u` unbound-array expansion, which `set +e` does not suppress.
+- `[assert]` **no `set +e` and no 123-branching in the implementation** — the
+  repo subsystem contains neither `set +e` (shell-global, leaks errexit past a
+  `return`) nor a comparison against exit status 123/124/125 (GNU-only; BSD
+  returns 1 for everything). Cheap lint against two corrections that a future
+  edit could silently undo.
 - `[assert]` **scope semantics** — with a non-empty fake session set,
   `cctrl repo status --root "$FIXTURES" --json | jq 'length'` equals the fixture
   repo count (session repos excluded), while `--all` returns the union count
@@ -519,3 +650,36 @@ refusing `--fetch` at 58 repos. All checked; all correct.
   currently working in `~/dev/repo-audits/natively-cluely-audit` — depth 2 — so
   `--root ~/dev` provably does not cover the fleet. Documented as the argument
   for `--all` and the `SRC` column, not as an argument for recursion.
+
+## Eng re-review — 2026-07-28 · author response 2026-07-29
+
+Re-review verdict: **CHANGES REQUESTED** (S1–S3 blockers, S4–S6 major, S7–S9
+minor). All accepted; every claim independently re-verified on this machine
+before editing (2026-07-29) rather than taken on faith. Results:
+
+| # | Claim | Re-verified | Outcome |
+|---|---|---|---|
+| S1 | empty array aborts under `set -u`; `set +e` does not suppress | `a[@]: unbound variable` both ways; guarded form reaches | **fixed** |
+| S2 | signals abort input identically; defense 2 cannot close it | accepted (SIGKILL/SIGPIPE bypass exit-code discipline by construction) | **fixed** |
+| S3 | mandated snippet had no redirection, no `<n>` source, undefined `CCTRL_SELF` | `grep CCTRL_SELF cctrl` → 0 matches | **fixed** |
+| S4 | "status 123 for 1–125" is GNU, not BSD | exits 1/42/125/255 all → `rc=1` | **corrected** |
+| S5 | `\|\| true` binds to the whole pipeline; `set +e` leaks | `REACHED-COLLECTION`; `LEAKED-ERREXIT-IS-OFF` | **corrected** |
+| S6 | exit-1 fixture still passes against a broken impl | accepted | **test rewritten** |
+| S7/S8 | `-I` 254-byte limit; BSD xargs parses quotes | accepted | **fixed via `-0 -n 1`** |
+| S9 | overrides must be exported for the subprocess | accepted | **fixed** |
+
+**S4 and S5 were corrections to claims I introduced in the previous revision**,
+not to the original draft — the reviewer caught me codifying a false rule
+(`set +e` over `|| true`) in a plan that explicitly instructs its prose to reach
+source comments. Both are now stated as corrections, with the measurement, so a
+future editor cannot quietly restore them.
+
+The structural point I had wrong: I presented three defenses as belt-and-braces
+when in fact **only defense 3 closes the hole**. Defenses 1 and 2 are hygiene.
+The plan now says so plainly and makes defense 3's two load-bearing details
+mandatory — iterate the scope's input path list (never a temp-dir glob), and
+assert `row-count == scope-count` — because BSD's exit status cannot distinguish
+failure from truncation.
+
+S7/S8 collapsed into one change: `-0 -n 1` instead of `-I{}`, which removes the
+replstr limit rather than leaving headroom under it.
