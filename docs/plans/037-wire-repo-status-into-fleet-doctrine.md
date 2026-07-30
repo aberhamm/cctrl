@@ -6,11 +6,11 @@ blocked-by: [036]
 priority: 37
 goal: cctrl-fleet-repo-visibility
 allows-migrations: false
-needs-review: eng
+needs-review: none
 review-required: eng
 created: 2026-07-26
 reviews:
-  - type=eng verdict=changes-requested date=2026-07-28 by=mstack-review
+  - type=eng verdict=approved date=2026-07-30 by=mstack-review
 ---
 
 ## Requirements
