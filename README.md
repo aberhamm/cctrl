@@ -335,6 +335,34 @@ interactive, TTY-requesting command, the same as `session attach`. Peers with no
 live session (polling/MCP-only) and stale recorded sessions fail with a clear
 error.
 
+#### Agent operating contract (`peer help-agent`)
+
+Humans learn `peer say` from the examples above, but an agent needs a compact
+contract telling it *when* to direct-chat a live peer and *when* to queue durable
+async work. `cctrl peer help-agent` prints exactly that — distinguishing
+`peer say` (live tmux chat), `peer send` (durable async), and the
+`peer recv` / `peer ack` mailbox loop.
+
+```bash
+cctrl peer help-agent                 # generic guidance (no identity needed)
+cctrl peer help-agent --as comet      # examples phrased for peer comet
+CCTRL_PEER=comet cctrl peer help-agent # same, from the ambient identity
+cctrl peer help-agent --json          # structured contract for prompt builders/tests
+```
+
+A bare `peer help-agent` prints generic guidance and never fails for a missing
+identity; `--as NAME` and `CCTRL_PEER` canonicalize the peer through the same
+resolver the mailbox and `peer say` use, then tailor the examples. The
+**default rule** is: use `peer say` for a live tmux agent you want to act now,
+and `peer send` for durable/offline async work.
+
+This contract is **not** injected automatically. `cctrl start --peer` does not
+add any prompt text; an agent receives the contract only when it asks
+(`peer help-agent`), when a user prompt includes it, or through the MCP tool
+descriptions. Automatic startup injection would change model behavior and prompt
+size for every peer session, so it stays an explicit opt-in left to a future
+plan rather than a hidden default here.
+
 Mailbox messages are stored as JSON Lines in `data/messages.jsonl` under the
 same peer data root. The lifecycle is intentionally small:
 `queued -> delivered -> acked`. Sending creates `queued` messages; later receive
@@ -566,12 +594,24 @@ peer_overview
 whoami
 list_peers
 resolve_peer
+say_peer
 send_message
 check_messages
 recv_message
 show_message
 ack_message
 ```
+
+`say_peer` and `send_message` are the two ways to reach a peer, and the default
+rule mirrors the CLI: use `say_peer` for a live tmux agent you want to act **now**
+(direct chat, the tool-call form of `cctrl peer say`, no mailbox message), and
+`send_message` for durable async work that must survive the recipient being
+away/offline. `say_peer` takes `to` and `body` plus optional `submit` (defaults
+to true; `submit:false` types a draft without pressing Enter) and `force_busy`
+(override the readiness guard); the body is passed through
+`cctrl peer say --body-file -` so multi-line and trailing-newline bodies are
+preserved byte-for-byte. It fails rather than queueing when the peer has no live
+local tmux session — fall back to `send_message` there.
 
 `peer_overview` is the orientation entry point: one call returns your identity,
 the reachable peers, and an unread-mailbox summary, so a model new to peer

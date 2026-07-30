@@ -281,6 +281,7 @@ _cctrl() {
                     'unregister:Remove a manual peer'
                     'rm:Remove a manual peer'
                     'whoami:Resolve peer identity'
+                    'help-agent:Agent contract: peer say (live) vs peer send (async)'
                     'send:Queue a mailbox message'
                     'inbox:List inbound mailbox messages'
                     'outbox:List outbound mailbox messages'
@@ -353,6 +354,11 @@ _cctrl() {
                         (( CURRENT == 4 )) && _cctrl_peers
                         ;;
                     whoami|identity)
+                        _arguments \
+                            '--as[Peer identity]:peer:_cctrl_peers' \
+                            '--json[Machine-readable output]'
+                        ;;
+                    help-agent)
                         _arguments \
                             '--as[Peer identity]:peer:_cctrl_peers' \
                             '--json[Machine-readable output]'

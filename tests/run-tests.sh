@@ -4532,6 +4532,133 @@ JSON
     echo "ok: peer say delegates to session say (flags shared) and never touches the mailbox"
 }
 
+test_peer_help_agent() {
+    # plan 011: `cctrl peer help-agent` is the agent-facing operating contract that
+    # distinguishes `peer say` (live tmux chat), `peer send` (durable async), and
+    # the `peer recv` / `peer ack` mailbox loop. A bare (no --as, no CCTRL_PEER)
+    # call prints GENERIC guidance and must NOT fail for a missing identity;
+    # `--as NAME` and `CCTRL_PEER` canonicalize the peer via the shared resolver and
+    # tailor the examples; `--json` returns a structured version of the same
+    # contract; an invalid peer fails rather than silently printing generic text.
+    local data="$TMPDIR/help-agent-data"
+    mkdir -p "$TMPDIR/comet-ha"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet-ha" --agent codex >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet comet-agent >/dev/null
+
+    local out rc
+
+    # (1) bare: generic guidance, exit 0, names all four verbs, no identity failure.
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer help-agent 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected bare peer help-agent to exit 0 (generic guidance, no identity failure)"
+    assert_contains "$out" "peer say"
+    assert_contains "$out" "peer send"
+    assert_contains "$out" "peer recv"
+    assert_contains "$out" "peer ack"
+
+    # (2) bare --json: generic structured JSON contract, peer null, no auto-injection.
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer help-agent --json)"
+    printf '%s\n' "$out" | jq -e '
+        .ok == true and .generic == true and .peer == null
+        and (.commands | has("say") and has("send") and has("recv") and has("ack"))
+        and .commands.say.mailbox == false and .commands.send.mailbox == true
+        and .auto_injection == false
+    ' >/dev/null || fail "expected bare --json help-agent to return generic structured JSON contract"
+
+    # (3) --as canonicalizes an alias to the peer and tailors the examples.
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer help-agent --as comet-agent --json)"
+    printf '%s\n' "$out" | jq -e '
+        .ok == true and .generic == false and .peer == "comet"
+        and (.commands.send.example | test("--from comet"))
+    ' >/dev/null || fail "expected --as to canonicalize the alias and tailor examples for the peer"
+
+    # (4) CCTRL_PEER produces the SAME peer-specific guidance as --as.
+    local via_as via_env
+    via_as="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer help-agent --as comet --json)"
+    via_env="$(CCTRL_DATA_DIR="$data" CCTRL_PEER=comet "$ROOT/cctrl" peer help-agent --json)"
+    [[ "$via_as" == "$via_env" ]] || fail "expected CCTRL_PEER help-agent to match --as help-agent"
+
+    # (5) invalid peer fails (does not fall back to generic guidance).
+    rc=0
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer help-agent --as nope-not-real >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected an unknown --as peer to fail rather than print generic guidance"
+
+    echo "ok: peer help-agent generic guidance + --as/CCTRL_PEER canonicalization + structured JSON + invalid peer"
+}
+
+test_peer_mcp_say_peer() {
+    # plan 011: the MCP `say_peer` tool is direct live-tmux chat (the tool-call form
+    # of `cctrl peer say`). It must (a) be advertised in tools/list, (b) pass the
+    # body through `cctrl peer say --body-file -` so trailing newlines survive
+    # byte-for-byte, (c) map submit:false -> --no-submit and force_busy:true ->
+    # --force-busy, (d) reject non-boolean submit/force_busy like the other tools,
+    # and (e) NEVER create a mailbox message (no messages.jsonl write).
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local data="$TMPDIR/say-peer-data"
+    local log="$TMPDIR/say-peer.log"
+    local bytes="$TMPDIR/say-peer-buffer.bin"
+    local expected="$TMPDIR/say-peer-expected.bin"
+    mkdir -p "$TMPDIR/comet-sp" "$TMPDIR/orchestrator-sp"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet-sp" --agent codex --session TMUX--comet >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orchestrator --dir "$TMPDIR/orchestrator-sp" --agent codex >/dev/null
+
+    local out say_req
+
+    # (a) advertised in tools/list.
+    out="$(
+        {
+            printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+            printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+        } | PATH="$TMPDIR:$PATH" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator
+    )"
+    printf '%s\n' "$out" | jq -s -e '[.[].result.tools[]?.name] | index("say_peer") != null' >/dev/null \
+        || fail "expected MCP tools/list to advertise say_peer"
+
+    # (b) + default submit: trailing newline preserved through --body-file -, submits.
+    : > "$log"
+    say_req="$(jq -cn --arg to comet --arg body $'live line one\nlive line two\n' '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"say_peer",arguments:{to:$to,body:$body}}}')"
+    out="$(printf '%s\n' "$say_req" | PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_BUFFER_FILE="$bytes" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '
+        .result.structuredContent.ok == true
+        and .result.structuredContent.data.ok == true
+        and .result.structuredContent.data.submitted == true
+        and .result.structuredContent.data.status == "ok"
+    ' >/dev/null || fail "expected say_peer to submit via the live tmux path with an ok result"
+    printf 'live line one\nlive line two\n' > "$expected"
+    cmp -s "$bytes" "$expected" || fail "expected say_peer to preserve the trailing newline via --body-file -"
+    assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+    # (e) NEVER creates a mailbox message.
+    [[ ! -e "$data/messages.jsonl" ]] || fail "say_peer must not create a mailbox message"
+
+    # (c) submit:false -> --no-submit (no Enter is sent).
+    : > "$log"
+    say_req="$(jq -cn --arg to comet --arg body "draft only" '{jsonrpc:"2.0",id:4,method:"tools/call",params:{name:"say_peer",arguments:{to:$to,body:$body,submit:false}}}')"
+    out="$(printf '%s\n' "$say_req" | PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.submitted == false' >/dev/null \
+        || fail "expected say_peer submit:false to map to --no-submit"
+    assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+
+    # (c) force_busy:true -> --force-busy is accepted.
+    : > "$log"
+    say_req="$(jq -cn --arg to comet --arg body "busy override" '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"say_peer",arguments:{to:$to,body:$body,force_busy:true}}}')"
+    out="$(printf '%s\n' "$say_req" | PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.submitted == true' >/dev/null \
+        || fail "expected say_peer force_busy:true to succeed"
+
+    # (d) non-boolean submit is a validation error, same style as the other tools.
+    out="$(printf '%s\n' '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"say_peer","arguments":{"to":"comet","body":"x","submit":"yes"}}}' | PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.ok == false and .result.structuredContent.error.code == "validation" and .result.structuredContent.error.message == "submit must be a boolean"' >/dev/null \
+        || fail "expected non-boolean submit to be a validation error"
+
+    # (d) non-boolean force_busy is a validation error too.
+    out="$(printf '%s\n' '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"say_peer","arguments":{"to":"comet","body":"x","force_busy":1}}}' | PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.error.code == "validation" and .result.structuredContent.error.message == "force_busy must be a boolean"' >/dev/null \
+        || fail "expected non-boolean force_busy to be a validation error"
+
+    echo "ok: MCP say_peer is direct live-tmux chat — preserves trailing newlines, maps submit/force_busy, creates no mailbox message"
+}
+
 test_peer_direct_non_local_host_hint() {
     # A peer whose host metadata differs from the current host label must NOT be
     # auto-SSH'd; direct commands fail with an actionable `--host` hint.
@@ -4753,6 +4880,8 @@ test_peer_session_resolves_and_alias
 test_peer_session_offline_unknown_stale
 test_peer_attach_targets_resolved_session
 test_peer_say_delegates_and_no_mailbox
+test_peer_help_agent
+test_peer_mcp_say_peer
 test_peer_direct_non_local_host_hint
 test_peer_attach_remote_forwarding_tty
 test_peer_ls_shows_session_and_status

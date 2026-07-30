@@ -68,10 +68,41 @@ TOOLS = [
         },
     },
     {
+        "name": "say_peer",
+        "description": (
+            "Send a DIRECT live-tmux chat message to a peer running RIGHT NOW — the "
+            "tool-call form of `cctrl peer say`. DEFAULT RULE: use `say_peer` for a "
+            "live tmux agent you want to act immediately; use `send_message` for "
+            "durable async work that must survive the recipient being away/offline. "
+            "Unlike `send_message`, this creates NO mailbox message: it types the "
+            "body straight into the peer's tmux session. Address `to` with a peer "
+            "`name` from `peer_overview` or `list_peers` (aliases are accepted and "
+            "canonicalized). `submit` defaults to true (the message is submitted for "
+            "the peer); pass submit:false to type a draft without pressing Enter. "
+            "`force_busy:true` overrides the readiness guard when the peer looks busy "
+            "(never a known modal). Fails (nothing typed) if the peer has no live "
+            "local tmux session — fall back to `send_message` in that case."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "body": {"type": "string"},
+                "submit": {"type": "boolean"},
+                "force_busy": {"type": "boolean"},
+            },
+            "required": ["to", "body"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "send_message",
         "description": (
-            "Send a message from this server's identity to another peer and attempt "
-            "delivery. Address `to` with a peer `name` from `peer_overview` or "
+            "Send a durable mailbox message from this server's identity to another "
+            "peer and attempt delivery. Use this for async work that must survive the "
+            "recipient being away/offline; for a live tmux agent you want to act now, "
+            "prefer `say_peer` (direct chat, no mailbox). Address `to` with a peer "
+            "`name` from `peer_overview` or "
             "`list_peers` (aliases are accepted and canonicalized). To REPLY to a "
             "message you received via `recv_message`, set `to` to that message's "
             "`sender.name`. Returns ok:true with an `outcome` field naming one of "
@@ -245,6 +276,24 @@ class Bridge:
             ensure_no_extra(args, {"name"})
             peer = require_string(args, "name")
             return ok(self.cli(["peer", "resolve", peer, "--json"]))
+        if name == "say_peer":
+            # Direct live-tmux chat — the tool-call form of `cctrl peer say`. The
+            # body is piped through stdin to `cctrl peer say <to> --json
+            # --body-file -` so multi-line and trailing-newline bodies survive
+            # byte-for-byte. This path NEVER writes data/messages.jsonl (peer say
+            # owns that guarantee); a failure to reach a live session surfaces as a
+            # cctrl error, not a queued message.
+            ensure_no_extra(args, {"to", "body", "submit", "force_busy"})
+            to = require_string(args, "to")
+            body = require_string(args, "body")
+            submit = require_bool(args, "submit", True)
+            force_busy = require_bool(args, "force_busy", False)
+            cmd = ["peer", "say", to, "--json", "--body-file", "-"]
+            if not submit:
+                cmd.append("--no-submit")
+            if force_busy:
+                cmd.append("--force-busy")
+            return ok(self.cli(cmd, stdin=body))
         if name == "send_message":
             ensure_no_extra(args, {"to", "subject", "body"})
             to = require_string(args, "to")
@@ -310,6 +359,18 @@ def optional_string(args: dict[str, Any], key: str, default: str) -> str:
     value = args.get(key, default)
     if not isinstance(value, str):
         raise McpError("validation", f"{key} must be a string")
+    return value
+
+
+def require_bool(args: dict[str, Any], key: str, default: bool) -> bool:
+    if key not in args:
+        return default
+    value = args[key]
+    # isinstance(True, int) is True but bools are the only accepted type here;
+    # ints/strings ("yes", 1) are rejected the same way the other tools reject
+    # malformed arguments.
+    if not isinstance(value, bool):
+        raise McpError("validation", f"{key} must be a boolean")
     return value
 
 

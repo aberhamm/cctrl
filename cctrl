@@ -2622,6 +2622,107 @@ _peer_cmd_whoami() {
     fi
 }
 
+# Agent-facing operating contract (plan 011). Tells an agent WHEN to direct-chat a
+# live tmux peer (`peer say`), when to queue durable async work (`peer send`), and
+# how to drain the mailbox (`peer recv` / `peer ack`). A bare call prints GENERIC
+# guidance and NEVER fails for a missing identity; `--as NAME` / `CCTRL_PEER`
+# canonicalize the peer through the shared resolver (no lookup is reimplemented
+# here) and tailor the examples. This contract is deliberately NOT auto-injected
+# into `start --peer`: agents receive it only on request, via a user prompt, or
+# through the MCP tool surface.
+_peer_cmd_help_agent() {
+    local json=false identity="" peer_json canonical=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--as needs a peer name${RESET}" >&2; return 1; }
+                identity="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            *)
+                echo -e "${RED}Unknown peer help-agent flag: $1${RESET}" >&2
+                return 1 ;;
+        esac
+    done
+    [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    if [[ -n "$identity" ]]; then
+        if ! peer_json="$(_peer_resolve_json "$identity" 2>/dev/null)"; then
+            if $json; then
+                jq -n --arg id "$identity" '{ok:false,error:{code:"unknown-peer",message:("Unknown or ambiguous peer: " + $id)}}'
+            else
+                echo -e "${RED}Unknown or ambiguous peer: '$identity'${RESET}" >&2
+                echo -e "${DIM}Run 'cctrl peer help-agent' (no --as) for generic guidance, or register the peer first.${RESET}" >&2
+            fi
+            return 1
+        fi
+        canonical="$(jq -r '.name' <<< "$peer_json")"
+    fi
+    if $json; then
+        _peer_help_agent_json "$canonical"
+    else
+        _peer_help_agent_human "$canonical"
+    fi
+}
+
+_peer_help_agent_human() {
+    local peer="$1" sendfrom
+    if [[ -n "$peer" ]]; then
+        sendfrom="--from $peer "
+        echo -e "${BOLD}Peer operating contract${RESET} — you are running as peer: ${BOLD}${peer}${RESET}"
+    else
+        sendfrom="--from <you> "
+        echo -e "${BOLD}Peer operating contract${RESET} — no identity set (pass --as NAME or set CCTRL_PEER for tailored examples)"
+    fi
+    echo "  Live tmux chat (acts now, writes no mailbox message):"
+    echo "    cctrl peer say <peer> -- \"<message>\""
+    echo "  Durable async work (survives the peer being away/offline):"
+    echo "    cctrl peer send <peer> ${sendfrom}-- \"<message>\""
+    echo "  Drain your mailbox:"
+    echo "    cctrl peer recv --json        # read the next queued/delivered message"
+    echo "    cctrl peer ack <id> --json    # mark it handled once you have acted"
+    echo -e "${DIM}Default rule: use 'peer say' for a live tmux agent you want to act now; use 'peer send' for durable/offline async work.${RESET}"
+    echo -e "${DIM}No auto-injection: 'cctrl start --peer' does not inject this contract; you receive it only via 'cctrl peer help-agent', a user prompt, or MCP tool metadata.${RESET}"
+}
+
+_peer_help_agent_json() {
+    local peer="$1"
+    jq -n --arg peer "$peer" '
+      ($peer | if . == "" then null else . end) as $p
+      | {
+          ok: true,
+          peer: $p,
+          generic: ($p == null),
+          default_rule: "Use `peer say` for a live tmux agent you want to act now; use `peer send` for durable async work that must survive the recipient being away.",
+          auto_injection: false,
+          auto_injection_note: "cctrl start --peer does not auto-inject this contract; an agent receives it only via an explicit `cctrl peer help-agent` call, a user prompt, or MCP tool metadata.",
+          commands: {
+            say: {
+              transport: "live-tmux",
+              mailbox: false,
+              when: "The peer is a live tmux session and you want it to act now.",
+              example: "cctrl peer say <peer> -- \"<message>\""
+            },
+            send: {
+              transport: "mailbox",
+              mailbox: true,
+              when: "Durable async work that must survive the peer being away/offline.",
+              example: ("cctrl peer send <peer> --from " + ($p // "<you>") + " -- \"<message>\"")
+            },
+            recv: {
+              transport: "mailbox",
+              mailbox: true,
+              when: "Read the next queued or delivered-unacked message addressed to you.",
+              example: "cctrl peer recv --json"
+            },
+            ack: {
+              transport: "mailbox",
+              mailbox: true,
+              when: "Mark a delivered message handled so it stops reappearing.",
+              example: "cctrl peer ack <id> --json"
+            }
+          }
+        }'
+}
+
 # Single-enumeration orientation entry point (plan 025). Answers "who am I, who
 # can I reach, do I have mail?" from ONE _peer_all_json resolution. It deliberately
 # does NOT call _peer_cmd_whoami / _peer_cmd_check / _mailbox_resolve_identity_for_mode
@@ -5300,6 +5401,7 @@ cmd_peer() {
         alias) _peer_cmd_alias "$@" ;;
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
+        help-agent) _peer_cmd_help_agent "$@" ;;
         overview) _peer_cmd_overview "$@" ;;
         send) _peer_cmd_send "$@" ;;
         reply) _peer_cmd_reply "$@" ;;
@@ -5328,6 +5430,8 @@ cmd_peer() {
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer whoami [--as NAME] [--json]"
+            echo "  cctrl peer help-agent [--as NAME] [--json]"
+            echo "                                     Agent contract: peer say (live) vs peer send (async); not auto-injected"
             echo "  cctrl peer overview [--as NAME] [--json]"
             echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>"
             echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--json] -- <body>"
@@ -7089,6 +7193,7 @@ cmd_help() {
     echo "  cctrl peer alias <name> <alias>     Add an alias to a manual peer"
     echo "  cctrl peer unregister <name>        Remove a manual peer"
     echo "  cctrl peer whoami [--as NAME]       Resolve identity from --as or CCTRL_PEER"
+    echo "  cctrl peer help-agent [--as NAME]   Agent contract: peer say (live) vs peer send (async)"
     echo "  cctrl peer send <to> -- <body>      Queue a mailbox message"
     echo "  cctrl peer inbox [--as NAME]        List queued/delivered messages for a peer"
     echo "  cctrl peer outbox [--as NAME]       List messages sent by a peer"

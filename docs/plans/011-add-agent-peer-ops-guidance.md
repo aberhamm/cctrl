@@ -1,7 +1,8 @@
 ---
 id: 011
 title: Add agent-facing peer operations guidance
-status: pending
+status: done
+completed: 2026-07-22
 blocked-by: [010]
 priority: 11
 goal: tmux-peer-direct-chat
