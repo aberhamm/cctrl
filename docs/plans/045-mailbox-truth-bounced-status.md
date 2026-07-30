@@ -1,16 +1,16 @@
 ---
 id: 045
 title: Mailbox truth — guard-aware check and an explicit bounced status
-status: blocked
+status: pending
 blocked-by: []
 priority: 17
 goal: revised-cctrl-audit-backlog
 allows-migrations: false
-needs-review: eng
+needs-review: none
 review-required: eng
 created: 2026-07-30
 reviews:
-  - type=eng verdict=changes-requested date=2026-07-30 by=mstack-review
+  - type=eng verdict=approved date=2026-07-30 by=mstack-review
 ---
 
 ## Requirements
