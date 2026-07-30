@@ -96,3 +96,47 @@ queued before it landed, which is the failure it exists to prevent.
 makes *detection* exact; 029 makes the *address* durable so a replaced peer can
 be succeeded rather than merely refused. If 029 lands first, this plan reduces
 to reusing 029's stable id as the stamp — smaller, not obsolete.
+
+**Files expected to change:**
+
+- `cctrl`: `_peer_cmd_send` (retain `to_peer_json`, build + persist the
+  `recipient` object in the `jq -cn` construction alongside plan 023's `sender`);
+  32's replacement guard (`_peer_deliver`-side check) to prefer the stamp when
+  present; whichever of `_peer_derived_json` / `_session_id` supplies `session_id`
+- `tests/run-tests.sh`: recipient-stamp assertions in the peer mailbox test group
+
+**Testing approach: E2E** — the peer tests drive the real `cctrl` binary against
+an isolated `CCTRL_DATA_DIR`, so send + guard behavior is exercised end to end.
+
+## Tasks
+
+1. In `_peer_cmd_send`, stop reducing `to_peer_json` to `.name`; retain it and
+   build a `recipient` object with `name`, `created_at`, and `session_id` where
+   resolvable, pruned with `with_entries(select(.value != null))`.
+2. Decide and implement the `session_id` source explicitly: resolve `_session_id`
+   at send time, or teach `_peer_derived_json` to emit `session_id` — do not
+   assume the field is already on the peer object. For codex peers with no stable
+   id, stamp `created_at` only; never claim a codex UUID that does not exist.
+3. Add `recipient` to the `jq -cn` message construction alongside plan 023's
+   landed `sender` object, leaving `to` and every other existing field
+   byte-identical.
+4. Update plan 032's replacement guard to prefer the stamp when present
+   (replacement becomes an exact identity mismatch, not a timestamp inequality),
+   and to keep 032's heuristic for unstamped (pre-existing) messages.
+5. Make `--allow-unknown` with an unresolved recipient record *no* recipient
+   stamp — positive evidence that no occupant was verified — disambiguating the
+   recipient-vs-sender conflation 032's top-level `unknown_peer` flag cannot.
+6. Add tests: recipient stamp present + correct on send; a stamped message is
+   judged by the stamp alone; a legacy message with no stamp still resolves via
+   032's heuristic; `--allow-unknown` records no stamp; no stored message is
+   rewritten.
+
+## Verification
+
+Checks:
+
+- `[cmd] bash -n cctrl && bash -n tests/run-tests.sh`
+- `[cmd] bash tests/run-tests.sh`
+- `[assert] cd "$(mktemp -d)" && CCTRL_DATA_DIR="$PWD" ~/dev/cctrl/cctrl peer send x --from y --allow-unknown --json -- "hi" | jq -r '.recipient // "absent"'` → recipient absent for an unresolved `--allow-unknown` recipient
+- `[cmd] bash -c 'h1=$(shasum data/messages.jsonl 2>/dev/null || echo absent); bash tests/run-tests.sh >/dev/null 2>&1; h2=$(shasum data/messages.jsonl 2>/dev/null || echo absent); [ "$h1" = "$h2" ]'` → live store byte-identical before and after the suite
+- `[assert] grep -Eq 'recipient' tests/run-tests.sh` → recipient-stamp coverage present

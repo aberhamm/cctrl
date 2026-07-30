@@ -45,6 +45,31 @@ model happens to read the brief, and the fleet has ~24 sessions.
 **What this plan adds:** a per-session policy file, and a `PreToolUse` hook that
 reads it and **blocks** the call before it runs. Mechanism, not persuasion.
 
+**Acceptance criteria** (formalized from the Tasks and Verification below; no
+new scope):
+
+- [ ] `cctrl start` writes `policy/<session-id>.json` from new flags (`--deny
+      push,delete`, `--policy-file PATH`) and records the resolved policy in the
+      session metadata so `cctrl session ls` can show it.
+- [ ] A `PreToolUse` hook resolves the session id, loads its policy, classifies
+      the pending `Bash`/`Write`/`Edit` call, and **blocks** a denied call before
+      it runs, with a denial message that names the policy and states what to do
+      instead.
+- [ ] Classification fails closed: all 15 deny-list commands from the 2026-07-28
+      incident classify into their denied category (`delete`/`push`), and an
+      unrecognised command inside a denied family is denied, not allowed.
+- [ ] The near-misses are **not** blocked: `git status`, `docker ps -a`, `rm`
+      inside an `allow_paths_write` path, `npm ci`.
+- [ ] An empty or absent policy behaves byte-identically to today — opt-in, so it
+      cannot brick the existing fleet or a spawn that predates the feature.
+- [ ] `cctrl policy install` is idempotent (running it twice leaves one hook
+      entry, not two) and `cctrl start` does not hand-edit settings as a side
+      effect.
+- [ ] `cctrl policy check <session> -- <command>` dry-runs classification so a
+      policy can be validated before a spawn relies on it.
+- [ ] `AGENTS.md` and the `cctrl-spawn` skill document that a brief states intent,
+      the policy enforces it, and the brief is no longer the guardrail.
+
 ### Why the hook, and not the alternatives
 
 - **Better briefs** — already disproven above.

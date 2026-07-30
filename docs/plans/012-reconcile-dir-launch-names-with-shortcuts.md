@@ -92,6 +92,40 @@ identical across the two launch paths.
 - Any change to the homelab case where the repo basename already equals the
   alias (`homelab`), which is already consistent.
 
+## Tasks
+
+1. Add `_shortcut_for_dir <abs-dir>`: scan `data/shortcuts.json` for an entry
+   whose resolved directory equals the launch directory and return its shortcut
+   key. On collision (multiple keys → same dir), pick the first match by sorted
+   key, deterministically.
+2. In `_launch_detached`'s directory branch (`target_kind == "dir"`), after
+   resolving the absolute `dir`, call `_shortcut_for_dir`. If a key is found,
+   derive `context_name` / `session_name` from it via `_tmux_session_slug
+   "<key>"` exactly as the shortcut branch does, and set `display_label` /
+   `metadata_target` to `@<key>`. Otherwise keep the current repo-dir slug.
+3. Confirm the resolved name still flows through to `--name` and therefore to
+   `--remote-control-session-name-prefix` (preserving the `fa2af76` name==prefix
+   reconciliation), and that duplicate-name auto-increment runs *after* alias
+   resolution.
+4. Leave foreground launches (`--foreground`, no `--name`) untouched.
+5. Document the deterministic-collision rule (first match by sorted key) in the
+   README / `session` help.
+6. Add fake-tmux tests: (a) `start -d <dir>` and `start -d @<key>` for the same
+   repo yield the identical `TMUX--<device>--<alias>` name and the identical
+   remote-control prefix; (b) two shortcuts pointing at one dir resolve
+   deterministically; (c) a dir with no matching shortcut still yields the
+   repo-dir slug (behavior unchanged).
+
+## Verification
+
+Checks:
+
+- `[cmd] bash -n cctrl && bash -n tests/run-tests.sh`
+- `[cmd] bash tests/run-tests.sh`
+- `[assert] grep -Eq '_shortcut_for_dir' cctrl` → present
+- `[assert] grep -Eq 'same (name|prefix)|dir.*shortcut.*same|_shortcut_for_dir' tests/run-tests.sh` → a test asserts dir-launch and shortcut-launch parity
+- `[cmd] grep -Eq 'sorted|first match|deterministic' cctrl` → collision rule documented in code
+
 ## Notes
 
 - Core fix already shipped: commit `fa2af76` (bridge prefix from `--name`,
