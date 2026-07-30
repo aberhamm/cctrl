@@ -41,9 +41,9 @@ data-corruption or double-action risk as fleet size grows:
 **Acceptance criteria:**
 
 - [ ] Dir-lock acquisition is race-free: preferred approach (see Design) is a mandatory shlock fast path with an atomic `ln -s $$ lockfile` fallback, retiring the mkdir+pid-file dance entirely; if the worker instead keeps the mkdir path, the grace-window repair applies (a breaker must re-verify staleness after a grace window and must never remove a lock younger than the grace period). Applied to both `_mailbox_lock_acquire` and `_watch_lock_acquire`.
-- [ ] A stress test (N concurrent senders via the harness) loses no messages and never observes two concurrent lock holders (assert via a lock-held marker file the test injects). The race fires deterministically, not by timing luck: an env hook (e.g. `CCTRL_LOCK_TEST_DELAY`) injects a sleep between lock acquisition and pid visibility so the two-holder window is held open on demand.
+- [ ] A stress test (N concurrent senders via the harness) loses no messages and never observes two concurrent lock holders (assert via a lock-held marker file the test injects). The race fires deterministically, not by timing luck: an env hook (e.g. `CCTRL_LOCK_TEST_DELAY`) deterministically extends lock hold time for contention and two-holder-invariant tests. (Under the preferred `ln -s` design there is no pid-visibility window to widen — the hook manufactures contention; it must not reopen a race the design retires.)
 - [ ] `peers.json` writes go through the mailbox lock (or a dedicated `peers` lock with the same discipline); a concurrent register/alias test loses no entries.
-- [ ] Delivery no longer holds the mailbox lock across tmux I/O: the pass snapshots deliverable rows under the lock, releases, performs tmux work, then re-acquires per-row to record state transitions — with the row re-checked on re-acquire (it may have been recv'd/bounced meanwhile). A row whose state changed between snapshot and re-acquire is reported in the `skipped` outcome bucket with a row-changed reason — NEVER `failed` (plan 027's five-outcome consumers would wrongly retry a message that was actually handled). A test asserts `deliver --all --json`'s result-array shape is unchanged by the restructure. Concurrent `send` during a slow deliver pass succeeds within its timeout (test with an artificially slow fake tmux).
+- [ ] Delivery no longer holds the mailbox lock across tmux I/O: the pass CLAIMS its rows under the snapshot lock (an in-flight marker stamped on each selected row before release), releases, performs tmux work, then re-acquires per-row to record final state and clear the marker — with the row re-checked on re-acquire (it may have been recv'd/bounced meanwhile). The claim marker prevents the concurrent-deliver double-paste: without it, a manual `deliver --all` racing a watch-tick pass can both snapshot the same queued row and both paste it before either re-acquires (the watch lock only guards watch-vs-watch). A second pass skips rows carrying a live claim; a stale claim (holder pid dead) is reclaimable. A concurrent deliver-vs-deliver test asserts two simultaneous passes over one queued row produce exactly one paste. A row whose state changed between snapshot and re-acquire is reported in the `skipped` outcome bucket with a row-changed reason — NEVER `failed` (plan 027's five-outcome consumers would wrongly retry a message that was actually handled). A test asserts `deliver --all --json`'s result-array shape is unchanged by the restructure. Concurrent `send` during a slow deliver pass succeeds within its timeout (test with an artificially slow fake tmux).
 - [ ] Deliver-path nudge dedupe compares timestamps within a configurable window (default 30s), not string equality of the same second. The watch-path renudge check (already epoch-window based) is left untouched.
 - [ ] A wedged lock is diagnosable after the aggressive self-heal is removed: lock age and holder pid are surfaced in `peer status` (or `peer doctor`), and the lock-timeout error text documents the manual-clear path.
 - [ ] Full suite passes; the ~375 peer assertions unchanged except lock-behavior tests.
@@ -70,6 +70,15 @@ Keep `set -euo pipefail` interactions in mind for any parallel/stress test
 helpers (see `.mstack/learnings.jsonl`: xargs -P pools under set -e kill the
 parent on worker failure — guard whole pipelines, not just the last command).
 
+**Watch-lock contract preserved:** `_watch_lock_acquire` intentionally differs
+from the mailbox lock — no timeout loop; it returns 2 with `WATCH_LOCK_PID` set
+to signal "a watcher is already running". Port the acquisition mechanics, keep
+that return-2 signaling contract intact.
+
+**Optional (non-blocking):** on shlock-less fallback systems a kill-9'd holder
+wedges peer ops until manual clear; `peer doctor --fix` MAY clear a
+verifiably-dead-holder lock after a grace period.
+
 **Files expected to change:**
 
 - `cctrl`: `_mailbox_lock_acquire`, `_watch_lock_acquire`, peers.json write sites (register/alias/unregister), the deliver-pass loop, the deliver-path nudge dedupe check, lock-status surfacing in `peer status`/`peer doctor` + timeout error text
@@ -86,7 +95,7 @@ daemonization.
 
 1. Fix both dir-lock acquire paths (preferred: mandatory shlock + atomic `ln -s` fallback, retiring mkdir+pid-file; alternative: atomic pid visibility + breaker grace re-verify); add the two-holder stress test with the `CCTRL_LOCK_TEST_DELAY` env hook.
 2. Route peers.json mutations through the lock; add the concurrent-register test.
-3. Restructure the deliver pass to snapshot-release-reacquire with per-row re-check (changed rows → `skipped` with row-changed reason); add the slow-deliver/concurrent-send test and the `deliver --all --json` shape test.
+3. Restructure the deliver pass to claim-snapshot-release-reacquire (in-flight markers per the AC) with per-row re-check (changed rows → `skipped` with row-changed reason); add the slow-deliver/concurrent-send test, the concurrent deliver-vs-deliver single-paste test, and the `deliver --all --json` shape test.
 4. Widen the deliver-path nudge dedupe to a timestamp window (watch-path renudge untouched); add its test.
 5. Surface lock age + holder pid in `peer status` (or `peer doctor`) and document the manual-clear path in the lock-timeout error text.
 6. Run the full suite.
