@@ -1,12 +1,13 @@
 ---
 id: 012
 title: Reconcile directory-launch session names with configured shortcut aliases
-status: pending
+status: done
 blocked-by: []
 priority: 12
 allows-migrations: false
 needs-review: none
 created: 2026-06-19
+completed: 2026-07-22
 ---
 
 ## Background

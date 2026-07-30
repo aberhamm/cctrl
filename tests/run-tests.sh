@@ -861,6 +861,123 @@ test_bridge_prefix_matches_explicit_name() {
     assert_not_contains "$out" "TMUX--ms--unstructured-data-portal-"
 }
 
+test_dir_launch_adopts_shortcut_alias() {
+    # Plan 012: `cctrl start -d <dir>` where <dir> matches a configured shortcut
+    # must name the session from the shortcut's short alias — identically to
+    # `cctrl start -d @<key>` — so both launch paths yield the same
+    # TMUX--<device>--<alias> name AND the same remote-control prefix (name ==
+    # prefix, per fa2af76). On collision the first shortcut by sorted key wins.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_agent "$TMPDIR/claude" claude
+
+    local rootcopy="$TMPDIR/cctrl-alias-copy"
+    # Basename differs from the alias so the two naming conventions are distinct.
+    local project="$TMPDIR/unstructured-data-portal"
+    local dlog="$TMPDIR/alias-dir.log"
+    local slog="$TMPDIR/alias-shortcut.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"portal":{"dir":"%s","agent":"codex"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    # (a) dir launch adopts the alias — names TMUX--ms--portal, not
+    # TMUX--ms--unstructured-data-portal.
+    : > "$dlog"
+    local dout
+    dout="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$dlog" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --agent codex --purpose p "$project")"
+    assert_contains "$dout" "CCTRL_SESSION=TMUX--ms--portal"
+    assert_contains "$(cat "$dlog")" "new-session -d -s TMUX--ms--portal"
+    assert_contains "$(cat "$dlog")" "--name TMUX--ms--portal"
+    assert_not_contains "$(cat "$dlog")" "TMUX--ms--unstructured-data-portal"
+
+    # (b) shortcut launch of the same repo — must match exactly.
+    : > "$slog"
+    local sout
+    sout="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$slog" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --purpose p @portal)"
+    assert_contains "$sout" "CCTRL_SESSION=TMUX--ms--portal"
+    assert_contains "$(cat "$slog")" "new-session -d -s TMUX--ms--portal"
+    assert_contains "$(cat "$slog")" "--name TMUX--ms--portal"
+
+    # Same session name from both launch paths.
+    local dname sname
+    dname="$(grep -oE -- '--name TMUX--[^ ]+' "$dlog" | head -1)"
+    sname="$(grep -oE -- '--name TMUX--[^ ]+' "$slog" | head -1)"
+    [[ -n "$dname" && "$dname" == "$sname" ]] || \
+        fail "dir-launch name ($dname) must equal shortcut-launch name ($sname)"
+
+    # Same remote-control prefix: both --name values flow through to the bridge
+    # prefix (prefix == name-). Drive the foreground child the detached launch
+    # would spawn and capture the real --remote-control-session-name-prefix.
+    local dpfx spfx
+    dpfx="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--ms--portal \
+        "$rootcopy/cctrl" start --foreground --agent claude --name TMUX--ms--portal -m hi 2>&1)"
+    spfx="$(PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--ms--portal \
+        "$rootcopy/cctrl" @portal --foreground --agent claude --name TMUX--ms--portal -m hi 2>&1)"
+    assert_contains "$dpfx" "TMUX--ms--portal-"
+    assert_contains "$spfx" "TMUX--ms--portal-"
+    assert_not_contains "$dpfx" "TMUX--ms--unstructured-data-portal-"
+
+    echo "ok: dir launch adopts matching shortcut alias (same name + bridge prefix as @shortcut)"
+}
+
+test_dir_launch_shortcut_collision_deterministic() {
+    # Plan 012: when two shortcuts point at the same directory, the reverse
+    # lookup is deterministic — the first key by sorted order wins.
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-collision-copy"
+    local project="$TMPDIR/collision-project"
+    local log="$TMPDIR/collision.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    # Insertion order zzz-before-aaa; sorted order must pick "aaa".
+    printf '{"zzz":{"dir":"%s"},"aaa":{"dir":"%s"}}\n' "$project" "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --agent codex --purpose p "$project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--aaa"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--aaa"
+    assert_not_contains "$(cat "$log")" "TMUX--ms--zzz"
+
+    echo "ok: dir-launch shortcut collision resolves to first sorted key"
+}
+
+test_dir_launch_no_shortcut_match_unchanged() {
+    # Plan 012: a directory with no matching shortcut keeps the repo-dir slug —
+    # behavior is unchanged.
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-nomatch-copy"
+    local project="$TMPDIR/lonely-project"
+    local other="$TMPDIR/some-other-repo"
+    local log="$TMPDIR/nomatch.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project" "$other"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    # A shortcut exists, but points elsewhere.
+    printf '{"portal":{"dir":"%s"}}\n' "$other" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --agent codex --purpose p "$project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--lonely-project"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--lonely-project"
+    assert_contains "$(cat "$log")" "--name TMUX--ms--lonely-project"
+
+    echo "ok: dir launch with no matching shortcut keeps the repo-dir slug"
+}
+
 test_session_doctor_classifies_bridge() {
     # session doctor reads bridgeSessionId from the Claude session file to decide
     # live vs dead, and flags app/tmux name-prefix mismatches.
@@ -4013,6 +4130,9 @@ test_attach_prompt_after_start
 test_codex_statusline_tui_config
 test_context_names
 test_bridge_prefix_matches_explicit_name
+test_dir_launch_adopts_shortcut_alias
+test_dir_launch_shortcut_collision_deterministic
+test_dir_launch_no_shortcut_match_unchanged
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision
 test_session_doctor_realign_reports_hint

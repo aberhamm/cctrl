@@ -1747,11 +1747,28 @@ _launch_detached() {
             return 1
         fi
         dir="$(cd "$dir" && pwd)"
-        context_name="$(_tmux_session_slug "$dir")"
-        session_name="$context_name"
-        display_label="$dir"
-        metadata_target="$dir"
         metadata_cwd="$dir"
+        # Naming-only alias adoption: if this directory matches a configured
+        # shortcut, name the session from that shortcut's short alias so a dir
+        # launch and an `@<key>` launch of the same repo produce the identical
+        # TMUX--<device>--<alias> name — and therefore the identical
+        # --remote-control-session-name-prefix (name == prefix, per fa2af76).
+        # The cwd, agent, resume and bridge mechanism are unchanged: this launch
+        # still runs `cd <dir> && cctrl start --foreground`. On collision the
+        # first shortcut by sorted key wins (see _shortcut_for_dir).
+        local dir_shortcut
+        dir_shortcut="$(_shortcut_for_dir "$dir")"
+        if [[ -n "$dir_shortcut" ]]; then
+            context_name="$(_tmux_session_slug "$dir_shortcut")"
+            session_name="$context_name"
+            display_label="@$dir_shortcut"
+            metadata_target="@$dir_shortcut"
+        else
+            context_name="$(_tmux_session_slug "$dir")"
+            session_name="$context_name"
+            display_label="$dir"
+            metadata_target="$dir"
+        fi
     fi
 
     # Never assign a name whose tmux session is currently live — that would
@@ -7882,6 +7899,38 @@ _shortcut_lookup_key() {
         to_entries
         | map(select(.key | ascii_downcase == ($n | ascii_downcase)))[0].key // empty
     ' "$SHORTCUTS_FILE" 2>/dev/null
+}
+
+_shortcut_for_dir() {
+    # Reverse lookup: given an absolute, already-resolved directory, echo the
+    # shortcut key whose configured `dir` resolves to the same path (or empty).
+    # This lets a `cctrl start -d <dir>` launch adopt the matching shortcut's
+    # short alias so it names identically to `cctrl start -d @<key>`.
+    #
+    # Collision rule: when multiple keys point at the same directory, the first
+    # match by sorted key wins — a deterministic, documented choice.
+    local want="$1"
+    [[ -n "$want" && -f "$SHORTCUTS_FILE" ]] || return 0
+    local key raw resolved
+    while IFS=$'\t' read -r key raw; do
+        [[ -n "$key" ]] || continue
+        resolved="${raw/#\~/$HOME}"
+        if [[ -d "$resolved" ]]; then
+            resolved="$(cd "$resolved" && pwd)"
+        else
+            resolved="${resolved%/}"
+        fi
+        if [[ "$resolved" == "$want" ]]; then
+            printf '%s' "$key"
+            return 0
+        fi
+    done < <(jq -r '
+        to_entries
+        | sort_by(.key)[]
+        | select(.value.dir != null and .value.dir != "")
+        | "\(.key)\t\(.value.dir)"
+    ' "$SHORTCUTS_FILE" 2>/dev/null)
+    return 0
 }
 
 _shortcut_help() {
