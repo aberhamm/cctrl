@@ -14,18 +14,52 @@ from typing import Any
 
 TOOLS = [
     {
+        "name": "peer_overview",
+        "description": (
+            "START HERE if you have not used peer messaging before. One call answers "
+            "who am I, which peers can I reach, and do I have unread mail. Returns "
+            "`identity` (this server's own peer), `peers` (every reachable peer — "
+            "address these by their `name` in `send_message`), and `mailbox` (unread "
+            "`queued` and `delivered_unacked` counts). From here: call `send_message` "
+            "to start a conversation, or `recv_message` then `ack_message` to handle "
+            "incoming mail. When `mailbox.queued` or `delivered_unacked` is non-zero, "
+            "read the next message with `recv_message`. Takes no arguments; the "
+            "identity is fixed at server startup. If tmux peer discovery is skipped, "
+            "`peers` may be empty and `derived_skipped` is true, but `identity` and "
+            "`mailbox` are still returned."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
         "name": "whoami",
-        "description": "Return the peer identity bound to this MCP server.",
+        "description": (
+            "Return this server's own peer identity (name, agent, capabilities) — the "
+            "identity every message is sent as. You rarely need this alone: "
+            "`peer_overview` already includes it alongside the peer list and your "
+            "mailbox counts. Reach for it only to re-confirm who you are."
+        ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "list_peers",
-        "description": "List registered and live cctrl peers.",
+        "description": (
+            "List every peer you can address, registered or live. Each entry's `name` "
+            "is exactly what you pass as `to` in `send_message`. For a first look "
+            "prefer `peer_overview`, which returns this list plus your identity and "
+            "mailbox in a single call; use `resolve_peer` to check one specific "
+            "name or alias."
+        ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "resolve_peer",
-        "description": "Resolve a peer name or alias.",
+        "description": (
+            "Resolve a single peer name or alias to its canonical identity before you "
+            "address it — use when you are unsure a name is valid or which peer an "
+            "alias points to. To browse all peers at once use `list_peers` (or "
+            "`peer_overview`). The resolved `name` is what `send_message` expects "
+            "as `to`."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"name": {"type": "string"}},
@@ -37,8 +71,11 @@ TOOLS = [
         "name": "send_message",
         "description": (
             "Send a message from this server's identity to another peer and attempt "
-            "delivery. Returns ok:true with an `outcome` field naming one of five "
-            "states (sent-and-nudged, sent-and-queued, sent-but-deferred, "
+            "delivery. Address `to` with a peer `name` from `peer_overview` or "
+            "`list_peers` (aliases are accepted and canonicalized). To REPLY to a "
+            "message you received via `recv_message`, set `to` to that message's "
+            "`sender.name`. Returns ok:true with an `outcome` field naming one of "
+            "five states (sent-and-nudged, sent-and-queued, sent-but-deferred, "
             "sent-but-undelivered) whenever the message was durably queued; only "
             "send-failed (nothing queued) is ok:false. On sent-but-* the message id "
             "is returned so delivery can be retried alone — never resend, or the "
@@ -57,12 +94,25 @@ TOOLS = [
     },
     {
         "name": "check_messages",
-        "description": "Return unread mailbox counts for this peer.",
+        "description": (
+            "Return unread mailbox counts (`queued` and `delivered_unacked`) for this "
+            "peer. `peer_overview` returns the same counts alongside your identity "
+            "and peer list, so prefer it for a first orientation. When either count "
+            "is non-zero, call `recv_message` to read the next message."
+        ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "recv_message",
-        "description": "Receive the next queued or delivered-unacked message for this peer.",
+        "description": (
+            "Receive the next queued or delivered-unacked message addressed to this "
+            "peer (a queued message is marked delivered). The returned message "
+            "carries a `sender` object identifying who sent it: reply by calling "
+            "`send_message` with `to` set to `sender.name`. After you have handled "
+            "the message, call `ack_message` with its `id` — unacked messages keep "
+            "reappearing here and in `check_messages`. Use `peer_overview` or "
+            "`check_messages` first to see whether anything is waiting."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"status": {"type": "string"}},
@@ -71,7 +121,13 @@ TOOLS = [
     },
     {
         "name": "show_message",
-        "description": "Show a full mailbox message envelope.",
+        "description": (
+            "Show the full envelope of one message by `id` — including its `sender` "
+            "object and body — without changing its state. Use it to re-read a "
+            "message surfaced by `recv_message`. Only messages sent to or from this "
+            "peer are visible. This does not acknowledge; call `ack_message` when "
+            "you are done handling it."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "string"}},
@@ -81,7 +137,13 @@ TOOLS = [
     },
     {
         "name": "ack_message",
-        "description": "Acknowledge a delivered message addressed to this peer.",
+        "description": (
+            "Acknowledge a message (by `id`) that was delivered to this peer, marking "
+            "it handled so it stops appearing in `recv_message` and "
+            "`check_messages`. Acknowledge only after you have acted on the message "
+            "and sent any reply via `send_message`. A message must first be received "
+            "(`recv_message`) before it can be acked."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "string"}},
@@ -161,6 +223,18 @@ class Bridge:
 
     def call_tool(self, name: str, arguments: Any) -> dict[str, Any]:
         args = require_object(arguments)
+        if name == "peer_overview":
+            # Thin passthrough to `cctrl peer overview --json`, which resolves the
+            # peer+session document ONCE and derives identity + peers + mailbox from
+            # that single enumeration (plan 025). Graceful degradation lives CLI-side:
+            # when tmux peer discovery is skipped, `peer overview` still exits 0 with
+            # identity + mailbox counts and `derived_skipped: true`, which we surface
+            # unchanged. A hard document-build failure that would prevent identity
+            # resolution is unreachable by construction — main() resolves whoami
+            # before this bridge ever reads stdin — so there is nothing to fall back
+            # to and no separate re-enumeration is attempted.
+            ensure_no_extra(args, set())
+            return ok(self.cli(["peer", "overview", "--as", self.identity, "--json"]))
         if name == "whoami":
             ensure_no_extra(args, set())
             return ok(self.cli(["peer", "whoami", "--as", self.identity, "--json"]))

@@ -2449,6 +2449,103 @@ _peer_cmd_whoami() {
     fi
 }
 
+# Single-enumeration orientation entry point (plan 025). Answers "who am I, who
+# can I reach, do I have mail?" from ONE _peer_all_json resolution. It deliberately
+# does NOT call _peer_cmd_whoami / _peer_cmd_check / _mailbox_resolve_identity_for_mode
+# — each of those re-enters _peer_all_json -> _session_list and walks tmux again,
+# which would defeat the whole point (three enumerations for one answer). Identity
+# is resolved locally against the single document; the MCP `peer_overview` tool is a
+# thin passthrough to `peer overview --json`.
+_peer_cmd_overview() {
+    local as_identity="" json=false identity doc matches count peer_json messages
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--as needs a peer name" || echo -e "${RED}--as needs a peer name${RESET}" >&2; return 64; }
+                as_identity="$2"; shift 2 ;;
+            --json)
+                json=true; shift ;;
+            *)
+                $json && _json_error "validation" "Unknown peer overview flag: $1" || echo -e "${RED}Unknown peer overview flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+    identity="$as_identity"
+    [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    if [[ -z "$identity" ]]; then
+        if $json; then _json_error "missing-identity" "Use --as <peer> or set CCTRL_PEER."; return 66; fi
+        echo -e "${RED}No peer identity provided.${RESET}" >&2
+        echo -e "${DIM}Use: cctrl peer overview --as <peer>  or set CCTRL_PEER.${RESET}" >&2
+        return 1
+    fi
+
+    # ONE enumeration. Everything below is derived from $doc.
+    doc="$(_peer_all_json)" || return 1
+
+    # Resolve identity against the single document (mirrors _peer_resolve_json's
+    # matching without a second _peer_all_json walk).
+    matches="$(jq -c --arg n "$identity" '[ .peers[] | select(.name == $n or ((.aliases // []) | index($n))) ]' <<< "$doc")"
+    count="$(jq -r 'length' <<< "$matches")"
+    if [[ "$count" == "0" ]]; then
+        if $json; then _json_error "unknown-peer" "Unknown peer: $identity"; return 66; fi
+        echo -e "${RED}Unknown peer: '$identity'${RESET}" >&2
+        echo -e "${DIM}Register it with: cctrl peer register $identity --dir <path> --agent <agent>${RESET}" >&2
+        return 1
+    fi
+    if (( count > 1 )); then
+        if $json; then _json_error "ambiguous-peer" "Ambiguous peer identity: $identity"; return 66; fi
+        echo -e "${RED}Ambiguous peer identity: '$identity'${RESET}" >&2
+        jq -r '.[] | "  - " + .name + " (" + .source + ")"' <<< "$matches" >&2
+        return 1
+    fi
+    peer_json="$(jq -c '.[0]' <<< "$matches")"
+    identity="$(jq -r '.name' <<< "$peer_json")"
+
+    # Mailbox summary for the canonical identity, reusing `peer check`'s shape.
+    _mailbox_read_json_or_error "$json" || return $?
+    messages="$MAILBOX_MESSAGES"
+
+    local overview
+    overview="$(jq -n \
+        --argjson identity "$peer_json" \
+        --argjson doc "$doc" \
+        --argjson messages "$messages" \
+        --arg who "$identity" '
+        ($messages | map(select(.to == $who))) as $mine
+        | {
+            identity: $identity,
+            peers: ($doc.peers // []),
+            mailbox: {
+              queued: ([$mine[] | select(.status == "queued")] | length),
+              delivered_unacked: ([$mine[] | select(.status == "delivered")] | length),
+              oldest_queued_age_seconds: (
+                [$mine[] | select(.status == "queued") | .created_at]
+                | if length == 0 then null else ((now - (min | fromdateiso8601)) | floor) end
+              )
+            },
+            derived_skipped: ($doc.derived_skipped // false),
+            derived_skip_reason: ($doc.derived_skip_reason // null)
+          }')"
+
+    if $json; then
+        printf '%s\n' "$overview"
+        return
+    fi
+
+    if [[ "$(jq -r '.derived_skipped' <<< "$overview")" == "true" ]]; then
+        echo -e "${YELLOW}Derived tmux peer discovery skipped: $(jq -r '.derived_skip_reason' <<< "$overview").${RESET}" >&2
+    fi
+    echo -e "${BOLD}Peer Overview${RESET}"
+    jq -r '
+        "  identity: " + .identity.name
+        + "\n  peers reachable: " + (.peers | length | tostring)
+        + "\n  mailbox: queued=" + (.mailbox.queued | tostring)
+        + " delivered_unacked=" + (.mailbox.delivered_unacked | tostring)
+        + " oldest_queued_age_seconds=" + (.mailbox.oldest_queued_age_seconds | tostring)
+    ' <<< "$overview"
+}
+
 _mailbox_init() {
     mkdir -p "$(dirname "$MESSAGES_FILE")"
     [[ -f "$MESSAGES_FILE" ]] || : > "$MESSAGES_FILE"
@@ -5027,6 +5124,7 @@ cmd_peer() {
         alias) _peer_cmd_alias "$@" ;;
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
+        overview) _peer_cmd_overview "$@" ;;
         send) _peer_cmd_send "$@" ;;
         reply) _peer_cmd_reply "$@" ;;
         inbox) _peer_cmd_inbox "$@" ;;
@@ -5050,6 +5148,7 @@ cmd_peer() {
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer whoami [--as NAME] [--json]"
+            echo "  cctrl peer overview [--as NAME] [--json]"
             echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>"
             echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--json] -- <body>"
             echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"

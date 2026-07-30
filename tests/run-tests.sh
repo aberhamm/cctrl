@@ -2700,12 +2700,28 @@ test_peer_mcp_bridge_stdio() {
             printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
         } | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as comet
     )"
+    # Assert tool names by MEMBERSHIP, never an exact count/set: plan 025 adds
+    # `peer_overview` and pending plan 011 may independently add `say_peer` to the
+    # same TOOLS list, so a hardcoded total would be brittle. All 8 original names
+    # must remain present (renaming breaks the ~16 live sessions with the current
+    # list loaded), plus the new `peer_overview` entry point.
     printf '%s\n' "$out" | jq -s -e '
       length == 2
       and .[0].id == 1
       and .[1].id == 2
-      and ([.[1].result.tools[].name] | sort) == (["ack_message","check_messages","list_peers","recv_message","resolve_peer","send_message","show_message","whoami"] | sort)
-    ' >/dev/null || fail "expected MCP tools/list to advertise peer messaging tools"
+      and ([.[1].result.tools[].name]) as $names
+      | (["whoami","list_peers","resolve_peer","send_message","check_messages","recv_message","show_message","ack_message","peer_overview"] | all(. as $n | $names | index($n) != null))
+    ' >/dev/null || fail "expected MCP tools/list to advertise all 8 original tools plus peer_overview by name"
+
+    local overview_req
+    overview_req="$(jq -cn '{jsonrpc:"2.0",id:9,method:"tools/call",params:{name:"peer_overview",arguments:{}}}')"
+    out="$(printf '%s\n' "$overview_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as comet)"
+    printf '%s\n' "$out" | jq -e '
+      .result.structuredContent.ok == true
+      and .result.structuredContent.data.identity.name == "comet"
+      and (.result.structuredContent.data.peers | type == "array")
+      and (.result.structuredContent.data.mailbox | has("queued") and has("delivered_unacked") and has("oldest_queued_age_seconds"))
+    ' >/dev/null || fail "expected MCP peer_overview to return identity + peers + mailbox sections"
 
     send_req="$(jq -cn --arg to comet --arg subject "MCP" --arg body $'hello from mcp\n' '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:$to,subject:$subject,body:$body}}}')"
     out="$(printf '%s\n' "$send_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
@@ -2737,6 +2753,53 @@ test_peer_mcp_bridge_stdio() {
     printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.to == "comet"' >/dev/null || fail "expected MCP send_message to canonicalize recipient aliases through CLI"
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json)"
     printf '%s\n' "$out" | jq -e '.queued == 1 and .delivered_unacked == 1' >/dev/null || fail "expected alias-addressed MCP message to be visible to canonical peer"
+}
+
+test_peer_overview() {
+    # plan 025: `cctrl peer overview` answers who-am-I / who-can-I-reach /
+    # do-I-have-mail from a SINGLE session enumeration. Assert all three sections,
+    # single enumeration via the fake-tmux list-sessions COUNTER (never timing),
+    # and the derived_skipped passthrough when tmux is unavailable.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/overview-data"
+    local log="$TMPDIR/overview-enum.log"
+    setup_delivery_peers "$data"   # comet(session TMUX--comet), orchestrator(none), offline(none)
+
+    # Queue a message to comet so the mailbox summary is non-trivial.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "orient me" >/dev/null
+
+    # (1) All three sections present, correct identity + mailbox counts.
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json)"
+    printf '%s\n' "$out" | jq -e '
+        .identity.name == "comet"
+        and (.peers | type == "array")
+        and .mailbox.queued == 1
+        and .mailbox.delivered_unacked == 0
+        and (.mailbox | has("oldest_queued_age_seconds"))
+    ' >/dev/null || fail "expected peer overview to return identity + peers + mailbox in one call"
+
+    # (2) SINGLE enumeration: exactly one tmux list-sessions for the whole command.
+    # Counting the enumeration proves the code path; timing would prove nothing.
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json >/dev/null
+    local count
+    count="$(grep -c 'TMUX list-sessions' "$log" || true)"
+    [[ "$count" -eq 1 ]] || fail "expected exactly 1 session enumeration for peer overview, got $count"
+
+    # (3) derived_skipped passthrough: with tmux unavailable the manual identity and
+    # mailbox counts still resolve, no derived peers appear, and the skip reason is
+    # surfaced instead of failing the whole call.
+    out="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json)"
+    printf '%s\n' "$out" | jq -e '
+        .derived_skipped == true
+        and .derived_skip_reason == "tmux unavailable"
+        and .identity.name == "comet"
+        and .mailbox.queued == 1
+        and ([.peers[] | select(.source == "derived")] | length) == 0
+    ' >/dev/null || fail "expected peer overview to pass through derived_skipped with identity + mailbox intact"
+
+    echo "ok: peer overview — one enumeration, three sections, derived_skipped passthrough"
 }
 
 test_peer_send_deliver_outcomes() {
@@ -4407,6 +4470,7 @@ test_peer_mailbox_concurrency_and_stale_lock
 test_peer_polling_json_contracts
 test_peer_polling_identity_and_errors
 test_peer_mcp_bridge_stdio
+test_peer_overview
 test_peer_deliver_tmux_nudge_lifecycle
 test_peer_deliver_addressee_guard_replaced_occupant
 test_peer_deliver_busy_no_submit_and_inline

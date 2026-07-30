@@ -1,7 +1,8 @@
 ---
 id: 025
 title: Teach the peer MCP surface and add an entry point
-status: pending
+status: done
+completed: 2026-07-22
 blocked-by: [023, 027]
 priority: 25
 goal: cctrl-peer-messaging-discoverable-models
