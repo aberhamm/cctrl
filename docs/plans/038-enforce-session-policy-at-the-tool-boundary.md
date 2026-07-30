@@ -1,16 +1,16 @@
 ---
 id: 038
 title: Enforce per-session policy at the tool boundary, not in the brief
-status: blocked
+status: pending
 blocked-by: []
 priority: 10
 goal: cctrl-fleet-safety
 allows-migrations: false
-needs-review: eng
+needs-review: none
 review-required: eng
 created: 2026-07-30
 reviews:
-  - type=eng verdict=changes-requested date=2026-07-30 by=mstack-review
+  - type=eng verdict=approved date=2026-07-30 by=mstack-review
 ---
 
 ## Requirements
@@ -71,6 +71,17 @@ new scope):
       policy can be validated before a spawn relies on it.
 - [ ] `AGENTS.md` and the `cctrl-spawn` skill document that a brief states intent,
       the policy enforces it, and the brief is no longer the guardrail.
+- [ ] **Non-Claude runtimes never get a silent no-op policy:** cctrl spawns codex
+      sessions as a first-class runtime (with `--yolo`), and a Claude Code
+      `PreToolUse` hook enforces nothing there. Policy flags on a non-Claude
+      spawn must either refuse the spawn or warn loudly AND record the policy as
+      `unenforced` in the session metadata (visible in `cctrl session ls`), with
+      a test — an operator must never believe a guardrail exists where none does.
+- [ ] **The policy cannot disable itself:** the hook implicitly denies `Write`/
+      `Edit`/`Bash` mutations of `$CCTRL_DATA_DIR/policy/` and of the settings
+      entry that registers the hook, independent of the per-session
+      `deny_paths_write` list. "I'll update my policy" is the same
+      self-authorization move that produced the incident; tested.
 
 ### Why the hook, and not the alternatives
 
@@ -128,6 +139,29 @@ ran, not invented. `git push`, `gh release create`, `gh repo edit --visibility`
 count as `push`. Anything unrecognised inside a denied category's command family
 is **denied, not allowed**.
 
+**Session-id resolution** needs no invented lookup: `cctrl start` already bakes
+`CCTRL_SESSION_NAME` and `CCTRL_DATA_DIR` into the launched agent's environment,
+so the hook subprocess inherits both. Unresolvable session → no policy → allow
+(consistent with opt-in).
+
+**"Command family" defined:** classification is a per-binary safe-subcommand
+list — known-safe subcommands of a listed binary pass (`docker ps -a`,
+`git status`), unknown subcommands of a listed binary are denied
+(`docker frobnicate`). Path-argument extraction for the path rules fails
+closed: unresolvable, relative-outside-cwd, or glob paths are treated as not
+inside any `allow_paths_write`.
+
+**Stale policy cleanup:** session names recur across the fleet's lifetime
+(realign/relaunch, kills). `cctrl start` without policy flags removes any stale
+`policy/<session-id>.json` for that name, so a new session never inherits a
+dead session's policy.
+
+**Hook-protocol caveat for the implementer:** the in-repo precedent
+`hooks/block-git-commit.py` exits 1, which under the PreToolUse protocol is
+*non-blocking* (exit 2 blocks). Task 4's verify-against-a-live-session step is
+load-bearing — the precedent may itself be subtly wrong; do not copy its exit
+code blindly.
+
 **Known limits, stated so nobody mistakes this for a sandbox:**
 
 - Shell indirection defeats string classification (`eval`, a variable holding
@@ -168,6 +202,11 @@ is **denied, not allowed**.
 - `[cmd]` Absent policy file → behaviour byte-identical to today (regression
   guard for the whole existing fleet).
 - `[cmd]` `cctrl policy install` twice leaves one hook entry, not two.
+- `[cmd]` Policy flags on a codex spawn refuse or mark the policy `unenforced`
+  in session metadata (never a silent no-op).
+- `[cmd]` With any non-empty policy, a `Write`/`Edit`/`Bash` mutation of
+  `$CCTRL_DATA_DIR/policy/` or the hook's settings registration is denied
+  regardless of `deny_paths_write`.
 - `[manual]` A real detached session, spawned with `--deny delete`, is handed a
   deletion task and reports back that it was blocked rather than silently
   failing or looping.
