@@ -1,7 +1,7 @@
 ---
 id: 034
 title: Stamp the resolved recipient's identity at send time so the guard is exact
-status: pending
+status: blocked
 blocked-by: [023, 032]
 priority: 34
 goal: cctrl-peer-identity-integrity
