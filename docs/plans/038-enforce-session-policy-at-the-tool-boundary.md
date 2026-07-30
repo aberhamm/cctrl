@@ -1,7 +1,7 @@
 ---
 id: 038
 title: Enforce per-session policy at the tool boundary, not in the brief
-status: pending
+status: blocked
 blocked-by: []
 priority: 10
 goal: cctrl-fleet-safety
@@ -9,6 +9,8 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-07-30
+reviews:
+  - type=eng verdict=changes-requested date=2026-07-30 by=mstack-review
 ---
 
 ## Requirements
