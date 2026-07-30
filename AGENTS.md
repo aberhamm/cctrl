@@ -32,3 +32,27 @@ it's environment-specific and lives in the operator's private infra repo, not he
 ## Skill routing
 
 See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
+
+## Peer messaging
+
+Sessions coordinate through a local mailbox (`cctrl peer ...`). A peer identity
+is a registry or derived **name** — for a tmux-backed session, the session name
+itself. This is the operating contract; commands take real flags as shown.
+
+- **Orient first:** `cctrl peer overview --json` answers who you are, who you
+  can reach, and whether you have unread mail, in one call.
+- **Receive:** `cctrl peer check --json` for counts, `cctrl peer recv --json`
+  to take the next message, then `cctrl peer ack <id> --json` once handled.
+  Unacked messages get re-nudged, so acking is not optional.
+- **Reply:** `cctrl peer reply <message-id> --as <you> --json -- "<body>"`. It
+  resolves the recipient from the message itself and both sends **and** delivers,
+  so you never need the sender's address. Never reply with a bare
+  `cctrl peer send` — send only **queues**, and nothing arrives until a deliver
+  runs (no watcher runs by default). Always pass `--as`; a non-interactive shell
+  may not export `CCTRL_PEER`.
+- **Send:** find a peer with `cctrl peer overview` (or `cctrl peer ls`), then
+  `cctrl peer send <peer> --as <you> --json -- "<body>"` and deliver it.
+- Received messages carry a `sender` object; reply to `sender.name`.
+- **Limitation:** derived peer names are tmux session names, so an address can
+  dangle once that session closes. Treat a `sender` snapshot as historical and
+  verify liveness with `cctrl peer ls` before relying on it.

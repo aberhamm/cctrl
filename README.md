@@ -432,7 +432,13 @@ message history without changing message status.
 
 `--inline <message-id>` is explicit paste-only delivery for a full message
 body. It never presses Enter and should not be used for unattended sessions,
-because it pastes arbitrary message content into the target pane.
+because it pastes arbitrary message content into the target pane. The pasted
+text is prefixed with a compact envelope carrying the sender's label and
+canonical name, the message id, and ready-to-run `cctrl peer reply` and
+`cctrl peer ack` commands; the original body follows verbatim. Inline delivery
+also transitions the message to `delivered`, so it can then be acked. Messages
+queued before the `sender` field existed carry only a bare `from` string, and
+the envelope falls back to that.
 
 ### Peer Orchestrator Workflow
 
@@ -488,7 +494,10 @@ Trust model and limitations: cctrl authenticates peers by local registry name,
 not cryptographic identity. The mailbox is local filesystem state protected by
 normal file permissions. Tmux nudges are only doorbells; they do not prove the
 agent read or completed the work. Full-body inline paste is intentionally
-manual-only because it sends arbitrary text into an interactive shell.
+manual-only because it sends arbitrary text into an interactive shell. Peer
+names for derived peers are tmux session names, so an address can dangle once
+that session closes; treat a received `sender` snapshot as historical and
+verify liveness with `cctrl peer ls` before relying on it.
 
 Polling exit codes:
 
@@ -516,6 +525,7 @@ identity, and `recv_message`/`ack_message` always operate as that identity.
 Exposed tools:
 
 ```text
+peer_overview
 whoami
 list_peers
 resolve_peer
@@ -525,6 +535,13 @@ recv_message
 show_message
 ack_message
 ```
+
+`peer_overview` is the orientation entry point: one call returns your identity,
+the reachable peers, and an unread-mailbox summary, so a model new to peer
+messaging can start there instead of composing `whoami` + `list_peers` +
+`check_messages`. It is a thin passthrough to the `cctrl peer overview [--as
+NAME] [--json]` CLI subcommand, which serves all three answers from a single
+session enumeration and is usable directly from the shell.
 
 Codex global config in `~/.codex/config.toml`:
 

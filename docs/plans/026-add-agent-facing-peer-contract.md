@@ -1,7 +1,7 @@
 ---
 id: 026
 title: Put the peer operating contract where agents read
-status: pending
+status: done
 blocked-by: [024, 025]
 priority: 26
 goal: cctrl-peer-messaging-discoverable-models
@@ -9,6 +9,7 @@ allows-migrations: false
 needs-review: none
 review-required: none
 created: 2026-07-19
+completed: 2026-07-22
 ---
 
 ## Requirements

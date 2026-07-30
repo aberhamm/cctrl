@@ -4405,6 +4405,30 @@ test_session_say_errors() {
     echo "ok: session say reports unknown session, empty/missing body, and tmux paste failures"
 }
 
+test_peer_contract_docs() {
+    # Plan 026: the peer operating contract must live where agents actually read
+    # (AGENTS.md + CLAUDE.md routing), and the README must document the sender
+    # envelope, peer_overview, and the dangling-address limitation.
+    local agents="$ROOT/AGENTS.md" claude="$ROOT/CLAUDE.md" readme="$ROOT/README.md"
+    grep -q '^## Peer messaging' "$agents" || fail "AGENTS.md missing '## Peer messaging' section"
+    grep -q 'cctrl peer ack' "$agents" || fail "AGENTS.md contract missing concrete 'cctrl peer ack' command"
+    grep -q 'cctrl peer reply' "$agents" || fail "AGENTS.md contract missing 'cctrl peer reply'"
+    grep -q 'sender' "$agents" || fail "AGENTS.md contract missing sender identity"
+    grep -qi 'peer' "$claude" || fail "CLAUDE.md missing a peer routing entry"
+    grep -q 'peer_overview' "$readme" || fail "README.md missing peer_overview documentation"
+    grep -qi 'an address can dangle' "$readme" || fail "README.md missing the dangling-address limitation"
+    # Contract stays compact: <=30 lines between the heading and the next '## ' (or EOF).
+    local n
+    n="$(awk '/^## Peer messaging/{f=1;next}/^## /{if(f)exit}f' "$agents" | wc -l | tr -d ' ')"
+    [[ "$n" -le 30 ]] || fail "AGENTS.md peer contract too long ($n lines > 30)"
+    # Public-repo hygiene: no environment specifics inside the contract section.
+    if awk '/^## Peer messaging/{f=1;next}/^## /{if(f)exit}f' "$agents" \
+        | grep -Eq 'TMUX--|home\.matthew|homelab|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9]{4}\b'; then
+        fail "AGENTS.md peer contract contains environment specifics"
+    fi
+    echo "ok: peer operating contract in AGENTS.md + CLAUDE.md routing + README envelope/overview/limitation docs"
+}
+
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -4510,5 +4534,6 @@ test_session_prune_codex_never_prompted
 test_session_prune_dry_run_closes_nothing
 test_session_prune_excludes_self_and_attached
 test_usage_cost_fixtures
+test_peer_contract_docs
 
 echo "ok"
