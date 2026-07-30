@@ -92,7 +92,7 @@ the mailbox remains the async channel).
 Checks:
 
 - `[cmd] bash tests/run-tests.sh`
-- `[assert] ./cctrl session 2>&1 || true` contains `ask`
+- `[assert] ./cctrl session --help 2>&1` contains `ask` (bare `./cctrl session` defaults to `ls` and prints the session table — same defect the 042 review caught)
 - `[assert] ./cctrl session ask 2>&1 || true` contains `Usage`
 
 <!-- mstack:seam
