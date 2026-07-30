@@ -1,16 +1,16 @@
 ---
 id: 041
 title: Invert modal readiness — require a positively identified idle composer
-status: blocked
+status: pending
 blocked-by: [040]
 priority: 13
 goal: revised-cctrl-audit-backlog
 allows-migrations: false
-needs-review: eng
+needs-review: none
 review-required: eng
 created: 2026-07-30
 reviews:
-  - type=eng verdict=changes-requested date=2026-07-30 by=mstack-review
+  - type=eng verdict=approved date=2026-07-30 by=mstack-review
 ---
 
 ## Requirements
@@ -43,7 +43,7 @@ type and fixes that.
 - [ ] Readiness = the pinned pane's bottom input region positively matches a known idle-composer shape (Claude `❯ ` prompt line / Codex composer), AND no dialog marker is present. Everything else is not-ready.
 - [ ] `session say` against an unrecognized dialog (e.g. the resume modal: "Resuming the full session will consume … Enter to confirm") refuses instead of pasting; `--force-busy` still overrides, and its help text states the Enter-presses-a-button risk.
 - [ ] `peer deliver` classifies not-ready as `deferred` (existing vocabulary) — but a peer with an unrecognized `agent` whose pane shows a detectable idle composer is now **nudgeable**, eliminating the permanent silent deferral.
-- [ ] The readiness decision and the paste happen against the same single capture wherever feasible, AND the readiness check is re-run against a fresh capture immediately before the Enter keypress wherever the substrate allows — not just "where feasible" for the recheck. This shrinks (not fully closes — noted limitation) the check-then-paste TOCTOU window. `--force-busy` remains a blind-Enter path; its help text must state that risk.
+- [ ] The readiness decision and the paste happen against the same single capture wherever feasible. Immediately before the Enter keypress, a **narrower pre-Enter predicate** is re-checked against a fresh capture: dialog-markers-absent (no known dialog/selector signature in the bottom region) — NOT the full idle-composer predicate, which cannot be used at this point because the pane now contains our own pasted text and would always classify not-ready. Optionally, the pasted-prefix match from 040's verification capture doubles as confirmation the composer holds our text. This shrinks (not fully closes — noted limitation) the check-then-paste TOCTOU window. `--force-busy` remains a blind-Enter path; its help text must state that risk.
 - [ ] Rollback guard: `CCTRL_READINESS_POSITIVE=0` restores the old allowlist polarity (per-detector env-guard convention, like `CCTRL_STATE_DETECT_*`). Default is the new positive-identification polarity.
 - [ ] Operator visibility: deferred deliveries are distinguishable by age — `peer status` gains one minimal field per peer (oldest-deferral age, or deferral count), so a week-old deferral doesn't look fresh. One field only; not a status redesign.
 - [ ] Autoheal's and doctor's busy-gating keep their current fail-safe behavior (they may only get MORE conservative, never less).
@@ -67,6 +67,17 @@ deferred. That is the intended direction — silent deferral is visible in
 `peer status` while a mispressed dialog button is invisible and irreversible.
 Call this out in CHANGELOG.
 
+**Fixture sourcing fallback:** if a live resume modal cannot be reproduced on
+demand, capture the fixture from a fleet session exhibiting it (two sessions sat
+on this exact modal during the 2026-07 audit) — never fabricate fixture text.
+
+**Codex contingency:** if Task 1 finds no stable Codex composer signature (Codex
+renders selection as reverse-video with no reliable glyph — see the existing
+readiness comments), fall back per-agent: codex peers KEEP the current
+allowlist polarity (modal-anchor deferral) while claude panes get positive
+detection. Inversion must never permanently defer all codex peers;
+`CCTRL_READINESS_POSITIVE=0` remains the fleet-wide rollback.
+
 **Files expected to change:**
 
 - `cctrl`: new `_pane_bottom_region` helper; `_peer_pane_ready_for_delivery` rewritten around positive composer identification (with `CCTRL_READINESS_POSITIVE=0` polarity rollback guard); `_session_say` refusal message; help text for `--force-busy`; one deferral-age/count field in `peer status`
@@ -83,7 +94,7 @@ detection (plan 046), changing autoheal.
 2. Add `_pane_bottom_region` (last non-empty block / tail-N rows of a capture) as the shared helper this plan owns; plan 046 will adopt it.
 3. Rewrite `_peer_pane_ready_for_delivery`: bottom-region positive composer match; dialog markers force not-ready; drop the agent-type dead-end default. Guard the new polarity behind `CCTRL_READINESS_POSITIVE` (default on; `=0` restores the old allowlist polarity, per the `CCTRL_STATE_DETECT_*` env-guard convention).
 4. Update `_session_say` refusal text and `--force-busy` help (state the blind-Enter risk).
-5. Wire single-capture readiness into the paste path, and re-check readiness against a fresh capture immediately before the Enter keypress wherever the substrate allows.
+5. Wire single-capture readiness into the paste path; immediately before Enter, re-check the narrower dialog-markers-absent predicate against a fresh capture (the full idle-composer predicate would always fail here — the pane now contains the pasted text).
 6. Add the one deferral-age (or deferral-count) field to `peer status`.
 7. Add fixture-driven tests incl. unknown-agent-nudgeable case and the `CCTRL_READINESS_POSITIVE=0` rollback path.
 8. Run the full suite; update CHANGELOG noting the polarity change.
