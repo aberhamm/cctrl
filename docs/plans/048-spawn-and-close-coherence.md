@@ -1,16 +1,16 @@
 ---
 id: 048
 title: Spawn and close coherence — brief contract, close safety, leak fix
-status: blocked
+status: pending
 blocked-by: []
 priority: 20
 goal: revised-cctrl-audit-backlog
 allows-migrations: false
-needs-review: eng
+needs-review: none
 review-required: eng
 created: 2026-07-30
 reviews:
-  - type=eng verdict=changes-requested date=2026-07-30 by=mstack-review
+  - type=eng verdict=approved date=2026-07-30 by=mstack-review
 ---
 
 ## Requirements
