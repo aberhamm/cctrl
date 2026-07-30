@@ -4529,7 +4529,26 @@ JSON
     assert_not_contains "$(cat "$log")" "send-keys -t demo Enter"
     [[ ! -e "$data/messages.jsonl" ]] || fail "peer say --no-submit must not write messages.jsonl"
 
-    echo "ok: peer say delegates to session say (flags shared) and never touches the mailbox"
+    # peer say rejects --as/--from at the peer level with a clear message (they
+    # belong to the mailbox path, peer send), rather than leaking session say's
+    # "Unknown session say flag" error.
+    local rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer say demo --as beta --json -- "hi")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for peer say --as"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "validation" and (.reason | test("peer say takes no --as"))' >/dev/null \
+        || fail "expected a peer-level --as rejection, not a session say flag leak"
+
+    # A message body that mentions --as after `--` is delivered, not misread.
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer say demo --json -- "explain --as usage")"
+    printf '%s\n' "$out" | jq -e '.ok == true' >/dev/null || fail "peer say must not misread --as inside the body"
+    assert_contains "$(cat "$log")" "BUFFER explain --as usage"
+
+    echo "ok: peer say delegates to session say (flags shared), rejects --as/--from clearly, never touches the mailbox"
 }
 
 test_peer_help_agent() {

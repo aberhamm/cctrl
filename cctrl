@@ -2558,6 +2558,25 @@ _peer_cmd_say() {
     shift
     _arg_has_json "$@" && json=true
 
+    # peer say is direct chat with no sender identity; --as/--from belong to the
+    # mailbox path (peer send). Reject them here with a clear message rather than
+    # leaking session say's "Unknown session say flag" error. Stop scanning at
+    # `--` so a message body that mentions --as/--from is not misread as a flag.
+    local _a
+    for _a in "$@"; do
+        [[ "$_a" == "--" ]] && break
+        case "$_a" in
+            --as|--from)
+                if $json; then
+                    _session_say_json false "" false validation "peer say takes no $_a (direct chat has no sender identity); use 'peer send' for durable mailbox delivery"
+                else
+                    echo -e "${RED}peer say takes no $_a — direct chat has no sender identity.${RESET}" >&2
+                    echo -e "${DIM}Use 'cctrl peer send <peer> --from <you> ...' for durable mailbox delivery.${RESET}" >&2
+                fi
+                return 64 ;;
+        esac
+    done
+
     local rc=0; _peer_direct_resolve "$identity" || rc=$?
     if (( rc != 0 )); then
         if $json; then
