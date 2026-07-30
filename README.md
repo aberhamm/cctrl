@@ -292,11 +292,48 @@ at read time and include `mailbox` and `tmux` capabilities plus a computed
 peer has the same name as a live session, the manual entry wins and `peer ls
 --json` marks it with `shadows`.
 
+Human `cctrl peer ls` shows each peer's backing `SESSION` and a live/offline
+status by default, so the peer-to-session mapping is visible without `--json`.
+Mailbox queue counts stay in `cctrl peer status`.
+
 Peer names and aliases may contain letters, numbers, dots, underscores, and
 dashes. Whitespace, shell metacharacters, and the reserved name `user` are
 rejected. Peer state is machine-local. Tests and isolated workflows can set
 `CCTRL_DATA_DIR` to move only peer-messaging runtime files; existing shortcuts,
 hosts, profiles, and cost data keep using their normal cctrl paths.
+
+#### Talking to a peer's live session
+
+Because a peer resolves to a live tmux session, you can chat with it directly
+the same way `session say` talks to a session — but addressed by peer name or
+alias instead of a raw tmux target. This is **live tmux chat**, not mailbox
+delivery: use `peer say` when the agent is running and you want it to act now,
+and `peer send` (below) for durable, async work that should survive the
+recipient being away.
+
+```bash
+cctrl peer session comet            # comet -> TMUX--comet   (its backing session)
+cctrl peer session comet --json     # {ok, name, label, session, tmux_target, host, live, status}
+cctrl peer attach comet             # attach to comet's live tmux session (interactive)
+cctrl peer say comet -- "run the test suite and report back"
+cctrl peer say comet --no-submit -- "draft reply, I'll hit enter"
+cctrl peer say comet --json -- "status?"   # same result shape as session say
+```
+
+`peer say` resolves the peer/alias to a live local tmux session and delegates to
+`session say`, sharing all of its flags (`--body-file PATH|-`, `--no-submit`,
+`--json`, `--force-busy`) and its readiness/modal checks. Like `session say`, it
+**never** writes `data/messages.jsonl`, changes mailbox status, or records nudge
+metadata.
+
+Peer host metadata is descriptive, not a transport. If a peer's `.host` is not
+the current host label, `peer session`/`peer attach`/`peer say` fail with a hint
+to run the command through the top-level `--host` layer
+(`cctrl --host studio peer say comet -- ...`) rather than auto-SSHing from
+registry metadata. `cctrl --host <host> peer attach <peer>` is forwarded as an
+interactive, TTY-requesting command, the same as `session attach`. Peers with no
+live session (polling/MCP-only) and stale recorded sessions fail with a clear
+error.
 
 Mailbox messages are stored as JSON Lines in `data/messages.jsonl` under the
 same peer data root. The lifecycle is intentionally small:

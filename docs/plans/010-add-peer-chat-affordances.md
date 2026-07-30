@@ -1,7 +1,8 @@
 ---
 id: 010
 title: Add peer chat affordances over tmux sessions
-status: pending
+status: done
+completed: 2026-07-22
 blocked-by: [009]
 priority: 10
 goal: tmux-peer-direct-chat

@@ -2378,23 +2378,195 @@ _peer_cmd_ls() {
         return
     fi
     echo -e "${BOLD}Peers${RESET}"
+    printf '  %b%-18s %-8s %-7s %-20s %-8s %s%b\n' \
+        "$DIM" "NAME" "SOURCE" "AGENT" "SESSION" "STATUS" "DIR / PURPOSE" "$RESET"
     jq -r '
         .peers[]
         | [
             .name,
             .source,
             (.agent // "-"),
+            ((.tmux_target // .session) // ""),
             (.dir // "-"),
             ((.capabilities // []) | join(",")),
             (.purpose // ""),
             (.shadows // "")
           ]
         | @tsv
-    ' <<< "$doc" | while IFS=$'\t' read -r name source agent dir capabilities purpose shadows; do
-        local shadow_text=""
+    ' <<< "$doc" | while IFS=$'\t' read -r name source agent session dir capabilities purpose shadows; do
+        local shadow_text="" session_text status_text
+        if [[ -n "$session" ]] && _tmux_run_with_timeout has-session -t "$session" >/dev/null 2>&1; then
+            session_text="$session"
+            status_text="${GREEN}live${RESET}"
+        elif [[ -n "$session" ]]; then
+            session_text="$session"
+            status_text="${DIM}offline${RESET}"
+        else
+            session_text="-"
+            status_text="${DIM}offline${RESET}"
+        fi
         [[ -n "$shadows" ]] && shadow_text=" ${DIM}shadows=$shadows${RESET}"
-        printf '  %b%-18s%b %-8s %-7s %-32s %-15s %s\n' "$GREEN" "$name" "$RESET" "$source" "$agent" "$dir" "$capabilities" "$purpose$shadow_text"
+        printf '  %b%-18s%b %-8s %-7s %-20s %b%-8s%b %-24s %s%s\n' \
+            "$GREEN" "$name" "$RESET" "$source" "$agent" "$session_text" \
+            "" "$status_text" "$RESET" "$dir" "$capabilities" "$purpose$shadow_text"
     done
+}
+
+# ── Direct peer chat over tmux (plan 010) ─────────────────────────────
+# Resolve a peer identity/alias to a LIVE, LOCAL tmux target for the direct-chat
+# affordances (`peer session`, `peer attach`, `peer say`). Goes through the
+# shared peer JSON resolver so alias/canonical handling and the
+# live-derived-over-stale-manual behavior stay consistent — it never reads
+# data/peers.json directly. Peer host metadata is descriptive, not a transport:
+# a peer whose `.host` differs from the current host label is rejected with a
+# `--host` hint rather than auto-SSH'd.
+#
+# Sets PEER_DIRECT_{NAME,LABEL,TARGET,HOST,LIVE,STATUS,REASON}. Returns 0 for a
+# live local target; non-zero otherwise (STATUS in unknown-peer / remote-host /
+# no-session / stale).
+_peer_direct_resolve() {
+    local identity="$1" peer_json
+    PEER_DIRECT_NAME=""
+    PEER_DIRECT_LABEL="$identity"
+    PEER_DIRECT_TARGET=""
+    PEER_DIRECT_HOST=""
+    PEER_DIRECT_LIVE=false
+    PEER_DIRECT_STATUS=""
+    PEER_DIRECT_REASON=""
+
+    if ! peer_json="$(_peer_resolve_json "$identity" 2>/dev/null)"; then
+        PEER_DIRECT_STATUS="unknown-peer"
+        PEER_DIRECT_REASON="Unknown or ambiguous peer: '$identity'"
+        return 66
+    fi
+    PEER_DIRECT_NAME="$(jq -r '.name // empty' <<< "$peer_json")"
+    PEER_DIRECT_HOST="$(jq -r '.host // "local"' <<< "$peer_json")"
+    PEER_DIRECT_TARGET="$(jq -r '(.tmux_target // .session) // empty' <<< "$peer_json")"
+
+    local host_label="${CCTRL_HOST_PREFIX:-local}"
+    if [[ "$PEER_DIRECT_HOST" != "$host_label" ]]; then
+        PEER_DIRECT_STATUS="remote-host"
+        PEER_DIRECT_REASON="Peer '$PEER_DIRECT_NAME' lives on host '$PEER_DIRECT_HOST', not '$host_label'."
+        return 65
+    fi
+
+    if [[ -z "$PEER_DIRECT_TARGET" ]]; then
+        PEER_DIRECT_STATUS="no-session"
+        PEER_DIRECT_REASON="Peer '$PEER_DIRECT_NAME' has no live tmux session (polling/MCP-only)."
+        return 66
+    fi
+
+    if command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "$PEER_DIRECT_TARGET" >/dev/null 2>&1; then
+        PEER_DIRECT_LIVE=true
+        PEER_DIRECT_STATUS="ok"
+        return 0
+    fi
+    PEER_DIRECT_STATUS="stale"
+    PEER_DIRECT_REASON="Peer '$PEER_DIRECT_NAME' maps to tmux session '$PEER_DIRECT_TARGET', which is not live."
+    return 66
+}
+
+# Print a resolution failure (human mode) with an actionable hint. For
+# non-local host metadata, hint the top-level `--host` forwarding layer — the
+# only sanctioned cross-host path — instead of auto-SSH.
+_peer_direct_print_error() {
+    local verb="$1"
+    echo -e "${RED}${PEER_DIRECT_REASON}${RESET}" >&2
+    if [[ "$PEER_DIRECT_STATUS" == "remote-host" ]]; then
+        local suffix=""
+        [[ "$verb" == "say" ]] && suffix=" -- ..."
+        echo -e "${DIM}Run: cctrl --host ${PEER_DIRECT_HOST} peer ${verb} ${PEER_DIRECT_LABEL}${suffix}${RESET}" >&2
+    fi
+}
+
+_peer_cmd_session() {
+    local identity="" json=false a
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            -*) echo -e "${RED}Unknown peer session flag: $1${RESET}" >&2; return 64 ;;
+            *)
+                if [[ -z "$identity" ]]; then identity="$1"; shift
+                else echo -e "${RED}Unexpected argument: $1${RESET}" >&2; return 64; fi ;;
+        esac
+    done
+    if [[ -z "$identity" ]]; then
+        echo -e "${RED}Usage: cctrl peer session <peer> [--json]${RESET}" >&2
+        return 64
+    fi
+    _peer_direct_resolve "$identity"; local rc=$?
+    if $json; then
+        jq -n \
+            --argjson ok "$( [[ $rc -eq 0 ]] && echo true || echo false )" \
+            --arg name "$PEER_DIRECT_NAME" \
+            --arg label "$PEER_DIRECT_LABEL" \
+            --arg session "$PEER_DIRECT_TARGET" \
+            --arg host "$PEER_DIRECT_HOST" \
+            --argjson live "$PEER_DIRECT_LIVE" \
+            --arg status "$PEER_DIRECT_STATUS" \
+            --arg reason "$PEER_DIRECT_REASON" '
+            {ok:$ok, name:$name, label:$label,
+             session:(if $session != "" then $session else null end),
+             tmux_target:(if $session != "" then $session else null end),
+             host:$host, live:$live, status:$status}
+            + (if $reason != "" then {reason:$reason} else {} end)'
+        return $rc
+    fi
+    if (( rc != 0 )); then
+        _peer_direct_print_error session
+        return $rc
+    fi
+    echo -e "${GREEN}${PEER_DIRECT_NAME}${RESET} -> ${PEER_DIRECT_TARGET}"
+}
+
+_peer_cmd_attach() {
+    # Interactive only — no --json mode. Resolve to the backing tmux session and
+    # delegate to the existing `session attach` path.
+    local identity="" a
+    for a in "$@"; do
+        case "$a" in
+            --json) echo -e "${RED}peer attach is interactive and has no --json mode.${RESET}" >&2; return 64 ;;
+            -*) echo -e "${RED}Unknown peer attach flag: $a${RESET}" >&2; return 64 ;;
+            *)
+                if [[ -z "$identity" ]]; then identity="$a"
+                else echo -e "${RED}Unexpected argument: $a${RESET}" >&2; return 64; fi ;;
+        esac
+    done
+    if [[ -z "$identity" ]]; then
+        echo -e "${RED}Usage: cctrl peer attach <peer>${RESET}" >&2
+        return 64
+    fi
+    _peer_direct_resolve "$identity" || { _peer_direct_print_error attach; return $?; }
+    _session_attach "$PEER_DIRECT_TARGET"
+}
+
+_peer_cmd_say() {
+    # Direct live-tmux chat to a peer. Resolves the peer/alias to a live local
+    # tmux session and delegates to plan 009's `session say`, sharing all its
+    # flags (--body-file, --no-submit, --json, --force-busy). Never touches the
+    # mailbox: no data/messages.jsonl write, no status change, no nudge metadata.
+    local identity="${1:-}" json=false
+    if [[ -z "$identity" || "$identity" == -* ]]; then
+        if _arg_has_json "$@"; then
+            _session_say_json false "" false validation "peer name required"
+        else
+            echo -e "${RED}Usage: cctrl peer say <peer> [--no-submit] [--force-busy] [--body-file PATH|-] [--json] -- <message>${RESET}" >&2
+        fi
+        return 64
+    fi
+    shift
+    _arg_has_json "$@" && json=true
+
+    _peer_direct_resolve "$identity"; local rc=$?
+    if (( rc != 0 )); then
+        if $json; then
+            _session_say_json false "$PEER_DIRECT_TARGET" false "$PEER_DIRECT_STATUS" "$PEER_DIRECT_REASON"
+        else
+            _peer_direct_print_error say
+        fi
+        return $rc
+    fi
+    _session_say "$PEER_DIRECT_TARGET" "$@"
 }
 
 _peer_cmd_resolve() {
@@ -5119,6 +5291,9 @@ cmd_peer() {
     shift 2>/dev/null || true
     case "$action" in
         ls|list) _peer_cmd_ls "$@" ;;
+        session) _peer_cmd_session "$@" ;;
+        attach|a) _peer_cmd_attach "$@" ;;
+        say) _peer_cmd_say "$@" ;;
         resolve) _peer_cmd_resolve "$@" ;;
         register|add) _peer_cmd_register "$@" ;;
         alias) _peer_cmd_alias "$@" ;;
@@ -5142,7 +5317,11 @@ cmd_peer() {
         mcp) _peer_cmd_mcp "$@" ;;
         help|-h|--help)
             echo -e "${BOLD}cctrl peer${RESET} — Addressable agent registry"
-            echo "  cctrl peer ls [--json]"
+            echo "  cctrl peer ls [--json]              (shows backing SESSION + live/offline)"
+            echo "  cctrl peer session <peer> [--json] Show a peer's backing live tmux session"
+            echo "  cctrl peer attach <peer>           Attach to a peer's live tmux session (interactive)"
+            echo "  cctrl peer say <peer> [--no-submit] [--force-busy] [--body-file PATH|-] [--json] -- <msg>"
+            echo "                                     Direct live-tmux chat (no mailbox); use 'peer send' for async mailbox"
             echo "  cctrl peer resolve <name-or-alias> [--json]"
             echo "  cctrl peer register <name> [--alias NAME] [--host HOST] [--dir DIR] [--agent AGENT] [--session SESSION] [--purpose TEXT] [--capability NAME]"
             echo "  cctrl peer alias <name> <alias>"
@@ -6900,7 +7079,10 @@ cmd_help() {
     echo "  cctrl session kill <name>   Kill a detached session immediately"
     echo ""
     echo -e "${BOLD}Peers${RESET}"
-    echo "  cctrl peer ls [--json]              List registered and live cctrl-managed peers"
+    echo "  cctrl peer ls [--json]              List peers with backing SESSION + live/offline"
+    echo "  cctrl peer session <peer> [--json]  Show a peer's backing live tmux session"
+    echo "  cctrl peer attach <peer>            Attach to a peer's live tmux session (interactive)"
+    echo "  cctrl peer say <peer> -- <msg>      Direct live-tmux chat (no mailbox); vs 'peer send' async"
     echo "  cctrl peer resolve <name> [--json]  Resolve a peer name or alias"
     echo "  cctrl peer register <name> [flags]  Register a manual peer"
     echo "  cctrl peer alias <name> <alias>     Add an alias to a manual peer"
@@ -7359,6 +7541,13 @@ _remote_exec() {
         @*)   use_tty=true ;;
         session)
             # `session attach` is interactive; ls/kill are not.
+            case "${2:-}" in
+                attach|a) use_tty=true ;;
+            esac
+            ;;
+        peer)
+            # `peer attach` resolves to a live tmux session and attaches; it is
+            # interactive and needs a TTY, the same as `session attach`.
             case "${2:-}" in
                 attach|a) use_tty=true ;;
             esac

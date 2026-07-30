@@ -4405,6 +4405,230 @@ test_session_say_errors() {
     echo "ok: session say reports unknown session, empty/missing body, and tmux paste failures"
 }
 
+test_peer_session_resolves_and_alias() {
+    # `peer session <peer>` resolves through the shared peer JSON resolver
+    # (aliases + canonical names) to the backing live tmux session. Human output
+    # is concise (name -> target); --json carries canonical name, requested
+    # label, session/tmux_target, host, and live status.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local meta="$TMPDIR/peer-session-meta"
+    local data="$TMPDIR/peer-session-data"
+    mkdir -p "$meta"
+    cat > "$meta/demo.json" <<'JSON'
+{"purpose":"peer chat target","created_at":"2026-06-11T10:00:00Z","peer":"comet"}
+JSON
+    local out
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer session comet)"
+    assert_contains "$out" "comet -> demo"
+
+    # Alias ("demo") resolves to canonical name "comet"; label echoes the request.
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer session demo --json)"
+    printf '%s\n' "$out" | jq -e '.ok == true and .name == "comet" and .label == "demo" and .session == "demo" and .tmux_target == "demo" and .host == "local" and .live == true and .status == "ok"' >/dev/null \
+        || fail "expected peer session json to resolve alias to canonical live target"
+
+    echo "ok: peer session resolves canonical + alias through the peer resolver to the backing tmux session"
+}
+
+test_peer_session_offline_unknown_stale() {
+    # Clear, machine-readable errors for polling/MCP-only peers (no session),
+    # unknown peers, and manual peers whose recorded session is no longer live.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local meta="$TMPDIR/peer-session-err-meta"
+    mkdir -p "$meta"
+    local out rc
+
+    # Unknown peer.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$TMPDIR/peer-unknown-data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer session ghost --json)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for unknown peer session"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "unknown-peer"' >/dev/null || fail "expected unknown-peer status"
+
+    # Polling/MCP-only peer with no tmux session.
+    local poll_data="$TMPDIR/peer-poll-data"
+    CCTRL_DATA_DIR="$poll_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer register poller --agent codex --capability polling >/dev/null
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$poll_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer session poller --json)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for polling-only peer session"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "no-session"' >/dev/null || fail "expected no-session status"
+
+    # Manual peer with a recorded session that is not live (stale).
+    local stale_data="$TMPDIR/peer-stale-data"
+    CCTRL_DATA_DIR="$stale_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer register stale --agent codex --session TMUX--gone >/dev/null
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$stale_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_HAS_SESSION="" \
+        "$ROOT/cctrl" peer session stale --json)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for stale peer session"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "stale" and .tmux_target == "TMUX--gone"' >/dev/null || fail "expected stale status with recorded target"
+
+    echo "ok: peer session reports unknown, polling-only (no-session), and stale peers with clear machine-readable errors"
+}
+
+test_peer_attach_targets_resolved_session() {
+    # `peer attach <peer>` resolves the peer to its backing tmux session and
+    # delegates to the existing session-attach path (exec tmux attach-session).
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local meta="$TMPDIR/peer-attach-meta"
+    local data="$TMPDIR/peer-attach-data"
+    local log="$TMPDIR/peer-attach.log"
+    mkdir -p "$meta"
+    cat > "$meta/demo.json" <<'JSON'
+{"purpose":"peer chat target","created_at":"2026-06-11T10:00:00Z","peer":"comet"}
+JSON
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer attach comet >/dev/null 2>&1 || true
+    assert_contains "$(cat "$log")" "attach-session -t demo"
+
+    echo "ok: peer attach resolves the peer and attaches to the resolved tmux session"
+}
+
+test_peer_say_delegates_and_no_mailbox() {
+    # `peer say` resolves a peer/alias to a live tmux session and delegates to
+    # plan 009's `session say` (same flags). It must NEVER write messages.jsonl
+    # or otherwise touch mailbox state.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local meta="$TMPDIR/peer-say-meta"
+    local data="$TMPDIR/peer-say-data"
+    local log="$TMPDIR/peer-say.log"
+    mkdir -p "$meta"
+    cat > "$meta/demo.json" <<'JSON'
+{"purpose":"peer chat target","created_at":"2026-06-11T10:00:00Z","peer":"comet"}
+JSON
+    local out
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer say demo --json -- "live chat hi")"
+    printf '%s\n' "$out" | jq -e '.ok == true and .session == "demo" and .submitted == true and .status == "ok"' >/dev/null \
+        || fail "expected peer say to delegate to session say with ok result"
+    assert_contains "$(cat "$log")" "BUFFER live chat hi"
+    assert_contains "$(cat "$log")" "send-keys -t demo Enter"
+    # No mailbox mutation whatsoever.
+    [[ ! -e "$data/messages.jsonl" ]] || fail "peer say must not write messages.jsonl"
+
+    # --no-submit is honored (shared session say flag).
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer say comet --no-submit --json -- "no enter")"
+    printf '%s\n' "$out" | jq -e '.ok == true and .submitted == false' >/dev/null || fail "expected peer say --no-submit"
+    assert_not_contains "$(cat "$log")" "send-keys -t demo Enter"
+    [[ ! -e "$data/messages.jsonl" ]] || fail "peer say --no-submit must not write messages.jsonl"
+
+    echo "ok: peer say delegates to session say (flags shared) and never touches the mailbox"
+}
+
+test_peer_direct_non_local_host_hint() {
+    # A peer whose host metadata differs from the current host label must NOT be
+    # auto-SSH'd; direct commands fail with an actionable `--host` hint.
+    make_fake_tmux "$TMPDIR/tmux"
+    local meta="$TMPDIR/peer-host-meta"
+    local data="$TMPDIR/peer-host-data"
+    mkdir -p "$meta"
+    CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer register comet --host studio --agent codex --session TMUX--comet >/dev/null
+
+    local out rc
+    # Human `peer say` prints the reason plus the top-level `--host` hint.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer say comet -- "hi" 2>&1)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for non-local peer say"
+    assert_contains "$out" "cctrl --host studio peer say comet"
+
+    # JSON `peer session` surfaces remote-host status.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer session comet --json)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for non-local peer session"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "remote-host" and .host == "studio"' >/dev/null || fail "expected remote-host status"
+
+    # peer attach also refuses and hints.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer attach comet 2>&1)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for non-local peer attach"
+    assert_contains "$out" "cctrl --host studio peer attach comet"
+
+    echo "ok: non-local peer host metadata fails with a --host hint instead of auto-SSH"
+}
+
+test_peer_attach_remote_forwarding_tty() {
+    # `cctrl --host <host> peer attach <peer>` is interactive: the forwarding
+    # layer must request a TTY (ssh -t), the same as `session attach`.
+    make_fake_ssh "$TMPDIR/ssh"
+    local rootcopy="$TMPDIR/cctrl-peerattach-copy"
+    local log="$TMPDIR/peer-attach-ssh.log"
+    mkdir -p "$rootcopy/data"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"ms":{"hostname":"example.invalid","user":"tester"}}\n' > "$rootcopy/data/hosts.json"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" SSH_LOG="$log" \
+        "$rootcopy/cctrl" --host ms peer attach comet >/dev/null 2>&1 || true
+
+    local ssh_log
+    ssh_log="$(cat "$log")"
+    assert_contains "$ssh_log" "SSH -t tester@example.invalid"
+    assert_contains "$ssh_log" "peer\\ attach\\ comet"
+
+    echo "ok: cctrl --host <host> peer attach requests a TTY (ssh -t)"
+}
+
+test_peer_ls_shows_session_and_status() {
+    # Human `peer ls` shows the backing SESSION column and live/offline status by
+    # default, without dropping any existing --json fields.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local meta="$TMPDIR/peer-ls-meta"
+    local data="$TMPDIR/peer-ls-data"
+    mkdir -p "$meta"
+    cat > "$meta/demo.json" <<'JSON'
+{"purpose":"peer chat target","created_at":"2026-06-11T10:00:00Z","peer":"comet"}
+JSON
+    local out
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer ls)"
+    assert_contains "$out" "SESSION"
+    assert_contains "$out" "STATUS"
+    assert_contains "$out" "demo"
+    assert_contains "$out" "live"
+
+    # An offline manual peer (recorded session not live) shows offline.
+    local off_data="$TMPDIR/peer-ls-off-data"
+    CCTRL_DATA_DIR="$off_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" peer register comet --agent codex --session TMUX--gone >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$off_data" CCTRL_SESSION_METADATA_DIR="$TMPDIR/peer-ls-empty-meta" \
+        TMUX_FAKE_HAS_SESSION="" \
+        "$ROOT/cctrl" peer ls)"
+    assert_contains "$out" "offline"
+
+    # --json still carries the full peer objects (tmux_target preserved).
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
+        "$ROOT/cctrl" peer ls --json)"
+    printf '%s\n' "$out" | jq -e '.peers[] | select(.name == "comet") | .tmux_target == "demo"' >/dev/null \
+        || fail "expected peer ls --json to keep tmux_target field"
+
+    echo "ok: peer ls human output shows SESSION + live/offline while --json keeps all fields"
+}
+
 test_peer_contract_docs() {
     # Plan 026: the peer operating contract must live where agents actually read
     # (AGENTS.md + CLAUDE.md routing), and the README must document the sender
@@ -4525,6 +4749,13 @@ test_session_say_body_file_preserves_newlines
 test_session_say_modal_deferral_not_overridden_by_force_busy
 test_session_say_unknown_readiness_requires_force_busy
 test_session_say_errors
+test_peer_session_resolves_and_alias
+test_peer_session_offline_unknown_stale
+test_peer_attach_targets_resolved_session
+test_peer_say_delegates_and_no_mailbox
+test_peer_direct_non_local_host_hint
+test_peer_attach_remote_forwarding_tty
+test_peer_ls_shows_session_and_status
 test_session_close_named_immediate
 test_session_close_outside_requires_name
 test_session_prune_never_prompted_claude

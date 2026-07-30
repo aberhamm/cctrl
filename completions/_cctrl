@@ -271,6 +271,9 @@ _cctrl() {
                 local -a peer_cmds=(
                     'ls:List peers'
                     'list:List peers'
+                    'session:Show a peer'\''s backing live tmux session'
+                    'attach:Attach to a peer'\''s live tmux session'
+                    'say:Direct live-tmux chat to a peer (no mailbox)'
                     'resolve:Resolve a peer'
                     'register:Register a manual peer'
                     'add:Register a manual peer'
@@ -300,6 +303,28 @@ _cctrl() {
                 case "$peercmd" in
                     ls|list)
                         _arguments '--json[Machine-readable output]'
+                        ;;
+                    session)
+                        if (( CURRENT == 4 )); then
+                            _cctrl_peers
+                        else
+                            _arguments '--json[Machine-readable output]'
+                        fi
+                        ;;
+                    attach|a)
+                        (( CURRENT == 4 )) && _cctrl_peers
+                        ;;
+                    say)
+                        if (( CURRENT == 4 )); then
+                            _cctrl_peers
+                        else
+                            _arguments \
+                                '--no-submit[Paste without pressing Enter]' \
+                                '--body-file[Read body from a file or stdin]:file:_files' \
+                                '--force-busy[Paste when readiness is unknown (never a known modal)]' \
+                                '--json[Machine-readable result]' \
+                                '--[Everything after is the message body]'
+                        fi
                         ;;
                     resolve)
                         if (( CURRENT == 4 )); then
