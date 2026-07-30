@@ -1,7 +1,8 @@
 ---
 id: 024
 title: Add a sender envelope to inline peer delivery
-status: pending
+status: done
+completed: 2026-07-22
 blocked-by: [023, 027]
 priority: 24
 goal: cctrl-peer-messaging-discoverable-models

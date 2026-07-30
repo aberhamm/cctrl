@@ -3208,6 +3208,47 @@ _peer_nudge_line() {
     printf '[cctrl] %s new peer message(s) for %s. Run: cctrl peer recv --as %s --json' "$count" "$peer" "$peer"
 }
 
+# Sender envelope prepended to inline peer delivery (plan 024). Renders a compact
+# header from the message's sender snapshot (plan 023) so the receiving model can
+# see WHO sent the message, reply, and acknowledge — none of which it can do from
+# a bare body pasted into its input. Arguments: the message JSON object, the
+# delivering peer's canonical name (`recipient`), and a reachability verdict
+# (`reach` ∈ live | mailbox-only | unreachable | user) already resolved against
+# the SENDER at delivery time. Every command carries `--as <recipient>` because a
+# non-interactive agent shell may not export CCTRL_PEER, and a bare command then
+# fails identity resolution. The reply line is the atomic `cctrl peer reply`
+# (plan 027), which sends AND delivers — never a bare `cctrl peer send`, which
+# only queues and silently never reaches the sender. The caller appends the body
+# verbatim after the trailing `---` line.
+_peer_inline_envelope() {
+    local msg_json="$1" recipient="$2" reach="$3"
+    local id label name subject
+    id="$(jq -r '.id // ""' <<< "$msg_json")"
+    subject="$(jq -r '.subject // ""' <<< "$msg_json")"
+    # jq `//` treats "" as present, so fall through empty strings explicitly to
+    # avoid a blank label when a legacy message carries sender:{label:""}.
+    label="$(jq -r '(.sender.label // "") as $l | (.from // "") as $f | if $l != "" then $l else $f end' <<< "$msg_json")"
+    name="$(jq -r '(.sender.name // "") as $n | (.from // "") as $f | if $n != "" then $n else $f end' <<< "$msg_json")"
+
+    printf '[cctrl peer message] from: %s (%s) · id: %s\n' "$label" "$name" "$id"
+    [[ -n "$subject" ]] && printf 'Subject: %s\n' "$subject"
+    case "$reach" in
+        user)
+            # from == "user": the human operator sent this, not a peer. A
+            # `cctrl peer send/reply user` command fails recipient resolution, so
+            # direct the reply into the conversation instead.
+            printf 'Sender is the human operator — reply in this conversation, not via cctrl.\n' ;;
+        unreachable)
+            printf 'SENDER IS NO LONGER LIVE — do not reply to this peer.\n' ;;
+        *)
+            # live or mailbox-only: both are reachable (mailbox-only peers collect
+            # their own mail); emit the atomic send-and-deliver reply line.
+            printf 'Reply:  cctrl peer reply %s --as %s --json -- "<your reply>"\n' "$id" "$recipient" ;;
+    esac
+    printf 'Ack:    cctrl peer ack %s --as %s --json\n' "$id" "$recipient"
+    printf -- '---\n'
+}
+
 _peer_has_capability() {
     local peer_json="$1" capability="$2"
     jq -e --arg c "$capability" '(.capabilities // []) | index($c)' <<< "$peer_json" >/dev/null 2>&1
@@ -3429,6 +3470,14 @@ _peer_record_nudge_json() {
 
 _peer_record_inline_json() {
     local messages="$1" id="$2" ok="$3" error="$4" now="$5"
+    # On a SUCCESSFUL paste of a still-`queued` message, transition it to
+    # `delivered` the way `_peer_cmd_recv` does — set delivered_at (which
+    # `_peer_delivered_stale_json` reads to age the delivered-but-unacked sweep)
+    # and append a `delivered` history entry — so `cctrl peer ack` (which rejects
+    # queued messages) can now complete the lifecycle (plan 024). Only touch a
+    # queued message: an already-`delivered`/`acked` message keeps its status and
+    # its original delivered_at when re-delivered inline. Failure branches pass
+    # ok=false and never transition.
     jq --arg id "$id" --arg now "$now" --arg error "$error" --argjson ok "$ok" '
         map(
           if .id == $id then
@@ -3438,6 +3487,11 @@ _peer_record_inline_json() {
                 ({at: $now, event: "inline", ok: $ok, by: "cctrl", adapter: "tmux"}
                  + (if $error == "" then {} else {error: $error} end))
               ])
+            | (if ($ok and .status == "queued") then
+                 .status = "delivered"
+                 | .delivered_at = $now
+                 | .history = (.history + [{at: $now, status: "delivered", by: "cctrl"}])
+               else . end)
           else . end
         )
     ' <<< "$messages"
@@ -3499,6 +3553,7 @@ _peer_deliver_one_locked() {
     local peer_json="$1" messages="$2" dry_run="$3" json="$4" no_submit="$5" force_busy="$6" inline_id="$7"
     local peer agent target queued now nudge buffer submit payload result message_body message_to updated recent
     local peer_created guard blocked_now msg_status
+    local inline_msg_json inline_from inline_sender inline_sender_json inline_reach inline_envelope
     peer="$(jq -r '.name' <<< "$peer_json")"
     agent="$(jq -r '.agent // empty' <<< "$peer_json")"
     peer_created="$(jq -r '.created_at // ""' <<< "$peer_json")"
@@ -3565,7 +3620,26 @@ _peer_deliver_one_locked() {
         unset PEER_MESSAGE_BODY
         queued="$(jq -r --arg peer "$peer" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
         PEER_DELIVER_QUEUED="$queued"
-        payload="$message_body"
+        # Prepend a sender envelope (plan 024). Resolve the SENDER's reachability
+        # NOW, at delivery time — the sender snapshot (plan 023) records who they
+        # WERE; by the time the model reads the pane they may be gone. Consume the
+        # PURE classifier (plan 027); do NOT call _peer_tmux_target_for_delivery,
+        # which writes PEER_DELIVER_STATUS/TARGET and would clobber this in-flight
+        # RECIPIENT delivery. A sender that no longer resolves at all is
+        # unreachable. Prepend to PEER_MESSAGE_BODY so the body's trailing-newline
+        # -safe extraction is preserved verbatim after the `---`.
+        inline_msg_json="$(jq -c --arg id "$inline_id" '[.[] | select(.id == $id)][0]' <<< "$messages")"
+        inline_from="$(jq -r '.from // ""' <<< "$inline_msg_json")"
+        inline_sender="$(jq -r '(.sender.name // "") as $n | (.from // "") as $f | if $n != "" then $n else $f end' <<< "$inline_msg_json")"
+        if [[ "$inline_from" == "user" ]]; then
+            inline_reach="user"
+        elif inline_sender_json="$(_peer_resolve_json "$inline_sender" 2>/dev/null)"; then
+            inline_reach="$(_peer_reachability_class "$inline_sender_json")"
+        else
+            inline_reach="unreachable"
+        fi
+        inline_envelope="$(_peer_inline_envelope "$inline_msg_json" "$peer" "$inline_reach")"
+        payload="${inline_envelope}"$'\n'"${message_body}"
         submit=false
     else
         queued="$(jq -r --arg peer "$peer" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"

@@ -91,6 +91,10 @@ case "${1:-}" in
         input="$(cat; printf '%s' "$sentinel")"
         input="${input%$sentinel}"
         printf 'BUFFER %s\n' "$input" >> "${TMUX_LOG:?}"
+        # Raw-byte capture (plan 024): the `BUFFER %s\n` log line cannot prove
+        # trailing-newline fidelity, so when asked, dump the exact load-buffer
+        # payload bytes to a file for a byte-for-byte comparison.
+        [[ -n "${TMUX_BUFFER_FILE:-}" ]] && printf '%s' "$input" > "$TMUX_BUFFER_FILE"
         exit 0
         ;;
     paste-buffer)
@@ -3091,9 +3095,234 @@ test_peer_deliver_busy_no_submit_and_inline() {
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$inline_id" --json)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "inline" and .results[0].inline == true and .results[0].submitted == false' >/dev/null || fail "expected inline paste result"
-    assert_contains "$(cat "$log")" "BUFFER inline body"
+    # Envelope (plan 024): the pasted buffer now leads with a sender header and
+    # the reply/ack commands, then the original body verbatim after `---`.
+    assert_contains "$(cat "$log")" "[cctrl peer message] from: orchestrator (orchestrator)"
+    assert_contains "$(cat "$log")" "inline body"
     assert_contains "$(cat "$log")" "paste-buffer -b cctrl-inline-comet-"
     assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+}
+
+test_peer_inline_envelope_and_ack() {
+    # Plan 024, Task 6: the inline envelope carries the sender label/name/id and
+    # the subject (when non-empty), the body arrives verbatim, and `peer ack` now
+    # succeeds against an inline-delivered message (the queued->delivered
+    # transition closes the old ack dead-end). A legacy message with no `sender`
+    # object still yields a usable envelope from bare `from`; a `--from user`
+    # message emits the human-operator variant and never `cctrl peer send user`.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/env-data" log="$TMPDIR/env-tmux.log"
+    setup_delivery_peers "$data"
+
+    local id out buf
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --subject 'Hello there' --json -- "envelope body one" | jq -r '.id')"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "inline"' >/dev/null || fail "expected inline paste"
+    buf="$(cat "$log")"
+    assert_contains "$buf" "[cctrl peer message] from: orchestrator (orchestrator) · id: $id"
+    assert_contains "$buf" "Subject: Hello there"
+    assert_contains "$buf" "Reply:  cctrl peer reply $id --as comet --json"
+    assert_contains "$buf" "Ack:    cctrl peer ack $id --as comet --json"
+    assert_contains "$buf" "envelope body one"
+
+    # queued -> delivered with delivered_at, and ack now succeeds.
+    jq -c "select(.id==\"$id\")" "$data/messages.jsonl" | jq -e '.status == "delivered" and .delivered_at != null' >/dev/null || fail "expected inline delivery to mark message delivered"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet --json | jq -e '.message.status == "acked"' >/dev/null || fail "expected ack to succeed after inline delivery"
+
+    # Legacy message (pre-plan-023): strip .sender and confirm the envelope still
+    # renders from the bare `from` string.
+    local legacy_id
+    legacy_id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "legacy body" | jq -r '.id')"
+    jq -c "if .id==\"$legacy_id\" then del(.sender) else . end" "$data/messages.jsonl" > "$data/messages.jsonl.tmp"
+    mv "$data/messages.jsonl.tmp" "$data/messages.jsonl"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$legacy_id" --json >/dev/null
+    assert_contains "$(cat "$log")" "[cctrl peer message] from: orchestrator (orchestrator) · id: $legacy_id"
+
+    # --from user: human-operator variant, no reply command, ack still emitted,
+    # and never a `cctrl peer send user` line (which would fail resolution).
+    local user_id
+    user_id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from user --json -- "from a human" | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$user_id" --json >/dev/null
+    buf="$(cat "$log")"
+    assert_contains "$buf" "Sender is the human operator"
+    assert_contains "$buf" "Ack:    cctrl peer ack $user_id --as comet --json"
+    assert_not_contains "$buf" "cctrl peer reply"
+    assert_not_contains "$buf" "cctrl peer send"
+
+    echo "ok: inline envelope carries sender + reply/ack, body verbatim, ack closes the loop, legacy + user variants"
+}
+
+test_peer_inline_envelope_reachability() {
+    # Plan 024, Task 8: sender reachability is resolved at DELIVERY time via the
+    # pure classifier (plan 027). live -> reply line; dead tmux session ->
+    # SENDER IS NO LONGER LIVE and no reply command; mailbox-only (no tmux
+    # capability) -> reply line (reachable); unresolvable sender -> unreachable.
+    # The ack line appears in every branch, and no branch emits a bare send.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/reach-data" log="$TMPDIR/reach-tmux.log"
+    setup_delivery_peers "$data"
+    mkdir -p "$TMPDIR/livesender" "$TMPDIR/deadsender" "$TMPDIR/tempsender"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register livesender --dir "$TMPDIR/livesender" --agent codex --session TMUX--livesender >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register deadsender --dir "$TMPDIR/deadsender" --agent codex --session TMUX--deadsender >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register tempsender --dir "$TMPDIR/tempsender" --agent codex >/dev/null
+
+    local id buf
+
+    # live sender: its session is in the has-session set -> reply line emitted.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from livesender --json -- "L" | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet TMUX--livesender" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    buf="$(cat "$log")"
+    assert_contains "$buf" "Reply:  cctrl peer reply $id --as comet --json"
+    assert_contains "$buf" "Ack:    cctrl peer ack $id --as comet --json"
+    assert_not_contains "$buf" "SENDER IS NO LONGER LIVE"
+    assert_not_contains "$buf" "cctrl peer send"
+
+    # dead tmux sender: has tmux capability + target but session not live.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from deadsender --json -- "D" | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    buf="$(cat "$log")"
+    assert_contains "$buf" "SENDER IS NO LONGER LIVE"
+    assert_contains "$buf" "Ack:    cctrl peer ack $id --as comet --json"
+    assert_not_contains "$buf" "cctrl peer reply"
+    assert_not_contains "$buf" "cctrl peer send"
+
+    # mailbox-only sender (no tmux capability): reachable by mailbox -> reply line.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "M" | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    buf="$(cat "$log")"
+    assert_contains "$buf" "Reply:  cctrl peer reply $id --as comet --json"
+    assert_contains "$buf" "Ack:    cctrl peer ack $id --as comet --json"
+    assert_not_contains "$buf" "SENDER IS NO LONGER LIVE"
+
+    # unresolvable sender: unregister it after sending -> treated as unreachable.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from tempsender --json -- "U" | jq -r '.id')"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer unregister tempsender >/dev/null
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    buf="$(cat "$log")"
+    assert_contains "$buf" "SENDER IS NO LONGER LIVE"
+    assert_contains "$buf" "Ack:    cctrl peer ack $id --as comet --json"
+    assert_not_contains "$buf" "cctrl peer reply"
+
+    echo "ok: inline envelope reachability branches (live/dead/mailbox-only/unresolvable) + ack in all"
+}
+
+test_peer_inline_paste_failure_keeps_queued() {
+    # Plan 024, Task 9 (CRITICAL): if the tmux paste fails, the message MUST stay
+    # queued with delivered_at null. A regression here silently drops fleet mail —
+    # the sender believes it landed and nothing retries.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/pf-data" log="$TMPDIR/pf-tmux.log"
+    setup_delivery_peers "$data"
+    local id out
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "will fail to paste" | jq -r '.id')"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_LOAD_FAIL=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json)" || true
+    printf '%s\n' "$out" | jq -e '.results[0].status == "failed"' >/dev/null || fail "expected failed inline result on paste failure"
+    jq -c "select(.id==\"$id\")" "$data/messages.jsonl" | jq -e '.status == "queued" and .delivered_at == null' >/dev/null || fail "paste failure must leave message queued with null delivered_at"
+    echo "ok: inline paste failure leaves the message queued (no silent drop)"
+}
+
+test_peer_inline_delivery_idempotent() {
+    # Plan 024, Task 10: re-delivering an already-delivered message preserves its
+    # original delivered_at; an already-acked message is left unchanged.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/idem-data" log="$TMPDIR/idem-tmux.log"
+    setup_delivery_peers "$data"
+    local id
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "idempotent" | jq -r '.id')"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-07-01T00:00:00Z" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    [[ "$(jq -r "select(.id==\"$id\") | .delivered_at" "$data/messages.jsonl")" == "2026-07-01T00:00:00Z" ]] || fail "expected delivered_at from first inline delivery"
+
+    # Re-deliver with a later clock: status stays delivered, delivered_at frozen.
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-07-02T00:00:00Z" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    jq -c "select(.id==\"$id\")" "$data/messages.jsonl" | jq -e '.status == "delivered" and .delivered_at == "2026-07-01T00:00:00Z"' >/dev/null || fail "re-delivery must not regress status or clobber delivered_at"
+
+    # Ack, then re-deliver: acked stays acked, delivered_at still frozen.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet --json >/dev/null
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-07-03T00:00:00Z" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    jq -c "select(.id==\"$id\")" "$data/messages.jsonl" | jq -e '.status == "acked" and .delivered_at == "2026-07-01T00:00:00Z"' >/dev/null || fail "re-delivering an acked message must leave it unchanged"
+    echo "ok: inline delivery is idempotent for delivered and acked messages"
+}
+
+test_peer_inline_pastes_into_recipient_pane() {
+    # Plan 024, Task 10a: an inline delivery to peer A whose SENDER is peer B must
+    # paste into A's pane, never B's — guards the global-clobber regression where
+    # resolving the sender's target would overwrite the in-flight recipient target.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/pane-data" log="$TMPDIR/pane-tmux.log"
+    setup_delivery_peers "$data"
+    mkdir -p "$TMPDIR/bsender"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register bsender --dir "$TMPDIR/bsender" --agent codex --session TMUX--bsender >/dev/null
+    local id buf
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from bsender --json -- "into A" | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet TMUX--bsender" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    buf="$(cat "$log")"
+    assert_contains "$buf" "paste-buffer -b cctrl-inline-comet-"
+    assert_contains "$buf" "-t TMUX--comet"
+    assert_not_contains "$buf" "cctrl-inline-bsender"
+    echo "ok: inline delivery pastes into the recipient's pane, not the sender's"
+}
+
+test_peer_reachability_class_is_pure() {
+    # Plan 024, Task 10a: the pure classifier (plan 027) maps a peer JSON to
+    # live/mailbox-only/unreachable WITHOUT writing PEER_DELIVER_STATUS/TARGET
+    # (which would clobber an in-flight recipient delivery).
+    make_fake_tmux "$TMPDIR/tmux"
+    local out
+    out="$(CCTRL_NO_MAIN=1 PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--live" bash -c '
+        source "'"$ROOT"'/cctrl" >/dev/null 2>&1
+        PEER_DELIVER_STATUS="SENTINEL_S"; PEER_DELIVER_TARGET="SENTINEL_T"
+        a="$(_peer_reachability_class "{\"name\":\"p\",\"capabilities\":[\"mailbox\",\"tmux\"],\"tmux_target\":\"TMUX--live\"}")"
+        b="$(_peer_reachability_class "{\"name\":\"q\",\"capabilities\":[\"mailbox\"]}")"
+        c="$(_peer_reachability_class "{\"name\":\"r\",\"capabilities\":[\"mailbox\",\"tmux\"],\"tmux_target\":\"TMUX--dead\"}")"
+        printf "%s|%s|%s|%s|%s" "$a" "$b" "$c" "$PEER_DELIVER_STATUS" "$PEER_DELIVER_TARGET"
+    ')"
+    [[ "$out" == "live|mailbox-only|unreachable|SENTINEL_S|SENTINEL_T" ]] || fail "classifier impure or wrong: $out"
+    echo "ok: pure reachability classifier maps classes without touching PEER_DELIVER_* globals"
+}
+
+test_peer_inline_body_bytes_preserved() {
+    # Plan 024, Task 10b: the body must arrive byte-for-byte after the envelope,
+    # trailing newline included. The `BUFFER %s\n` log line cannot prove this, so
+    # capture the raw load-buffer payload and byte-compare its tail to the body.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/bytes-data" log="$TMPDIR/bytes-tmux.log" bodyfile="$TMPDIR/bytes-body" buffile="$TMPDIR/bytes-buffer"
+    setup_delivery_peers "$data"
+    printf 'line one\n\nline three\ntrailing kept\n' > "$bodyfile"
+    local id nbytes
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --body-file "$bodyfile" --json | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_BUFFER_FILE="$buffile" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    [[ -f "$buffile" ]] || fail "expected raw buffer capture file"
+    nbytes="$(wc -c < "$bodyfile")"
+    tail -c "$nbytes" "$buffile" | cmp -s - "$bodyfile" || fail "inline body not preserved byte-for-byte after the envelope"
+    echo "ok: inline body arrives byte-for-byte (trailing newline preserved) after the envelope"
+}
+
+test_peer_inline_delivered_appears_in_stale_sweep() {
+    # Plan 024, Task 7: an inline-delivered message must fold into the
+    # delivered-but-unacked stale sweep — it sets delivered_at, which
+    # _peer_delivered_stale_json ages on.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/stale-data" log="$TMPDIR/stale-tmux.log"
+    setup_delivery_peers "$data"
+    local id out
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "stale me" | jq -r '.id')"
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-07-01T00:00:00Z" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer nudge --stale --older-than 0 --json)"
+    printf '%s\n' "$out" | jq -e --arg id "$id" '.delivered_unacked_stale | map(.id) | index($id) != null' >/dev/null || fail "expected inline-delivered message in delivered-stale sweep"
+    echo "ok: inline-delivered messages fold into the delivered-stale sweep"
 }
 
 test_peer_deliver_claude_modal_detection() {
@@ -4181,6 +4410,14 @@ test_peer_mcp_bridge_stdio
 test_peer_deliver_tmux_nudge_lifecycle
 test_peer_deliver_addressee_guard_replaced_occupant
 test_peer_deliver_busy_no_submit_and_inline
+test_peer_inline_envelope_and_ack
+test_peer_inline_envelope_reachability
+test_peer_inline_paste_failure_keeps_queued
+test_peer_inline_delivery_idempotent
+test_peer_inline_pastes_into_recipient_pane
+test_peer_reachability_class_is_pure
+test_peer_inline_body_bytes_preserved
+test_peer_inline_delivered_appears_in_stale_sweep
 test_peer_deliver_claude_modal_detection
 test_peer_deliver_codex_modal_detection
 test_peer_deliver_failures_all_and_concurrency
