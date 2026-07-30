@@ -2494,7 +2494,7 @@ _peer_cmd_session() {
         echo -e "${RED}Usage: cctrl peer session <peer> [--json]${RESET}" >&2
         return 64
     fi
-    _peer_direct_resolve "$identity"; local rc=$?
+    local rc=0; _peer_direct_resolve "$identity" || rc=$?
     if $json; then
         jq -n \
             --argjson ok "$( [[ $rc -eq 0 ]] && echo true || echo false )" \
@@ -2516,7 +2516,7 @@ _peer_cmd_session() {
         _peer_direct_print_error session
         return $rc
     fi
-    echo -e "${GREEN}${PEER_DIRECT_NAME}${RESET} -> ${PEER_DIRECT_TARGET}"
+    echo "${PEER_DIRECT_NAME} -> ${PEER_DIRECT_TARGET}"
 }
 
 _peer_cmd_attach() {
@@ -2536,7 +2536,8 @@ _peer_cmd_attach() {
         echo -e "${RED}Usage: cctrl peer attach <peer>${RESET}" >&2
         return 64
     fi
-    _peer_direct_resolve "$identity" || { _peer_direct_print_error attach; return $?; }
+    local rc=0; _peer_direct_resolve "$identity" || rc=$?
+    if (( rc != 0 )); then _peer_direct_print_error attach; return $rc; fi
     _session_attach "$PEER_DIRECT_TARGET"
 }
 
@@ -2557,7 +2558,7 @@ _peer_cmd_say() {
     shift
     _arg_has_json "$@" && json=true
 
-    _peer_direct_resolve "$identity"; local rc=$?
+    local rc=0; _peer_direct_resolve "$identity" || rc=$?
     if (( rc != 0 )); then
         if $json; then
             _session_say_json false "$PEER_DIRECT_TARGET" false "$PEER_DIRECT_STATUS" "$PEER_DIRECT_REASON"
