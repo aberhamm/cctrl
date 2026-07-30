@@ -1,7 +1,8 @@
 ---
 id: 027
 title: Add an atomic peer reply that sends and delivers
-status: pending
+status: done
+completed: 2026-07-22
 blocked-by: [023]
 priority: 27
 goal: cctrl-peer-messaging-discoverable-models

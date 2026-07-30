@@ -2618,6 +2618,247 @@ test_peer_mcp_bridge_stdio() {
     printf '%s\n' "$out" | jq -e '.queued == 1 and .delivered_unacked == 1' >/dev/null || fail "expected alias-addressed MCP message to be visible to canonical peer"
 }
 
+test_peer_send_deliver_outcomes() {
+    # plan 027: `peer send --deliver` classifies into five named outcomes with the
+    # exact exit codes the plan specifies.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/send-deliver-outcomes-data"
+    local log="$TMPDIR/send-deliver-outcomes.log"; : > "$log"
+    setup_delivery_peers "$data"   # comet(session TMUX--comet), orchestrator(none), offline(none)
+    local out rc
+
+    # (1) live tmux peer -> sent-and-nudged, exit 0.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "live one")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected live nudge to exit 0, got $rc"
+    printf '%s\n' "$out" | jq -e '.ok == true and .outcome == "sent-and-nudged" and .delivered == true and .to == "comet" and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-and-nudged outcome"
+
+    # (2) mailbox-only peer -> sent-and-queued, exit 0.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --deliver --json -- "queue one")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected mailbox-only send-deliver to exit 0, got $rc"
+    printf '%s\n' "$out" | jq -e '.ok == true and .outcome == "sent-and-queued" and .delivered == false and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-and-queued outcome"
+
+    # (3) busy/modal pane -> sent-but-deferred, exit non-zero, retry hint (deliver only).
+    local codex_modal
+    codex_modal="$(printf '%s\n' '● working' '│ Allow Codex to run `npm test`? │' '│ No, and tell Codex what to do differently │')"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$codex_modal" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "busy one")" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected sent-but-deferred to exit non-zero"
+    printf '%s\n' "$out" | jq -e '.ok == false and .outcome == "sent-but-deferred" and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-but-deferred outcome"
+    printf '%s\n' "$out" | jq -e '.hint | contains("cctrl peer deliver comet")' >/dev/null || fail "expected deferred hint to retry delivery only"
+
+    # (4) paste failure -> sent-but-undelivered, message still queued, exit non-zero.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_PASTE_FAIL=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "paste fail one")" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected sent-but-undelivered to exit non-zero"
+    printf '%s\n' "$out" | jq -e '.ok == false and .outcome == "sent-but-undelivered" and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-but-undelivered outcome"
+    printf '%s\n' "$out" | jq -e '.hint | contains("cctrl peer deliver comet")' >/dev/null || fail "expected undelivered hint to retry delivery only"
+    local pf_id; pf_id="$(printf '%s\n' "$out" | jq -r '.message_id')"
+    jq -s -e --arg id "$pf_id" 'any(.[]; .id == $id and .status == "queued")' "$data/messages.jsonl" >/dev/null || fail "expected paste-failed reply to stay queued"
+
+    # (5) send failure -> send-failed, nothing queued, exit non-zero.
+    local before after
+    before="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send ghostnobody --from orchestrator --deliver --json -- "nope")" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected send-failed to exit non-zero"
+    printf '%s\n' "$out" | jq -e '.ok == false and .outcome == "send-failed"' >/dev/null || fail "expected send-failed outcome"
+    after="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    [[ "$before" == "$after" ]] || fail "expected send-failed to queue nothing (was $before, now $after)"
+
+    echo "ok: peer send --deliver classifies all five outcomes with correct exit codes"
+}
+
+test_peer_reply_core() {
+    # plan 027: reply-by-message-id (happy, legacy, unauthorized, user, dead sender,
+    # delivery failure keeps queued) plus plain `peer send` byte-identical guard.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/reply-core-data"
+    local log="$TMPDIR/reply-core.log"; : > "$log"
+    setup_delivery_peers "$data"   # comet(session TMUX--comet), orchestrator(none), offline(none)
+    local out rc id
+
+    # (a) happy path: orchestrator replies to comet's message; comet is live -> nudged + acked.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "please review" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$id"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id" --as orchestrator --json -- "on it")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected happy reply to exit 0, got $rc"
+    printf '%s\n' "$out" | jq -e '.ok == true and .outcome == "sent-and-nudged" and .to == "comet" and .from == "orchestrator" and .body == "on it"' >/dev/null || fail "expected happy reply nudged to comet"
+    printf '%s\n' "$out" | jq -e '.ack.state == "acked"' >/dev/null || fail "expected reply to ack the original by default"
+    printf '%s\n' "$out" | jq -e '.note | contains("session is gone")' >/dev/null || fail "expected reply to note the session-derived-address limitation"
+    [[ "$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json | jq -r '.status')" == "acked" ]] || fail "expected original acked after reply"
+    jq -s -e 'any(.[]; .from == "orchestrator" and .to == "comet" and .body == "on it")' "$data/messages.jsonl" >/dev/null || fail "expected a new reply message queued"
+
+    # (b) legacy message with no sender: recipient falls back to bare `from`.
+    printf '%s\n' '{"id":"msg_legacy_reply","from":"comet","to":"orchestrator","status":"delivered","subject":"legacy","body":"old","created_at":"2026-06-13T00:00:00Z","updated_at":"2026-06-13T00:00:00Z","delivered_at":"2026-06-13T00:00:00Z","acked_at":null,"nudge_count":0,"last_nudge_at":null,"last_nudge_error":null,"history":[]}' >> "$data/messages.jsonl"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply msg_legacy_reply --as orchestrator --json -- "legacy reply")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected legacy reply to succeed, got $rc"
+    printf '%s\n' "$out" | jq -e '.to == "comet" and .outcome == "sent-and-nudged"' >/dev/null || fail "expected legacy reply to derive recipient from bare from"
+
+    # (c) unauthorized: reply from a peer the message is not addressed to.
+    local id2
+    id2="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "second" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$id2"
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id2" --as comet -- "nope" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected unauthorized reply to fail"
+    assert_contains "$out" "not addressed to 'comet'"
+
+    # (d) user-sender refusal.
+    printf '%s\n' '{"id":"msg_from_user","from":"user","to":"orchestrator","status":"delivered","subject":"hi","body":"human note","sender":{"name":"user","label":"user"},"created_at":"2026-06-13T00:00:00Z","updated_at":"2026-06-13T00:00:00Z","delivered_at":"2026-06-13T00:00:00Z","acked_at":null,"nudge_count":0,"last_nudge_at":null,"last_nudge_error":null,"history":[]}' >> "$data/messages.jsonl"
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply msg_from_user --as orchestrator -- "reply" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected user-sender reply to fail"
+    assert_contains "$out" "not an addressable peer"
+
+    # (e) dead-sender refusal: sender no longer resolves.
+    printf '%s\n' '{"id":"msg_from_ghost","from":"ghost","to":"orchestrator","status":"delivered","subject":"hi","body":"gone","sender":{"name":"ghost","label":"ghost"},"created_at":"2026-06-13T00:00:00Z","updated_at":"2026-06-13T00:00:00Z","delivered_at":"2026-06-13T00:00:00Z","acked_at":null,"nudge_count":0,"last_nudge_at":null,"last_nudge_error":null,"history":[]}' >> "$data/messages.jsonl"
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply msg_from_ghost --as orchestrator -- "reply" 2>&1)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected dead-sender reply to exit 66, got $rc"
+    assert_contains "$out" "no longer resolves"
+
+    # (f) delivery failure keeps the reply queued and exits non-zero; original still acked.
+    local id3
+    id3="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "third" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$id3"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_PASTE_FAIL=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id3" --as orchestrator --json -- "will fail delivery")" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected delivery-failure reply to exit non-zero"
+    printf '%s\n' "$out" | jq -e '.outcome == "sent-but-undelivered" and .ack.state == "acked"' >/dev/null || fail "expected undelivered reply to still ack the original"
+    local rid; rid="$(printf '%s\n' "$out" | jq -r '.message_id')"
+    jq -s -e --arg id "$rid" 'any(.[]; .id == $id and .status == "queued")' "$data/messages.jsonl" >/dev/null || fail "expected failed-delivery reply to stay queued"
+
+    # (g) plain `peer send` (no --deliver) stays byte-identical: no outcome/delivered keys.
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "plain")"
+    printf '%s\n' "$out" | jq -e '.status == "queued" and (has("outcome") | not) and (has("delivered") | not)' >/dev/null || fail "expected plain send output unchanged (no --deliver fields)"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator -- "plain human")"
+    assert_contains "$out" "Queued message:"
+
+    echo "ok: peer reply happy/legacy/auth/user/dead/delivery-failure + plain send byte-identical"
+}
+
+test_peer_reply_ack_and_refusals() {
+    # plan 027: ack default / --no-ack / ack-failure isolation, plus queued-original
+    # and --allow-unknown+--deliver refusals.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/reply-ack-data"
+    local log="$TMPDIR/reply-ack.log"; : > "$log"
+    setup_delivery_peers "$data"
+    local out rc id
+
+    # --no-ack leaves the original delivered.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "a" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$id"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id" --as orchestrator --no-ack --json -- "no ack reply")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected --no-ack reply to exit 0"
+    printf '%s\n' "$out" | jq -e '.ack.state == "skipped"' >/dev/null || fail "expected --no-ack to skip ack"
+    [[ "$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json | jq -r '.status')" == "delivered" ]] || fail "expected --no-ack to leave original delivered"
+
+    # ack failure is reported but does not fail the reply or change its exit status.
+    # A non-queued, non-ackable original (status "blocked") passes reply auth but
+    # cannot be acked; the reply still succeeds (nudged, exit 0).
+    printf '%s\n' '{"id":"msg_blocked","from":"comet","to":"orchestrator","status":"blocked","subject":"b","body":"blocked one","sender":{"name":"comet","label":"comet"},"created_at":"2026-06-13T00:00:00Z","updated_at":"2026-06-13T00:00:00Z","delivered_at":null,"acked_at":null,"nudge_count":0,"last_nudge_at":null,"last_nudge_error":null,"history":[]}' >> "$data/messages.jsonl"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply msg_blocked --as orchestrator --json -- "reply anyway")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected ack-failure reply to still exit 0, got $rc"
+    printf '%s\n' "$out" | jq -e '.outcome == "sent-and-nudged" and .ack.state == "failed" and (.ack.error | length > 0)' >/dev/null || fail "expected ack failure reported without failing the reply"
+
+    # queued-original refusal: cannot reply to mail not yet received.
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "still queued" | jq -r '.id')"
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id" --as orchestrator -- "reply" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected reply to queued original to fail"
+    assert_contains "$out" "receive it first (cctrl peer recv"
+
+    # --allow-unknown + --deliver is rejected.
+    rc=0
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --allow-unknown --deliver --json -- "x" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "expected --allow-unknown + --deliver to be rejected"
+    printf '%s\n' "$out" | jq -e '.error.message | contains("cannot be combined with --deliver")' >/dev/null || fail "expected explicit allow-unknown+deliver rejection"
+
+    echo "ok: reply ack default/--no-ack/ack-failure isolation + queued & allow-unknown refusals"
+}
+
+test_peer_reply_single_enumeration() {
+    # plan 027 (7d): one reply performs exactly ONE session enumeration
+    # (tmux list-sessions), not one per read/send/deliver/ack step. Count
+    # list-sessions specifically — has-session/capture/paste are legitimate.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/reply-enum-data"
+    local log="$TMPDIR/reply-enum.log"
+    setup_delivery_peers "$data"
+    local id
+    id="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "enumerate" | jq -r '.id')"
+    mark_message_delivered "$data/messages.jsonl" "$id"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id" --as orchestrator --json -- "reply" >/dev/null
+    local count
+    count="$(grep -c 'TMUX list-sessions' "$log" || true)"
+    [[ "$count" -eq 1 ]] || fail "expected exactly 1 session enumeration for one reply, got $count"
+
+    echo "ok: one reply enumerates sessions exactly once (cached resolver)"
+}
+
+test_peer_mcp_send_deliver_outcomes() {
+    # plan 027 (7e): the MCP send_message surface exposes the SAME five states as
+    # the CLI, and its tool description no longer says "Queue a message". Only
+    # send-failed maps to ok:false; every durably-queued state is ok:true with an
+    # `outcome` and the message id.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/mcp-deliver-data"
+    setup_delivery_peers "$data"   # comet(session TMUX--comet), orchestrator(none), offline(none)
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register deadsess --dir "$TMPDIR/comet" --agent codex --session TMUX--gone >/dev/null
+
+    local list_out send_req out
+    # description no longer claims to only "Queue a message"; mentions delivery.
+    list_out="$(printf '%s\n' \
+        '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+        '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' \
+        '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+        | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$list_out" | jq -s -e '
+      (.[] | select(.id == 2) | .result.tools[] | select(.name == "send_message") | .description) as $d
+      | ($d | contains("Queue a message") | not) and ($d | test("deliver"))
+    ' >/dev/null || fail "expected send_message description updated to mention delivery"
+
+    mcp_send() {
+        # $1=recipient ; emits the tools/call request line
+        local to="$1"
+        send_req="$(jq -cn --arg to "$to" --arg body "hi $to" '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:$to,body:$body}}}')"
+        printf '%s\n' "$send_req"
+    }
+
+    # sent-and-nudged (live comet).
+    out="$(mcp_send comet | PATH="$TMPDIR:$PATH" TMUX_LOG="$TMPDIR/mcp-deliver.log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError != true and .result.structuredContent.ok == true and .result.structuredContent.data.outcome == "sent-and-nudged" and (.result.structuredContent.data.id | startswith("msg_"))' >/dev/null || fail "expected MCP sent-and-nudged"
+
+    # sent-and-queued (mailbox-only offline).
+    out="$(mcp_send offline | PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError != true and .result.structuredContent.ok == true and .result.structuredContent.data.outcome == "sent-and-queued"' >/dev/null || fail "expected MCP sent-and-queued"
+
+    # sent-but-deferred (busy comet pane).
+    local codex_modal
+    codex_modal="$(printf '%s\n' '│ Allow Codex to run x? │' '│ No, and tell Codex what to do differently │')"
+    out="$(mcp_send comet | PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$codex_modal" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError != true and .result.structuredContent.ok == true and .result.structuredContent.data.outcome == "sent-but-deferred" and (.result.structuredContent.data.id | startswith("msg_"))' >/dev/null || fail "expected MCP sent-but-deferred as ok:true"
+
+    # sent-but-undelivered (tmux-capable peer, session gone).
+    out="$(mcp_send deadsess | PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError != true and .result.structuredContent.ok == true and .result.structuredContent.data.outcome == "sent-but-undelivered" and (.result.structuredContent.data.id | startswith("msg_"))' >/dev/null || fail "expected MCP sent-but-undelivered as ok:true"
+
+    # send-failed (unknown recipient) -> ok:false / isError.
+    out="$(mcp_send ghostnobody | PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.ok == false' >/dev/null || fail "expected MCP send-failed as ok:false"
+
+    echo "ok: MCP send_message exposes all five outcomes; only send-failed is ok:false"
+}
+
 test_peer_deliver_tmux_nudge_lifecycle() {
     make_fake_tmux "$TMPDIR/tmux"
     local data="$TMPDIR/deliver-nudge-data"
@@ -3826,6 +4067,11 @@ test_peer_deliver_failures_all_and_concurrency
 test_peer_orchestrator_status_nudge_watch
 test_peer_gc_retention_and_doctor
 test_peer_doorbell_hook
+test_peer_send_deliver_outcomes
+test_peer_reply_core
+test_peer_reply_ack_and_refusals
+test_peer_reply_single_enumeration
+test_peer_mcp_send_deliver_outcomes
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json

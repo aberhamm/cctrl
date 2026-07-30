@@ -35,7 +35,15 @@ TOOLS = [
     },
     {
         "name": "send_message",
-        "description": "Queue a message from this server's identity to another peer.",
+        "description": (
+            "Send a message from this server's identity to another peer and attempt "
+            "delivery. Returns ok:true with an `outcome` field naming one of five "
+            "states (sent-and-nudged, sent-and-queued, sent-but-deferred, "
+            "sent-but-undelivered) whenever the message was durably queued; only "
+            "send-failed (nothing queued) is ok:false. On sent-but-* the message id "
+            "is returned so delivery can be retried alone — never resend, or the "
+            "message duplicates."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -117,6 +125,40 @@ class Bridge:
             raise McpError("invalid-response", "cctrl returned non-JSON output")
         return parsed
 
+    def cli_send_and_deliver(self, args: list[str], stdin: str | None = None) -> Any:
+        # Delivery-aware variant of cli(). `peer send --deliver` exits non-zero on
+        # sent-but-undelivered / sent-but-deferred, but those states DID durably
+        # queue the message — turning them into an MCP error would report a
+        # perfectly good queued message as a send failure. Only send-failed
+        # (nothing queued) becomes ok:false; every other outcome is ok:true with
+        # the message id so the caller can retry delivery alone.
+        proc = subprocess.run(
+            [self.cctrl, *args],
+            input=stdin,
+            text=True,
+            capture_output=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+        stdout = proc.stdout.strip()
+        parsed = parse_json(stdout)
+        if isinstance(parsed, dict) and parsed.get("outcome"):
+            if parsed.get("outcome") != "send-failed":
+                return parsed
+            err = parsed.get("error") or {}
+            raise McpError(
+                str(err.get("code") or "send-failed"),
+                str(err.get("message") or proc.stderr.strip() or "peer send failed"),
+            )
+        if proc.returncode != 0:
+            if isinstance(parsed, dict) and parsed.get("ok") is False:
+                err = parsed.get("error") or {}
+                raise McpError(str(err.get("code") or "cctrl-error"), str(err.get("message") or proc.stderr.strip() or "cctrl command failed"))
+            raise McpError("cctrl-error", proc.stderr.strip() or stdout or f"cctrl exited {proc.returncode}")
+        if parsed is None:
+            raise McpError("invalid-response", "cctrl returned non-JSON output")
+        return parsed
+
     def call_tool(self, name: str, arguments: Any) -> dict[str, Any]:
         args = require_object(arguments)
         if name == "whoami":
@@ -134,10 +176,10 @@ class Bridge:
             to = require_string(args, "to")
             body = require_string(args, "body")
             subject = optional_string(args, "subject", "")
-            cmd = ["peer", "send", to, "--as", self.identity, "--body-file", "-", "--json"]
+            cmd = ["peer", "send", to, "--as", self.identity, "--deliver", "--body-file", "-", "--json"]
             if subject:
                 cmd[3:3] = ["--subject", subject]
-            return ok(self.cli(cmd, stdin=body))
+            return ok(self.cli_send_and_deliver(cmd, stdin=body))
         if name == "check_messages":
             ensure_no_extra(args, set())
             return ok(self.cli(["peer", "check", "--as", self.identity, "--json"]))

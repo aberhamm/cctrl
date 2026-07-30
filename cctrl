@@ -2037,7 +2037,7 @@ _peer_derived_json() {
         }'
 }
 
-_peer_all_json() {
+_peer_all_json_build() {
     _peer_init
     local manual_json derived_json
     manual_json="$(cat "$PEERS_FILE")"
@@ -2089,6 +2089,32 @@ _peer_all_json() {
                 ]
             )
           }'
+}
+
+# Memoized peer+session enumeration (plan 027). A single command that touches
+# the registry several times (`peer reply`, `peer send --deliver`) resolves the
+# full document ONCE via _peer_all_json_cache_begin and every downstream
+# _peer_resolve_json / _peer_all_json call reuses it, instead of one
+# _peer_all_json -> _session_list walk per step (~1.43s each). The cache is
+# process-local and only primed by commands that opt in; every other caller
+# (and plain `peer send`) rebuilds fresh, byte-for-byte as before.
+_peer_all_json() {
+    if [[ "${_PEER_ALL_JSON_CACHED:-0}" == "1" ]]; then
+        printf '%s\n' "$_PEER_ALL_JSON_CACHE"
+        return 0
+    fi
+    _peer_all_json_build
+}
+
+_peer_all_json_cache_begin() {
+    local doc
+    doc="$(_peer_all_json_build)" || return 1
+    _PEER_ALL_JSON_CACHE="$doc"
+    _PEER_ALL_JSON_CACHED=1
+}
+
+_peer_all_json_cache_end() {
+    unset _PEER_ALL_JSON_CACHE _PEER_ALL_JSON_CACHED
 }
 
 _peer_resolve_json() {
@@ -2643,10 +2669,10 @@ _mailbox_resolve_identity_for_mode() {
 
 _peer_cmd_send() {
     local to="${1:-}"
-    [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--json] -- <body>${RESET}" >&2; return 64; }
+    [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>${RESET}" >&2; return 64; }
     shift
 
-    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false
+    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2664,6 +2690,8 @@ _peer_cmd_send() {
                 body_file="$2"; shift 2 ;;
             --allow-unknown)
                 allow_unknown=true; shift ;;
+            --deliver)
+                deliver=true; shift ;;
             --json)
                 json=true; shift ;;
             --)
@@ -2697,6 +2725,27 @@ _peer_cmd_send() {
     if ! $saw_body; then
         $json && _json_error "validation" "peer send needs --body-file or a body after --." || echo -e "${RED}peer send needs --body-file or a body after --.${RESET}" >&2
         return 64
+    fi
+
+    # `--deliver` (plan 027): send, then attempt delivery, then classify the
+    # outcome — routed through the same shared helper as `peer reply` so the
+    # send/deliver failure semantics live in exactly one place. The plain path
+    # below is left byte-for-byte untouched.
+    if $deliver; then
+        if $allow_unknown; then
+            $json && _json_error "validation" "--allow-unknown cannot be combined with --deliver: an unresolvable recipient cannot be delivered to." || echo -e "${RED}--allow-unknown cannot be combined with --deliver: an unresolvable recipient cannot be delivered to.${RESET}" >&2
+            return 64
+        fi
+        local -a send_flags=()
+        [[ -n "$from" ]] && send_flags+=(--from "$from")
+        [[ -n "$as_identity" ]] && send_flags+=(--as "$as_identity")
+        [[ -n "$subject" ]] && send_flags+=(--subject "$subject")
+        _peer_all_json_cache_begin >/dev/null 2>&1 || true
+        _peer_send_and_deliver "$to" "$body" ${send_flags[@]+"${send_flags[@]}"} || true
+        local _sd_rc=$PEER_SD_RC
+        _peer_send_deliver_emit "$json" "${PEER_SD_TO:-$to}" send
+        _peer_all_json_cache_end
+        return "$_sd_rc"
     fi
 
     if [[ -z "$from" ]]; then
@@ -3206,35 +3255,67 @@ _tmux_run_stdin_with_timeout() {
     return $rc
 }
 
-_peer_tmux_target_for_delivery() {
-    local peer_json="$1" peer target
-    peer="$(jq -r '.name' <<< "$peer_json")"
+# Pure reachability classifier (plan 027). Maps a peer JSON object to one of
+# three reachability classes, printed on stdout:
+#   live         — has tmux capability, a target, and a live tmux session
+#   mailbox-only — no tmux capability; collects its own mail (polling / MCP)
+#   unreachable  — has tmux capability but no target / no tmux / dead session
+# "Pure" means it writes NONE of the PEER_DELIVER_* globals: plan 024 consumes
+# this for its envelope and must not inherit delivery-side effects. It may run
+# tmux `has-session` to distinguish a live pane from a dead one.
+_peer_reachability_class() {
+    local peer_json="$1" target
     if ! _peer_has_capability "$peer_json" "tmux"; then
-        PEER_DELIVER_STATUS="skipped"
-        PEER_DELIVER_REASON="no-tmux-capability"
-        return 1
+        printf 'mailbox-only\n'
+        return 0
     fi
     target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
     if [[ -z "$target" ]]; then
-        PEER_DELIVER_STATUS="failed"
-        PEER_DELIVER_REASON="missing tmux session for $peer"
-        return 1
+        printf 'unreachable\n'
+        return 0
     fi
     if ! command -v tmux >/dev/null 2>&1; then
-        PEER_DELIVER_STATUS="failed"
-        PEER_DELIVER_REASON="tmux unavailable"
-        return 1
+        printf 'unreachable\n'
+        return 0
     fi
     if ! _tmux_run_with_timeout has-session -t "$target"; then
-        PEER_DELIVER_STATUS="failed"
-        PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux session not found: $target}"
-        [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux session not found: $target"
-        return 1
+        printf 'unreachable\n'
+        return 0
     fi
-    PEER_DELIVER_STATUS="ok"
-    PEER_DELIVER_REASON=""
-    PEER_DELIVER_TARGET="$target"
-    return 0
+    printf 'live\n'
+}
+
+_peer_tmux_target_for_delivery() {
+    local peer_json="$1" peer target class
+    peer="$(jq -r '.name' <<< "$peer_json")"
+    class="$(_peer_reachability_class "$peer_json")"
+    case "$class" in
+        mailbox-only)
+            PEER_DELIVER_STATUS="skipped"
+            PEER_DELIVER_REASON="no-tmux-capability"
+            return 1
+            ;;
+        unreachable)
+            target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+            PEER_DELIVER_STATUS="failed"
+            if [[ -z "$target" ]]; then
+                PEER_DELIVER_REASON="missing tmux session for $peer"
+            elif ! command -v tmux >/dev/null 2>&1; then
+                PEER_DELIVER_REASON="tmux unavailable"
+            else
+                PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux session not found: $target}"
+                [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux session not found: $target"
+            fi
+            return 1
+            ;;
+        live)
+            target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+            PEER_DELIVER_STATUS="ok"
+            PEER_DELIVER_REASON=""
+            PEER_DELIVER_TARGET="$target"
+            return 0
+            ;;
+    esac
 }
 
 _peer_pane_ready_for_delivery() {
@@ -3699,6 +3780,313 @@ _peer_cmd_deliver() {
         done
     fi
     return $rc
+}
+
+# Shared send-then-deliver core for `peer reply` and `peer send --deliver`
+# (plan 027). Sends via the UNCHANGED `peer send`, then nudges the recipient and
+# classifies the result into one of five named outcomes:
+#
+#   send-failed          nothing queued                        exit != 0
+#   sent-but-undelivered queued, paste failed, retryable       exit != 0
+#   sent-but-deferred    queued, pane busy/modal, not pasted   exit != 0
+#   sent-and-nudged      queued, nudge pasted into a live pane exit 0
+#   sent-and-queued      queued, peer is mailbox-only          exit 0
+#
+# On any non-zero outcome except send-failed the message is durably queued: the
+# send is NEVER rolled back, and the caller must retry DELIVERY ONLY (never the
+# reply/send, which would duplicate the message). Results are returned via
+# PEER_SD_* globals so the caller renders them; this function prints nothing.
+#   $1 = recipient (name or alias)
+#   $2 = body
+#   remaining args = extra `peer send` flags (--from NAME / --as NAME / --subject)
+_peer_send_and_deliver() {
+    local to="$1" body="$2"; shift 2
+    local -a send_flags=("$@")
+    local send_out="" send_rc=0 deliver_out="" status canon_to id to_peer_json class
+
+    PEER_SD_OUTCOME=""
+    PEER_SD_MESSAGE_ID=""
+    PEER_SD_RC=0
+    PEER_SD_TO="$to"
+    PEER_SD_SEND_JSON=""
+    PEER_SD_DELIVER_JSON=""
+    PEER_SD_DELIVER_REASON=""
+
+    # Step 1: send. The inner `peer send` is plain (no --deliver), so this reuses
+    # all of send's resolution/validation/sender-snapshot with zero duplication.
+    # Body flows via --body-file - so an arbitrary body (leading dashes, newlines)
+    # can never be mis-parsed as a flag.
+    send_out="$(printf '%s' "$body" | _peer_cmd_send "$to" ${send_flags[@]+"${send_flags[@]}"} --body-file - --json)" || send_rc=$?
+    PEER_SD_SEND_JSON="$send_out"
+    if [[ $send_rc -ne 0 ]]; then
+        PEER_SD_OUTCOME="send-failed"
+        PEER_SD_RC=$send_rc
+        return "$send_rc"
+    fi
+
+    id="$(jq -r '.id // ""' <<< "$send_out")"
+    canon_to="$(jq -r '.to // ""' <<< "$send_out")"
+    [[ -n "$canon_to" ]] && PEER_SD_TO="$canon_to"
+    PEER_SD_MESSAGE_ID="$id"
+
+    # Step 2: deliver (nudge) the recipient peer.
+    deliver_out="$(_peer_cmd_deliver "$PEER_SD_TO" --json)" || true
+    PEER_SD_DELIVER_JSON="$deliver_out"
+    status="$(jq -r '.results[0].status // "unknown"' <<< "$deliver_out")"
+    PEER_SD_DELIVER_REASON="$(jq -r '.results[0].reason // ""' <<< "$deliver_out")"
+
+    # Step 3: classify. `nudged` is the only state that pasted into a live pane;
+    # `deferred` is a busy pane (nothing pasted, nothing retries). Anything else
+    # is disambiguated by the PURE reachability classifier: a mailbox-only peer's
+    # skip is a normal success (sent-and-queued), not a delivery failure.
+    case "$status" in
+        nudged)
+            PEER_SD_OUTCOME="sent-and-nudged"
+            PEER_SD_RC=0
+            ;;
+        deferred)
+            PEER_SD_OUTCOME="sent-but-deferred"
+            PEER_SD_RC=1
+            ;;
+        *)
+            to_peer_json="$(_peer_resolve_json "$PEER_SD_TO" 2>/dev/null || printf '{}')"
+            class="$(_peer_reachability_class "$to_peer_json")"
+            if [[ "$class" == "mailbox-only" ]]; then
+                PEER_SD_OUTCOME="sent-and-queued"
+                PEER_SD_RC=0
+            elif [[ "$status" == "skipped" ]]; then
+                # Live pane already nudged this instant — treat as nudged.
+                PEER_SD_OUTCOME="sent-and-nudged"
+                PEER_SD_RC=0
+            else
+                PEER_SD_OUTCOME="sent-but-undelivered"
+                PEER_SD_RC=1
+            fi
+            ;;
+    esac
+    return "$PEER_SD_RC"
+}
+
+# Render a PEER_SD_* outcome for `peer reply` / `peer send --deliver`.
+#   $1 = json (bool)   $2 = recipient   $3 = context ("reply" | "send")
+# For context=reply the caller sets PEER_SD_ACK_STATE (acked|skipped|failed) and
+# PEER_SD_ACK_ERROR. JSON always goes to stdout (so MCP/CLI callers can parse it
+# even on a non-zero exit); human errors go to stderr.
+_peer_send_deliver_emit() {
+    local json="$1" to="$2" ctx="${3:-send}"
+
+    if [[ "$PEER_SD_OUTCOME" == "send-failed" ]]; then
+        if [[ "$json" == "true" ]]; then
+            local err_json="$PEER_SD_SEND_JSON"
+            printf '%s\n' "$err_json" | jq -e . >/dev/null 2>&1 || err_json='{"ok":false,"error":{"code":"send-failed","message":"peer send failed"}}'
+            jq -n --argjson base "$err_json" '$base + {outcome:"send-failed"}'
+        else
+            local m
+            m="$(printf '%s\n' "$PEER_SD_SEND_JSON" | jq -r '.error.message // empty' 2>/dev/null)"
+            [[ -n "$m" ]] || m="peer send failed"
+            echo -e "${RED}Send failed:${RESET} $m" >&2
+        fi
+        return 0
+    fi
+
+    local ok=false delivered=false hint=""
+    [[ "$PEER_SD_RC" -eq 0 ]] && ok=true
+    [[ "$PEER_SD_OUTCOME" == "sent-and-nudged" ]] && delivered=true
+    case "$PEER_SD_OUTCOME" in
+        sent-but-undelivered)
+            hint="Message $PEER_SD_MESSAGE_ID is queued but delivery failed (${PEER_SD_DELIVER_REASON:-unknown}). Retry DELIVERY ONLY: cctrl peer deliver $to (re-running this command would duplicate the message)." ;;
+        sent-but-deferred)
+            hint="Message $PEER_SD_MESSAGE_ID is queued; $to's pane is busy so nothing was pasted. Retry DELIVERY ONLY once it clears: cctrl peer deliver $to (re-running this command would duplicate the message)." ;;
+    esac
+
+    if [[ "$json" == "true" ]]; then
+        jq -n \
+          --argjson base "$PEER_SD_SEND_JSON" \
+          --argjson ok "$ok" \
+          --arg outcome "$PEER_SD_OUTCOME" \
+          --argjson delivered "$delivered" \
+          --arg to "$to" \
+          --arg reason "$PEER_SD_DELIVER_REASON" \
+          --arg hint "$hint" \
+          --arg ctx "$ctx" \
+          --arg ackstate "${PEER_SD_ACK_STATE:-}" \
+          --arg ackerror "${PEER_SD_ACK_ERROR:-}" \
+          '$base
+           + {ok:$ok, outcome:$outcome, delivered:$delivered, to:$to, message_id:($base.id // null)}
+           + (if $reason != "" then {delivery_reason:$reason} else {} end)
+           + (if $hint != "" then {hint:$hint} else {} end)
+           + (if $ctx == "reply" and $ackstate != "" then
+               {ack: ({state:$ackstate} + (if $ackerror != "" then {error:$ackerror} else {} end))}
+             else {} end)
+           + (if $ctx == "reply" then
+               {note:"reply-by-message-id still fails once the sender'"'"'s session is gone; addresses are tmux-session-derived until plans 028/029."}
+             else {} end)'
+    else
+        case "$PEER_SD_OUTCOME" in
+            sent-and-nudged)   echo -e "${GREEN}Sent and nudged $to${RESET} (message $PEER_SD_MESSAGE_ID)" ;;
+            sent-and-queued)   echo -e "${GREEN}Sent and queued for $to${RESET} (message $PEER_SD_MESSAGE_ID; $to collects its own mail)" ;;
+            sent-but-deferred) echo -e "${YELLOW}Sent but deferred${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
+            sent-but-undelivered) echo -e "${YELLOW}Sent but not delivered${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
+        esac
+        if [[ "$ctx" == "reply" ]]; then
+            case "${PEER_SD_ACK_STATE:-}" in
+                failed) echo -e "${YELLOW}Note:${RESET} could not ack the original message: ${PEER_SD_ACK_ERROR:-unknown} (the reply was still sent)." >&2 ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
+# `peer reply <message-id>` (plan 027): send a reply addressed to the referenced
+# message's sender (by id, not address) and deliver it in one command. The
+# recipient is inferred from the message's `sender.name` snapshot (plan 023),
+# falling back to its bare `from` for messages that predate the snapshot.
+_peer_cmd_reply() {
+    local id="${1:-}"
+    if [[ -z "$id" || "$id" == -* ]]; then
+        echo -e "${RED}Usage: cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--json] -- <body>${RESET}" >&2
+        return 64
+    fi
+    shift
+
+    local as_identity="" subject="" body="" body_file="" json=false no_ack=false saw_body=false
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--as needs a peer name" || echo -e "${RED}--as needs a peer name${RESET}" >&2; return 64; }
+                as_identity="$2"; shift 2 ;;
+            --subject)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--subject needs a value" || echo -e "${RED}--subject needs a value${RESET}" >&2; return 64; }
+                subject="$2"; shift 2 ;;
+            --body-file)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--body-file needs a value" || echo -e "${RED}--body-file needs a value${RESET}" >&2; return 64; }
+                body_file="$2"; shift 2 ;;
+            --no-ack)
+                no_ack=true; shift ;;
+            --json)
+                json=true; shift ;;
+            --)
+                shift
+                body="$*"
+                saw_body=true
+                break ;;
+            *)
+                $json && _json_error "validation" "Unknown peer reply flag: $1" || echo -e "${RED}Unknown peer reply flag: $1${RESET}" >&2
+                return 64 ;;
+        esac
+    done
+
+    if [[ -n "$body_file" ]]; then
+        if $saw_body; then
+            $json && _json_error "validation" "Use either --body-file or -- <body>, not both." || echo -e "${RED}Use either --body-file or -- <body>, not both.${RESET}" >&2
+            return 64
+        fi
+        if [[ "$body_file" == "-" ]]; then
+            _read_body_file -
+            body="$MAILBOX_BODY"
+        elif [[ -f "$body_file" ]]; then
+            _read_body_file "$body_file"
+            body="$MAILBOX_BODY"
+        else
+            $json && _json_error "validation" "Body file not found: $body_file" || echo -e "${RED}Body file not found: $body_file${RESET}" >&2
+            return 64
+        fi
+        unset MAILBOX_BODY
+        saw_body=true
+    fi
+    if ! $saw_body; then
+        $json && _json_error "validation" "peer reply needs --body-file or a body after --." || echo -e "${RED}peer reply needs --body-file or a body after --.${RESET}" >&2
+        return 64
+    fi
+
+    # One peer+session enumeration for read + send + deliver + ack.
+    _peer_all_json_cache_begin >/dev/null 2>&1 || true
+
+    local rc=0
+    _mailbox_resolve_identity_for_mode "$as_identity" "$json" || { rc=$?; _peer_all_json_cache_end; return "$rc"; }
+    local identity="$MAILBOX_RESOLVED_IDENTITY"
+
+    _mailbox_read_json_or_error "$json" || { rc=$?; _peer_all_json_cache_end; return "$rc"; }
+    local messages="$MAILBOX_MESSAGES" ref
+    ref="$(jq -c --arg id "$id" '[.[] | select(.id == $id)][0] // empty' <<< "$messages")"
+    if [[ -z "$ref" ]]; then
+        $json && _json_error "validation" "Unknown message: $id" || echo -e "${RED}Unknown message: '$id'${RESET}" >&2
+        _peer_all_json_cache_end
+        return 64
+    fi
+
+    local msg_to msg_status recipient
+    msg_to="$(jq -r '.to // ""' <<< "$ref")"
+    if [[ "$msg_to" != "$identity" ]]; then
+        $json && _json_error "validation" "Message '$id' is not addressed to '$identity'." || echo -e "${RED}Message '$id' is not addressed to '$identity'.${RESET}" >&2
+        _peer_all_json_cache_end
+        return 64
+    fi
+
+    msg_status="$(jq -r '.status // ""' <<< "$ref")"
+    if [[ "$msg_status" == "queued" ]]; then
+        $json && _json_error "validation" "Message '$id' is still queued; receive it first (cctrl peer recv --as $identity)." || echo -e "${RED}Message '$id' is still queued; receive it first (cctrl peer recv --as $identity).${RESET}" >&2
+        _peer_all_json_cache_end
+        return 64
+    fi
+
+    recipient="$(jq -r '.sender.name // .from // ""' <<< "$ref")"
+    if [[ -z "$recipient" ]]; then
+        $json && _json_error "validation" "Message '$id' has no resolvable sender to reply to." || echo -e "${RED}Message '$id' has no resolvable sender to reply to.${RESET}" >&2
+        _peer_all_json_cache_end
+        return 64
+    fi
+    if [[ "$recipient" == "user" ]]; then
+        if $json; then
+            _json_error "validation" "Message '$id' was sent by 'user' (the human operator), which is not an addressable peer; reply out of band."
+        else
+            echo -e "${RED}Message '$id' was sent by 'user' (the human operator), which is not an addressable peer.${RESET}" >&2
+            echo -e "${DIM}'user' has no mailbox; reply out of band.${RESET}" >&2
+        fi
+        _peer_all_json_cache_end
+        return 64
+    fi
+    if ! _peer_resolve_json "$recipient" >/dev/null 2>&1; then
+        if $json; then
+            _json_error "unknown-peer" "Original sender '$recipient' no longer resolves; message '$id' cannot be replied to."
+        else
+            echo -e "${RED}Original sender '$recipient' no longer resolves; message '$id' cannot be replied to.${RESET}" >&2
+            echo -e "${DIM}Addresses are tmux-session-derived until plans 028/029; reply fails once the sender's session is gone.${RESET}" >&2
+        fi
+        _peer_all_json_cache_end
+        return 66
+    fi
+
+    local -a extra=(--from "$identity")
+    [[ -n "$subject" ]] && extra+=(--subject "$subject")
+    _peer_send_and_deliver "$recipient" "$body" ${extra[@]+"${extra[@]}"} || true
+    local sd_rc=$PEER_SD_RC
+
+    # Ack the original after a successful send. An ack failure is reported but
+    # never fails the reply (the reply already went out; re-running would
+    # duplicate it), so exit status stays driven by the send/deliver outcome.
+    PEER_SD_ACK_STATE=""
+    PEER_SD_ACK_ERROR=""
+    if [[ "$PEER_SD_OUTCOME" != "send-failed" ]]; then
+        if $no_ack; then
+            PEER_SD_ACK_STATE="skipped"
+        else
+            local ack_out ack_rc=0
+            ack_out="$(_peer_cmd_ack "$id" --as "$identity" --json 2>/dev/null)" || ack_rc=$?
+            if [[ $ack_rc -eq 0 ]]; then
+                PEER_SD_ACK_STATE="acked"
+            else
+                PEER_SD_ACK_STATE="failed"
+                PEER_SD_ACK_ERROR="$(printf '%s\n' "$ack_out" | jq -r '.error.message // empty' 2>/dev/null)"
+                [[ -n "$PEER_SD_ACK_ERROR" ]] || PEER_SD_ACK_ERROR="ack failed"
+            fi
+        fi
+    fi
+
+    _peer_send_deliver_emit "$json" "${PEER_SD_TO:-$recipient}" reply
+    _peer_all_json_cache_end
+    return "$sd_rc"
 }
 
 _duration_to_seconds() {
@@ -4549,6 +4937,7 @@ cmd_peer() {
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
         send) _peer_cmd_send "$@" ;;
+        reply) _peer_cmd_reply "$@" ;;
         inbox) _peer_cmd_inbox "$@" ;;
         outbox) _peer_cmd_outbox "$@" ;;
         show) _peer_cmd_show "$@" ;;
@@ -4570,7 +4959,8 @@ cmd_peer() {
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer whoami [--as NAME] [--json]"
-            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--json] -- <body>"
+            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>"
+            echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--json] -- <body>"
             echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"
             echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"
             echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]"
