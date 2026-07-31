@@ -1,16 +1,16 @@
 ---
 id: 038
 title: Enforce per-session policy at the tool boundary, not in the brief
-status: blocked
+status: pending
 blocked-by: []
 priority: 10
 goal: cctrl-fleet-safety
 allows-migrations: false
-needs-review: eng
+needs-review: none
 review-required: eng
 created: 2026-07-30
 reviews:
-  - type=eng verdict=approved date=2026-07-30 by=mstack-review
+  - type=eng verdict=approved date=2026-07-31 by=mstack-review
 ---
 
 ## Requirements
@@ -61,13 +61,18 @@ new scope):
       the pending `Bash`/`Write`/`Edit` call, and **blocks** a denied call before
       it runs, with a denial message that names the policy and states what to do
       instead.
-- [ ] Classification fails closed: all 15 deny-list commands from the 2026-07-28
-      incident classify into their denied category (`delete`/`push`), and an
-      unrecognised command inside a denied family is denied, not allowed.
+- [ ] Classification is an **explicit deny-list**: all 15 deny-list commands from
+      the 2026-07-28 incident classify into their denied category
+      (`delete`/`push`). A command that is not enumerated in an active denied
+      category **passes**. See "Deny-list, not deny-unknown" in Design for why
+      the inverse rule was rejected.
 - [ ] The near-misses are **not** blocked: `git status`, `docker ps -a`, `rm`
-      inside an `allow_paths_write` path, `npm ci`.
-- [ ] An empty or absent policy behaves byte-identically to today — opt-in, so it
-      cannot brick the existing fleet or a spawn that predates the feature.
+      inside an `allow_paths_write` path, `npm ci` — and neither is any ordinary
+      unenumerated command such as `git commit`, `git add`, or `git diff`.
+- [ ] An empty or absent policy behaves byte-identically to today **except that
+      the policy store stays protected** (see the self-protection criterion
+      below) — opt-in, so it cannot brick the existing fleet or a spawn that
+      predates the feature.
 - [ ] `cctrl policy install` is idempotent (running it twice leaves one hook
       entry, not two) and `cctrl start` does not hand-edit settings as a side
       effect.
@@ -75,9 +80,11 @@ new scope):
       policy can be validated before a spawn relies on it.
 - [ ] `AGENTS.md` and the `cctrl-spawn` skill document that a brief states intent,
       the policy enforces it, and the brief is no longer the guardrail.
-- [ ] **No launch shape gets a silent no-op policy.** There are two distinct
-      ways enforcement can be absent, and both must be handled — an operator
-      must never believe a guardrail exists where none does:
+- [ ] **A policy flag on a launch shape that cannot enforce it REFUSES the
+      spawn.** Not a warning, not an `unenforced` marker — a hard refusal with a
+      nonzero exit. If the operator typed `--deny delete`, the only safe response
+      to "I cannot enforce that here" is to not launch. A warning is exactly what
+      a detached workflow does not read. Three shapes cannot enforce:
       1. *Non-Claude runtime.* cctrl spawns codex as a first-class runtime and a
          Claude Code `PreToolUse` hook enforces nothing there.
       2. *Non-tmux (foreground) launch.* `_launch_exec_agent` exports
@@ -86,14 +93,24 @@ new scope):
          **Claude** session therefore reaches the hook with no resolvable
          session, takes the opt-in "no policy → allow" branch, and enforces
          nothing — even though the runtime is fully hook-capable.
-      In both cases `cctrl start` must either refuse the spawn or warn loudly
-      AND record the policy as `unenforced` in the session metadata (visible in
-      `cctrl session ls`), each with its own test.
-- [ ] **The policy cannot disable itself:** the hook implicitly denies `Write`/
-      `Edit`/`Bash` mutations of `$CCTRL_DATA_DIR/policy/` and of the settings
-      entry that registers the hook, independent of the per-session
-      `deny_paths_write` list. "I'll update my policy" is the same
-      self-authorization move that produced the incident; tested.
+      3. *Remote-host spawn.* `cctrl --host <alias> start ...` runs cctrl on
+         another machine over SSH (`_remote_exec`, `cctrl:7637`). The policy file
+         and the hook must both exist on **that** host, and nothing verifies they
+         do.
+      Each refusal gets its own test. `unenforced` remains a valid **metadata
+      state** for a session whose policy was cleared out-of-band, but it is no
+      longer an acceptable outcome of a policy-bearing `cctrl start`.
+- [ ] **The policy cannot disable itself, in every session, unconditionally:**
+      the hook denies `Write`/`Edit`/`Bash` mutations of
+      `$CCTRL_DATA_DIR/policy/` and of the settings entry that registers the
+      hook — independent of the per-session `deny_paths_write` list, and
+      **independent of whether the current session has any policy loaded at
+      all**. An unrestricted session must not be able to delete a restricted
+      session's policy file; otherwise the guardrail is removable by any
+      neighbour and `cctrl session ls` keeps displaying a policy that no longer
+      binds. "I'll update my policy" is the same self-authorization move that
+      produced the incident; tested in both the policy-bearing and the
+      empty-policy session.
 
 ### Why the hook, and not the alternatives
 
@@ -191,12 +208,78 @@ Two changes, both required:
 Unresolvable session id (no `CCTRL_SESSION_NAME` — e.g. a non-cctrl Claude
 session) → no policy → allow, consistent with opt-in.
 
-**"Command family" defined:** classification is a per-binary safe-subcommand
-list — known-safe subcommands of a listed binary pass (`docker ps -a`,
-`git status`), unknown subcommands of a listed binary are denied
-(`docker frobnicate`). Path-argument extraction for the path rules fails
-closed: unresolvable, relative-outside-cwd, or glob paths are treated as not
-inside any `allow_paths_write`.
+**Deny-list, not deny-unknown.** Classification enumerates the denied commands
+per category; anything not enumerated in an active denied category **passes**.
+
+The inverse rule (per-binary safe-subcommand list, deny unknown subcommands of a
+listed binary) was specified in an earlier draft and is **rejected**. Under
+`deny: ["push"]` it makes `git` a listed binary, so every git subcommand not on
+the safe list — `git commit`, `git add`, `git diff` — is denied. An agent doing
+ordinary work is blocked on its first commit, someone switches the feature off,
+and a guardrail that is switched off protects nothing. Enumerating an exhaustive
+safe-list per binary is a permanent maintenance treadmill where each new
+subcommand is a false-block bug, and a false-block in a detached session is
+invisible until a human reads the transcript.
+
+The cost is stated plainly: novel deletion syntax that nobody enumerated will
+pass. That is the same class of gap already conceded under Known limits — this
+is a guardrail, not a jail.
+
+**Path-argument extraction still fails closed** for the path rules:
+unresolvable, relative-outside-cwd, or glob paths are treated as not inside any
+`allow_paths_write`. Filesystem aliasing defeats the "inside an allowed path"
+model in ways string inspection cannot fully close — `rm -rf allowed/../forbidden`,
+a symlink or hard link inside an allowed dir, `~` and env-var expansion,
+`find allowed -exec rm /outside \;`, `tar --remove-files`. Resolve paths to their
+canonical real form before the containment test, and treat a path that cannot be
+canonicalized as outside. Residual aliasing risk is accepted and belongs in Known
+limits, not in a claim of completeness.
+
+**Policy file integrity.** The store is a security control, so its handling is
+specified rather than assumed:
+
+- Write atomically (temp file in the same directory, then `mv`), so a partially
+  written policy is never observable.
+- Refuse to read a policy file that is a symlink, or whose ownership or mode
+  allows non-owner writes.
+- A policy file that fails to parse is **fail-closed**: deny, do not fall through
+  to allow. A corrupt policy is not an absent policy.
+
+**`--policy-file PATH` semantics**, fixed here so the implementer does not
+choose: the file is **read and copied** into `policy/<CCTRL_SESSION_NAME>.json`
+at spawn time. The spawned session never references the source path, so mutating
+the source afterwards changes nothing. A relative `PATH` resolves against the
+invoking shell's cwd, before any target-directory change. When both flags are
+given, `--deny` is **merged into** the copied policy's `deny` list (union, not
+replace), so the flag can only ever tighten the file.
+
+**Write-capable tools.** The hook must name every write-capable tool the
+`PreToolUse` protocol can emit, not only `Bash`/`Write`/`Edit`. Enumerate the
+current set against the installed Claude Code version at implementation time
+(`MultiEdit` and `NotebookEdit` are the ones most likely to be missed) and fail
+closed on an unrecognised tool name that carries a path argument.
+
+**Denial audit trail.** `cctrl session ls` showing a policy is not observability.
+Every denial appends one line to `$CCTRL_DATA_DIR/policy/denials.log` — timestamp,
+session, tool, the command, and the category that matched. Without it there is no
+way to answer "did the guardrail fire?", "why was this classified `delete`?", or
+"how often is this session hitting the wall", and the only evidence lives in a
+transcript nobody reads.
+
+**Stale-cleanup race.** Cleanup keys off session name, and names recur across
+realign/relaunch/kill. Do not delete a `policy/<name>.json` whose session is
+still live: check the name against `tmux list-sessions` first and skip cleanup
+when it is present.
+
+Do **not** assume `cctrl start` already serializes this. The existing duplicate
+guard is keyed on **peer identity**, not session name — it refuses a second
+launch for a peer that "already has a live tmux session"
+(`tests/run-tests.sh:609-611`), so a spawn with no `--peer` never reaches it.
+Two concurrent starts resolving the same session name is therefore a real
+interleaving: A cleans up the stale policy, B writes the new one, A's cleanup
+lands after B's write and deletes a policy that belongs to a live session. Guard
+the write+cleanup pair for a given name (an flock on the policy directory is
+sufficient) rather than relying on inherited ordering.
 
 **Stale policy cleanup:** session names recur across the fleet's lifetime
 (realign/relaunch, kills). `cctrl start` without policy flags removes any stale
@@ -220,11 +303,13 @@ code blindly.
 
 **Files expected to change:**
 
-- `cctrl` (modified) — `cmd_start`: `--deny` / `--policy-file` flag parsing,
-  policy-file write, stale-policy cleanup, unconditional `CCTRL_DATA_DIR`
-  export (see Session-id resolution above), and the codex/non-Claude
-  `unenforced` path. New `cmd_policy` (`install` / `check`) plus its `_dispatch`
-  case. `_session_write_metadata` gains policy fields, and `cmd_session`'s
+- `cctrl` (modified) — `_session_write_metadata` named-argument refactor (task 0,
+  landed as its own change before any policy field is added). `cmd_start`:
+  `--deny` / `--policy-file` flag parsing, policy-file write, stale-policy
+  cleanup under flock, unconditional `CCTRL_DATA_DIR` export (see Session-id
+  resolution above), and the three refusal paths (codex, foreground, `--host`).
+  New `cmd_policy` (`install` / `check`) plus its `_dispatch` case.
+  `_session_write_metadata` then gains policy fields, and `cmd_session`'s
   listing renders them.
 - `hooks/policy-guard.py` (created) — the `PreToolUse` hook: session-id
   resolution, policy load, command classification, path rules, the
@@ -261,6 +346,17 @@ code blindly.
 
 ## Tasks
 
+0. **Structural first, behavioural second (do not combine).** `_session_write_metadata`
+   (`cctrl:1212`) already takes 10 positional parameters; adding policy fields as
+   an 11th and 12th means a single misordered argument silently writes the wrong
+   value into session metadata with no error. Refactor it to named/associative
+   arguments and update every existing call site as its own change, with a
+   regression test proving the existing metadata fields still round-trip. Only
+   then add policy fields to the clean signature. Reuse
+   `_session_metadata_file` (`cctrl:1207`) for the filename-safe transform rather
+   than reinventing it, and model `cctrl policy install`'s idempotency check on
+   `_peer_doorbell_registered` (`cctrl:5289`), which already scans `$SETTINGS`,
+   `~/.claude.json`, and the codex config.
 1. `cctrl start` writes `policy/<session-id>.json` from new flags
    (`--deny push,delete`, `--policy-file PATH`), and records the resolved policy
    in the session metadata so `cctrl session ls` can show it. In the same pass,
@@ -280,6 +376,13 @@ code blindly.
    policy can be validated before a spawn relies on it.
 6. Document in `AGENTS.md` and in the `cctrl-spawn` skill: a brief states intent,
    the policy enforces it, and **the brief is no longer the guardrail**.
+7. Refusal paths for the three shapes that cannot enforce (codex runtime,
+   foreground launch, `--host` remote spawn), each with its own test. These are
+   hard refusals with a nonzero exit, not warnings.
+8. Policy-store hardening from Design: atomic write, symlink/ownership refusal,
+   fail-closed on unparseable JSON, canonical-path resolution before the
+   `allow_paths_write` containment test, the flock around write+stale-cleanup,
+   and the `denials.log` audit line on every block.
 
 ## Verification
 
@@ -318,6 +421,48 @@ code blindly.
   refuses, or records `unenforced` in session metadata. Guards the
   `cctrl:474-477` path where `CCTRL_SESSION_NAME` is unset and the hook would
   otherwise allow everything.
+- `[cmd]` **CRITICAL regression (task 0):** after `_session_write_metadata` is
+  refactored to named arguments, every pre-existing metadata field
+  (`name`, `created_at`, `cwd`, `target_kind`, `target`, `display_label`,
+  `purpose`, `initial_prompt`, `launch_command`, `peer`, `agent`) still
+  round-trips through `_session_metadata_field` with the same values as before
+  the refactor. This modifies existing behaviour with existing callers, so the
+  test is mandatory, not optional.
+- `[cmd]` `--deny frobnicate` (an unknown category) is rejected with a nonzero
+  exit and a message naming the valid categories — not silently written into the
+  policy file where it would deny nothing.
+- `[cmd]` `--policy-file` pointing at a nonexistent path, and at a file
+  containing malformed JSON, each fail the spawn with a clear error. A policy
+  that cannot be parsed must never degrade to "no policy".
+- `[cmd]` `cctrl --host <alias> start --deny delete` refuses with a nonzero exit
+  (the remote host has neither the policy file nor the hook).
+- `[cmd]` `cctrl policy check <session> -- rm -rf /tmp/x` reports the category it
+  would match and whether it would be denied, without spawning anything and
+  without mutating the policy store. Asserts the dry-run path the acceptance
+  criteria promise but nothing currently exercises.
+- `[cmd]` `cctrl session ls` displays the resolved policy for a policy-bearing
+  session. Asserts the "visible in `cctrl session ls`" half of the acceptance
+  criteria, which no other check covers.
+- `[cmd]` A `Write` to a path inside `deny_paths_write` is denied even when it is
+  also inside an `allow_paths_write` entry (deny wins), and a path escaping an
+  allowed dir via `allowed/../forbidden` or a symlink is treated as outside.
+- `[cmd]` **Empty-policy session cannot sabotage a restricted one:** with session
+  A holding `{"deny":["delete"]}` and session B holding no policy, a `Bash`/
+  `Write`/`Edit` from B targeting `$CCTRL_DATA_DIR/policy/A.json` or the hook's
+  settings registration is denied. This is the AC5/AC8 collision — assert it
+  directly, since every other check passes while the hole is open.
+- `[cmd]` Hook input protocol: the hook handles a well-formed `PreToolUse`
+  payload, a payload with missing fields, an unrecognised tool name carrying a
+  path argument, and malformed JSON on stdin — denying (exit 2) rather than
+  crashing or exiting 0 in the last three. The in-repo precedent
+  `hooks/block-git-commit.py:33` exits 1, which is non-blocking; assert exit 2
+  explicitly rather than copying it.
+- `[cmd]` Every denial appends one parseable line to `policy/denials.log` naming
+  the session, tool, command, and matched category.
+- `[cmd]` Tests isolate `CCTRL_DATA_DIR` to a temp dir (the harness pattern at
+  `tests/run-tests.sh:548`). The repo's own `data/` is the **live fleet store**
+  and is gitignored, so a test that writes there both pollutes the running fleet
+  and produces vacuous `git status`-based assertions.
 - `[manual]` A real detached session, spawned with `--deny delete`, is handed a
   deletion task and reports back that it was blocked rather than silently
   failing or looping.
@@ -332,9 +477,62 @@ strength of a click on an agent-authored option labelled "(Recommended)". Whethe
 to suppress it in detached sessions, or route it through a logged channel, is a
 separate decision — record it, do not fold it in here.
 
+Two items raised by the 2026-07-31 outside voice and deliberately left open:
+
+- **Capability opt-in instead of a deny-list.** Rather than enumerating dangerous
+  commands, launch survey/propose sessions without bypass and grant capabilities
+  explicitly (an `--allow-tools` shape). The "Why the hook" section rejects
+  *dropping* `bypassPermissions` wholesale because it defeats detached operation,
+  but it never evaluated per-capability grants, which would not. This is a
+  strictly better primitive if it works, and it would make the classifier mostly
+  unnecessary. Not folded in here because it is a different plan with a different
+  blast radius — but it should be evaluated before this classifier accretes more
+  categories.
+- **The classifier is narrower than the sample policy.** The example JSON lists
+  `service-restart`, `credential-write`, and `purchase` as deny categories, but
+  only `delete` and `push` have enumerated command lists and tests. Either ship
+  the remaining three with real lists and tests, or drop them from the example so
+  the policy format does not advertise enforcement it lacks.
+
 Deliberately **not** in scope: the status-card and fleet-reader work discussed on
 2026-07-29. That design (sessions declare, readers read, measured facts kept
 separate from self-report) is sound but rests on a single night's evidence, so it
 waits for the `mstack recap` experiment to show whether the cheap in-session
 version is what actually gets used. This plan is independent of all of it and
 would still be worth doing if that work is never built.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 1 | issues_found | 4 findings (1 blocking), all folded |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean | 6 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | not applicable (no UI surface) |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**CODEX:** Outside voice ran twice — a pre-fix adversarial audit (4 findings: the
+`CCTRL_DATA_DIR` forwarding gap, the foreground `CCTRL_SESSION_NAME` hole, the
+`session_id` naming collision, and unverified stale cleanup) and a post-review
+challenge (14 findings). Both were verified against source before folding; the
+two most severe — an empty-policy session being able to delete a restricted
+session's policy file, and refusal-vs-warning for unenforceable launch shapes —
+became acceptance-criteria changes.
+
+**CROSS-MODEL:** Three tension points surfaced and were resolved by the user, not
+auto-applied. (1) Empty-policy sabotage: the eng review treated AC5 and AC8 as
+independent; the outside voice showed they collide. Resolved by making
+self-protection unconditional. (2) Warn vs refuse: the eng review left codex and
+foreground spawns at "warn + unenforced"; the outside voice argued refusal is the
+only safe response to an explicit `--deny`. Resolved as refuse, which also removes
+the inconsistency created by refusing on `--host`. (3) Scope: the eng review
+scored scope-fit 6/10; the outside voice recommended a 4-way split. Held whole —
+the backlog is dependency-wired and the plan sits under both complexity
+thresholds (7 files, 2 new components).
+
+**VERDICT:** ENG CLEARED — ready to implement. Classifier inverted to an explicit
+deny-list, self-protection made unconditional, three refusal paths added, the
+metadata refactor sequenced ahead of the behavioural change, and verification
+grown from 11 to 22 executable checks including a mandatory regression test.
+
+NO UNRESOLVED DECISIONS
