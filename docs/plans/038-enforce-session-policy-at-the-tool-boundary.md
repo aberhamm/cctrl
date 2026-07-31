@@ -1,12 +1,12 @@
 ---
 id: 038
 title: Enforce per-session policy at the tool boundary, not in the brief
-status: in-progress
+status: blocked
 blocked-by: []
 priority: 10
 goal: cctrl-fleet-safety
 allows-migrations: false
-needs-review: none
+needs-review: eng
 review-required: eng
 created: 2026-07-30
 reviews:
