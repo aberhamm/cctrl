@@ -1,7 +1,7 @@
 ---
 id: 050
 title: Docs and test-coverage catch-up for the current command surface
-status: pending
+status: blocked
 blocked-by: [042, 043, 044, 045, 046]
 priority: 22
 goal: revised-cctrl-audit-backlog
@@ -86,6 +86,80 @@ Checks:
 - `[assert] ./cctrl help 2>&1` contains `session say`
 - `[assert] cat README.md` contains `needs-me`
 - `[assert] bash -c 'sed -n "/_res_health_line()/,/^}/p" cctrl'` contains `n/a`
+
+## Implementation Notes (partially implemented 2026-07-31, NOT done)
+
+**Status is `blocked`, not `done` — but most of this plan has already shipped.**
+Every acceptance criterion that does not depend on 042-046 is implemented and
+verified below. The four that do are untouched, and they are the only reason
+this stays blocked. Whoever picks it up after 042-046 land should read the
+"Deliberately NOT done" list at the bottom and do only that; re-doing the rest
+would churn work that is already in `main`.
+
+### Completed
+
+- `cmd_help` now lists `peer overview`, `peer check`, `peer recv`, `peer reply`,
+  `session say`, `session autoheal`, `session ls --recap`, and a literal
+  `cctrl start --profile NAME` line. Asserted by string, per the plan's
+  "concrete named lines" rule: `./cctrl help` and README each contain
+  `peer check`, `peer recv`, and `start --profile`.
+- `_res_health_line`'s empty-probe fallback prints `n/a` instead of a bare `?`,
+  with the unit suffix (`%`, `MB`) travelling with the number so a dropped value
+  never leaves a stray unit. The Darwin `sysctl` parsing was NOT touched, as the
+  plan required — confirmed still live: `mem 75% free · swap 17639MB used ·
+  load 4.98 · 28 sessions`.
+- README documents `session doctor` / `autoheal` / `prune`, the rich STATE
+  column, `session ls --recap`, `cctrl fleet`, `cctrl needs-me`, the low-memory
+  launch guard (`-f`/`--force` and its `CCTRL_*` thresholds), `peer reply` and
+  `peer send --deliver` with the five-outcome table, top-level `shortcuts`, the
+  `cctrl-scan` plugin, and a note that `ports` and `scan` are plugins rather than
+  core commands. Peer messaging is now in the feature list.
+- The `session ls` sample is **generated**, not hand-written: a fixture fleet
+  built with the same fake-tmux/fake-ps technique `tests/run-tests.sh` uses, run
+  through the real binary, output pasted verbatim. The old sample was two
+  releases stale and used a `~/_projects/` path that does not exist.
+- Every command and flag written into the README was spot-verified against the
+  live binary first (`./cctrl fleet --help`, `./cctrl needs-me --help`,
+  `./cctrl session prune --help`, `./cctrl session autoheal --dry-run`,
+  `./cctrl scan --help`, `./cctrl session doctor --json`).
+- `test_syntax` compiles the plugin entry scripts. Both plugins are python3, so
+  they are copied to a `.py` name and run through `python3 -m py_compile`
+  (py_compile requires the suffix). Negative-controlled: a deliberately broken
+  plugin is caught.
+- New `test_session_say_claude_modal_blocks_and_benign_pane_passes` — the say
+  path had a Codex modal fixture only, so the `claude)` branch of the readiness
+  check was exercised solely through `peer deliver`, a different code path with a
+  different contract (`deferred` vs `busy`). Asserts both directions: a real
+  `❯ 1.` modal is a hard stop `--force-busy` cannot override, and a benign
+  markdown numbered list still pastes.
+- New `test_host_registry_crud` — `host add`/`list`/`rm` had zero direct
+  coverage; `hosts.json` was only ever hand-written as a fixture.
+- New `test_profile_use_current_diff` — `use`, `current`, and `diff` were
+  untested. Confirmed the plan's assumption first: `save`/`rename` are already
+  covered (weakly) by the profile-perms test, `edit` still is not.
+
+### Additional finding, fixed here (not in the original plan)
+
+`lib/usage_costs.py` hardcoded one machine's home directory. `claude_project_name`
+matched the literal strings `-Users-matthew--projects-` and `-Users-matthew-`, so
+on any other machine every Claude project fell through to its raw encoded path in
+the `By Project` column — a real correctness bug, not just a public-repo hygiene
+problem. The encoded `$HOME` prefix is now derived at runtime via a new
+`encoded_home()`, and `codex_project_name` lost its matching hardcoded
+`~/_projects/` special case. Covered by `test_project_name_derives_home_at_runtime`,
+which drives a fake `HOME` and also greps the source for the old username.
+The same sweep replaced the non-existent `$HOME/_projects` in the shortcut
+directory-search fallback with `$HOME/dev`, and the personal paths in the
+cost-reporting test fixtures with `$HOME`-derived ones.
+
+### Deliberately NOT done (blocked on 042-046)
+
+- `session key` (042) and `session ask` (043) — the commands do not exist, so
+  neither `cmd_help` nor README can document them.
+- Doorbell install via `peer doctor --fix` (044) — `--fix` does not exist on
+  `peer doctor`.
+- `bounced` mailbox status (045) — the string appears nowhere in `cctrl`.
+- `needs-me --peek` (046) — the flag does not exist.
 
 <!-- mstack:seam
 produced:

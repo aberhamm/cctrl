@@ -4,6 +4,125 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 2026-07-31
+
+Peers became addressable as live agents, not just mailboxes: direct tmux chat by
+peer name, a one-call orientation command, atomic reply, and an inline delivery
+that no longer dead-ends the message lifecycle. Plus a docs and help-surface
+catch-up, and a cost-reporting fix for anyone whose username isn't the author's.
+
+### Added
+- `cctrl peer say <peer> [--no-submit] [--force-busy] [--body-file PATH|-]
+  [--json] -- <message>` is direct **live tmux chat** addressed by peer name or
+  alias — the peer-addressed form of `session say`, sharing all its flags and its
+  readiness/modal guard. It never writes `data/messages.jsonl`, never changes
+  mailbox status, and never records nudge metadata. The companion
+  `cctrl peer session <peer> [--json]` resolves a peer to its backing session
+  (`{ok, name, label, session, tmux_target, host, live, status}`) and
+  `cctrl peer attach <peer>` attaches to it. A peer whose `.host` is not this
+  machine is refused with a `cctrl --host <host> peer …` hint rather than
+  auto-SSHing from registry metadata, and human `cctrl peer ls` now shows each
+  peer's backing SESSION with live/offline status by default (JSON unchanged).
+- `cctrl peer overview [--as NAME] [--json]` is the orientation entry point: one
+  call answers who you are, who you can reach, and whether you have unread mail
+  (`{queued, delivered_unacked, oldest_queued_age_seconds}`), served from a
+  single session enumeration instead of composing `whoami` + `list_peers` +
+  `check_messages`. A matching `peer_overview` MCP tool passes through to it, and
+  all eight pre-existing peer MCP tool descriptions were rewritten as
+  workflow-aware instructions that cross-reference their siblings — no tool names
+  changed.
+- `cctrl peer reply <message-id> [--as NAME] [--subject TEXT]
+  [--body-file PATH|-] [--no-ack] [--json] -- <body>` sends, delivers, and acks
+  the original in one command, resolving the recipient from the referenced
+  message's `sender` snapshot — so a replying agent never needs the sender's
+  address. `cctrl peer send` gained `--deliver` for the same send-then-nudge
+  behavior. Both report five named outcomes rather than failing silently:
+  `sent-and-nudged` and `sent-and-queued` (exit 0), `send-failed`,
+  `sent-but-undelivered`, and `sent-but-deferred` (non-zero). A delivery failure
+  never rolls the send back — the message stays queued and the hint says to retry
+  **delivery only**, because re-running would duplicate it. `--allow-unknown`
+  cannot be combined with `--deliver`. MCP `send_message` now delivers too and
+  surfaces the same five states, with only `send-failed` mapping to `ok:false`.
+- `cctrl peer help-agent [--as NAME] [--json]` prints the compact agent-facing
+  contract: when to `peer say` (live tmux agent, act now), when to `peer send`
+  (durable async), and the `peer recv` / `peer ack` loop. A bare invocation gives
+  generic guidance and never fails for a missing identity; `--as` or
+  `CCTRL_PEER` canonicalizes through the same resolver the mailbox uses and
+  tailors the examples. The contract is deliberately **not** auto-injected —
+  `cctrl start --peer` adds no prompt text, so an agent gets it only by asking.
+- MCP tool `say_peer` (`to`, `body`, optional `submit` defaulting true, optional
+  `force_busy`) — the tool-call form of `cctrl peer say`. The body is piped
+  through `cctrl peer say --body-file -` so multi-line and trailing-newline
+  bodies survive byte-for-byte. It creates no mailbox message and fails rather
+  than queueing when the peer has no live local tmux session.
+- The peer operating contract now lives in `AGENTS.md` (with a `CLAUDE.md`
+  routing pointer), not only in README — agents auto-load the former and not the
+  latter.
+
+### Changed
+- `cctrl start -d <dir>` adopts a matching shortcut's alias for the session name,
+  so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal`
+  produce the identical `TMUX--<device>--portal` name and therefore the identical
+  remote-control bridge prefix. On collision the first key by sorted order wins
+  (deterministic). A directory with no matching shortcut keeps its repo-folder
+  slug, foreground launches are unaffected, and duplicate-name auto-increment
+  still runs afterward.
+- `cctrl help` now lists the verbs the messaging and maintenance loops actually
+  depend on and previously omitted: `peer overview`, `peer check`, `peer recv`,
+  `peer reply`, `session say`, `session autoheal`, `session ls --recap`, and
+  `start --profile` — the last being the flag the README leads with.
+- `cctrl fleet`'s local resource header renders an unmeasurable probe as an
+  explicit `n/a` instead of a bare `?`, so "this platform can't measure it" no
+  longer reads as "the value is broken". The unit suffix travels with the number
+  and is dropped alongside it. The Darwin `sysctl` parsing is unchanged.
+- README documents the surface that shipped over the last month: `session
+  doctor` / `autoheal` / `prune`, `session ls --recap` and the rich STATE column
+  (with a sample regenerated from a fixture fleet rather than hand-written),
+  `cctrl fleet`, `cctrl needs-me`, the low-memory launch guard, peer messaging in
+  the feature list, and the fact that `ports` and `scan` are plugins rather than
+  core commands.
+
+### Fixed
+- `cctrl costs` no longer hardcodes one machine's username when naming projects.
+  `claude_project_name` matched the literal strings `-Users-matthew--projects-`
+  and `-Users-matthew-`, so on any other machine — or any other home directory —
+  every Claude project fell through to its raw encoded path. The encoded `$HOME`
+  prefix is now derived at runtime, and `codex_project_name` lost its matching
+  hardcoded `~/_projects/` special case.
+- `cctrl peer deliver <peer> --inline <message-id>` no longer strands the message
+  as `queued` forever. Inline delivery previously pasted the raw body with no
+  sender context and never transitioned status, so `cctrl peer ack` — which
+  rejects queued messages — could never complete the lifecycle. The paste now
+  carries a compact envelope (sender label and canonical name, message id,
+  optional subject, and ready-to-run `peer reply` and `peer ack` lines) and moves
+  the message to `delivered` with a `delivered_at`. Sender reachability is
+  resolved at delivery time: live and mailbox-only senders get a reply line, a
+  dead or unresolvable one gets `SENDER IS NO LONGER LIVE` and no reply command,
+  and a `from == "user"` sender routes the reply out of band. The body still
+  arrives byte-for-byte after a `---` separator, and legacy messages carrying only
+  a bare `from` fall back to that.
+- `cctrl peer say` rejects `--as` and `--from` at the peer-say level with a
+  message pointing at `cctrl peer send`, instead of forwarding them to the
+  internal `session say` and leaking `Unknown session say flag: --as`. `peer say`
+  has no sender identity, so the flags were never meaningful. The flag scan stops
+  at `--`, so a message body that mentions `--as` is not misread.
+- `peer session`, `peer say`, and `peer attach` report their own failures again.
+  The first two called the resolver bare under `set -e`, so an unresolvable,
+  remote, or stale peer aborted `cctrl` before the error JSON or message printed;
+  `peer attach` returned the exit status of its error-printer (always 0), so a
+  non-local or unknown peer printed the hint and exited **successfully**.
+  `peer session` also stopped colorizing the name, so `name -> target` is one
+  contiguous copyable string.
+- `cctrl save`, `cctrl rename`, and `cctrl edit` force profiles to mode `600`.
+  There was no `chmod` anywhere in `cctrl`: `save` wrote through a plain shell
+  redirect and landed at the ambient umask, commonly `0644`. Profiles routinely
+  carry `PORTKEY_API_KEY` and `ANTHROPIC_CUSTOM_HEADERS`, so a live key was
+  readable by every local account — for about two and a half months. `rename`
+  carried the source mode across with `mv` and `edit` lost the mode to
+  write-and-replace editors, so all three write paths needed it.
+
+<!-- commits: a028d2b, d77d4f6, ad314dd, ee048b2, d0464c5, be93bd0, b90d621, 1ec2638, 55de8ee, f7db9ab, d82260b -->
+
 ## [Unreleased] - 2026-07-26
 
 Direct session messaging, durable sender identity on peer mail, bundled role
