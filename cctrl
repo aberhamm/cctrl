@@ -1410,8 +1410,14 @@ _res_health_line() {
     local mf sw ld sc
     mf="$(_res_mem_free_pct)"; sw="$(_res_swap_used_mb)"
     ld="$(_res_load1)"; sc="$(_active_session_count)"
-    printf 'mem %s%% free · swap %sMB used · load %s · %s sessions' \
-        "${mf:-?}" "${sw:-?}" "${ld:-?}" "${sc:-?}"
+    # An unavailable probe prints an explicit 'n/a' rather than a bare '?', so
+    # "this platform can't measure it" never reads as "the value is unknown/bad".
+    # The unit suffix travels with the number and is dropped alongside it.
+    local mf_d sw_d
+    [[ -n "$mf" ]] && mf_d="${mf}%" || mf_d="n/a"
+    [[ -n "$sw" ]] && sw_d="${sw}MB" || sw_d="n/a"
+    printf 'mem %s free · swap %s used · load %s · %s sessions' \
+        "$mf_d" "$sw_d" "${ld:-n/a}" "${sc:-n/a}"
 }
 
 _launch_resource_guardrail() {
@@ -6423,8 +6429,7 @@ _autoheal_log() {
 
 _session_autoheal_install() {
     # Install an opt-in launchd agent that runs `cctrl session autoheal` on an
-    # interval. Mirrors the user's existing local agent style
-    # (com.matthew.proxy-orphan-guard): a per-user LaunchAgent plist with a
+    # interval. Standard per-user LaunchAgent style: a plist with a
     # StartInterval. Never installed automatically. The plist dir is overridable
     # (CCTRL_LAUNCH_AGENTS_DIR) so tests never touch ~/Library/LaunchAgents.
     local interval=900
@@ -7175,6 +7180,7 @@ cmd_help() {
     echo -e "${BOLD}Session${RESET} ${DIM}(tmux-backed by default; --foreground for one-offs)${RESET}"
     echo "  cctrl start [@name]         Launch selected agent in tmux and attach when interactive"
     echo "    --agent claude|codex      Select runtime (default: $(_default_agent_label))"
+    echo "    --profile NAME            Use a profile's model + env for this launch only"
     echo "    --foreground, --no-tmux   Launch directly without tmux"
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
@@ -7190,9 +7196,17 @@ cmd_help() {
     echo "    --remote-auth-token-env E Codex: env var containing remote auth token"
     echo "                              Extra flags are appended to the selected agent"
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
+    echo "  cctrl start --profile NAME  Launch with that profile's model + env (this launch only;"
+    echo "                              does not change the global default — see 'cctrl use')"
     echo ""
     echo "  cctrl session ls            List sessions (dir, agent/shell, model, state, rc; --json)"
+    echo "    --recap                   Add a one-line recap per session (costs a transcript read)"
+    echo "  cctrl session say <name> -- <msg>  Paste a message into a live session's pane and submit"
+    echo "                              (direct chat, no mailbox; --no-submit, --body-file PATH|-,"
+    echo "                              --json, --force-busy)"
     echo "  cctrl session doctor [--fix] Audit/repair remote-control bridges (--json, --yes)"
+    echo "  cctrl session autoheal      Repair dead bridges unattended (--dry-run, --json;"
+    echo "                              install/uninstall manage the launchd timer)"
     echo "  cctrl session current       Show this process/session identity; --json for agents"
     echo "  cctrl session attach [name] Reattach to a session (picker if no name)"
     echo "  cctrl session prune         Propose stale / never-prompted sessions (dry-run;"
@@ -7203,6 +7217,7 @@ cmd_help() {
     echo "  cctrl session kill <name>   Kill a detached session immediately"
     echo ""
     echo -e "${BOLD}Peers${RESET}"
+    echo "  cctrl peer overview [--as NAME]     Start here: identity + reachable peers + unread mail"
     echo "  cctrl peer ls [--json]              List peers with backing SESSION + live/offline"
     echo "  cctrl peer session <peer> [--json]  Show a peer's backing live tmux session"
     echo "  cctrl peer attach <peer>            Attach to a peer's live tmux session (interactive)"
@@ -7213,7 +7228,10 @@ cmd_help() {
     echo "  cctrl peer unregister <name>        Remove a manual peer"
     echo "  cctrl peer whoami [--as NAME]       Resolve identity from --as or CCTRL_PEER"
     echo "  cctrl peer help-agent [--as NAME]   Agent contract: peer say (live) vs peer send (async)"
-    echo "  cctrl peer send <to> -- <body>      Queue a mailbox message"
+    echo "  cctrl peer send <to> -- <body>      Queue a mailbox message (--deliver to also nudge)"
+    echo "  cctrl peer check [--as NAME]        Compact unread summary (--exit-on-empty exits 2)"
+    echo "  cctrl peer recv [--as NAME]         Take the next message (queued -> delivered)"
+    echo "  cctrl peer reply <id> [--as NAME]   Reply to a message: sends AND delivers, then acks"
     echo "  cctrl peer inbox [--as NAME]        List queued/delivered messages for a peer"
     echo "  cctrl peer outbox [--as NAME]       List messages sent by a peer"
     echo "  cctrl peer deliver <peer|--all>     Nudge tmux peers with queued messages"
@@ -8582,7 +8600,7 @@ _shortcut_jump() {
         echo
         # Search common project directories for a matching folder name
         local -a candidates=()
-        local search_dirs=("$HOME/_projects" "$HOME/Documents/Obsidian Vault" "$HOME/Projects" "$HOME/projects" "$HOME/src")
+        local search_dirs=("$HOME/dev" "$HOME/Projects" "$HOME/projects" "$HOME/src")
         for sdir in "${search_dirs[@]}"; do
             [[ -d "$sdir" ]] || continue
             while IFS= read -r match; do
@@ -8629,7 +8647,7 @@ _shortcut_jump() {
         # Try to find where the folder moved to
         local basename="${dir##*/}"
         local -a candidates=()
-        local search_dirs=("$HOME/_projects" "$HOME/Documents/Obsidian Vault" "$HOME/Projects" "$HOME/projects" "$HOME/src")
+        local search_dirs=("$HOME/dev" "$HOME/Projects" "$HOME/projects" "$HOME/src")
         for sdir in "${search_dirs[@]}"; do
             [[ -d "$sdir" ]] || continue
             while IFS= read -r match; do

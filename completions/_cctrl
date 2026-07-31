@@ -107,6 +107,8 @@ _cctrl() {
         'statusline:Configure Claude/Codex status lines'
         'log:Show profile switch history'
         'chrome:Launch Chrome with CDP remote debugging'
+        'fleet:Aggregate sessions across local + all hosts, by recency'
+        'needs-me:Digest of sessions that newly need you since the last run'
         'shortcuts:Manage shortcuts'
         'help:Show help'
     )
@@ -232,14 +234,19 @@ _cctrl() {
                 local -a session_cmds=(
                     'ls:List sessions (dir, agent/shell, model, state)'
                     'attach:Reattach to a session'
+                    'current:Show this process/session identity'
                     'say:Paste a direct chat message into a live tmux session'
+                    'doctor:Audit/repair remote-control bridges'
+                    'autoheal:Repair dead bridges unattended'
+                    'prune:Propose stale / never-prompted sessions'
                     'close:Gracefully close a session (default: the one you are inside)'
                     'kill:Kill a detached session'
                 )
                 _describe "session commands" session_cmds
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == ls ]]; then
                 _arguments \
-                    '--json[Machine-readable output]'
+                    '--json[Machine-readable output]' \
+                    '--recap[Add a one-line recap per session]'
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == say ]]; then
                 _arguments \
                     '--no-submit[Paste without pressing Enter]' \
@@ -269,6 +276,7 @@ _cctrl() {
         peer)
             if (( CURRENT == 3 )); then
                 local -a peer_cmds=(
+                    'overview:Identity + reachable peers + unread mail, in one call'
                     'ls:List peers'
                     'list:List peers'
                     'session:Show a peer'\''s backing live tmux session'
@@ -283,6 +291,7 @@ _cctrl() {
                     'whoami:Resolve peer identity'
                     'help-agent:Agent contract: peer say (live) vs peer send (async)'
                     'send:Queue a mailbox message'
+                    'reply:Reply to a message: send, deliver, and ack the original'
                     'inbox:List inbound mailbox messages'
                     'outbox:List outbound mailbox messages'
                     'check:Check unread mailbox counts'
