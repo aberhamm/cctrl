@@ -1,7 +1,7 @@
 ---
 id: 038
 title: Enforce per-session policy at the tool boundary, not in the brief
-status: pending
+status: in-progress
 blocked-by: []
 priority: 10
 goal: cctrl-fleet-safety
