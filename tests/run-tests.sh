@@ -210,6 +210,18 @@ test_syntax() {
     bash -n "$ROOT/install.sh"
     zsh -n "$ROOT/completions/_cctrl"
     python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/lib/peer_mcp.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
+    # Plugin entry scripts are dispatched by `cctrl <cmd>` exactly like a core
+    # command, so a syntax error in one is a user-visible break. Both are
+    # python3 (#!/usr/bin/env python3), same as lib/*.py above. py_compile needs
+    # a .py name, so compile a suffixed copy rather than skipping them.
+    local plugin dest
+    mkdir -p "$TMPDIR/plugin-syntax"
+    for plugin in "$ROOT"/plugins/cctrl-*; do
+        [[ -f "$plugin" ]] || continue
+        dest="$TMPDIR/plugin-syntax/$(basename "$plugin" | tr - _).py"
+        cp "$plugin" "$dest"
+        python3 -m py_compile "$dest"
+    done
 }
 
 test_launch_args() {
@@ -319,6 +331,106 @@ test_profile_writes_are_owner_only() {
     fi
 
     echo "ok: profile writes land at mode 600 (credentials are not world-readable)"
+}
+
+test_host_registry_crud() {
+    # `cctrl host add|list|rm` had zero direct coverage: hosts.json was only ever
+    # written by hand as a fixture for the fleet/remote tests, so the CRUD verbs
+    # that produce it were never exercised. CCTRL_ROOT isolates the registry
+    # (<root>/data/hosts.json) from the developer's real one.
+    local rootcopy="$TMPDIR/cctrl-host-crud-copy"
+    mkdir -p "$rootcopy/data"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    local out rc
+
+    # add: with and without an explicit user.
+    CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" host add box box.invalid tester >/dev/null
+    CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" host add plain plain.invalid >/dev/null
+    jq -e '.box.hostname == "box.invalid" and .box.user == "tester"' "$rootcopy/data/hosts.json" >/dev/null \
+        || fail "host add did not persist hostname+user"
+    jq -e '.plain.hostname == "plain.invalid" and (.plain.user == "" or .plain.user == null)' "$rootcopy/data/hosts.json" >/dev/null \
+        || fail "host add without a user should leave user empty"
+
+    # list: shows both registered hosts and the built-in local aliases.
+    out="$(CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" host list)"
+    assert_contains "$out" "box"
+    assert_contains "$out" "tester@box.invalid"
+    assert_contains "$out" "plain.invalid"
+    assert_contains "$out" "local"
+
+    # rm: removes only the named host.
+    CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" host rm box >/dev/null
+    jq -e 'has("box") | not' "$rootcopy/data/hosts.json" >/dev/null || fail "host rm did not remove the host"
+    jq -e 'has("plain")' "$rootcopy/data/hosts.json" >/dev/null || fail "host rm removed an unrelated host"
+
+    # Failure paths exit non-zero rather than silently succeeding.
+    rc=0
+    CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" host rm ghost >/dev/null 2>&1 || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit removing an unregistered host"
+    rc=0
+    CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" host add incomplete >/dev/null 2>&1 || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for host add missing a hostname"
+
+    echo "ok: host registry add/list/rm round-trips and fails loudly on bad input"
+}
+
+test_profile_use_current_diff() {
+    # `use`, `current`, and `diff` had no direct coverage (only `save`/`rename`
+    # were touched, by the profile-perms test). All three read and WRITE
+    # $HOME/.claude/settings.json — CLAUDE_DIR is derived from HOME with no
+    # override — so HOME is redirected at a fixture dir. Without that, running
+    # this suite would merge a test profile into the developer's real Claude
+    # settings. (CCTRL_SETTINGS is not a variable cctrl reads; HOME is the seam.)
+    local rootcopy="$TMPDIR/cctrl-profile-verbs-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.claude"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"claude-sonnet-5","env":{"KEEP":"yes"}}\n' > "$fakehome/.claude/settings.json"
+    printf '{"model":"claude-opus-5","env":{"PROFILE_ONLY":"1"}}\n' > "$rootcopy/profiles/work.json"
+    printf '{"model":"claude-sonnet-5","env":{"KEEP":"yes"}}\n' > "$rootcopy/profiles/home.json"
+
+    local out rc
+
+    # ls lists both profiles.
+    out="$(HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" ls)"
+    assert_contains "$out" "work"
+    assert_contains "$out" "home"
+
+    # use sets the active default AND merges the profile's Claude model+env into
+    # settings.json for legacy compatibility. The merge is additive: a key the
+    # profile does not mention survives.
+    HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use work >/dev/null
+    [[ "$(cat "$rootcopy/.active-profile")" == "work" ]] || fail "use did not write .active-profile"
+    jq -e '.model == "claude-opus-5" and .env.PROFILE_ONLY == "1" and .env.KEEP == "yes"' \
+        "$fakehome/.claude/settings.json" >/dev/null \
+        || fail "use should merge the profile's model+env without dropping existing keys"
+
+    # current names the active profile.
+    out="$(HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "work"
+    assert_contains "$out" "claude-opus-5"
+
+    # diff reports the delta against another profile; the differing model shows
+    # on both sides and the profile-only env key shows as removed.
+    out="$(HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff home)"
+    assert_contains "$out" "claude-sonnet-5"
+    assert_contains "$out" "PROFILE_ONLY"
+
+    # Unknown profile names fail loudly on both verbs.
+    rc=0
+    HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use ghost >/dev/null 2>&1 || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for 'use' with an unknown profile"
+    rc=0
+    HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff ghost >/dev/null 2>&1 || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for 'diff' with an unknown profile"
+    # The failed switch must not have moved the active default.
+    [[ "$(cat "$rootcopy/.active-profile")" == "work" ]] || fail "a failed 'use' changed the active profile"
+
+    echo "ok: profile use/current/diff resolve, merge additively, and reject unknown names"
 }
 
 test_profile_prompt_overrides_global_default() {
@@ -4051,7 +4163,7 @@ JSON
 
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
-    local claude_dir="$base/claude/projects/-Users-matthew--projects-demo"
+    local claude_dir="$base/claude/projects/$(printf %s "$HOME/dev/demo" | tr -c "[:alnum:]" -)"
     local archive_dir="$base/codex/archived_sessions"
     local claude_ts claude_user_ts codex_meta_ts codex_context_ts codex_token_ts codex_path primary_reset secondary_reset
     { IFS= read -r claude_ts
@@ -4096,8 +4208,8 @@ PY
 JSONL
 
     cat > "$codex_dir/codex-session.jsonl" <<JSONL
-{"timestamp":"$codex_meta_ts","type":"session_meta","payload":{"id":"codex-session","cwd":"/Users/matthew/_projects/demo"}}
-{"timestamp":"$codex_context_ts","type":"turn_context","payload":{"cwd":"/Users/matthew/_projects/demo","model":"gpt-5.5"}}
+{"timestamp":"$codex_meta_ts","type":"session_meta","payload":{"id":"codex-session","cwd":"$HOME/dev/demo"}}
+{"timestamp":"$codex_context_ts","type":"turn_context","payload":{"cwd":"$HOME/dev/demo","model":"gpt-5.5"}}
 {"timestamp":"$codex_token_ts","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":100,"reasoning_output_tokens":10},"total_token_usage":{"input_tokens":1000,"cached_input_tokens":250,"output_tokens":100,"reasoning_output_tokens":10}},"rate_limits":{"plan_type":"plus","primary":{"used_percent":12,"resets_at":"$primary_reset"},"secondary":{"used_percent":34,"resets_at":"$secondary_reset"}}}}
 JSONL
 
@@ -4116,6 +4228,52 @@ JSONL
     assert_contains "$out" "Agent"
     assert_contains "$out" "API Value"
     assert_contains "$out" "codex:"
+}
+
+test_project_name_derives_home_at_runtime() {
+    # Regression: claude_project_name matched the literal strings
+    # '-Users-matthew--projects-' and '-Users-matthew-', so on any machine whose
+    # home directory was not the author's, EVERY Claude project fell through to
+    # its raw encoded path in the `By Project` column. The encoded-$HOME prefix
+    # must be derived from the running user's HOME instead. Driven through a
+    # fake HOME so the assertion is about the code, not this machine.
+    local probe="$TMPDIR/project-name-probe.py"
+    cat > "$probe" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1] + "/lib")
+import usage_costs as u
+
+enc = u.encoded_home()
+assert enc == "-Users-someone-else", enc
+
+# A project under the running user's HOME renders tilde-relative.
+print(u.claude_project_name("/p", "/p/" + enc + "-dev-demo/s.jsonl"))
+# HOME itself.
+print(u.claude_project_name("/p", "/p/" + enc + "/s.jsonl"))
+# A path outside HOME is left alone rather than mangled.
+print(u.claude_project_name("/p", "/p/-opt-apps-thing/s.jsonl"))
+# A loose file at the top level keeps its name.
+print(u.claude_project_name("/p", "/p/loose.jsonl"))
+# Codex reports a real cwd, not an encoded one.
+print(u.codex_project_name("/Users/someone-else/dev/demo"))
+print(u.codex_project_name("/Users/someone-else"))
+print(u.codex_project_name("/opt/apps/thing"))
+PY
+
+    local out
+    out="$(HOME=/Users/someone-else python3 "$probe" "$ROOT")"
+    local expected
+    expected="$(printf '%s\n' '~/dev-demo' '~' '-opt-apps-thing' 'loose.jsonl' 'demo' '~' 'thing')"
+    [[ "$out" == "$expected" ]] || fail "project naming did not track HOME; got:
+$out
+expected:
+$expected"
+
+    # And the author's old hardcoded username must not reappear in the source.
+    if grep -q 'Users-matthew' "$ROOT/lib/usage_costs.py"; then
+        fail "lib/usage_costs.py still hardcodes a personal home directory"
+    fi
+    echo "ok: project naming derives the encoded \$HOME at runtime (no hardcoded username)"
 }
 
 # ── Fleet aggregation ────────────────────────────────────────────────
@@ -4343,6 +4501,65 @@ test_session_say_modal_deferral_not_overridden_by_force_busy() {
         || fail "expected status busy for visible modal even with --force-busy"
     assert_not_contains "$(cat "$log")" "paste-buffer"
     echo "ok: session say never overrides a known modal, even with --force-busy"
+}
+
+test_session_say_claude_modal_blocks_and_benign_pane_passes() {
+    # The say path had a Codex modal fixture but no Claude one, so the claude)
+    # branch of the readiness check was only ever exercised through `peer
+    # deliver` — a different code path with a different contract (deferred vs
+    # busy). Both directions matter here: a real Claude proceed modal (anchored
+    # on the highlighted "❯ 1." selection line) is a hard stop that --force-busy
+    # must NOT override, and a benign markdown numbered list plus "Do you want
+    # ... proceed" prose must still paste — that false positive is what the old
+    # '. 1\.' heuristic got wrong.
+    make_fake_tmux "$TMPDIR/tmux"
+    # Pane must resolve to claude (make_fake_ps hardcodes codex for 12345).
+    cat > "$TMPDIR/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    printf 'claude --model opus-5 --name TMUX--demo\n'
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$TMPDIR/ps"
+
+    local log="$TMPDIR/say-claude-modal.log" out rc=0 modal_pane benign_pane
+    modal_pane="$(printf '%s\n' \
+        '● Ready to remove the old build artifacts.' \
+        '' \
+        '╭──────────────────────────────────────────────────╮' \
+        '│ Do you want to proceed?                          │' \
+        '│ ❯ 1. Yes                                         │' \
+        '│   2. No, and tell Claude what to do differently  │' \
+        '╰──────────────────────────────────────────────────╯')"
+    benign_pane="$(printf '%s\n' \
+        '● Here is the fleet plan:' \
+        '  1. First item' \
+        '  2. Second item' \
+        '' \
+        'Earlier you asked: Do you want to proceed with the old approach?')"
+
+    # A visible Claude modal is a hard stop even with --force-busy, and nothing
+    # is pasted into the dialog.
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_PANE_PID=4242 TMUX_FAKE_CAPTURE_PANE="$modal_pane" \
+        "$ROOT/cctrl" session say TMUX--demo --force-busy --json -- "should be blocked")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for a visible Claude modal"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "busy" and .reason == "modal prompt visible"' >/dev/null \
+        || fail "expected status busy / modal prompt visible for the Claude modal"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    # A numbered list is not a modal: the message pastes with no override flag.
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_PANE_PID=4242 TMUX_FAKE_CAPTURE_PANE="$benign_pane" \
+        "$ROOT/cctrl" session say TMUX--demo --json -- "should paste")"
+    printf '%s\n' "$out" | jq -e '.ok == true and .status == "ok"' >/dev/null \
+        || fail "expected a benign numbered-list pane to accept the paste"
+    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    echo "ok: session say blocks on a Claude modal and still pastes on a benign numbered list"
 }
 
 test_session_say_unknown_readiness_requires_force_busy() {
@@ -4804,6 +5021,7 @@ test_launch_args
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
 test_profile_writes_are_owner_only
+test_profile_use_current_diff
 test_detached_agent_prompt_exports_selection
 test_detached_arg_parsing
 test_live_aware_index_picker
@@ -4847,6 +5065,7 @@ test_session_list_rich_state
 test_session_pane_has_draft_glyph_fixtures
 test_session_rich_state_detects_glyph_draft
 test_needs_me_digest
+test_host_registry_crud
 test_fleet_merges_multiple_hosts
 test_fleet_sorts_by_recency_across_hosts
 test_fleet_offline_host_non_fatal
@@ -4893,6 +5112,7 @@ test_session_current_identity_json
 test_session_say_submit_and_no_submit
 test_session_say_body_file_preserves_newlines
 test_session_say_modal_deferral_not_overridden_by_force_busy
+test_session_say_claude_modal_blocks_and_benign_pane_passes
 test_session_say_unknown_readiness_requires_force_busy
 test_session_say_errors
 test_peer_session_resolves_and_alias
@@ -4913,6 +5133,7 @@ test_session_prune_codex_never_prompted
 test_session_prune_dry_run_closes_nothing
 test_session_prune_excludes_self_and_attached
 test_usage_cost_fixtures
+test_project_name_derives_home_at_runtime
 test_peer_contract_docs
 
 echo "ok"
