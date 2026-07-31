@@ -6,11 +6,14 @@ A CLI for managing local coding-agent sessions, profiles, costs, and developer e
 
 - **Profile switching** — swap between settings configs (API keys, models, hooks, permissions) with one command
 - **Session launching** — start Claude Code or Codex with consistent flags, resume previous sessions, jump into projects via named shortcuts, or run detached so it survives SSH disconnect
+- **Session health** — a rich per-session STATE (waiting-input, blocked-dialog, unsent-draft, idle-done), plus `session doctor`/`autoheal` to repair broken remote-control bridges and `session prune` to retire stale sessions
+- **Peer messaging** — sessions address each other by name: a durable local mailbox (`peer send`/`check`/`recv`/`ack`/`reply`) for async work, direct live-tmux chat (`peer say`) for a running agent, tmux doorbell nudges, and a stdio MCP bridge so tool-calling agents get the same surface
+- **Fleet view** — `cctrl fleet` merges every host's sessions into one recency-sorted list; `cctrl needs-me` reports only what newly needs your attention since the last check
 - **Remote hosts** — run any cctrl command on another machine over SSH; start a detached session on your Mac from your phone and auto-attach
 - **Usage & cost tracking** — token spend by model/project/day, rate limit monitoring, billing week breakdowns
-- **Port management** — track port history, find free ports, kill processes by port, discover ports from project files
 - **Chrome CDP** — launch Chrome with remote debugging for browser automation workflows
 - **Agent status lines** — Claude Code script statusline or Codex TUI footer setup from one command
+- **Plugins** — port management (`cctrl ports`) and directory scanning (`cctrl scan`) ship as drop-in plugins, not core commands
 
 ## Install
 
@@ -24,8 +27,12 @@ Or manually:
 
 ```bash
 git clone https://github.com/aberhamm/cctrl.git ~/.local/share/cctrl
+mkdir -p ~/.local/bin
 ln -s ~/.local/share/cctrl/cctrl ~/.local/bin/cctrl
 ```
+
+`~/.local/bin` does not exist on a fresh machine, so create it before symlinking
+and make sure it is on your `PATH`.
 
 ## Profiles
 
@@ -158,11 +165,11 @@ Add `-d` to start the tmux session and return without attaching. No GUI required
 When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic). A directory with no matching shortcut keeps its repo-folder slug (unchanged).
 
 ```bash
-cctrl start ~/_projects/myapp     # tmux-backed; prompts to connect in a TTY
+cctrl start ~/dev/myapp           # tmux-backed; prompts to connect in a TTY
 cctrl @myapp                      # shortcut launch, also tmux-backed
 cctrl @myapp --foreground         # direct launch without tmux
 
-cctrl start -d ~/_projects/myapp  # launch detached; prompts with default "no"
+cctrl start -d ~/dev/myapp        # launch detached; prompts with default "no"
 cctrl start -d @myapp             # ...or via a saved shortcut
 cctrl start -d @myapp --agent codex
 cctrl start -d @myapp --purpose "review auth logs"
@@ -238,18 +245,79 @@ TMUX--myapp              # local detached session
 TMUX--studio--myapp      # detached session launched with --host studio
 ```
 
-`cctrl session ls` is self-describing — for each tmux session it shows the working
-directory, whether it's a live agent process (and which model) or a plain shell,
-and attached/detached state. A `✦` marks sessions cctrl spawned. Add `--json` for
-machine-readable output:
+`cctrl session ls` is self-describing. There is no header row — a legend line
+explains the two markers, and each row reads left to right as: `✦` (cctrl
+spawned it), session name, agent and model (or `shell (zsh)`), working
+directory, **STATE**, attached/detached, time since last active, `rc` (the
+remote-control bridge: `live` / `dead` / `off`), and the session purpose. Rows
+are sorted by last-active, most recent first. Anything unmeasurable renders `-`
+rather than guessing.
 
 ```
 $ cctrl session ls
-✦ = cctrl-managed agent session
-✦ TMUX--homelab    claude (opus-5)    ~/_projects/homelab   detached
-✦ TMUX--cctrl      codex (?)          ~/_projects/cctrl      detached
-  scratch          shell (zsh)        ~/tmp                 attached
+✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix
+✦ TMUX--homelab   claude (opus-5)    ~/dev/homelab                  working        detached  4m     live  deploy-poll flake
+✦ TMUX--api       claude (sonnet-4-6) ~/dev/api                      idle           detached  3h     live  rate-limit middleware
+  scratch         shell (zsh)        ~/tmp                          -              attached  -      -
 ```
+
+STATE is richer than attached/detached. Beyond the base activity states
+(`working`, `idle`, `shell`) it surfaces the ones worth acting on:
+`waiting-input`, `blocked-dialog` (an approval or trust modal is up),
+`unsent-draft` (text is sitting in the input line, unsubmitted), and
+`idle-done` (finished its turn). Every detector fails safe — an ambiguous
+signal falls back to the base state instead of asserting something false.
+
+```bash
+cctrl session ls --json           # machine-readable; adds session_id, last_active, bridge, peer
+cctrl session ls --recap          # add a one-line recap per session
+```
+
+`--recap` appends a compact summary of what each session was last doing, read
+from the transcript's compact-summary entry. It costs a bounded transcript read
+per session, so it is opt-in; sessions with no summary show `-`, and the JSON
+`recap` key is absent entirely without the flag.
+
+#### Keeping the fleet healthy
+
+Three maintenance verbs, in increasing order of how much they touch:
+
+```bash
+cctrl session doctor                # audit remote-control bridges (read-only)
+cctrl session doctor --fix          # repair them (--yes to skip prompts, --json)
+cctrl session autoheal --dry-run    # show which dead bridges would be repaired
+cctrl session autoheal              # repair them unattended
+cctrl session prune                 # propose stale / never-prompted sessions
+cctrl session prune --older-than 24h --yes   # ...and close them
+```
+
+`session doctor` classifies each Claude session's remote-control bridge as
+`live`, `dead`, or `off`, and flags sessions whose bridge prefix has drifted out
+of alignment with the tmux session name. `--fix` repairs what it can.
+
+`session autoheal` is the unattended form: it repairs cleanly-dead bridges and
+refuses to touch anything ambiguous. It skips a session that is busy, in copy
+mode, or has an unsent draft sitting in its input line, because repairing means
+relaunching and that would discard the draft. `cctrl session autoheal install
+[--interval SECONDS]` registers a per-user launchd timer to run it periodically;
+`uninstall` removes it. Nothing is installed automatically.
+
+`session prune` proposes two kinds of candidate: sessions idle longer than the
+staleness threshold (default 72h) and **never-prompted** ones that were launched
+but never given a user turn. It is a dry run until `--yes`, always excludes the
+session you are calling from, and excludes attached sessions unless you pass
+`--force`.
+
+#### The low-memory launch guard
+
+Before creating another session, `cctrl start` checks free memory and refuses to
+launch when the machine is genuinely low, printing the same resource line
+`cctrl fleet` shows. It deliberately does not gate on session count — idle
+sessions cost almost nothing, so counting them would block launches while memory
+is fine. Bypass with `-f` / `--force` or `CCTRL_FORCE=1`. The thresholds are
+overridable (`CCTRL_MEM_FREE_MIN_PCT`, `CCTRL_MEM_FREE_SOFT_PCT`,
+`CCTRL_SWAP_USED_HI_MB`). On a platform where memory cannot be measured the
+guard never fires, and the resource line renders the unavailable probe as `n/a`.
 
 ### Shortcuts
 
@@ -260,9 +328,10 @@ cctrl @<name>                # cd + switch profile + start
 cctrl @<name> -m "fix bug"  # with an initial prompt
 cctrl @<name> --resume       # resume picker for that project
 cctrl @                      # list shortcuts
+cctrl shortcuts              # same listing, spelled out
 
-cctrl @add myapp ~/projects/myapp --profile work
-cctrl @add cctrl ~/projects/cctrl --agent codex
+cctrl @add myapp ~/dev/myapp --profile work
+cctrl @add cctrl ~/dev/cctrl --agent codex
 cctrl @rm myapp
 ```
 
@@ -273,7 +342,7 @@ registry combines manual entries from `data/peers.json` with live cctrl-managed
 tmux sessions derived from `cctrl session ls --json`.
 
 ```bash
-cctrl peer register comet --dir /Users/matthew/_projects/comet-automation --agent codex
+cctrl peer register comet --dir ~/dev/comet-automation --agent codex
 cctrl peer register reviewer --agent codex --capability polling
 cctrl peer alias comet comet-agent
 
@@ -388,6 +457,38 @@ without an identity fail instead of silently defaulting. Mailbox writes use an
 exclusive lock and atomic rewrites for state transitions; stale fallback lock
 directories record their holder PID and are reclaimed automatically.
 
+#### Sending and delivering in one step
+
+A bare `peer send` only **queues**. Nothing reaches the recipient until a
+delivery runs, and no watcher runs by default — so a send-only workflow silently
+goes nowhere. Two commands close that gap:
+
+```bash
+cctrl peer send comet --as orchestrator --deliver --json -- "Please check XYZ"
+cctrl peer reply msg_20260608_070000_abc123 --as comet --json -- "Checked, all green"
+```
+
+`--deliver` sends and then nudges in one command. `peer reply` goes further: it
+resolves the recipient from the referenced message itself (via its `sender`
+snapshot, falling back to a legacy bare `from`), sends, delivers, and acks the
+original — so a replying agent never needs to know the sender's address. Pass
+`--no-ack` to leave the original unacked. `--allow-unknown` cannot be combined
+with `--deliver`.
+
+Both report one of five named outcomes so a failure is never silent:
+
+| Outcome | Exit | Meaning |
+|---|---:|---|
+| `sent-and-nudged` | 0 | queued and the recipient was nudged |
+| `sent-and-queued` | 0 | queued; no delivery was requested |
+| `send-failed` | ≠0 | nothing was written |
+| `sent-but-undelivered` | ≠0 | the message is queued; delivery failed |
+| `sent-but-deferred` | ≠0 | queued; delivery deferred (a modal was on screen) |
+
+A delivery failure never rolls the send back. The message stays queued, and the
+hint tells you to retry **delivery only** (`cctrl peer deliver comet`) — re-running
+the whole command would send a duplicate.
+
 Agents that do not have a tmux session can poll the mailbox directly:
 
 ```bash
@@ -414,7 +515,7 @@ The preferred setup is an idle doorbell: launch the session with a peer
 identity, then let the agent check its mailbox at natural pause points.
 
 ```bash
-cctrl start -d --peer comet ~/projects/comet-automation
+cctrl start -d --peer comet ~/dev/comet-automation
 cctrl start --foreground --peer comet --agent codex
 ```
 
@@ -673,8 +774,8 @@ Run any cctrl command on a named host over SSH. The `--host` flag transparently 
 
 ```bash
 cctrl whoami                              # which machine am I? which aliases mean "local"?
-cctrl host add studio ms-128g-bln         # register a host
-cctrl host add studio ms-128g-bln matt    # with explicit user
+cctrl host add studio studio.local        # register a host
+cctrl host add studio studio.local matt   # with explicit user
 cctrl host list                            # show registered hosts (marks the local one)
 cctrl host rm studio                       # remove a host
 cctrl host doctor studio                   # check SSH, tmux, cctrl, agent, shared skills
@@ -709,6 +810,43 @@ cctrl --host studio costs --week             # view remote cost data
 **Host doctor** checks SSH connectivity, brew, tmux, the selected agent, cctrl availability, `~/.tmux.conf`, shared Skillshare targets, and the selected agent's common instruction file (`~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`) — with interactive auto-fix offers for missing dependencies.
 
 The host registry lives in `data/hosts.json` (gitignored, machine-local). Each machine is its own source of truth — no sync.
+
+### Fleet view
+
+`cctrl fleet` runs `session ls` on the local machine and on every host in
+`data/hosts.json`, labels each row with its host, and sorts the merged result by
+last-active, most recent first.
+
+```bash
+cctrl fleet                 # every host's sessions in one recency-sorted list
+cctrl fleet --json          # same, machine-readable (adds a "host" field per row)
+```
+
+An unreachable host is marked `offline` inline and does not fail the command —
+the overall exit stays 0, so a laptop that is asleep never breaks the view. A
+host running an older cctrl that does not report last-active or STATE renders
+those cells as `-` rather than dropping the rows. The local header also carries
+a one-line resource summary (`mem … free · swap … used · load … · N sessions`),
+with `n/a` for anything this platform cannot measure.
+
+### What needs me
+
+`cctrl needs-me` answers the narrower question: what changed since I last
+looked?
+
+```bash
+cctrl needs-me              # sessions that NEWLY need attention
+cctrl needs-me --json       # {name, from_state, to_state, last_active}
+```
+
+It diffs every session's current rich STATE against a snapshot from the previous
+run and reports only the sessions that just entered an attention state
+(`waiting-input`, `blocked-dialog`, `idle-done`). A session that was already
+waiting last run is not re-flagged, so the digest stays short instead of
+re-listing the same backlog every time. The first run has no snapshot and
+therefore reports every current attention session, with `from_state` of `-`. It
+is strictly read-only: it never closes, repairs, or otherwise mutates a session,
+and the only thing it writes is its own snapshot file.
 
 ## Usage & cost tracking
 
@@ -819,6 +957,10 @@ Finds the current session JSONL, sums deduplicated token usage, and upserts to t
 
 ## Port management
 
+> Ships as the `cctrl-ports` **plugin** (`plugins/cctrl-ports`), not a core
+> command. It is auto-dispatched like any other `cctrl-*` executable, so
+> `cctrl ports` works out of the box, but it can be removed independently.
+
 Track which ports have ever been in use on your machine and get clean suggestions. History accumulates across invocations.
 
 ```bash
@@ -827,7 +969,7 @@ cctrl ports --consecutive 4        # find 4 consecutive free ports
 cctrl ports --check 3000,5432      # check if ports are safe to use
 cctrl ports --kill 3000-3003       # kill processes on ports (SIGTERM)
 cctrl ports --kill 3000 --force    # SIGKILL
-cctrl ports --discover ~/projects  # scan project files for port references
+cctrl ports --discover ~/dev       # scan project files for port references
 cctrl ports --history              # all ports ever seen
 cctrl ports --known                # well-known exclusions (MySQL, Redis, etc.)
 ```
@@ -852,6 +994,21 @@ Free ports (never seen, 3000–9999)
 ```
 
 Port discovery scans `.env`, `Dockerfile`, `docker-compose.yml`, YAML/TOML configs, and source files for port references — then adds them to history so they're never suggested. 22 well-known service ports (PostgreSQL, Redis, MySQL, etc.) are always excluded.
+
+## Directory scanning
+
+> Also a **plugin** (`plugins/cctrl-scan`).
+
+Survey a tree of projects: size, git state, and what is safe to delete.
+
+```bash
+cctrl scan                     # top-level subdirs, sorted by name
+cctrl scan --large ~/dev       # top 20 largest dirs, up to 3 levels deep
+cctrl scan --dirty             # only git repos with uncommitted changes
+cctrl scan --secrets           # scan dirty repos for credential patterns
+cctrl scan --clean             # find (and optionally delete) reclaimable dirs
+cctrl scan --reclaimable       # also total up node_modules, .next, etc.
+```
 
 ## Chrome CDP
 
@@ -881,12 +1038,21 @@ cctrl/
   hooks/
     notify.sh              # sound notifications (stop/needs-input/permission)
     block-git-commit.py    # commit guardrail hook
+    peer-doorbell.sh       # Stop/Notification hook: exit 2 on queued peer mail
     session-log.py         # token tracking hook
     statusline.sh          # status bar + rate limit capture
+  lib/
+    usage_costs.py         # usage/cost aggregation for `cctrl usage` and `cctrl costs`
+    peer_mcp.py            # stdio MCP server behind `cctrl peer mcp`
+  plugins/
+    cctrl-ports            # `cctrl ports` — port history and suggestions
+    cctrl-scan             # `cctrl scan` — directory/repo survey
+  skills/                  # bundled agent skills (cctrl-spawn, -session-end, -fleet-manager)
   completions/_cctrl       # zsh tab completion
+  docs/                    # plans, debug reports, findings
+  tests/run-tests.sh       # end-to-end suite (real binary, fixture dirs)
   costs/                   # session spending log (gitignored)
   data/                    # runtime data (gitignored)
-  plugins/                 # drop-in subcommands
 ```
 
 ## License

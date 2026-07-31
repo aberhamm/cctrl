@@ -8,6 +8,7 @@ reference are the same file, so there is nothing to keep in sync.
 |---|---|
 | [`cctrl-fleet-manager`](./cctrl-fleet-manager/SKILL.md) | Orchestrate a fleet of concurrent cctrl sessions: monitor → decide → sequence, delegate all hands-on work, a two-mode autonomy model (auto-pilot / manual) with an always-confirm set and session-close gate. |
 | [`cctrl-session-end`](./cctrl-session-end/SKILL.md) | Gracefully wind down a session from the inside: check for uncommitted work, save context/handoff, report completion, then self-close. Counterpart to `cctrl-spawn`. |
+| [`cctrl-spawn`](./cctrl-spawn/SKILL.md) | Spin up a managed session properly from any repo: pick the runtime, create it detached and then attach (never launch an agent straight into a tab), seed a brief, verify boot, and gate on local resources. Counterpart to `cctrl-session-end`. |
 
 ## How these load as skills
 
@@ -15,12 +16,12 @@ These directories are the source. To make them live as agent skills, symlink eac
 into your skill host — e.g. skillshare:
 
 ```sh
-ln -s ~/dev/cctrl/skills/cctrl-fleet-manager ~/.config/skillshare/skills/cctrl-fleet-manager
-ln -s ~/dev/cctrl/skills/cctrl-session-end   ~/.config/skillshare/skills/cctrl-session-end
+ln -s <path-to>/cctrl/skills/cctrl-fleet-manager ~/.config/skillshare/skills/cctrl-fleet-manager
+ln -s <path-to>/cctrl/skills/cctrl-session-end   ~/.config/skillshare/skills/cctrl-session-end
+ln -s <path-to>/cctrl/skills/cctrl-spawn         ~/.config/skillshare/skills/cctrl-spawn
 ```
 
-(This mirrors how mstack skills are symlinked from `~/dev/mstack/skills/`.) The
-symlink is a filesystem artifact; the version-controlled copy lives here. Edit the
+The symlink is a filesystem artifact; the version-controlled copy lives here. Edit the
 doctrine here and every symlinked host picks it up instantly.
 
 `docs/cctrl-fleet-manager.md` is a thin pointer back to this file, so the `docs/`

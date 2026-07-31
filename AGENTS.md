@@ -18,6 +18,10 @@ the invocable skill *is* the doctrine):
   drafts, session harvest, context save), completion reporting, self-close via
   `cctrl close`.
   Counterpart to `cctrl-spawn`.
+- **[skills/cctrl-spawn/SKILL.md](./skills/cctrl-spawn/SKILL.md)** — spin a managed
+  session up properly from any repo: runtime choice, detached-create then attach
+  (never launch an agent straight into a tab), brief seeding, boot verification,
+  and the local resource gate. Counterpart to `cctrl-session-end`.
 
 `docs/` has thin pointers to each; `skills/README.md` explains the
 symlink-into-skillshare setup. Skills contain **no environment specifics** (no
