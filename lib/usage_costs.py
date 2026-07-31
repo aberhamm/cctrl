@@ -246,21 +246,36 @@ def profile_at(ts, all_switches, switch_times):
     return all_switches[idx][2]
 
 
+def encoded_home():
+    """Claude Code's on-disk encoding of $HOME.
+
+    Session transcripts live in ~/.claude/projects/<encoded-cwd>/, where the cwd
+    has every path separator (and dot) rewritten to '-'. Derive that prefix from
+    the running user's HOME instead of hardcoding one, so the project column is
+    correct on any machine and for any username.
+    """
+    return "".join(c if c.isalnum() else "-" for c in HOME)
+
+
 def claude_project_name(projects_dir, session_file):
     rel = os.path.relpath(session_file, projects_dir)
     first = rel.split(os.sep)[0]
-    if os.sep in rel:
-        return first.replace("-Users-matthew--projects-", "").replace("-Users-matthew-", "~").replace("-", "/", 1)
+    if os.sep not in rel:
+        return first
+    enc = encoded_home()
+    if first == enc:
+        return "~"
+    if first.startswith(enc + "-"):
+        # '-Users-me-dev-cctrl' -> '~/dev-cctrl'. The remaining dashes are
+        # genuinely ambiguous (a dir name may contain one), so they are left
+        # alone rather than guessed back into separators.
+        return "~/" + first[len(enc) + 1:]
     return first
 
 
 def codex_project_name(cwd, session_file=None):
     if cwd:
         cwd = cwd.replace(HOME, "~", 1) if cwd.startswith(HOME) else cwd
-        marker = "~/_projects/"
-        if cwd.startswith(marker):
-            rest = cwd[len(marker):]
-            return rest.split("/", 1)[0] or "~/_projects"
         if cwd == "~":
             return "~"
         return os.path.basename(cwd.rstrip("/")) or cwd
