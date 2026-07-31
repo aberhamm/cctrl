@@ -808,7 +808,7 @@ examples:
   cctrl ports --kill 3000-3003         kill processes on ports 3000 through 3003
   cctrl ports --kill 3000,3001,4321 -y kill specific ports, skip confirmation
   cctrl ports --kill 3000 --force      SIGKILL instead of SIGTERM
-  cctrl ports --discover ~/_projects  scan project files for port refs, add to history
+  cctrl ports --discover ~/dev        scan project files for port refs, add to history
   cctrl ports --discover . -y         same, skip confirmation
   cctrl ports --history               show all ports ever seen, compact range notation
   cctrl ports --known                 list well-known ports always excluded from suggestions

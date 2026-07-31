@@ -22,7 +22,7 @@ MCP plans build on.
 
 **Acceptance criteria:**
 
-- [ ] `cctrl peer register comet --dir /Users/matthew/_projects/comet-automation --agent codex` saves a peer to `data/peers.json`
+- [ ] `cctrl peer register comet --dir ~/dev/comet-automation --agent codex` saves a peer to `data/peers.json`
 - [ ] `cctrl peer ls --json` lists manually registered peers and derived cctrl-managed tmux sessions, including each peer's `purpose` when available
 - [ ] `cctrl peer resolve comet --json` returns a single normalized peer object with name, aliases, host, dir, agent, session, purpose, computed tmux target, and capabilities
 - [ ] `cctrl peer alias comet comet-agent` adds an alias that resolves to the same peer
@@ -56,7 +56,7 @@ Testing approach: unit-only.
     "name": "comet",
     "aliases": ["comet-agent"],
     "host": "local",
-    "dir": "/Users/matthew/_projects/comet-automation",
+    "dir": "~/dev/comet-automation",
     "agent": "codex",
     "session": "comet",
     "purpose": "PiKVM automation work",

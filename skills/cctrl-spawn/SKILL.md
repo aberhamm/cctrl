@@ -27,8 +27,8 @@ Concrete environment bits — how to open a session in a terminal **tab**, the S
 alias to reach the orchestrator host, the tmux socket setup, and the local
 resource gate — live in a **private env brief**. Load it before the tab step:
 
-> **Private env brief:** `~/dev/homelab/fleet/spawn-env.md` (adjust path to your
-> setup). If it is missing, do the create step below and hand the user the
+> **Private env brief:** `<your-private-infra-repo>/fleet/spawn-env.md`. If it is
+> missing, do the create step below and hand the user the
 > `cctrl session attach <id>` command instead of opening a tab yourself.
 
 ## When a new session is the right tool
