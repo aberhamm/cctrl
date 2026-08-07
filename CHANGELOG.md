@@ -4,7 +4,45 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - 2026-07-31
+## [Unreleased] - 2026-08-06
+
+### Added
+- **Persisted `conversation_id`** (plan 051): session records now carry a
+  `conversation_id` field (Claude's `sessionId` / transcript UUID) and
+  `transcript_path`, both surviving process death. Populated at launch time for
+  `--resume` launches and by a best-effort background poll for fresh launches.
+  `session ls` and `session doctor` refresh the stored value when they observe a
+  non-empty live value that differs from the record. Records with no recoverable
+  UUID carry `null`.
+- `cctrl session backfill-ids [--dry-run] [--apply] [--json]`: backfill
+  `conversation_id` on all session records from `--resume`/`-r` UUIDs in the
+  record's `launch_command`. Anchored on the flag (never matches bare UUIDs in
+  paths). Reports three counts: filled, already-set, unrecoverable. Dry-run is
+  the default.
+- `_session_update_metadata_field`: read-modify-write of a single field via
+  same-dir `mktemp` + `mv` for atomicity. Never creates a partial record.
+- `cctrl session snapshot [--dir PATH] [--allow-empty] [--json] [--quiet]`
+  captures the live fleet to `data/snapshots/latest.json` plus a timestamped
+  history file, with atomic writes, an empty-fleet guard that preserves the
+  last good snapshot when the fleet is empty (e.g. at boot), and retention
+  pruning (7 days full, then daily up to 90). A `contrib/launchd/` template
+  runs it every 5 minutes so the fleet state survives an unplanned power loss.
+  `session doctor` warns when the timer is not installed or snapshots are stale.
+- `cctrl session restore [--from PATH] [--only PATTERN] [--dry-run] [--limit N]
+  [--yes] [--stale-ok] [--force-host] [--json] [--quiet]` reads a fleet
+  snapshot and respawns sessions by resuming their conversations (plan 053).
+  Human-in-the-loop: waves are operator-released (interactive) or gate-paced
+  (`--yes`), never inferred from pane state. Launch configuration (model,
+  permission-mode, peer, profile, etc.) is replayed from the snapshot.
+  Idempotent: re-run the same command to continue where you left off.
+
+### Fixed
+- `_active_session_count` now counts only managed sessions (was counting all tmux
+  sessions including unmanaged ones).
+- Failed session metadata writes now show a warning on all launches, not just
+  `--peer` launches.
+
+## 2026-07-31
 
 Peers became addressable as live agents, not just mailboxes: direct tmux chat by
 peer name, a one-call orientation command, atomic reply, and an inline delivery

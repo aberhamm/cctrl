@@ -308,6 +308,104 @@ but never given a user turn. It is a dry run until `--yes`, always excludes the
 session you are calling from, and excludes attached sessions unless you pass
 `--force`.
 
+#### Fleet snapshots
+
+`cctrl session snapshot` captures the live fleet to a single JSON file —
+every session's name, state, conversation ID, transcript path, working
+directory, purpose, and launch flags. A launchd timer runs it every 5
+minutes so the fleet state survives an unplanned power loss.
+
+```bash
+cctrl session snapshot                # write data/snapshots/latest.json
+cctrl session snapshot --json         # also print the snapshot to stdout
+cctrl session snapshot --dir /tmp/s   # custom snapshot directory
+```
+
+Snapshots are written atomically (same-dir `mktemp` + `mv`) and carry an
+**empty-fleet guard**: if the capture yields zero sessions but the existing
+`latest.json` has sessions in it, the file is preserved. This prevents a
+snapshot taken at boot (or while the tmux server is down) from overwriting
+the only record of the fleet you are trying to restore. `--allow-empty`
+overrides.
+
+**Retention:** Every history file younger than 7 days is kept at full
+5-minute granularity. Older than 7 days, only the first file of each UTC
+day is kept, up to 90 days. Steady-state disk usage is under 30 MB.
+
+**Timer install** (per-user LaunchAgent, not installed automatically):
+
+```bash
+# Fill in placeholders
+sed "s|@CCTRL_BIN@|$(which cctrl)|; s|@HOME@|$HOME|" \
+    contrib/launchd/com.cctrl.session-snapshot.plist.template \
+    > ~/Library/LaunchAgents/com.cctrl.session-snapshot.plist
+
+# Load it
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cctrl.session-snapshot.plist
+```
+
+#### Session restore
+
+`cctrl session restore` reads a fleet snapshot and respawns sessions by
+resuming their conversations. It is the rebuild command after a power loss
+or reboot — one command, gated on memory, waved, dry-runnable, and
+idempotent (re-run the same command to continue where you left off).
+
+```bash
+cctrl session restore --dry-run          # show the plan; spawn nothing
+cctrl session restore --yes              # run non-interactively (required for no TTY)
+cctrl session restore --only homelab     # filter by name/label/purpose/cwd
+cctrl session restore --from <path>      # use a specific snapshot file
+cctrl session restore --limit 4          # cap spawns in this invocation
+```
+
+**Resume the conversation; never replay `initial_prompt`.** Those stored
+prompts reference sibling sessions that no longer exist. A session with no
+`conversation_id` is reported and skipped, full stop.
+
+**Waves and the resource gate.** Sessions spawn in waves of
+`CCTRL_RESTORE_WAVE_SIZE` (default 2). In interactive mode, the operator
+releases each wave (`y` to proceed, `N` or `q` to stop at the boundary).
+In non-interactive mode (`--yes`), waves advance after a fixed pause
+(`CCTRL_RESTORE_WAVE_PAUSE`, default 60s) and a memory/swap re-check.
+The cap stops when live managed sessions reach `CCTRL_RESTORE_MAX_ACTIVE`
+(default 8).
+
+**Answering the resume picker.** When a session has a large transcript
+(above ~1 MB), Claude shows a resume picker. The restore report tells you
+which sessions to expect it for, with the `tmux attach -t <name>` command.
+Attach, press Enter (option 1 "Resume from summary" is preselected), and
+detach. Restore itself never captures panes or injects keystrokes.
+
+**Launch configuration replay.** Restore threads `model`, `permission-mode`,
+`profile`, `peer`, `sandbox`, `--no-bridge`, and `agent` from the snapshot's
+`launch_flags` back onto the spawn argv. A third of the fleet runs with
+explicit `--model`; without replay every session comes back on defaults.
+
+#### Persisted conversation_id
+
+Each session record (`data/sessions/*.json`) carries a `conversation_id` field
+(Claude's `sessionId` / transcript UUID) that survives process death. It is
+populated at launch time for `--resume` launches, and by a best-effort background
+poll for fresh launches. `session ls` and `session doctor` refresh the stored
+value whenever they observe a non-empty live value that differs from the record.
+
+Records created before this field existed, and sessions whose conversation could
+not be resolved, carry `conversation_id: null`. A companion `transcript_path`
+field records the transcript file location.
+
+```bash
+cctrl session backfill-ids              # preview: show what would be filled (dry-run, default)
+cctrl session backfill-ids --apply      # actually write the backfilled ids
+cctrl session backfill-ids --json       # structured output with per-record status
+```
+
+`backfill-ids` operates on all session records (live and dead). It extracts
+conversation UUIDs only from `--resume`/`-r` flags in the record's
+`launch_command`, never from bare UUIDs that may appear elsewhere (e.g. in
+scratchpad paths). Records with no recoverable UUID remain `null`. The verb
+reports three counts: filled, already-set, and unrecoverable.
+
 #### The low-memory launch guard
 
 Before creating another session, `cctrl start` checks free memory and refuses to
