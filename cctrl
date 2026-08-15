@@ -2186,6 +2186,25 @@ _peer_all_json() {
     _peer_all_json_build
 }
 
+_peer_fleet_peers() {
+    [[ -f "$HOSTS_FILE" ]] || { echo '[]'; return; }
+    local alias hostname rc raw peers_json result="[]"
+    while IFS=$'\t' read -r alias hostname; do
+        [[ -n "$alias" ]] || continue
+        _host_is_local "$hostname" && continue
+        rc=0
+        raw="$(_fleet_remote_peers "$alias")" || rc=$?
+        if [[ $rc -eq 0 && -n "$raw" ]] \
+            && printf '%s' "$raw" | jq -e '.peers' >/dev/null 2>&1; then
+            peers_json="$(jq -c --arg host "$alias" '
+                [.peers[] | . + {host: $host, source: "remote"}]
+            ' <<< "$raw")"
+            result="$(jq -c --argjson existing "$result" '. as $new | $existing + $new' <<< "$peers_json")"
+        fi
+    done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.hostname)"' "$HOSTS_FILE" 2>/dev/null)
+    printf '%s\n' "$result"
+}
+
 _peer_all_json_cache_begin() {
     local doc
     doc="$(_peer_all_json_build)" || return 1
@@ -2419,16 +2438,27 @@ _peer_cmd_unregister() {
 }
 
 _peer_cmd_ls() {
-    local json=false a doc
+    local json=false fleet=false a doc
     for a in "$@"; do
         case "$a" in
             --json) json=true ;;
+            --fleet) fleet=true ;;
             *)
                 echo -e "${RED}Unknown peer ls flag: $a${RESET}" >&2
                 return 1 ;;
         esac
     done
     doc="$(_peer_all_json)" || return 1
+    if $fleet; then
+        local remote_peers
+        remote_peers="$(_peer_fleet_peers)"
+        if [[ -n "$remote_peers" && "$remote_peers" != "[]" ]]; then
+            doc="$(jq -c --slurpfile remote <(echo "$remote_peers") '
+                .peers = (.peers + $remote[0])
+                | .fleet = true
+            ' <<< "$doc")"
+        fi
+    fi
     if $json; then
         jq '.' <<< "$doc"
         return
@@ -2813,7 +2843,7 @@ _peer_help_agent_json() {
 # is resolved locally against the single document; the MCP `peer_overview` tool is a
 # thin passthrough to `peer overview --json`.
 _peer_cmd_overview() {
-    local as_identity="" json=false identity doc matches count peer_json messages
+    local as_identity="" json=false fleet=false identity doc matches count peer_json messages
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -2822,6 +2852,8 @@ _peer_cmd_overview() {
                 as_identity="$2"; shift 2 ;;
             --json)
                 json=true; shift ;;
+            --fleet)
+                fleet=true; shift ;;
             *)
                 $json && _json_error "validation" "Unknown peer overview flag: $1" || echo -e "${RED}Unknown peer overview flag: $1${RESET}" >&2
                 return 64 ;;
@@ -2838,6 +2870,17 @@ _peer_cmd_overview() {
 
     # ONE enumeration. Everything below is derived from $doc.
     doc="$(_peer_all_json)" || return 1
+
+    if $fleet; then
+        local remote_peers
+        remote_peers="$(_peer_fleet_peers)"
+        if [[ -n "$remote_peers" && "$remote_peers" != "[]" ]]; then
+            doc="$(jq -c --slurpfile remote <(echo "$remote_peers") '
+                .peers = (.peers + $remote[0])
+                | .fleet = true
+            ' <<< "$doc")"
+        fi
+    fi
 
     # Resolve identity against the single document (mirrors _peer_resolve_json's
     # matching without a second _peer_all_json walk).
@@ -2881,7 +2924,8 @@ _peer_cmd_overview() {
               )
             },
             derived_skipped: ($doc.derived_skipped // false),
-            derived_skip_reason: ($doc.derived_skip_reason // null)
+            derived_skip_reason: ($doc.derived_skip_reason // null),
+            fleet: ($doc.fleet // false)
           }')"
 
     if $json; then
@@ -3142,7 +3186,7 @@ _peer_cmd_send() {
     [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>${RESET}" >&2; return 64; }
     shift
 
-    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false
+    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false sender_host_override=""
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3158,6 +3202,9 @@ _peer_cmd_send() {
             --body-file)
                 [[ $# -ge 2 ]] || { $json && _json_error "validation" "--body-file needs a value" || echo -e "${RED}--body-file needs a value${RESET}" >&2; return 64; }
                 body_file="$2"; shift 2 ;;
+            --sender-host)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--sender-host needs a value" || echo -e "${RED}--sender-host needs a value${RESET}" >&2; return 64; }
+                sender_host_override="$2"; shift 2 ;;
             --allow-unknown)
                 allow_unknown=true; shift ;;
             --deliver)
@@ -3210,6 +3257,7 @@ _peer_cmd_send() {
         [[ -n "$from" ]] && send_flags+=(--from "$from")
         [[ -n "$as_identity" ]] && send_flags+=(--as "$as_identity")
         [[ -n "$subject" ]] && send_flags+=(--subject "$subject")
+        [[ -n "$sender_host_override" ]] && send_flags+=(--sender-host "$sender_host_override")
         _peer_all_json_cache_begin >/dev/null 2>&1 || true
         _peer_send_and_deliver "$to" "$body" ${send_flags[@]+"${send_flags[@]}"} || true
         local _sd_rc=$PEER_SD_RC
@@ -3301,6 +3349,9 @@ _peer_cmd_send() {
             | with_entries(select(.value != null))')"
     else
         sender_json="$(jq -cn --arg name "$from" '{name: $name}')"
+    fi
+    if [[ -n "$sender_host_override" ]]; then
+        sender_json="$(jq -c --arg h "$sender_host_override" '. + {host: $h}' <<< "$sender_json")"
     fi
 
     _mailbox_lock_acquire || return 1
@@ -3796,6 +3847,51 @@ _peer_reachability_class() {
     printf 'live\n'
 }
 
+# ── Claude Code socket delivery adapter ─────────────────────────────
+# Resolve a peer's tmux session name to a Claude Code messaging socket.
+# Reads ~/.claude/sessions/*.json, matches the tmux_target against the
+# parenthesized session name, and returns the socket path. Returns 1
+# if no matching live socket is found.
+_peer_claude_socket_for() {
+    local tmux_target="$1" sessions_dir="$HOME/.claude/sessions" f name sock
+    [[ -d "$sessions_dir" ]] || return 1
+    for f in "$sessions_dir"/*.json; do
+        [[ -f "$f" ]] || continue
+        name="$(jq -r '.name // ""' "$f" 2>/dev/null)"
+        [[ "$name" == *"($tmux_target)"* ]] || continue
+        sock="$(jq -r '.messagingSocketPath // ""' "$f" 2>/dev/null)"
+        [[ -n "$sock" && -S "$sock" ]] || continue
+        printf '%s' "$sock"
+        return 0
+    done
+    return 1
+}
+
+_peer_socket_deliver() {
+    local socket_path="$1" payload="$2"
+    if command -v socat >/dev/null 2>&1; then
+        printf '{"type":"user","message":{"role":"user","content":%s}}\n' \
+            "$(jq -Rs '.' <<< "$payload")" \
+            | socat -t2 - UNIX-CONNECT:"$socket_path" >/dev/null 2>&1
+        return $?
+    fi
+    if command -v node >/dev/null 2>&1; then
+        local escaped
+        escaped="$(jq -Rs '.' <<< "$payload")"
+        node -e "
+const net=require('net');
+const c=net.createConnection('$socket_path',()=>{
+  c.write(JSON.stringify({type:'user',message:{role:'user',content:$escaped}})+'\n');
+  c.end();
+});
+c.on('error',()=>process.exit(1));
+c.on('end',()=>process.exit(0));
+" >/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
 _peer_tmux_target_for_delivery() {
     local peer_json="$1" peer target class
     peer="$(jq -r '.name' <<< "$peer_json")"
@@ -3904,8 +4000,8 @@ _peer_tmux_paste() {
 }
 
 _peer_record_nudge_json() {
-    local messages="$1" peer="$2" ok="$3" error="$4" now="$5" count_it="${6:-true}"
-    jq --arg peer "$peer" --arg now "$now" --arg error "$error" --argjson ok "$ok" --argjson countit "$count_it" '
+    local messages="$1" peer="$2" ok="$3" error="$4" now="$5" count_it="${6:-true}" adapter="${7:-tmux}"
+    jq --arg peer "$peer" --arg now "$now" --arg error "$error" --argjson ok "$ok" --argjson countit "$count_it" --arg adapter "$adapter" '
         map(
           if .to == $peer and .status == "queued" then
             (if $countit then .nudge_count = ((.nudge_count // 0) + 1) else . end)
@@ -3913,7 +4009,7 @@ _peer_record_nudge_json() {
             | (if $countit then .last_nudge_at = $now else . end)
             | .last_nudge_error = (if $error == "" then null else $error end)
             | .history = ((.history // []) + [
-                ({at: $now, event: "nudge", ok: $ok, by: "cctrl", adapter: "tmux"}
+                ({at: $now, event: "nudge", ok: $ok, by: "cctrl", adapter: $adapter}
                  + (if $error == "" then {} else {error: $error} end))
               ])
           else . end
@@ -4114,6 +4210,29 @@ _peer_deliver_one_locked() {
         PEER_DELIVER_SUBMITTED="$submit"
         _peer_delivery_result_json
         return 0
+    fi
+
+    # Socket adapter: try Claude Code native socket before tmux paste.
+    # Faster, no tmux dependency, no pane-readiness check needed.
+    local _sock_target _sock_path
+    _sock_target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+    if [[ -n "$_sock_target" ]] && _sock_path="$(_peer_claude_socket_for "$_sock_target")"; then
+        if _peer_socket_deliver "$_sock_path" "$payload"; then
+            now="$(_peer_now_utc)"
+            if [[ -n "$inline_id" ]]; then
+                PEER_DELIVER_STATUS="socket"
+                updated="$(_peer_record_inline_json "$messages" "$inline_id" true "" "$now")"
+            else
+                PEER_DELIVER_STATUS="nudged"
+                updated="$(_peer_record_nudge_json "$messages" "$peer" true "" "$now" true "socket")"
+                PEER_DELIVER_SUBMITTED="$submit"
+            fi
+            PEER_DELIVER_TARGET="$_sock_path"
+            _mailbox_rewrite_json_locked "$updated"
+            _peer_delivery_result_json
+            return 0
+        fi
+        # Socket delivery failed — fall through to tmux paste
     fi
 
     if ! _peer_tmux_target_for_delivery "$peer_json"; then
@@ -4326,6 +4445,77 @@ _peer_cmd_deliver() {
     return $rc
 }
 
+# Cross-machine send+deliver: forward the operation to a remote host via SSH.
+# The message is written to the REMOTE mailbox and delivered by REMOTE adapters,
+# so `peer recv` on that machine finds it. Sets PEER_SD_* globals like the local
+# path, with PEER_SD_REMOTE_HOST populated for the emitter.
+_peer_send_and_deliver_remote() {
+    local to="$1" body="$2" remote_host="$3"; shift 3
+    local -a extra_flags=("$@")
+    local lookup hostname user ssh_target sender_as="" sender_host result rc=0
+
+    lookup="$(_host_lookup "$remote_host")"
+    if [[ -z "$lookup" ]]; then
+        PEER_SD_OUTCOME="send-failed"
+        PEER_SD_RC=1
+        PEER_SD_SEND_JSON="$(jq -cn --arg h "$remote_host" '{ok:false,error:{code:"unknown-host",message:("No SSH target for host \"\($h)\". Register it: cctrl host add \($h) <hostname> [--user <user>]")}}')"
+        return 1
+    fi
+    hostname="${lookup%% *}"
+    user="${lookup#* }"
+    [[ -n "$user" ]] && ssh_target="${user}@${hostname}" || ssh_target="$hostname"
+
+    local i=0
+    while (( i < ${#extra_flags[@]} )); do
+        case "${extra_flags[$i]}" in
+            --as|--from) sender_as="${extra_flags[$((i+1))]}"; break ;;
+        esac
+        ((i++))
+    done
+    [[ -z "$sender_as" ]] && sender_as="${CCTRL_PEER:-user}"
+    sender_host="${CCTRL_HOST_PREFIX:-local}"
+
+    local quoted_args=""
+    quoted_args+=" $(printf '%q' "$to")"
+    quoted_args+=" --as $(printf '%q' "$sender_as")"
+    quoted_args+=" --sender-host $(printf '%q' "$sender_host")"
+    quoted_args+=" --deliver --json --body-file -"
+    local j=0
+    while (( j < ${#extra_flags[@]} )); do
+        case "${extra_flags[$j]}" in
+            --subject) quoted_args+=" --subject $(printf '%q' "${extra_flags[$((j+1))]}")"; ((j+=2)); continue ;;
+        esac
+        ((j++))
+    done
+
+    result="$(printf '%s' "$body" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
+        "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=$(printf '%q' "$remote_host") cctrl peer send${quoted_args}" 2>/dev/null)" || rc=$?
+
+    if [[ $rc -ne 0 && -z "$result" ]]; then
+        PEER_SD_OUTCOME="send-failed"
+        PEER_SD_RC=1
+        PEER_SD_SEND_JSON="$(jq -cn --arg h "$remote_host" --arg t "$ssh_target" --arg rc "$rc" \
+            '{ok:false,error:{code:"ssh-failed",message:"SSH to \($h) (\($t)) failed (exit \($rc))"}}')"
+        return 1
+    fi
+
+    PEER_SD_SEND_JSON="$result"
+    PEER_SD_MESSAGE_ID="$(jq -r '.message_id // .id // ""' <<< "$result" 2>/dev/null)"
+    PEER_SD_TO="$(jq -r '.to // ""' <<< "$result" 2>/dev/null)"
+    [[ -z "$PEER_SD_TO" ]] && PEER_SD_TO="$to"
+    PEER_SD_OUTCOME="$(jq -r '.outcome // "sent-remote"' <<< "$result" 2>/dev/null)"
+    PEER_SD_DELIVER_REASON="$(jq -r '.delivery_reason // ""' <<< "$result" 2>/dev/null)"
+    PEER_SD_DELIVER_JSON="$(jq -c '.delivery // {}' <<< "$result" 2>/dev/null)"
+    PEER_SD_REMOTE_HOST="$remote_host"
+
+    case "$PEER_SD_OUTCOME" in
+        sent-and-nudged|sent-and-queued) PEER_SD_RC=0 ;;
+        send-failed) PEER_SD_RC=1 ;;
+        *) PEER_SD_RC=1 ;;
+    esac
+    return "$PEER_SD_RC"
+}
+
 # Shared send-then-deliver core for `peer reply` and `peer send --deliver`
 # (plan 027). Sends via the UNCHANGED `peer send`, then nudges the recipient and
 # classifies the result into one of five named outcomes:
@@ -4355,6 +4545,32 @@ _peer_send_and_deliver() {
     PEER_SD_SEND_JSON=""
     PEER_SD_DELIVER_JSON=""
     PEER_SD_DELIVER_REASON=""
+    PEER_SD_REMOTE_HOST=""
+
+    # Cross-machine routing: if the target peer is known locally with a remote
+    # host, or if it's unknown locally but exists on a remote host, forward the
+    # entire send+deliver there via SSH. The message is written to the REMOTE
+    # mailbox so `peer recv` on that machine finds it.
+    local _route_peer_json _route_host _route_local
+    _route_local="${CCTRL_HOST_PREFIX:-local}"
+    if _route_peer_json="$(_peer_resolve_json "$to" 2>/dev/null)"; then
+        _route_host="$(jq -r '.host // "local"' <<< "$_route_peer_json")"
+        if [[ "$_route_host" != "$_route_local" && "$_route_host" != "local" ]]; then
+            _peer_send_and_deliver_remote "$to" "$body" "$_route_host" ${send_flags[@]+"${send_flags[@]}"}
+            return $?
+        fi
+    elif [[ -f "$HOSTS_FILE" ]]; then
+        local _fleet_peers _fleet_match _fleet_host
+        _fleet_peers="$(_peer_fleet_peers 2>/dev/null)"
+        if [[ -n "$_fleet_peers" && "$_fleet_peers" != "[]" ]]; then
+            _fleet_match="$(jq -c --arg n "$to" '[.[] | select(.name == $n or ((.aliases // []) | index($n)))] | first // empty' <<< "$_fleet_peers" 2>/dev/null)"
+            if [[ -n "$_fleet_match" ]]; then
+                _fleet_host="$(jq -r '.host' <<< "$_fleet_match")"
+                _peer_send_and_deliver_remote "$to" "$body" "$_fleet_host" ${send_flags[@]+"${send_flags[@]}"}
+                return $?
+            fi
+        fi
+    fi
 
     # Step 1: send. The inner `peer send` is plain (no --deliver), so this reuses
     # all of send's resolution/validation/sender-snapshot with zero duplication.
@@ -4443,6 +4659,8 @@ _peer_send_deliver_emit() {
             hint="Message $PEER_SD_MESSAGE_ID is queued; $to's pane is busy so nothing was pasted. Retry DELIVERY ONLY once it clears: cctrl peer deliver $to (re-running this command would duplicate the message)." ;;
     esac
 
+    local remote_host="${PEER_SD_REMOTE_HOST:-}"
+
     if [[ "$json" == "true" ]]; then
         jq -n \
           --argjson base "$PEER_SD_SEND_JSON" \
@@ -4455,8 +4673,10 @@ _peer_send_deliver_emit() {
           --arg ctx "$ctx" \
           --arg ackstate "${PEER_SD_ACK_STATE:-}" \
           --arg ackerror "${PEER_SD_ACK_ERROR:-}" \
+          --arg remote "$remote_host" \
           '$base
            + {ok:$ok, outcome:$outcome, delivered:$delivered, to:$to, message_id:($base.id // null)}
+           + (if $remote != "" then {remote_host:$remote} else {} end)
            + (if $reason != "" then {delivery_reason:$reason} else {} end)
            + (if $hint != "" then {hint:$hint} else {} end)
            + (if $ctx == "reply" and $ackstate != "" then
@@ -4466,11 +4686,13 @@ _peer_send_deliver_emit() {
                {note:"reply-by-message-id still fails once the sender'"'"'s session is gone; addresses are tmux-session-derived until plans 028/029."}
              else {} end)'
     else
+        local via=""
+        [[ -n "$remote_host" ]] && via=" via $remote_host"
         case "$PEER_SD_OUTCOME" in
-            sent-and-nudged)   echo -e "${GREEN}Sent and nudged $to${RESET} (message $PEER_SD_MESSAGE_ID)" ;;
-            sent-and-queued)   echo -e "${GREEN}Sent and queued for $to${RESET} (message $PEER_SD_MESSAGE_ID; $to collects its own mail)" ;;
-            sent-but-deferred) echo -e "${YELLOW}Sent but deferred${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
-            sent-but-undelivered) echo -e "${YELLOW}Sent but not delivered${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
+            sent-and-nudged)   echo -e "${GREEN}Sent and nudged $to${via}${RESET} (message $PEER_SD_MESSAGE_ID)" ;;
+            sent-and-queued)   echo -e "${GREEN}Sent and queued for $to${via}${RESET} (message $PEER_SD_MESSAGE_ID; $to collects its own mail)" ;;
+            sent-but-deferred) echo -e "${YELLOW}Sent but deferred${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
+            sent-but-undelivered) echo -e "${YELLOW}Sent but not delivered${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
         esac
         if [[ "$ctx" == "reply" ]]; then
             case "${PEER_SD_ACK_STATE:-}" in
@@ -9043,6 +9265,17 @@ _fleet_remote_sessions() {
     fi
     ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
         "source ~/.zprofile 2>/dev/null; cctrl session ls --json" 2>/dev/null
+}
+
+_fleet_remote_peers() {
+    local host_alias="$1" lookup hostname user ssh_target
+    lookup="$(_host_lookup "$host_alias")"
+    [[ -z "$lookup" ]] && return 1
+    hostname="${lookup%% *}"
+    user="${lookup#* }"
+    [[ -n "$user" ]] && ssh_target="${user}@${hostname}" || ssh_target="$hostname"
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
+        "source ~/.zprofile 2>/dev/null; cctrl peer ls --json" 2>/dev/null
 }
 
 _fleet_tag() {

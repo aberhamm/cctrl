@@ -223,3 +223,31 @@ should set `CCTRL_PEER` guidance in its output since the env var can't be export
 into an already-running agent process.
 
 **Depends on / blocked by:** plans 002 and 008 shipped.
+
+## livesync-cli launchd service not loaded after power cycle
+
+**What:** The `com.livesync-cli` daemon plist exists at `/Library/LaunchDaemons/com.livesync-cli.plist`
+but is not loaded. `sudo launchctl bootstrap system <path>` fails with `Input/output error` (exit 5).
+The service was cleanly shut down (SIGTERM in logs) and never restarted.
+
+**Why:** Without livesync, changes to cctrl (and other synced repos) don't propagate from the
+Mac Studio to the MacBook Pro automatically. The cross-machine peer messaging feature depends
+on both machines having the same cctrl script. Currently requires manual `scp` after edits.
+
+**Impact:** Low urgency (manual scp works), but silently degrades the fleet workflow — edits
+to cctrl, homelab, or obsidian-vault on the Studio don't reach the MacBook until noticed.
+
+**Fix:** Run in a GUI terminal (launchctl bootstrap needs interactive context):
+```bash
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.livesync-cli.plist
+# If that still fails, check the wrapper script and node version:
+bash /Users/matthew/scripts/livesync-cli-wrapper.sh  # manual test
+```
+If the I/O error persists, the plist may need re-signing or the service identity may be
+stale after a macOS update. Check `log show --predicate 'subsystem == "com.apple.xpc.launchd"' --last 5m`.
+
+**Wrapper:** `/Users/matthew/scripts/livesync-cli-wrapper.sh`
+**Logs:** `/Users/matthew/apps/livesync-cli/logs/livesync-cli.{stdout,stderr}.log`
+**Last log entry:** clean SIGTERM shutdown, CouchDB target at `http://100.67.240.85:5984/obsidian`
+
+**Depends on / blocked by:** nothing; fix requires Matthew in a GUI terminal on ms-128g-bln.
