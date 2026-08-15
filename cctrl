@@ -2510,9 +2510,10 @@ _peer_cmd_ls() {
 # affordances (`peer session`, `peer attach`, `peer say`). Goes through the
 # shared peer JSON resolver so alias/canonical handling and the
 # live-derived-over-stale-manual behavior stay consistent — it never reads
-# data/peers.json directly. Peer host metadata is descriptive, not a transport:
+# data/peers.json directly. For direct-chat affordances (say/attach/session),
 # a peer whose `.host` differs from the current host label is rejected with a
-# `--host` hint rather than auto-SSH'd.
+# `--host` hint. For durable messaging (send --deliver, reply), cross-host
+# routing is automatic via _peer_send_and_deliver_remote.
 #
 # Sets PEER_DIRECT_{NAME,LABEL,TARGET,HOST,LIVE,STATUS,REASON}. Returns 0 for a
 # live local target; non-zero otherwise (STATUS in unknown-peer / remote-host /
