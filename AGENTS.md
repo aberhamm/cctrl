@@ -57,6 +57,14 @@ itself. This is the operating contract; commands take real flags as shown.
 - **Send:** find a peer with `cctrl peer overview` (or `cctrl peer ls`), then
   `cctrl peer send <peer> --as <you> --json -- "<body>"` and deliver it.
 - Received messages carry a `sender` object; reply to `sender.name`.
+- **Cross-machine:** `cctrl peer send` routes transparently across machines
+  via SSH. Remote peers appear in `cctrl peer ls` / `cctrl peer overview` with
+  a different host label — no special flags needed. The routing is automatic
+  based on the peer's `host` field vs `CCTRL_HOST_PREFIX`.
+- **Do NOT use Claude Code's built-in `SendMessage`/`ListAgents`** for peer
+  messaging. Those tools discover peers through local `~/.claude/sessions/`
+  files and cannot reach sessions on other machines. Always use the cctrl peer
+  tools (`send_message` MCP tool or `cctrl peer send` CLI).
 - **Limitation:** derived peer names are tmux session names, so an address can
   dangle once that session closes. Treat a `sender` snapshot as historical and
   verify liveness with `cctrl peer ls` before relying on it.

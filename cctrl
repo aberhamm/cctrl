@@ -554,6 +554,15 @@ _launch_exec_agent() {
         fi
         $_chrome_flag_set || LAUNCH_FLAGS+=("--chrome")
 
+        # Auto-register the peer MCP server when --peer was used so the
+        # Claude agent has cctrl peer tools (send_message, etc.) available.
+        if [[ -n "${CCTRL_PEER:-}" ]]; then
+            local _peer_mcp_json
+            _peer_mcp_json=$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' \
+                "$SCRIPT_DIR/cctrl" "$CCTRL_PEER")
+            LAUNCH_FLAGS+=("--mcp-config" "$_peer_mcp_json")
+        fi
+
         [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
         [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
 

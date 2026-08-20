@@ -110,7 +110,11 @@ TOOLS = [
             "sent-but-undelivered) whenever the message was durably queued; only "
             "send-failed (nothing queued) is ok:false. On sent-but-* the message id "
             "is returned so delivery can be retried alone — never resend, or the "
-            "message duplicates."
+            "message duplicates. Routes transparently across machines — local "
+            "and remote peers are handled identically, no special flags needed. "
+            "Do NOT use Claude Code's built-in SendMessage/ListAgents for peer "
+            "messaging; those are local-only and cannot reach peers on other "
+            "machines."
         ),
         "inputSchema": {
             "type": "object",
