@@ -566,8 +566,18 @@ _launch_exec_agent() {
         [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
         [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
 
-        echo -e "${DIM}claude ${LAUNCH_FLAGS[*]}${RESET}"
-        exec claude "${LAUNCH_FLAGS[@]}"
+        if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]]; then
+            # tmux sessions use the wrapper so `cctrl restart` can re-launch
+            # with --resume (fresh process, fresh config, same context).
+            local _restart_marker="${TMPDIR:-/tmp}/cctrl-restart-${CCTRL_SESSION_NAME:-$$}"
+            rm -f "$_restart_marker"
+            export CCTRL_RESTART_MARKER="$_restart_marker"
+            echo -e "${DIM}claude ${LAUNCH_FLAGS[*]}${RESET}"
+            exec "$SCRIPT_DIR/lib/session-wrapper.sh" claude "$_restart_marker" "${LAUNCH_FLAGS[@]}"
+        else
+            echo -e "${DIM}claude ${LAUNCH_FLAGS[*]}${RESET}"
+            exec claude "${LAUNCH_FLAGS[@]}"
+        fi
     fi
 
     if [[ -n "$LAUNCH_PERMISSION_MODE" && "$LAUNCH_PERMISSION_MODE" != "bypassPermissions" ]]; then
@@ -592,13 +602,29 @@ _launch_exec_agent() {
         else
             [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("--last" "$final_prompt")
         fi
-        echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]}${RESET}"
-        exec codex resume "${LAUNCH_FLAGS[@]}"
+        if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]]; then
+            local _restart_marker="${TMPDIR:-/tmp}/cctrl-restart-${CCTRL_SESSION_NAME:-$$}"
+            rm -f "$_restart_marker"
+            export CCTRL_RESTART_MARKER="$_restart_marker"
+            echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]}${RESET}"
+            exec "$SCRIPT_DIR/lib/session-wrapper.sh" codex "$_restart_marker" "${LAUNCH_FLAGS[@]}"
+        else
+            echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]}${RESET}"
+            exec codex resume "${LAUNCH_FLAGS[@]}"
+        fi
     fi
 
     [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
-    echo -e "${DIM}codex ${LAUNCH_FLAGS[*]}${RESET}"
-    exec codex "${LAUNCH_FLAGS[@]}"
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]]; then
+        local _restart_marker="${TMPDIR:-/tmp}/cctrl-restart-${CCTRL_SESSION_NAME:-$$}"
+        rm -f "$_restart_marker"
+        export CCTRL_RESTART_MARKER="$_restart_marker"
+        echo -e "${DIM}codex ${LAUNCH_FLAGS[*]}${RESET}"
+        exec "$SCRIPT_DIR/lib/session-wrapper.sh" codex "$_restart_marker" "${LAUNCH_FLAGS[@]}"
+    else
+        echo -e "${DIM}codex ${LAUNCH_FLAGS[*]}${RESET}"
+        exec codex "${LAUNCH_FLAGS[@]}"
+    fi
 }
 
 _log_event() {
@@ -8288,6 +8314,84 @@ _session_close() {
     fi
 }
 
+cmd_restart() {
+    # Restart the current session in place: fresh process, fresh config
+    # (MCP servers, CLAUDE.md, settings), same conversation context via
+    # --resume. Only works inside a tmux session launched through cctrl
+    # (the session-wrapper.sh must be the pane process).
+    #
+    # Writes a restart marker containing the current session ID, then
+    # sends /exit to the agent. The wrapper detects the marker on exit
+    # and re-launches with --resume.
+
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        echo "Usage: cctrl restart"
+        echo ""
+        echo "  Restart the current session to pick up config changes"
+        echo "  (MCP servers, CLAUDE.md, settings, hooks)."
+        echo ""
+        echo "  The conversation context is preserved via --resume."
+        echo "  Only works inside a cctrl-managed tmux session."
+        return 0
+    fi
+
+    if [[ "${CCTRL_SESSION_KIND:-}" != "tmux" ]]; then
+        echo -e "${RED}cctrl restart only works inside a cctrl-managed tmux session.${RESET}" >&2
+        return 1
+    fi
+
+    local marker="${CCTRL_RESTART_MARKER:-}"
+    if [[ -z "$marker" ]]; then
+        echo -e "${RED}No restart marker path set (CCTRL_RESTART_MARKER).${RESET}" >&2
+        echo -e "${DIM}This session may have been started before the restart feature was added.${RESET}" >&2
+        echo -e "${DIM}Close and re-create it to enable restart support.${RESET}" >&2
+        return 1
+    fi
+
+    # Get the session ID for --resume. Try env var first (set by Claude Code),
+    # then fall back to cctrl's session metadata.
+    local session_id="${CLAUDE_CODE_SESSION_ID:-}"
+    if [[ -z "$session_id" ]]; then
+        local sess_name
+        sess_name="$(_session_current_name 2>/dev/null || true)"
+        if [[ -n "$sess_name" ]]; then
+            session_id="$(_session_id "$sess_name" 2>/dev/null || true)"
+        fi
+    fi
+
+    if [[ -z "$session_id" ]]; then
+        echo -e "${RED}Could not determine the current session ID for --resume.${RESET}" >&2
+        echo -e "${DIM}Neither CLAUDE_CODE_SESSION_ID nor session metadata available.${RESET}" >&2
+        return 1
+    fi
+
+    # Write the restart marker. The wrapper reads this after the agent exits.
+    printf '%s' "$session_id" > "$marker"
+
+    echo -e "${GREEN}✓${RESET} Restart marker written (session: ${DIM}${session_id}${RESET})"
+    echo -e "${DIM}Restarting with fresh config in 3s...${RESET}"
+
+    # Schedule the agent process kill in the background so this command
+    # returns cleanly to the calling agent before the process dies.
+    # The wrapper (session-wrapper.sh) will see the marker and re-launch
+    # with --resume after the agent exits.
+    (
+        sleep 3
+        # Find the agent process: it's the tmux pane's command's child chain.
+        # The wrapper is the pane command; the agent is its direct child.
+        local _pane_pid _agent_pid
+        _pane_pid="$(tmux display-message -p '#{pane_pid}' 2>/dev/null || true)"
+        if [[ -n "$_pane_pid" ]]; then
+            _agent_pid="$(ps -ax -o pid=,ppid= 2>/dev/null \
+                | awk -v pp="$_pane_pid" '$2==pp {print $1; exit}')"
+            if [[ -n "$_agent_pid" ]]; then
+                kill -TERM "$_agent_pid" 2>/dev/null || true
+            fi
+        fi
+    ) &
+    disown
+}
+
 _duration_to_ms() {
     # Parse a compact duration (Nd / Nh / Nm / Ns) to epoch-milliseconds.
     # Echo the ms value; return non-zero on an unparseable input.
@@ -10367,6 +10471,7 @@ _dispatch() {
         fleet) cmd_fleet "$@" ;;
         needs-me|needsme|needs_me) cmd_needs_me "$@" ;;
         close) cmd_session close "$@" ;;
+        restart) cmd_restart "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         statusline|status-line) cmd_statusline "$@" ;;
