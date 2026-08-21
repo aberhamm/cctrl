@@ -153,6 +153,85 @@ _config_default_agent() {
     esac
 }
 
+_heuristic_title() {
+    local prompt="$1" repo_name="$2"
+    local short full_wc
+    short="$(printf '%s' "$prompt" | tr '\n' ' ' | tr -s ' ' | cut -d' ' -f1-8)"
+    full_wc=$(printf '%s' "$prompt" | wc -w | tr -d ' ')
+    (( full_wc > 8 )) && short+="..."
+    if (( ${#short} > 60 )); then
+        short="${short:0:57}..."
+    fi
+    if [[ -n "$repo_name" ]]; then
+        printf '%s: %s' "$repo_name" "$short"
+    else
+        printf '%s' "$short"
+    fi
+}
+
+_llm_generate_title() {
+    local endpoint="$1" model="$2" prompt="$3" repo_name="$4"
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v jq >/dev/null 2>&1 || return 1
+
+    local fmt_hint
+    if [[ -n "$repo_name" ]]; then
+        fmt_hint="Format: '${repo_name}: action'."
+    else
+        fmt_hint="Format: 'repo: action'."
+    fi
+    local system_msg="Generate a concise session title (3-8 words) for this coding task. ${fmt_hint} Reply with ONLY the title, no quotes or explanation."
+
+    local user_msg="$prompt"
+    if (( ${#user_msg} > 500 )); then
+        user_msg="${user_msg:0:500}..."
+    fi
+
+    local payload
+    payload="$(jq -n --arg model "$model" --arg system "$system_msg" --arg user "$user_msg" '{
+        model: $model,
+        messages: [
+            {role: "system", content: $system},
+            {role: "user", content: $user}
+        ],
+        max_tokens: 30,
+        temperature: 0.3
+    }')" || return 1
+
+    local response title
+    response="$(curl -s --max-time 3 -X POST "${endpoint}/chat/completions" \
+        -H "Content-Type: application/json" \
+        -d "$payload" 2>/dev/null)" || return 1
+
+    title="$(printf '%s' "$response" | jq -r '.choices[0].message.content // empty' 2>/dev/null)" || return 1
+    [[ -n "$title" ]] || return 1
+
+    title="$(printf '%s' "$title" | tr '\n' ' ' | sed 's/^[[:space:]"]*//;s/[[:space:]"]*$//')"
+    if (( ${#title} > 80 )); then
+        title="${title:0:77}..."
+    fi
+    printf '%s' "$title"
+}
+
+_generate_auto_purpose() {
+    local prompt="$1" repo_name="$2"
+
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        local endpoint model
+        endpoint="$(jq -r '.titleEndpoint // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+        model="$(jq -r '.titleModel // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+        if [[ -n "$endpoint" && -n "$model" ]]; then
+            local result
+            if result="$(_llm_generate_title "$endpoint" "$model" "$prompt" "$repo_name")"; then
+                printf '%s' "$result"
+                return 0
+            fi
+        fi
+    fi
+
+    _heuristic_title "$prompt" "$repo_name"
+}
+
 _configured_default_agent() {
     if [[ -n "${CCTRL_AGENT:-}" ]]; then
         _normalize_agent "$CCTRL_AGENT"
@@ -1855,7 +1934,13 @@ _launch_detached() {
         final_purpose="$purpose"
     else
         if [[ -n "$initial_prompt" ]]; then
-            default_purpose="$initial_prompt"
+            local repo_label
+            if [[ "$metadata_target" == @* ]]; then
+                repo_label="${metadata_target#@}"
+            else
+                repo_label="${metadata_cwd##*/}"
+            fi
+            default_purpose="$(_generate_auto_purpose "$initial_prompt" "$repo_label")"
         elif [[ "$target_kind" == "shortcut" ]]; then
             default_purpose="$metadata_target"
         else
