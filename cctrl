@@ -9081,6 +9081,350 @@ _chrome_cdp_ready() {
     curl -s --max-time 1 "http://localhost:$port/json/version" &>/dev/null
 }
 
+cmd_hooks() {
+    local action="${1:-help}"; shift 2>/dev/null || true
+
+    case "$action" in
+        run) _hooks_run "$@" ;;
+        install) _hooks_install "$@" ;;
+        doctor) _hooks_doctor "$@" ;;
+        -h|--help|help)
+            echo "Usage: cctrl hooks <run|install|doctor>"
+            echo ""
+            echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify)"
+            echo "  install       Write portable hook configs for Claude Code and Codex"
+            echo "  doctor        Validate hook configs point to working commands"
+            return 0
+            ;;
+        *)
+            echo -e "${RED}Unknown hooks action: $action${RESET}" >&2
+            echo -e "${DIM}Usage: cctrl hooks <run|install|doctor>${RESET}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_hooks_run() {
+    local name="${1:-}"
+    if [[ -z "$name" || "$name" == "-h" || "$name" == "--help" ]]; then
+        echo "Usage: cctrl hooks run <name>"
+        echo ""
+        echo "  pre-tool-use   Block disallowed tool calls (stdin passthrough)"
+        echo "  stop           Post-turn logging and notifications"
+        echo "  notify         Push notification on agent events"
+        return 0
+    fi
+
+    case "$name" in
+        pre-tool-use)
+            exec python3 "$SCRIPT_DIR/hooks/block-git-commit.py"
+            ;;
+        stop)
+            "$SCRIPT_DIR/hooks/notify.sh" stop
+            python3 "$SCRIPT_DIR/hooks/session-log.py"
+            ;;
+        notify)
+            exec "$SCRIPT_DIR/hooks/notify.sh" notification
+            ;;
+        *)
+            echo -e "${RED}Unknown hook: $name${RESET}" >&2
+            echo -e "${DIM}Available: pre-tool-use, stop, notify${RESET}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_hooks_install() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        echo "Usage: cctrl hooks install"
+        echo ""
+        echo "  Write portable hook configs for Claude Code and Codex."
+        echo "  Uses 'cctrl hooks run <name>' so hooks survive cctrl moves."
+        echo "  Idempotent — safe to run repeatedly."
+        return 0
+    fi
+
+    local cctrl_bin
+    cctrl_bin="$(command -v cctrl 2>/dev/null || true)"
+    if [[ -z "$cctrl_bin" ]]; then
+        echo -e "${YELLOW}Warning: cctrl is not on \$PATH.${RESET}"
+        echo -e "${DIM}Hooks will use the full path ($SCRIPT_DIR/cctrl) as fallback.${RESET}"
+        echo -e "${DIM}Add cctrl to \$PATH for truly portable hooks.${RESET}"
+        echo ""
+    fi
+
+    local errors=0
+
+    # --- Claude Code ---
+    local claude_settings="$HOME/.claude/settings.json"
+    if [[ -d "$HOME/.claude" ]]; then
+        python3 -c "
+import json, sys, os
+
+path = os.path.expanduser('$claude_settings')
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    cfg = {}
+
+hooks = cfg.setdefault('hooks', {})
+
+# PreToolUse: replace any cctrl-sourced entry, preserve others
+new_ptu = []
+for entry in hooks.get('PreToolUse', []):
+    cmds = [h.get('command', '') for h in entry.get('hooks', [])]
+    if any('block-git-commit' in c or 'cctrl hooks run pre-tool-use' in c for c in cmds):
+        continue
+    new_ptu.append(entry)
+new_ptu.append({
+    'matcher': 'Bash',
+    'hooks': [{'type': 'command', 'command': 'cctrl hooks run pre-tool-use'}]
+})
+hooks['PreToolUse'] = new_ptu
+
+# Stop: replace cctrl-sourced entry, preserve others (e.g. gstack)
+new_stop = []
+for entry in hooks.get('Stop', []):
+    cmds = [h.get('command', '') for h in entry.get('hooks', [])]
+    if any('notify.sh' in c or 'session-log' in c or 'cctrl hooks run stop' in c for c in cmds):
+        if not entry.get('_gstack_source'):
+            continue
+    new_stop.append(entry)
+new_stop.insert(0, {
+    'hooks': [{'type': 'command', 'command': 'cctrl hooks run stop'}]
+})
+hooks['Stop'] = new_stop
+
+# Notification: replace cctrl-sourced entry, preserve others
+new_notif = []
+for entry in hooks.get('Notification', []):
+    cmds = [h.get('command', '') for h in entry.get('hooks', [])]
+    if any('notify.sh' in c or 'cctrl hooks run notify' in c for c in cmds):
+        continue
+    new_notif.append(entry)
+new_notif.append({
+    'hooks': [{'type': 'command', 'command': 'cctrl hooks run notify'}]
+})
+hooks['Notification'] = new_notif
+
+with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+" 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✓${RESET} Claude Code hooks installed → $claude_settings"
+        else
+            echo -e "${RED}✗${RESET} Failed to update Claude Code hooks" >&2
+            errors=1
+        fi
+    else
+        echo -e "${DIM}Skipping Claude Code — ~/.claude/ not found${RESET}"
+    fi
+
+    # --- Codex ---
+    local codex_hooks="$HOME/.codex/hooks.json"
+    if [[ -d "$HOME/.codex" ]]; then
+        python3 -c "
+import json, os
+
+path = os.path.expanduser('$codex_hooks')
+
+cfg = {
+    'hooks': {
+        'PreToolUse': [{
+            'hooks': [{'type': 'command', 'command': 'cctrl hooks run pre-tool-use'}],
+            'matcher': 'Bash'
+        }],
+        'Stop': [{
+            'hooks': [{'type': 'command', 'command': 'cctrl hooks run stop'}]
+        }]
+    }
+}
+
+with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+    f.write('\n')
+" 2>&1
+        if [[ $? -eq 0 ]]; then
+            echo -e "${GREEN}✓${RESET} Codex hooks installed → $codex_hooks"
+        else
+            echo -e "${RED}✗${RESET} Failed to update Codex hooks" >&2
+            errors=1
+        fi
+    else
+        echo -e "${DIM}Skipping Codex — ~/.codex/ not found${RESET}"
+    fi
+
+    if [[ $errors -eq 0 ]]; then
+        echo ""
+        echo -e "${GREEN}Done.${RESET} Verify with: ${DIM}cctrl hooks doctor${RESET}"
+    fi
+    return $errors
+}
+
+_hooks_doctor() {
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+        echo "Usage: cctrl hooks doctor"
+        echo ""
+        echo "  Validate hook configs for Claude Code and Codex."
+        echo "  Checks that hook commands resolve and scripts exist."
+        return 0
+    fi
+
+    local issues=0
+
+    echo "Hook doctor"
+    echo "═══════════"
+    echo ""
+
+    # Check cctrl is on PATH
+    if command -v cctrl &>/dev/null; then
+        echo -e "${GREEN}✓${RESET} cctrl on \$PATH: $(command -v cctrl)"
+    else
+        echo -e "${RED}✗${RESET} cctrl not on \$PATH — portable hooks won't resolve"
+        issues=1
+    fi
+
+    # Check hook scripts exist
+    for script in block-git-commit.py notify.sh session-log.py; do
+        if [[ -f "$SCRIPT_DIR/hooks/$script" ]]; then
+            echo -e "${GREEN}✓${RESET} $script exists"
+        else
+            echo -e "${RED}✗${RESET} $script missing at $SCRIPT_DIR/hooks/$script"
+            issues=1
+        fi
+    done
+
+    echo ""
+
+    # --- Claude Code ---
+    local claude_settings="$HOME/.claude/settings.json"
+    echo "Claude Code ($claude_settings):"
+    if [[ -f "$claude_settings" ]]; then
+        local stale
+        stale="$(python3 -c "
+import json
+with open('$claude_settings') as f:
+    cfg = json.load(f)
+hooks = cfg.get('hooks', {})
+stale = []
+for event_name, entries in hooks.items():
+    for entry in entries:
+        for h in entry.get('hooks', []):
+            cmd = h.get('command', '')
+            if '/cctrl/hooks/' in cmd or '/_projects/' in cmd:
+                stale.append(f'  {event_name}: {cmd}')
+if stale:
+    print('\n'.join(stale))
+" 2>/dev/null)"
+        if [[ -n "$stale" ]]; then
+            echo -e "${YELLOW}⚠${RESET}  Stale absolute paths found:"
+            echo "$stale"
+            echo -e "${DIM}  Fix with: cctrl hooks install${RESET}"
+            issues=1
+        fi
+
+        local portable
+        portable="$(python3 -c "
+import json
+with open('$claude_settings') as f:
+    cfg = json.load(f)
+hooks = cfg.get('hooks', {})
+found = set()
+for event_name, entries in hooks.items():
+    for entry in entries:
+        for h in entry.get('hooks', []):
+            cmd = h.get('command', '')
+            if 'cctrl hooks run' in cmd:
+                found.add(cmd.split('cctrl hooks run ')[-1])
+for name in ['pre-tool-use', 'stop', 'notify']:
+    if name in found:
+        print(f'OK {name}')
+    else:
+        print(f'MISSING {name}')
+" 2>/dev/null)"
+        while IFS= read -r line; do
+            if [[ "$line" == OK* ]]; then
+                echo -e "  ${GREEN}✓${RESET} ${line#OK }"
+            else
+                echo -e "  ${RED}✗${RESET} ${line#MISSING } — not installed"
+                issues=1
+            fi
+        done <<< "$portable"
+    else
+        echo -e "  ${DIM}Not found${RESET}"
+    fi
+
+    echo ""
+
+    # --- Codex ---
+    local codex_hooks="$HOME/.codex/hooks.json"
+    echo "Codex ($codex_hooks):"
+    if [[ -f "$codex_hooks" ]]; then
+        local stale_codex
+        stale_codex="$(python3 -c "
+import json
+with open('$codex_hooks') as f:
+    cfg = json.load(f)
+hooks = cfg.get('hooks', {})
+stale = []
+for event_name, entries in hooks.items():
+    for entry in entries:
+        for h in entry.get('hooks', []):
+            cmd = h.get('command', '')
+            if '/cctrl/hooks/' in cmd or '/_projects/' in cmd:
+                stale.append(f'  {event_name}: {cmd}')
+if stale:
+    print('\n'.join(stale))
+" 2>/dev/null)"
+        if [[ -n "$stale_codex" ]]; then
+            echo -e "${YELLOW}⚠${RESET}  Stale absolute paths found:"
+            echo "$stale_codex"
+            echo -e "${DIM}  Fix with: cctrl hooks install${RESET}"
+            issues=1
+        fi
+
+        local portable_codex
+        portable_codex="$(python3 -c "
+import json
+with open('$codex_hooks') as f:
+    cfg = json.load(f)
+hooks = cfg.get('hooks', {})
+found = set()
+for event_name, entries in hooks.items():
+    for entry in entries:
+        for h in entry.get('hooks', []):
+            cmd = h.get('command', '')
+            if 'cctrl hooks run' in cmd:
+                found.add(cmd.split('cctrl hooks run ')[-1])
+for name in ['pre-tool-use', 'stop']:
+    if name in found:
+        print(f'OK {name}')
+    else:
+        print(f'MISSING {name}')
+" 2>/dev/null)"
+        while IFS= read -r line; do
+            if [[ "$line" == OK* ]]; then
+                echo -e "  ${GREEN}✓${RESET} ${line#OK }"
+            else
+                echo -e "  ${RED}✗${RESET} ${line#MISSING } — not installed"
+                issues=1
+            fi
+        done <<< "$portable_codex"
+    else
+        echo -e "  ${DIM}Not found${RESET}"
+    fi
+
+    echo ""
+    if [[ $issues -eq 0 ]]; then
+        echo -e "${GREEN}All OK${RESET}"
+    else
+        echo -e "${YELLOW}$issues issue(s) found.${RESET} Fix with: ${DIM}cctrl hooks install${RESET}"
+    fi
+    return $issues
+}
+
 cmd_chrome() {
     local port="$CHROME_DEFAULT_PORT"
     local data_dir="$CHROME_DATA_DIR"
@@ -10557,6 +10901,7 @@ _dispatch() {
         needs-me|needsme|needs_me) cmd_needs_me "$@" ;;
         close) cmd_session close "$@" ;;
         restart) cmd_restart "$@" ;;
+        hooks) cmd_hooks "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         statusline|status-line) cmd_statusline "$@" ;;

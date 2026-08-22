@@ -1,7 +1,7 @@
 ---
 id: 053
 title: cctrl session restore — waved, gated, dry-runnable fleet rebuild (human-in-the-loop)
-status: blocked
+status: done
 blocked-by: [051, 052]
 priority: 7
 goal: fleet-restore-after-power-loss
@@ -9,6 +9,7 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-08-03
+completed: 2026-08-07
 ---
 
 ## Requirements

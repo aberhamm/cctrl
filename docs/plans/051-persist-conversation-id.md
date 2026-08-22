@@ -1,7 +1,7 @@
 ---
 id: 051
 title: Persist conversation_id on the session record
-status: blocked
+status: done
 blocked-by: []
 priority: 5
 goal: fleet-restore-after-power-loss
@@ -9,6 +9,7 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-08-03
+completed: 2026-08-07
 ---
 
 ## Requirements

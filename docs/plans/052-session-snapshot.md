@@ -1,7 +1,7 @@
 ---
 id: 052
 title: cctrl session snapshot — periodic, atomic, side-effect-free fleet capture
-status: blocked
+status: done
 blocked-by: [051]
 priority: 6
 goal: fleet-restore-after-power-loss
@@ -9,6 +9,7 @@ allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-08-03
+completed: 2026-08-07
 ---
 
 ## Requirements

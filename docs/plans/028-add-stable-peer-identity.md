@@ -1,7 +1,7 @@
 ---
 id: 028
 title: Design the stable-peer-identity migration and produce a written proposal
-status: blocked
+status: pending
 blocked-by: [023]
 priority: 28
 goal: cctrl-peer-messaging-discoverable-models
