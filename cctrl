@@ -5952,6 +5952,7 @@ cmd_session() {
         snapshot)  _session_snapshot "$@" ;;
         restore)   _session_restore "$@" ;;
         close|stop) _session_close "$@" ;;
+        reconcile-names) _session_reconcile_names "$@" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
@@ -6180,6 +6181,53 @@ _session_transcript_path() {
     for f in "$CLAUDE_PROJECTS_DIR"/*/"$sid".jsonl; do
         [[ -e "$f" ]] && { printf '%s' "$f"; return 0; }
     done
+    return 0
+}
+
+_claude_get_display_name() {
+    # Read the last custom-title from a Claude Code transcript JSONL.
+    # Returns the title string, or empty if none found.
+    local tpath="$1"
+    [[ -f "$tpath" ]] || return 0
+    # Tail-scan: custom-title lines are sparse, so reading from the end is fast.
+    local line title
+    while IFS= read -r line; do
+        title="$(printf '%s' "$line" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    if d.get('type') == 'custom-title':
+        print(d.get('customTitle', ''))
+except: pass
+" 2>/dev/null)"
+        [[ -n "$title" ]] && { printf '%s' "$title"; return 0; }
+    done < <(tail -r "$tpath" 2>/dev/null | head -500)
+    return 0
+}
+
+_claude_set_display_name() {
+    # Append a custom-title entry to a Claude Code transcript JSONL.
+    # Verifies the write by reading it back. Returns 0 on success, 1 on failure.
+    local session_id="$1" new_name="$2" tpath="$3"
+    [[ -f "$tpath" ]] || { echo -e "${RED}Transcript not found: $tpath${RESET}" >&2; return 1; }
+
+    local entry
+    entry="$(python3 -c "
+import json, sys
+print(json.dumps({'type': 'custom-title', 'customTitle': sys.argv[1], 'sessionId': sys.argv[2]}))" \
+        "$new_name" "$session_id" 2>/dev/null)"
+    [[ -n "$entry" ]] || { echo -e "${RED}Failed to build custom-title JSON${RESET}" >&2; return 1; }
+
+    printf '%s\n' "$entry" >> "$tpath"
+
+    # Verify the write took.
+    local readback
+    readback="$(_claude_get_display_name "$tpath")"
+    if [[ "$readback" != "$new_name" ]]; then
+        echo -e "${YELLOW}Warning: custom-title verify failed (wrote '$new_name', read back '$readback').${RESET}" >&2
+        echo -e "${DIM}The transcript format may have changed. Metadata was updated but Claude's display may not reflect the rename.${RESET}" >&2
+        return 1
+    fi
     return 0
 }
 
@@ -8475,6 +8523,135 @@ cmd_restart() {
         fi
     ) &
     disown
+}
+
+cmd_rename() {
+    # Rename a session's display label everywhere: cctrl metadata, tmux
+    # option, and Claude Code transcript (custom-title).
+    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 2 ]]; then
+        echo "Usage: cctrl rename <session> \"new label\""
+        echo ""
+        echo "  Update the display label for a session."
+        echo "  Changes cctrl metadata, tmux @cctrl_purpose, and"
+        echo "  Claude Code's display name (via transcript custom-title)."
+        [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && return 0
+        return 1
+    fi
+
+    local target="$1" new_label="$2"
+
+    if ! tmux has-session -t "$target" 2>/dev/null; then
+        echo -e "${RED}No session named '$target'.${RESET}" >&2
+        return 1
+    fi
+
+    # 1. Update cctrl metadata .purpose
+    local meta_file
+    meta_file="$(_session_metadata_file "$target")"
+    if [[ -f "$meta_file" ]]; then
+        local tmp
+        tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-rename-XXXXXX")"
+        python3 -c "
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+d['purpose'] = sys.argv[2]
+with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
+" "$meta_file" "$new_label" "$tmp" 2>/dev/null && mv "$tmp" "$meta_file"
+        rm -f "$tmp" 2>/dev/null
+    fi
+
+    # 2. Update tmux @cctrl_purpose
+    tmux set-option -t "$target" @cctrl_purpose "$new_label" 2>/dev/null || true
+
+    # 3. For Claude Code sessions: append custom-title to transcript
+    local agent
+    agent="$(tmux show-option -qv -t "$target" @cctrl_agent 2>/dev/null || true)"
+    if [[ "$agent" != "codex" ]]; then
+        local sid tpath
+        sid="$(_session_id "$target" 2>/dev/null || true)"
+        tpath="$(_session_transcript_path "$target" 2>/dev/null || true)"
+        if [[ -n "$sid" && -n "$tpath" ]]; then
+            local display_name="${new_label} (${target})"
+            if _claude_set_display_name "$sid" "$display_name" "$tpath"; then
+                echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux + Claude transcript)"
+            else
+                echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux only; transcript write failed)"
+            fi
+        else
+            echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux; no transcript found)"
+        fi
+    else
+        echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux; Codex has no naming surface)"
+    fi
+}
+
+_session_reconcile_names() {
+    # For each live Claude Code session, read the last custom-title from
+    # its transcript and sync into cctrl metadata if different.
+    # Direction: Claude wins — the user's most recent UI rename propagates.
+    local json_mode=false
+    [[ "${1:-}" == "--json" ]] && json_mode=true
+
+    local name corrections=0 json_entries=()
+    for name in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+        [[ "$name" == TMUX--* ]] || continue
+        local agent
+        agent="$(tmux show-option -qv -t "$name" @cctrl_agent 2>/dev/null || true)"
+        [[ "$agent" == "codex" ]] && continue
+
+        local tpath claude_title meta_purpose
+        tpath="$(_session_transcript_path "$name" 2>/dev/null || true)"
+        [[ -n "$tpath" ]] || continue
+
+        claude_title="$(_claude_get_display_name "$tpath")"
+        [[ -n "$claude_title" ]] || continue
+
+        # Strip the tmux suffix if present: "label (TMUX--ms--cctrl)" → "label"
+        local claude_label="$claude_title"
+        if [[ "$claude_title" == *" ($name)"* ]]; then
+            claude_label="${claude_title% ($name)*}"
+        fi
+
+        local meta_file
+        meta_file="$(_session_metadata_file "$name")"
+        meta_purpose=""
+        [[ -f "$meta_file" ]] && meta_purpose="$(python3 -c "
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+print(d.get('purpose', ''))
+" "$meta_file" 2>/dev/null || true)"
+
+        if [[ -n "$claude_label" && "$claude_label" != "$meta_purpose" ]]; then
+            # Update metadata
+            if [[ -f "$meta_file" ]]; then
+                local tmp
+                tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-reconcile-XXXXXX")"
+                python3 -c "
+import json, sys
+with open(sys.argv[1]) as f: d = json.load(f)
+d['purpose'] = sys.argv[2]
+with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
+" "$meta_file" "$claude_label" "$tmp" 2>/dev/null && mv "$tmp" "$meta_file"
+                rm -f "$tmp" 2>/dev/null
+            fi
+            tmux set-option -t "$name" @cctrl_purpose "$claude_label" 2>/dev/null || true
+            ((corrections++))
+
+            if $json_mode; then
+                json_entries+=("$(printf '{"session":"%s","old":"%s","new":"%s"}' "$name" "$meta_purpose" "$claude_label")")
+            else
+                echo -e "${DIM}Synced: $name purpose → '$claude_label'${RESET}"
+            fi
+        fi
+    done
+
+    if $json_mode; then
+        printf '{"corrections":%d,"details":[%s]}\n' "$corrections" "$(IFS=,; echo "${json_entries[*]:-}")"
+    elif (( corrections == 0 )); then
+        echo -e "${DIM}All session names in sync.${RESET}"
+    else
+        echo -e "${GREEN}✓${RESET} Reconciled $corrections session name(s)."
+    fi
 }
 
 _duration_to_ms() {
@@ -10902,6 +11079,7 @@ _dispatch() {
         close) cmd_session close "$@" ;;
         restart) cmd_restart "$@" ;;
         hooks) cmd_hooks "$@" ;;
+        rename) cmd_rename "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         statusline|status-line) cmd_statusline "$@" ;;
