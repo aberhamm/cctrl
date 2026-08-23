@@ -4,6 +4,52 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 2026-08-23
+
+Cross-machine messaging, session self-restart, portable hooks, and session
+name reconciliation — four features that make the fleet work across machines
+and survive config changes without losing conversation context.
+
+### Added
+- **Cross-machine peer messaging** (951f45f, 58ac604): `cctrl peer send`
+  now routes transparently across machines via SSH. Remote peers appear in
+  `cctrl peer ls` with their host label; no special flags needed. Sessions
+  launched with `--peer` auto-register the peer MCP server so agents have
+  peer tools available (the prior gap that caused agents to fall back to
+  Claude Code's local-only SendMessage).
+- **Session self-restart** (e09909f): `cctrl restart` lets an agent restart
+  itself to pick up config changes (MCP servers, CLAUDE.md, settings, hooks).
+  The conversation context is preserved via `--resume`. A new session wrapper
+  (`lib/session-wrapper.sh`) runs as the tmux pane process and re-launches the
+  agent on restart. Works for both Claude Code and Codex.
+- **Portable hook installation** (53994fb): `cctrl hooks run <name>` resolves
+  hooks via `$PATH` instead of absolute paths. `cctrl hooks install` writes
+  configs for both Claude Code and Codex using portable commands.
+  `cctrl hooks doctor` validates the setup. Moving cctrl to a different
+  directory no longer breaks hooks.
+- **Session name reconciliation** (53a6993): `cctrl rename <session> "label"`
+  updates the display name across cctrl metadata, tmux, and Claude Code's
+  transcript (syncs to desktop and iOS). `cctrl session reconcile-names`
+  detects drift between Claude's UI and cctrl, correcting automatically
+  (Claude wins by default; explicit `cctrl rename` wins explicitly).
+- **Auto-generated session titles** (b0c1892): sessions started with `-m`
+  get short, descriptive titles generated from the initial prompt via a
+  local LLM (configurable endpoint) or a heuristic fallback.
+
+### Changed
+- AGENTS.md peer contract now documents cross-machine routing and warns
+  against using Claude Code's built-in SendMessage/ListAgents for peer
+  messaging (those are local-only).
+- The `send_message` MCP tool description now mentions cross-machine
+  capability.
+
+### Fixed
+- Peer MCP server was never registered on `--peer` sessions — agents had no
+  peer tools and fell back to Claude Code's local-only messaging (58ac604).
+- Stale comment in cross-host peer routing corrected (4ce9f94).
+
+<!-- commits: 53a6993, 53994fb, b0c1892, cb56c55, e09909f, 58ac604, 4ce9f94, 951f45f -->
+
 ## [Unreleased] - 2026-08-06
 
 ### Added
