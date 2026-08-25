@@ -3,7 +3,7 @@ id: 055
 title: Session name reconciliation and cctrl rename
 status: pending
 blocked-by: []
-priority:
+priority: 55
 allows-migrations: false
 needs-review: none
 review-required: eng

@@ -3,7 +3,7 @@ id: 054
 title: Portable hook installation — resolve hooks via PATH, not absolute paths
 status: pending
 blocked-by: []
-priority:
+priority: 54
 allows-migrations: false
 needs-review: eng
 review-required: eng

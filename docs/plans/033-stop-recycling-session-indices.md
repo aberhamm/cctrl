@@ -1,7 +1,9 @@
 ---
 id: 033
 title: Stop handing a freed session index to the next spawn
-status: superseded
+status: skipped
+skipped: 2026-08-25
+skipped-reason: "superseded by 029"
 superseded-by: 029
 blocked-by: [031]
 priority: 33
