@@ -30,23 +30,25 @@ while true; do
         if [[ "$_agent" == "claude" ]]; then
             echo -e "\033[2mRestarting: claude --resume $_resume_flag ${_flags[*]}\033[0m"
             claude --resume "$_resume_flag" "${_flags[@]}" &
+            _child_pid=$!
+            wait $_child_pid 2>/dev/null || true
         else
             # Codex: options must precede SESSION_ID.
             echo -e "\033[2mRestarting: codex resume ${_flags[*]} $_resume_flag\033[0m"
-            codex resume "${_flags[@]}" "$_resume_flag" &
+            codex resume "${_flags[@]}" "$_resume_flag"
         fi
     else
         if [[ "$_agent" == "claude" ]]; then
             echo -e "\033[2mclaude ${_flags[*]}\033[0m"
             claude "${_flags[@]}" &
+            _child_pid=$!
+            wait $_child_pid 2>/dev/null || true
         else
             echo -e "\033[2mcodex ${_flags[*]}\033[0m"
-            codex "${_flags[@]}" &
+            codex "${_flags[@]}"
         fi
     fi
 
-    _child_pid=$!
-    wait $_child_pid 2>/dev/null || true
     _child_pid=""
 
     # If we were killed by a signal (cctrl close / tmux kill), exit

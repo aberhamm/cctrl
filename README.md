@@ -164,6 +164,31 @@ Add `-d` to start the tmux session and return without attaching. No GUI required
 
 When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic). A directory with no matching shortcut keeps its repo-folder slug (unchanged).
 
+Detached agent app titles are reconciled to `repo: description (TMUX--...)`.
+Claude gets this at launch through its `--name`/remote-control title surface.
+Codex has no equivalent title flag, so cctrl resolves the Codex rollout id and
+updates the local Codex app state row after the session appears. When Codex
+remote control is enabled (`codex remote-control start` /
+`~/.codex/app-server-daemon/settings.json`), tmux-backed Codex launches
+automatically connect with `--remote unix://`; pass `--no-bridge` to suppress
+that default. `cctrl rename <session> "new description"` uses the same title
+path for live Codex sessions.
+
+For Codex, tmux is only the terminal control surface. Once a Codex task has been
+registered with the app-server, you can release the tmux owner and continue in
+the ChatGPT/Codex app:
+
+```bash
+cctrl session release-to-app TMUX--myapp --yes
+cctrl session release-to-app --all --yes
+cctrl session app-ls
+```
+
+`release-to-app` sends EOF to the tmux session, waits for it to exit, preserves
+the cctrl metadata record, and quarantines only stale Codex writer locks that no
+live tmux session or Codex process appears to own. `app-ls` is the app-first
+fleet view; `session ls` remains the live tmux view.
+
 ```bash
 cctrl start ~/dev/myapp           # tmux-backed; prompts to connect in a TTY
 cctrl @myapp                      # shortcut launch, also tmux-backed
@@ -175,6 +200,7 @@ cctrl start -d @myapp --agent codex
 cctrl start -d @myapp --purpose "review auth logs"
 
 cctrl session ls                  # list sessions (see below)
+cctrl session app-ls              # list released Codex app tasks
 cctrl session current --json      # machine-readable identity for the current agent/process
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
 cctrl session close TMUX--myapp   # gracefully close a session

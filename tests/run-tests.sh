@@ -266,6 +266,24 @@ test_launch_args() {
     assert_contains "$out" "ARG[1]=--remote"
     assert_contains "$out" "ARG[2]=unix://"
     assert_contains "$out" "ARG[3]=remote prompt"
+
+    local codex_home="$TMPDIR/codex-remote-home"
+    mkdir -p "$codex_home/app-server-daemon"
+    printf '{"remoteControlEnabled":true}\n' > "$codex_home/app-server-daemon/settings.json"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex -m "remote default")"
+    assert_contains "$out" "CMD=codex"
+    assert_contains "$out" "ARG[0]=--yolo"
+    assert_contains "$out" "ARG[1]=--remote"
+    assert_contains "$out" "ARG[2]=unix://"
+    assert_contains "$out" "ARG[3]=--cd"
+    assert_contains "$out" "ARG[5]=remote default"
+
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex --no-bridge -m "remote suppressed")"
+    assert_contains "$out" "CMD=codex"
+    assert_contains "$out" "ARG[0]=--yolo"
+    assert_contains "$out" "ARG[1]=--cd"
+    assert_contains "$out" "ARG[3]=remote suppressed"
+    assert_not_contains "$out" "--remote"
 }
 
 test_agent_prompt_without_default() {
@@ -512,7 +530,7 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "CCTRL_TMUX_CONTEXT=1"
     assert_contains "$(cat "$log")" "--agent\\ codex"
     assert_contains "$(cat "$log")" "-m line\\ one"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "line one"'
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "project: line one"'
     assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"initial_prompt": "line one"'
     # Plan 031: the resolved agent is persisted so display/registry read it back
     # instead of re-sniffing the pane argv.
@@ -523,7 +541,7 @@ test_detached_arg_parsing() {
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
     assert_contains "$(cat "$log")" "start --foreground"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "literal prompt words"'
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "project: literal prompt words"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --purpose "cleanup context" "$project")"
@@ -618,7 +636,7 @@ JSON
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--reuseproj--2"
     assert_not_contains "$out" "CCTRL_SESSION=TMUX--reuseproj--3"
     # Stale metadata was refreshed for the new session, not preserved.
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--reuseproj--2.json")" '"purpose": "fresh"'
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--reuseproj--2.json")" '"purpose": "reuseproj: fresh"'
 
     echo "ok: live-aware index picker skips live sessions, reuses freed indices"
 }
@@ -993,7 +1011,10 @@ test_dir_launch_adopts_shortcut_alias() {
     local slog="$TMPDIR/alias-shortcut.log"
     mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
     cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    mkdir -p "$rootcopy/lib"
+    cp "$ROOT/lib/session-wrapper.sh" "$rootcopy/lib/session-wrapper.sh"
     chmod +x "$rootcopy/cctrl"
+    chmod +x "$rootcopy/lib/session-wrapper.sh"
     printf '{"portal":{"dir":"%s","agent":"codex"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
     printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
 
@@ -4064,6 +4085,137 @@ SH
     echo "ok: codex never-prompted (rollout fixture) flagged as prune candidate"
 }
 
+test_codex_rename_updates_app_title() {
+    # Codex has no --name/custom-title flag, so cctrl rename updates the local
+    # Codex app state row identified from the rollout's session_meta id.
+    local bin="$TMPDIR/codex-rename-bin" meta="$TMPDIR/codex-rename-meta" codex_home="$TMPDIR/codex-rename-home"
+    mkdir -p "$bin" "$meta" "$codex_home/sessions/2026/08/24"
+    make_fake_tmux "$bin/tmux"
+    cat > "$meta/TMUX--demo.json" <<'JSON'
+{"name":"TMUX--demo","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"old label","initial_prompt":"original prompt","agent":"codex","cctrl_managed":true,"created_at":"2026-08-24T10:00:00Z","conversation_id":null,"transcript_path":null}
+JSON
+    cat > "$codex_home/sessions/2026/08/24/rollout-2026-08-24T10-00-00-thread-123.jsonl" <<'JSONL'
+{"timestamp":"2026-08-24T10:00:00.000Z","type":"session_meta","payload":{"id":"thread-123","cwd":"/tmp/demo"}}
+{"timestamp":"2026-08-24T10:00:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"original prompt"}}
+JSONL
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT)")
+con.execute("INSERT INTO threads (id, title, name) VALUES (?, ?, ?)", ("thread-123", "old title", "old title"))
+con.commit()
+PY
+
+    local out title name purpose conv_id
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
+        TMUX_FAKE_HAS_SESSION="TMUX--demo" "$ROOT/cctrl" rename TMUX--demo "new label")"
+    assert_contains "$out" "Codex app"
+    title="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT title FROM threads WHERE id='thread-123'")"
+    name="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT name FROM threads WHERE id='thread-123'")"
+    [[ "$title" == "Demo: new label (TMUX--demo)" ]] || fail "unexpected Codex title: $title"
+    [[ "$name" == "Demo: new label (TMUX--demo)" ]] || fail "unexpected Codex name: $name"
+    purpose="$(jq -r '.purpose' "$meta/TMUX--demo.json")"
+    conv_id="$(jq -r '.conversation_id' "$meta/TMUX--demo.json")"
+    [[ "$purpose" == "new label" ]] || fail "metadata purpose not updated: $purpose"
+    [[ "$conv_id" == "thread-123" ]] || fail "metadata conversation_id not backfilled: $conv_id"
+    echo "ok: codex rename updates app title"
+}
+
+test_codex_rename_prefers_prompt_match_over_stale_id() {
+    # A recycled tmux name can briefly carry a stale but unarchived Codex
+    # conversation_id. The exact current prompt is a stronger identity signal.
+    local bin="$TMPDIR/codex-stale-bin" meta="$TMPDIR/codex-stale-meta" codex_home="$TMPDIR/codex-stale-home"
+    mkdir -p "$bin" "$meta" "$codex_home/sessions/2026/08/24"
+    make_fake_tmux "$bin/tmux"
+    cat > "$meta/TMUX--demo.json" <<'JSON'
+{"name":"TMUX--demo","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"old label","initial_prompt":"current prompt","agent":"codex","cctrl_managed":true,"created_at":"2026-08-24T10:00:00Z","conversation_id":"thread-old","transcript_path":null}
+JSON
+    cat > "$codex_home/sessions/2026/08/24/rollout-2026-08-24T10-01-00-thread-old.jsonl" <<'JSONL'
+{"timestamp":"2026-08-24T10:01:00.000Z","type":"session_meta","payload":{"id":"thread-old","cwd":"/tmp/demo"}}
+{"timestamp":"2026-08-24T10:01:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"old prompt"}}
+JSONL
+    cat > "$codex_home/sessions/2026/08/24/rollout-2026-08-24T10-02-00-thread-new.jsonl" <<'JSONL'
+{"timestamp":"2026-08-24T10:02:00.000Z","type":"session_meta","payload":{"id":"thread-new","cwd":"/tmp/other-cwd"}}
+{"timestamp":"2026-08-24T10:02:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"current prompt"}}
+JSONL
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT)")
+con.execute("INSERT INTO threads (id, title, name) VALUES (?, ?, ?)", ("thread-old", "old title", "old title"))
+con.execute("INSERT INTO threads (id, title, name) VALUES (?, ?, ?)", ("thread-new", "new title", "new title"))
+con.commit()
+PY
+
+    local out old_title new_title conv_id
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
+        TMUX_FAKE_HAS_SESSION="TMUX--demo" "$ROOT/cctrl" rename TMUX--demo "fleet manager")"
+    assert_contains "$out" "Codex app"
+    old_title="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT title FROM threads WHERE id='thread-old'")"
+    new_title="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT title FROM threads WHERE id='thread-new'")"
+    conv_id="$(jq -r '.conversation_id' "$meta/TMUX--demo.json")"
+    [[ "$old_title" == "old title" ]] || fail "stale Codex title should not change: $old_title"
+    [[ "$new_title" == "Demo: fleet manager (TMUX--demo)" ]] || fail "current Codex title not updated: $new_title"
+    [[ "$conv_id" == "thread-new" ]] || fail "metadata conversation_id not corrected: $conv_id"
+    echo "ok: codex rename prefers prompt match over stale id"
+}
+
+test_session_app_ls_codex_records() {
+    # Released Codex tasks no longer appear in `session ls` (tmux-live-only), so
+    # cctrl has an app-first view over preserved metadata + Codex app state.
+    local meta="$TMPDIR/app-ls-meta" codex_home="$TMPDIR/app-ls-codex"
+    mkdir -p "$meta" "$codex_home"
+    cat > "$meta/TMUX--appdemo.json" <<'JSON'
+{"name":"TMUX--appdemo","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"released task","agent":"codex","cctrl_managed":true,"created_at":"2026-08-24T10:00:00Z","conversation_id":"thread-app-1","transcript_path":null}
+JSON
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT, cwd TEXT, archived INTEGER, updated_at TEXT)")
+con.execute("INSERT INTO threads (id, title, name, cwd, archived, updated_at) VALUES (?, ?, ?, ?, ?, ?)", ("thread-app-1", "Demo: released task (TMUX--appdemo)", "Demo: released task (TMUX--appdemo)", "/tmp/demo", 0, "2026-08-24T10:02:00Z"))
+con.commit()
+PY
+
+    local out
+    out="$(CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" "$ROOT/cctrl" session app-ls --json)"
+    assert_contains "$out" '"name": "TMUX--appdemo"'
+    assert_contains "$out" '"state": "app-owned"'
+    assert_contains "$out" '"title": "Demo: released task (TMUX--appdemo)"'
+    echo "ok: app-ls shows cctrl-known Codex app tasks"
+}
+
+test_session_release_to_app_quarantines_stale_codex_lock() {
+    # A dead tmux-backed Codex record with a leftover writer lock can be released
+    # to the app by moving the stale lock aside, preserving the metadata record.
+    local bin="$TMPDIR/release-bin" meta="$TMPDIR/release-meta" codex_home="$TMPDIR/release-codex" backup="$TMPDIR/release-backup"
+    mkdir -p "$bin" "$meta" "$codex_home/thread-writer-locks" "$backup"
+    make_fake_tmux "$bin/tmux"
+    cat > "$meta/TMUX--release.json" <<'JSON'
+{"name":"TMUX--release","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"release task","agent":"codex","cctrl_managed":true,"created_at":"2026-08-24T10:00:00Z","conversation_id":"thread-release-1","transcript_path":null}
+JSON
+    : > "$codex_home/thread-writer-locks/thread-release-1.lock"
+
+    local out control released lock_path
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
+        CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" "$ROOT/cctrl" session release-to-app TMUX--release --yes --json)"
+    assert_contains "$out" '"status": "released"'
+    assert_contains "$out" '"lock_action": "quarantined"'
+    [[ ! -e "$codex_home/thread-writer-locks/thread-release-1.lock" ]] || fail "stale lock was not removed from live lock dir"
+    lock_path="$backup/thread-release-1.lock"
+    [[ -e "$lock_path" ]] || fail "stale lock was not quarantined to $lock_path"
+    control="$(jq -r '.control_surface' "$meta/TMUX--release.json")"
+    released="$(jq -r '.released_at // empty' "$meta/TMUX--release.json")"
+    [[ "$control" == "app" ]] || fail "metadata control_surface not set: $control"
+    [[ -n "$released" ]] || fail "metadata released_at not set"
+    echo "ok: release-to-app quarantines stale Codex writer lock"
+}
+
 test_session_prune_dry_run_closes_nothing() {
     # Default is a dry run: candidates are listed but no kill/run-shell fires.
     # --yes routes each candidate through _session_close (tmux kill-session).
@@ -6668,6 +6820,10 @@ test_session_prune_never_prompted_claude
 test_session_prune_fresh_active_not_candidate
 test_session_prune_codex_no_claude_transcript_bug_guard
 test_session_prune_codex_never_prompted
+test_codex_rename_updates_app_title
+test_codex_rename_prefers_prompt_match_over_stale_id
+test_session_app_ls_codex_records
+test_session_release_to_app_quarantines_stale_codex_lock
 test_session_prune_dry_run_closes_nothing
 test_session_prune_excludes_self_and_attached
 test_usage_cost_fixtures

@@ -46,6 +46,7 @@ PROJECTS_DIR="$CLAUDE_DIR/projects"
 ACTIVE_FILE="$SCRIPT_DIR/.active-profile"
 CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
 CODEX_SESSIONS_DIR="$CODEX_DIR/sessions"
+CODEX_STATE_DB="${CCTRL_CODEX_STATE_DB:-$CODEX_DIR/state_5.sqlite}"
 # Claude Code writes one <pid>.json per live session here; bridgeSessionId in
 # that file is the authoritative remote-control liveness signal (null = not
 # bridged). Honors CLAUDE_CONFIG_DIR; CCTRL_CLAUDE_SESSIONS_DIR overrides (tests).
@@ -545,6 +546,36 @@ _launch_apply_profile_args() {
     done
 }
 
+_codex_remote_control_enabled() {
+    local settings="$CODEX_DIR/app-server-daemon/settings.json"
+    [[ -f "$settings" ]] || return 1
+    jq -e '.remoteControlEnabled == true' "$settings" >/dev/null 2>&1
+}
+
+_launch_flags_has_codex_remote() {
+    local arg
+    for arg in "${LAUNCH_FLAGS[@]:-}" "${LAUNCH_PASSTHROUGH[@]:-}"; do
+        case "$arg" in
+            --remote|--remote=*|--remote-auth-token-env|--remote-auth-token-env=*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+_launch_flags_has_codex_cd() {
+    local arg
+    for arg in "${LAUNCH_FLAGS[@]:-}" "${LAUNCH_PASSTHROUGH[@]:-}"; do
+        case "$arg" in
+            --cd|-C|--cd=*|-C=*)
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
 _launch_exec_agent() {
     local agent="$1" pf="$2" cli_model="$3" launch_name="$4" no_bridge="$5"
     local resume="$6" resume_val="$7" final_prompt="$8" bridge_dir="${9:-$PWD}"
@@ -674,6 +705,22 @@ _launch_exec_agent() {
         fi
     fi
     [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && "$no_bridge" != "true" ]] && ! _launch_flags_has_codex_remote; then
+        local _codex_remote_default="${CCTRL_CODEX_REMOTE_DEFAULT:-}"
+        if [[ -z "$_codex_remote_default" ]] && _codex_remote_control_enabled; then
+            _codex_remote_default="unix://"
+        fi
+        case "$_codex_remote_default" in
+            ""|0|false|False|FALSE|off|Off|OFF|none|None|NONE)
+                ;;
+            *)
+                LAUNCH_FLAGS+=("--remote" "$_codex_remote_default")
+                ;;
+        esac
+    fi
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]] && ! _launch_flags_has_codex_cd; then
+        LAUNCH_FLAGS+=("--cd" "$PWD")
+    fi
 
     if [[ "$resume" == "true" ]]; then
         if [[ -n "$resume_val" ]]; then
@@ -1350,6 +1397,70 @@ _session_update_metadata_field() {
     fi
 }
 
+_session_repo_name() {
+    local cwd="${1:-}"
+    cwd="${cwd/#\~/$HOME}"
+    if [[ -n "$cwd" ]]; then
+        cwd="${cwd%/}"
+        local shortcut
+        shortcut="$(_shortcut_for_dir "$cwd" 2>/dev/null || true)"
+        if [[ -n "$shortcut" ]]; then
+            _session_pretty_repo_label "$shortcut"
+        else
+            _session_pretty_repo_label "${cwd##*/}"
+        fi
+    fi
+}
+
+_session_pretty_repo_label() {
+    local slug="$1"
+    case "$slug" in
+        obsidian|obsidian-vault) printf '%s' 'Obsidian' ;;
+        scraper|django-c|django-celery-scraper) printf '%s' 'Scraper' ;;
+        comet|comet-automation) printf '%s' 'Comet' ;;
+        homelab) printf '%s' 'Homelab' ;;
+        rentkompass) printf '%s' 'Rentkompass' ;;
+        agenthub|agent-hub) printf '%s' 'Agent Hub' ;;
+        voice-assistant|voice-studio) printf '%s' 'Voice Assistant' ;;
+        portal|unstructured-data-portal) printf '%s' 'Portal' ;;
+        cctrl) printf '%s' 'cctrl' ;;
+        *)
+            printf '%s' "$slug" | awk -F- '{
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "") continue
+                    $i = toupper(substr($i, 1, 1)) substr($i, 2)
+                }
+                print $0
+            }' OFS=" "
+            ;;
+    esac
+}
+
+_session_clean_purpose_label() {
+    local purpose="${1:-}"
+    purpose="${purpose//\[Codex restore\]/}"
+    purpose="${purpose//\[codex restore\]/}"
+    printf '%s' "$purpose" | awk '{$1=$1; print}'
+}
+
+_session_app_display_name() {
+    local session_name="$1" purpose="${2:-}" cwd="${3:-}"
+    local repo
+    purpose="$(_session_clean_purpose_label "$purpose")"
+    repo="$(_session_repo_name "$cwd")"
+    if [[ -n "$repo" && -n "$purpose" && "$purpose" == "$repo: "* ]]; then
+        printf '%s (%s)' "$purpose" "$session_name"
+    elif [[ -n "$repo" && -n "$purpose" ]]; then
+        printf '%s: %s (%s)' "$repo" "$purpose" "$session_name"
+    elif [[ -n "$repo" ]]; then
+        printf '%s (%s)' "$repo" "$session_name"
+    elif [[ -n "$purpose" ]]; then
+        printf '%s (%s)' "$purpose" "$session_name"
+    else
+        printf '%s' "$session_name"
+    fi
+}
+
 _session_write_metadata() {
     local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8" peer="${9:-}" agent="${10:-}" conversation_id="${11:-}" transcript_path="${12:-}"
     mkdir -p "$SESSION_METADATA_DIR" || return 1
@@ -1980,6 +2091,7 @@ _launch_detached() {
         return 1
     fi
     tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
+    tmux set-option -t "$session_name" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
 
     # Best-effort background poll for conversation_id on fresh launches (plan 051).
     # MUST drop stdio: _remote_exec captures via $(ssh ...) which returns on
@@ -2009,6 +2121,13 @@ _launch_detached() {
             done
         ) </dev/null >/dev/null 2>&1 &
         disown 2>/dev/null || true
+    fi
+
+    if [[ "$detach_agent" == "codex" ]]; then
+        local _codex_title _codex_created_at
+        _codex_title="$(_session_app_display_name "$session_name" "$final_purpose" "$metadata_cwd")"
+        _codex_created_at="$(_session_metadata_field "$session_name" created_at)"
+        _session_codex_schedule_display_name_sync "$session_name" "$_codex_title" "$_codex_created_at"
     fi
 
     # When this launch is driven from a remote `--host <alias>` invocation, the
@@ -5889,9 +6008,18 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
+            echo "Usage: cctrl session <ls | app-ls | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
+            echo "    --json                       Machine-readable output"
+            echo "  cctrl session app-ls           List app-owned Codex tasks known to cctrl"
+            echo "    --all                        Include all local Codex app threads"
+            echo "    --json                       Machine-readable output"
+            echo "  cctrl session release-to-app <session>|--all"
+            echo "                                 Exit tmux Codex owners, preserve app tasks,"
+            echo "                                 and quarantine stale writer locks"
+            echo "    --yes                        Act without interactive confirmation"
+            echo "    --dry-run                    Show the release plan; act on nothing"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session doctor [--fix]   Audit/repair remote-control bridges (--json, --yes)"
             echo "  cctrl session autoheal         Heal DEAD bridges non-interactively (safety-gated)"
@@ -5942,6 +6070,8 @@ cmd_session() {
             return 0
             ;;
         ls|list)   _session_list "$@" ;;
+        app-ls|apps|app-list) _session_app_list "$@" ;;
+        release-to-app|release) _session_release_to_app "$@" ;;
         doctor|reconcile) _session_doctor "$@" ;;
         autoheal)  _session_autoheal "$@" ;;
         current|whoami|identity) _session_current "$@" ;;
@@ -6229,6 +6359,286 @@ print(json.dumps({'type': 'custom-title', 'customTitle': sys.argv[1], 'sessionId
         return 1
     fi
     return 0
+}
+
+_codex_state_db() {
+    if [[ -n "${CCTRL_CODEX_STATE_DB:-}" ]]; then
+        [[ -f "$CCTRL_CODEX_STATE_DB" ]] && printf '%s' "$CCTRL_CODEX_STATE_DB"
+        return 0
+    fi
+    if [[ -f "$CODEX_STATE_DB" ]]; then
+        printf '%s' "$CODEX_STATE_DB"
+        return 0
+    fi
+    local f newest=""
+    for f in "$CODEX_DIR"/state_*.sqlite; do
+        [[ -f "$f" ]] || continue
+        if [[ -z "$newest" || "$f" -nt "$newest" ]]; then
+            newest="$f"
+        fi
+    done
+    [[ -n "$newest" ]] && printf '%s' "$newest"
+    return 0
+}
+
+_codex_rollout_thread_id() {
+    local rollout="$1"
+    [[ -f "$rollout" ]] || return 0
+    head -20 "$rollout" 2>/dev/null | jq -r '
+        select(.type == "session_meta")
+        | (.payload.id // .payload.session_id // empty)
+    ' 2>/dev/null | head -1
+    return 0
+}
+
+_codex_thread_is_unarchived() {
+    local thread_id="$1" db
+    db="$(_codex_state_db)"
+    [[ -n "$thread_id" ]] || return 1
+    [[ -n "$db" && -f "$db" ]] || return 0
+    python3 - "$db" "$thread_id" <<'PY'
+import sqlite3
+import sys
+
+db, thread_id = sys.argv[1], sys.argv[2]
+try:
+    con = sqlite3.connect(db)
+    try:
+        row = con.execute("SELECT archived FROM threads WHERE id = ?", (thread_id,)).fetchone()
+    except sqlite3.OperationalError:
+        row = con.execute("SELECT 0 FROM threads WHERE id = ?", (thread_id,)).fetchone()
+except Exception:
+    sys.exit(0)
+if row is None:
+    sys.exit(1)
+sys.exit(0 if row[0] in (0, None, "") else 1)
+PY
+}
+
+_codex_thread_writer_lock_path() {
+    local thread_id="$1"
+    [[ -n "$thread_id" ]] || return 1
+    printf '%s/thread-writer-locks/%s.lock' "$CODEX_DIR" "$thread_id"
+}
+
+_codex_thread_has_live_process() {
+    # Best-effort guard for resume-style Codex owners. Empty writer lock files
+    # do not record a PID, so exact thread-id argv matching is the safest process
+    # signal available here.
+    local thread_id="$1"
+    [[ -n "$thread_id" ]] || return 1
+    ps -axo command 2>/dev/null | grep -F 'codex' | grep -F -- "$thread_id" >/dev/null 2>&1
+}
+
+_codex_thread_has_live_tmux_owner() {
+    local thread_id="$1" name agent conv
+    [[ -n "$thread_id" ]] || return 1
+    command -v tmux >/dev/null 2>&1 || return 1
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        agent="$(_session_metadata_field "$name" agent)"
+        [[ -n "$agent" ]] || agent="$(_agent_from_cmd "$(_session_agent_cmd "$name")")"
+        [[ "$agent" == "codex" ]] || continue
+        conv="$(_session_metadata_field "$name" conversation_id)"
+        if [[ -z "$conv" ]]; then
+            local rollout
+            rollout="$(_session_codex_rollout_path "$name")"
+            [[ -n "$rollout" ]] && conv="$(_codex_rollout_thread_id "$rollout")"
+        fi
+        [[ "$conv" == "$thread_id" ]] && return 0
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    return 1
+}
+
+_codex_writer_lock_is_stale() {
+    local thread_id="$1" lock
+    lock="$(_codex_thread_writer_lock_path "$thread_id" 2>/dev/null)" || return 1
+    [[ -f "$lock" ]] || return 1
+    _codex_thread_has_live_tmux_owner "$thread_id" && return 1
+    _codex_thread_has_live_process "$thread_id" && return 1
+    return 0
+}
+
+_codex_quarantine_writer_lock() {
+    local thread_id="$1" lock backup_dir
+    lock="$(_codex_thread_writer_lock_path "$thread_id" 2>/dev/null)" || return 1
+    [[ -f "$lock" ]] || return 1
+    backup_dir="${CCTRL_CODEX_LOCK_BACKUP_DIR:-$CODEX_DIR/backups/stale-writer-locks-$(date +%Y%m%d-%H%M%S)}"
+    mkdir -p "$backup_dir" || return 1
+    mv "$lock" "$backup_dir/" || return 1
+    printf '%s/%s' "$backup_dir" "${lock##*/}"
+}
+
+_codex_app_threads_json() {
+    local include_all="${1:-false}" db
+    db="$(_codex_state_db)"
+    python3 - "$SESSION_METADATA_DIR" "$db" "$CODEX_DIR" "$include_all" <<'PY'
+import glob
+import json
+import os
+import sqlite3
+import sys
+
+metadata_dir, db, codex_dir, include_all = sys.argv[1:5]
+include_all = include_all == "true"
+
+def clean_purpose(value):
+    if not isinstance(value, str):
+        return value
+    return " ".join(value.replace("[Codex restore]", "").replace("[codex restore]", "").split())
+
+records = {}
+for path in glob.glob(os.path.join(metadata_dir, "*.json")):
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception:
+        continue
+    if meta.get("agent") != "codex":
+        continue
+    name = meta.get("name") or os.path.splitext(os.path.basename(path))[0]
+    thread_id = meta.get("conversation_id")
+    key = thread_id or f"metadata:{name}"
+    records[key] = {
+        "name": name,
+        "agent": "codex",
+        "provider": "codex",
+        "runtime": "app",
+        "source": "metadata",
+        "dir": meta.get("cwd"),
+        "purpose": clean_purpose(meta.get("purpose")),
+        "display_label": meta.get("display_label"),
+        "created_at": meta.get("created_at"),
+        "session_id": thread_id,
+        "title": None,
+        "archived": None,
+        "updated_at": None,
+    }
+
+threads = {}
+if db and os.path.exists(db):
+    try:
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        cols = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
+        wanted = [
+            "id",
+            "title" if "title" in cols else None,
+            "name" if "name" in cols else None,
+            "cwd" if "cwd" in cols else None,
+            "archived" if "archived" in cols else None,
+            "updated_at" if "updated_at" in cols else None,
+            "updated_at_ms" if "updated_at_ms" in cols else None,
+            "recency_at" if "recency_at" in cols else None,
+            "recency_at_ms" if "recency_at_ms" in cols else None,
+        ]
+        selected = [c for c in wanted if c]
+        if "id" in cols and selected:
+            query = "SELECT " + ", ".join(selected) + " FROM threads"
+            for row in con.execute(query):
+                d = dict(row)
+                tid = d.get("id")
+                if not tid:
+                    continue
+                threads[tid] = d
+    except Exception:
+        threads = {}
+
+for key, rec in list(records.items()):
+    tid = rec.get("session_id")
+    row = threads.get(tid or "")
+    if not row:
+        continue
+    title = row.get("title") or row.get("name")
+    rec["title"] = title
+    rec["dir"] = rec.get("dir") or row.get("cwd")
+    rec["archived"] = bool(row.get("archived")) if row.get("archived") is not None else False
+    rec["updated_at"] = (
+        row.get("recency_at")
+        or row.get("updated_at")
+        or row.get("recency_at_ms")
+        or row.get("updated_at_ms")
+    )
+
+if include_all:
+    for tid, row in threads.items():
+        if tid in records:
+            continue
+        title = row.get("title") or row.get("name")
+        records[tid] = {
+            "name": None,
+            "agent": "codex",
+            "provider": "codex",
+            "runtime": "app",
+            "source": "codex",
+            "dir": row.get("cwd"),
+            "purpose": None,
+            "display_label": None,
+            "created_at": None,
+            "session_id": tid,
+            "title": title,
+            "archived": bool(row.get("archived")) if row.get("archived") is not None else False,
+            "updated_at": row.get("recency_at") or row.get("updated_at") or row.get("recency_at_ms") or row.get("updated_at_ms"),
+        }
+
+lock_dir = os.path.join(codex_dir, "thread-writer-locks")
+for rec in records.values():
+    tid = rec.get("session_id")
+    lock = os.path.join(lock_dir, f"{tid}.lock") if tid else None
+    rec["writer_lock"] = bool(lock and os.path.exists(lock))
+    if rec.get("archived"):
+        rec["state"] = "archived"
+    elif rec["writer_lock"]:
+        rec["state"] = "locked"
+    else:
+        rec["state"] = "app-owned"
+
+def sort_key(rec):
+    return (
+        rec.get("updated_at") is not None,
+        str(rec.get("updated_at") or rec.get("created_at") or ""),
+        rec.get("title") or rec.get("name") or "",
+    )
+
+print(json.dumps(sorted(records.values(), key=sort_key, reverse=True)))
+PY
+}
+
+_codex_rollout_matches_prompt() {
+    local rollout="$1" prompt="$2"
+    [[ -f "$rollout" && -n "$prompt" ]] || return 1
+    python3 - "$rollout" "$prompt" <<'PY'
+import json
+import sys
+
+path, prompt = sys.argv[1], sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i > 80:
+                break
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            payload = d.get("payload") or {}
+            texts = []
+            if d.get("type") == "response_item" and payload.get("role") == "user":
+                for item in payload.get("content") or []:
+                    texts.append(item.get("text") or "")
+            if d.get("type") == "event_msg":
+                item = payload.get("item") or {}
+                if item.get("type") == "UserMessage":
+                    for part in item.get("content") or []:
+                        texts.append(part.get("text") or "")
+                if payload.get("type") == "user_message":
+                    texts.append(payload.get("message") or "")
+            if any(text == prompt for text in texts):
+                sys.exit(0)
+except Exception:
+    pass
+sys.exit(1)
+PY
 }
 
 _session_last_active_ms() {
@@ -6554,10 +6964,22 @@ _session_list() {
             fi
         fi
 
-        # Recency: sessionId + transcript path + last-active (epoch-ms). Live
-        # read from the per-pid Claude session file; empty for non-claude sessions.
-        session_id="$(_session_id "$name")"
-        transcript="$(_session_transcript_path "$name")"
+        # Recency/session id: Claude exposes a per-pid session file; Codex uses
+        # rollout JSONLs plus the local app state DB.
+        session_id=""
+        transcript=""
+        if [[ "$agent" == "codex" ]]; then
+            if [[ -n "$stored_conv_id" ]] && _codex_thread_is_unarchived "$stored_conv_id"; then
+                session_id="$stored_conv_id"
+            else
+                local rollout
+                rollout="$(_session_codex_rollout_path "$name")"
+                [[ -n "$rollout" ]] && session_id="$(_codex_rollout_thread_id "$rollout")"
+            fi
+        else
+            session_id="$(_session_id "$name")"
+            transcript="$(_session_transcript_path "$name")"
+        fi
         # Refresh conversation_id/transcript_path on the record when the live
         # value is non-empty and differs from the stored value (plan 051).
         if [[ -n "$session_id" && "$session_id" != "$stored_conv_id" ]]; then
@@ -6635,6 +7057,225 @@ _session_list() {
         for idx in "${order[@]}"; do printf '%s\n' "${human_lines[idx]}"; done
     fi
     return 0
+}
+
+_session_app_list() {
+    local json=false include_all=false a rows
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            --all) include_all=true ;;
+            -h|--help|help)
+                echo "Usage: cctrl session app-ls [--all] [--json]"
+                echo ""
+                echo "  List app-owned Codex tasks known to cctrl. This is the app-first"
+                echo "  counterpart to 'session ls', which only lists live tmux sessions."
+                echo ""
+                echo "    --all     Include all local Codex app threads, not just cctrl records"
+                echo "    --json    Machine-readable output"
+                return 0
+                ;;
+            -*) echo -e "${RED}Unknown app-ls flag: $a${RESET}" >&2; return 64 ;;
+        esac
+    done
+    rows="$(_codex_app_threads_json "$include_all")" || return 1
+    if $json; then
+        printf '%s\n' "$rows" | jq '.'
+        return 0
+    fi
+    if [[ "$(printf '%s\n' "$rows" | jq 'length' 2>/dev/null)" == "0" ]]; then
+        echo -e "${DIM}No app-owned Codex tasks known to cctrl.${RESET}"
+        return 0
+    fi
+    echo -e "${DIM}App-owned tasks survive outside tmux. STATE locked means a writer lock exists.${RESET}"
+    printf '%-15s %-10s %-40s %s\n' "SESSION" "STATE" "TITLE" "DIR"
+    printf '%s\n' "$rows" | jq -r '.[] | [
+        (.name // "-"),
+        (.state // "-"),
+        ((.title // .purpose // "-") | if length > 40 then .[0:37] + "..." else . end),
+        (.dir // "-")
+    ] | @tsv' | while IFS=$'\t' read -r name state title dir; do
+        printf '%-15s %-10s %-40s %s\n' "$name" "$state" "$title" "${dir/#$HOME/~}"
+    done
+}
+
+_session_release_to_app_names() {
+    local all="$1" target="${2:-}" f name agent names=""
+    if [[ "$all" == "true" ]]; then
+        for f in "$SESSION_METADATA_DIR"/*.json; do
+            [[ -e "$f" ]] || continue
+            agent="$(jq -r '.agent // empty' "$f" 2>/dev/null)"
+            [[ "$agent" == "codex" ]] || continue
+            name="$(jq -r '.name // empty' "$f" 2>/dev/null)"
+            [[ -n "$name" ]] && names+="$name"$'\n'
+        done
+        if command -v tmux >/dev/null 2>&1; then
+            while IFS= read -r name; do
+                [[ -n "$name" ]] || continue
+                agent="$(_session_metadata_field "$name" agent)"
+                [[ -n "$agent" ]] || agent="$(_agent_from_cmd "$(_session_agent_cmd "$name")")"
+                [[ "$agent" == "codex" ]] && names+="$name"$'\n'
+            done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+        fi
+    else
+        names="$target"$'\n'
+    fi
+    printf '%s' "$names" | awk 'NF && !seen[$0]++'
+}
+
+_session_release_to_app() {
+    local json=false dry_run=false assume_yes=false all=false wait_s="${CCTRL_RELEASE_WAIT_SECONDS:-10}" target=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            --yes|-y) assume_yes=true; shift ;;
+            --all) all=true; shift ;;
+            --wait)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--wait needs seconds${RESET}" >&2; return 64; }
+                wait_s="$2"; shift 2 ;;
+            -h|--help|help)
+                echo "Usage: cctrl session release-to-app <session>|--all [--yes] [--dry-run] [--wait SECONDS] [--json]"
+                echo ""
+                echo "  Release tmux-backed Codex sessions to the Codex/ChatGPT app."
+                echo "  cctrl sends EOF to the tmux owner, waits for it to exit, then"
+                echo "  quarantines only writer locks that no live tmux/session process owns."
+                echo ""
+                echo "    --all       Release every cctrl-known Codex session"
+                echo "    --yes       Act without interactive confirmation"
+                echo "    --dry-run   Show what would happen"
+                echo "    --json      Machine-readable output"
+                return 0
+                ;;
+            -*)
+                echo -e "${RED}Unknown release-to-app flag: $1${RESET}" >&2
+                return 64
+                ;;
+            *)
+                [[ -z "$target" ]] || { echo -e "${RED}Only one session name expected.${RESET}" >&2; return 64; }
+                target="$1"; shift ;;
+        esac
+    done
+    if ! [[ "$wait_s" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}--wait must be a non-negative integer, got: $wait_s${RESET}" >&2
+        return 64
+    fi
+    if [[ "$all" != "true" && -z "$target" ]]; then
+        echo -e "${RED}Usage: cctrl session release-to-app <session>|--all [--yes] [--dry-run]${RESET}" >&2
+        return 64
+    fi
+    if [[ "$dry_run" != "true" && "$assume_yes" != "true" ]]; then
+        if _prompt_tty_available; then
+            local ans=""
+            if [[ "$all" == "true" ]]; then
+                printf 'Release all cctrl-known Codex tmux sessions to the app? [y/N] ' > /dev/tty
+            else
+                printf 'Release %s to the Codex app? [y/N] ' "$target" > /dev/tty
+            fi
+            IFS= read -r ans < /dev/tty || true
+            [[ "$ans" == [yY]* ]] || { echo "Declined."; return 1; }
+        else
+            echo -e "${RED}Refusing to release sessions without --yes in a non-interactive shell.${RESET}" >&2
+            return 1
+        fi
+    fi
+
+    local -a names=() json_items=()
+    local n
+    while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(_session_release_to_app_names "$all" "$target")
+    if [[ ${#names[@]} -eq 0 ]]; then
+        $json && { echo "[]"; return 0; }
+        echo -e "${DIM}No cctrl-known Codex sessions to release.${RESET}"
+        return 0
+    fi
+
+    local name agent live_before live_after status thread_id rollout lock_state lock_action quarantine_path seconds
+    local ok lock
+    for name in "${names[@]}"; do
+        agent="$(_session_metadata_field "$name" agent)"
+        [[ -n "$agent" ]] || agent="$(_agent_from_cmd "$(_session_agent_cmd "$name")")"
+        thread_id="$(_session_metadata_field "$name" conversation_id)"
+        if [[ -z "$thread_id" ]]; then
+            rollout="$(_session_codex_rollout_path "$name")"
+            [[ -n "$rollout" ]] && thread_id="$(_codex_rollout_thread_id "$rollout")"
+        fi
+        live_before=false
+        if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$name" 2>/dev/null; then
+            live_before=true
+        fi
+        ok=true
+        status="released"
+        lock_state=""
+        lock_action="none"
+        quarantine_path=""
+
+        if [[ "$agent" != "codex" ]]; then
+            ok=false
+            status="skipped-unsupported-agent"
+        elif [[ -z "$thread_id" ]]; then
+            ok=false
+            status="skipped-no-thread-id"
+        else
+            if [[ "$live_before" == "true" ]]; then
+                if [[ "$dry_run" == "true" ]]; then
+                    status="would-release"
+                else
+                    tmux send-keys -t "$name" C-d 2>/dev/null || true
+                    seconds=0
+                    while (( seconds < wait_s )); do
+                        sleep 1
+                        if ! tmux has-session -t "$name" 2>/dev/null; then
+                            break
+                        fi
+                        seconds=$((seconds + 1))
+                    done
+                fi
+            fi
+            live_after=false
+            if command -v tmux >/dev/null 2>&1 && tmux has-session -t "$name" 2>/dev/null; then
+                live_after=true
+            fi
+            if [[ "$dry_run" != "true" && "$live_after" == "true" ]]; then
+                ok=false
+                status="still-live"
+            fi
+            lock="$(_codex_thread_writer_lock_path "$thread_id" 2>/dev/null || true)"
+            if [[ -n "$lock" && -f "$lock" ]]; then
+                lock_state="present"
+                if _codex_writer_lock_is_stale "$thread_id"; then
+                    if [[ "$dry_run" == "true" ]]; then
+                        lock_action="would-quarantine"
+                    elif [[ "$ok" == "true" ]]; then
+                        quarantine_path="$(_codex_quarantine_writer_lock "$thread_id")"
+                        lock_action="quarantined"
+                    fi
+                else
+                    lock_action="kept-live-owner"
+                fi
+            else
+                lock_state="absent"
+            fi
+            if [[ "$dry_run" != "true" && "$ok" == "true" ]]; then
+                _session_update_metadata_field "$name" control_surface "app" 2>/dev/null || true
+                _session_update_metadata_field "$name" released_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" 2>/dev/null || true
+                [[ -n "$thread_id" ]] && _session_update_metadata_field "$name" conversation_id "$thread_id" 2>/dev/null || true
+            fi
+        fi
+
+        json_items+=("$(jq -n \
+            --arg name "$name" --arg agent "$agent" --arg status "$status" \
+            --arg thread_id "$thread_id" --arg lock "$lock_state" --arg lock_action "$lock_action" \
+            --arg quarantine "$quarantine_path" \
+            --argjson ok "$ok" --argjson live_before "$live_before" \
+            '{name:$name, ok:$ok, agent:(if $agent=="" then null else $agent end), status:$status, thread_id:(if $thread_id=="" then null else $thread_id end), tmux_was_live:$live_before, writer_lock:(if $lock=="" then null else $lock end), lock_action:$lock_action, quarantine_path:(if $quarantine=="" then null else $quarantine end)}')")
+        if [[ "$json" != "true" ]]; then
+            printf '%-28s %-24s %-18s %s\n' "$name" "$status" "$lock_action" "${thread_id:-no-thread-id}"
+        fi
+    done
+
+    if $json; then
+        printf '%s\n' "${json_items[@]}" | jq -s '.'
+    fi
 }
 
 _session_repair_bridge() {
@@ -8527,13 +9168,13 @@ cmd_restart() {
 
 cmd_rename() {
     # Rename a session's display label everywhere: cctrl metadata, tmux
-    # option, and Claude Code transcript (custom-title).
+    # option, and the backing agent app title when a supported surface exists.
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 2 ]]; then
         echo "Usage: cctrl rename <session> \"new label\""
         echo ""
         echo "  Update the display label for a session."
-        echo "  Changes cctrl metadata, tmux @cctrl_purpose, and"
-        echo "  Claude Code's display name (via transcript custom-title)."
+        echo "  Changes cctrl metadata, tmux @cctrl_purpose, and the app display name"
+        echo "  for Claude Code (transcript custom-title) or Codex (local state DB)."
         [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && return 0
         return 1
     fi
@@ -8564,9 +9205,23 @@ with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
     tmux set-option -t "$target" @cctrl_purpose "$new_label" 2>/dev/null || true
 
     # 3. For Claude Code sessions: append custom-title to transcript
+    #    For Codex sessions: update the local Codex app thread title/name.
     local agent
     agent="$(tmux show-option -qv -t "$target" @cctrl_agent 2>/dev/null || true)"
-    if [[ "$agent" != "codex" ]]; then
+    if [[ -z "$agent" || "$agent" == "1" ]]; then
+        agent="$(_session_metadata_field "$target" agent 2>/dev/null || true)"
+    fi
+    if [[ "$agent" == "codex" ]]; then
+        local cwd display_name
+        cwd="$(_session_metadata_field "$target" cwd 2>/dev/null || true)"
+        display_name="$(_session_app_display_name "$target" "$new_label" "$cwd")"
+        if _session_codex_set_display_name "$target" "$display_name"; then
+            echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux + Codex app)"
+        else
+            echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux; Codex app title not found)"
+            echo -e "${DIM}Run again after the Codex rollout appears, or check CODEX_HOME/state_*.sqlite.${RESET}" >&2
+        fi
+    else
         local sid tpath
         sid="$(_session_id "$target" 2>/dev/null || true)"
         tpath="$(_session_transcript_path "$target" 2>/dev/null || true)"
@@ -8580,8 +9235,6 @@ with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
         else
             echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux; no transcript found)"
         fi
-    else
-        echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux; Codex has no naming surface)"
     fi
 }
 
@@ -8681,21 +9334,145 @@ _session_created_at_ms() {
 }
 
 _session_codex_rollout_path() {
-    # Resolve a codex session's rollout log under $CODEX_SESSIONS_DIR by
-    # correlating the session_meta cwd (first line of each rollout) against the
-    # tmux session's current path (or its recorded metadata cwd). Rollout file
-    # names embed a zero-padded timestamp, so a reverse lexical sort yields the
-    # newest match first. Echo the single best match, or empty if none.
-    local sess="$1" cwd f meta_cwd
+    # Resolve a codex session's rollout log under $CODEX_SESSIONS_DIR. Prefer an
+    # exact initial-prompt match when present, then a stored conversation_id,
+    # then cwd + initial prompt, then cwd. The cwd-only fallback is inherently
+    # ambiguous for same-repo concurrent sessions, so launch/ls paths backfill
+    # conversation_id as soon as possible.
+    local sess="$1" cwd f meta_cwd meta_id meta_ts meta_ts_floor stored_id initial_prompt created_at first_cwd_match=""
+    stored_id="$(_session_metadata_field "$sess" conversation_id)"
+    created_at="$(_session_metadata_field "$sess" created_at)"
+    initial_prompt="$(_session_metadata_field "$sess" initial_prompt)"
+    if [[ -n "$stored_id" && -d "$CODEX_SESSIONS_DIR" ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            meta_id="$(_codex_rollout_thread_id "$f")"
+            [[ "$meta_id" == "$stored_id" ]] || continue
+            _codex_thread_is_unarchived "$meta_id" || continue
+            if [[ -n "$initial_prompt" ]] && ! _codex_rollout_matches_prompt "$f" "$initial_prompt"; then
+                continue
+            fi
+            if [[ -n "$created_at" ]]; then
+                meta_ts="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.timestamp // .timestamp // empty' 2>/dev/null)"
+                if [[ "$meta_ts" == *.*Z ]]; then
+                    meta_ts_floor="${meta_ts%%.*}Z"
+                else
+                    meta_ts_floor="$meta_ts"
+                fi
+                [[ -n "$meta_ts_floor" && "$meta_ts_floor" < "$created_at" ]] && continue
+            fi
+            printf '%s' "$f"
+            return 0
+        done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
+    fi
+
+    if [[ -n "$initial_prompt" && -d "$CODEX_SESSIONS_DIR" ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            meta_id="$(_codex_rollout_thread_id "$f")"
+            _codex_thread_is_unarchived "$meta_id" || continue
+            if [[ -n "$created_at" ]]; then
+                meta_ts="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.timestamp // .timestamp // empty' 2>/dev/null)"
+                if [[ "$meta_ts" == *.*Z ]]; then
+                    meta_ts_floor="${meta_ts%%.*}Z"
+                else
+                    meta_ts_floor="$meta_ts"
+                fi
+                [[ -n "$meta_ts_floor" && "$meta_ts_floor" < "$created_at" ]] && continue
+            fi
+            if _codex_rollout_matches_prompt "$f" "$initial_prompt"; then
+                printf '%s' "$f"
+                return 0
+            fi
+        done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
+    fi
+
     cwd="$(tmux list-panes -t "$sess" -F '#{pane_current_path}' 2>/dev/null | head -1)"
     [[ -n "$cwd" ]] || cwd="$(_session_metadata_field "$sess" cwd)"
     [[ -n "$cwd" && -d "$CODEX_SESSIONS_DIR" ]] || return 0
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
         meta_cwd="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.cwd // empty' 2>/dev/null)"
-        [[ "$meta_cwd" == "$cwd" ]] && { printf '%s' "$f"; return 0; }
+        [[ "$meta_cwd" == "$cwd" ]] || continue
+        if [[ -n "$created_at" ]]; then
+            meta_ts="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.timestamp // .timestamp // empty' 2>/dev/null)"
+            if [[ "$meta_ts" == *.*Z ]]; then
+                meta_ts_floor="${meta_ts%%.*}Z"
+            else
+                meta_ts_floor="$meta_ts"
+            fi
+            [[ -n "$meta_ts_floor" && "$meta_ts_floor" < "$created_at" ]] && continue
+        fi
+        meta_id="$(_codex_rollout_thread_id "$f")"
+        _codex_thread_is_unarchived "$meta_id" || continue
+        [[ -z "$first_cwd_match" ]] && first_cwd_match="$f"
+        if [[ -n "$initial_prompt" ]] && _codex_rollout_matches_prompt "$f" "$initial_prompt"; then
+            printf '%s' "$f"
+            return 0
+        fi
     done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
+    [[ -n "$first_cwd_match" ]] && printf '%s' "$first_cwd_match"
     return 0
+}
+
+_codex_set_thread_title() {
+    local thread_id="$1" title="$2" db
+    db="$(_codex_state_db)"
+    [[ -n "$db" && -f "$db" ]] || return 2
+    python3 - "$db" "$thread_id" "$title" <<'PY'
+import sqlite3
+import sys
+
+db, thread_id, title = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    con = sqlite3.connect(db)
+    cur = con.execute(
+        "UPDATE threads SET title = ?, name = ? WHERE id = ?",
+        (title, title, thread_id),
+    )
+    con.commit()
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+if cur.rowcount == 0:
+    sys.exit(3)
+PY
+}
+
+_session_codex_set_display_name() {
+    local session_name="$1" display_name="$2" rollout thread_id
+    rollout="$(_session_codex_rollout_path "$session_name")"
+    if [[ -n "$rollout" ]]; then
+        thread_id="$(_codex_rollout_thread_id "$rollout")"
+        if [[ -n "$thread_id" ]] && _codex_thread_is_unarchived "$thread_id"; then
+            _codex_set_thread_title "$thread_id" "$display_name" || return $?
+            _session_update_metadata_field "$session_name" conversation_id "$thread_id" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    thread_id="$(_session_metadata_field "$session_name" conversation_id)"
+    if [[ -n "$thread_id" ]] && _codex_thread_is_unarchived "$thread_id"; then
+        _codex_set_thread_title "$thread_id" "$display_name" && return 0
+    fi
+    return 2
+}
+
+_session_codex_schedule_display_name_sync() {
+    local session_name="$1" display_name="$2" created_at="$3"
+    [[ -n "$session_name" && -n "$display_name" ]] || return 0
+    (
+        local _elapsed=0 _timeout="${CCTRL_CODEX_TITLE_POLL_TIMEOUT:-30}" _interval="${CCTRL_CODEX_TITLE_POLL_INTERVAL:-2}" _rec_created
+        while [[ "$_elapsed" -lt "$_timeout" ]]; do
+            sleep "$_interval"
+            _elapsed=$((_elapsed + _interval))
+            _rec_created="$(_session_metadata_field "$session_name" created_at 2>/dev/null)"
+            [[ "$_rec_created" == "$created_at" ]] || break
+            if _session_codex_set_display_name "$session_name" "$display_name" 2>/dev/null; then
+                break
+            fi
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
 }
 
 _session_never_prompted() {
