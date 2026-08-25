@@ -3,11 +3,14 @@ id: 011
 title: Add agent-facing peer operations guidance
 status: done
 completed: 2026-07-22
+qa: automated
+reviewed: false
 blocked-by: [010]
 priority: 60
 goal: tmux-peer-direct-chat
 allows-migrations: false
 needs-review: none
+tui-fixture: n/a  # help and MCP metadata describe direct chat but do not inspect terminal pane content
 created: 2026-06-14
 ---
 

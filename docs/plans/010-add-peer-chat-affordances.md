@@ -3,11 +3,14 @@ id: 010
 title: Add peer chat affordances over tmux sessions
 status: done
 completed: 2026-07-22
+qa: automated
+reviewed: false
 blocked-by: [009]
 priority: 10
 goal: tmux-peer-direct-chat
 allows-migrations: false
 needs-review: none
+tui-fixture: n/a  # peer affordances resolve tmux sessions but add no pane-content parser; plan 009 owns the readiness delegation
 created: 2026-06-14
 ---
 

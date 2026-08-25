@@ -23,6 +23,7 @@ chmod +x "$TMPDIR/hostname"
 # leak in (CCTRL_TMUX_CONTEXT flips `cctrl start` into foreground mode).
 unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
+export CCTRL_TITLE_MODE=heuristic
 
 fail() {
     echo "FAIL: $*" >&2
@@ -104,7 +105,14 @@ case "${1:-}" in
         fi
         exit 0
         ;;
-    send-keys|delete-buffer)
+    send-keys)
+        if [[ "${TMUX_FAKE_SEND_FAIL:-}" == "1" ]]; then
+            echo "send failed" >&2
+            exit 1
+        fi
+        exit 0
+        ;;
+    delete-buffer)
         exit 0
         ;;
     has-session)
@@ -5876,11 +5884,11 @@ test_session_say_unknown_readiness_requires_force_busy() {
 }
 
 test_session_say_errors() {
-    # Unknown session, empty body, missing body, and tmux paste failure all
-    # produce clear errors and non-zero exits.
+    # Unknown session, empty body, missing body, body-file read failure, and
+    # tmux load/paste/send failures all produce clear errors and non-zero exits.
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"
-    local log="$TMPDIR/say-err.log" out rc=0
+    local log="$TMPDIR/say-err.log" out rc=0 body_path
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="" \
         "$ROOT/cctrl" session say TMUX--nope --json -- "hi")" || rc=$?
@@ -5900,6 +5908,34 @@ test_session_say_errors() {
     (( rc != 0 )) || fail "expected non-zero exit for missing body"
     printf '%s\n' "$out" | jq -e '.ok == false and .status == "validation"' >/dev/null || fail "expected validation status for missing body"
 
+    body_path="$TMPDIR/unreadable-say-body.txt"
+    printf 'hidden body\n' > "$body_path"
+    cat > "$TMPDIR/cat" <<SH
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "$body_path" ]]; then
+    echo "permission denied" >&2
+    exit 1
+fi
+exec /bin/cat "\$@"
+SH
+    chmod +x "$TMPDIR/cat"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --body-file "$body_path" --json 2>&1)" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for body-file read failure"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "validation" and (.reason | test("Failed to read body file"))' >/dev/null \
+        || fail "expected structured validation error for body-file read failure"
+    rm -f "$TMPDIR/cat"
+
+    : > "$log"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_LOAD_FAIL=1 \
+        "$ROOT/cctrl" session say TMUX--demo --json -- "load boom")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for tmux load-buffer failure"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "paste-failed" and (.reason | test("load failed|load-buffer"))' >/dev/null \
+        || fail "expected paste-failed status for tmux load-buffer failure"
+
     : > "$log"
     rc=0
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
@@ -5908,7 +5944,16 @@ test_session_say_errors() {
     (( rc != 0 )) || fail "expected non-zero exit for tmux paste failure"
     printf '%s\n' "$out" | jq -e '.ok == false and .status == "paste-failed"' >/dev/null || fail "expected paste-failed status"
 
-    echo "ok: session say reports unknown session, empty/missing body, and tmux paste failures"
+    : > "$log"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_SEND_FAIL=1 \
+        "$ROOT/cctrl" session say TMUX--demo --json -- "send boom")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit for tmux send-keys failure"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "paste-failed" and (.reason | test("send failed|send-keys"))' >/dev/null \
+        || fail "expected paste-failed status for tmux send-keys failure"
+
+    echo "ok: session say reports unknown session, empty/missing body, body-file read failure, and tmux load/paste/send failures"
 }
 
 test_peer_session_resolves_and_alias() {

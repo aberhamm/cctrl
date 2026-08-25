@@ -217,7 +217,7 @@ _llm_generate_title() {
 _generate_auto_purpose() {
     local prompt="$1" repo_name="$2"
 
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ "${CCTRL_TITLE_MODE:-auto}" != "heuristic" && -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
         local endpoint model
         endpoint="$(jq -r '.titleEndpoint // empty' "$CONFIG_FILE" 2>/dev/null || true)"
         model="$(jq -r '.titleModel // empty' "$CONFIG_FILE" 2>/dev/null || true)"
@@ -3361,12 +3361,43 @@ _arg_has_json() {
 }
 
 _read_body_file() {
-    local path="$1" body sentinel=$'\037'
+    local path="$1" body sentinel=$'\037' tmp tmperr err rc=0
+    MAILBOX_BODY=""
+    MAILBOX_BODY_READ_ERROR=""
+    tmp="$(mktemp)" || {
+        MAILBOX_BODY_READ_ERROR="Could not create temporary body file."
+        return 1
+    }
+    tmperr="$(mktemp)" || {
+        rm -f "$tmp"
+        MAILBOX_BODY_READ_ERROR="Could not create temporary body error file."
+        return 1
+    }
     if [[ "$path" == "-" ]]; then
-        body="$(cat; printf '%s' "$sentinel")"
+        if cat > "$tmp" 2>"$tmperr"; then
+            :
+        else
+            rc=$?
+            err="$(cat "$tmperr" 2>/dev/null || true)"
+            MAILBOX_BODY_READ_ERROR="Failed to read body from stdin."
+            [[ -n "$err" ]] && MAILBOX_BODY_READ_ERROR+=" $err"
+            rm -f "$tmp" "$tmperr"
+            return "$rc"
+        fi
     else
-        body="$(cat "$path"; printf '%s' "$sentinel")"
+        if cat "$path" > "$tmp" 2>"$tmperr"; then
+            :
+        else
+            rc=$?
+            err="$(cat "$tmperr" 2>/dev/null || true)"
+            MAILBOX_BODY_READ_ERROR="Failed to read body file: $path"
+            [[ -n "$err" ]] && MAILBOX_BODY_READ_ERROR+=" $err"
+            rm -f "$tmp" "$tmperr"
+            return "$rc"
+        fi
     fi
+    body="$(cat "$tmp"; printf '%s' "$sentinel")"
+    rm -f "$tmp" "$tmperr"
     MAILBOX_BODY="${body%$sentinel}"
 }
 
@@ -3467,16 +3498,24 @@ _peer_cmd_send() {
             return 64
         fi
         if [[ "$body_file" == "-" ]]; then
-            _read_body_file -
+            if ! _read_body_file -; then
+                $json && _json_error "validation" "${MAILBOX_BODY_READ_ERROR:-Failed to read body from stdin.}" || echo -e "${RED}${MAILBOX_BODY_READ_ERROR:-Failed to read body from stdin.}${RESET}" >&2
+                unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
+                return 64
+            fi
             body="$MAILBOX_BODY"
         elif [[ -f "$body_file" ]]; then
-            _read_body_file "$body_file"
+            if ! _read_body_file "$body_file"; then
+                $json && _json_error "validation" "${MAILBOX_BODY_READ_ERROR:-Failed to read body file: $body_file}" || echo -e "${RED}${MAILBOX_BODY_READ_ERROR:-Failed to read body file: $body_file}${RESET}" >&2
+                unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
+                return 64
+            fi
             body="$MAILBOX_BODY"
         else
             $json && _json_error "validation" "Body file not found: $body_file" || echo -e "${RED}Body file not found: $body_file${RESET}" >&2
             return 64
         fi
-        unset MAILBOX_BODY
+        unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
         saw_body=true
     fi
     if ! $saw_body; then
@@ -4989,16 +5028,24 @@ _peer_cmd_reply() {
             return 64
         fi
         if [[ "$body_file" == "-" ]]; then
-            _read_body_file -
+            if ! _read_body_file -; then
+                $json && _json_error "validation" "${MAILBOX_BODY_READ_ERROR:-Failed to read body from stdin.}" || echo -e "${RED}${MAILBOX_BODY_READ_ERROR:-Failed to read body from stdin.}${RESET}" >&2
+                unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
+                return 64
+            fi
             body="$MAILBOX_BODY"
         elif [[ -f "$body_file" ]]; then
-            _read_body_file "$body_file"
+            if ! _read_body_file "$body_file"; then
+                $json && _json_error "validation" "${MAILBOX_BODY_READ_ERROR:-Failed to read body file: $body_file}" || echo -e "${RED}${MAILBOX_BODY_READ_ERROR:-Failed to read body file: $body_file}${RESET}" >&2
+                unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
+                return 64
+            fi
             body="$MAILBOX_BODY"
         else
             $json && _json_error "validation" "Body file not found: $body_file" || echo -e "${RED}Body file not found: $body_file${RESET}" >&2
             return 64
         fi
-        unset MAILBOX_BODY
+        unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
         saw_body=true
     fi
     if ! $saw_body; then
@@ -6195,16 +6242,24 @@ _session_say() {
             return 64
         fi
         if [[ "$body_file" == "-" ]]; then
-            _read_body_file -
+            if ! _read_body_file -; then
+                $json && _session_say_json false "$sess" false validation "${MAILBOX_BODY_READ_ERROR:-Failed to read body from stdin.}" || echo -e "${RED}${MAILBOX_BODY_READ_ERROR:-Failed to read body from stdin.}${RESET}" >&2
+                unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
+                return 64
+            fi
             body="$MAILBOX_BODY"
         elif [[ -f "$body_file" ]]; then
-            _read_body_file "$body_file"
+            if ! _read_body_file "$body_file"; then
+                $json && _session_say_json false "$sess" false validation "${MAILBOX_BODY_READ_ERROR:-Failed to read body file: $body_file}" || echo -e "${RED}${MAILBOX_BODY_READ_ERROR:-Failed to read body file: $body_file}${RESET}" >&2
+                unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
+                return 64
+            fi
             body="$MAILBOX_BODY"
         else
             $json && _session_say_json false "$sess" false validation "Body file not found: $body_file" || echo -e "${RED}Body file not found: $body_file${RESET}" >&2
             return 64
         fi
-        unset MAILBOX_BODY
+        unset MAILBOX_BODY MAILBOX_BODY_READ_ERROR
         saw_body=true
     fi
     if ! $saw_body; then

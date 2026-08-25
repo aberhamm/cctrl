@@ -4,11 +4,13 @@ title: Add direct tmux session say command
 status: done
 completed: 2026-07-22
 qa: automated
+reviewed: false
 blocked-by: []
 priority: 9
 goal: tmux-peer-direct-chat
 allows-migrations: false
 needs-review: none
+tui-fixture: n/a  # reuses existing _peer_pane_ready_for_delivery modal signatures; this plan only wires session say to that helper
 created: 2026-06-14
 ---
 
