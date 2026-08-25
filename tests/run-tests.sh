@@ -278,7 +278,14 @@ test_launch_args() {
     local codex_home="$TMPDIR/codex-remote-home"
     mkdir -p "$codex_home/app-server-daemon"
     printf '{"remoteControlEnabled":true}\n' > "$codex_home/app-server-daemon/settings.json"
-    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex -m "remote default")"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex -m "tmux default")"
+    assert_contains "$out" "CMD=codex"
+    assert_contains "$out" "ARG[0]=--yolo"
+    assert_contains "$out" "ARG[1]=--cd"
+    assert_contains "$out" "ARG[3]=tmux default"
+    assert_not_contains "$out" "--remote"
+
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_CODEX_REMOTE_DEFAULT=unix:// CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex -m "remote default")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=--remote"
@@ -1191,6 +1198,48 @@ JSON
     local out
     out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--homelab--3 TMUX--ms--homelab--5" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
     assert_contains "$out" '"remote_control": "collision"'
+}
+
+test_session_doctor_quarantines_orphan_codex_writer_lock() {
+    # Codex can leave behind an empty thread-writer-lock for a thread id that has
+    # no app DB row and no rollout JSONL. That lock makes the app think a task is
+    # owned/open, but resume fails with "no rollout found". Doctor should report
+    # and, under --fix --yes, quarantine only that orphan.
+    local bin="$TMPDIR/orphanbin" codex_home="$TMPDIR/orphan-codex" backup="$TMPDIR/orphan-backup"
+    mkdir -p "$bin" "$codex_home/thread-writer-locks" "$codex_home/sessions/2026/08/25" "$backup"
+    make_fake_tmux "$bin/tmux"
+    : > "$codex_home/thread-writer-locks/orphan-thread.lock"
+    : > "$codex_home/thread-writer-locks/db-thread.lock"
+    : > "$codex_home/thread-writer-locks/rollout-thread.lock"
+    : > "$codex_home/sessions/2026/08/25/rollout-2026-08-25T10-00-00-rollout-thread.jsonl"
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT)")
+con.execute("INSERT INTO threads (id, title) VALUES (?, ?)", ("db-thread", "Backed by DB"))
+con.commit()
+PY
+
+    local out
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$codex_home" CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" "$ROOT/cctrl" session doctor --json)"
+    printf '%s\n' "$out" | jq -e '
+      (map(select(.type == "codex_writer_lock" and .thread_id == "orphan-thread" and .status == "orphan" and .action == null)) | length) == 1
+      and (map(select(.thread_id == "db-thread" or .thread_id == "rollout-thread")) | length) == 0
+    ' >/dev/null || fail "expected doctor to report only the orphan Codex writer lock"
+    [[ -e "$codex_home/thread-writer-locks/orphan-thread.lock" ]] || fail "report-only doctor must not move orphan lock"
+
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$codex_home" CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" "$ROOT/cctrl" session doctor --fix --yes --json)"
+    printf '%s\n' "$out" | jq -e '
+      (map(select(.type == "codex_writer_lock" and .thread_id == "orphan-thread" and .action == "quarantined")) | length) == 1
+    ' >/dev/null || fail "expected doctor --fix --yes to quarantine orphan Codex writer lock"
+    [[ ! -e "$codex_home/thread-writer-locks/orphan-thread.lock" ]] || fail "orphan lock stayed in live lock dir"
+    [[ -e "$backup/orphan-thread.lock" ]] || fail "orphan lock was not moved to backup"
+    [[ -e "$codex_home/thread-writer-locks/db-thread.lock" ]] || fail "DB-backed lock must be kept"
+    [[ -e "$codex_home/thread-writer-locks/rollout-thread.lock" ]] || fail "rollout-backed lock must be kept"
+
+    echo "ok: session doctor quarantines only orphan Codex writer locks"
 }
 
 # --- plan 018: guided-relaunch realign of app/tmux name mismatches ---------
@@ -3586,10 +3635,13 @@ test_peer_deliver_codex_modal_detection() {
 
     # modal_pane: a real Codex approval modal ("Allow Codex to …" + the "tell
     # Codex what to do differently" option) must DEFER.
+    # hook_pane: Codex's hook-review trust prompt must also DEFER. This prompt
+    # appears before any normal input prompt, so nudging it would move the modal
+    # selection instead of delivering the peer message.
     # benign_pane: prose with "Approve", a shell "[y/N]" prompt, and a markdown
     # numbered list — but no real modal marker — must NOT defer (the old
     # 'Approve'/'y/N' markers wrongly did).
-    local modal_pane benign_pane
+    local modal_pane hook_pane benign_pane out
     modal_pane="$(printf '%s\n' \
         '● Applying the proposed patch next.' \
         '' \
@@ -3608,7 +3660,21 @@ test_peer_deliver_codex_modal_detection() {
 
     assert_modal_detection "$data" "$log" comet TMUX--comet "$modal_pane" "$benign_pane"
 
-    echo "ok: codex modal-detector anchors on real Codex modal text (no false-positive deferral)"
+    hook_pane="$(printf '%s\n' \
+        'Hooks need review' \
+        '2 hooks are new or changed.' \
+        '' \
+        'PreToolUse hooks' \
+        '1 hook needs review before it can run.' \
+        '' \
+        'Press t to trust; esc to go back')"
+    : > "$log"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "hold for hook review" >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$hook_pane" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --json)"
+    printf '%s\n' "$out" | jq -e '.results[0].status == "deferred" and .results[0].reason == "modal prompt visible"' >/dev/null || fail "expected Codex hook-review prompt to defer"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    echo "ok: codex modal-detector anchors on real Codex modal text and hook-review prompts"
 }
 
 test_peer_deliver_failures_all_and_concurrency() {
@@ -4196,6 +4262,62 @@ PY
     assert_contains "$out" '"state": "app-owned"'
     assert_contains "$out" '"title": "Demo: released task (TMUX--appdemo)"'
     echo "ok: app-ls shows cctrl-known Codex app tasks"
+}
+
+test_codex_tmux_exit_archives_app_task() {
+    # A terminal-first Codex session should leave the app task list when its
+    # tmux wrapper exits. Opting out keeps the task visible for exceptional use.
+    local rootcopy="$TMPDIR/codex-archive-wrapper" meta="$TMPDIR/codex-archive-meta" codex_home="$TMPDIR/codex-archive-home" bin="$TMPDIR/codex-archive-bin"
+    mkdir -p "$rootcopy/lib" "$rootcopy/data" "$rootcopy/profiles" "$meta" "$codex_home" "$bin"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    cp "$ROOT/lib/session-wrapper.sh" "$rootcopy/lib/session-wrapper.sh"
+    chmod +x "$rootcopy/cctrl" "$rootcopy/lib/session-wrapper.sh"
+    cat > "$bin/codex" <<'SH'
+#!/usr/bin/env bash
+if [[ "${CODEX_TEST_WAIT:-}" == "1" ]]; then
+    trap 'exit 0' TERM INT HUP
+    while true; do sleep 1; done
+fi
+exit 0
+SH
+    chmod +x "$bin/codex"
+    cat > "$meta/TMUX--archive.json" <<'JSON'
+{"name":"TMUX--archive","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"archive task","agent":"codex","cctrl_managed":true,"created_at":"2026-08-25T10:00:00Z","conversation_id":"thread-archive-1","transcript_path":null}
+JSON
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT, archived INTEGER)")
+con.execute("INSERT INTO threads (id, title, name, archived) VALUES (?, ?, ?, ?)", ("thread-archive-1", "Demo", "Demo", 0))
+con.commit()
+PY
+
+    PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
+        CCTRL_SESSION_NAME="TMUX--archive" "$rootcopy/lib/session-wrapper.sh" codex "$TMPDIR/archive-marker" --cd /tmp/demo
+    local archived_at
+    archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
+    [[ "$archived_at" == "1" ]] || fail "tmux wrapper did not archive completed Codex task"
+    [[ -n "$(jq -r '.archived_at // empty' "$meta/TMUX--archive.json")" ]] || fail "archive timestamp missing from metadata"
+
+    sqlite3 "$codex_home/state_5.sqlite" "UPDATE threads SET archived = 0 WHERE id='thread-archive-1'"
+    PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
+        CCTRL_SESSION_NAME="TMUX--archive" CCTRL_CODEX_ARCHIVE_ON_EXIT=0 \
+        "$rootcopy/lib/session-wrapper.sh" codex "$TMPDIR/archive-marker-optout" --cd /tmp/demo
+    archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
+    [[ "$archived_at" == "0" ]] || fail "archive-on-exit opt-out was ignored"
+
+    PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
+        CCTRL_SESSION_NAME="TMUX--archive" CODEX_TEST_WAIT=1 \
+        "$rootcopy/lib/session-wrapper.sh" codex "$TMPDIR/archive-marker-signal" --cd /tmp/demo &
+    local wrapper_pid=$!
+    sleep 0.1
+    kill -TERM "$wrapper_pid"
+    wait "$wrapper_pid" || true
+    archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
+    [[ "$archived_at" == "1" ]] || fail "tmux wrapper did not archive after termination"
+    echo "ok: tmux Codex exit archives its app task"
 }
 
 test_session_release_to_app_quarantines_stale_codex_lock() {
@@ -5783,7 +5905,7 @@ test_session_say_modal_deferral_not_overridden_by_force_busy() {
     # status busy, non-zero exit, no paste — and --force-busy must NOT override it.
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"
-    local log="$TMPDIR/say-modal.log" out rc=0 codex_modal
+    local log="$TMPDIR/say-modal.log" out rc=0 codex_modal hook_modal
     codex_modal="$(printf '%s\n' \
         '● Applying the proposed patch next.' \
         '' \
@@ -5797,6 +5919,25 @@ test_session_say_modal_deferral_not_overridden_by_force_busy() {
     printf '%s\n' "$out" | jq -e '.ok == false and .status == "busy" and .reason == "modal prompt visible"' >/dev/null \
         || fail "expected status busy for visible modal even with --force-busy"
     assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    hook_modal="$(printf '%s\n' \
+        'Hooks need review' \
+        '2 hooks are new or changed.' \
+        '' \
+        'PreToolUse hooks' \
+        '1 hook needs review before it can run.' \
+        '' \
+        'Press t to trust; esc to go back')"
+    : > "$log"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        TMUX_FAKE_CAPTURE_PANE="$hook_modal" \
+        "$ROOT/cctrl" session say TMUX--demo --force-busy --json -- "should also be blocked")" || rc=$?
+    (( rc != 0 )) || fail "expected non-zero exit when a hook-review prompt is visible"
+    printf '%s\n' "$out" | jq -e '.ok == false and .status == "busy" and .reason == "modal prompt visible"' >/dev/null \
+        || fail "expected status busy for visible hook-review prompt even with --force-busy"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
     echo "ok: session say never overrides a known modal, even with --force-busy"
 }
 
@@ -6773,6 +6914,7 @@ test_dir_launch_shortcut_collision_deterministic
 test_dir_launch_no_shortcut_match_unchanged
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision
+test_session_doctor_quarantines_orphan_codex_writer_lock
 test_session_doctor_realign_reports_hint
 test_session_doctor_realign_fix_emits_relaunch
 test_session_doctor_realign_skips_busy
@@ -6868,6 +7010,7 @@ test_session_prune_codex_never_prompted
 test_codex_rename_updates_app_title
 test_codex_rename_prefers_prompt_match_over_stale_id
 test_session_app_ls_codex_records
+test_codex_tmux_exit_archives_app_task
 test_session_release_to_app_quarantines_stale_codex_lock
 test_session_prune_dry_run_closes_nothing
 test_session_prune_excludes_self_and_attached

@@ -133,7 +133,7 @@ A launch is described by three independent axes:
 | **Location** | which machine runs it? | `--host <alias>` (default: local) |
 | **Durability** | does it survive disconnect? | tmux-backed by default; `--foreground` for direct one-offs; `-d` / `--detach` to start detached and return |
 | **Agent** | which CLI runs? | `--agent codex`, `--agent claude`, or the configured default |
-| **Bridge** | can the phone app drive it? | Claude only, on by default; `--no-bridge` to disable |
+| **Bridge** | can the app drive it? | Claude bridge on by default; Codex app bridge is experimental and opt-in |
 
 There's **one launch verb — `start`** — and the flags above pick the behavior. Interactive starts are tmux-backed by default so local and remote agents are durable and addressable. Managing tmux sessions (list/attach/kill) lives under `cctrl session`.
 
@@ -148,7 +148,7 @@ cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
 cctrl start -m "fix bug"          # launch with an initial prompt
 cctrl start --purpose "fix bug"   # store cleanup/review context without sending a prompt
 cctrl start --no-bridge           # launch without the phone-control bridge
-cctrl start --agent codex --remote unix://  # connect Codex TUI to local app-server
+cctrl start --agent codex --remote unix://  # opt into Codex app-server bridge
 ```
 
 `cctrl start` uses `--agent` first, then `CCTRL_AGENT`, then the active profile's `defaultAgent`, then `defaultAgent` from `data/config.json`. If no agent is selected and the command has a TTY, it prompts with the available agents; non-interactive launches should pass `--agent claude|codex` or configure a default. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
@@ -164,17 +164,19 @@ Add `-d` to start the tmux session and return without attaching. No GUI required
 
 When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic). A directory with no matching shortcut keeps its repo-folder slug (unchanged).
 
+For tmux-backed Codex sessions, cctrl treats the tmux exit as task completion and archives the matching Codex task automatically. Restarts stay open. Set `CCTRL_CODEX_ARCHIVE_ON_EXIT=0` only when a session should remain visible after its tmux pane exits.
+
 Detached agent app titles are reconciled to `repo: description (TMUX--...)`.
 Claude gets this at launch through its `--name`/remote-control title surface.
 Codex has no equivalent title flag, so cctrl resolves the Codex rollout id and
 updates the local Codex app state row after the session appears. When Codex
-remote control is enabled (`codex remote-control start` /
-`~/.codex/app-server-daemon/settings.json`), tmux-backed Codex launches
-automatically connect with `--remote unix://`; pass `--no-bridge` to suppress
-that default. `cctrl rename <session> "new description"` uses the same title
-path for live Codex sessions.
+app bridging is desired, opt in explicitly with `--remote unix://` for one launch
+or `CCTRL_CODEX_REMOTE_DEFAULT=unix://` for tmux-backed Codex launches in that
+environment. `--no-bridge` suppresses that default. `cctrl rename <session> "new
+description"` uses the same title path for live Codex sessions.
 
-For Codex, tmux is only the terminal control surface. Once a Codex task has been
+For now, tmux is the default Codex control surface. The app-owned Codex path is
+experimental and should be used deliberately. Once a Codex task has been
 registered with the app-server, you can release the tmux owner and continue in
 the ChatGPT/Codex app:
 
@@ -186,8 +188,8 @@ cctrl session app-ls
 
 `release-to-app` sends EOF to the tmux session, waits for it to exit, preserves
 the cctrl metadata record, and quarantines only stale Codex writer locks that no
-live tmux session or Codex process appears to own. `app-ls` is the app-first
-fleet view; `session ls` remains the live tmux view.
+live tmux session or Codex process appears to own. `app-ls` is the experimental
+app-owned Codex view; `session ls` remains the default live tmux view.
 
 ```bash
 cctrl start ~/dev/myapp           # tmux-backed; prompts to connect in a TTY

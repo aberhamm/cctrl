@@ -707,9 +707,6 @@ _launch_exec_agent() {
     [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
     if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && "$no_bridge" != "true" ]] && ! _launch_flags_has_codex_remote; then
         local _codex_remote_default="${CCTRL_CODEX_REMOTE_DEFAULT:-}"
-        if [[ -z "$_codex_remote_default" ]] && _codex_remote_control_enabled; then
-            _codex_remote_default="unix://"
-        fi
         case "$_codex_remote_default" in
             ""|0|false|False|FALSE|off|Off|OFF|none|None|NONE)
                 ;;
@@ -4236,7 +4233,7 @@ _peer_pane_ready_for_delivery() {
             # The old markers were doubly wrong: "Allow command" never matched a
             # real modal (the header is "Allow Codex to run"), while bare
             # "Approve"/"y/N" false-flagged normal prose and shell [y/N] prompts.
-            if printf '%s\n' "$capture" | grep -E 'Allow Codex to |approve network access|tell Codex what to do differently' >/dev/null 2>&1; then
+            if printf '%s\n' "$capture" | grep -E 'Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' >/dev/null 2>&1; then
                 PEER_DELIVER_READY_REASON="modal prompt visible"
                 return 1
             fi
@@ -6055,13 +6052,14 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | app-ls | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
+            echo "Usage: cctrl session <ls | app-ls | archive | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session app-ls           List app-owned Codex tasks known to cctrl"
             echo "    --all                        Include all local Codex app threads"
             echo "    --json                       Machine-readable output"
+            echo "  cctrl session archive <name>   Archive a completed cctrl Codex task"
             echo "  cctrl session release-to-app <session>|--all"
             echo "                                 Exit tmux Codex owners, preserve app tasks,"
             echo "                                 and quarantine stale writer locks"
@@ -6118,6 +6116,7 @@ cmd_session() {
             ;;
         ls|list)   _session_list "$@" ;;
         app-ls|apps|app-list) _session_app_list "$@" ;;
+        archive) _session_archive_codex_task "$@" ;;
         release-to-app|release) _session_release_to_app "$@" ;;
         doctor|reconcile) _session_doctor "$@" ;;
         autoheal)  _session_autoheal "$@" ;;
@@ -6470,6 +6469,36 @@ sys.exit(0 if row[0] in (0, None, "") else 1)
 PY
 }
 
+_codex_thread_has_state_row() {
+    local thread_id="$1" db
+    db="$(_codex_state_db)"
+    [[ -n "$thread_id" ]] || return 1
+    [[ -n "$db" && -f "$db" ]] || return 2
+    python3 - "$db" "$thread_id" <<'PY'
+import sqlite3
+import sys
+
+db, thread_id = sys.argv[1], sys.argv[2]
+try:
+    con = sqlite3.connect(db)
+    row = con.execute("SELECT 1 FROM threads WHERE id = ? LIMIT 1", (thread_id,)).fetchone()
+except Exception:
+    sys.exit(2)
+sys.exit(0 if row else 1)
+PY
+}
+
+_codex_thread_has_rollout() {
+    local thread_id="$1" dir found
+    [[ -n "$thread_id" ]] || return 1
+    for dir in "$CODEX_SESSIONS_DIR" "$CODEX_ARCHIVED_SESSIONS_DIR"; do
+        [[ -d "$dir" ]] || continue
+        found="$(find "$dir" -type f -name "*${thread_id}*.jsonl" -print -quit 2>/dev/null)"
+        [[ -n "$found" ]] && return 0
+    done
+    return 1
+}
+
 _codex_thread_writer_lock_path() {
     local thread_id="$1"
     [[ -n "$thread_id" ]] || return 1
@@ -6522,6 +6551,70 @@ _codex_quarantine_writer_lock() {
     mkdir -p "$backup_dir" || return 1
     mv "$lock" "$backup_dir/" || return 1
     printf '%s/%s' "$backup_dir" "${lock##*/}"
+}
+
+_codex_orphan_writer_lock_items() {
+    local fix="${1:-false}" assume_yes="${2:-false}" lock_dir lock id has_thread db_state has_rollout has_owner action quarantine_path do_fix ans
+    lock_dir="$CODEX_DIR/thread-writer-locks"
+    [[ -d "$lock_dir" ]] || return 0
+
+    for lock in "$lock_dir"/*.lock; do
+        [[ -e "$lock" ]] || continue
+        id="${lock##*/}"
+        id="${id%.lock}"
+        [[ -n "$id" && "$id" != ".coordination" ]] || continue
+
+        has_thread=false
+        db_state="absent"
+        if _codex_thread_has_state_row "$id"; then
+            has_thread=true
+            db_state="present"
+        else
+            case "$?" in
+                2) db_state="unknown" ;;
+                *) db_state="absent" ;;
+            esac
+        fi
+        [[ "$db_state" == "unknown" ]] && continue
+
+        has_rollout=false
+        _codex_thread_has_rollout "$id" && has_rollout=true
+
+        has_owner=false
+        if _codex_thread_has_live_tmux_owner "$id" || _codex_thread_has_live_process "$id"; then
+            has_owner=true
+        fi
+
+        if [[ "$has_thread" == "false" && "$has_rollout" == "false" && "$has_owner" == "false" ]]; then
+            action=""
+            quarantine_path=""
+            if [[ "$fix" == "true" ]]; then
+                do_fix=true
+                if [[ "$assume_yes" != "true" ]]; then
+                    if _prompt_tty_available; then
+                        printf 'Quarantine orphan Codex writer lock %s? [y/N] ' "$id" > /dev/tty
+                        ans=""; IFS= read -r ans < /dev/tty || true
+                        [[ "$ans" == [yY]* ]] || { do_fix=false; action="declined"; }
+                    else
+                        do_fix=false
+                        action="skipped-no-tty"
+                    fi
+                fi
+                if $do_fix; then
+                    if quarantine_path="$(_codex_quarantine_writer_lock "$id")"; then
+                        action="quarantined"
+                    else
+                        action="quarantine-failed"
+                    fi
+                fi
+            fi
+            jq -nc \
+                --arg id "$id" --arg lock "$lock" --arg db "$db_state" \
+                --argjson has_rollout "$has_rollout" --argjson has_owner "$has_owner" \
+                --arg action "$action" --arg quarantine "$quarantine_path" \
+                '{type:"codex_writer_lock", thread_id:$id, lock:$lock, status:"orphan", codex_db:$db, rollout_exists:$has_rollout, live_owner:$has_owner, action:(if $action=="" then null else $action end), quarantine_path:(if $quarantine=="" then null else $quarantine end)}'
+        fi
+    done
 }
 
 _codex_app_threads_json() {
@@ -6803,14 +6896,14 @@ _session_transcript_last_turn() {
 
 _session_pane_has_dialog() {
     # True (exit 0) when the captured pane text carries a STABLE, SPECIFIC
-    # Claude Code modal-dialog signature — a permission/trust prompt or the
-    # selected numbered option of its fullscreen renderer. Deliberately matches
+    # Agent modal-dialog signature — a permission/trust prompt or the selected
+    # numbered option of its fullscreen renderer. Deliberately matches
     # fixed prompt strings, not loose heuristics: an unmatched pane is NOT a
     # dialog. Read-only; never injects keystrokes. This is the fragile pane
     # detector flagged in eng review — keep the signature list tight.
     local capture="$1"
     printf '%s\n' "$capture" \
-        | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes' \
+        | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes|Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' \
         >/dev/null 2>&1
 }
 
@@ -7123,7 +7216,7 @@ _session_app_list() {
             -h|--help|help)
                 echo "Usage: cctrl session app-ls [--all] [--json]"
                 echo ""
-                echo "  List app-owned Codex tasks known to cctrl. This is the app-first"
+                echo "  List app-owned Codex tasks known to cctrl. This is the experimental"
                 echo "  counterpart to 'session ls', which only lists live tmux sessions."
                 echo ""
                 echo "    --all     Include all local Codex app threads, not just cctrl records"
@@ -7409,13 +7502,15 @@ _session_doctor() {
                 echo "  Audit remote-control bridges for live Claude sessions. A session is"
                 echo "  'dead' when it launched with --remote-control but its Claude session"
                 echo "  file has no bridgeSessionId. Also flags app/tmux name mismatches and"
-                echo "  panes stuck in copy-mode (which blocks keystroke repair)."
+                echo "  panes stuck in copy-mode (which blocks keystroke repair). For Codex,"
+                echo "  also flags orphan writer locks with no DB row, rollout, or live owner."
                 echo ""
                 echo "    --fix     Re-establish dead bridges by injecting /rc, and REALIGN"
                 echo "              app/tmux name mismatches via a guided relaunch (kill +"
                 echo "              relaunch detached with the corrected --name, --resume-ing"
-                echo "              the same conversation). Skips busy/copy-mode sessions;"
-                echo "              confirms each (unless --yes)."
+                echo "              the same conversation). Also quarantines orphan Codex"
+                echo "              writer locks. Skips busy/copy-mode sessions; confirms each"
+                echo "              (unless --yes)."
                 echo "    --yes     Repair/realign without per-session confirmation."
                 echo "    --json    Machine-readable output."
                 return 0 ;;
@@ -7444,6 +7539,7 @@ _session_doctor() {
     local name cmd pid bridge prefix expected aligned copy_mode st verdict repaired detail do_fix ans newid
     local sid mtarget mpurpose realign_cmd
     local n_total=0 n_live=0 n_dead=0 n_off=0 n_misnamed=0 n_fixed=0 n_realigned=0 n_skipped=0 n_collision=0
+    local n_orphan_locks=0 n_locks_quarantined=0 n_locks_skipped=0
     $json || printf '%-22s %-6s %-8s %-9s %s\n' "SESSION" "RC" "STATE" "NAME" "DETAIL"
     for name in "${names[@]}"; do
         cmd="$(_session_agent_cmd "$name")"
@@ -7588,6 +7684,24 @@ _session_doctor() {
         fi
     done
 
+    local lock_item lock_id lock_action lock_detail
+    while IFS= read -r lock_item; do
+        [[ -n "$lock_item" ]] || continue
+        json_items+=("$lock_item")
+        n_orphan_locks=$((n_orphan_locks+1))
+        lock_id="$(jq -r '.thread_id' <<< "$lock_item")"
+        lock_action="$(jq -r '.action // empty' <<< "$lock_item")"
+        case "$lock_action" in
+            quarantined) n_locks_quarantined=$((n_locks_quarantined+1)) ;;
+            skipped-*|declined) n_locks_skipped=$((n_locks_skipped+1)) ;;
+        esac
+        if [[ "$json" != "true" ]]; then
+            lock_detail="$lock_id"
+            [[ -n "$lock_action" ]] && lock_detail+="; $lock_action"
+            printf '%-22s %-6s %-8s %-9s %s\n' "codex-writer-lock" "orphan" "-" "-" "$lock_detail"
+        fi
+    done < <(_codex_orphan_writer_lock_items "$fix" "$assume_yes")
+
     if $json; then
         if [[ ${#json_items[@]} -eq 0 ]]; then echo "[]"; else printf '%s\n' "${json_items[@]}" | jq -s '.'; fi
         return 0
@@ -7600,6 +7714,9 @@ _session_doctor() {
     [[ "$n_realigned" -gt 0 ]] && summary+=", ${n_realigned} realigned"
     [[ "$n_skipped" -gt 0 ]] && summary+=", ${n_skipped} skipped"
     [[ "$n_misnamed" -gt 0 ]] && summary+="; ${n_misnamed} app/tmux name mismatch(es)"
+    [[ "$n_orphan_locks" -gt 0 ]] && summary+="; ${n_orphan_locks} orphan Codex writer lock(s)"
+    [[ "$n_locks_quarantined" -gt 0 ]] && summary+=", ${n_locks_quarantined} quarantined"
+    [[ "$n_locks_skipped" -gt 0 ]] && summary+=", ${n_locks_skipped} skipped"
     echo -e "${BOLD}${summary}${RESET}"
     if [[ "$n_dead" -gt 0 && "$fix" != true ]]; then
         echo -e "${DIM}Repair dead bridges with: cctrl session doctor --fix${RESET}"
@@ -7609,6 +7726,9 @@ _session_doctor() {
     fi
     if [[ "$n_misnamed" -gt 0 && "$fix" != true ]]; then
         echo -e "${DIM}Name mismatches are fixed for new launches; realign existing ones with: cctrl session doctor --fix (guided relaunch, --resume-s the conversation), or run the per-row realign hint.${RESET}"
+    fi
+    if [[ "$n_orphan_locks" -gt 0 && "$fix" != true ]]; then
+        echo -e "${DIM}Quarantine orphan Codex writer locks with: cctrl session doctor --fix --yes${RESET}"
     fi
 
     # Snapshot timer health check: warn when the launchd agent is not installed
@@ -9492,6 +9612,97 @@ except Exception as exc:
 if cur.rowcount == 0:
     sys.exit(3)
 PY
+}
+
+_codex_set_thread_archived() {
+    local thread_id="$1" db
+    db="$(_codex_state_db)"
+    [[ -n "$db" && -f "$db" ]] || return 2
+    python3 - "$db" "$thread_id" <<'PY'
+import sqlite3
+import sys
+
+db, thread_id = sys.argv[1], sys.argv[2]
+try:
+    con = sqlite3.connect(db, timeout=5)
+    con.execute("PRAGMA busy_timeout = 5000")
+    cur = con.execute("UPDATE threads SET archived = 1 WHERE id = ?", (thread_id,))
+    con.commit()
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+if cur.rowcount == 0:
+    sys.exit(3)
+PY
+}
+
+_session_codex_thread_id() {
+    # Prefer the rollout identified by this launch's prompt and creation time.
+    # The metadata id is a fallback for a task whose rollout has moved already.
+    local session_name="$1" rollout thread_id
+    rollout="$(_session_codex_rollout_path "$session_name")"
+    if [[ -n "$rollout" ]]; then
+        thread_id="$(_codex_rollout_thread_id "$rollout")"
+        [[ -n "$thread_id" ]] && { printf '%s' "$thread_id"; return 0; }
+    fi
+    thread_id="$(_session_metadata_field "$session_name" conversation_id)"
+    [[ -n "$thread_id" ]] && printf '%s' "$thread_id"
+}
+
+_session_archive_codex_task() {
+    local session_name="" quiet=false json=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --quiet) quiet=true; shift ;;
+            --json) json=true; shift ;;
+            -h|--help)
+                echo "Usage: cctrl session archive <name> [--quiet] [--json]"
+                echo ""
+                echo "Archive the Codex task associated with a completed cctrl tmux session."
+                return 0
+                ;;
+            -*)
+                echo -e "${RED}Unknown archive flag: $1${RESET}" >&2
+                return 64
+                ;;
+            *)
+                [[ -z "$session_name" ]] || { echo -e "${RED}Only one session name expected.${RESET}" >&2; return 64; }
+                session_name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$session_name" ]] || { echo -e "${RED}Usage: cctrl session archive <name> [--quiet] [--json]${RESET}" >&2; return 64; }
+
+    local agent thread_id archived=false status=""
+    agent="$(_session_metadata_field "$session_name" agent)"
+    if [[ "$agent" != "codex" ]]; then
+        status="skipped-not-codex"
+    else
+        thread_id="$(_session_codex_thread_id "$session_name")"
+        if [[ -z "$thread_id" ]]; then
+            status="skipped-no-thread-id"
+        elif ! _codex_thread_is_unarchived "$thread_id"; then
+            status="already-archived"
+        elif _codex_set_thread_archived "$thread_id"; then
+            archived=true
+            status="archived"
+            _session_update_metadata_field "$session_name" archived_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" 2>/dev/null || true
+        else
+            status="failed"
+        fi
+    fi
+
+    if $json; then
+        jq -n --arg session "$session_name" --arg thread_id "${thread_id:-}" --arg status "$status" --argjson archived "$archived" \
+            '{session:$session,thread_id:$thread_id,status:$status,archived:$archived}'
+    elif [[ "$quiet" != "true" ]]; then
+        case "$status" in
+            archived) echo -e "${GREEN}Archived Codex task for ${BOLD}$session_name${RESET}" ;;
+            already-archived) echo -e "${DIM}Codex task already archived for $session_name${RESET}" ;;
+            skipped-*) echo -e "${DIM}No Codex task archived for $session_name ($status).${RESET}" ;;
+            *) echo -e "${YELLOW}Could not archive Codex task for $session_name.${RESET}" >&2 ;;
+        esac
+    fi
+    [[ "$status" != "failed" ]]
 }
 
 _session_codex_set_display_name() {
