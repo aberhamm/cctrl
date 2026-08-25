@@ -37,6 +37,7 @@ env/
 
 # Runtime data
 data/
+data/config.local.json
 
 # Local-only artifacts (post drafts, scratch, personal exports)
 drafts/

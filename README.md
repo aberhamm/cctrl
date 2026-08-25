@@ -92,6 +92,19 @@ Profiles can also override the global agent default. Set `defaultAgent` to
 }
 ```
 
+Shared defaults live in the tracked `data/config.json`. Machine-local defaults
+belong in `~/.config/cctrl/config.json` or `data/config.local.json`; later files
+override earlier ones, and `data/config.local.json` is ignored by git. Use the
+local files for per-machine settings such as `titleEndpoint` and `titleModel` so
+they do not sync to other machines:
+
+```json
+{
+  "titleEndpoint": "http://127.0.0.1:8000/v1",
+  "titleModel": "local-title-model"
+}
+```
+
 Legacy profiles with no `agents` block keep their old Claude behavior: top-level
 `env` and `model` apply to Claude. When launching Codex with a legacy profile,
 CCTRL ignores Claude-looking top-level models such as `sonnet`, `opus`, and
@@ -151,7 +164,7 @@ cctrl start --no-bridge           # launch without the phone-control bridge
 cctrl start --agent codex --remote unix://  # opt into Codex app-server bridge
 ```
 
-`cctrl start` uses `--agent` first, then `CCTRL_AGENT`, then the active profile's `defaultAgent`, then `defaultAgent` from `data/config.json`. If no agent is selected and the command has a TTY, it prompts with the available agents; non-interactive launches should pass `--agent claude|codex` or configure a default. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
+`cctrl start` uses `--agent` first, then `CCTRL_AGENT`, then the active profile's `defaultAgent`, then the merged config `defaultAgent` from `data/config.json`, `~/.config/cctrl/config.json`, and `data/config.local.json`. If no agent is selected and the command has a TTY, it prompts with the available agents; non-interactive launches should pass `--agent claude|codex` or configure a default. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
 
 ### Tmux sessions
 

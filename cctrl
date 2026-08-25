@@ -13,6 +13,11 @@ SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
 HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
+CONFIG_USER_FILE="${CCTRL_USER_CONFIG:-}"
+if [[ -z "$CONFIG_USER_FILE" && -n "${HOME:-}" ]]; then
+    CONFIG_USER_FILE="$HOME/.config/cctrl/config.json"
+fi
+CONFIG_LOCAL_FILE="${CCTRL_CONFIG_LOCAL:-$SCRIPT_DIR/data/config.local.json}"
 _peer_refresh_paths() {
     PEER_DATA_DIR="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}"
     PEERS_FILE="$PEER_DATA_DIR/peers.json"
@@ -139,15 +144,57 @@ _agent_from_cmd() {
     esac
 }
 
-_config_default_agent() {
-    [[ -f "$CONFIG_FILE" ]] || return 1
+_config_files() {
+    local file
+    for file in "$CONFIG_FILE" "$CONFIG_USER_FILE" "$CONFIG_LOCAL_FILE"; do
+        [[ -n "$file" && -f "$file" ]] && printf '%s\n' "$file"
+    done
+}
+
+_config_jq() {
+    local filter="$1" file
     command -v jq >/dev/null 2>&1 || return 1
 
+    local -a files=()
+    while IFS= read -r file; do
+        files+=("$file")
+    done < <(_config_files)
+    [[ ${#files[@]} -gt 0 ]] || return 1
+
+    jq -s -r "reduce .[] as \$item ({}; . * \$item) | $filter" "${files[@]}" 2>/dev/null
+}
+
+_display_path() {
+    local path="$1"
+    if [[ -n "${HOME:-}" ]]; then
+        printf '%s' "${path/#$HOME/~}"
+    else
+        printf '%s' "$path"
+    fi
+}
+
+_config_default_hint() {
+    printf '%s (local) or %s (shared)' \
+        "$(_display_path "$CONFIG_LOCAL_FILE")" \
+        "$(_display_path "$CONFIG_FILE")"
+}
+
+_config_default_agent() {
     local configured
-    configured="$(jq -r '.defaultAgent // .default_agent // empty' "$CONFIG_FILE" 2>/dev/null || true)"
-    [[ -n "$configured" ]] || return 1
+    configured="$(_config_jq '
+        if has("defaultAgent") then
+            if .defaultAgent == null then "__cctrl_prompt__" else (.defaultAgent | tostring) end
+        elif has("default_agent") then
+            if .default_agent == null then "__cctrl_prompt__" else (.default_agent | tostring) end
+        else
+            "__cctrl_missing__"
+        end
+    ' 2>/dev/null || true)"
 
     case "$(printf '%s' "$configured" | tr '[:upper:]' '[:lower:]')" in
+        ""|__cctrl_missing__|__cctrl_prompt__|prompt|ask|choose|none|null|false)
+            return 1
+            ;;
         claude|claude-code) printf 'claude' ;;
         codex|openai)       printf 'codex' ;;
         *)                  return 1 ;;
@@ -217,10 +264,10 @@ _llm_generate_title() {
 _generate_auto_purpose() {
     local prompt="$1" repo_name="$2"
 
-    if [[ "${CCTRL_TITLE_MODE:-auto}" != "heuristic" && -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
+    if [[ "${CCTRL_TITLE_MODE:-auto}" != "heuristic" ]]; then
         local endpoint model
-        endpoint="$(jq -r '.titleEndpoint // empty' "$CONFIG_FILE" 2>/dev/null || true)"
-        model="$(jq -r '.titleModel // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+        endpoint="$(_config_jq '.titleEndpoint // empty' 2>/dev/null || true)"
+        model="$(_config_jq '.titleModel // empty' 2>/dev/null || true)"
         if [[ -n "$endpoint" && -n "$model" ]]; then
             local result
             if result="$(_llm_generate_title "$endpoint" "$model" "$prompt" "$repo_name")"; then
@@ -305,7 +352,7 @@ _prompt_agent_choice() {
 
     if ! _prompt_tty_available; then
         echo -e "${RED}No agent selected and prompting is unavailable.${RESET}" >&2
-        echo -e "${DIM}Pass --agent <agent> ($(_supported_agents_display)) or set defaultAgent in ${CONFIG_FILE/#$HOME/~}.${RESET}" >&2
+        echo -e "${DIM}Pass --agent <agent> ($(_supported_agents_display)) or set defaultAgent in $(_config_default_hint).${RESET}" >&2
         return 1
     fi
 

@@ -22,8 +22,11 @@ chmod +x "$TMPDIR/hostname"
 # Tests may be run from inside a cctrl tmux session; don't let its context
 # leak in (CCTRL_TMUX_CONTEXT flips `cctrl start` into foreground mode).
 unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
+unset CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
 export CCTRL_TITLE_MODE=heuristic
+export CCTRL_USER_CONFIG="$TMPDIR/no-user-config.json"
+export CCTRL_CONFIG_LOCAL="$TMPDIR/no-local-config.json"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -497,6 +500,51 @@ test_profile_prompt_overrides_global_default() {
     assert_contains "$out" "ARG[0]=--permission-mode"
     assert_contains "$out" "ARG[2]=--chrome"
     assert_contains "$out" "ARG[3]=profile picked claude"
+}
+
+test_local_config_overrides_shared_defaults() {
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-local-config-copy"
+    local project="$TMPDIR/config-local-project"
+    local log="$TMPDIR/local-config-tmux.log"
+    local curl_log="$TMPDIR/local-config-curl.log"
+    local user_config="$TMPDIR/user-config/config.json"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project" "$(dirname "$user_config")"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"defaultAgent":"claude","titleEndpoint":"http://shared.invalid/v1","titleModel":"shared-model"}\n' > "$rootcopy/data/config.json"
+    printf '{"defaultAgent":"codex","titleEndpoint":"http://user.invalid/v1","titleModel":"user-model"}\n' > "$user_config"
+    printf '{"titleEndpoint":"http://local.invalid/v1","titleModel":"local-model"}\n' > "$rootcopy/data/config.local.json"
+
+    cat > "$TMPDIR/curl" <<'SH'
+#!/usr/bin/env bash
+{
+    printf 'CURL'
+    for arg in "$@"; do
+        printf ' %q' "$arg"
+    done
+    printf '\n'
+} >> "${CURL_LOG:?}"
+printf '{"choices":[{"message":{"content":"Local Override Title"}}]}\n'
+SH
+    chmod +x "$TMPDIR/curl"
+
+    : > "$log"
+    : > "$curl_log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CURL_LOG="$curl_log" \
+        CCTRL_TITLE_MODE=auto CCTRL_USER_CONFIG="$user_config" CCTRL_CONFIG_LOCAL="$rootcopy/data/config.local.json" \
+        CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d -m "generate a title from local config" "$project")"
+    assert_contains "$out" "detached session started"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--config-local-project"
+    assert_contains "$(cat "$log")" "CCTRL_AGENT=codex"
+    assert_contains "$(cat "$curl_log")" "http://local.invalid/v1/chat/completions"
+    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--config-local-project.json")" '"purpose": "Local Override Title"'
+
+    echo "ok: local config overlays shared and user config for defaults and title generation"
 }
 
 test_detached_agent_prompt_exports_selection() {
@@ -6882,6 +6930,7 @@ test_syntax
 test_launch_args
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
+test_local_config_overrides_shared_defaults
 test_profile_writes_are_owner_only
 test_profile_use_current_diff
 test_detached_agent_prompt_exports_selection
