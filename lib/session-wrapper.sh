@@ -52,9 +52,7 @@ while true; do
         else
             # Codex: options must precede SESSION_ID.
             echo -e "\033[2mRestarting: codex resume ${_flags[*]} $_resume_flag\033[0m"
-            codex resume "${_flags[@]}" "$_resume_flag" &
-            _child_pid=$!
-            wait $_child_pid 2>/dev/null || true
+            codex resume "${_flags[@]}" "$_resume_flag"
         fi
     else
         if [[ "$_agent" == "claude" ]]; then
@@ -64,9 +62,7 @@ while true; do
             wait $_child_pid 2>/dev/null || true
         else
             echo -e "\033[2mcodex ${_flags[*]}\033[0m"
-            codex "${_flags[@]}" &
-            _child_pid=$!
-            wait $_child_pid 2>/dev/null || true
+            codex "${_flags[@]}"
         fi
     fi
 

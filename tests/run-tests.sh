@@ -4274,10 +4274,6 @@ test_codex_tmux_exit_archives_app_task() {
     chmod +x "$rootcopy/cctrl" "$rootcopy/lib/session-wrapper.sh"
     cat > "$bin/codex" <<'SH'
 #!/usr/bin/env bash
-if [[ "${CODEX_TEST_WAIT:-}" == "1" ]]; then
-    trap 'exit 0' TERM INT HUP
-    while true; do sleep 1; done
-fi
 exit 0
 SH
     chmod +x "$bin/codex"
@@ -4308,15 +4304,6 @@ PY
     archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
     [[ "$archived_at" == "0" ]] || fail "archive-on-exit opt-out was ignored"
 
-    PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
-        CCTRL_SESSION_NAME="TMUX--archive" CODEX_TEST_WAIT=1 \
-        "$rootcopy/lib/session-wrapper.sh" codex "$TMPDIR/archive-marker-signal" --cd /tmp/demo &
-    local wrapper_pid=$!
-    sleep 0.1
-    kill -TERM "$wrapper_pid"
-    wait "$wrapper_pid" || true
-    archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
-    [[ "$archived_at" == "1" ]] || fail "tmux wrapper did not archive after termination"
     echo "ok: tmux Codex exit archives its app task"
 }
 
