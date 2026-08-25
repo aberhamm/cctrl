@@ -117,6 +117,9 @@ cctrl close
 This closes the tmux session the agent is running inside, with a 5-second grace
 period (enough for the final output to render before the pane disappears). The
 agent process terminates with the pane — no cleanup needed after this command.
+For Codex sessions, this normal close also archives the associated Codex app
+task. Use `cctrl session release-to-app <name> --yes` when the app task should
+remain available for continued app use.
 
 **Do not use `cctrl session kill`** — that is an immediate hard kill with no
 grace period, meant for external cleanup, not self-close.

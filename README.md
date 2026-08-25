@@ -177,7 +177,16 @@ Add `-d` to start the tmux session and return without attaching. No GUI required
 
 When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic). A directory with no matching shortcut keeps its repo-folder slug (unchanged).
 
-For tmux-backed Codex sessions, cctrl treats the tmux exit as task completion and archives the matching Codex task automatically. Restarts stay open. Set `CCTRL_CODEX_ARCHIVE_ON_EXIT=0` only when a session should remain visible after its tmux pane exits.
+For tmux-backed Codex sessions, `cctrl close` treats the terminal owner as
+complete and archives the matching Codex app task automatically. Restarts stay
+open. A plain Codex exit leaves the app task available; use
+`cctrl session archive <name>` when archival is desired after an exit that was
+not initiated by `cctrl close`.
+
+New tmux-backed Codex sessions also receive a read-only `runtime_context` MCP
+tool. It asks cctrl to verify the live tmux pane and agent process; it does not
+trust `$TMUX`, which Codex command sandboxes may intentionally hide. Operators
+can inspect the same record with `cctrl session attest <name> --json`.
 
 Detached agent app titles are reconciled to `repo: description (TMUX--...)`.
 Claude gets this at launch through its `--name`/remote-control title surface.
@@ -200,9 +209,11 @@ cctrl session app-ls
 ```
 
 `release-to-app` sends EOF to the tmux session, waits for it to exit, preserves
-the cctrl metadata record, and quarantines only stale Codex writer locks that no
-live tmux session or Codex process appears to own. `app-ls` is the experimental
-app-owned Codex view; `session ls` remains the default live tmux view.
+the unarchived Codex app task and cctrl metadata record, and quarantines only
+stale Codex writer locks that no live tmux session or Codex process appears to
+own. It is the explicit path for continuing work in the app; `app-ls` is the
+experimental app-owned Codex view, while `session ls` remains the default live
+tmux view.
 
 ```bash
 cctrl start ~/dev/myapp           # tmux-backed; prompts to connect in a TTY
@@ -238,6 +249,10 @@ cctrl close --in 15               # longer grace period
 cctrl close --now                 # no grace period
 cctrl close TMUX--myapp           # close a specific session (immediate from outside)
 ```
+
+For a Codex session, `cctrl close` also archives its associated app task before
+the tmux owner is closed. Use `cctrl session release-to-app <name> --yes` when
+the app task should remain available instead.
 
 Sessions not started by cctrl are refused unless you add `--force`. Stale or
 inherited tmux-looking environment is refused for no-arg self-close; pass an

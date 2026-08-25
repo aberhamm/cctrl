@@ -148,6 +148,8 @@ case "${1:-}" in
     list-panes)
         if [[ "$*" == *pane_current_path* ]]; then
             printf '/tmp/demo\n'
+        elif [[ "$*" == *pane_id* ]]; then
+            printf '%s:%s\n' "${TMUX_FAKE_PANE_ID:-%0}" "${TMUX_FAKE_PANE_PID:-12345}"
         elif [[ "${TMUX_FAKE_PANE_PID:-}" == "__current__" ]]; then
             printf '%s\n' "${CCTRL_CURRENT_PID:?}"
         elif [[ -n "${TMUX_FAKE_PANE_PID:-}" ]]; then
@@ -220,7 +222,7 @@ test_syntax() {
     bash -n "$ROOT/hooks/statusline.sh"
     bash -n "$ROOT/install.sh"
     zsh -n "$ROOT/completions/_cctrl"
-    python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/lib/peer_mcp.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
+    python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/lib/peer_mcp.py" "$ROOT/lib/runtime_mcp.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
     # Plugin entry scripts are dispatched by `cctrl <cmd>` exactly like a core
     # command, so a syntax error in one is a user-visible break. Both are
     # python3 (#!/usr/bin/env python3), same as lib/*.py above. py_compile needs
@@ -285,7 +287,9 @@ test_launch_args() {
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=--cd"
-    assert_contains "$out" "ARG[3]=tmux default"
+    assert_contains "$out" "ARG[3]=-c"
+    assert_contains "$out" "mcp_servers.cctrl_runtime.command"
+    assert_contains "$out" "ARG[7]=tmux default"
     assert_not_contains "$out" "--remote"
 
     out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_CODEX_REMOTE_DEFAULT=unix:// CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex -m "remote default")"
@@ -294,13 +298,15 @@ test_launch_args() {
     assert_contains "$out" "ARG[1]=--remote"
     assert_contains "$out" "ARG[2]=unix://"
     assert_contains "$out" "ARG[3]=--cd"
-    assert_contains "$out" "ARG[5]=remote default"
+    assert_contains "$out" "mcp_servers.cctrl_runtime.args"
+    assert_contains "$out" "ARG[9]=remote default"
 
     out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$codex_home" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--project "$ROOT/cctrl" start --foreground --agent codex --no-bridge -m "remote suppressed")"
     assert_contains "$out" "CMD=codex"
     assert_contains "$out" "ARG[0]=--yolo"
     assert_contains "$out" "ARG[1]=--cd"
-    assert_contains "$out" "ARG[3]=remote suppressed"
+    assert_contains "$out" "mcp_servers.cctrl_runtime.command"
+    assert_contains "$out" "ARG[7]=remote suppressed"
     assert_not_contains "$out" "--remote"
 }
 
@@ -4060,6 +4066,95 @@ JSON
     assert_contains "$out" '"purpose": "verify identity"'
 }
 
+# --- planned session attest -------------------------------------------------
+
+test_session_attest_live_tmux_process_matches() {
+    # The attestation must prove the metadata record still maps to a live tmux
+    # pane whose process is the recorded Codex owner, rather than trusting the
+    # record merely because it exists.
+    local bin="$TMPDIR/attest-live-bin" meta="$TMPDIR/attest-live-meta"
+    mkdir -p "$bin" "$meta"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    cat > "$meta/TMUX--attest-live.json" <<'JSON'
+{"name":"TMUX--attest-live","agent":"codex","control_surface":"tmux","tmux_session":"TMUX--attest-live","pane_id":"%42","pane_pid":"12345","wrapper_pid":"12345","agent_pid":"12345","created_at":"2026-08-25T12:00:00Z","cctrl_managed":true}
+JSON
+
+    local out rc=0
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_HAS_SESSION="TMUX--attest-live" TMUX_FAKE_PANE_ID="%42" TMUX_FAKE_PANE_PID=12345 \
+        "$ROOT/cctrl" session attest TMUX--attest-live --json)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "live session attest exited $rc: $out"
+    assert_contains "$out" '"verified": true'
+    assert_contains "$out" '"control_surface": "tmux"'
+    assert_contains "$out" '"tmux_session": "TMUX--attest-live"'
+    assert_contains "$out" '"pane_id": "%42"'
+    assert_contains "$out" '"pane_pid": 12345'
+    assert_contains "$out" '"process_match": true'
+    echo "ok: session attest verifies matching live tmux pane process"
+}
+
+test_session_attest_direct_metadata() {
+    # A cctrl record that deliberately has no tmux owner is still a conclusive
+    # result: it is a direct session, not an unverified tmux session.
+    local meta="$TMPDIR/attest-direct-meta"
+    mkdir -p "$meta"
+    cat > "$meta/direct-attest.json" <<'JSON'
+{"name":"direct-attest","agent":"codex","control_surface":"direct","created_at":"2026-08-25T12:00:00Z","cctrl_managed":true}
+JSON
+
+    local out rc=0
+    out="$(CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" session attest direct-attest --json)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "direct session attest exited $rc: $out"
+    assert_contains "$out" '"verified": true'
+    assert_contains "$out" '"control_surface": "direct"'
+    assert_contains "$out" '"tmux_session": null'
+    assert_contains "$out" '"process_match": null'
+    echo "ok: session attest conclusively reports direct metadata"
+}
+
+test_session_attest_stale_tmux_session_missing() {
+    # A record for a vanished tmux session must fail closed, while preserving
+    # the declared control surface so callers can explain the failure.
+    local bin="$TMPDIR/attest-stale-bin" meta="$TMPDIR/attest-stale-meta"
+    mkdir -p "$bin" "$meta"
+    make_fake_tmux "$bin/tmux"
+    cat > "$meta/TMUX--attest-stale.json" <<'JSON'
+{"name":"TMUX--attest-stale","agent":"codex","control_surface":"tmux","tmux_session":"TMUX--attest-stale","pane_id":"%7","pane_pid":"7777","wrapper_pid":"7777","agent_pid":"7777","created_at":"2026-08-25T12:00:00Z","cctrl_managed":true}
+JSON
+
+    local out rc=0
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_HAS_SESSION="" "$ROOT/cctrl" session attest TMUX--attest-stale --json)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "stale session attest exited $rc: $out"
+    assert_contains "$out" '"verified": false'
+    assert_contains "$out" '"control_surface": "tmux"'
+    assert_contains "$out" '"tmux_session": "TMUX--attest-stale"'
+    assert_contains "$out" '"reason": "tmux-session-missing"'
+    echo "ok: session attest fails closed for missing tmux session"
+}
+
+test_session_runtime_mcp_attests_fixed_session() {
+    # The task-facing MCP server pins one session at startup and exposes only
+    # the read-only runtime_context tool, never a caller-selected tmux target.
+    local bin="$TMPDIR/runtime-mcp-bin" meta="$TMPDIR/runtime-mcp-meta"
+    mkdir -p "$bin" "$meta"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    cat > "$meta/TMUX--runtime-mcp.json" <<'JSON'
+{"name":"TMUX--runtime-mcp","agent":"codex","control_surface":"tmux","tmux_session":"TMUX--runtime-mcp","pane_id":"%9","pane_pid":"12345","wrapper_pid":"12345","created_at":"2026-08-25T12:00:00Z","cctrl_managed":true}
+JSON
+
+    local request out
+    request='{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"runtime_context","arguments":{}}}'
+    out="$(printf '%s\n' "$request" | PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_HAS_SESSION="TMUX--runtime-mcp" TMUX_FAKE_PANE_ID="%9" TMUX_FAKE_PANE_PID=12345 \
+        "$ROOT/cctrl" session mcp --session TMUX--runtime-mcp)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.verified == true and .result.structuredContent.data.session == "TMUX--runtime-mcp"' >/dev/null \
+        || fail "runtime MCP did not return a verified fixed-session attestation"
+    echo "ok: runtime MCP attests its fixed session"
+}
+
 test_session_close_named_immediate() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-named.log"
@@ -4312,14 +4407,13 @@ PY
     echo "ok: app-ls shows cctrl-known Codex app tasks"
 }
 
-test_codex_tmux_exit_archives_app_task() {
-    # A terminal-first Codex session should leave the app task list when its
-    # tmux wrapper exits. Opting out keeps the task visible for exceptional use.
-    local rootcopy="$TMPDIR/codex-archive-wrapper" meta="$TMPDIR/codex-archive-meta" codex_home="$TMPDIR/codex-archive-home" bin="$TMPDIR/codex-archive-bin"
-    mkdir -p "$rootcopy/lib" "$rootcopy/data" "$rootcopy/profiles" "$meta" "$codex_home" "$bin"
-    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+test_codex_wrapper_exit_preserves_app_task() {
+    # Wrapper exit alone must not archive: release-to-app ends the wrapper with
+    # EOF and keeps the Codex app task available.
+    local rootcopy="$TMPDIR/codex-preserve-wrapper" meta="$TMPDIR/codex-preserve-meta" codex_home="$TMPDIR/codex-preserve-home" bin="$TMPDIR/codex-preserve-bin"
+    mkdir -p "$rootcopy/lib" "$meta" "$codex_home" "$bin"
     cp "$ROOT/lib/session-wrapper.sh" "$rootcopy/lib/session-wrapper.sh"
-    chmod +x "$rootcopy/cctrl" "$rootcopy/lib/session-wrapper.sh"
+    chmod +x "$rootcopy/lib/session-wrapper.sh"
     cat > "$bin/codex" <<'SH'
 #!/usr/bin/env bash
 exit 0
@@ -4342,17 +4436,44 @@ PY
         CCTRL_SESSION_NAME="TMUX--archive" "$rootcopy/lib/session-wrapper.sh" codex "$TMPDIR/archive-marker" --cd /tmp/demo
     local archived_at
     archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
-    [[ "$archived_at" == "1" ]] || fail "tmux wrapper did not archive completed Codex task"
-    [[ -n "$(jq -r '.archived_at // empty' "$meta/TMUX--archive.json")" ]] || fail "archive timestamp missing from metadata"
+    [[ "$archived_at" == "0" ]] || fail "plain tmux wrapper exit archived Codex task"
+    [[ -z "$(jq -r '.archived_at // empty' "$meta/TMUX--archive.json")" ]] || fail "plain wrapper exit wrote archive timestamp"
 
-    sqlite3 "$codex_home/state_5.sqlite" "UPDATE threads SET archived = 0 WHERE id='thread-archive-1'"
+    echo "ok: plain tmux Codex exit preserves app task"
+}
+
+test_codex_close_archives_and_resolves_rollout_identity() {
+    # Close must archive even when the async session-list/title sync has not
+    # yet backfilled conversation_id; the matching live rollout is sufficient.
+    local meta="$TMPDIR/codex-close-meta" codex_home="$TMPDIR/codex-close-home" bin="$TMPDIR/codex-close-bin"
+    mkdir -p "$meta" "$codex_home/sessions/2026/08/25" "$bin"
+    make_fake_tmux "$bin/tmux"
+    cat > "$meta/TMUX--close.json" <<'JSON'
+{"name":"TMUX--close","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"close task","initial_prompt":"finish lifecycle","agent":"codex","cctrl_managed":true,"created_at":"2026-08-25T10:00:00Z","conversation_id":null,"transcript_path":null}
+JSON
+    cat > "$codex_home/sessions/2026/08/25/rollout-2026-08-25T10-01-00-thread-close.jsonl" <<'JSONL'
+{"timestamp":"2026-08-25T10:01:00.000Z","type":"session_meta","payload":{"id":"thread-close","cwd":"/tmp/demo"}}
+{"timestamp":"2026-08-25T10:01:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"finish lifecycle"}}
+JSONL
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT, archived INTEGER)")
+con.execute("INSERT INTO threads (id, title, name, archived) VALUES (?, ?, ?, ?)", ("thread-close", "cctrl: Codex close archives app task (TMUX--close)", "cctrl: Codex close archives app task (TMUX--close)", 0))
+con.commit()
+PY
+
     PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
-        CCTRL_SESSION_NAME="TMUX--archive" CCTRL_CODEX_ARCHIVE_ON_EXIT=0 \
-        "$rootcopy/lib/session-wrapper.sh" codex "$TMPDIR/archive-marker-optout" --cd /tmp/demo
-    archived_at="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-archive-1'")"
-    [[ "$archived_at" == "0" ]] || fail "archive-on-exit opt-out was ignored"
-
-    echo "ok: tmux Codex exit archives its app task"
+        TMUX_FAKE_HAS_SESSION=1 "$ROOT/cctrl" session close TMUX--close --now >/dev/null
+    [[ "$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-close'")" == "1" ]] \
+        || fail "cctrl close did not archive rollout-resolved Codex task"
+    [[ "$(jq -r '.conversation_id' "$meta/TMUX--close.json")" == "thread-close" ]] \
+        || fail "close did not persist rollout-resolved conversation_id"
+    [[ -n "$(jq -r '.archived_at // empty' "$meta/TMUX--close.json")" ]] \
+        || fail "close archive timestamp missing from metadata"
+    echo "ok: Codex close archives and persists rollout identity"
 }
 
 test_session_release_to_app_quarantines_stale_codex_lock() {
@@ -4364,6 +4485,15 @@ test_session_release_to_app_quarantines_stale_codex_lock() {
     cat > "$meta/TMUX--release.json" <<'JSON'
 {"name":"TMUX--release","cwd":"/tmp/demo","target_kind":"dir","target":"/tmp/demo","display_label":"/tmp/demo","purpose":"release task","agent":"codex","cctrl_managed":true,"created_at":"2026-08-24T10:00:00Z","conversation_id":"thread-release-1","transcript_path":null}
 JSON
+    python3 - "$codex_home/state_5.sqlite" <<'PY'
+import sqlite3
+import sys
+
+con = sqlite3.connect(sys.argv[1])
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, title TEXT, name TEXT, archived INTEGER)")
+con.execute("INSERT INTO threads (id, title, name, archived) VALUES (?, ?, ?, ?)", ("thread-release-1", "Release", "Release", 0))
+con.commit()
+PY
     : > "$codex_home/thread-writer-locks/thread-release-1.lock"
 
     local out control released lock_path
@@ -4378,6 +4508,8 @@ JSON
     released="$(jq -r '.released_at // empty' "$meta/TMUX--release.json")"
     [[ "$control" == "app" ]] || fail "metadata control_surface not set: $control"
     [[ -n "$released" ]] || fail "metadata released_at not set"
+    [[ "$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-release-1'")" == "0" ]] \
+        || fail "release-to-app archived the Codex task"
     echo "ok: release-to-app quarantines stale Codex writer lock"
 }
 
@@ -6926,6 +7058,22 @@ test_session_write_metadata_includes_new_fields() {
     echo "ok: _session_write_metadata emits conversation_id and transcript_path"
 }
 
+if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
+    case "$CCTRL_TEST_ONLY" in
+        session-attest)
+            test_session_attest_live_tmux_process_matches
+            test_session_attest_direct_metadata
+            test_session_attest_stale_tmux_session_missing
+            test_session_runtime_mcp_attests_fixed_session
+            echo "ok"
+            exit 0
+            ;;
+        *)
+            fail "unknown focused test group: $CCTRL_TEST_ONLY"
+            ;;
+    esac
+fi
+
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -7022,6 +7170,10 @@ test_peer_mcp_send_deliver_outcomes
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
+test_session_attest_live_tmux_process_matches
+test_session_attest_direct_metadata
+test_session_attest_stale_tmux_session_missing
+test_session_runtime_mcp_attests_fixed_session
 test_session_say_submit_and_no_submit
 test_session_say_body_file_preserves_newlines
 test_session_say_modal_deferral_not_overridden_by_force_busy
@@ -7046,7 +7198,8 @@ test_session_prune_codex_never_prompted
 test_codex_rename_updates_app_title
 test_codex_rename_prefers_prompt_match_over_stale_id
 test_session_app_ls_codex_records
-test_codex_tmux_exit_archives_app_task
+test_codex_wrapper_exit_preserves_app_task
+test_codex_close_archives_and_resolves_rollout_identity
 test_session_release_to_app_quarantines_stale_codex_lock
 test_session_prune_dry_run_closes_nothing
 test_session_prune_excludes_self_and_attached

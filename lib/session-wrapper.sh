@@ -3,7 +3,8 @@
 # as a child and supports restart-in-place. On exit, if a restart marker
 # exists, the agent is re-launched with --resume (fresh process = fresh
 # MCP/config, same conversation context). Without a marker the pane exits
-# normally.
+# normally; lifecycle actions such as Codex task archival belong to cctrl's
+# explicit session commands so release-to-app can preserve the app task.
 #
 # Usage (called by _launch_exec_agent, not directly):
 #   session-wrapper.sh <agent> <marker-path> [flags...]
@@ -17,19 +18,6 @@ _flags=("$@")
 _resume_flag=""
 _child_pid=""
 _killed=false
-_cctrl_bin="${CCTRL_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/cctrl}"
-
-_archive_codex_task() {
-    # A tmux-backed Codex task has one clear terminal event: the wrapper exits.
-    # Let cctrl resolve the rollout/metadata identity rather than guessing here.
-    [[ "$_agent" == "codex" ]] || return 0
-    case "${CCTRL_CODEX_ARCHIVE_ON_EXIT:-1}" in
-        0|false|False|FALSE|off|Off|OFF) return 0 ;;
-    esac
-    [[ -n "${CCTRL_SESSION_NAME:-}" && -x "$_cctrl_bin" ]] || return 0
-    "$_cctrl_bin" session archive "$CCTRL_SESSION_NAME" --quiet >/dev/null 2>&1 || true
-}
-
 _cleanup() {
     _killed=true
     if [[ -n "$_child_pid" ]]; then
@@ -38,7 +26,6 @@ _cleanup() {
         _child_pid=""
     fi
     rm -f "$_marker"
-    _archive_codex_task
 }
 trap _cleanup SIGTERM SIGINT SIGHUP
 
@@ -99,6 +86,5 @@ while true; do
         continue
     fi
 
-    _archive_codex_task
     break
 done

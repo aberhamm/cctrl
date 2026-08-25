@@ -765,6 +765,15 @@ _launch_exec_agent() {
     if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]] && ! _launch_flags_has_codex_cd; then
         LAUNCH_FLAGS+=("--cd" "$PWD")
     fi
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
+        # Codex command sandboxes cannot inspect the parent tmux socket or
+        # process tree. This fixed-session MCP tool asks cctrl's host-side
+        # verifier without granting arbitrary tmux access to the task.
+        LAUNCH_FLAGS+=(
+            "-c" "mcp_servers.cctrl_runtime.command=\"$SCRIPT_DIR/cctrl\""
+            "-c" "mcp_servers.cctrl_runtime.args=[\"session\",\"mcp\",\"--session\",\"$CCTRL_SESSION_NAME\"]"
+        )
+    fi
 
     if [[ "$resume" == "true" ]]; then
         if [[ -n "$resume_val" ]]; then
@@ -1549,6 +1558,12 @@ _session_write_metadata() {
             host: $host,
             conversation_id: (if $conversation_id == "" then null else $conversation_id end),
             transcript_path: (if $transcript_path == "" then null else $transcript_path end),
+            control_surface: "tmux",
+            tmux_session: $name,
+            pane_id: null,
+            pane_pid: null,
+            pane_started: null,
+            wrapper_pid: null,
             cctrl_managed: true
         }' > "$tmp" && mv "$tmp" "$(_session_metadata_file "$session_name")"
 }
@@ -2136,6 +2151,9 @@ _launch_detached() {
     fi
     tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
     tmux set-option -t "$session_name" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
+    # Bind this registry record to the newly-created tmux pane. A later
+    # attestation rejects a recycled session name or a replaced pane.
+    _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null || true
 
     # Best-effort background poll for conversation_id on fresh launches (plan 051).
     # MUST drop stdio: _remote_exec captures via $(ssh ...) which returns on
@@ -6099,7 +6117,7 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | app-ls | archive | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
+            echo "Usage: cctrl session <ls | app-ls | archive | attest | mcp | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
@@ -6107,6 +6125,8 @@ cmd_session() {
             echo "    --all                        Include all local Codex app threads"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session archive <name>   Archive a completed cctrl Codex task"
+            echo "  cctrl session attest <name>    Verify a recorded tmux owner against its live pane"
+            echo "    --json                       Machine-readable control-surface attestation"
             echo "  cctrl session release-to-app <session>|--all"
             echo "                                 Exit tmux Codex owners, preserve app tasks,"
             echo "                                 and quarantine stale writer locks"
@@ -6164,6 +6184,8 @@ cmd_session() {
         ls|list)   _session_list "$@" ;;
         app-ls|apps|app-list) _session_app_list "$@" ;;
         archive) _session_archive_codex_task "$@" ;;
+        attest) _session_attest "$@" ;;
+        mcp) _session_cmd_mcp "$@" ;;
         release-to-app|release) _session_release_to_app "$@" ;;
         doctor|reconcile) _session_doctor "$@" ;;
         autoheal)  _session_autoheal "$@" ;;
@@ -6206,6 +6228,251 @@ _session_agent_cmd() {
         fi
     fi
     printf '%s' "$cmd"
+}
+
+_session_process_started() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    ps -o lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}'
+}
+
+_session_tmux_host_command() {
+    # Codex MCP subprocesses may be denied process inspection even though they
+    # can contact tmux. Run the narrow read-only probe through the verified tmux
+    # server instead; its output is returned through a private temporary file.
+    local session="$1" command="$2" tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-attest.XXXXXX")" || return 1
+    if ! tmux run-shell "$command > $tmp 2>/dev/null" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    cat "$tmp" 2>/dev/null
+    rm -f "$tmp"
+}
+
+_session_tmux_host_process_table() {
+    local session="$1"
+    _session_tmux_host_command "$session" 'ps -ax -o pid=,ppid=,command='
+}
+
+_session_tmux_host_process_started() {
+    local session="$1" pid="$2"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+    _session_tmux_host_command "$session" "ps -o lstart= -p $pid" | awk '{$1=$1; print}'
+}
+
+_session_find_agent_descendant() {
+    # Return the first process in a pane's short descendant tree whose argv[0]
+    # is the registered agent. The pane normally owns session-wrapper.sh, so a
+    # direct pane-command check alone is insufficient for Codex.
+    local pid="$1" agent="$2" depth="${3:-0}" cmd child found
+    [[ "$pid" =~ ^[0-9]+$ && "$depth" =~ ^[0-9]+$ ]] || return 0
+    (( depth < 8 )) || return 0
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
+    if [[ "$(_agent_from_cmd "$cmd")" == "$agent" ]]; then
+        printf '%s' "$pid"
+        return 0
+    fi
+    while IFS= read -r child; do
+        [[ "$child" =~ ^[0-9]+$ ]] || continue
+        found="$(_session_find_agent_descendant "$child" "$agent" $((depth + 1)))"
+        [[ -n "$found" ]] && { printf '%s' "$found"; return 0; }
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    return 0
+}
+
+_session_find_agent_in_process_table() {
+    local root="$1" agent="$2" table="$3"
+    [[ "$root" =~ ^[0-9]+$ ]] || return 0
+    awk -v root="$root" -v agent="$agent" '
+        $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {
+            pid = $1
+            parent[pid] = $2
+            command[pid] = $0
+            sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]*/, "", command[pid])
+        }
+        END {
+            seen[root] = 1
+            changed = 1
+            while (changed) {
+                changed = 0
+                for (pid in parent) {
+                    if (seen[parent[pid]] && !seen[pid]) {
+                        seen[pid] = 1
+                        changed = 1
+                    }
+                }
+            }
+            for (pid in command) {
+                if (!seen[pid]) continue
+                split(command[pid], parts, /[[:space:]]+/)
+                bin = parts[1]
+                sub(/^.*\//, "", bin)
+                if (bin == agent) {
+                    print pid
+                    exit
+                }
+            }
+        }
+    ' <<< "$table"
+}
+
+_session_capture_tmux_attestation_anchor() {
+    # Called immediately after cctrl creates a tmux session. The pane PID and
+    # its start time make the metadata record resistant to a recycled tmux name.
+    local session="$1" line pane_id pane_pid pane_started
+    line="$(tmux list-panes -t "$session" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)"
+    IFS=: read -r pane_id pane_pid <<< "$line"
+    [[ -n "$pane_id" && "$pane_pid" =~ ^[0-9]+$ ]] || return 1
+    pane_started="$(_session_tmux_host_process_started "$session" "$pane_pid")"
+    _session_update_metadata_field "$session" control_surface tmux || return 1
+    _session_update_metadata_field "$session" tmux_session "$session" || return 1
+    _session_update_metadata_field "$session" pane_id "$pane_id" || return 1
+    _session_update_metadata_field "$session" pane_pid "$pane_pid" || return 1
+    _session_update_metadata_field "$session" wrapper_pid "$pane_pid" || return 1
+    _session_update_metadata_field "$session" pane_started "$pane_started" || return 1
+}
+
+_session_attest_json() {
+    local verified="$1" control_surface="$2" session="$3" tmux_session="$4" pane_id="$5" pane_pid="$6" agent="$7" agent_pid="$8" process_match="$9" reason="${10}" thread_id="${11:-}"
+    local pane_pid_json="null" agent_pid_json="null"
+    [[ "$pane_pid" =~ ^[0-9]+$ ]] && pane_pid_json="$pane_pid"
+    [[ "$agent_pid" =~ ^[0-9]+$ ]] && agent_pid_json="$agent_pid"
+    jq -n \
+        --argjson verified "$verified" \
+        --arg control_surface "$control_surface" \
+        --arg session "$session" \
+        --arg tmux_session "$tmux_session" \
+        --arg pane_id "$pane_id" \
+        --argjson pane_pid "$pane_pid_json" \
+        --arg agent "$agent" \
+        --argjson agent_pid "$agent_pid_json" \
+        --argjson process_match "$process_match" \
+        --arg reason "$reason" \
+        --arg thread_id "$thread_id" \
+        --arg checked_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        '{
+            verified: $verified,
+            control_surface: (if $control_surface == "" then null else $control_surface end),
+            session: (if $session == "" then null else $session end),
+            tmux_session: (if $tmux_session == "" then null else $tmux_session end),
+            pane_id: (if $pane_id == "" then null else $pane_id end),
+            pane_pid: $pane_pid,
+            agent: (if $agent == "" then null else $agent end),
+            agent_pid: $agent_pid,
+            process_match: $process_match,
+            reason: (if $reason == "" then null else $reason end),
+            thread_id: (if $thread_id == "" then null else $thread_id end),
+            checked_at: $checked_at
+        }'
+}
+
+_session_attest() {
+    local session="" json=false current=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --self)
+                [[ -z "$session" ]] || { echo -e "${RED}Use either a session name or --self.${RESET}" >&2; return 64; }
+                current="$(_session_current_name 2>/dev/null || true)"
+                [[ -n "$current" ]] || { echo -e "${RED}Could not verify this process as a cctrl tmux owner.${RESET}" >&2; return 1; }
+                session="$current"; shift ;;
+            -h|--help)
+                echo "Usage: cctrl session attest <name>|--self [--json]"
+                echo ""
+                echo "Verify cctrl's recorded control surface against the live tmux pane and agent process."
+                return 0 ;;
+            -*)
+                echo -e "${RED}Unknown attest flag: $1${RESET}" >&2; return 64 ;;
+            *)
+                [[ -z "$session" ]] || { echo -e "${RED}Only one session name expected.${RESET}" >&2; return 64; }
+                session="$1"; shift ;;
+        esac
+    done
+    [[ -n "$session" ]] || { echo -e "${RED}Usage: cctrl session attest <name>|--self [--json]${RESET}" >&2; return 64; }
+
+    local file control_surface tmux_session pane_id expected_pid expected_started current_line current_id current_pid current_started agent agent_pid thread_id process_table result
+    file="$(_session_metadata_file "$session")"
+    if [[ ! -f "$file" ]]; then
+        result="$(_session_attest_json false "" "$session" "" "" "" "" "" null "metadata-missing")"
+    else
+        control_surface="$(jq -r '.control_surface // empty' "$file" 2>/dev/null)"
+        tmux_session="$(jq -r '.tmux_session // .name // empty' "$file" 2>/dev/null)"
+        pane_id="$(jq -r '.pane_id // empty' "$file" 2>/dev/null)"
+        expected_pid="$(jq -r '.pane_pid // .wrapper_pid // empty' "$file" 2>/dev/null)"
+        expected_started="$(jq -r '.pane_started // empty' "$file" 2>/dev/null)"
+        agent="$(jq -r '.agent // empty' "$file" 2>/dev/null)"
+        thread_id="$(jq -r '.conversation_id // empty' "$file" 2>/dev/null)"
+        case "$control_surface" in
+            direct|foreground|app)
+                result="$(_session_attest_json true "$control_surface" "$session" "" "" "" "$agent" "" null "")"
+                ;;
+            tmux)
+                if ! command -v tmux >/dev/null 2>&1; then
+                    result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "tmux-unavailable" "$thread_id")"
+                elif ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+                    result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" false "tmux-session-missing" "$thread_id")"
+                elif [[ -z "$pane_id" || ! "$expected_pid" =~ ^[0-9]+$ ]]; then
+                    result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "unanchored-legacy-session" "$thread_id")"
+                else
+                    current_line="$(tmux list-panes -t "$tmux_session" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | awk -F : -v id="$pane_id" '$1 == id {print; exit}')"
+                    IFS=: read -r current_id current_pid <<< "$current_line"
+                    if [[ "$current_id" != "$pane_id" ]]; then
+                        result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" false "tmux-pane-missing" "$thread_id")"
+                    elif [[ "$current_pid" != "$expected_pid" ]]; then
+                        result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$current_pid" "$agent" "" false "tmux-pane-pid-mismatch" "$thread_id")"
+                    else
+                        process_table="$(_session_tmux_host_process_table "$tmux_session" 2>/dev/null || true)"
+                        current_started="$(_session_tmux_host_process_started "$tmux_session" "$current_pid" 2>/dev/null || true)"
+                        if [[ -n "$expected_started" && "$current_started" != "$expected_started" ]]; then
+                            result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$current_pid" "$agent" "" false "tmux-pane-process-replaced" "$thread_id")"
+                        elif [[ -z "$agent" ]]; then
+                            result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$current_pid" "" "" null "agent-unknown" "$thread_id")"
+                        else
+                            if [[ -n "$process_table" ]]; then
+                                agent_pid="$(_session_find_agent_in_process_table "$current_pid" "$agent" "$process_table")"
+                            else
+                                agent_pid="$(_session_find_agent_descendant "$current_pid" "$agent")"
+                            fi
+                            if [[ -n "$agent_pid" ]]; then
+                                result="$(_session_attest_json true "$control_surface" "$session" "$tmux_session" "$pane_id" "$current_pid" "$agent" "$agent_pid" true "" "$thread_id")"
+                            else
+                                result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$current_pid" "$agent" "" false "agent-process-missing" "$thread_id")"
+                            fi
+                        fi
+                    fi
+                fi
+                ;;
+            *)
+                result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "control-surface-unknown" "$thread_id")"
+                ;;
+        esac
+    fi
+
+    if $json; then
+        printf '%s\n' "$result"
+    else
+        jq -r 'if .verified then "verified: \(.control_surface // "unknown")" else "unverified: \(.reason // "unknown")" end' <<< "$result"
+    fi
+}
+
+_session_cmd_mcp() {
+    local session=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--session needs a session name${RESET}" >&2; return 64; }
+                session="$2"; shift 2 ;;
+            -h|--help)
+                echo "Usage: cctrl session mcp --session <name>"
+                echo "Run the fixed-session, read-only runtime attestation MCP server."
+                return 0 ;;
+            *)
+                echo -e "${RED}Unknown session mcp flag: $1${RESET}" >&2; return 64 ;;
+        esac
+    done
+    [[ -n "$session" ]] || { echo -e "${RED}cctrl session mcp needs --session <name>${RESET}" >&2; return 64; }
+    exec python3 "$SCRIPT_DIR/lib/runtime_mcp.py" --session "$session" --cctrl "$SCRIPT_DIR/cctrl"
 }
 
 _session_tmux_paste() {
@@ -9190,7 +9457,7 @@ _session_current() {
     echo "  Target:         ${target:-unknown}"
     echo "  Purpose:        ${purpose:-unknown}"
     if $can_close; then
-        echo "  Close self:     cctrl close"
+        echo "  Close self:     cctrl close (archives Codex app task)"
     else
         echo "  Close self:     unavailable"
     fi
@@ -9220,6 +9487,8 @@ _session_close() {
                 echo "Usage: cctrl session close [name] [--in SECONDS | --now] [--force]"
                 echo ""
                 echo "  Without a name, closes the tmux session you are currently inside."
+                echo "  For Codex sessions, archives the associated app task."
+                echo "  Use 'cctrl session release-to-app' to keep that task available."
                 echo "  When closing your own session the kill is delayed (default 5s) so"
                 echo "  the calling process can finish its output first."
                 echo ""
@@ -9288,6 +9557,12 @@ _session_close() {
         echo -e "${RED}Grace period must be a number of seconds, got: $grace${RESET}" >&2
         return 1
     fi
+
+    # A normal cctrl close means the terminal owner and its Codex app task are
+    # both complete. Keep archival here, rather than in session-wrapper.sh:
+    # release-to-app also ends the wrapper with EOF but deliberately preserves
+    # the app task for continued use.
+    _session_archive_codex_task "$target" --quiet >/dev/null 2>&1 || true
 
     if (( grace > 0 )); then
         local target_q
@@ -9727,14 +10002,20 @@ _session_archive_codex_task() {
         thread_id="$(_session_codex_thread_id "$session_name")"
         if [[ -z "$thread_id" ]]; then
             status="skipped-no-thread-id"
-        elif ! _codex_thread_is_unarchived "$thread_id"; then
-            status="already-archived"
-        elif _codex_set_thread_archived "$thread_id"; then
-            archived=true
-            status="archived"
-            _session_update_metadata_field "$session_name" archived_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" 2>/dev/null || true
         else
-            status="failed"
+            # A live Codex rollout can be discovered before the async session
+            # listing/title sync has backfilled metadata. Persist the resolved
+            # id here so app-ls and later lifecycle commands see the same task.
+            _session_update_metadata_field "$session_name" conversation_id "$thread_id" 2>/dev/null || true
+            if ! _codex_thread_is_unarchived "$thread_id"; then
+                status="already-archived"
+            elif _codex_set_thread_archived "$thread_id"; then
+                archived=true
+                status="archived"
+                _session_update_metadata_field "$session_name" archived_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" 2>/dev/null || true
+            else
+                status="failed"
+            fi
         fi
     fi
 
@@ -10079,7 +10360,8 @@ cmd_help() {
     echo "                              --older-than DURATION, --yes to close, --json)"
     echo "  cctrl session close [name]  Gracefully close a session (alias: cctrl close);"
     echo "                              no name = the session you're inside, killed after"
-    echo "                              a short grace period (--in N, --now, --force)"
+    echo "                              a short grace period (--in N, --now, --force);"
+    echo "                              Codex close also archives its app task"
     echo "  cctrl session kill <name>   Kill a detached session immediately"
     echo ""
     echo -e "${BOLD}Peers${RESET}"
