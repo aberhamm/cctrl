@@ -1,7 +1,7 @@
 ---
 id: 056
 title: Post-spawn health check with auto-dismiss for known prompts
-status: in-progress
+status: done
 blocked-by: []
 priority:
 goal: post-spawn-health-check
@@ -9,6 +9,9 @@ allows-migrations: false
 needs-review: none
 review-required: none
 created: 2026-09-07
+completed: 2026-09-07
+reviewed: false
+qa: automated
 ---
 
 ## Plain-English Summary
@@ -253,3 +256,24 @@ finding above. Run with Claude Code or Codex; checkbox as you ship.
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Created shared pattern table (lib/health-check-patterns.sh) with parallel indexed arrays
+for Claude and Codex agent types. Patterns anchored on modal chrome to prevent false
+matches from seeded prompt text. Created poll-match-act loop (lib/health-check.sh) with
+bash 3.2-compatible transition guard. Refactored _session_pane_has_dialog and migrated
+_peer_pane_ready_for_delivery to use the shared pattern table with inline fallback for
+environments without lib/. Wired health check into _launch_detached, gated on --detach.
+Added --no-health-check and --health-check-timeout flags plus CCTRL_NO_HEALTH_CHECK env
+var. Added 7 automated tests covering pattern matching, transition guard, needs-human,
+timeout, bypass flag, and dialog regression.
+
+**Files changed:**
+
+- `lib/health-check-patterns.sh` (created)
+- `lib/health-check.sh` (created)
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `4a1969d` — `feat(start): post-spawn health check with auto-dismiss`

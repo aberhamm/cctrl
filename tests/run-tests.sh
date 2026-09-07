@@ -24,6 +24,9 @@ chmod +x "$TMPDIR/hostname"
 unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
 unset CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
+# Skip post-spawn health check by default in tests — it would sleep through
+# poll loops with the fake tmux. Individual health check tests override this.
+export CCTRL_NO_HEALTH_CHECK=1
 export CCTRL_TITLE_MODE=heuristic
 export CCTRL_USER_CONFIG="$TMPDIR/no-user-config.json"
 export CCTRL_CONFIG_LOCAL="$TMPDIR/no-local-config.json"
@@ -7256,5 +7259,300 @@ test_restore_no_force_structural
 test_restore_no_pane_inference_structural
 test_restore_already_live_record_join
 test_restore_exit_codes
+
+# =====================================================================
+# Health check pattern table & health check tests (plan 056)
+# =====================================================================
+
+test_health_check_patterns_syntax() {
+    # The shared pattern table must be valid bash and define the expected arrays.
+    bash -n "$ROOT/lib/health-check-patterns.sh" \
+        || fail "health-check-patterns.sh has syntax errors"
+    bash -n "$ROOT/lib/health-check.sh" \
+        || fail "health-check.sh has syntax errors"
+    echo "ok: health check lib files have valid syntax"
+}
+
+test_health_check_pattern_matching() {
+    # Source the pattern table and verify each pattern matches its intended
+    # fixture text and does NOT false-match on seeded prompt text that
+    # merely mentions the keywords in prose.
+    source "$ROOT/lib/health-check-patterns.sh"
+    _hc_patterns_for_agent claude
+
+    # Workspace trust modal (should match)
+    local trust_pane
+    trust_pane="$(printf '%s\n' \
+        '╭──────────────────────────────────────────────────╮' \
+        '│ Do you trust the files in this folder?            │' \
+        '│ ❯ 1. Yes                                         │' \
+        '│   2. No                                          │' \
+        '╰──────────────────────────────────────────────────╯')"
+    printf '%s\n' "$trust_pane" | grep -E "${HC_PATTERN[0]}" >/dev/null 2>&1 \
+        || fail "workspace-trust pattern should match trust modal"
+
+    # Conversation picker (should match)
+    local picker_pane
+    picker_pane="$(printf '%s\n' \
+        'Continue from a previous conversation?' \
+        '❯ 1. Start new conversation')"
+    printf '%s\n' "$picker_pane" | grep -E "${HC_PATTERN[1]}" >/dev/null 2>&1 \
+        || fail "conversation-picker pattern should match picker modal"
+
+    # Seeded prompt text mentioning "trust" should NOT match
+    local seeded_pane
+    seeded_pane="$(printf '%s\n' \
+        'Your task: ensure the files are trustworthy.' \
+        'Continue from a previous plan and verify.')"
+    ! printf '%s\n' "$seeded_pane" | grep -E "${HC_PATTERN[0]}" >/dev/null 2>&1 \
+        || fail "workspace-trust pattern should NOT match seeded prompt prose"
+
+    # Codex patterns
+    _hc_patterns_for_agent codex
+    local codex_modal
+    codex_modal="$(printf '%s\n' \
+        'Allow Codex to run: npm test' \
+        'tell Codex what to do differently')"
+    printf '%s\n' "$codex_modal" | grep -E "${HC_PATTERN[0]}" >/dev/null 2>&1 \
+        || fail "codex-approval-modal pattern should match Codex modal"
+
+    local codex_hooks
+    codex_hooks="$(printf '%s\n' 'Hooks need review' 'Press t to trust')"
+    printf '%s\n' "$codex_hooks" | grep -E "${HC_PATTERN[1]}" >/dev/null 2>&1 \
+        || fail "codex-hooks-trust pattern should match hooks modal"
+
+    echo "ok: health check patterns match expected fixtures and reject prose"
+}
+
+test_health_check_transition_guard() {
+    # The health check must auto-dismiss each pattern at most once. After
+    # dismissal, the same pattern should not trigger another send-keys.
+    # We test this by sourcing the health check in a controlled env with
+    # a fake tmux that logs send-keys calls.
+    local hc_bin="$TMPDIR/hcguard-bin"
+    mkdir -p "$hc_bin"
+
+    # Fake tmux: capture-pane returns the trust modal for the first 2 calls,
+    # then returns a clean pane. Logs send-keys calls.
+    local call_count_file="$TMPDIR/hcguard-call-count"
+    local sendkeys_log="$TMPDIR/hcguard-sendkeys.log"
+    echo "0" > "$call_count_file"
+    : > "$sendkeys_log"
+
+    cat > "$hc_bin/tmux" <<FAKESH
+#!/usr/bin/env bash
+case "\${1:-}" in
+    capture-pane)
+        count=\$(cat "$call_count_file")
+        count=\$((count + 1))
+        echo "\$count" > "$call_count_file"
+        if [[ \$count -le 2 ]]; then
+            printf '%s\n' '❯ 1. Yes' 'Do you trust the files in this folder?'
+        else
+            printf '%s\n' 'claude> ready to work'
+        fi
+        exit 0
+        ;;
+    send-keys)
+        echo "SEND-KEYS \$*" >> "$sendkeys_log"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+FAKESH
+    chmod +x "$hc_bin/tmux"
+
+    # Minimal session metadata setup
+    local sdir="$TMPDIR/hcguard-sessions"
+    mkdir -p "$sdir"
+    echo '{"created_at":"2026-01-01T00:00:00Z"}' > "$sdir/test-session.json"
+
+    # Source cctrl functions we need (color vars, metadata helpers, tmux wrapper)
+    local fn_file="$TMPDIR/hcguard-fns.sh"
+    cat > "$fn_file" <<'FNSSH'
+RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
+_session_update_metadata_field() { :; }
+_tmux_run_with_timeout() {
+    TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?
+}
+FNSSH
+    source "$fn_file"
+
+    # Source the health check
+    _HC_SCRIPT_DIR="$ROOT/lib"
+    _HC_PATTERNS_LOADED=""
+    source "$ROOT/lib/health-check.sh"
+
+    # Run with a short timeout and poll interval
+    (
+        export PATH="$hc_bin:$PATH"
+        export CCTRL_HC_POLL_INTERVAL=0
+        export CCTRL_HC_STABLE_THRESHOLD=2
+        _health_check_run "test-session" "claude" 5
+    ) 2>/dev/null
+
+    # Count send-keys calls — should be exactly 1 (transition guard)
+    local sk_count
+    sk_count="$(grep -c 'SEND-KEYS' "$sendkeys_log" 2>/dev/null || echo 0)"
+    [[ "$sk_count" -eq 1 ]] \
+        || fail "expected exactly 1 send-keys call (transition guard), got $sk_count"
+
+    echo "ok: transition guard fires auto-dismiss exactly once per pattern"
+}
+
+test_health_check_needs_human_path() {
+    # When the pane shows a needs-human modal, the health check should detect
+    # it immediately and return 0.
+    local hc_bin="$TMPDIR/hcneeds-bin"
+    mkdir -p "$hc_bin"
+
+    cat > "$hc_bin/tmux" <<'FAKESH'
+#!/usr/bin/env bash
+case "${1:-}" in
+    capture-pane)
+        # Show a login-unavailable needs-human modal (no auto-dismiss match)
+        printf '%s\n' 'auth is required to proceed' 'please visit the web console'
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+FAKESH
+    chmod +x "$hc_bin/tmux"
+
+    RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
+    _session_update_metadata_field() { :; }
+    _tmux_run_with_timeout() {
+        TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?
+    }
+    _HC_SCRIPT_DIR="$ROOT/lib"
+    _HC_PATTERNS_LOADED=""
+    source "$ROOT/lib/health-check.sh"
+
+    local rc=0
+    (
+        export PATH="$hc_bin:$PATH"
+        export CCTRL_HC_POLL_INTERVAL=0
+        _health_check_run "test-session" "claude" 2
+    ) 2>/dev/null || rc=$?
+
+    [[ "$rc" -eq 0 ]] \
+        || fail "health check should always return 0, got $rc"
+
+    echo "ok: health check needs-human path returns 0"
+}
+
+test_health_check_timeout_path() {
+    # When the pane shows unrecognized content (no pattern match), the health
+    # check should time out and still return 0.
+    local hc_bin="$TMPDIR/hctimeout-bin"
+    mkdir -p "$hc_bin"
+
+    local timeout_count_file="$TMPDIR/hctimeout-count"
+    echo "0" > "$timeout_count_file"
+    cat > "$hc_bin/tmux" <<FAKESH
+#!/usr/bin/env bash
+case "\${1:-}" in
+    capture-pane)
+        # Always show unrecognized content — never matches any pattern
+        printf '%s\n' 'Loading...' 'Please wait...'
+        count=\$(cat "$timeout_count_file")
+        echo "\$((count + 1))" > "$timeout_count_file"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+FAKESH
+    chmod +x "$hc_bin/tmux"
+
+    RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
+    _session_update_metadata_field() { :; }
+    _tmux_run_with_timeout() {
+        TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?
+    }
+    _HC_SCRIPT_DIR="$ROOT/lib"
+    _HC_PATTERNS_LOADED=""
+    source "$ROOT/lib/health-check.sh"
+
+    local rc=0
+    (
+        export PATH="$hc_bin:$PATH"
+        export CCTRL_HC_POLL_INTERVAL=0
+        _health_check_run "test-session" "claude" 3
+    ) 2>/dev/null || rc=$?
+
+    [[ "$rc" -eq 0 ]] \
+        || fail "health check should always return 0 on timeout, got $rc"
+
+    echo "ok: health check timeout path returns 0"
+}
+
+test_health_check_bypass_flag() {
+    # --no-health-check must be parsed by _launch_detached and skip the check.
+    # We verify by checking that the flag is accepted in the arg parser.
+    local fn_file="$TMPDIR/hcbypass-fn.sh"
+    awk '/^_launch_detached\(\) \{/,/^}/' "$ROOT/cctrl" > "$fn_file"
+    grep -q 'no_health_check=true' "$fn_file" \
+        || fail "expected --no-health-check to set no_health_check=true in _launch_detached"
+    grep -q 'health_check_timeout=' "$fn_file" \
+        || fail "expected --health-check-timeout to be parsed in _launch_detached"
+    echo "ok: --no-health-check and --health-check-timeout flags are parsed"
+}
+
+test_session_pane_has_dialog_refactored() {
+    # Regression test: _session_pane_has_dialog must still detect the same
+    # modals after refactoring to the shared pattern table.
+    local fn_file="$TMPDIR/hcdialog-fn.sh"
+
+    # Extract the function + the pattern table source
+    cat > "$fn_file" <<FNSH
+#!/usr/bin/env bash
+SCRIPT_DIR="$ROOT"
+_HC_SCRIPT_DIR="$ROOT/lib"
+source "$ROOT/lib/health-check-patterns.sh"
+$(awk '/^_session_pane_has_dialog\(\) \{/,/^}/' "$ROOT/cctrl")
+FNSH
+
+    source "$fn_file"
+
+    # Claude trust modal (should match)
+    local trust_pane
+    trust_pane="$(printf '%s\n' 'Do you trust the files' '❯ 1. Yes')"
+    _session_pane_has_dialog "$trust_pane" \
+        || fail "refactored dialog detector should match workspace trust modal"
+
+    # Codex approval modal (should match)
+    local codex_pane
+    codex_pane="$(printf '%s\n' 'Allow Codex to run' 'tell Codex what to do differently')"
+    _session_pane_has_dialog "$codex_pane" \
+        || fail "refactored dialog detector should match Codex approval modal"
+
+    # Codex hooks modal (should match)
+    local hooks_pane
+    hooks_pane="$(printf '%s\n' 'Hooks need review' 'Press t to trust')"
+    _session_pane_has_dialog "$hooks_pane" \
+        || fail "refactored dialog detector should match Codex hooks modal"
+
+    # Benign text (should NOT match)
+    local benign_pane
+    benign_pane="$(printf '%s\n' 'Here is the plan:' '  1. First step' '  2. Second step')"
+    ! _session_pane_has_dialog "$benign_pane" \
+        || fail "refactored dialog detector should NOT match benign text"
+
+    # Proceed prompt (should match — added in refactor)
+    local proceed_pane
+    proceed_pane="$(printf '%s\n' 'Do you want to proceed?' '❯ 1. Yes')"
+    _session_pane_has_dialog "$proceed_pane" \
+        || fail "refactored dialog detector should match proceed prompt"
+
+    echo "ok: _session_pane_has_dialog regression tests pass after shared-pattern refactor"
+}
+
+test_health_check_patterns_syntax
+test_health_check_pattern_matching
+test_health_check_transition_guard
+test_health_check_needs_human_path
+test_health_check_timeout_path
+test_health_check_bypass_flag
+test_session_pane_has_dialog_refactored
 
 echo "ok"

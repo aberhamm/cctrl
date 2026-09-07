@@ -1795,6 +1795,8 @@ _launch_detached() {
     local shortcut_canonical=""
     local force=false
     local resume_id=""
+    local no_health_check=false
+    local health_check_timeout=30
     local passthrough_count=0
     local passthrough=()
     while [[ $# -gt 0 ]]; do
@@ -1890,6 +1892,18 @@ _launch_detached() {
                     return 1
                 fi
                 peer_identity="$2"
+                shift 2
+                ;;
+            --no-health-check)
+                no_health_check=true
+                shift
+                ;;
+            --health-check-timeout)
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--health-check-timeout needs a value${RESET}" >&2
+                    return 1
+                fi
+                health_check_timeout="$2"
                 shift 2
                 ;;
             --foreground|--no-tmux|--tmux)
@@ -2154,6 +2168,22 @@ _launch_detached() {
     # Bind this registry record to the newly-created tmux pane. A later
     # attestation rejects a recycled session name or a replaced pane.
     _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null || true
+
+    # Post-spawn health check (plan 056): poll the pane for known blocking
+    # prompts and auto-dismiss safe ones. Only for detached spawns (not
+    # attach-after) and not when explicitly bypassed. Always returns 0 —
+    # results go to session metadata (health_status field).
+    # CCTRL_NO_HEALTH_CHECK=1 env var also skips (for tests and scripting).
+    if [[ "$no_health_check" != "true" && "${CCTRL_NO_HEALTH_CHECK:-}" != "1" \
+          && "${CCTRL_ATTACH_AFTER_START:-}" != "1" ]]; then
+        if [[ -f "$SCRIPT_DIR/lib/health-check.sh" ]]; then
+            if [[ -z "${_HC_PATTERNS_LOADED:-}" ]]; then
+                _HC_SCRIPT_DIR="$SCRIPT_DIR/lib"
+                source "$SCRIPT_DIR/lib/health-check.sh"
+            fi
+            _health_check_run "$session_name" "$detach_agent" "$health_check_timeout"
+        fi
+    fi
 
     # Best-effort background poll for conversation_id on fresh launches (plan 051).
     # MUST drop stdio: _remote_exec captures via $(ssh ...) which returns on
@@ -4267,6 +4297,9 @@ _peer_tmux_target_for_delivery() {
 }
 
 _peer_pane_ready_for_delivery() {
+    # Returns 0 = ready, 1 = modal visible, 2 = capture failed.
+    # Sets PEER_DELIVER_READY_REASON on non-zero return.
+    # Uses the shared pattern table from lib/health-check-patterns.sh.
     local target="$1" agent="${2:-}" force_busy="${3:-false}" capture
     if ! _tmux_run_with_timeout capture-pane -p -S -15 -t "$target"; then
         PEER_DELIVER_READY_REASON="${TMUX_RUN_ERROR:-capture-pane failed}"
@@ -4274,34 +4307,46 @@ _peer_pane_ready_for_delivery() {
         return 2
     fi
     capture="$TMUX_RUN_OUTPUT"
+    # Source pattern table if not already loaded
+    if [[ -z "${_HC_PATTERNS_LOADED:-}" ]]; then
+        if [[ -f "$SCRIPT_DIR/lib/health-check-patterns.sh" ]]; then
+            _HC_SCRIPT_DIR="$SCRIPT_DIR/lib"
+            source "$SCRIPT_DIR/lib/health-check-patterns.sh"
+        else
+            # Fallback: inline patterns for environments without the lib dir
+            case "$agent" in
+                claude)
+                    if printf '%s\n' "$capture" | grep -E '❯ 1\.' >/dev/null 2>&1; then
+                        PEER_DELIVER_READY_REASON="modal prompt visible"; return 1; fi ;;
+                codex)
+                    if printf '%s\n' "$capture" | grep -E 'Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' >/dev/null 2>&1; then
+                        PEER_DELIVER_READY_REASON="modal prompt visible"; return 1; fi ;;
+                *)
+                    if [[ "$force_busy" != "true" ]]; then
+                        PEER_DELIVER_READY_REASON="unknown agent readiness"; return 1; fi ;;
+            esac
+            PEER_DELIVER_READY_REASON=""
+            return 0
+        fi
+    fi
     case "$agent" in
         claude)
-            # Anchor on the modal's highlighted selection line "❯ 1." — present in
-            # every Claude proceed/trust/permission modal, but never in a plain
-            # markdown numbered list ("  1. ...") nor the empty "❯ " input prompt.
-            # The old heuristic used ". 1\." (any-char, matched any numbered list)
-            # plus bare "Do you want"/"Do you trust" prose, which false-flagged
-            # normal output and silently deferred peer messages.
-            if printf '%s\n' "$capture" | grep -E '❯ 1\.' >/dev/null 2>&1; then
-                PEER_DELIVER_READY_REASON="modal prompt visible"
-                return 1
-            fi
+            local i
+            for (( i = 0; i < ${#CLAUDE_HC_PATTERN[@]}; i++ )); do
+                if printf '%s\n' "$capture" | grep -E "${CLAUDE_HC_PATTERN[$i]}" >/dev/null 2>&1; then
+                    PEER_DELIVER_READY_REASON="modal prompt visible"
+                    return 1
+                fi
+            done
             ;;
         codex)
-            # Anchor on real Codex approval-modal text (verified against the
-            # Codex CLI 0.142.5 TUI). Codex modals use no "❯" cursor (the
-            # selection is reverse-video, so no reliable glyph appears in a
-            # capture), which rules out the Claude-style arrow anchor — so match
-            # the modal's own strings instead: the "Allow Codex to …" header
-            # (run/apply/edit/access/create), the network-access prompt, and the
-            # always-present "tell Codex what to do differently" option line.
-            # The old markers were doubly wrong: "Allow command" never matched a
-            # real modal (the header is "Allow Codex to run"), while bare
-            # "Approve"/"y/N" false-flagged normal prose and shell [y/N] prompts.
-            if printf '%s\n' "$capture" | grep -E 'Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' >/dev/null 2>&1; then
-                PEER_DELIVER_READY_REASON="modal prompt visible"
-                return 1
-            fi
+            local i
+            for (( i = 0; i < ${#CODEX_HC_PATTERN[@]}; i++ )); do
+                if printf '%s\n' "$capture" | grep -E "${CODEX_HC_PATTERN[$i]}" >/dev/null 2>&1; then
+                    PEER_DELIVER_READY_REASON="modal prompt visible"
+                    return 1
+                fi
+            done
             ;;
         *)
             if [[ "$force_busy" != "true" ]]; then
@@ -7215,10 +7260,39 @@ _session_pane_has_dialog() {
     # fixed prompt strings, not loose heuristics: an unmatched pane is NOT a
     # dialog. Read-only; never injects keystrokes. This is the fragile pane
     # detector flagged in eng review — keep the signature list tight.
-    local capture="$1"
-    printf '%s\n' "$capture" \
-        | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes|Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' \
-        >/dev/null 2>&1
+    #
+    # Uses the shared pattern table from lib/health-check-patterns.sh.
+    local capture="$1" agent="${2:-}"
+    # Source pattern table if not already loaded
+    if [[ -z "${_HC_PATTERNS_LOADED:-}" ]]; then
+        if [[ -f "$SCRIPT_DIR/lib/health-check-patterns.sh" ]]; then
+            _HC_SCRIPT_DIR="$SCRIPT_DIR/lib"
+            source "$SCRIPT_DIR/lib/health-check-patterns.sh"
+        else
+            # Fallback: inline pattern for environments without the lib dir
+            printf '%s\n' "$capture" \
+                | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes|Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' \
+                >/dev/null 2>&1
+            return
+        fi
+    fi
+    # Loop over the agent's pattern array
+    local i
+    if [[ -z "$agent" || "$agent" == "claude" ]]; then
+        for (( i = 0; i < ${#CLAUDE_HC_PATTERN[@]}; i++ )); do
+            if printf '%s\n' "$capture" | grep -E "${CLAUDE_HC_PATTERN[$i]}" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    fi
+    if [[ -z "$agent" || "$agent" == "codex" ]]; then
+        for (( i = 0; i < ${#CODEX_HC_PATTERN[@]}; i++ )); do
+            if printf '%s\n' "$capture" | grep -E "${CODEX_HC_PATTERN[$i]}" >/dev/null 2>&1; then
+                return 0
+            fi
+        done
+    fi
+    return 1
 }
 
 _session_pane_has_draft() {
