@@ -1,7 +1,7 @@
 ---
 id: 059
 title: Make task registry updates atomic and order-independent
-status: in-progress
+status: done
 blocked-by: [057, 058]
 priority: 59
 goal: codex-task-ownership-surfaces
@@ -9,8 +9,12 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-16
+reviewed: false
+qa: automated
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-16 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -100,3 +104,18 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented atomic per-task locking, a versioned pure event reducer, digest-guarded ownership transitions, bounded event and cursor state, canonical conflict evidence, and atomic same-directory replacement. Routed canonical schema-v2 creation, promotion, metadata updates, and ownership transitions through the registry API. Added deterministic concurrency, replay-order, stale-lock, cursor, malformed-input, provenance, and pre-rename failure coverage. Health scored 10.0, all four verification checks passed, the 198-line full suite ended in `ok`, and the actual live `data/` store remained byte-for-byte unchanged.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `docs/plans/059-atomic-task-registry-reducer.md` (modified)
+- `tests/run-tests.sh` (modified)
+- `tests/fixtures/codex-lifecycle/registry-events/app-claim.json` (created)
+- `tests/fixtures/codex-lifecycle/registry-events/conflict-expected.json` (created)
+- `tests/fixtures/codex-lifecycle/registry-events/terminal-claim.json` (created)
+
+**Commit:** `0189d28` — `feat(tasks): add atomic task registry reducer`

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "event_id": "fixture-terminal-claim",
+  "event_type": "handoff",
+  "provider": "codex",
+  "provider_task_id": "<THREAD_ID>",
+  "host_id": "0123456789abcdef0123456789abcdef",
+  "source": "cctrl-handoff",
+  "source_instance_id": "fixture-terminal",
+  "source_sequence": 10,
+  "source_cursor": null,
+  "expected_record_digest": "<BASIS_DIGEST>",
+  "observed_at": "2026-09-16T10:00:00Z",
+  "payload": {
+    "authority_class": "authoritative",
+    "control_owner": "cctrl",
+    "execution_runtime": "tmux",
+    "lifecycle_state": "active",
+    "restore_strategy": "tmux",
+    "reason": "fixture terminal handoff"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "event_id": "fixture-app-claim",
+  "event_type": "handoff",
+  "provider": "codex",
+  "provider_task_id": "<THREAD_ID>",
+  "host_id": "0123456789abcdef0123456789abcdef",
+  "source": "app-server",
+  "source_instance_id": "fixture-app",
+  "source_sequence": 20,
+  "source_cursor": null,
+  "expected_record_digest": "<BASIS_DIGEST>",
+  "observed_at": "2026-09-16T10:00:01Z",
+  "payload": {
+    "authority_class": "authoritative",
+    "control_owner": "app",
+    "execution_runtime": "app-server",
+    "lifecycle_state": "active",
+    "restore_strategy": "provider-managed",
+    "reason": "fixture app handoff"
+  }
+}

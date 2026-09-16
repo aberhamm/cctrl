@@ -7357,6 +7357,147 @@ JSON
     echo "ok: identity-dependent provider archive refuses missing identity while identity-independent tmux close continues"
 }
 
+test_task_registry_atomic_concurrent_updates() {
+    local root="$TMPDIR/task-registry-concurrent" meta="$TMPDIR/task-registry-concurrent/meta" data="$TMPDIR/task-registry-concurrent/data"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--registry" /tmp directory /tmp label purpose prompt cmd "" codex "registry-id" ""'
+    local record key host event_a="$root/a.json" event_b="$root/b.json" p1 p2 rc1=0 rc2=0
+    record="$(session_record_path "TMUX--registry" "$meta")"; key="${record##*/}"; key="${key%.json}"
+    host="$(jq -r '.host_id' "$record")"
+    jq -n --arg host "$host" '{version:1,event_id:"field-a",event_type:"observe",provider:"codex",provider_task_id:"registry-id",host_id:$host,source:"cctrl-metadata",source_instance_id:"writer-a",source_sequence:1,source_cursor:null,expected_record_digest:null,observed_at:"2026-09-16T10:00:00Z",payload:{authority_class:"authoritative",set:{purpose:"atomic-purpose"}}}' > "$event_a"
+    jq -n --arg host "$host" '{version:1,event_id:"field-b",event_type:"observe",provider:"codex",provider_task_id:"registry-id",host_id:$host,source:"cctrl-metadata",source_instance_id:"writer-b",source_sequence:1,source_cursor:null,expected_record_digest:null,observed_at:"2026-09-16T10:00:01Z",payload:{authority_class:"authoritative",set:{transcript_path:"/tmp/atomic-rollout.jsonl"}}}' > "$event_b"
+
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$event_a" & p1=$!
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$event_b" & p2=$!
+    wait "$p1" || rc1=$?
+    wait "$p2" || rc2=$?
+    [[ "$rc1" -eq 0 && "$rc2" -eq 0 ]] || fail "concurrent registry writers failed: $rc1/$rc2"
+    jq -e '.purpose == "atomic-purpose" and .transcript_path == "/tmp/atomic-rollout.jsonl" and
+        (.registry_event_ids | index("field-a") != null) and (.registry_event_ids | index("field-b") != null)' "$record" >/dev/null \
+        || fail "locked concurrent registry writers lost an update"
+    [[ ! -e "$meta/.task-registry-locks/$key.lock" ]] || fail "registry lock leaked after concurrent writers"
+    echo "ok: registry lock serializes the whole read-reduce-write cycle without losing different-field updates"
+}
+
+test_task_registry_replay_order_and_guards() {
+    local root="$TMPDIR/task-registry-order" seed data a b
+    seed="$root/seed"; data="$root/data"; a="$root/a"; b="$root/b"
+    rm -rf "$root"; mkdir -p "$seed" "$data" "$a" "$b"
+    CCTRL_SESSION_METADATA_DIR="$seed" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--order" /tmp directory /tmp label purpose prompt cmd "" codex "<THREAD_ID>" ""'
+    local seed_record key host basis terminal="$root/terminal.json" app="$root/app.json" filtered_a filtered_b before bad="$root/bad.json" out
+    seed_record="$(session_record_path "TMUX--order" "$seed")"; key="${seed_record##*/}"; key="${key%.json}"
+    cp "$seed_record" "$a/$key.json"; cp "$seed_record" "$b/$key.json"
+    host="$(jq -r '.host_id' "$seed_record")"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    basis="$(CCTRL_SESSION_METADATA_DIR="$seed" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_record_digest "$1"' "$seed_record")"
+    jq --arg host "$host" --arg basis "$basis" '.host_id=$host | .expected_record_digest=$basis' \
+        "$ROOT/tests/fixtures/codex-lifecycle/registry-events/terminal-claim.json" > "$terminal"
+    jq --arg host "$host" --arg basis "$basis" '.host_id=$host | .expected_record_digest=$basis' \
+        "$ROOT/tests/fixtures/codex-lifecycle/registry-events/app-claim.json" > "$app"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$terminal"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$app"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$b" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$app"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$b" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$terminal"
+    filtered_a="$(jq -S '{control_owner,execution_runtime,lifecycle_state,restore_strategy,ownership_observations,registry_event_ids,registry_source_high_water,ownership_evidence,last_observed_at}' "$a/$key.json")"
+    filtered_b="$(jq -S '{control_owner,execution_runtime,lifecycle_state,restore_strategy,ownership_observations,registry_event_ids,registry_source_high_water,ownership_evidence,last_observed_at}' "$b/$key.json")"
+    [[ "$filtered_a" == "$filtered_b" ]] || fail "same-basis ownership conflict depended on arrival order"
+    jq -e --slurpfile expected "$ROOT/tests/fixtures/codex-lifecycle/registry-events/conflict-expected.json" '
+        .control_owner == $expected[0].control_owner and .execution_runtime == $expected[0].execution_runtime and
+        .lifecycle_state == $expected[0].lifecycle_state and .restore_strategy == null and
+        (.ownership_observations | length) == $expected[0].ownership_observation_count
+    ' "$a/$key.json" >/dev/null || fail "canonical conflict state did not match fixture"
+
+    before="$(shasum -a 256 "$a/$key.json" | awk '{print $1}')"
+    jq '.event_id="weak-owner" | .payload.authority_class="diagnostic" | .expected_record_digest="bad"' "$terminal" > "$bad"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$bad" 2>/dev/null; then
+        fail "weak diagnostic evidence changed ownership"
+    fi
+    jq -n --arg host "$host" '{version:1,event_id:"immutable-attack",event_type:"observe",provider:"codex",provider_task_id:"<THREAD_ID>",host_id:$host,source:"cctrl-metadata",source_instance_id:"attack",source_sequence:null,source_cursor:null,expected_record_digest:null,observed_at:"2026-09-16T10:00:02Z",payload:{authority_class:"diagnostic",set:{origin:"codex-app",launched_by_cctrl:false}}}' > "$bad"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$bad" 2>/dev/null; then
+        fail "observer downgraded immutable provenance"
+    fi
+    [[ "$before" == "$(shasum -a 256 "$a/$key.json" | awk '{print $1}')" ]] || fail "rejected registry event modified the record"
+
+    jq -n --arg host "$host" '{version:1,event_id:"cursor-10",event_type:"observe",provider:"codex",provider_task_id:"<THREAD_ID>",host_id:$host,source:"cctrl-metadata",source_instance_id:"cursor-source",source_sequence:10,source_cursor:null,expected_record_digest:null,observed_at:"2026-09-16T10:00:03Z",payload:{authority_class:"authoritative",set:{purpose:"cursor-new"}}}' > "$bad"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$bad"
+    jq '.event_id="cursor-9" | .source_sequence=9 | .payload.set.purpose="cursor-old"' "$bad" > "$root/stale.json"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    out="$(CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2"' "$key" "$root/stale.json")"
+    [[ "$(jq -r '.status' <<< "$out")" == "stale" && "$(jq -r '.purpose' "$a/$key.json")" == "cursor-new" ]] \
+        || fail "source cursor below the high-water mark was not rejected"
+
+    before="$(shasum -a 256 "$a/$key.json" | awk '{print $1}')"
+    jq '.event_id="fail-before-rename" | .source_sequence=11 | .payload.set.purpose="must-not-commit"' "$bad" > "$root/failpoint.json"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    if CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME=1 CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$root/failpoint.json" 2>/dev/null; then
+        fail "injected pre-rename termination unexpectedly succeeded"
+    fi
+    [[ "$before" == "$(shasum -a 256 "$a/$key.json" | awk '{print $1}')" ]] || fail "pre-rename failure modified the canonical record"
+
+    printf '%s\n' '{not-json' > "$a/$key.json"
+    before="$(shasum -a 256 "$a/$key.json" | awk '{print $1}')"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_registry_apply_event "$1" "$2" >/dev/null' "$key" "$terminal" 2>/dev/null; then
+        fail "malformed registry record was accepted"
+    fi
+    [[ "$before" == "$(shasum -a 256 "$a/$key.json" | awk '{print $1}')" ]] || fail "malformed registry record was touched"
+    echo "ok: replay order converges; cursors, CAS, provenance, malformed input, and pre-rename failure all fail closed"
+}
+
+test_task_registry_lock_stale_timeout_and_release_token() {
+    local root="$TMPDIR/task-registry-lock" meta data key lock token rc=0
+    meta="$root/meta"; data="$root/data"; key="task-$(printf 'a%.0s' {1..64})"
+    rm -rf "$root"; mkdir -p "$meta/.task-registry-locks" "$data"; chmod 700 "$meta/.task-registry-locks"
+    lock="$meta/.task-registry-locks/$key.lock"
+    printf '999999\t1\t%s\n' "$(printf 'b%.0s' {1..32})" > "$lock"
+    # shellcheck disable=SC2016 # registry token variables belong to the sourced shell
+    CCTRL_TASK_REGISTRY_LOCK_GRACE=0 CCTRL_TASK_REGISTRY_LOCK_TIMEOUT=1 CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_registry_lock_acquire "$1"; _task_registry_lock_release "$TASK_REGISTRY_LOCK_FILE" "$TASK_REGISTRY_LOCK_TOKEN"' "$key" \
+        || fail "dead stale registry lock was not reclaimed"
+    printf '%s\t%s\t%s\n' "$$" "$(date +%s)" "$(printf 'c%.0s' {1..32})" > "$lock"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_TASK_REGISTRY_LOCK_GRACE=0 CCTRL_TASK_REGISTRY_LOCK_TIMEOUT=1 CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_registry_lock_acquire "$1"' "$key" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "live registry lock did not time out closed (rc=$rc)"
+    token="$(awk -F '\t' '{print $3}' "$lock")"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_registry_lock_release "$1" deadbeefdeadbeefdeadbeefdeadbeef' "$lock" >/dev/null 2>&1; then
+        fail "registry lock released with a non-owner token"
+    fi
+    [[ -f "$lock" && "$token" == "$(awk -F '\t' '{print $3}' "$lock")" ]] || fail "token mismatch disturbed live registry lock"
+    rm -f "$lock"
+    echo "ok: task registry locks reclaim dead owners after grace, time out on live owners, and require the owner token"
+}
+
+test_task_registry_structural_boundary() {
+    rg -q '^_task_registry_apply_event\(\)' "$ROOT/cctrl" || fail "registry apply boundary is missing"
+    rg -q '^_task_registry_reduce\(\)' "$ROOT/cctrl" || fail "pure registry reducer boundary is missing"
+    local update transition direct_rewrite
+    update="$(awk '/^_session_update_metadata_field\(\)/,/^}/' "$ROOT/cctrl")"
+    transition="$(awk '/^_task_record_transition\(\)/,/^}/' "$ROOT/cctrl")"
+    [[ "$update" == *'_task_registry_apply_event'* && "$transition" == *'_task_registry_apply_event'* ]] \
+        || fail "schema-v2 metadata writers bypass the task registry boundary"
+    direct_rewrite="mv \"\$tmp\" \"\$file\""
+    [[ "$update" != *"$direct_rewrite"* && "$transition" != *"$direct_rewrite"* ]] \
+        || fail "ad-hoc schema-v2 rewrite remains outside the registry"
+    echo "ok: schema-v2 metadata and transition writers route through the single registry API"
+}
+
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
         session-attest)
@@ -7374,6 +7515,10 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_task_record_legacy_validation_and_lazy_promotion
             test_task_record_merge_conflict_preserves_evidence
             test_task_record_identity_independent_close_continues
+            test_task_registry_atomic_concurrent_updates
+            test_task_registry_replay_order_and_guards
+            test_task_registry_lock_stale_timeout_and_release_token
+            test_task_registry_structural_boundary
             echo "ok"
             exit 0
             ;;
@@ -7601,6 +7746,10 @@ test_task_record_schema_v2_and_provisional_promotion
 test_task_record_legacy_validation_and_lazy_promotion
 test_task_record_merge_conflict_preserves_evidence
 test_task_record_identity_independent_close_continues
+test_task_registry_atomic_concurrent_updates
+test_task_registry_replay_order_and_guards
+test_task_registry_lock_stale_timeout_and_release_token
+test_task_registry_structural_boundary
 test_snapshot_header_and_session_shape
 test_snapshot_initial_prompt_absent
 test_snapshot_empty_fleet_guard_preserves

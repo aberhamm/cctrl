@@ -31,6 +31,11 @@ _session_refresh_paths() {
 _session_refresh_paths
 TASK_RECORD_SCHEMA_VERSION=2
 TASK_RECORD_MAX_EVIDENCE=32
+TASK_REGISTRY_MAX_EVENT_IDS=64
+TASK_REGISTRY_MAX_SOURCES=32
+TASK_REGISTRY_ABSENT_DIGEST="absent"
+TASK_REGISTRY_LOCK_TIMEOUT="${CCTRL_TASK_REGISTRY_LOCK_TIMEOUT:-10}"
+TASK_REGISTRY_LOCK_GRACE="${CCTRL_TASK_REGISTRY_LOCK_GRACE:-5}"
 _autoheal_refresh_paths() {
     # Paths for the opt-in dead-bridge autoheal timer (plan 021). The launchd
     # agent dir is overridable (CCTRL_LAUNCH_AGENTS_DIR) so tests write a plist to
@@ -1634,6 +1639,29 @@ for index, item in enumerate(evidence):
     if item.get("observed_state") not in states: fail("unknown evidence observed_state")
     if not isinstance(item.get("observed_at"), str) or not rfc3339.match(item["observed_at"]): fail("evidence observed_at must be RFC 3339")
     if not isinstance(item.get("reason"), str) or not item["reason"]: fail("evidence reason is required")
+
+event_ids = data.get("registry_event_ids", [])
+if not isinstance(event_ids, list) or len(event_ids) > 64 or any(not isinstance(item, str) or not item for item in event_ids):
+    fail("registry_event_ids must contain at most 64 non-empty strings")
+if len(event_ids) != len(set(event_ids)): fail("registry_event_ids must be unique")
+high_water = data.get("registry_source_high_water", {})
+if not isinstance(high_water, dict) or len(high_water) > 32:
+    fail("registry_source_high_water must contain at most 32 sources")
+for key, value in high_water.items():
+    if not isinstance(key, str) or not key or not (isinstance(value, str) or type(value) is int):
+        fail("registry source cursors must be string or integer values")
+observations = data.get("ownership_observations", [])
+if not isinstance(observations, list) or len(observations) > max_evidence:
+    fail(f"ownership_observations must be an array of at most {max_evidence} entries")
+for item in observations:
+    if not isinstance(item, dict): fail("ownership observation must be an object")
+    for field in ("basis_record_digest", "authority_class", "source", "source_instance_id", "event_fingerprint",
+                  "proposed_owner", "proposed_runtime", "proposed_state", "observed_at"):
+        if not isinstance(item.get(field), str) or not item[field]: fail(f"ownership observation {field} is required")
+    if item["authority_class"] not in authorities: fail("unknown observation authority_class")
+    if item["proposed_owner"] not in owners: fail("unknown observation owner")
+    if item["proposed_runtime"] not in runtimes: fail("unknown observation runtime")
+    if item["proposed_state"] not in states: fail("unknown observation state")
 print(json.dumps(data, separators=(",", ":")))
 PY
     then
@@ -1726,6 +1754,396 @@ _session_metadata_field() {
     _task_record_normalize_json "$file" 2>/dev/null | jq -r --arg field "$field" '.[$field] // empty' 2>/dev/null
 }
 
+_task_registry_lock_acquire() {
+    # Registry locks deliberately do not use flock: macOS does not ship it.
+    # A private lock directory contains one atomic claim per record.  shlock is
+    # preferred when present; otherwise hard-link publication supplies the
+    # same create-if-absent property.  The opaque token is required to release.
+    local record_key="$1" lock_root lock_file candidate token started now elapsed
+    local owner pid created snapshot
+    [[ "$record_key" =~ ^(task-[0-9a-f]{64}|launch-[0-9a-f-]+)$ ]] || return 1
+    lock_root="$SESSION_METADATA_DIR/.task-registry-locks"
+    mkdir -p "$lock_root" || return 1
+    chmod 700 "$lock_root" 2>/dev/null || return 1
+    lock_file="$lock_root/$record_key.lock"
+    token="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+    [[ "$token" =~ ^[0-9a-f]{32}$ ]] || return 1
+    candidate="$(mktemp "$lock_root/.claim.XXXXXX")" || return 1
+    chmod 600 "$candidate" || { rm -f "$candidate"; return 1; }
+    created="$(date +%s)"
+    printf '%s\t%s\t%s\n' "$$" "$created" "$token" > "$candidate" || { rm -f "$candidate"; return 1; }
+    started="$created"
+    while :; do
+        if command -v shlock >/dev/null 2>&1; then
+            if shlock -p "$$" -f "$lock_file" >/dev/null 2>&1; then
+                # Replace shlock's pid-only contents only after its exclusive
+                # create succeeds; readers treat the short gap as unverifiable.
+                cp "$candidate" "$lock_file" || { rm -f "$lock_file" "$candidate"; return 1; }
+                break
+            fi
+        elif ln "$candidate" "$lock_file" 2>/dev/null; then
+            break
+        fi
+        snapshot="$(cat "$lock_file" 2>/dev/null || true)"
+        IFS=$'\t' read -r pid created owner <<< "$snapshot"
+        now="$(date +%s)"
+        if [[ "$pid" =~ ^[0-9]+$ && "$created" =~ ^[0-9]+$ && "$owner" =~ ^[0-9a-f]{32}$ ]] \
+            && ! kill -0 "$pid" 2>/dev/null && (( now - created >= TASK_REGISTRY_LOCK_GRACE )); then
+            sleep 0.05
+            if [[ "$(cat "$lock_file" 2>/dev/null || true)" == "$snapshot" ]] && ! kill -0 "$pid" 2>/dev/null; then
+                rm -f "$lock_file" 2>/dev/null || true
+                continue
+            fi
+        fi
+        elapsed=$((now - started))
+        if (( elapsed >= TASK_REGISTRY_LOCK_TIMEOUT )); then
+            rm -f "$candidate"
+            echo "Timed out acquiring task registry lock for $record_key" >&2
+            return 75
+        fi
+        sleep 0.05
+    done
+    rm -f "$candidate"
+    TASK_REGISTRY_LOCK_FILE="$lock_file"
+    TASK_REGISTRY_LOCK_TOKEN="$token"
+    export TASK_REGISTRY_LOCK_FILE TASK_REGISTRY_LOCK_TOKEN
+}
+
+_task_registry_lock_release() {
+    local lock_file="${1:-${TASK_REGISTRY_LOCK_FILE:-}}" token="${2:-${TASK_REGISTRY_LOCK_TOKEN:-}}" owner
+    [[ -n "$lock_file" && -n "$token" && -f "$lock_file" && ! -L "$lock_file" ]] || return 1
+    owner="$(awk -F '\t' 'NR==1 {print $3}' "$lock_file" 2>/dev/null || true)"
+    [[ "$owner" == "$token" ]] || {
+        echo "Refusing to release task registry lock owned by another token" >&2
+        return 1
+    }
+    rm -f "$lock_file"
+}
+
+_task_registry_record_digest() {
+    local input="$1"
+    python3 - "$input" <<'PY'
+import hashlib, json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+print(hashlib.sha256(canonical).hexdigest())
+PY
+}
+
+_task_registry_next_sequence() {
+    # Derive the next per-source counter from registry state. This is only a
+    # proposal made before CAS; a concurrent winner makes the event stale and
+    # the caller retries. Wall-clock time is never used as ownership order.
+    local input="$1" source="$2" instance="$3"
+    python3 - "$input" "$source" "$instance" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    record = json.load(handle)
+value = (record.get("registry_source_high_water") or {}).get(sys.argv[2] + "\0" + sys.argv[3], 0)
+print(value + 1 if type(value) is int else 1)
+PY
+}
+
+_task_registry_reduce_files() {
+    local record_file="$1" event_file="$2"
+    python3 - "$record_file" "$event_file" "$TASK_RECORD_SCHEMA_VERSION" \
+        "$TASK_RECORD_MAX_EVIDENCE" "$TASK_REGISTRY_MAX_EVENT_IDS" \
+        "$TASK_REGISTRY_MAX_SOURCES" "$TASK_REGISTRY_ABSENT_DIGEST" <<'PY'
+import copy, hashlib, json, re, sys
+
+record_path, event_path = sys.argv[1], sys.argv[2]
+schema, max_evidence, max_events, max_sources = map(int, sys.argv[3:7])
+absent_digest = sys.argv[7]
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+def emit(status, record, detail=None):
+    out = {"status": status, "record": record}
+    if detail: out["detail"] = detail
+    print(canonical(out))
+    raise SystemExit(0)
+
+try:
+    with open(record_path, encoding="utf-8") as handle: record = json.load(handle)
+    with open(event_path, encoding="utf-8") as handle: event = json.load(handle)
+except Exception as exc:
+    print(f"task registry input is not valid JSON: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+if record is not None and not isinstance(record, dict):
+    print("task registry record must be an object or null", file=sys.stderr); raise SystemExit(2)
+if not isinstance(event, dict):
+    print("task registry event must be an object", file=sys.stderr); raise SystemExit(2)
+
+required = ("event_id", "event_type", "provider", "provider_task_id", "host_id",
+            "source", "source_instance_id", "observed_at", "payload")
+for field in required:
+    if field not in event:
+        print(f"task registry event missing {field}", file=sys.stderr); raise SystemExit(2)
+if event.get("version") != 1:
+    print("task registry event version must be 1", file=sys.stderr); raise SystemExit(2)
+for field in required[:-1]:
+    if not isinstance(event.get(field), str) or not event[field]:
+        print(f"task registry event {field} must be a non-empty string", file=sys.stderr); raise SystemExit(2)
+if event["event_type"] not in {"register", "observe", "launch", "handoff", "reconcile", "end"}:
+    print("unknown task registry event_type", file=sys.stderr); raise SystemExit(2)
+if not isinstance(event["payload"], dict):
+    print("task registry event payload must be an object", file=sys.stderr); raise SystemExit(2)
+if event.get("source_sequence") is not None and (type(event["source_sequence"]) is not int or event["source_sequence"] < 0):
+    print("source_sequence must be a non-negative integer", file=sys.stderr); raise SystemExit(2)
+if event.get("source_cursor") is not None and not isinstance(event["source_cursor"], str):
+    print("source_cursor must be a string", file=sys.stderr); raise SystemExit(2)
+if event.get("expected_record_digest") is not None and not isinstance(event["expected_record_digest"], str):
+    print("expected_record_digest must be a string", file=sys.stderr); raise SystemExit(2)
+if event.get("expected_record_digest") not in (None, absent_digest) and not re.match(r"^[0-9a-f]{64}$", event["expected_record_digest"]):
+    print("expected_record_digest must be a canonical SHA-256 or absent sentinel", file=sys.stderr); raise SystemExit(2)
+if not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$", event["observed_at"]):
+    print("observed_at must be RFC 3339", file=sys.stderr); raise SystemExit(2)
+
+payload = event["payload"]
+requested_owner = any(k in payload for k in ("control_owner", "execution_runtime"))
+authority = payload.get("authority_class", "diagnostic" if event["event_type"] == "observe" else "authoritative")
+if authority not in {"authoritative", "corroborating", "diagnostic"}:
+    print("unknown event authority_class", file=sys.stderr); raise SystemExit(2)
+if requested_owner and event["event_type"] not in {"launch", "handoff", "reconcile", "end"}:
+    print("event type is not authorized to change ownership", file=sys.stderr); raise SystemExit(2)
+if requested_owner and authority != "authoritative":
+    print("non-authoritative event cannot change ownership", file=sys.stderr); raise SystemExit(2)
+if requested_owner and not event.get("expected_record_digest"):
+    print("owner/runtime mutation requires expected_record_digest", file=sys.stderr); raise SystemExit(2)
+
+semantic_event = {k: v for k, v in event.items() if k not in {"event_id", "observed_at"}}
+fingerprint = digest(semantic_event)
+source_key = event["source"] + "\0" + event["source_instance_id"]
+source_allowed = bool(re.match(r"^(cctrl-|app-server$|lifecycle-hook$|legacy-)", event["source"]))
+
+created_record = record is None
+if record is None:
+    if event["event_type"] != "register" or event.get("expected_record_digest") != absent_digest:
+        emit("missing", None, "record creation requires register plus absent sentinel")
+    proposed = copy.deepcopy(payload.get("record"))
+    if not isinstance(proposed, dict):
+        print("register event requires payload.record", file=sys.stderr); raise SystemExit(2)
+    for field in ("provider", "provider_task_id", "host_id"):
+        if proposed.get(field) != event[field]:
+            print(f"register identity mismatch for {field}", file=sys.stderr); raise SystemExit(2)
+    if proposed.get("schema_version") != schema:
+        print("register record must use current schema", file=sys.stderr); raise SystemExit(2)
+    record = proposed
+else:
+    for field in ("provider", "provider_task_id", "host_id"):
+        if record.get(field) != event[field]:
+            print(f"event identity mismatch for {field}", file=sys.stderr); raise SystemExit(2)
+    if event["event_type"] == "register":
+        incoming = copy.deepcopy(payload.get("record"))
+        if not isinstance(incoming, dict) or incoming.get("schema_version") != schema:
+            print("register event requires a current-schema payload.record", file=sys.stderr); raise SystemExit(2)
+        for field in ("provider", "provider_task_id", "host_id"):
+            if incoming.get(field) != record.get(field):
+                print(f"register cannot change immutable field {field}", file=sys.stderr); raise SystemExit(2)
+        merged = copy.deepcopy(incoming)
+        merged.update(record)
+        merged["registered_by_cctrl"] = bool(record.get("registered_by_cctrl") or incoming.get("registered_by_cctrl"))
+        merged["launched_by_cctrl"] = bool(record.get("launched_by_cctrl") or incoming.get("launched_by_cctrl"))
+        for field in ("execution_runtime", "control_owner", "lifecycle_state"):
+            old, new = record.get(field, "unknown"), incoming.get(field, "unknown")
+            if old in (None, "unknown"): merged[field] = new
+            elif new in (None, "unknown") or old == new: merged[field] = old
+            else: merged[field] = "conflict"
+        if record.get("restore_strategy") is None:
+            merged["restore_strategy"] = incoming.get("restore_strategy")
+        old_lineage, new_lineage = record.get("lineage") or {}, incoming.get("lineage") or {}
+        merged["lineage"] = {k: old_lineage.get(k) if old_lineage.get(k) is not None else new_lineage.get(k)
+                             for k in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis")}
+        combined = list(record.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
+        unique = {canonical(item): item for item in combined}
+        merged["ownership_evidence"] = [unique[k] for k in sorted(unique)][-max_evidence:]
+        record = merged
+
+original = copy.deepcopy(record)
+event_ids = sorted(set(record.get("registry_event_ids", [])))
+if event["event_id"] in event_ids:
+    emit("duplicate", record)
+
+# Trusted cursors are kept only for allowlisted sources and within a fixed map.
+high_water = dict(record.get("registry_source_high_water", {}))
+cursor_value = event.get("source_sequence")
+if cursor_value is None: cursor_value = event.get("source_cursor")
+if cursor_value is not None and source_allowed:
+    previous = high_water.get(source_key)
+    def cursor_key(value):
+        return (0, value) if type(value) is int else (1, str(value))
+    if previous is not None and cursor_key(cursor_value) <= cursor_key(previous):
+        emit("stale", record, "source cursor is not above the high-water mark")
+    if source_key in high_water or len(high_water) < max_sources:
+        high_water[source_key] = cursor_value
+
+expected = event.get("expected_record_digest")
+current_digest = digest(original)
+observations = list(record.get("ownership_observations", []))
+
+proposal = {
+    "basis_record_digest": expected,
+    "authority_class": authority,
+    "source": event["source"],
+    "source_instance_id": event["source_instance_id"],
+    "source_sequence": event.get("source_sequence"),
+    "source_cursor": event.get("source_cursor"),
+    "event_fingerprint": fingerprint,
+    "proposed_owner": payload.get("control_owner", record.get("control_owner", "unknown")),
+    "proposed_runtime": payload.get("execution_runtime", record.get("execution_runtime", "unknown")),
+    "proposed_state": payload.get("lifecycle_state", record.get("lifecycle_state", "unknown")),
+    "observed_at": event["observed_at"],
+}
+
+if requested_owner and expected != current_digest:
+    competing = [o for o in observations
+                 if o.get("basis_record_digest") == expected
+                 and o.get("authority_class") == authority
+                 and (o.get("proposed_owner"), o.get("proposed_runtime"), o.get("proposed_state"))
+                     != (proposal["proposed_owner"], proposal["proposed_runtime"], proposal["proposed_state"])]
+    if not competing:
+        emit("stale", record, "expected record digest does not match")
+    observations.append(proposal)
+    unique = {o["event_fingerprint"]: o for o in observations}
+    observations = [unique[k] for k in sorted(unique)][-max_evidence:]
+    record["ownership_observations"] = observations
+    record["control_owner"] = "conflict"
+    record["execution_runtime"] = "conflict"
+    record["lifecycle_state"] = "conflict"
+    record["restore_strategy"] = None
+elif requested_owner:
+    # A cursorless fact may corroborate or create conflict, but cannot replace
+    # an already authoritative owner solely by arrival order.
+    current = (record.get("control_owner", "unknown"), record.get("execution_runtime", "unknown"))
+    proposed_pair = (proposal["proposed_owner"], proposal["proposed_runtime"])
+    prior_authoritative = [o for o in observations if o.get("authority_class") == "authoritative"]
+    prior_authoritative += [o for o in record.get("ownership_evidence", [])
+                            if o.get("authority_class") == "authoritative"]
+    if cursor_value is None and prior_authoritative and current != proposed_pair:
+        observations.append(proposal)
+        unique = {o["event_fingerprint"]: o for o in observations}
+        record["ownership_observations"] = [unique[k] for k in sorted(unique)][-max_evidence:]
+        record["control_owner"] = "conflict"
+        record["execution_runtime"] = "conflict"
+        record["lifecycle_state"] = "conflict"
+        record["restore_strategy"] = None
+    else:
+        record["control_owner"] = proposal["proposed_owner"]
+        record["execution_runtime"] = proposal["proposed_runtime"]
+        record["lifecycle_state"] = proposal["proposed_state"]
+        if "restore_strategy" in payload: record["restore_strategy"] = payload["restore_strategy"]
+        observations.append(proposal)
+        unique = {o["event_fingerprint"]: o for o in observations}
+        record["ownership_observations"] = [unique[k] for k in sorted(unique)][-max_evidence:]
+
+# Immutable identity/provenance can only be repeated identically.  The two
+# cctrl booleans are monotonic: observers cannot downgrade them.
+updates = payload.get("set", {})
+if not isinstance(updates, dict):
+    print("payload.set must be an object", file=sys.stderr); raise SystemExit(2)
+immutable = {"schema_version", "provider", "provider_task_id", "origin", "host_id", "launched_by_cctrl"}
+if cursor_value is None and event["event_type"] != "register" and any(field not in immutable for field in updates):
+    print("cursorless events may only repeat immutable-identical facts", file=sys.stderr); raise SystemExit(2)
+for field, value in updates.items():
+    if field in immutable:
+        if record.get(field) != value:
+            print(f"immutable task field cannot change: {field}", file=sys.stderr); raise SystemExit(2)
+        continue
+    if field in {"control_owner", "execution_runtime", "lifecycle_state", "restore_strategy"}:
+        print(f"ownership field must use the event transition payload: {field}", file=sys.stderr); raise SystemExit(2)
+    if field == "registered_by_cctrl" and record.get(field) is True and value is not True:
+        print("registered_by_cctrl cannot be downgraded", file=sys.stderr); raise SystemExit(2)
+    record[field] = value
+
+# Canonical bounded evidence/cache state. Event time updates diagnostic time
+# deterministically, never ownership precedence.
+event_ids.append(event["event_id"])
+record["registry_event_ids"] = sorted(set(event_ids))[-max_events:]
+record["registry_source_high_water"] = {k: high_water[k] for k in sorted(high_water)[-max_sources:]}
+record["last_observed_at"] = max(str(record.get("last_observed_at", "")), event["observed_at"])
+
+evidence = list(record.get("ownership_evidence", []))
+if requested_owner:
+    evidence.append({
+        "source": event["source"], "source_instance": event["source_instance_id"],
+        "source_cursor": None if cursor_value is None else str(cursor_value),
+        "authority_class": authority, "observed_owner": proposal["proposed_owner"],
+        "observed_runtime": proposal["proposed_runtime"], "observed_state": proposal["proposed_state"],
+        "observed_at": event["observed_at"], "reason": payload.get("reason", event["event_type"]),
+        "basis_record_digest": expected, "event_fingerprint": fingerprint,
+    })
+    unique = {i.get("event_fingerprint", digest(i)): i for i in evidence}
+    record["ownership_evidence"] = [unique[k] for k in sorted(unique)][-max_evidence:]
+
+emit("created" if created_record else "applied", record)
+PY
+}
+
+_task_registry_reduce() {
+    # Pure JSON boundary: neither argument is evaluated by the shell or jq.
+    local record_json="$1" event_json="$2" scratch record_file event_file rc
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-task-reduce.XXXXXX")" || return 1
+    record_file="$scratch/record.json"; event_file="$scratch/event.json"
+    printf '%s' "$record_json" > "$record_file"
+    printf '%s' "$event_json" > "$event_file"
+    if _task_registry_reduce_files "$record_file" "$event_file"; then rc=0; else rc=$?; fi
+    rm -rf "$scratch"
+    return "$rc"
+}
+
+_task_registry_apply_event() {
+    local record_key="$1" event_file="$2" record_file input_file result_file output_file tmp status rc=0
+    [[ "$record_key" =~ ^(task-[0-9a-f]{64}|launch-[0-9a-f-]+)$ ]] || return 1
+    [[ -f "$event_file" && ! -L "$event_file" ]] || return 1
+    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    record_file="$SESSION_METADATA_DIR/$record_key.json"
+    _task_registry_lock_acquire "$record_key" || return $?
+    input_file="$(mktemp "$SESSION_METADATA_DIR/.task-input.XXXXXX")" || rc=1
+    result_file="$(mktemp "$SESSION_METADATA_DIR/.task-result.XXXXXX")" || rc=1
+    output_file="$(mktemp "$SESSION_METADATA_DIR/.task-output.XXXXXX")" || rc=1
+    if (( rc == 0 )); then
+        if [[ -e "$record_file" || -L "$record_file" ]]; then
+            if [[ ! -f "$record_file" || -L "$record_file" ]] || ! _task_record_normalize_json "$record_file" >/dev/null 2>&1; then
+                echo "Malformed task record left untouched: $record_file" >&2
+                rc=2
+            else
+                cp "$record_file" "$input_file" || rc=1
+            fi
+        else
+            printf 'null\n' > "$input_file"
+        fi
+    fi
+    if (( rc == 0 )); then
+        _task_registry_reduce_files "$input_file" "$event_file" > "$result_file" || rc=$?
+    fi
+    if (( rc == 0 )); then
+        status="$(jq -r '.status' "$result_file")"
+        if [[ "$status" == "applied" || "$status" == "created" ]]; then
+            jq -S '.record' "$result_file" > "$output_file" || rc=1
+            if (( rc == 0 )) && ! _task_record_normalize_json "$output_file" >/dev/null 2>&1; then rc=2; fi
+            if (( rc == 0 )); then
+                chmod 600 "$output_file" 2>/dev/null || true
+                if [[ "${CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME:-0}" == "1" ]]; then
+                    echo "Injected task registry failure before atomic replace" >&2
+                    rc=76
+                else
+                    mv "$output_file" "$record_file" || rc=1
+                fi
+            fi
+        fi
+        (( rc == 0 )) && cat "$result_file"
+    fi
+    rm -f "$input_file" "$result_file" "$output_file" 2>/dev/null || true
+    _task_registry_lock_release "$TASK_REGISTRY_LOCK_FILE" "$TASK_REGISTRY_LOCK_TOKEN" || rc=1
+    return "$rc"
+}
+
 _task_record_promote_legacy() {
     # Promote a legacy or provisional record after stable provider identity is
     # known. The canonical write commits first; only a provisional source is
@@ -1784,59 +2202,27 @@ evidence.append({
 })
 incoming["ownership_evidence"] = evidence[-max_evidence:]
 
-try:
-    with open(canonical_path, encoding="utf-8") as handle:
-        canonical = json.load(handle)
-except FileNotFoundError:
-    canonical = None
-
-if canonical is None:
-    result = incoming
-else:
-    result = dict(incoming)
-    result.update(canonical)
-    # Immutable identity and established origin always remain canonical.
-    for field in ("schema_version", "provider", "provider_task_id", "host_id", "origin"):
-        result[field] = canonical[field]
-    authoritative = any(item.get("authority_class") == "authoritative" for item in incoming.get("ownership_evidence", []))
-    if authoritative:
-        result["registered_by_cctrl"] = bool(canonical.get("registered_by_cctrl") or incoming.get("registered_by_cctrl"))
-        result["launched_by_cctrl"] = bool(canonical.get("launched_by_cctrl") or incoming.get("launched_by_cctrl"))
-    for field in ("execution_runtime", "control_owner", "lifecycle_state"):
-        old, new = canonical.get(field, "unknown"), incoming.get(field, "unknown")
-        if old in (None, "unknown"):
-            result[field] = new
-        elif field == "lifecycle_state" and new == "provisional":
-            result[field] = old
-        elif new in (None, "unknown") or old == new:
-            result[field] = old
-        else:
-            result[field] = "conflict"
-    if canonical.get("restore_strategy") is None:
-        result["restore_strategy"] = incoming.get("restore_strategy")
-    result["tmux_session"] = canonical.get("tmux_session") or incoming.get("tmux_session")
-    old_lineage = canonical.get("lineage") or {}
-    new_lineage = incoming.get("lineage") or {}
-    result["lineage"] = {key: old_lineage.get(key) if old_lineage.get(key) is not None else new_lineage.get(key)
-                         for key in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis")}
-    combined = list(canonical.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
-    unique = []
-    seen = set()
-    for item in combined:
-        marker = json.dumps(item, sort_keys=True, separators=(",", ":"))
-        if marker not in seen:
-            seen.add(marker)
-            unique.append(item)
-    result["ownership_evidence"] = unique[-max_evidence:]
-    result["last_observed_at"] = now
-    result["conversation_id"] = result["provider_task_id"]
-print(json.dumps(result, indent=2, sort_keys=True))
+print(json.dumps(incoming, indent=2, sort_keys=True))
 PY
     if ! _task_record_normalize_json "$tmp" >/dev/null 2>&1; then
         rm -f "$tmp"
         return 1
     fi
-    mv "$tmp" "$canonical" || { rm -f "$tmp"; return 1; }
+    local event_file record_key event_id result
+    event_file="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || { rm -f "$tmp"; return 1; }
+    record_key="${canonical##*/}"; record_key="${record_key%.json}"
+    event_id="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+    jq -n --slurpfile record "$tmp" --arg id "$event_id" --arg provider "$provider" \
+        --arg task "$provider_task_id" --arg host "$host_id" --arg observed "$now" \
+        --arg expected "$TASK_REGISTRY_ABSENT_DIGEST" '
+        {version:1,event_id:$id,event_type:"register",provider:$provider,provider_task_id:$task,
+         host_id:$host,source:"legacy-promotion",source_instance_id:($record[0].tmux_session // $record[0].name // "promotion"),
+         source_sequence:null,source_cursor:null,expected_record_digest:$expected,observed_at:$observed,
+         payload:{authority_class:"authoritative",record:$record[0]}}
+    ' > "$event_file" || { rm -f "$tmp" "$event_file"; return 1; }
+    result="$(_task_registry_apply_event "$record_key" "$event_file")" || { rm -f "$tmp" "$event_file"; return 1; }
+    rm -f "$tmp" "$event_file"
+    case "$(jq -r '.status' <<< "$result")" in created|applied|duplicate) ;; *) return 1 ;; esac
     local indexed_session
     indexed_session="$(jq -r '.tmux_session // .name // empty' "$canonical" 2>/dev/null || true)"
     [[ -n "$indexed_session" ]] && _session_record_index_update "$indexed_session" "$canonical" 2>/dev/null || true
@@ -1847,11 +2233,10 @@ PY
 }
 
 _session_update_metadata_field() {
-    # Read-modify-write of a single field. Same-dir mktemp + mv for atomicity.
-    # Never creates a record that doesn't exist. Returns non-zero on missing
-    # file or jq parse failure.
+    # Legacy inputs retain their compatibility promotion path. Every schema-v2
+    # update is expressed as an event so the lock covers read/reduce/write.
     local session_name="$1" field="$2" value="$3"
-    local file tmp version promoted stable_id
+    local file version promoted stable_id record_key event_file event_id now sequence source_instance result
     file="$(_session_metadata_file "$session_name")"
     [[ -f "$file" ]] || return 1
     version="$(jq -r '.schema_version // empty' "$file" 2>/dev/null || true)"
@@ -1869,29 +2254,28 @@ _session_update_metadata_field() {
         promoted="$(_task_record_promote_legacy "$file" "$stable_id")" || return 1
         file="$promoted"
     fi
-    tmp="$(mktemp "$SESSION_METADATA_DIR/tmp.XXXXXX")" || return 1
-    if jq --arg f "$field" --arg v "$value" --arg now "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
-        'if ($f == "conversation_id" or $f == "provider_task_id") then
-             .provider_task_id = (if $v == "" then null else $v end)
-             | .conversation_id = (if $v == "" then null else $v end)
-         else .[$f] = (if $v == "" then null else $v end) end
-         | .last_observed_at = $now' \
-        "$file" > "$tmp" 2>/dev/null; then
-        if _task_record_normalize_json "$tmp" >/dev/null 2>&1; then
-            mv "$tmp" "$file"
-        else
-            rm -f "$tmp" 2>/dev/null
-            return 1
-        fi
-    else
-        rm -f "$tmp" 2>/dev/null
-        return 1
-    fi
+    record_key="${file##*/}"; record_key="${record_key%.json}"
+    event_file="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || return 1
+    event_id="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    source_instance="$session_name:$field"
+    sequence="$(_task_registry_next_sequence "$file" "cctrl-metadata" "$source_instance")" || { rm -f "$event_file"; return 1; }
+    jq -n --arg id "$event_id" --arg provider "$(jq -r '.provider' "$file")" \
+        --arg task "$(jq -r '.provider_task_id' "$file")" --arg host "$(jq -r '.host_id' "$file")" \
+        --arg instance "$source_instance" --arg observed "$now" --arg field "$field" --arg value "$value" --argjson sequence "$sequence" '
+        {version:1,event_id:$id,event_type:"observe",provider:$provider,provider_task_id:$task,
+         host_id:$host,source:"cctrl-metadata",source_instance_id:$instance,
+         source_sequence:$sequence,source_cursor:null,expected_record_digest:null,observed_at:$observed,
+         payload:{authority_class:"authoritative",set:{($field):(if $value == "" then null else $value end)}}}
+    ' > "$event_file" || { rm -f "$event_file"; return 1; }
+    result="$(_task_registry_apply_event "$record_key" "$event_file")" || { rm -f "$event_file"; return 1; }
+    rm -f "$event_file"
+    [[ "$(jq -r '.status' <<< "$result")" == "applied" ]]
 }
 
 _task_record_transition() {
     local session_name="$1" runtime="$2" owner="$3" state="$4" restore="$5" source="$6" authority="$7" reason="$8"
-    local file stable_id promoted tmp now
+    local file stable_id promoted now record_key event_file event_id expected sequence result
     file="$(_session_metadata_file "$session_name")"
     [[ -f "$file" ]] || return 1
     stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
@@ -1900,35 +2284,27 @@ _task_record_transition() {
         promoted="$(_task_record_promote_legacy "$file" "$stable_id")" || return 1
         file="$promoted"
     fi
-    tmp="$(mktemp "$SESSION_METADATA_DIR/.task-transition.XXXXXX")" || return 1
+    record_key="${file##*/}"; record_key="${record_key%.json}"
+    event_file="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || return 1
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    if jq \
-        --arg runtime "$runtime" --arg owner "$owner" --arg state "$state" \
-        --arg restore "$restore" --arg source "$source" --arg authority "$authority" \
-        --arg reason "$reason" --arg now "$now" --argjson max "$TASK_RECORD_MAX_EVIDENCE" '
-        .execution_runtime = $runtime
-        | .control_owner = $owner
-        | .lifecycle_state = $state
-        | .restore_strategy = (if $restore == "" then null else $restore end)
-        | .control_surface = (if $runtime == "tmux" then "tmux" elif $runtime == "app-server" then "app" else "unknown" end)
-        | .last_observed_at = $now
-        | .ownership_evidence = (((.ownership_evidence // []) + [{
-            source:$source,
-            source_instance:(.tmux_session // .name // null),
-            source_cursor:null,
-            authority_class:$authority,
-            observed_owner:$owner,
-            observed_runtime:$runtime,
-            observed_state:$state,
-            observed_at:$now,
-            reason:$reason
-          }]) | if length > $max then .[-$max:] else . end)
-        ' "$file" > "$tmp" 2>/dev/null && _task_record_normalize_json "$tmp" >/dev/null 2>&1; then
-        mv "$tmp" "$file"
-    else
-        rm -f "$tmp"
-        return 1
-    fi
+    expected="$(_task_registry_record_digest "$file")" || { rm -f "$event_file"; return 1; }
+    event_id="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
+    sequence="$(_task_registry_next_sequence "$file" "$source" "$session_name")" || { rm -f "$event_file"; return 1; }
+    jq -n --arg id "$event_id" --arg provider "$(jq -r '.provider' "$file")" \
+        --arg task "$(jq -r '.provider_task_id' "$file")" --arg host "$(jq -r '.host_id' "$file")" \
+        --arg source "$source" --arg instance "$session_name" --arg observed "$now" \
+        --arg expected "$expected" --arg runtime "$runtime" --arg owner "$owner" --arg state "$state" \
+        --arg restore "$restore" --arg authority "$authority" --arg reason "$reason" --argjson sequence "$sequence" '
+        {version:1,event_id:$id,event_type:"reconcile",provider:$provider,provider_task_id:$task,
+         host_id:$host,source:$source,source_instance_id:$instance,source_sequence:$sequence,
+         source_cursor:null,expected_record_digest:$expected,observed_at:$observed,
+         payload:{authority_class:$authority,control_owner:$owner,execution_runtime:$runtime,
+                  lifecycle_state:$state,restore_strategy:(if $restore == "" then null else $restore end),
+                  reason:$reason,set:{control_surface:(if $runtime == "tmux" then "tmux" elif $runtime == "app-server" then "app" else "unknown" end)}}}
+    ' > "$event_file" || { rm -f "$event_file"; return 1; }
+    result="$(_task_registry_apply_event "$record_key" "$event_file")" || { rm -f "$event_file"; return 1; }
+    rm -f "$event_file"
+    [[ "$(jq -r '.status' <<< "$result")" == "applied" ]]
 }
 
 _session_repo_name() {
@@ -2099,7 +2475,9 @@ _session_write_metadata() {
             cctrl_managed: true
         }' > "$tmp" || { rm -f "$tmp"; return 1; }
     _task_record_normalize_json "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
-    if [[ -n "$provider_task_id" && -f "$output_file" ]]; then
+    if [[ -n "$provider_task_id" ]]; then
+        # Canonical schema-v2 creation and merge both cross the registry event
+        # boundary; provisional launch records remain identity-less staging.
         _task_record_promote_legacy "$tmp" "$provider_task_id" >/dev/null || { rm -f "$tmp"; return 1; }
     else
         mv "$tmp" "$output_file"
