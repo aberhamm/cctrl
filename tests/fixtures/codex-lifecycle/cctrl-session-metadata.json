@@ -1,0 +1,12 @@
+{
+  "name": "TMUX--lifecycle-probe",
+  "created_at": "2026-09-16T10:00:00Z",
+  "cwd": "<WORKSPACE>",
+  "agent": "codex",
+  "host": "<HOST_LABEL>",
+  "conversation_id": "<THREAD_ID>",
+  "transcript_path": "<ROLLOUT_PATH>",
+  "control_surface": "tmux",
+  "tmux_session": "TMUX--lifecycle-probe",
+  "released_at": null
+}

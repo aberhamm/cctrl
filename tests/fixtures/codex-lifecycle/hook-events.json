@@ -1,0 +1,54 @@
+{
+  "events": [
+    {
+      "hook_event_name": "SessionStart",
+      "source": "startup",
+      "session_id": "<THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<ROLLOUT_PATH>"
+    },
+    {
+      "hook_event_name": "SessionStart",
+      "source": "resume",
+      "session_id": "<THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<ROLLOUT_PATH>"
+    },
+    {
+      "hook_event_name": "SessionStart",
+      "source": "clear",
+      "session_id": "<THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<ROLLOUT_PATH>"
+    },
+    {
+      "hook_event_name": "PreCompact",
+      "source": "compact",
+      "session_id": "<THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<ROLLOUT_PATH>"
+    },
+    {
+      "hook_event_name": "SessionStart",
+      "source": "fork",
+      "session_id": "<FORK_THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<FORK_ROLLOUT_PATH>"
+    },
+    {
+      "hook_event_name": "SessionStart",
+      "source": "app-server",
+      "session_id": "<THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<ROLLOUT_PATH>"
+    },
+    {
+      "hook_event_name": "SessionStart",
+      "source": "cli",
+      "session_id": "<THREAD_ID>",
+      "cwd": "<WORKSPACE>",
+      "transcript_path": "<ROLLOUT_PATH>"
+    }
+  ],
+  "scope_warning": "User-level hooks can run for app-server and CLI surfaces; source is context, not ownership proof."
+}

@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "path": "matrix.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "contract-matrix",
+      "capture_method": "Consolidated from generated App Server schemas and read-only local source/store inspection.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "all lifecycle boundaries",
+      "field_status": { "provider fields": "observed", "root lineage": "derived", "empty composer id": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "fork id": "<FORK_THREAD_ID>", "fork-of-fork id": "<FORK_OF_FORK_THREAD_ID>", "subagent id": "<SUBAGENT_THREAD_ID>" },
+      "refresh_rule": "Refresh after a Codex CLI/app upgrade changes thread schemas, hooks, persistence, or writer-lock behavior."
+    },
+    {
+      "path": "app-server-thread.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "app-server",
+      "capture_method": "codex app-server generate-json-schema --experimental; inspect v2 ThreadListResponse.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "fork identity and lineage",
+      "field_status": { "id": "observed", "forkedFromId": "observed", "parentThreadId": "observed", "rootId": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "parent id": "<PARENT_THREAD_ID>", "workspace": "<WORKSPACE>" },
+      "refresh_rule": "Regenerate when codex --version changes or thread/list response schema changes."
+    },
+    {
+      "path": "hook-events.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "hooks",
+      "capture_method": "Generated hook configuration schema plus sanitized observed payload shape; unavailable sources are recorded conservatively.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "startup resume clear compact fork app-server cli",
+      "field_status": { "hook_event_name": "observed", "session_id": "observed", "source": "observed", "owner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "fork id": "<FORK_THREAD_ID>", "workspace": "<WORKSPACE>", "rollout": "<ROLLOUT_PATH>", "fork rollout": "<FORK_ROLLOUT_PATH>" },
+      "refresh_rule": "Refresh when hook event names, source vocabulary, trust behavior, or payload fields change."
+    },
+    {
+      "path": "sqlite-thread-row.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "sqlite",
+      "capture_method": "Read-only PRAGMA table_info(threads) and sanitized row projection.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "durable thread inventory",
+      "field_status": { "id": "observed", "title": "observed", "cwd": "observed", "lineage": "unsupported", "writerOwner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "workspace": "<WORKSPACE>" },
+      "refresh_rule": "Refresh when PRAGMA table_info(threads) changes after a Codex upgrade."
+    },
+    {
+      "path": "rollout-session-meta.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "rollout",
+      "capture_method": "Read-only first-record inspection of a rollout file, reduced to session_meta fields.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "persisted provider task identity",
+      "field_status": { "id": "observed", "session_id": "observed", "cwd": "observed", "source": "observed", "owner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "workspace": "<WORKSPACE>" },
+      "refresh_rule": "Refresh when rollout session_meta format or _codex_rollout_thread_id parsing changes."
+    },
+    {
+      "path": "cctrl-session-metadata.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "cctrl-metadata",
+      "capture_method": "_session_write_metadata output shape with values replaced by approved placeholders.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "cctrl terminal launch and release-to-app",
+      "field_status": { "conversation_id": "observed", "host": "observed", "control_surface": "observed", "lineage": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "workspace": "<WORKSPACE>", "host": "<HOST_LABEL>", "rollout": "<ROLLOUT_PATH>" },
+      "refresh_rule": "Refresh when _session_write_metadata or _session_release_to_app changes persisted fields."
+    },
+    {
+      "path": "writer-lock.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "writer-lock",
+      "capture_method": "Read-only stat and content-length inspection through _codex_thread_writer_lock_path behavior.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "single-writer lock present",
+      "field_status": { "presence": "observed", "thread id from filename": "derived", "owner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "codex home": "<CODEX_HOME>" },
+      "refresh_rule": "Refresh when lock path, contents, or stale-lock semantics change."
+    },
+    {
+      "path": "process-argv.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "process-argv",
+      "capture_method": "Sanitized ps argv shape used by _codex_thread_has_live_process.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "direct CLI resume hint",
+      "field_status": { "thread id argument": "observed", "writerOwner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>" },
+      "refresh_rule": "Refresh when Codex resume argv or process correlation logic changes."
+    },
+    {
+      "path": "probe-protocol.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "probe-protocol",
+      "capture_method": "Protocol declaration; no production task was mutated while creating this fixture.",
+      "observed_at": "2026-09-16T10:00:00Z",
+      "scenario": "disposable lifecycle probe safety",
+      "field_status": { "temporary cctrl stores": "observed", "live-store digest": "derived", "expected Codex delta": "derived" },
+      "sanitization": { "thread id": "<THREAD_ID>", "before digest": "<BEFORE_DIGEST>", "after digest": "<AFTER_DIGEST>", "temporary data": "<TEMP_DATA_DIR>", "temporary metadata": "<TEMP_METADATA_DIR>" },
+      "refresh_rule": "Use for every future live probe; invalidate if cctrl environment override names or Codex store locations change.",
+      "cleanup": "Archive the named disposable task, remove only the temporary cctrl directories, and verify its writer lock is absent."
+    }
+  ]
+}

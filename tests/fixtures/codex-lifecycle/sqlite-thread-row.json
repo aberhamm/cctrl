@@ -1,0 +1,11 @@
+{
+  "table": "threads",
+  "row": {
+    "id": "<THREAD_ID>",
+    "title": "Lifecycle probe",
+    "cwd": "<WORKSPACE>",
+    "archived": 0,
+    "updated_at": 1789552800
+  },
+  "unsupported_fields": ["forkedFromId", "parentThreadId", "rootId", "writerOwner"]
+}

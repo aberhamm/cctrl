@@ -1,0 +1,13 @@
+{
+  "timestamp": "2026-09-16T10:00:00Z",
+  "type": "session_meta",
+  "payload": {
+    "id": "<THREAD_ID>",
+    "session_id": "<THREAD_ID>",
+    "cwd": "<WORKSPACE>",
+    "originator": "codex_cli_rs",
+    "cli_version": "0.153.4",
+    "source": "cli",
+    "thread_source": "user"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "probe_name": "cctrl-codex-lifecycle-probe",
+  "environment": {
+    "CCTRL_DATA_DIR": "<TEMP_DATA_DIR>",
+    "CCTRL_SESSION_METADATA_DIR": "<TEMP_METADATA_DIR>"
+  },
+  "live_store": {
+    "before_digest": "sha256:<BEFORE_DIGEST>",
+    "after_digest": "sha256:<AFTER_DIGEST>",
+    "expected_codex_delta": [
+      "One disposable rollout and thread row for <THREAD_ID>",
+      "A transient writer lock while the disposable task is active"
+    ]
+  },
+  "cleanup": [
+    "Close and archive the disposable task named cctrl-codex-lifecycle-probe.",
+    "Remove only <TEMP_DATA_DIR> and <TEMP_METADATA_DIR>.",
+    "Confirm that no writer lock for <THREAD_ID> remains before declaring cleanup complete."
+  ]
+}

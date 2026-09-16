@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "scenario": "native-app-empty-plus",
+      "boundary": "The native app opens an empty + composer before the first prompt is submitted.",
+      "provider_task_id": { "status": "unsupported", "value": null },
+      "forkedFromId": { "status": "unsupported", "value": null },
+      "parentThreadId": { "status": "unsupported", "value": null },
+      "derivedRootId": { "status": "unsupported", "value": null },
+      "evidence": [
+        { "source": "visible empty composer", "classification": "diagnostic-only" }
+      ],
+      "ownership_outcome": "unknown",
+      "notes": "No provider task id exists yet. cctrl records nothing and never mints a synthetic identity."
+    },
+    {
+      "scenario": "native-app-first-prompt",
+      "boundary": "The native app submits the first prompt and thread/start returns a thread.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "thread/start response on the app-owned connection", "classification": "authoritative" },
+        { "source": "SessionStart hook and rollout session_meta", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "app",
+      "notes": "The response establishes identity and the initiating control surface at creation time."
+    },
+    {
+      "scenario": "cctrl-tmux-launch",
+      "boundary": "cctrl launches Codex in a managed tmux session and records the resulting provider id.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "successful cctrl launch transaction plus session metadata", "classification": "authoritative" },
+        { "source": "rollout session_meta and live tmux process", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "terminal",
+      "notes": "cwd, title, lock presence, and process argv do not independently establish this result."
+    },
+    {
+      "scenario": "remote-unix",
+      "boundary": "cctrl launches a Codex TUI that connects with --remote unix:// to an already running App Server host.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "successful cctrl launch of the app-server-backed TUI", "classification": "authoritative" },
+        { "source": "App Server request/response on the connected host", "classification": "corroborating" },
+        { "source": "remote client argv", "classification": "diagnostic-only" }
+      ],
+      "ownership_outcome": "terminal",
+      "notes": "The terminal TUI owns the control surface while the connected host runs the task runtime; the remote client device is not a second writer."
+    },
+    {
+      "scenario": "direct-cli-resume",
+      "boundary": "A CLI outside a cctrl launch runs codex resume for an existing provider id.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "unsupported", "value": null },
+      "parentThreadId": { "status": "unsupported", "value": null },
+      "derivedRootId": { "status": "unsupported", "value": null },
+      "evidence": [
+        { "source": "resume argument and process argv", "classification": "diagnostic-only" },
+        { "source": "matching rollout session_meta", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "unknown",
+      "notes": "Without an observed launch transaction or provider ownership response, a matching argv is not enough."
+    },
+    {
+      "scenario": "cctrl-app-owned-launch",
+      "boundary": "cctrl asks App Server to create a task and records the returned id and connected host.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "successful cctrl App Server transaction and recorded host", "classification": "authoritative" },
+        { "source": "SQLite row and rollout session_meta", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "app",
+      "notes": "The record is host-scoped and does not claim that every device can reach that host."
+    },
+    {
+      "scenario": "app-restart",
+      "boundary": "The native app process exits and reconnects to the same host state.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "new App Server connection reads the same provider id", "classification": "authoritative" },
+        { "source": "unchanged SQLite and rollout records", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "app",
+      "notes": "A stale writer lock alone cannot prove successful reacquisition after restart."
+    },
+    {
+      "scenario": "host-reboot",
+      "boundary": "The connected host reboots and only durable SQLite/rollout/metadata evidence remains.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "unsupported", "value": null },
+      "parentThreadId": { "status": "unsupported", "value": null },
+      "derivedRootId": { "status": "unsupported", "value": null },
+      "evidence": [
+        { "source": "SQLite, rollout, and cctrl metadata survive reboot", "classification": "corroborating" },
+        { "source": "writer-lock residue", "classification": "diagnostic-only" }
+      ],
+      "ownership_outcome": "unknown",
+      "notes": "Ownership is re-established only by a new successful launch, resume, or App Server connection."
+    },
+    {
+      "scenario": "clear",
+      "boundary": "A running task handles clear and emits a SessionStart hook with source clear.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "existing live owner transaction", "classification": "authoritative" },
+        { "source": "SessionStart source=clear hook", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "unchanged",
+      "notes": "clear is a lifecycle event within the task and preserves whichever live surface already owns it."
+    },
+    {
+      "scenario": "compact",
+      "boundary": "A running task emits PreCompact/PostCompact without changing its provider identity.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "existing live owner transaction", "classification": "authoritative" },
+        { "source": "PreCompact/PostCompact hook", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "unchanged",
+      "notes": "Compaction changes context, not task identity or ownership; app and terminal owners are both preserved."
+    },
+    {
+      "scenario": "fork",
+      "boundary": "thread/fork creates a new provider id from one source thread.",
+      "provider_task_id": { "status": "observed", "value": "<FORK_THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": "<THREAD_ID>" },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "thread/fork response forkedFromId", "classification": "authoritative" },
+        { "source": "fork hook and new rollout", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "app",
+      "notes": "forkedFromId is fork ancestry; parentThreadId remains reserved for subagent ancestry."
+    },
+    {
+      "scenario": "fork-of-fork",
+      "boundary": "A second fork points to the immediate fork parent, requiring traversal for the root.",
+      "provider_task_id": { "status": "observed", "value": "<FORK_OF_FORK_THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": "<FORK_THREAD_ID>" },
+      "parentThreadId": { "status": "observed", "value": null },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "thread/read responses traversed through forkedFromId", "classification": "authoritative" },
+        { "source": "computed terminal ancestor", "classification": "corroborating" }
+      ],
+      "ownership_outcome": "app",
+      "notes": "Codex does not expose rootId; cctrl may label a root only as derived by traversal."
+    },
+    {
+      "scenario": "subagent-thread",
+      "boundary": "A subagent thread is created under an agent parent without a fork operation.",
+      "provider_task_id": { "status": "observed", "value": "<SUBAGENT_THREAD_ID>" },
+      "forkedFromId": { "status": "observed", "value": null },
+      "parentThreadId": { "status": "observed", "value": "<THREAD_ID>" },
+      "derivedRootId": { "status": "derived", "value": "<THREAD_ID>" },
+      "evidence": [
+        { "source": "thread/read parentThreadId", "classification": "authoritative" }
+      ],
+      "ownership_outcome": "app",
+      "notes": "parentThreadId is subagent ancestry and must not be substituted for forkedFromId."
+    },
+    {
+      "scenario": "release-to-app",
+      "boundary": "cctrl stops the tmux writer, verifies exit, handles only a stale lock, and updates metadata.",
+      "provider_task_id": { "status": "observed", "value": "<THREAD_ID>" },
+      "forkedFromId": { "status": "unsupported", "value": null },
+      "parentThreadId": { "status": "unsupported", "value": null },
+      "derivedRootId": { "status": "unsupported", "value": null },
+      "evidence": [
+        { "source": "verified tmux writer exit", "classification": "authoritative" },
+        { "source": "stale-lock quarantine", "classification": "corroborating" },
+        { "source": "control_surface=app destination receipt", "classification": "diagnostic-only" }
+      ],
+      "ownership_outcome": "unknown",
+      "notes": "Release ends terminal ownership but does not observe app acquisition. Ownership becomes app only after a successful app-side transaction."
+    }
+  ]
+}

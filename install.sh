@@ -33,8 +33,7 @@ add_to_path() {
     if [ -f "$file" ] && grep -q '.local/bin' "$file" 2>/dev/null; then
         return
     fi
-    echo '' >> "$file"
-    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$file"
+    printf "\nexport PATH=\"\$HOME/.local/bin:\$PATH\"\n" >> "$file"
     dim "Added ~/.local/bin to PATH in $(basename "$file")"
 }
 
@@ -55,9 +54,11 @@ if [ "$(basename "$SHELL")" = "zsh" ]; then
     # Add to fpath if not already present
     ZSHRC="${HOME}/.zshrc"
     if [ -f "$ZSHRC" ] && ! grep -q 'site-functions' "$ZSHRC" 2>/dev/null; then
-        echo '' >> "$ZSHRC"
-        echo 'fpath=(~/.local/share/zsh/site-functions $fpath)' >> "$ZSHRC"
-        echo 'autoload -Uz compinit && compinit' >> "$ZSHRC"
+        {
+            echo ''
+            printf "fpath=(~/.local/share/zsh/site-functions \$fpath)\n"
+            echo 'autoload -Uz compinit && compinit'
+        } >> "$ZSHRC"
         dim "Added zsh completions to .zshrc"
     fi
 fi

@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
 export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
+# Keep discovery tests isolated from large, live Codex/Claude stores. Individual
+# persistence tests override these roots with their own fixtures.
+export CODEX_HOME="$TMPDIR/no-codex-home"
+export CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-config"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 cat > "$TMPDIR/hostname" <<'SH'
@@ -44,6 +48,49 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2"
     [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
+}
+
+run_with_pty_input() {
+    local input="$1"
+    shift
+    PTY_INPUT="$input" python3 - "$@" <<'PY'
+import errno
+import os
+import pty
+import select
+import signal
+import sys
+
+argv = sys.argv[1:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvpe(argv[0], argv, os.environ)
+
+pending = os.environ["PTY_INPUT"].encode()
+sent = False
+while True:
+    readable, _, _ = select.select([fd], [], [], 10)
+    if not readable:
+        os.kill(pid, signal.SIGTERM)
+        os.waitpid(pid, 0)
+        raise SystemExit(124)
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError as exc:
+        if exc.errno == errno.EIO:
+            break
+        raise
+    if not chunk:
+        break
+    sys.stdout.buffer.write(chunk)
+    sys.stdout.buffer.flush()
+    if not sent and b"> " in chunk:
+        os.write(fd, pending)
+        sent = True
+
+_, status = os.waitpid(pid, 0)
+raise SystemExit(os.waitstatus_to_exitcode(status))
+PY
 }
 
 make_fake_agent() {
@@ -328,13 +375,12 @@ test_agent_prompt_without_default() {
     assert_contains "$out" "No agent selected and prompting is unavailable"
     assert_contains "$out" "Pass --agent <agent>"
 
-    command -v script >/dev/null 2>&1 || return 0
-    script -q /dev/null true >/dev/null 2>&1 || return 0
-
     local out_file="$TMPDIR/agent-prompt-output.log"
-    printf '2\n' | env PATH="$TMPDIR:$PATH" \
-        script -q /dev/null "$rootcopy/cctrl" start --foreground -m "prompted agent" \
-        > "$out_file" 2>&1
+    if ! run_with_pty_input $'2\n' env PATH="$TMPDIR:$PATH" \
+        "$rootcopy/cctrl" start --foreground -m "prompted agent" \
+        > "$out_file" 2>&1; then
+        fail "agent prompt pseudo-TTY invocation failed: $(cat "$out_file")"
+    fi
 
     out="$(cat "$out_file")"
     assert_contains "$out" "Choose agent runtime:"
@@ -495,13 +541,12 @@ test_profile_prompt_overrides_global_default() {
     [[ "$rc" -ne 0 ]] || fail "expected profile prompt override to fail without a TTY"
     assert_contains "$out" "No agent selected and prompting is unavailable"
 
-    command -v script >/dev/null 2>&1 || return 0
-    script -q /dev/null true >/dev/null 2>&1 || return 0
-
     local out_file="$TMPDIR/profile-agent-prompt-output.log"
-    printf '1\n' | env PATH="$TMPDIR:$PATH" \
-        script -q /dev/null "$rootcopy/cctrl" start --foreground --no-bridge -m "profile picked claude" \
-        > "$out_file" 2>&1
+    if ! run_with_pty_input $'1\n' env PATH="$TMPDIR:$PATH" \
+        "$rootcopy/cctrl" start --foreground --no-bridge -m "profile picked claude" \
+        > "$out_file" 2>&1; then
+        fail "profile prompt pseudo-TTY invocation failed: $(cat "$out_file")"
+    fi
 
     out="$(cat "$out_file")"
     assert_contains "$out" "Choose agent runtime:"
@@ -557,9 +602,6 @@ SH
 }
 
 test_detached_agent_prompt_exports_selection() {
-    command -v script >/dev/null 2>&1 || return 0
-    script -q /dev/null true >/dev/null 2>&1 || return 0
-
     make_fake_agent "$TMPDIR/codex" codex
     make_fake_agent "$TMPDIR/claude" claude
     make_fake_tmux "$TMPDIR/tmux"
@@ -573,10 +615,12 @@ test_detached_agent_prompt_exports_selection() {
     chmod +x "$rootcopy/cctrl"
 
     : > "$log"
-    printf '2\n' | env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
+    if ! run_with_pty_input $'2\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
         CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never CCTRL_EMIT_SESSION=1 \
-        script -q /dev/null "$rootcopy/cctrl" start -d "$project" \
-        > "$out_file" 2>&1
+        "$rootcopy/cctrl" start -d "$project" \
+        > "$out_file" 2>&1; then
+        fail "detached agent prompt pseudo-TTY invocation failed: $(cat "$out_file")"
+    fi
 
     out="$(cat "$out_file")"
     assert_contains "$out" "Choose agent runtime:"
@@ -932,9 +976,6 @@ JSON
 }
 
 test_purpose_prompt_uses_controlling_tty() {
-    command -v script >/dev/null 2>&1 || return 0
-    script -q /dev/null true >/dev/null 2>&1 || return 0
-
     make_fake_tmux "$TMPDIR/tmux"
     local rootcopy="$TMPDIR/cctrl-devtty-copy"
     local project="$TMPDIR/devtty-project"
@@ -947,9 +988,11 @@ test_purpose_prompt_uses_controlling_tty() {
     printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
 
     : > "$log"
-    printf '\n' | env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
-        CCTRL_ATTACH_PROMPT=never script -q /dev/null "$rootcopy/cctrl" @cctrl \
-        > "$out_file" 2>&1
+    if ! run_with_pty_input $'\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" \
+        CCTRL_ATTACH_PROMPT=never "$rootcopy/cctrl" @cctrl \
+        > "$out_file" 2>&1; then
+        fail "purpose prompt pseudo-TTY invocation failed: $(cat "$out_file")"
+    fi
 
     local out
     out="$(cat "$out_file")"
@@ -3072,7 +3115,7 @@ test_peer_send_deliver_outcomes() {
 
     # (3) busy/modal pane -> sent-but-deferred, exit non-zero, retry hint (deliver only).
     local codex_modal
-    codex_modal="$(printf '%s\n' '● working' '│ Allow Codex to run `npm test`? │' '│ No, and tell Codex what to do differently │')"
+    codex_modal="$(printf '%s\n' '● working' $'│ Allow Codex to run `npm test`? │' '│ No, and tell Codex what to do differently │')"
     rc=0
     out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$codex_modal" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "busy one")" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected sent-but-deferred to exit non-zero"
@@ -3382,7 +3425,7 @@ test_peer_deliver_busy_no_submit_and_inline() {
         '● Running the test suite next.' \
         '' \
         '╭──────────────────────────────────────────────────╮' \
-        '│ Allow Codex to run `npm test`?                   │' \
+        $'│ Allow Codex to run `npm test`?                   │' \
         '│                                                  │' \
         '│ > Yes, proceed                                   │' \
         "│   Yes, and don't ask again for this command      │" \
@@ -3713,7 +3756,7 @@ test_peer_deliver_codex_modal_detection() {
         '  1. Approve the upstream change' \
         '  2. Rerun CI' \
         '' \
-        'I ran `git clean -n` (the tool would normally ask y/N before deleting).')"
+        $'I ran `git clean -n` (the tool would normally ask y/N before deleting).')"
 
     assert_modal_detection "$data" "$log" comet TMUX--comet "$modal_pane" "$benign_pane"
 
@@ -4165,7 +4208,7 @@ test_session_close_named_immediate() {
 
     # Outside tmux with an explicit name: immediate kill.
     local out
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX= TMUX_FAKE_HAS_SESSION=1 \
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX='' TMUX_FAKE_HAS_SESSION=1 \
         "$ROOT/cctrl" close TMUX--demo)"
     assert_contains "$out" "Closed session: TMUX--demo"
     assert_contains "$(cat "$log")" "kill-session -t TMUX--demo"
@@ -4175,7 +4218,7 @@ test_session_close_named_immediate() {
 test_session_close_outside_requires_name() {
     make_fake_tmux "$TMPDIR/tmux"
     local out rc=0
-    out="$(PATH="$TMPDIR:$PATH" TMUX= "$ROOT/cctrl" session close 2>&1)" || rc=$?
+    out="$(PATH="$TMPDIR:$PATH" TMUX='' "$ROOT/cctrl" session close 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected close outside tmux without a name to fail"
     assert_contains "$out" "Could not verify that this process is inside a cctrl tmux session"
 }
@@ -4688,7 +4731,7 @@ test_snapshot_header_and_session_shape() {
     assert_contains "$out" '"launch_flags":'
     [[ -f "$snapdir/latest.json" ]] || fail "latest.json not created"
     local hcount
-    hcount="$(ls "$snapdir"/[0-9]*.json 2>/dev/null | wc -l | tr -d ' ')"
+    hcount="$(find "$snapdir" -maxdepth 1 -type f -name '[0-9]*.json' -print | wc -l | tr -d ' ')"
     [[ "$hcount" -ge 1 ]] || fail "no history file created"
     echo "ok: snapshot header and per-session shape"
 }
@@ -4777,7 +4820,7 @@ test_snapshot_history_and_latest_agree() {
         TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --quiet
 
     local history_file latest_hash history_hash
-    history_file="$(ls "$snapdir"/[0-9]*.json 2>/dev/null | head -1)"
+    history_file="$(find "$snapdir" -maxdepth 1 -type f -name '[0-9]*.json' -print | sort | head -1)"
     [[ -n "$history_file" ]] || fail "no history file found"
     latest_hash="$(shasum "$snapdir/latest.json" | awk '{print $1}')"
     history_hash="$(shasum "$history_file" | awk '{print $1}')"
@@ -5752,7 +5795,8 @@ JSON
 
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
-    local claude_dir="$base/claude/projects/$(printf %s "$HOME/dev/demo" | tr -c "[:alnum:]" -)"
+    local claude_dir
+    claude_dir="$base/claude/projects/$(printf %s "$HOME/dev/demo" | tr -c "[:alnum:]" -)"
     local archive_dir="$base/codex/archived_sessions"
     local claude_ts claude_user_ts codex_meta_ts codex_context_ts codex_token_ts codex_path primary_reset secondary_reset
     { IFS= read -r claude_ts
@@ -5851,8 +5895,8 @@ PY
 
     local out
     out="$(HOME=/Users/someone-else python3 "$probe" "$ROOT")"
-    local expected
-    expected="$(printf '%s\n' '~/dev-demo' '~' '-opt-apps-thing' 'loose.jsonl' 'demo' '~' 'thing')"
+    local expected tilde='~'
+    expected="$(printf '%s\n' "$tilde/dev-demo" "$tilde" '-opt-apps-thing' 'loose.jsonl' 'demo' "$tilde" 'thing')"
     [[ "$out" == "$expected" ]] || fail "project naming did not track HOME; got:
 $out
 expected:
@@ -7376,6 +7420,7 @@ _tmux_run_with_timeout() {
     TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?
 }
 FNSSH
+    # shellcheck source=/dev/null
     source "$fn_file"
 
     # Source the health check
@@ -7385,10 +7430,8 @@ FNSSH
 
     # Run with a short timeout and poll interval
     (
-        export PATH="$hc_bin:$PATH"
-        export CCTRL_HC_POLL_INTERVAL=0
-        export CCTRL_HC_STABLE_THRESHOLD=2
-        _health_check_run "test-session" "claude" 5
+        PATH="$hc_bin:$PATH" CCTRL_HC_POLL_INTERVAL=0 CCTRL_HC_STABLE_THRESHOLD=2 \
+            _health_check_run "test-session" "claude" 5
     ) 2>/dev/null
 
     # Count send-keys calls — should be exactly 1 (transition guard)
@@ -7419,7 +7462,7 @@ esac
 FAKESH
     chmod +x "$hc_bin/tmux"
 
-    RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
+    export RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
     _session_update_metadata_field() { :; }
     _tmux_run_with_timeout() {
         TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?
@@ -7430,9 +7473,8 @@ FAKESH
 
     local rc=0
     (
-        export PATH="$hc_bin:$PATH"
-        export CCTRL_HC_POLL_INTERVAL=0
-        _health_check_run "test-session" "claude" 2
+        PATH="$hc_bin:$PATH" CCTRL_HC_POLL_INTERVAL=0 \
+            _health_check_run "test-session" "claude" 2
     ) 2>/dev/null || rc=$?
 
     [[ "$rc" -eq 0 ]] \
@@ -7464,7 +7506,7 @@ esac
 FAKESH
     chmod +x "$hc_bin/tmux"
 
-    RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
+    export RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
     _session_update_metadata_field() { :; }
     _tmux_run_with_timeout() {
         TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?
@@ -7475,9 +7517,8 @@ FAKESH
 
     local rc=0
     (
-        export PATH="$hc_bin:$PATH"
-        export CCTRL_HC_POLL_INTERVAL=0
-        _health_check_run "test-session" "claude" 3
+        PATH="$hc_bin:$PATH" CCTRL_HC_POLL_INTERVAL=0 \
+            _health_check_run "test-session" "claude" 3
     ) 2>/dev/null || rc=$?
 
     [[ "$rc" -eq 0 ]] \
@@ -7512,6 +7553,7 @@ source "$ROOT/lib/health-check-patterns.sh"
 $(awk '/^_session_pane_has_dialog\(\) \{/,/^}/' "$ROOT/cctrl")
 FNSH
 
+    # shellcheck source=/dev/null
     source "$fn_file"
 
     # Claude trust modal (should match)
@@ -7547,6 +7589,11 @@ FNSH
     echo "ok: _session_pane_has_dialog regression tests pass after shared-pattern refactor"
 }
 
+test_codex_lifecycle_fixture_contract() {
+    python3 "$ROOT/tests/fixtures/codex-lifecycle/validate.py" \
+        || fail "Codex lifecycle fixture contract validation failed"
+}
+
 test_health_check_patterns_syntax
 test_health_check_pattern_matching
 test_health_check_transition_guard
@@ -7554,5 +7601,6 @@ test_health_check_needs_human_path
 test_health_check_timeout_path
 test_health_check_bypass_flag
 test_session_pane_has_dialog_refactored
+test_codex_lifecycle_fixture_contract
 
 echo "ok"

@@ -1,0 +1,5 @@
+{
+  "argv": ["codex", "resume", "<THREAD_ID>"],
+  "classification": "diagnostic-only",
+  "limitation": "Process argv can corroborate a live CLI resume but cannot prove that it owns the writer lock."
+}

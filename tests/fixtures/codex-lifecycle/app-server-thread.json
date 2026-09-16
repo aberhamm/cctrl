@@ -1,0 +1,16 @@
+{
+  "method": "thread/list",
+  "thread": {
+    "id": "<THREAD_ID>",
+    "forkedFromId": "<PARENT_THREAD_ID>",
+    "parentThreadId": null,
+    "name": "Lifecycle probe",
+    "cwd": "<WORKSPACE>",
+    "source": "appServer"
+  },
+  "schema_observation": {
+    "provider_root_field": "unsupported",
+    "forkedFromId_meaning": "fork ancestry",
+    "parentThreadId_meaning": "subagent ancestry"
+  }
+}

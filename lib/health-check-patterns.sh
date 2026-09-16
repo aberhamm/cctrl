@@ -19,28 +19,24 @@ CLAUDE_HC_PATTERN=(
     'Continue from a previous|❯ 1\.'
     '❯ 1\..*(login|sign.in|authenticate)'
     'login isn.t available|auth.* required'
-    'Do you want to (proceed|create|make)'
 )
 CLAUDE_HC_LABEL=(
     "workspace-trust"
     "conversation-picker"
     "auth-login"
     "login-unavailable"
-    "proceed-confirm"
 )
 CLAUDE_HC_ACTION=(
     "auto-dismiss"
     "auto-dismiss"
     "needs-human"
     "needs-human"
-    "auto-dismiss"
 )
 CLAUDE_HC_KEYS=(
     "Enter"
     "Enter"
     'https://[^ ]*'
     ""
-    "Enter"
 )
 
 # --- Codex patterns ---

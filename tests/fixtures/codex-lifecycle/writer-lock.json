@@ -1,0 +1,8 @@
+{
+  "thread_id": "<THREAD_ID>",
+  "path": "<CODEX_HOME>/thread-writer-locks/<THREAD_ID>.lock",
+  "present": true,
+  "contents": "empty",
+  "classification": "corroborating",
+  "limitation": "Presence means a writer lock exists, but the empty file does not identify the owning process or surface."
+}

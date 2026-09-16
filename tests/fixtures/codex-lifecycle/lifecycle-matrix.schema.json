@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cctrl.example/schemas/codex-lifecycle-matrix-v1.json",
+  "title": "cctrl Codex lifecycle matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "entries"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "entries": {
+      "type": "array",
+      "minItems": 14,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scenario",
+          "boundary",
+          "provider_task_id",
+          "forkedFromId",
+          "parentThreadId",
+          "derivedRootId",
+          "evidence",
+          "ownership_outcome"
+        ],
+        "properties": {
+          "scenario": { "type": "string", "minLength": 1 },
+          "boundary": { "type": "string", "minLength": 1 },
+          "provider_task_id": { "$ref": "#/$defs/field" },
+          "forkedFromId": { "$ref": "#/$defs/field" },
+          "parentThreadId": { "$ref": "#/$defs/field" },
+          "derivedRootId": { "$ref": "#/$defs/field" },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["source", "classification"],
+              "properties": {
+                "source": { "type": "string", "minLength": 1 },
+                "classification": { "enum": ["authoritative", "corroborating", "diagnostic-only"] }
+              }
+            }
+          },
+          "ownership_outcome": { "enum": ["app", "terminal", "unchanged", "unknown", "conflict"] },
+          "notes": { "type": "string" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "value"],
+      "properties": {
+        "status": { "enum": ["observed", "derived", "unsupported"] },
+        "value": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

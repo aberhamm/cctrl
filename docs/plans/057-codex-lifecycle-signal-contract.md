@@ -1,7 +1,7 @@
 ---
 id: 057
 title: Establish the Codex lifecycle and ownership signal contract
-status: in-progress
+status: done
 blocked-by: []
 priority: 57
 goal: codex-task-ownership-surfaces
@@ -9,9 +9,13 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-16
+reviewed: false
+qa: automated
 tui-fixture: n/a  # this plan inventories tmux metadata/process evidence but never parses pane text
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-16 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -107,3 +111,30 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Established the versioned Codex lifecycle/ownership contract, canonical schemas, sanitized fixtures, and an executable validator enforcing schema, provenance, lineage, and privacy rules. All seven confidence-gated review findings were fixed, focused verification passed within 30 seconds, and the complete repository suite passed with restored real pseudo-TTY coverage despite exceeding the generic per-check cap. Approved deviations from the plan's direct scope were limited to behavior-preserving ShellCheck baseline repairs and removal of the redundant plan-056 modal matcher.
+
+**Files changed:**
+
+- `docs/plans/057-codex-lifecycle-signal-contract.md` (modified)
+- `install.sh` (modified)
+- `lib/health-check-patterns.sh` (modified)
+- `tests/run-tests.sh` (modified)
+- `docs/findings/codex-task-lifecycle-contract.md` (created)
+- `tests/fixtures/codex-lifecycle/app-server-thread.json` (created)
+- `tests/fixtures/codex-lifecycle/cctrl-session-metadata.json` (created)
+- `tests/fixtures/codex-lifecycle/fixture-manifest.schema.json` (created)
+- `tests/fixtures/codex-lifecycle/hook-events.json` (created)
+- `tests/fixtures/codex-lifecycle/lifecycle-matrix.schema.json` (created)
+- `tests/fixtures/codex-lifecycle/manifest.json` (created)
+- `tests/fixtures/codex-lifecycle/matrix.json` (created)
+- `tests/fixtures/codex-lifecycle/probe-protocol.json` (created)
+- `tests/fixtures/codex-lifecycle/process-argv.json` (created)
+- `tests/fixtures/codex-lifecycle/rollout-session-meta.json` (created)
+- `tests/fixtures/codex-lifecycle/sqlite-thread-row.json` (created)
+- `tests/fixtures/codex-lifecycle/validate.py` (created)
+- `tests/fixtures/codex-lifecycle/writer-lock.json` (created)
+
+**Commit:** `f07e309` — `docs(codex): define lifecycle ownership contract`
