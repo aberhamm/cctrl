@@ -1,7 +1,7 @@
 ---
 id: 062
 title: Register Codex tasks from lifecycle events without claiming them
-status: pending
+status: in-progress
 blocked-by: [059, 061]
 priority: 62
 goal: codex-task-ownership-surfaces
