@@ -217,6 +217,58 @@ unknown owner/runtime until an authoritative app-side event is observed.
 `app-ls` is the experimental Codex task view, while `session ls` remains the
 default live tmux view.
 
+### Codex App Server diagnostics
+
+Before enabling app-owned task flows, inspect the installed runtime and the
+already-running desktop App Server with:
+
+```bash
+cctrl codex capabilities
+cctrl codex capabilities --json
+```
+
+This is read-only discovery: it connects through `codex app-server proxy`,
+performs `initialize`/`initialized`, and generates the local protocol schema.
+It never calls `thread/start`, `turn/start`, or any other task-mutating method.
+This transport is the desktop daemon connection; it is deliberately distinct
+from both a newly spawned standalone `codex app-server --stdio` process and a
+terminal TUI started with `codex --remote unix://`.
+
+The JSON output is `codex_capabilities_v1` (`schema_version: 1`). It reports
+the selected executable and transport, CLI and connected-server versions,
+runtime facts (`userAgent`, `codexHome`, platform, and endpoint), and
+`supported`, `unsupported`, or `unknown` for `thread/start`, `thread/read`,
+`thread/list`, and `turn/start`. Generated schema counts as evidence only when
+the generating CLI version matches the connected server `userAgent`; a
+version mismatch is reported as `unknown`.
+
+Runtime discovery checks `CCTRL_CODEX_BIN` (or
+`codex.appServerExecutable` in cctrl's merged JSON config), then `PATH`, then a
+validated platform installation such as the Codex runtime bundled with the
+macOS ChatGPT app. This lets GUI hooks with a minimal `PATH` use the bundled
+runtime without a user-specific bundle path. Set
+`CCTRL_CODEX_APP_SERVER_SOCKET` only when the daemon uses a non-default control
+socket. Separate connect, handshake, request, and inactivity deadlines are
+available as `--connect-timeout`, `--handshake-timeout`, `--request-timeout`,
+and `--inactivity-timeout`.
+
+Stable exit codes:
+
+| Code | Meaning |
+| ---: | --- |
+| 0 | Connected discovery completed |
+| 64 | Invalid usage |
+| 65 | Codex runtime missing or invalid |
+| 66 | Desktop daemon connection failed/timed out |
+| 67 | Initialize handshake failed/timed out |
+| 68 | Request deadline expired |
+| 69 | Connection inactivity deadline expired |
+| 70 | Proxy exited or reached EOF |
+| 71 | Malformed, mismatched, or incompatible protocol data |
+| 72 | Structured App Server error |
+| 73 | Server request lacked an explicit caller callback |
+| 74 | Unexpected adapter failure |
+
 ```bash
 cctrl start ~/dev/myapp           # tmux-backed; prompts to connect in a TTY
 cctrl @myapp                      # shortcut launch, also tmux-backed
@@ -1229,6 +1281,7 @@ cctrl/
     session-log.py         # token tracking hook
     statusline.sh          # status bar + rate limit capture
   lib/
+    codex_app_server.py    # narrow desktop App Server protocol adapter
     usage_costs.py         # usage/cost aggregation for `cctrl usage` and `cctrl costs`
     peer_mcp.py            # stdio MCP server behind `cctrl peer mcp`
   plugins/

@@ -11499,6 +11499,7 @@ cmd_help() {
     echo -e "${BOLD}Usage Tracking${RESET}"
     echo "  cctrl usage [weeks]     Claude/Codex rate limits + billing week breakdown (default: 2)"
     echo "  cctrl costs [range]     Token usage and estimated API-equivalent cost by agent/model/project"
+    echo "  cctrl codex capabilities [--json]  Inspect desktop App Server support (read-only)"
     echo "    ranges: --today, --week, --month, --all [project-filter]"
     echo "  cctrl log [count]       Show profile switch history"
     echo ""
@@ -11525,6 +11526,44 @@ cmd_help() {
     echo "  cctrl chrome --connect          Also connect gstack browse to the session"
     echo ""
     echo -e "${DIM}Plugins: executable cctrl-* in $PLUGINS_DIR or PATH are auto-dispatched.${RESET}"
+}
+
+cmd_codex() {
+    local action="${1:-help}"
+    shift 2>/dev/null || true
+    case "$action" in
+        capabilities)
+            local python_bin="${CCTRL_PYTHON:-}" codex_bin="${CCTRL_CODEX_BIN:-}" rc=0
+            if [[ -z "$python_bin" ]]; then
+                python_bin="$(command -v python3 2>/dev/null || true)"
+            fi
+            if [[ -z "$python_bin" && -x /usr/bin/python3 ]]; then
+                python_bin=/usr/bin/python3
+            fi
+            if [[ -z "$python_bin" ]]; then
+                echo -e "${RED}Python 3 is required for Codex App Server diagnostics.${RESET}" >&2
+                return 65
+            fi
+            if [[ -z "$codex_bin" ]]; then
+                codex_bin="$(_config_jq '.codex.appServerExecutable // .codex.executable // empty' 2>/dev/null || true)"
+            fi
+            local -a adapter_args=("$SCRIPT_DIR/lib/codex_app_server.py" capabilities)
+            [[ -n "$codex_bin" ]] && adapter_args+=(--codex "$codex_bin")
+            "$python_bin" "${adapter_args[@]}" "$@" || rc=$?
+            return "$rc"
+            ;;
+        help|-h|--help|"")
+            echo "Usage: cctrl codex capabilities [--json] [timeout options]"
+            echo ""
+            echo "Read-only capability discovery for the desktop Codex App Server."
+            echo "This command initializes a connection through the daemon proxy; it never starts or mutates a task."
+            ;;
+        *)
+            echo -e "${RED}Unknown codex command: $action${RESET}" >&2
+            echo "Usage: cctrl codex capabilities [--json]" >&2
+            return 64
+            ;;
+    esac
 }
 
 cmd_usage() {
@@ -13525,6 +13564,7 @@ _dispatch() {
             cmd_shortcut "$name" "$@"
             ;;
         peer) cmd_peer "$@" ;;
+        codex) cmd_codex "$@" ;;
         shortcuts) cmd_shortcut "$@" ;;
         host) cmd_host "$@" ;;
         whoami) cmd_whoami "$@" ;;

@@ -1,7 +1,7 @@
 ---
 id: 060
 title: Encapsulate the Codex App Server transport
-status: in-progress
+status: done
 blocked-by: [057]
 priority: 60
 goal: codex-task-ownership-surfaces
@@ -9,8 +9,12 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-16
+reviewed: false
+qa: automated
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-16 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -93,3 +97,17 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented a narrow Codex desktop App Server adapter with newline-delimited JSON-RPC framing, typed request correlation, inbound request callbacks, phase-specific deadlines, bounded child termination, safe runtime discovery, exact schema evidence matching, guarded cctrl dispatch, and versioned read-only capability reporting. Added deterministic fake-server process tests covering success, interleaving, errors, crashes, timeouts, protocol mismatch, typed IDs, minimal-PATH discovery, non-mutating traces, and SIGKILL escalation. Health scored 10.0, all four verification checks passed, and the post-review full suite ended in `ok`; no real Codex task was mutated.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `docs/plans/060-codex-app-server-adapter.md` (modified)
+- `lib/codex_app_server.py` (created)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `97fd169` — `feat(codex): add App Server transport adapter`

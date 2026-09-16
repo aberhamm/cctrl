@@ -8074,6 +8074,326 @@ test_codex_lifecycle_fixture_contract() {
         || fail "Codex lifecycle fixture contract validation failed"
 }
 
+test_codex_app_server_adapter() {
+    local fake_root="$TMPDIR/codex-app-server" fake="$TMPDIR/codex-app-server/codex"
+    local trace="$TMPDIR/codex-app-server/rpc-trace" pid_file="$TMPDIR/codex-app-server/proxy.pid"
+    mkdir -p "$fake_root"
+    cat > "$fake" <<'PY'
+#!/usr/bin/python3
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+mode = os.environ.get("FAKE_CODEX_MODE", "success")
+trace_path = os.environ.get("FAKE_CODEX_TRACE")
+pid_path = os.environ.get("FAKE_CODEX_PID")
+term_path = os.environ.get("FAKE_CODEX_TERM")
+daemon_fail = os.environ.get("FAKE_CODEX_DAEMON_FAIL") == "1"
+cli_version = os.environ.get("FAKE_CODEX_CLI_VERSION", "1.2.3")
+server_version = os.environ.get("FAKE_CODEX_SERVER_VERSION", cli_version)
+
+def trace(value):
+    if trace_path:
+        with open(trace_path, "a", encoding="utf-8") as handle:
+            handle.write(value + "\n")
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+args = sys.argv[1:]
+if args == ["--version"]:
+    print(f"codex-cli {cli_version}")
+    raise SystemExit(0)
+if args[:3] == ["app-server", "daemon", "version"]:
+    if daemon_fail:
+        raise SystemExit(9)
+    if mode == "connect-timeout":
+        time.sleep(1)
+    print(json.dumps({"cliVersion": cli_version, "appServerVersion": server_version}))
+    raise SystemExit(0)
+if args[:2] == ["app-server", "generate-json-schema"]:
+    output = Path(args[args.index("--out") + 1])
+    output.mkdir(parents=True, exist_ok=True)
+    methods = [] if mode == "schema-missing" else ["thread/start", "thread/read", "thread/list", "turn/start"]
+    variants = [
+        {"type": "object", "properties": {"method": {"type": "string", "enum": [method]}}}
+        for method in methods
+    ]
+    schema = {"title": "ClientRequest", "oneOf": variants}
+    if mode == "schema-malformed":
+        schema = {"title": "not-client-requests", "methods": methods}
+    (output / "ClientRequest.json").write_text(json.dumps(schema))
+    raise SystemExit(0)
+if args[:2] != ["app-server", "proxy"]:
+    raise SystemExit(2)
+
+if pid_path:
+    Path(pid_path).write_text(str(os.getpid()))
+
+def terminate(_signum, _frame):
+    if term_path:
+        Path(term_path).write_text("terminated")
+    if mode == "ignore-term":
+        return
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, terminate)
+
+for raw in sys.stdin:
+    message = json.loads(raw)
+    method = message.get("method")
+    if method:
+        trace(method)
+    elif "error" in message:
+        trace(f"client-error:{message['error'].get('code')}")
+    elif "result" in message:
+        trace("client-result")
+    if method == "initialize":
+        if mode == "handshake-timeout":
+            time.sleep(1)
+            continue
+        if mode == "crash":
+            raise SystemExit(9)
+        if mode == "malformed":
+            sys.stdout.write("{not-json\n")
+            sys.stdout.flush()
+            continue
+        result = {
+            "userAgent": f"codex-cli/{server_version}",
+            "codexHome": "/tmp/fake-codex-home",
+            "platformFamily": "unix",
+            "platformOs": "macos",
+        }
+        if mode == "protocol-mismatch":
+            result["protocolVersion"] = 999
+        send({"method": "server/ready", "params": {"fake": True}})
+        send({"id": message["id"], "result": result})
+        continue
+    if method == "initialized":
+        continue
+    if method in {"thread/start", "thread/read", "thread/list", "turn/start"}:
+        if mode in {"request-timeout", "inactivity-timeout"}:
+            time.sleep(1)
+            continue
+        if mode == "unsupported-method":
+            send({"id": message["id"], "error": {"code": -32601, "message": "unsupported"}})
+            continue
+        if mode == "mismatched-id":
+            send({"id": f"wrong-{message['id']}", "result": {}})
+            continue
+        if mode == "typed-id-mismatch":
+            send({"id": 1 if isinstance(message["id"], str) else "1", "result": {}})
+            continue
+        if mode == "server-request":
+            send({"id": "approval-1", "method": "item/commandExecution/requestApproval", "params": {"command": "fake"}})
+            callback_reply = json.loads(sys.stdin.readline())
+            trace("callback-result" if "result" in callback_reply else "callback-error")
+        if mode == "unsupported-request":
+            send({"id": "mystery-1", "method": "server/mystery", "params": {}})
+            callback_reply = json.loads(sys.stdin.readline())
+            trace(f"client-error:{callback_reply.get('error', {}).get('code')}")
+            time.sleep(1)
+            continue
+        send({"id": message["id"], "result": {"method": method, "ok": True}})
+
+if mode == "ignore-term":
+    while True:
+        time.sleep(1)
+PY
+    chmod +x "$fake"
+
+    : > "$trace"
+    local out rc=0
+    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_PLATFORM_CANDIDATES="$fake" \
+        FAKE_CODEX_TRACE="$trace" FAKE_CODEX_PID="$pid_file" \
+        "$ROOT/cctrl" codex capabilities --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "capability discovery failed: $out"
+    jq -e '
+      .schema_version == 1 and .cli_version == "1.2.3" and .server_version == "1.2.3"
+      and .transport.kind == "desktop-daemon-proxy"
+      and .transport.discovery_source == "platform-installation"
+      and .runtime_facts.userAgent == "codex-cli/1.2.3"
+      and ([.methods[].status] | all(. == "supported"))
+      and (.errors | length) == 0
+    ' <<< "$out" >/dev/null || fail "unexpected capability schema: $out"
+    [[ "$(sort -u "$trace" | tr '\n' ' ')" == "initialize initialized " ]] \
+        || fail "capability discovery invoked a non-read-only RPC: $(cat "$trace")"
+
+    : > "$trace"
+    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" FAKE_CODEX_SERVER_VERSION=9.9.9 \
+        FAKE_CODEX_TRACE="$trace" "$ROOT/cctrl" codex capabilities --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "version mismatch diagnostics should complete"
+    jq -e '[.methods[].status] | all(. == "unknown")' <<< "$out" >/dev/null \
+        || fail "version mismatch must leave method support unknown"
+    jq -e '[.methods[].evidence] | all(. == "version-mismatch")' <<< "$out" >/dev/null \
+        || fail "version mismatch evidence not recorded"
+
+    rc=0
+    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_APP_SERVER_SOCKET=/tmp/fake-codex.sock \
+        FAKE_CODEX_DAEMON_FAIL=1 "$ROOT/cctrl" codex capabilities --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "explicit socket discovery incorrectly required the default daemon: $out"
+    [[ "$(jq -r '.transport.endpoint' <<< "$out")" == "/tmp/fake-codex.sock" ]] \
+        || fail "explicit App Server socket was not reported"
+
+    rc=0
+    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" FAKE_CODEX_MODE=schema-malformed \
+        "$ROOT/cctrl" codex capabilities --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "malformed schema diagnostics should complete"
+    jq -e '[.methods[].status] | all(. == "unknown")' <<< "$out" >/dev/null \
+        || fail "malformed schema must leave method support unknown"
+
+    rc=0
+    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_CONNECT_TIMEOUT=invalid \
+        "$ROOT/cctrl" codex capabilities --json)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "invalid timeout environment should exit 64, got $rc"
+    jq -e '.errors[0].code == 64 and .errors[0].phase == "usage"' <<< "$out" >/dev/null \
+        || fail "invalid timeout environment did not return normalized JSON"
+
+    /usr/bin/python3 - "$ROOT" "$fake" "$trace" "$pid_file" <<'PY'
+import errno
+import importlib.util
+import os
+import sys
+import time
+
+root, fake, trace, pid_file = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("codex_app_server", os.path.join(root, "lib", "codex_app_server.py"))
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+runtime = module.Runtime(fake, "test", "1.2.3")
+
+def set_mode(mode):
+    os.environ["FAKE_CODEX_MODE"] = mode
+    os.environ["FAKE_CODEX_TRACE"] = trace
+    os.environ["FAKE_CODEX_PID"] = pid_file
+    try:
+        os.unlink(pid_file)
+    except FileNotFoundError:
+        pass
+
+def assert_reaped():
+    if not os.path.exists(pid_file):
+        return
+    pid = int(open(pid_file).read())
+    try:
+        os.kill(pid, 0)
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return
+        raise
+    raise AssertionError(f"proxy process {pid} was not reaped")
+
+set_mode("server-request")
+callbacks = []
+with module.AppServerClient(
+    runtime,
+    timeouts=module.Timeouts(connect=.3, handshake=.3, request=.3, inactivity=.3, terminate=.1),
+    server_request_callback=lambda method, params: callbacks.append((method, params)) or {"decision": "accept"},
+) as client:
+    client.initialize()
+    client.thread_start({"ephemeral": True})
+    client.thread_read("fake-thread")
+    client.thread_list({"limit": 1})
+    client.turn_start("fake-thread", [{"type": "text", "text": "fake"}])
+    client.request("thread/list", {}, request_id="string-request-id")
+assert callbacks and callbacks[0][0] == "item/commandExecution/requestApproval"
+assert_reaped()
+
+cases = [
+    ("connect-timeout", module.EXIT_CONNECT, "initialize", .1, .3, .3, .3),
+    ("handshake-timeout", module.EXIT_HANDSHAKE, "initialize", .3, .1, .3, .3),
+    ("request-timeout", module.EXIT_REQUEST_TIMEOUT, "request", .3, .3, .1, .3),
+    ("inactivity-timeout", module.EXIT_INACTIVITY_TIMEOUT, "request", .3, .3, .4, .1),
+    ("crash", module.EXIT_EOF, "initialize", .3, .3, .3, .3),
+    ("malformed", module.EXIT_PROTOCOL, "initialize", .3, .3, .3, .3),
+    ("protocol-mismatch", module.EXIT_PROTOCOL, "initialize", .3, .3, .3, .3),
+    ("mismatched-id", module.EXIT_PROTOCOL, "request", .3, .3, .3, .3),
+    ("unsupported-method", module.EXIT_SERVER_ERROR, "request", .3, .3, .3, .3),
+    ("unsupported-request", module.EXIT_SERVER_REQUEST, "request", .3, .3, .3, .3),
+]
+for mode, expected, operation, connect, handshake, request, inactivity in cases:
+    set_mode(mode)
+    caught = None
+    try:
+        with module.AppServerClient(
+            runtime,
+            timeouts=module.Timeouts(
+                connect=connect,
+                handshake=handshake,
+                request=request,
+                inactivity=inactivity,
+                terminate=.05,
+            ),
+        ) as client:
+            client.initialize()
+            if operation == "request":
+                client.thread_list()
+    except module.AdapterError as exc:
+        caught = exc
+    assert caught is not None, f"{mode} did not fail"
+    assert caught.exit_code == expected, (mode, caught.exit_code, expected, caught.reason)
+    assert_reaped()
+
+assert "client-error:-32601" in open(trace).read()
+
+set_mode("typed-id-mismatch")
+caught = None
+try:
+    with module.AppServerClient(
+        runtime,
+        timeouts=module.Timeouts(connect=.3, handshake=.3, request=.3, inactivity=.3, terminate=.05),
+    ) as client:
+        client.initialize()
+        client.request("thread/list", {}, request_id="1")
+except module.AdapterError as exc:
+    caught = exc
+assert caught is not None and caught.exit_code == module.EXIT_PROTOCOL
+assert_reaped()
+
+term_file = trace + ".term"
+set_mode("ignore-term")
+os.environ["FAKE_CODEX_TERM"] = term_file
+try:
+    os.unlink(term_file)
+except FileNotFoundError:
+    pass
+with module.AppServerClient(
+    runtime,
+    timeouts=module.Timeouts(connect=.3, handshake=.3, request=.3, inactivity=.3, terminate=.05),
+) as client:
+    client.initialize()
+assert os.path.exists(term_file), "SIGTERM escalation was not attempted"
+assert_reaped()
+os.environ.pop("FAKE_CODEX_TERM", None)
+
+set_mode("server-request")
+caught = None
+try:
+    with module.AppServerClient(
+        runtime,
+        timeouts=module.Timeouts(connect=.3, handshake=.3, request=.1, inactivity=.3, terminate=.05),
+        server_request_callback=lambda _method, _params: time.sleep(1),
+    ) as client:
+        client.initialize()
+        client.thread_list()
+except module.AdapterError as exc:
+    caught = exc
+assert caught is not None and caught.exit_code == module.EXIT_REQUEST_TIMEOUT
+assert_reaped()
+PY
+
+    out="$(PATH=/usr/bin:/bin "$ROOT/cctrl" codex capabilities --help)" \
+        || fail "Codex capabilities help command failed"
+    assert_contains "$out" "capabilities"
+    echo "ok: Codex App Server adapter handles discovery, framing, failures, and cleanup"
+}
+
 test_health_check_patterns_syntax
 test_health_check_pattern_matching
 test_health_check_transition_guard
@@ -8082,5 +8402,6 @@ test_health_check_timeout_path
 test_health_check_bypass_flag
 test_session_pane_has_dialog_refactored
 test_codex_lifecycle_fixture_contract
+test_codex_app_server_adapter
 
 echo "ok"
