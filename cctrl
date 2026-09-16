@@ -11770,7 +11770,7 @@ cmd_hooks() {
         -h|--help|help)
             echo "Usage: cctrl hooks <run|install|doctor>"
             echo ""
-            echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify)"
+            echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify, codex-observe)"
             echo "  install       Write portable hook configs for Claude Code and Codex"
             echo "  doctor        Validate hook configs point to working commands"
             return 0
@@ -11791,6 +11791,7 @@ _hooks_run() {
         echo "  pre-tool-use   Block disallowed tool calls (stdin passthrough)"
         echo "  stop           Post-turn logging and notifications"
         echo "  notify         Push notification on agent events"
+        echo "  codex-observe  Validate bounded Codex lifecycle payloads (no state writes)"
         return 0
     fi
 
@@ -11805,9 +11806,12 @@ _hooks_run() {
         notify)
             exec "$SCRIPT_DIR/hooks/notify.sh" notification
             ;;
+        codex-observe)
+            exec python3 "$SCRIPT_DIR/hooks/codex-session-observer.py"
+            ;;
         *)
             echo -e "${RED}Unknown hook: $name${RESET}" >&2
-            echo -e "${DIM}Available: pre-tool-use, stop, notify${RESET}" >&2
+            echo -e "${DIM}Available: pre-tool-use, stop, notify, codex-observe${RESET}" >&2
             return 1
             ;;
     esac
@@ -11835,9 +11839,10 @@ _hooks_install() {
     local errors=0
 
     # --- Claude Code ---
-    local claude_settings="$HOME/.claude/settings.json"
-    if [[ -d "$HOME/.claude" ]]; then
-        python3 -c "
+    local claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    local claude_settings="$claude_dir/settings.json"
+    if [[ -d "$claude_dir" ]]; then
+        if python3 -c "
 import json, sys, os
 
 path = os.path.expanduser('$claude_settings')
@@ -11890,8 +11895,7 @@ hooks['Notification'] = new_notif
 with open(path, 'w') as f:
     json.dump(cfg, f, indent=2)
     f.write('\n')
-" 2>&1
-        if [[ $? -eq 0 ]]; then
+" 2>&1; then
             echo -e "${GREEN}✓${RESET} Claude Code hooks installed → $claude_settings"
         else
             echo -e "${RED}✗${RESET} Failed to update Claude Code hooks" >&2
@@ -11902,33 +11906,20 @@ with open(path, 'w') as f:
     fi
 
     # --- Codex ---
-    local codex_hooks="$HOME/.codex/hooks.json"
-    if [[ -d "$HOME/.codex" ]]; then
-        python3 -c "
-import json, os
-
-path = os.path.expanduser('$codex_hooks')
-
-cfg = {
-    'hooks': {
-        'PreToolUse': [{
-            'hooks': [{'type': 'command', 'command': 'cctrl hooks run pre-tool-use'}],
-            'matcher': 'Bash'
-        }],
-        'Stop': [{
-            'hooks': [{'type': 'command', 'command': 'cctrl hooks run stop'}]
-        }]
-    }
-}
-
-with open(path, 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-" 2>&1
-        if [[ $? -eq 0 ]]; then
+    local codex_dir="${CODEX_HOME:-$HOME/.codex}"
+    local codex_hooks="$codex_dir/hooks.json"
+    if [[ -d "$codex_dir" ]]; then
+        local codex_result codex_backup
+        if codex_result="$(python3 "$SCRIPT_DIR/hooks/codex-hook-config.py" "$codex_hooks" 2>&1)"; then
             echo -e "${GREEN}✓${RESET} Codex hooks installed → $codex_hooks"
+            codex_backup="${codex_result#*$'\t'}"
+            if [[ "$codex_result" == changed$'\t'* && "$codex_backup" != "-" ]]; then
+                echo -e "${DIM}  Exact pre-replace backup: $codex_backup${RESET}"
+            fi
         else
             echo -e "${RED}✗${RESET} Failed to update Codex hooks" >&2
+            echo -e "${DIM}$codex_result${RESET}" >&2
+            echo -e "${DIM}Repair the reported file or restore its same-directory cctrl backup, then retry.${RESET}" >&2
             errors=1
         fi
     else
@@ -11940,6 +11931,69 @@ with open(path, 'w') as f:
         echo -e "${GREEN}Done.${RESET} Verify with: ${DIM}cctrl hooks doctor${RESET}"
     fi
     return $errors
+}
+
+_codex_hooks_trust_report() {
+    local hooks_path="$1"
+    python3 - "$SCRIPT_DIR/lib/codex_app_server.py" "$hooks_path" "${CCTRL_CODEX_HOOKS_LIST_JSON:-}" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+
+adapter_path, hooks_path, fixture_path = sys.argv[1:4]
+commands = [
+    "cctrl hooks run pre-tool-use",
+    "cctrl hooks run stop",
+    "cctrl hooks run notify",
+    "cctrl hooks run codex-observe",
+]
+
+try:
+    if fixture_path:
+        with open(fixture_path, encoding="utf-8") as stream:
+            response = json.load(stream)
+    else:
+        spec = importlib.util.spec_from_file_location("cctrl_codex_app_server", adapter_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        timeouts = module.Timeouts(connect=2.0, handshake=2.0, request=2.0, inactivity=2.0, terminate=0.25)
+        runtime = module.discover_runtime(os.environ.get("CCTRL_CODEX_BIN"), validation_timeout=2.0)
+        with module.AppServerClient(
+            runtime,
+            socket_path=os.environ.get("CCTRL_CODEX_APP_SERVER_SOCKET") or None,
+            timeouts=timeouts,
+        ) as client:
+            client.initialize()
+            response = client.request("hooks/list", {"cwds": [os.getcwd()]})
+except Exception:
+    response = {}
+
+statuses = {command: [] for command in commands}
+expected_path = os.path.realpath(hooks_path)
+for entry in response.get("data", []) if isinstance(response, dict) else []:
+    for hook in entry.get("hooks", []) if isinstance(entry, dict) else []:
+        if not isinstance(hook, dict):
+            continue
+        command = hook.get("command")
+        source_path = hook.get("sourcePath")
+        if command not in statuses or not isinstance(source_path, str):
+            continue
+        if os.path.realpath(source_path) != expected_path:
+            continue
+        statuses[command].append(hook.get("trustStatus"))
+
+for command in commands:
+    values = statuses[command]
+    if values and all(value in ("trusted", "managed") for value in values):
+        state = "trusted"
+    elif any(value in ("untrusted", "modified") for value in values):
+        state = "untrusted"
+    else:
+        state = "unknown"
+    print(f"{command}\t{state}")
+PY
 }
 
 _hooks_doctor() {
@@ -11957,16 +12011,20 @@ _hooks_doctor() {
     echo "═══════════"
     echo ""
 
-    # Check cctrl is on PATH
-    if command -v cctrl &>/dev/null; then
-        echo -e "${GREEN}✓${RESET} cctrl on \$PATH: $(command -v cctrl)"
+    # GUI-launched Codex commonly has a much smaller PATH than a login shell.
+    local gui_path="${CCTRL_HOOK_GUI_PATH:-/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin}"
+    local gui_cctrl
+    gui_cctrl="$(PATH="$gui_path" command -v cctrl 2>/dev/null || true)"
+    if [[ -n "$gui_cctrl" ]]; then
+        echo -e "${GREEN}✓${RESET} cctrl resolves under minimal GUI PATH: $gui_cctrl"
     else
-        echo -e "${RED}✗${RESET} cctrl not on \$PATH — portable hooks won't resolve"
+        echo -e "${RED}✗${RESET} cctrl does not resolve under minimal GUI PATH"
+        echo -e "${DIM}  PATH=$gui_path${RESET}"
         issues=1
     fi
 
     # Check hook scripts exist
-    for script in block-git-commit.py notify.sh session-log.py; do
+    for script in block-git-commit.py notify.sh session-log.py codex-session-observer.py codex-hook-config.py; do
         if [[ -f "$SCRIPT_DIR/hooks/$script" ]]; then
             echo -e "${GREEN}✓${RESET} $script exists"
         else
@@ -11978,7 +12036,7 @@ _hooks_doctor() {
     echo ""
 
     # --- Claude Code ---
-    local claude_settings="$HOME/.claude/settings.json"
+    local claude_settings="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
     echo "Claude Code ($claude_settings):"
     if [[ -f "$claude_settings" ]]; then
         local stale
@@ -12038,59 +12096,105 @@ for name in ['pre-tool-use', 'stop', 'notify']:
     echo ""
 
     # --- Codex ---
-    local codex_hooks="$HOME/.codex/hooks.json"
+    local codex_hooks="${CODEX_HOME:-$HOME/.codex}/hooks.json"
     echo "Codex ($codex_hooks):"
     if [[ -f "$codex_hooks" ]]; then
-        local stale_codex
-        stale_codex="$(python3 -c "
+        local codex_analysis
+        if codex_analysis="$(python3 - "$codex_hooks" <<'PY'
 import json
-with open('$codex_hooks') as f:
-    cfg = json.load(f)
-hooks = cfg.get('hooks', {})
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    cfg = json.load(stream)
+if not isinstance(cfg, dict) or not isinstance(cfg.get("hooks", {}), dict):
+    raise ValueError("top level and hooks must be objects")
+
+specs = [
+    ("PreToolUse", "cctrl hooks run pre-tool-use", {"matcher": "Bash"}, "pre-tool-use"),
+    ("Stop", "cctrl hooks run stop", {}, "stop"),
+    ("PermissionRequest", "cctrl hooks run notify", {}, "notify"),
+    ("SessionStart", "cctrl hooks run codex-observe", {}, "codex-observe SessionStart"),
+    ("SessionEnd", "cctrl hooks run codex-observe", {}, "codex-observe SessionEnd"),
+    ("PreCompact", "cctrl hooks run codex-observe", {}, "codex-observe PreCompact"),
+    ("PostCompact", "cctrl hooks run codex-observe", {}, "codex-observe PostCompact"),
+]
+expected = {(event, command) for event, command, _metadata, _label in specs}
+unrelated = 0
 stale = []
-for event_name, entries in hooks.items():
-    for entry in entries:
-        for h in entry.get('hooks', []):
-            cmd = h.get('command', '')
-            if '/cctrl/hooks/' in cmd or '/_projects/' in cmd:
-                stale.append(f'  {event_name}: {cmd}')
-if stale:
-    print('\n'.join(stale))
-" 2>/dev/null)"
-        if [[ -n "$stale_codex" ]]; then
-            echo -e "${YELLOW}⚠${RESET}  Stale absolute paths found:"
-            echo "$stale_codex"
-            echo -e "${DIM}  Fix with: cctrl hooks install${RESET}"
+hooks = cfg.get("hooks", {})
+
+for event, command, metadata, label in specs:
+    found = False
+    entries = hooks.get(event, [])
+    if not isinstance(entries, list):
+        raise ValueError(f"hooks.{event} must be an array")
+    for wrapper in entries:
+        if not isinstance(wrapper, dict) or not isinstance(wrapper.get("hooks", []), list):
+            raise ValueError(f"hooks.{event} entries must contain a hooks array")
+        wrapper_metadata = {key: value for key, value in wrapper.items() if key != "hooks"}
+        if wrapper_metadata == metadata and {"type": "command", "command": command} in wrapper["hooks"]:
+            found = True
+    print(("OK" if found else "MISSING") + "\t" + label)
+
+for event, entries in hooks.items():
+    if not isinstance(entries, list):
+        raise ValueError(f"hooks.{event} must be an array")
+    for wrapper in entries:
+        if not isinstance(wrapper, dict) or not isinstance(wrapper.get("hooks", []), list):
+            raise ValueError(f"hooks.{event} entries must contain a hooks array")
+        for leaf in wrapper["hooks"]:
+            command = leaf.get("command") if isinstance(leaf, dict) else None
+            if isinstance(command, str) and ("/cctrl/hooks/" in command or "/_projects/" in command):
+                stale.append((event, command))
+            if not isinstance(leaf, dict) or (event, command) not in expected or leaf != {"type": "command", "command": command}:
+                unrelated += 1
+
+for event, command in stale:
+    print(f"STALE\t{event}: {command}")
+print(f"UNRELATED\t{unrelated}")
+PY
+)"; then
+            while IFS=$'\t' read -r status detail; do
+                case "$status" in
+                    OK) echo -e "  ${GREEN}✓${RESET} $detail" ;;
+                    MISSING)
+                        echo -e "  ${RED}✗${RESET} $detail — not installed"
+                        issues=1
+                        ;;
+                    STALE)
+                        echo -e "  ${YELLOW}⚠${RESET} unrelated stale absolute path preserved: $detail"
+                        ;;
+                    UNRELATED)
+                        echo -e "  ${DIM}$detail unrelated hook leaf/leaves preserved${RESET}"
+                        ;;
+                esac
+            done <<< "$codex_analysis"
+        else
+            echo -e "  ${RED}✗${RESET} invalid or unreadable Codex hook configuration"
             issues=1
         fi
 
-        local portable_codex
-        portable_codex="$(python3 -c "
-import json
-with open('$codex_hooks') as f:
-    cfg = json.load(f)
-hooks = cfg.get('hooks', {})
-found = set()
-for event_name, entries in hooks.items():
-    for entry in entries:
-        for h in entry.get('hooks', []):
-            cmd = h.get('command', '')
-            if 'cctrl hooks run' in cmd:
-                found.add(cmd.split('cctrl hooks run ')[-1])
-for name in ['pre-tool-use', 'stop']:
-    if name in found:
-        print(f'OK {name}')
-    else:
-        print(f'MISSING {name}')
-" 2>/dev/null)"
-        while IFS= read -r line; do
-            if [[ "$line" == OK* ]]; then
-                echo -e "  ${GREEN}✓${RESET} ${line#OK }"
-            else
-                echo -e "  ${RED}✗${RESET} ${line#MISSING } — not installed"
-                issues=1
-            fi
-        done <<< "$portable_codex"
+        local trust_report
+        if trust_report="$(_codex_hooks_trust_report "$codex_hooks" 2>/dev/null)"; then
+            while IFS=$'\t' read -r command trust_state; do
+                [[ -n "$command" ]] || continue
+                case "$trust_state" in
+                    trusted)
+                        echo -e "  ${GREEN}✓${RESET} trust/hash: trusted — $command"
+                        ;;
+                    untrusted)
+                        echo -e "  ${RED}✗${RESET} trust/hash: untrusted — $command"
+                        issues=1
+                        ;;
+                    *)
+                        echo -e "  ${YELLOW}⚠${RESET} trust/hash: unknown — $command"
+                        ;;
+                esac
+            done <<< "$trust_report"
+        else
+            echo -e "  ${YELLOW}⚠${RESET} trust/hash: unknown — Codex hook inventory unavailable"
+        fi
     else
         echo -e "  ${DIM}Not found${RESET}"
     fi

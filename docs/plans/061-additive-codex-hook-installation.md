@@ -1,7 +1,7 @@
 ---
 id: 061
 title: Make Codex hook installation additive and observable
-status: in-progress
+status: done
 blocked-by: [057]
 priority: 61
 goal: codex-task-ownership-surfaces
@@ -9,8 +9,12 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-16
+reviewed: false
+qa: automated
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-16 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -95,3 +99,18 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented additive, race-aware Codex hook installation with exact owned-leaf matching, cooperative locking, content-change retries, recoverable backups, validated mode-0600 atomic replacement, symlink refusal, and preservation of unrelated configuration. Added a validation-only bounded observer, expanded doctor reporting for lifecycle coverage, minimal-PATH resolution and trust state, isolated regression coverage, and documentation. A dedicated `hooks/codex-hook-config.py` helper was added beyond the expected file list to keep atomic merge logic testable. Health scored 10.0, all four verification checks passed, and the complete repository suite ended in `ok`; real hook/trust configuration and task records were not mutated.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `docs/plans/061-additive-codex-hook-installation.md` (modified)
+- `hooks/codex-hook-config.py` (created)
+- `hooks/codex-session-observer.py` (created)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `892116b` — `feat(hooks): install Codex observers additively`

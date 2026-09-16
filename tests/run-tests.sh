@@ -8394,6 +8394,270 @@ PY
     echo "ok: Codex App Server adapter handles discovery, framing, failures, and cleanup"
 }
 
+test_codex_hook_installation_is_additive_and_observer_is_bounded() {
+    local codex_root="$TMPDIR/hooks-061/codex"
+    local claude_root="$TMPDIR/hooks-061/claude" config="$TMPDIR/hooks-061/codex/hooks.json"
+    local original="$TMPDIR/hooks-061/original-hooks.json" out rc digest_once digest_twice
+    local real_hooks_before real_hooks_after real_trust_before real_trust_after live_before live_after
+    mkdir -p "$codex_root" "$claude_root"
+
+    file_digest() {
+        if [[ -f "$1" ]]; then shasum -a 256 "$1" | awk '{print $1}'; else printf 'absent'; fi
+    }
+    tree_digest() {
+        python3 - "$1" <<'PY'
+import hashlib
+import os
+import sys
+
+root = sys.argv[1]
+digest = hashlib.sha256()
+if os.path.isdir(root):
+    for base, dirs, files in os.walk(root):
+        dirs.sort()
+        for name in sorted(files):
+            path = os.path.join(base, name)
+            rel = os.path.relpath(path, root).encode()
+            digest.update(len(rel).to_bytes(8, "big"))
+            digest.update(rel)
+            if os.path.islink(path):
+                digest.update(b"L" + os.readlink(path).encode())
+            else:
+                with open(path, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+print(digest.hexdigest())
+PY
+    }
+
+    real_hooks_before="$(file_digest "$HOME/.codex/hooks.json")"
+    real_trust_before="$(file_digest "$HOME/.codex/config.toml")"
+
+    cat > "$config" <<'JSON'
+{
+  "theme": {"name": "user", "values": [1, {"two": true}]},
+  "hooks": {
+    "PreToolUse": [
+      {"hooks": [{"type": "command", "command": "cctrl hooks run pre-tool-use"}], "matcher": "Bash"},
+      {"hooks": [{"type": "command", "command": "cctrl hooks run pre-tool-use"}, {"type": "command", "command": "other pre"}], "matcher": "Bash", "timeout": 9},
+      {"hooks": [{"type": "command", "command": "cctrl hooks run pre-tool-use"}], "matcher": "Read"},
+      {"hooks": [{"type": "command", "command": "echo cctrl hooks run pre-tool-use"}], "matcher": "Bash"}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "cctrl hooks run stop"}]},
+      {"hooks": [{"type": "command", "command": "cctrl hooks run stop"}, {"type": "command", "command": "other stop"}], "async": true},
+      {"hooks": [{"type": "command", "command": "/old/cctrl/hooks/notify.sh stop"}]}
+    ],
+    "PermissionRequest": [{"hooks": [{"type": "command", "command": "third-party permission"}], "matcher": "Shell"}],
+    "SessionStart": [{"hooks": [{"type": "command", "command": "cctrl hooks run codex-observe"}], "custom": "keep"}],
+    "OtherEvent": [{"hooks": [{"type": "command", "command": "cctrl hooks run stop"}]}]
+  },
+  "thirdParty": {"enabled": true}
+}
+JSON
+    cp "$config" "$original"
+    cat > "$claude_root/settings.json" <<'JSON'
+{"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"other claude pre"}]}],"Stop":[{"_gstack_source":true,"hooks":[{"type":"command","command":"other claude stop"}]}]}}
+JSON
+
+    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install)"
+    assert_contains "$out" "Exact pre-replace backup:"
+    python3 - "$config" <<'PY'
+import json
+import sys
+
+cfg = json.load(open(sys.argv[1]))
+hooks = cfg["hooks"]
+assert cfg["theme"] == {"name": "user", "values": [1, {"two": True}]}
+assert cfg["thirdParty"] == {"enabled": True}
+
+def leaves(event):
+    return [leaf for wrapper in hooks[event] for leaf in wrapper.get("hooks", [])]
+
+def count(event, command):
+    return sum(leaf == {"type": "command", "command": command} for leaf in leaves(event))
+
+assert count("PreToolUse", "cctrl hooks run pre-tool-use") == 1
+assert count("Stop", "cctrl hooks run stop") == 1
+assert count("PermissionRequest", "cctrl hooks run notify") == 1
+for event in ("SessionStart", "SessionEnd", "PreCompact", "PostCompact"):
+    assert count(event, "cctrl hooks run codex-observe") == 1
+assert any(w.get("timeout") == 9 and w["hooks"] == [{"type":"command", "command":"other pre"}] for w in hooks["PreToolUse"])
+assert any(w.get("matcher") == "Read" and w["hooks"] == [] for w in hooks["PreToolUse"])
+assert {"type":"command", "command":"echo cctrl hooks run pre-tool-use"} in leaves("PreToolUse")
+assert any(w.get("async") is True and w["hooks"] == [{"type":"command", "command":"other stop"}] for w in hooks["Stop"])
+assert {"type":"command", "command":"/old/cctrl/hooks/notify.sh stop"} in leaves("Stop")
+assert hooks["OtherEvent"] == [{"hooks": [{"type":"command", "command":"cctrl hooks run stop"}]}]
+assert any(w.get("custom") == "keep" and w["hooks"] == [] for w in hooks["SessionStart"])
+PY
+    python3 - "$claude_root/settings.json" <<'PY'
+import json, sys
+d=json.load(open(sys.argv[1]))["hooks"]
+assert any(h.get("command") == "other claude pre" for w in d["PreToolUse"] for h in w["hooks"])
+assert any(w.get("_gstack_source") for w in d["Stop"])
+PY
+    [[ "$(stat -f '%Lp' "$config")" == "600" ]] || fail "Codex hooks config mode is not 0600"
+    local backup
+    backup="$(find "$codex_root" -maxdepth 1 -type f -name 'hooks.json.cctrl-backup-*' -print -quit)"
+    [[ -n "$backup" ]] || fail "Codex hook backup was not created"
+    cmp -s "$backup" "$original" || fail "Codex hook backup did not preserve exact source bytes"
+    [[ "$(stat -f '%Lp' "$backup")" == "600" ]] || fail "Codex hook backup mode is not 0600"
+
+    digest_once="$(file_digest "$config")"
+    CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install >/dev/null
+    digest_twice="$(file_digest "$config")"
+    [[ "$digest_once" == "$digest_twice" ]] || fail "Codex hook installation is not idempotent"
+    [[ "$(find "$codex_root" -maxdepth 1 -type f -name 'hooks.json.cctrl-backup-*' | wc -l | tr -d ' ')" == "1" ]] \
+        || fail "idempotent installation created another backup"
+
+    printf '{invalid' > "$config"
+    digest_once="$(file_digest "$config")"
+    rc=0
+    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "invalid Codex JSON did not fail closed"
+    assert_contains "$out" "left it untouched"
+    [[ "$digest_once" == "$(file_digest "$config")" ]] || fail "invalid Codex JSON was modified"
+
+    local symlink_root="$TMPDIR/hooks-061-symlink" symlink_target="$TMPDIR/hooks-061-symlink-target.json"
+    mkdir -p "$symlink_root"
+    printf '{"target":true}\n' > "$symlink_target"
+    ln -s "$symlink_target" "$symlink_root/hooks.json"
+    digest_once="$(file_digest "$symlink_target")"
+    rc=0
+    out="$(CODEX_HOME="$symlink_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "symlinked Codex destination was accepted"
+    assert_contains "$out" "refusing to read"
+    [[ "$digest_once" == "$(file_digest "$symlink_target")" ]] || fail "symlink target was modified"
+
+    python3 - "$ROOT/hooks/codex-hook-config.py" "$TMPDIR/hooks-061-races" <<'PY'
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+
+module_path, root = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("codex_hook_config", module_path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+root = Path(root)
+root.mkdir()
+
+changed_path = root / "changed.json"
+changed_path.write_bytes(b'{"before":1}\n')
+external_bytes = b'{"external":{"preserved":true}}\n'
+def change_once(attempt, path):
+    if attempt == 1:
+        path.write_bytes(external_bytes)
+changed, backup = module.install(changed_path, before_compare=change_once)
+assert changed and backup is not None and backup.read_bytes() == external_bytes
+assert json.loads(changed_path.read_text())["external"] == {"preserved": True}
+
+absent_path = root / "absent.json"
+def create_once(attempt, path):
+    if attempt == 1:
+        path.write_text('{"arrived":"during-install"}\n')
+changed, backup = module.install(absent_path, before_compare=create_once)
+assert changed and backup is not None
+assert json.loads(absent_path.read_text())["arrived"] == "during-install"
+assert not list(root.glob(".*.tmp"))
+PY
+
+    # Cooperative lock: two installers converge without duplicate leaves.
+    local concurrent_root="$TMPDIR/hooks-061-concurrent" p1 p2
+    mkdir -p "$concurrent_root"
+    CODEX_HOME="$concurrent_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install >"$TMPDIR/hooks-061-p1.log" 2>&1 & p1=$!
+    CODEX_HOME="$concurrent_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install >"$TMPDIR/hooks-061-p2.log" 2>&1 & p2=$!
+    wait "$p1" || fail "first concurrent Codex hook install failed"
+    wait "$p2" || fail "second concurrent Codex hook install failed"
+    python3 - "$concurrent_root/hooks.json" <<'PY'
+import json, sys
+d=json.load(open(sys.argv[1]))["hooks"]
+owned=[("PreToolUse","cctrl hooks run pre-tool-use"),("Stop","cctrl hooks run stop"),("PermissionRequest","cctrl hooks run notify")]
+owned += [(e,"cctrl hooks run codex-observe") for e in ("SessionStart","SessionEnd","PreCompact","PostCompact")]
+for event, command in owned:
+    assert sum(h == {"type":"command","command":command} for w in d[event] for h in w["hooks"]) == 1
+PY
+    [[ -z "$(find "$concurrent_root" -maxdepth 1 -type f -name '.*.tmp' -print -quit)" ]] \
+        || fail "Codex hook installer left temporary files behind"
+
+    # Restore a valid isolated config for doctor checks.
+    rm -f "$config"
+    CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install >/dev/null
+    local doctor_bin="$TMPDIR/hooks-061-bin" trust_fixture="$TMPDIR/hooks-061-trust.json"
+    mkdir -p "$doctor_bin"
+    ln -s "$ROOT/cctrl" "$doctor_bin/cctrl"
+    python3 - "$config" <<'PY'
+import json, sys
+p=sys.argv[1]; d=json.load(open(p))
+d["hooks"]["OtherEvent"]=[{"hooks":[{"type":"command","command":"/third-party/cctrl/hooks/custom.sh"}]}]
+json.dump(d,open(p,"w"),indent=2); open(p,"a").write("\n")
+PY
+    python3 - "$config" "$trust_fixture" <<'PY'
+import json, sys
+path, out = sys.argv[1:]
+cfg=json.load(open(path))
+hooks=[]
+for event, wrappers in cfg["hooks"].items():
+    for wrapper in wrappers:
+        for leaf in wrapper.get("hooks", []):
+            command=leaf.get("command") if isinstance(leaf,dict) else None
+            if command and command.startswith("cctrl hooks run "):
+                hooks.append({"command":command,"sourcePath":path,"trustStatus":"trusted"})
+json.dump({"data":[{"cwd":"/tmp","errors":[],"warnings":[],"hooks":hooks}]},open(out,"w"))
+PY
+    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" \
+        CCTRL_HOOK_GUI_PATH="$doctor_bin:/usr/bin:/bin" CCTRL_CODEX_HOOKS_LIST_JSON="$trust_fixture" \
+        "$ROOT/cctrl" hooks doctor)"
+    assert_contains "$out" "cctrl resolves under minimal GUI PATH"
+    assert_contains "$out" "trust/hash: trusted"
+    assert_contains "$out" "unrelated hook leaf/leaves preserved"
+    assert_contains "$out" "unrelated stale absolute path preserved"
+
+    python3 - "$trust_fixture" <<'PY'
+import json,sys
+p=sys.argv[1]; d=json.load(open(p));
+d["data"][0]["hooks"][0]["trustStatus"]="modified"
+d["data"][0]["hooks"]=[h for h in d["data"][0]["hooks"] if h["command"] != "cctrl hooks run notify"]
+json.dump(d,open(p,"w"))
+PY
+    rc=0
+    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" \
+        CCTRL_HOOK_GUI_PATH="$doctor_bin:/usr/bin:/bin" CCTRL_CODEX_HOOKS_LIST_JSON="$trust_fixture" \
+        "$ROOT/cctrl" hooks doctor 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "doctor did not fail an untrusted Codex hook"
+    assert_contains "$out" "trust/hash: untrusted"
+    assert_contains "$out" "trust/hash: unknown — cctrl hooks run notify"
+
+    live_before="$(tree_digest "$ROOT/data")"
+    local observer="$ROOT/hooks/codex-session-observer.py" payload="$TMPDIR/hooks-061-oversized"
+    for body in '' 'null' '[]' '{bad' '{"hook_event_name":"Unknown","session_id":"id"}' \
+        '{"hook_event_name":"SessionStart"}' '{"hook_event_name":"SessionStart","session_id":"fixture-id"}'; do
+        printf '%s' "$body" | python3 "$observer" || fail "observer rejected fail-open payload: $body"
+    done
+    python3 - "$payload" <<'PY'
+import sys
+open(sys.argv[1],"wb").write(b"x" * 1_048_577)
+PY
+    python3 "$observer" < "$payload" || fail "observer rejected oversized payload"
+    python3 - "$observer" <<'PY'
+import subprocess,sys,time
+p=subprocess.Popen([sys.executable,sys.argv[1]],stdin=subprocess.PIPE)
+started=time.monotonic()
+rc=p.wait(timeout=4)
+assert rc == 0
+assert time.monotonic()-started < 3.5
+PY
+    live_after="$(tree_digest "$ROOT/data")"
+    [[ "$live_before" == "$live_after" ]] || fail "validation-only observer changed the real cctrl live store"
+
+    real_hooks_after="$(file_digest "$HOME/.codex/hooks.json")"
+    real_trust_after="$(file_digest "$HOME/.codex/config.toml")"
+    [[ "$real_hooks_before" == "$real_hooks_after" ]] || fail "tests changed real Codex hooks.json"
+    [[ "$real_trust_before" == "$real_trust_after" ]] || fail "tests changed real Codex trust configuration"
+    echo "ok: Codex hooks install additively and observer remains bounded and validation-only"
+}
+
 test_health_check_patterns_syntax
 test_health_check_pattern_matching
 test_health_check_transition_guard
@@ -8403,5 +8667,6 @@ test_health_check_bypass_flag
 test_session_pane_has_dialog_refactored
 test_codex_lifecycle_fixture_contract
 test_codex_app_server_adapter
+test_codex_hook_installation_is_additive_and_observer_is_bounded
 
 echo "ok"

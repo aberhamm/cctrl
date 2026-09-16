@@ -1149,11 +1149,39 @@ and is surfaced through `cctrl usage`.
 | Rate-limit reporting | statusline/history files | session JSONL `token_count` events |
 | Status line | external script | built-in TUI footer |
 | Phone bridge | yes | no |
-| Hooks in this repo | Claude hook protocol | not installed by CCTRL |
+| Hooks in this repo | Claude hook protocol | additive user-level hooks with explicit trust |
 
 ## Hooks
 
-Included hooks for Claude Code's hook system. Configure them in your `settings.json` or in a cctrl profile.
+`cctrl hooks install` configures both Claude Code and Codex with portable
+`cctrl hooks run ...` commands. For Codex, installation is additive: cctrl
+removes only its exact owned command leaves and preserves unrelated top-level
+keys, event wrappers, wrapper attributes, and hook leaves. It installs the
+existing `PreToolUse`, `Stop`, and permission-notification commands plus a
+validation-only observer for `SessionStart`, `SessionEnd`, `PreCompact`, and
+`PostCompact`. The observer does not update task records; lifecycle
+interpretation is intentionally handled by later task-registry work.
+
+Codex updates take a cooperative same-directory lock, recheck a SHA-256 source
+version immediately before replacement, and retry when another writer changed
+the source. A successful change uses a validated `0600` temporary file, fsync,
+and atomic replacement. When a source file existed, cctrl first writes a
+timestamped same-directory backup containing its exact bytes and prints that
+recovery path. Invalid JSON and symlinked destinations fail closed without
+changing the original.
+
+The guarantee is semantic preservation of the source version cctrl read when
+no non-cooperating writer races the final replacement. A process that ignores
+the cooperative lock can still write after cctrl's last checksum comparison;
+the printed backup is the recovery point for that residual race. Run
+`cctrl hooks doctor` afterward: it checks every owned lifecycle entry, reports
+whether `cctrl` resolves under a minimal GUI `PATH`, and shows Codex hook
+trust/hash state as `trusted`, `untrusted`, or `unknown`. Doctor never changes
+trust. Review and approve new or changed hooks in Codex itself; do not bypass
+the trust prompt.
+
+The remaining hook scripts can also be configured manually in `settings.json`
+or in a cctrl profile.
 
 ### notify.sh — smart sound notifications
 
