@@ -81,9 +81,9 @@ produced:
 - kind: schema; name: codex_reconcile_result_v1; shape: "pass_id,observed_at,expected_record_digest,sources,outcome,reason,errors"; file: cctrl
 - kind: symbol; name: _session_reconcile_codex; file: cctrl
 assumed:
-- from: 059; kind: symbol; name: _task_registry_apply_event; shape: "record_key,event_file"; file: cctrl
+- from: 059; kind: symbol; name: _task_registry_apply_event; file: cctrl
 - from: 060; kind: symbol; name: AppServerClient; file: lib/codex_app_server.py
-- from: 062; kind: schema; name: codex_lifecycle_observation; shape: "provider,provider_task_id,origin,source,confidence,forked_from_id,parent_thread_id,derived_root_id,derived_root_basis,lifecycle_state"; file: hooks/codex-session-observer.py
+- from: 062; kind: schema; name: codex_lifecycle_observation; file: hooks/codex-session-observer.py
 -->
 
 
