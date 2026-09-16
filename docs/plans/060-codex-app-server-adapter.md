@@ -1,7 +1,7 @@
 ---
 id: 060
 title: Encapsulate the Codex App Server transport
-status: pending
+status: in-progress
 blocked-by: [057]
 priority: 60
 goal: codex-task-ownership-surfaces
