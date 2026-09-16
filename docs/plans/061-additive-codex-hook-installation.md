@@ -1,7 +1,7 @@
 ---
 id: 061
 title: Make Codex hook installation additive and observable
-status: pending
+status: in-progress
 blocked-by: [057]
 priority: 61
 goal: codex-task-ownership-surfaces
