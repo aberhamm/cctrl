@@ -83,7 +83,7 @@ produced:
 - kind: symbol; name: _task_registry_reduce; shape: "record_json,event_json"; file: cctrl
 assumed:
 - from: 057; kind: file; name: docs/findings/codex-task-lifecycle-contract.md; file: docs/findings/codex-task-lifecycle-contract.md
-- from: 058; kind: schema; name: task_record_v2; shape: "schema_version,provider,provider_task_id,origin,host_id,registered_by_cctrl,launched_by_cctrl,execution_runtime,control_owner,lifecycle_state,restore_strategy,last_observed_at,tmux_session,lineage,ownership_evidence"; file: cctrl
+- from: 058; kind: symbol; name: _task_record_normalize_json; file: cctrl
 -->
 
 
