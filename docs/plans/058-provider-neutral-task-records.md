@@ -1,7 +1,7 @@
 ---
 id: 058
 title: Add provider-neutral task records and legacy compatibility
-status: pending
+status: in-progress
 blocked-by: [057]
 priority: 58
 goal: codex-task-ownership-surfaces
