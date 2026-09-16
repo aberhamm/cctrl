@@ -1,0 +1,15 @@
+{
+  "events": {
+    "startup": {"hook_event_name":"SessionStart","source":"startup","session_id":"<THREAD_ID>","observed_at":"2026-09-16T10:00:00Z","source_sequence":1},
+    "resume": {"hook_event_name":"SessionStart","source":"resume","session_id":"<THREAD_ID>","observed_at":"2026-09-16T10:30:00Z","source_sequence":2},
+    "clear": {"hook_event_name":"SessionStart","source":"clear","session_id":"<THREAD_ID>","observed_at":"2026-09-16T10:40:00Z","source_sequence":3},
+    "pre_compact": {"hook_event_name":"PreCompact","source":"compact","session_id":"<THREAD_ID>","observed_at":"2026-09-16T10:50:00Z","source_sequence":4},
+    "post_compact": {"hook_event_name":"PostCompact","source":"compact","session_id":"<THREAD_ID>","observed_at":"2026-09-16T10:51:00Z","source_sequence":5},
+    "end": {"hook_event_name":"SessionEnd","source":"unknown","session_id":"<THREAD_ID>","observed_at":"2026-09-16T11:00:00Z","source_sequence":6},
+    "fork": {"hook_event_name":"SessionStart","source":"fork","session_id":"<FORK_THREAD_ID>","forkedFromId":"<THREAD_ID>","observed_at":"2026-09-16T11:10:00Z","source_sequence":1},
+    "fork_of_fork": {"hook_event_name":"SessionStart","source":"fork","session_id":"<FORK_OF_FORK_THREAD_ID>","forkedFromId":"<FORK_THREAD_ID>","observed_at":"2026-09-16T11:20:00Z","source_sequence":1},
+    "subagent": {"hook_event_name":"SessionStart","source":"app-server","session_id":"<SUBAGENT_THREAD_ID>","parentThreadId":"<THREAD_ID>","observed_at":"2026-09-16T11:30:00Z","source_sequence":1},
+    "authoritative_app": {"hook_event_name":"SessionStart","source":"app-server","source_kind":"codex-app","source_confidence":"authoritative","session_id":"<APP_THREAD_ID>","observed_at":"2026-09-16T12:00:00Z","source_sequence":1},
+    "no_id": {"hook_event_name":"SessionStart","source":"startup","observed_at":"2026-09-16T09:00:00Z"}
+  }
+}

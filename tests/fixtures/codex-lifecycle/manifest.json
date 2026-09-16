@@ -2,6 +2,30 @@
   "schema_version": 1,
   "fixtures": [
     {
+      "path": "lifecycle-sequences.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "hooks",
+      "capture_method": "Allowlisted lifecycle hook shapes derived from the plan-057 contract fixtures.",
+      "observed_at": "2026-09-16T12:00:00Z",
+      "scenario": "lifecycle replay, lineage, end, and no-id",
+      "field_status": { "hook fields": "observed", "fork root": "derived", "owner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "fork id": "<FORK_THREAD_ID>", "fork-of-fork id": "<FORK_OF_FORK_THREAD_ID>", "subagent id": "<SUBAGENT_THREAD_ID>", "app id": "<APP_THREAD_ID>" },
+      "refresh_rule": "Refresh when the normalized lifecycle allowlist or supported hook vocabulary changes."
+    },
+    {
+      "path": "lifecycle-expected-records.json",
+      "cli_version": "0.153.4",
+      "app_version": "26.908.40834 (build 8881)",
+      "source": "cctrl-metadata",
+      "capture_method": "Expected conservative schema-v2 projections for sanitized lifecycle replay.",
+      "observed_at": "2026-09-16T12:00:00Z",
+      "scenario": "origin and lineage reducer expectations",
+      "field_status": { "origin": "derived", "lineage": "derived", "owner": "unsupported" },
+      "sanitization": { "thread id": "<THREAD_ID>", "fork id": "<FORK_THREAD_ID>" },
+      "refresh_rule": "Refresh when task record schema or lifecycle source-confidence policy changes."
+    },
+    {
       "path": "matrix.json",
       "cli_version": "0.153.4",
       "app_version": "26.908.40834 (build 8881)",

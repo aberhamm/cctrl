@@ -1,0 +1,36 @@
+{
+  "generic": {
+    "origin": "unknown",
+    "registered_by_cctrl": true,
+    "launched_by_cctrl": false,
+    "execution_runtime": "unknown",
+    "control_owner": "unknown",
+    "restore_strategy": null
+  },
+  "authoritative_app": {
+    "origin": "codex-app",
+    "registered_by_cctrl": true,
+    "launched_by_cctrl": false,
+    "execution_runtime": "unknown",
+    "control_owner": "unknown",
+    "restore_strategy": null
+  },
+  "fork": {
+    "forked_from_id": "<THREAD_ID>",
+    "parent_thread_id": null,
+    "derived_root_id": "<THREAD_ID>",
+    "derived_root_basis": "forked-from-traversal"
+  },
+  "fork_of_fork": {
+    "forked_from_id": "<FORK_THREAD_ID>",
+    "parent_thread_id": null,
+    "derived_root_id": "<THREAD_ID>",
+    "derived_root_basis": "forked-from-traversal"
+  },
+  "subagent": {
+    "forked_from_id": null,
+    "parent_thread_id": "<THREAD_ID>",
+    "derived_root_id": null,
+    "derived_root_basis": null
+  }
+}

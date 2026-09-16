@@ -36,6 +36,7 @@ TASK_REGISTRY_MAX_SOURCES=32
 TASK_REGISTRY_ABSENT_DIGEST="absent"
 TASK_REGISTRY_LOCK_TIMEOUT="${CCTRL_TASK_REGISTRY_LOCK_TIMEOUT:-10}"
 TASK_REGISTRY_LOCK_GRACE="${CCTRL_TASK_REGISTRY_LOCK_GRACE:-5}"
+CODEX_LIFECYCLE_MAX_BYTES=65536
 _autoheal_refresh_paths() {
     # Paths for the opt-in dead-bridge autoheal timer (plan 021). The launchd
     # agent dir is overridable (CCTRL_LAUNCH_AGENTS_DIR) so tests write a plist to
@@ -1616,6 +1617,16 @@ if data["lifecycle_state"] not in states: fail("unknown lifecycle_state")
 if data.get("restore_strategy") is not None and data["restore_strategy"] not in strategies: fail("unknown restore_strategy")
 if not rfc3339.match(data["last_observed_at"]): fail("last_observed_at must be RFC 3339")
 
+lifecycle_observations = data.get("lifecycle_observations", [])
+if not isinstance(lifecycle_observations, list) or len(lifecycle_observations) > max_evidence:
+    fail(f"lifecycle_observations must be an array of at most {max_evidence} entries")
+for item in lifecycle_observations:
+    if not isinstance(item, dict): fail("lifecycle observation must be an object")
+    if item.get("state") not in states: fail("unknown lifecycle observation state")
+    for field in ("event_id", "event_name", "source", "observed_at"):
+        if not isinstance(item.get(field), str) or not item[field]: fail(f"lifecycle observation {field} is required")
+    if not rfc3339.match(item["observed_at"]): fail("lifecycle observation observed_at must be RFC 3339")
+
 lineage = data.get("lineage")
 if not isinstance(lineage, dict): fail("lineage must be an object")
 for field in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis"):
@@ -1907,6 +1918,10 @@ if not re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\
 
 payload = event["payload"]
 requested_owner = any(k in payload for k in ("control_owner", "execution_runtime"))
+requested_lifecycle = payload.get("lifecycle_state")
+if requested_lifecycle is not None and requested_lifecycle not in {"active", "closed", "released", "archived", "unknown"}:
+    print("unknown lifecycle observation state", file=sys.stderr); raise SystemExit(2)
+lifecycle_observation = None if requested_owner else requested_lifecycle
 authority = payload.get("authority_class", "diagnostic" if event["event_type"] == "observe" else "authoritative")
 if authority not in {"authoritative", "corroborating", "diagnostic"}:
     print("unknown event authority_class", file=sys.stderr); raise SystemExit(2)
@@ -1948,13 +1963,27 @@ else:
                 print(f"register cannot change immutable field {field}", file=sys.stderr); raise SystemExit(2)
         merged = copy.deepcopy(incoming)
         merged.update(record)
+        incoming_origin = incoming.get("origin")
+        trusted_origin_upgrade = (
+            record.get("origin") == "unknown"
+            and authority == "authoritative"
+            and (
+                (incoming_origin == "cctrl" and incoming.get("launched_by_cctrl") is True and event["source"] == "legacy-promotion")
+                or (incoming_origin in {"codex-app", "external-cli"} and event["source"] == "lifecycle-hook")
+            )
+        )
+        if trusted_origin_upgrade:
+            merged["origin"] = incoming_origin
         merged["registered_by_cctrl"] = bool(record.get("registered_by_cctrl") or incoming.get("registered_by_cctrl"))
         merged["launched_by_cctrl"] = bool(record.get("launched_by_cctrl") or incoming.get("launched_by_cctrl"))
-        for field in ("execution_runtime", "control_owner", "lifecycle_state"):
+        for field in ("execution_runtime", "control_owner"):
             old, new = record.get(field, "unknown"), incoming.get(field, "unknown")
             if old in (None, "unknown"): merged[field] = new
             elif new in (None, "unknown") or old == new: merged[field] = old
             else: merged[field] = "conflict"
+        # Lifecycle order is reduced from explicit observations below rather
+        # than from register arrival order.
+        merged["lifecycle_state"] = record.get("lifecycle_state", incoming.get("lifecycle_state", "unknown"))
         if record.get("restore_strategy") is None:
             merged["restore_strategy"] = incoming.get("restore_strategy")
         old_lineage, new_lineage = record.get("lineage") or {}, incoming.get("lineage") or {}
@@ -2060,6 +2089,23 @@ for field, value in updates.items():
     if field == "registered_by_cctrl" and record.get(field) is True and value is not True:
         print("registered_by_cctrl cannot be downgraded", file=sys.stderr); raise SystemExit(2)
     record[field] = value
+
+if lifecycle_observation is not None:
+    lifecycle_observations = list(record.get("lifecycle_observations") or [])
+    lifecycle_observations.append({
+        "event_id": event["event_id"],
+        "event_name": payload.get("lifecycle_event", event["event_type"]),
+        "source": event["source"],
+        "state": lifecycle_observation,
+        "observed_at": event["observed_at"],
+    })
+    unique_lifecycle = {item["event_id"]: item for item in lifecycle_observations}
+    lifecycle_observations = sorted(
+        unique_lifecycle.values(),
+        key=lambda item: (item["observed_at"], item["state"] == "closed", item["event_id"]),
+    )[-max_evidence:]
+    record["lifecycle_observations"] = lifecycle_observations
+    record["lifecycle_state"] = lifecycle_observations[-1]["state"]
 
 # Canonical bounded evidence/cache state. Event time updates diagnostic time
 # deterministically, never ownership precedence.
@@ -7073,6 +7119,236 @@ cmd_peer() {
 
 # ── Detached session management ───────────────────────────────────────
 
+_session_ingest_event() {
+    # Hidden stdin command used only by the Codex lifecycle hook. The input is
+    # a normalized allowlisted envelope, never a raw hook payload.
+    local event_file="$1" host_id scratch registry_event_file task_id record_key result provisional_record rc=0
+    [[ -f "$event_file" && ! -L "$event_file" ]] || return 64
+    [[ "$(stat -f '%z' "$event_file" 2>/dev/null || echo 0)" -le "$CODEX_LIFECYCLE_MAX_BYTES" ]] || return 64
+    host_id="$(_cctrl_host_id)" || return 74
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-codex-ingest.XXXXXX")" || return 74
+    registry_event_file="$scratch/registry-event.json"
+    task_id="$(python3 - "$event_file" "$registry_event_file" "$SESSION_METADATA_DIR" "$host_id" \
+        "$TASK_RECORD_SCHEMA_VERSION" "$TASK_RECORD_MAX_EVIDENCE" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+source_path, output_path, metadata_dir, host_id = sys.argv[1:5]
+schema, max_evidence = map(int, sys.argv[5:7])
+allowed = {
+    "version", "event_id", "provider", "provider_task_id", "hook_event_name", "source",
+    "source_kind", "source_confidence", "source_evidence_task_id", "source_sequence", "source_cursor", "forked_from_id",
+    "parent_thread_id", "observed_at", "lifecycle_state",
+}
+required = allowed
+rfc3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+
+def fail(message, code=64):
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+try:
+    envelope = json.loads(Path(source_path).read_text(encoding="utf-8"))
+except Exception:
+    fail("codex-lifecycle-invalid-json")
+if not isinstance(envelope, dict) or set(envelope) != required:
+    fail("codex-lifecycle-invalid-envelope")
+if envelope.get("version") != 1 or envelope.get("provider") != "codex":
+    fail("codex-lifecycle-invalid-version")
+for field in ("event_id", "provider_task_id", "hook_event_name", "source", "source_kind", "source_confidence", "observed_at", "lifecycle_state"):
+    value = envelope.get(field)
+    if not isinstance(value, str) or not value or len(value.encode()) > 4096:
+        fail("codex-lifecycle-invalid-field")
+for field in ("source_evidence_task_id", "source_cursor", "forked_from_id", "parent_thread_id"):
+    value = envelope.get(field)
+    if value is not None and (not isinstance(value, str) or not value or len(value.encode()) > 4096):
+        fail("codex-lifecycle-invalid-field")
+sequence = envelope.get("source_sequence")
+if sequence is not None and (type(sequence) is not int or sequence < 0):
+    fail("codex-lifecycle-invalid-sequence")
+if envelope["hook_event_name"] not in {"SessionStart", "SessionEnd", "PreCompact", "PostCompact"}:
+    fail("codex-lifecycle-unsupported-event", 65)
+if envelope["source"] not in {"startup", "resume", "clear", "compact", "fork", "app-server", "cli", "unknown"}:
+    fail("codex-lifecycle-invalid-source")
+if envelope["source_kind"] not in {"codex-app", "external-cli", "unknown"}:
+    fail("codex-lifecycle-invalid-source-kind")
+if envelope["source_confidence"] not in {"authoritative", "corroborating", "diagnostic"}:
+    fail("codex-lifecycle-invalid-confidence")
+evidence_task_id = envelope["source_evidence_task_id"]
+if evidence_task_id is None:
+    if envelope["source_kind"] != "unknown" or envelope["source_confidence"] != "diagnostic":
+        fail("codex-lifecycle-unbound-source-evidence")
+elif evidence_task_id != envelope["provider_task_id"]:
+    fail("codex-lifecycle-mismatched-source-evidence")
+if envelope["lifecycle_state"] not in {"active", "closed"} or not rfc3339.match(envelope["observed_at"]):
+    fail("codex-lifecycle-invalid-lifecycle")
+
+task_id = envelope["provider_task_id"]
+forked = envelope["forked_from_id"]
+parent = envelope["parent_thread_id"]
+if task_id in {forked, parent}:
+    fail("codex-lifecycle-self-lineage")
+
+def record_key(provider_task_id):
+    raw = b"codex\0" + host_id.encode() + b"\0" + provider_task_id.encode()
+    return "task-" + hashlib.sha256(raw).hexdigest()
+
+def load_record(provider_task_id):
+    path = Path(metadata_dir) / (record_key(provider_task_id) + ".json")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(value, dict) or value.get("provider_task_id") != provider_task_id or value.get("host_id") != host_id:
+        return None
+    return value
+
+derived_root = None
+derived_basis = None
+if forked:
+    seen = {task_id}
+    current = forked
+    valid = True
+    for _ in range(64):
+        if current in seen:
+            valid = False
+            break
+        seen.add(current)
+        ancestor = load_record(current)
+        next_id = ((ancestor or {}).get("lineage") or {}).get("forked_from_id")
+        if not isinstance(next_id, str) or not next_id:
+            derived_root = current
+            break
+        current = next_id
+    else:
+        valid = False
+    if valid and derived_root:
+        derived_basis = "forked-from-traversal"
+
+confidence = envelope["source_confidence"]
+source_kind = envelope["source_kind"]
+origin = source_kind if confidence == "authoritative" and source_kind != "unknown" else "unknown"
+observed = envelope["observed_at"]
+evidence = [{
+    "source": "lifecycle-hook",
+    "source_instance": task_id,
+    "source_cursor": str(sequence) if sequence is not None else envelope["source_cursor"],
+    "authority_class": confidence,
+    "observed_owner": "unknown",
+    "observed_runtime": "unknown",
+    "observed_state": envelope["lifecycle_state"],
+    "observed_at": observed,
+    "reason": "Codex lifecycle hook observation; hook surface does not prove control ownership",
+}]
+record = {
+    "schema_version": schema,
+    "provider": "codex",
+    "provider_task_id": task_id,
+    "origin": origin,
+    "host_id": host_id,
+    "registered_by_cctrl": True,
+    "launched_by_cctrl": False,
+    "execution_runtime": "unknown",
+    "control_owner": "unknown",
+    "lifecycle_state": envelope["lifecycle_state"],
+    "restore_strategy": None,
+    "last_observed_at": observed,
+    "tmux_session": None,
+    "lineage": {
+        "forked_from_id": forked,
+        "parent_thread_id": parent,
+        "derived_root_id": derived_root,
+        "derived_root_basis": derived_basis,
+    },
+    "ownership_evidence": evidence[-max_evidence:],
+}
+registry_event = {
+    "version": 1,
+    "event_id": envelope["event_id"],
+    "event_type": "register",
+    "provider": "codex",
+    "provider_task_id": task_id,
+    "host_id": host_id,
+    "source": "lifecycle-hook",
+    "source_instance_id": task_id,
+    "source_sequence": sequence,
+    "source_cursor": envelope["source_cursor"],
+    "expected_record_digest": "absent",
+    "observed_at": observed,
+    "payload": {
+        "authority_class": confidence,
+        "record": record,
+        "lifecycle_state": envelope["lifecycle_state"],
+        "lifecycle_event": envelope["hook_event_name"],
+    },
+}
+Path(output_path).write_text(json.dumps(registry_event, separators=(",", ":")), encoding="utf-8")
+print(task_id)
+PY
+    )" || rc=$?
+    if (( rc != 0 )); then
+        rm -rf "$scratch"
+        return "$rc"
+    fi
+    # A cctrl-launched Codex process inherits its exact tmux session identity.
+    # Bind the first stable provider id to that existing provisional receipt
+    # before applying the lifecycle observation, so a hook race cannot split
+    # cctrl provenance across launch-* and task-* records.
+    if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
+        provisional_record="$(_task_record_find_by_session "$CCTRL_SESSION_NAME" 2>/dev/null || true)"
+        if [[ "$provisional_record" == "$SESSION_METADATA_DIR"/launch-*.json ]]; then
+            if ! jq -e --arg name "$CCTRL_SESSION_NAME" '
+                .schema_version == 2 and .provider == "codex" and .provider_task_id == null and
+                .origin == "cctrl" and .launched_by_cctrl == true and .control_owner == "cctrl" and
+                .tmux_session == $name
+            ' "$provisional_record" >/dev/null 2>&1; then
+                rm -rf "$scratch"
+                return 65
+            fi
+            if ! _task_record_promote_legacy "$provisional_record" "$task_id" >/dev/null; then
+                rm -rf "$scratch"
+                return 74
+            fi
+        fi
+    fi
+    record_key="$(_task_record_key codex "$host_id" "$task_id")" || { rm -rf "$scratch"; return 64; }
+    result="$(_task_registry_apply_event "$record_key" "$registry_event_file")" || rc=$?
+    if (( rc != 0 )); then
+        rm -rf "$scratch"
+        case "$rc" in
+            75) return 75 ;;
+            2|64|65) return 65 ;;
+            *) return 74 ;;
+        esac
+    fi
+    rm -rf "$scratch"
+    case "$(jq -r '.status // empty' <<< "$result")" in
+        created|applied|duplicate|stale) return 0 ;;
+        *) return 74 ;;
+    esac
+}
+
+_session_ingest_event_stdin() {
+    local input_file rc=0
+    [[ $# -eq 0 ]] || return 64
+    input_file="$(mktemp "${TMPDIR:-/tmp}/cctrl-codex-envelope.XXXXXX")" || return 74
+    python3 -c 'import sys
+path, maximum = sys.argv[1], int(sys.argv[2])
+payload = sys.stdin.buffer.read(maximum + 1)
+if not payload or len(payload) > maximum:
+    raise SystemExit(64)
+with open(path, "wb") as handle:
+    handle.write(payload)' "$input_file" "$CODEX_LIFECYCLE_MAX_BYTES" || rc=$?
+    if (( rc == 0 )); then
+        _session_ingest_event "$input_file" || rc=$?
+    fi
+    rm -f "$input_file"
+    return "$rc"
+}
+
 cmd_session() {
     # Manage detached tmux sessions created by `cctrl start -d`.
     local action="${1:-ls}"
@@ -7148,6 +7424,7 @@ cmd_session() {
         archive) _session_archive_codex_task "$@" ;;
         attest) _session_attest "$@" ;;
         mcp) _session_cmd_mcp "$@" ;;
+        ingest-event) _session_ingest_event_stdin "$@" ;;
         release-to-app|release) _session_release_to_app "$@" ;;
         doctor|reconcile) _session_doctor "$@" ;;
         autoheal)  _session_autoheal "$@" ;;
@@ -11791,7 +12068,7 @@ _hooks_run() {
         echo "  pre-tool-use   Block disallowed tool calls (stdin passthrough)"
         echo "  stop           Post-turn logging and notifications"
         echo "  notify         Push notification on agent events"
-        echo "  codex-observe  Validate bounded Codex lifecycle payloads (no state writes)"
+        echo "  codex-observe  Observe bounded Codex lifecycle payloads (fail-open registry write)"
         return 0
     fi
 
@@ -11807,7 +12084,7 @@ _hooks_run() {
             exec "$SCRIPT_DIR/hooks/notify.sh" notification
             ;;
         codex-observe)
-            exec python3 "$SCRIPT_DIR/hooks/codex-session-observer.py"
+            CCTRL_BIN="$SCRIPT_DIR/cctrl" exec python3 "$SCRIPT_DIR/hooks/codex-session-observer.py"
             ;;
         *)
             echo -e "${RED}Unknown hook: $name${RESET}" >&2

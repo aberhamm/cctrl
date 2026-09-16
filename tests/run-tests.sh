@@ -7500,6 +7500,9 @@ test_task_registry_structural_boundary() {
 
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
+        codex-lifecycle)
+            # Defined in the later Codex-hook section; dispatched there.
+            ;;
         session-attest)
             test_session_attest_live_tmux_process_matches
             test_session_attest_direct_metadata
@@ -7590,6 +7593,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
+if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" ]]; then
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -7783,6 +7787,7 @@ test_restore_no_force_structural
 test_restore_no_pane_inference_structural
 test_restore_already_live_record_join
 test_restore_exit_codes
+fi
 
 # =====================================================================
 # Health check pattern table & health check tests (plan 056)
@@ -8072,6 +8077,182 @@ FNSH
 test_codex_lifecycle_fixture_contract() {
     python3 "$ROOT/tests/fixtures/codex-lifecycle/validate.py" \
         || fail "Codex lifecycle fixture contract validation failed"
+}
+
+test_codex_lifecycle_ingestion() {
+    local root="$TMPDIR/codex-lifecycle-062" fixtures="$ROOT/tests/fixtures/codex-lifecycle/lifecycle-sequences.json"
+    local expected="$ROOT/tests/fixtures/codex-lifecycle/lifecycle-expected-records.json" observer="$ROOT/hooks/codex-session-observer.py"
+    rm -rf "$root"; mkdir -p "$root"
+
+    lifecycle_record_path() {
+        local meta="$1" data="$2" task_id="$3"
+        # shellcheck disable=SC2016 # evaluated inside the sourced cctrl shell
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+            cctrl_source_eval '_task_record_file codex "$(_cctrl_host_id)" "$1"' "$task_id"
+    }
+    lifecycle_event() {
+        local name="$1" meta="$2" data="$3" payload="$4" source_kind="${5:-}" confidence="${6:-}"
+        local source_task_id="${7:-}" session_name="${8:-}"
+        printf '%s' "$payload" | CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
+            CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_BIN="$ROOT/cctrl" \
+            CCTRL_CODEX_SOURCE_KIND="$source_kind" CCTRL_CODEX_SOURCE_CONFIDENCE="$confidence" \
+            CCTRL_CODEX_SOURCE_TASK_ID="$source_task_id" CCTRL_SESSION_KIND="${session_name:+tmux}" \
+            CCTRL_SESSION_NAME="$session_name" python3 "$observer" \
+            || fail "lifecycle observer failed open for $name"
+    }
+    fixture_event() {
+        jq -c --arg name "$1" '.events[$name]' "$fixtures"
+    }
+
+    local meta="$root/meta" data="$root/data" payload record before after
+    mkdir -p "$meta" "$data"
+    payload="$(fixture_event no_id)"
+    lifecycle_event no-id "$meta" "$data" "$payload"
+    [[ -z "$(find "$meta" -maxdepth 1 -name 'task-*.json' -print -quit)" ]] || fail "no-id lifecycle event created a synthetic task"
+
+    payload="$(fixture_event startup | jq -c '.cwd="<WORKSPACE>" | .model="must-not-persist" | .title="must-not-persist" | .sandbox="must-not-persist" | .approval_policy="must-not-persist" | .source_kind="codex-app" | .source_confidence="authoritative"')"
+    lifecycle_event startup "$meta" "$data" "$payload"
+    record="$(lifecycle_record_path "$meta" "$data" '<THREAD_ID>')"
+    jq -e --slurpfile expected "$expected" '
+        .origin == $expected[0].generic.origin and
+        .registered_by_cctrl == true and .launched_by_cctrl == false and
+        .execution_runtime == "unknown" and .control_owner == "unknown" and
+        .restore_strategy == null and .lifecycle_state == "active" and
+        (.cwd == null and .model == null and .title == null and .sandbox == null and .approval_policy == null)
+    ' "$record" >/dev/null || fail "generic lifecycle registration guessed provenance or persisted settings"
+
+    before="$(shasum -a 256 "$record" | awk '{print $1}')"
+    lifecycle_event duplicate "$meta" "$data" "$payload"
+    after="$(shasum -a 256 "$record" | awk '{print $1}')"
+    [[ "$before" == "$after" ]] || fail "duplicate lifecycle replay was not idempotent"
+
+    lifecycle_event resume "$meta" "$data" "$(fixture_event resume)"
+    lifecycle_event clear "$meta" "$data" "$(fixture_event clear)"
+    lifecycle_event pre-compact "$meta" "$data" "$(fixture_event pre_compact)"
+    lifecycle_event post-compact "$meta" "$data" "$(fixture_event post_compact)"
+    lifecycle_event end "$meta" "$data" "$(fixture_event end)"
+    [[ -f "$record" ]] || fail "SessionEnd deleted the canonical task record"
+    jq -e '.lifecycle_state == "closed" and .origin == "unknown" and .control_owner == "unknown" and .restore_strategy == null' "$record" >/dev/null \
+        || fail "SessionEnd changed provenance, ownership, or archive state"
+
+    lifecycle_event fork "$meta" "$data" "$(fixture_event fork)"
+    lifecycle_event fork-of-fork "$meta" "$data" "$(fixture_event fork_of_fork)"
+    lifecycle_event subagent "$meta" "$data" "$(fixture_event subagent)"
+    local fork_record fork2_record subagent_record
+    fork_record="$(lifecycle_record_path "$meta" "$data" '<FORK_THREAD_ID>')"
+    fork2_record="$(lifecycle_record_path "$meta" "$data" '<FORK_OF_FORK_THREAD_ID>')"
+    subagent_record="$(lifecycle_record_path "$meta" "$data" '<SUBAGENT_THREAD_ID>')"
+    jq -e --slurpfile expected "$expected" '.lineage == $expected[0].fork' "$fork_record" >/dev/null || fail "fork lineage projection differed"
+    jq -e --slurpfile expected "$expected" '.lineage == $expected[0].fork_of_fork' "$fork2_record" >/dev/null || fail "fork-of-fork root was not explicit traversal"
+    jq -e --slurpfile expected "$expected" '.lineage == $expected[0].subagent' "$subagent_record" >/dev/null || fail "subagent ancestry was conflated with fork ancestry"
+
+    lifecycle_event app "$meta" "$data" "$(fixture_event authoritative_app)" codex-app authoritative '<APP_THREAD_ID>'
+    local app_record
+    app_record="$(lifecycle_record_path "$meta" "$data" '<APP_THREAD_ID>')"
+    jq -e --slurpfile expected "$expected" '
+        .origin == $expected[0].authoritative_app.origin and .registered_by_cctrl == true and
+        .launched_by_cctrl == false and .execution_runtime == "unknown" and
+        .control_owner == "unknown" and .restore_strategy == null
+    ' "$app_record" >/dev/null || fail "authoritative source-kind registration claimed control ownership"
+
+    lifecycle_event stale-source "$meta" "$data" \
+        "$(fixture_event authoritative_app | jq -c '.session_id="unbound-source-id"')" \
+        codex-app authoritative different-task-id
+    local stale_source_record
+    stale_source_record="$(lifecycle_record_path "$meta" "$data" unbound-source-id)"
+    jq -e '.origin == "unknown" and .control_owner == "unknown"' "$stale_source_record" >/dev/null \
+        || fail "source classification not bound to the observed provider task id"
+
+    # A later generic hook must not downgrade a canonical cctrl launch receipt.
+    local managed_meta="$root/managed-meta" managed_data="$root/managed-data" managed_record
+    mkdir -p "$managed_meta" "$managed_data"
+    CCTRL_SESSION_METADATA_DIR="$managed_meta" CCTRL_DATA_DIR="$managed_data" CCTRL_HOST_ID_FILE="$managed_data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--managed" /tmp directory /tmp label purpose prompt cmd "" codex "managed-id" ""'
+    managed_record="$(lifecycle_record_path "$managed_meta" "$managed_data" managed-id)"
+    lifecycle_event managed "$managed_meta" "$managed_data" "$(fixture_event startup | jq -c '.session_id="managed-id"')"
+    jq -e '.origin == "cctrl" and .launched_by_cctrl == true and .control_owner == "cctrl" and .execution_runtime == "tmux" and .restore_strategy == "tmux"' \
+        "$managed_record" >/dev/null || fail "late lifecycle event overwrote cctrl launch provenance"
+
+    # SessionStart may race provider-id discovery for a cctrl launch. The
+    # inherited tmux identity must promote the provisional launch receipt.
+    local provisional_meta="$root/provisional-meta" provisional_data="$root/provisional-data" provisional_record
+    mkdir -p "$provisional_meta" "$provisional_data"
+    CCTRL_SESSION_METADATA_DIR="$provisional_meta" CCTRL_DATA_DIR="$provisional_data" CCTRL_HOST_ID_FILE="$provisional_data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--provisional" /tmp directory /tmp label purpose prompt cmd "" codex "" ""'
+    lifecycle_event provisional "$provisional_meta" "$provisional_data" \
+        "$(fixture_event startup | jq -c '.session_id="provisional-id"')" "" "" "" "TMUX--provisional"
+    provisional_record="$(lifecycle_record_path "$provisional_meta" "$provisional_data" provisional-id)"
+    jq -e '.origin == "cctrl" and .launched_by_cctrl == true and .control_owner == "cctrl" and .execution_runtime == "tmux" and .restore_strategy == "tmux"' \
+        "$provisional_record" >/dev/null || fail "lifecycle race lost provisional cctrl launch provenance"
+    [[ -z "$(find "$provisional_meta" -maxdepth 1 -name 'launch-*.json' -print -quit)" ]] \
+        || fail "lifecycle promotion left a split provisional record"
+
+    # Delivery order converges because lifecycle state is reduced by observed_at.
+    local order_a="$root/order-a" order_b="$root/order-b" order_data_a="$root/order-data-a" order_data_b="$root/order-data-b"
+    mkdir -p "$order_a" "$order_b" "$order_data_a" "$order_data_b"
+    printf '0123456789abcdef0123456789abcdef\n' > "$order_data_a/host-id"
+    cp "$order_data_a/host-id" "$order_data_b/host-id"; chmod 600 "$order_data_a/host-id" "$order_data_b/host-id"
+    lifecycle_event order-a-start "$order_a" "$order_data_a" "$(fixture_event startup)"
+    lifecycle_event order-a-end "$order_a" "$order_data_a" "$(fixture_event end)"
+    lifecycle_event order-b-end "$order_b" "$order_data_b" "$(fixture_event end)"
+    lifecycle_event order-b-start "$order_b" "$order_data_b" "$(fixture_event startup)"
+    local order_record_a order_record_b
+    order_record_a="$(lifecycle_record_path "$order_a" "$order_data_a" '<THREAD_ID>')"
+    order_record_b="$(lifecycle_record_path "$order_b" "$order_data_b" '<THREAD_ID>')"
+    [[ "$(jq -S '{provider,provider_task_id,origin,registered_by_cctrl,launched_by_cctrl,execution_runtime,control_owner,lifecycle_state,restore_strategy,lineage,last_observed_at}' "$order_record_a")" == \
+       "$(jq -S '{provider,provider_task_id,origin,registered_by_cctrl,launched_by_cctrl,execution_runtime,control_owner,lifecycle_state,restore_strategy,lineage,last_observed_at}' "$order_record_b")" ]] \
+        || fail "out-of-order lifecycle delivery did not converge"
+    jq -e '.lifecycle_state == "closed"' "$order_record_b" >/dev/null || fail "SessionEnd-before-start did not converge to closed"
+
+    # Concurrent duplicate delivery must produce one canonical valid record.
+    local concurrent_meta="$root/concurrent-meta" concurrent_data="$root/concurrent-data" p1 p2 rc1=0 rc2=0
+    mkdir -p "$concurrent_meta" "$concurrent_data"
+    printf '%s' "$(fixture_event startup | jq -c '.session_id="concurrent-id"')" | \
+        CCTRL_DATA_DIR="$concurrent_data" CCTRL_SESSION_METADATA_DIR="$concurrent_meta" CCTRL_HOST_ID_FILE="$concurrent_data/host-id" CCTRL_BIN="$ROOT/cctrl" python3 "$observer" & p1=$!
+    printf '%s' "$(fixture_event startup | jq -c '.session_id="concurrent-id"')" | \
+        CCTRL_DATA_DIR="$concurrent_data" CCTRL_SESSION_METADATA_DIR="$concurrent_meta" CCTRL_HOST_ID_FILE="$concurrent_data/host-id" CCTRL_BIN="$ROOT/cctrl" python3 "$observer" & p2=$!
+    wait "$p1" || rc1=$?; wait "$p2" || rc2=$?
+    [[ "$rc1" -eq 0 && "$rc2" -eq 0 ]] || fail "concurrent observers did not fail open"
+    record="$(lifecycle_record_path "$concurrent_meta" "$concurrent_data" concurrent-id)"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced cctrl shell
+    CCTRL_SESSION_METADATA_DIR="$concurrent_meta" CCTRL_DATA_DIR="$concurrent_data" CCTRL_HOST_ID_FILE="$concurrent_data/host-id" \
+        cctrl_source_eval '_task_record_normalize_json "$1" >/dev/null' "$record" || fail "concurrent lifecycle record is invalid"
+
+    # Boundary failures are actionable, payload-free, and never block hooks.
+    local failure_payload failure_log="$root/failure.log" fake_bin="$root/slow-cctrl"
+    failure_payload="$(fixture_event startup | jq -c '.session_id="secret-payload-id"')"
+    printf '%s' "$failure_payload" | CCTRL_BIN="$root/missing-cctrl" python3 "$observer" 2> "$failure_log" \
+        || fail "command-not-found did not fail open"
+    grep -q 'ingest-command-not-found' "$failure_log" || fail "command-not-found reason code missing"
+    ! grep -q 'secret-payload-id' "$failure_log" || fail "failure log leaked lifecycle payload"
+    printf '#!/usr/bin/env bash\nsleep 3\n' > "$fake_bin"; chmod +x "$fake_bin"
+    printf '%s' "$failure_payload" | CCTRL_BIN="$fake_bin" python3 "$observer" 2> "$failure_log" || fail "timeout did not fail open"
+    grep -q 'ingest-timeout' "$failure_log" || fail "timeout reason code missing"
+    ! grep -q 'secret-payload-id' "$failure_log" || fail "timeout log leaked lifecycle payload"
+
+    local failed_meta="$root/failed-meta" failed_data="$root/failed-data"
+    mkdir -p "$failed_meta" "$failed_data"
+    printf '%s' "$failure_payload" | CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME=1 CCTRL_DATA_DIR="$failed_data" \
+        CCTRL_SESSION_METADATA_DIR="$failed_meta" CCTRL_HOST_ID_FILE="$failed_data/host-id" CCTRL_BIN="$ROOT/cctrl" \
+        python3 "$observer" 2> "$failure_log" || fail "persistence failure did not fail open"
+    grep -q 'ingest-exit-74' "$failure_log" || fail "persistence failure reason code missing"
+    [[ -z "$(find "$failed_meta" -maxdepth 1 -name 'task-*.json' -print -quit)" ]] || fail "failed persistence left a canonical record"
+    [[ -z "$(find "$failed_meta" -maxdepth 1 -type f -name '*spool*' -print -quit)" ]] || fail "failure created a retry spool"
+
+    # Hidden command accepts exactly the normalized stdin envelope and rejects extras.
+    local normalized="$root/normalized.json"
+    python3 - "$observer" "$fixtures" "$normalized" <<'PY'
+import importlib.util,json,sys
+observer,fixtures,out=sys.argv[1:]
+spec=importlib.util.spec_from_file_location("observer",observer); module=importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+payload=json.load(open(fixtures))["events"]["startup"]
+json.dump(module.normalize_codex_lifecycle_event(payload),open(out,"w"))
+PY
+    if jq '.unexpected="rejected"' "$normalized" | CCTRL_DATA_DIR="$root/invalid-data" CCTRL_SESSION_METADATA_DIR="$root/invalid-meta" \
+        CCTRL_HOST_ID_FILE="$root/invalid-data/host-id" "$ROOT/cctrl" session ingest-event >/dev/null 2>&1; then
+        fail "ingest-event accepted a non-allowlisted envelope field"
+    fi
+    echo "ok: Codex lifecycle ingestion is bounded, conservative, convergent, lineage-aware, and fail-open"
 }
 
 test_codex_app_server_adapter() {
@@ -8649,14 +8830,21 @@ assert rc == 0
 assert time.monotonic()-started < 3.5
 PY
     live_after="$(tree_digest "$ROOT/data")"
-    [[ "$live_before" == "$live_after" ]] || fail "validation-only observer changed the real cctrl live store"
+    [[ "$live_before" == "$live_after" ]] || fail "isolated observer test changed the real cctrl live store"
 
     real_hooks_after="$(file_digest "$HOME/.codex/hooks.json")"
     real_trust_after="$(file_digest "$HOME/.codex/config.toml")"
     [[ "$real_hooks_before" == "$real_hooks_after" ]] || fail "tests changed real Codex hooks.json"
     [[ "$real_trust_before" == "$real_trust_after" ]] || fail "tests changed real Codex trust configuration"
-    echo "ok: Codex hooks install additively and observer remains bounded and validation-only"
+    echo "ok: Codex hooks install additively and observer remains bounded and fail-open"
 }
+
+if [[ "${CCTRL_TEST_ONLY:-}" == "codex-lifecycle" ]]; then
+    test_codex_lifecycle_fixture_contract
+    test_codex_lifecycle_ingestion
+    echo "ok"
+    exit 0
+fi
 
 test_health_check_patterns_syntax
 test_health_check_pattern_matching
@@ -8666,6 +8854,7 @@ test_health_check_timeout_path
 test_health_check_bypass_flag
 test_session_pane_has_dialog_refactored
 test_codex_lifecycle_fixture_contract
+test_codex_lifecycle_ingestion
 test_codex_app_server_adapter
 test_codex_hook_installation_is_additive_and_observer_is_bounded
 

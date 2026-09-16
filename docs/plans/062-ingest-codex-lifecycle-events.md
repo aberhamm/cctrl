@@ -1,7 +1,7 @@
 ---
 id: 062
 title: Register Codex tasks from lifecycle events without claiming them
-status: in-progress
+status: done
 blocked-by: [059, 061]
 priority: 62
 goal: codex-task-ownership-surfaces
@@ -9,9 +9,14 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-17
+reviewed: false
+qa: automated
 tui-fixture: n/a  # no tmux pane parsing; tmux appears only as an ownership value
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=eng verdict=approved date=2026-09-17 by=mstack-review
+  - type=code verdict=pass date=2026-09-17 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -27,7 +32,7 @@ Hook execution is evidence that a Codex lifecycle event occurred, not proof that
 **Acceptance criteria:**
 
 - [ ] Supported hook payloads with a provider task id produce normalized `register` or `observe` events through plan 059's reducer.
-- [ ] A task positively identified as native app-created is stored with `origin:codex-app`, `registered_by_cctrl:true`, `launched_by_cctrl:false`, `execution_runtime:app-server`, `control_owner:app`, and provider-managed restore.
+- [ ] A hook observation whose source kind is positively identified as native app-created is stored with `origin:codex-app`, `registered_by_cctrl:true`, and `launched_by_cctrl:false`. Because hooks are corroborating rather than authoritative ownership transactions, it retains `execution_runtime:unknown`, `control_owner:unknown`, and no restore strategy until an App Server transaction or reconciliation proves the live owner.
 - [ ] A hook event that could also come from unmanaged CLI is recorded as `origin:unknown` or `external-cli` according to plan 057; it is never guessed to be app-created.
 - [ ] A payload without a stable task id exits successfully and creates no synthetic record. A later first-prompt event may create the first record for an empty app task.
 - [ ] Startup, resume, clear, compact, fork, fork-of-fork, and SessionEnd sequences follow the documented identity/parent rules. Normalization preserves provider forkedFromId as forked_from_id and provider subagent parentThreadId as parent_thread_id; it computes derived_root_id only by explicit ancestry traversal with a recorded derivation basis.
@@ -41,7 +46,7 @@ Hook execution is evidence that a Codex lifecycle event occurred, not proof that
 
 ## Design
 
-Keep `normalize_codex_lifecycle_event(payload)` in `hooks/codex-session-observer.py`, one hidden stdin-based ingestion command, and ownership transitions in the central reducer. Use source-kind evidence from plan 057 when available; otherwise preserve `unknown`. Preserve fork ancestry and subagent ancestry in separate normalized fields; derive a root only by traversing recorded fork ancestry and retain the derivation basis. Lineage ids are relations, never deduplication substitutes. Event JSON moves through stdin/files, never `jq --argjson` or shell/argv interpolation.
+Keep `normalize_codex_lifecycle_event(payload)` in `hooks/codex-session-observer.py`, one hidden stdin-based ingestion command, and ownership transitions in the central reducer. Use source-kind evidence from plan 057 when available; otherwise preserve `unknown`. A hook may establish origin but never live owner/runtime; those require an authoritative App Server transaction or later reconciliation. Preserve fork ancestry and subagent ancestry in separate normalized fields; derive a root only by traversing recorded fork ancestry and retain the derivation basis. Lineage ids are relations, never deduplication substitutes. Event JSON moves through stdin/files, never `jq --argjson` or shell/argv interpolation.
 
 **Files expected to change:**
 
@@ -90,10 +95,28 @@ assumed:
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | Not required for this implementation plan |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | SKIPPED | Running under Codex; nested pass suppressed |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 0 open issues, 0 critical gaps |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | CLEAR | 0 open issues; amendment aligned hook evidence with plan 057 |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | No visual UI scope |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | Not required |
 
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+**Amendment review (2026-09-17):** Resolved the contradictory owner/runtime acceptance sentence in favor of plan 057's source-of-truth classification: hooks corroborate identity and origin but cannot prove a live app owner. The implementation and tests already enforce the reviewed conservative behavior.
+
+## Implementation Notes
+
+Implemented bounded, fail-open Codex lifecycle ingestion with an allowlisted stdin envelope, hidden registry command, deterministic reduction, distinct fork/subagent lineage, explicit derived-root basis, provenance preservation, stable reason codes, and isolated replay/concurrency/failure coverage. Review fixes bind authoritative source evidence to the exact task id and promote provisional cctrl launch receipts before lifecycle apply. The plan's contradictory owner/runtime sentence was amended to match plan 057: hook observations may establish origin but retain unknown live owner/runtime until an authoritative transaction or reconciliation. Health scored 10.0, all four verification checks passed, the complete repository suite and lifecycle-only suite passed, and the actual live `data/` digest remained unchanged.
+
+**Files changed:**
+
+- `cctrl` (modified)
+- `docs/plans/062-ingest-codex-lifecycle-events.md` (modified)
+- `hooks/codex-session-observer.py` (modified)
+- `tests/fixtures/codex-lifecycle/manifest.json` (modified)
+- `tests/fixtures/codex-lifecycle/lifecycle-expected-records.json` (created)
+- `tests/fixtures/codex-lifecycle/lifecycle-sequences.json` (created)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `c1fb40e` — `feat(codex): ingest lifecycle observations safely`
