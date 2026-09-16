@@ -78,8 +78,8 @@ produced:
 - kind: symbol; name: _session_ingest_event; shape: "event_file"; file: cctrl
 - kind: symbol; name: normalize_codex_lifecycle_event; shape: "payload"; file: hooks/codex-session-observer.py
 assumed:
-- from: 059; kind: schema; name: task_registry_event; shape: "event_id,event_type,provider,provider_task_id,host_id,source,source_instance_id,source_sequence,source_cursor,expected_record_digest,observed_at,payload"; file: cctrl
-- from: 059; kind: symbol; name: _task_registry_apply_event; shape: "record_key,event_file"; file: cctrl
+- from: 059; kind: schema; name: task_registry_event; file: cctrl
+- from: 059; kind: symbol; name: _task_registry_apply_event; file: cctrl
 - from: 061; kind: file; name: hooks/codex-session-observer.py; file: hooks/codex-session-observer.py
 -->
 
