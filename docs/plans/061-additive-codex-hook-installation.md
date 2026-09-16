@@ -78,7 +78,7 @@ produced:
 - kind: symbol; name: _hooks_install; file: cctrl
 assumed:
 - from: 057; kind: file; name: docs/findings/codex-task-lifecycle-contract.md; file: docs/findings/codex-task-lifecycle-contract.md
-- from: 057; kind: schema; name: codex_lifecycle_fixture_manifest; shape: "cli_version,app_version,source,capture_method,observed_at,scenario,field_status,sanitization,refresh_rule"; file: tests/fixtures/codex-lifecycle/manifest.json
+- from: 057; kind: schema; name: codex_lifecycle_fixture_manifest; file: tests/fixtures/codex-lifecycle/manifest.json
 -->
 
 
