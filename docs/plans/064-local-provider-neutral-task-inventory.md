@@ -1,7 +1,7 @@
 ---
 id: 064
 title: Add a local provider-neutral task inventory
-status: pending
+status: in-progress
 blocked-by: [058, 063]
 priority: 64
 goal: codex-task-ownership-surfaces
