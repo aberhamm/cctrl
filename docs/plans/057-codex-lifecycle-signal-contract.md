@@ -1,7 +1,7 @@
 ---
 id: 057
 title: Establish the Codex lifecycle and ownership signal contract
-status: pending
+status: in-progress
 blocked-by: []
 priority: 57
 goal: codex-task-ownership-surfaces
