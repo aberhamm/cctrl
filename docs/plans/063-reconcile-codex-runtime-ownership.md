@@ -1,7 +1,7 @@
 ---
 id: 063
 title: Reconcile Codex runtime ownership from authoritative evidence
-status: pending
+status: in-progress
 blocked-by: [059, 060, 062]
 priority: 63
 goal: codex-task-ownership-surfaces
