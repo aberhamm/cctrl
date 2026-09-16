@@ -84,8 +84,8 @@ produced:
 - kind: symbol; name: _task_list_json; file: cctrl
 - kind: symbol; name: _task_tmux_rows_json_readonly; file: cctrl
 assumed:
-- from: 058; kind: schema; name: task_record_v2; shape: "schema_version,provider,provider_task_id,origin,host_id,registered_by_cctrl,launched_by_cctrl,execution_runtime,control_owner,lifecycle_state,restore_strategy,last_observed_at,tmux_session,lineage,ownership_evidence"; file: cctrl
-- from: 063; kind: schema; name: codex_reconcile_result_v1; shape: "pass_id,observed_at,expected_record_digest,sources,outcome,reason,errors"; file: cctrl
+- from: 058; kind: schema; name: task_record_v2; file: cctrl
+- from: 063; kind: schema; name: codex_reconcile_result_v1; file: cctrl
 -->
 
 
