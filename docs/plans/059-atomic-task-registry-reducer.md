@@ -1,7 +1,7 @@
 ---
 id: 059
 title: Make task registry updates atomic and order-independent
-status: pending
+status: in-progress
 blocked-by: [057, 058]
 priority: 59
 goal: codex-task-ownership-surfaces
