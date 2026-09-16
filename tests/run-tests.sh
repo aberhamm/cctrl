@@ -3,7 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
+export CCTRL_DATA_DIR="$TMPDIR/data"
 export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
+export CCTRL_HOST_ID_FILE="$CCTRL_DATA_DIR/host-id"
 # Keep discovery tests isolated from large, live Codex/Claude stores. Individual
 # persistence tests override these roots with their own fixtures.
 export CODEX_HOME="$TMPDIR/no-codex-home"
@@ -48,6 +50,32 @@ assert_contains() {
 assert_not_contains() {
     local haystack="$1" needle="$2"
     [[ "$haystack" != *"$needle"* ]] || fail "expected output not to contain: $needle"
+}
+
+session_record_path() {
+    local name="$1" dir="${2:-$CCTRL_SESSION_METADATA_DIR}" file legacy match=""
+    for file in "$dir"/task-*.json "$dir"/launch-*.json; do
+        [[ -f "$file" ]] || continue
+        if jq -e --arg name "$name" '(.tmux_session // .name // "") == $name' "$file" >/dev/null 2>&1; then
+            if [[ -z "$match" || "$file" -nt "$match" ]]; then match="$file"; fi
+        fi
+    done
+    [[ -n "$match" ]] && { printf '%s' "$match"; return 0; }
+    legacy="$dir/$(printf '%s' "$name" | tr '/:' '__').json"
+    [[ -f "$legacy" ]] && { printf '%s' "$legacy"; return 0; }
+    return 1
+}
+
+session_record_json() {
+    local path
+    path="$(session_record_path "$1" "${2:-$CCTRL_SESSION_METADATA_DIR}")" || return 1
+    cat "$path"
+}
+
+cctrl_source_eval() {
+    local code="$1"
+    shift
+    CCTRL_NO_MAIN=1 bash -c 'code="$1"; shift; source "$0"; eval "$code"' "$ROOT/cctrl" "$code" "$@"
 }
 
 run_with_pty_input() {
@@ -596,7 +624,7 @@ SH
     assert_contains "$out" "CCTRL_SESSION=TMUX--config-local-project"
     assert_contains "$(cat "$log")" "CCTRL_AGENT=codex"
     assert_contains "$(cat "$curl_log")" "http://local.invalid/v1/chat/completions"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--config-local-project.json")" '"purpose": "Local Override Title"'
+    assert_contains "$(session_record_json "TMUX--config-local-project")" '"purpose": "Local Override Title"'
 
     echo "ok: local config overlays shared and user config for defaults and title generation"
 }
@@ -646,25 +674,25 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "CCTRL_TMUX_CONTEXT=1"
     assert_contains "$(cat "$log")" "--agent\\ codex"
     assert_contains "$(cat "$log")" "-m line\\ one"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "project: line one"'
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"initial_prompt": "line one"'
+    assert_contains "$(session_record_json "TMUX--project")" '"purpose": "project: line one"'
+    assert_contains "$(session_record_json "TMUX--project")" '"initial_prompt": "line one"'
     # Plan 031: the resolved agent is persisted so display/registry read it back
     # instead of re-sniffing the pane argv.
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"agent": "codex"'
+    assert_contains "$(session_record_json "TMUX--project")" '"agent": "codex"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d "$project" -- "literal prompt words")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "-- literal\\ prompt\\ words"
     assert_contains "$(cat "$log")" "start --foreground"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "project: literal prompt words"'
+    assert_contains "$(session_record_json "TMUX--project")" '"purpose": "project: literal prompt words"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --purpose "cleanup context" "$project")"
     assert_contains "$out" "detached session started"
     assert_contains "$(cat "$log")" "start --foreground"
     assert_not_contains "$(cat "$log")" "--purpose"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--project.json")" '"purpose": "cleanup context"'
+    assert_contains "$(session_record_json "TMUX--project")" '"purpose": "cleanup context"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex --remote unix:// -m "remote line" "$project")"
@@ -752,7 +780,7 @@ JSON
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--reuseproj--2"
     assert_not_contains "$out" "CCTRL_SESSION=TMUX--reuseproj--3"
     # Stale metadata was refreshed for the new session, not preserved.
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--reuseproj--2.json")" '"purpose": "reuseproj: fresh"'
+    assert_contains "$(session_record_json "TMUX--reuseproj--2")" '"purpose": "reuseproj: fresh"'
 
     echo "ok: live-aware index picker skips live sessions, reuses freed indices"
 }
@@ -830,7 +858,7 @@ JSON
     assert_contains "$(cat "$profile_log")" "--profile\\ team"
     assert_contains "$(cat "$profile_log")" "--peer\\ comet"
     assert_contains "$(cat "$profile_log")" "CCTRL_PEER=comet"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--profile-detached-project.json")" '"peer": "comet"'
+    assert_contains "$(session_record_json "TMUX--profile-detached-project")" '"peer": "comet"'
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start -d --peer comet --agent codex "$project")"
@@ -839,7 +867,7 @@ JSON
     assert_contains "$(cat "$log")" "CCTRL_DATA_DIR=$data"
     assert_contains "$(cat "$log")" "CCTRL_SESSION_METADATA_DIR=$CCTRL_SESSION_METADATA_DIR"
     assert_contains "$(cat "$log")" "--peer\\ comet"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--start-peer-project.json")" '"peer": "comet"'
+    assert_contains "$(session_record_json "TMUX--start-peer-project")" '"peer": "comet"'
 
     local ordered_project="$TMPDIR/start-peer-ordered-project"
     mkdir -p "$ordered_project"
@@ -849,7 +877,7 @@ JSON
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--start-peer-ordered-project"
     assert_contains "$(cat "$log")" "SHELL_CMD=cd $ordered_project &&"
     assert_contains "$(cat "$log")" "--peer\\ comet"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--start-peer-ordered-project.json")" '"target": "'"$ordered_project"'"'
+    assert_contains "$(session_record_json "TMUX--start-peer-ordered-project")" '"target": "'"$ordered_project"'"'
 
     rc=0
     out="$(PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" TMUX_FAKE_SESSIONS="TMUX--start-peer-project" "$ROOT/cctrl" start --foreground --agent codex --peer comet -m "duplicate foreground" 2>&1)" || rc=$?
@@ -919,7 +947,7 @@ JSON
     assert_contains "$out" "detached session started"
     assert_contains "$out" "CCTRL_SESSION=TMUX--start-peer-new-project"
     assert_contains "$(cat "$log")" "CCTRL_PEER=rover"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--start-peer-new-project.json")" '"peer": "rover"'
+    assert_contains "$(session_record_json "TMUX--start-peer-new-project")" '"peer": "rover"'
 
     local duplicate_project="$TMPDIR/start-peer-duplicate-project"
     rc=0
@@ -964,7 +992,7 @@ JSON
     assert_contains "$out" "CCTRL_SESSION=TMUX--peerproj"
     assert_contains "$(cat "$log")" "CCTRL_PEER=comet"
     assert_contains "$(cat "$log")" "--peer\\ comet"
-    assert_contains "$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--peerproj.json")" '"peer": "comet"'
+    assert_contains "$(session_record_json "TMUX--peerproj")" '"peer": "comet"'
 
     cat > "$profile_meta/TMUX--shortcut-live.json" <<'JSON'
 {"purpose":"shortcut live peer","created_at":"2026-06-11T10:00:00Z","peer":"comet","cctrl_managed":true}
@@ -1727,6 +1755,25 @@ JSON
     out="$(PATH="$bin:$PATH" TMUX_FAKE_SESSIONS="TMUX--metademo" TMUX_FAKE_PANE_PID=8888 "$ROOT/cctrl" session ls --json)"
     assert_contains "$out" '"agent": "claude"'
     echo "ok: session ls prefers the agent recorded in metadata"
+}
+
+test_session_list_malformed_metadata_uses_unknown_defaults() {
+    # A malformed record must not make an otherwise-live tmux session vanish
+    # from JSON output or feed empty strings to jq --argjson.
+    local bin="$TMPDIR/agbadmetabin" meta="$TMPDIR/agbadmeta"
+    mkdir -p "$bin" "$meta"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    printf 'not json {{{\n' > "$meta/TMUX--badmeta.json"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="TMUX--badmeta" TMUX_FAKE_PANE_PID=8888 \
+        "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"name": "TMUX--badmeta"'
+    assert_contains "$out" '"execution_runtime": "unknown"'
+    assert_contains "$out" '"control_owner": "unknown"'
+    echo "ok: session ls preserves live sessions when metadata is malformed"
 }
 
 test_session_list_last_active_from_updated_at() {
@@ -4180,6 +4227,19 @@ JSON
     echo "ok: session attest fails closed for missing tmux session"
 }
 
+test_session_attest_malformed_metadata_fails_human_mode() {
+    local meta="$TMPDIR/attest-malformed-meta"
+    mkdir -p "$meta"
+    printf 'not json {{{\n' > "$meta/TMUX--attest-malformed.json"
+
+    local out rc=0
+    out="$(CCTRL_SESSION_METADATA_DIR="$meta" \
+        "$ROOT/cctrl" session attest TMUX--attest-malformed 2>&1)" || rc=$?
+    [[ $rc -ne 0 ]] || fail "malformed human attestation unexpectedly succeeded: $out"
+    assert_contains "$out" "unverified: metadata-invalid"
+    echo "ok: session attest reports malformed metadata and fails in human mode"
+}
+
 test_session_runtime_mcp_attests_fixed_session() {
     # The task-facing MCP server pins one session at startup and exposes only
     # the read-only runtime_context tool, never a caller-selected tmux target.
@@ -4379,8 +4439,8 @@ PY
     name="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT name FROM threads WHERE id='thread-123'")"
     [[ "$title" == "Demo: new label (TMUX--demo)" ]] || fail "unexpected Codex title: $title"
     [[ "$name" == "Demo: new label (TMUX--demo)" ]] || fail "unexpected Codex name: $name"
-    purpose="$(jq -r '.purpose' "$meta/TMUX--demo.json")"
-    conv_id="$(jq -r '.conversation_id' "$meta/TMUX--demo.json")"
+    purpose="$(session_record_json "TMUX--demo" "$meta" | jq -r '.purpose')"
+    conv_id="$(session_record_json "TMUX--demo" "$meta" | jq -r '.conversation_id')"
     [[ "$purpose" == "new label" ]] || fail "metadata purpose not updated: $purpose"
     [[ "$conv_id" == "thread-123" ]] || fail "metadata conversation_id not backfilled: $conv_id"
     echo "ok: codex rename updates app title"
@@ -4420,7 +4480,7 @@ PY
     assert_contains "$out" "Codex app"
     old_title="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT title FROM threads WHERE id='thread-old'")"
     new_title="$(sqlite3 "$codex_home/state_5.sqlite" "SELECT title FROM threads WHERE id='thread-new'")"
-    conv_id="$(jq -r '.conversation_id' "$meta/TMUX--demo.json")"
+    conv_id="$(session_record_json "TMUX--demo" "$meta" | jq -r '.conversation_id')"
     [[ "$old_title" == "old title" ]] || fail "stale Codex title should not change: $old_title"
     [[ "$new_title" == "Demo: fleet manager (TMUX--demo)" ]] || fail "current Codex title not updated: $new_title"
     [[ "$conv_id" == "thread-new" ]] || fail "metadata conversation_id not corrected: $conv_id"
@@ -4448,7 +4508,7 @@ PY
     local out
     out="$(CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" "$ROOT/cctrl" session app-ls --json)"
     assert_contains "$out" '"name": "TMUX--appdemo"'
-    assert_contains "$out" '"state": "app-owned"'
+    assert_contains "$out" '"state": "unknown"'
     assert_contains "$out" '"title": "Demo: released task (TMUX--appdemo)"'
     echo "ok: app-ls shows cctrl-known Codex app tasks"
 }
@@ -4515,9 +4575,9 @@ PY
         TMUX_FAKE_HAS_SESSION=1 "$ROOT/cctrl" session close TMUX--close --now >/dev/null
     [[ "$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-close'")" == "1" ]] \
         || fail "cctrl close did not archive rollout-resolved Codex task"
-    [[ "$(jq -r '.conversation_id' "$meta/TMUX--close.json")" == "thread-close" ]] \
+    [[ "$(session_record_json "TMUX--close" "$meta" | jq -r '.conversation_id')" == "thread-close" ]] \
         || fail "close did not persist rollout-resolved conversation_id"
-    [[ -n "$(jq -r '.archived_at // empty' "$meta/TMUX--close.json")" ]] \
+    [[ -n "$(session_record_json "TMUX--close" "$meta" | jq -r '.archived_at // empty')" ]] \
         || fail "close archive timestamp missing from metadata"
     echo "ok: Codex close archives and persists rollout identity"
 }
@@ -4550,9 +4610,10 @@ PY
     [[ ! -e "$codex_home/thread-writer-locks/thread-release-1.lock" ]] || fail "stale lock was not removed from live lock dir"
     lock_path="$backup/thread-release-1.lock"
     [[ -e "$lock_path" ]] || fail "stale lock was not quarantined to $lock_path"
-    control="$(jq -r '.control_surface' "$meta/TMUX--release.json")"
-    released="$(jq -r '.released_at // empty' "$meta/TMUX--release.json")"
-    [[ "$control" == "app" ]] || fail "metadata control_surface not set: $control"
+    control="$(session_record_json "TMUX--release" "$meta" | jq -r '.control_surface')"
+    released="$(session_record_json "TMUX--release" "$meta" | jq -r '.released_at // empty')"
+    [[ "$control" == "unknown" ]] || fail "release incorrectly claimed app ownership: $control"
+    [[ "$(session_record_json "TMUX--release" "$meta" | jq -r '.control_owner')" == "unknown" ]] || fail "release owner should remain unknown"
     [[ -n "$released" ]] || fail "metadata released_at not set"
     [[ "$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-release-1'")" == "0" ]] \
         || fail "release-to-app archived the Codex task"
@@ -6715,15 +6776,18 @@ test_update_metadata_field_preserves_keys() {
     cat > "$meta/TMUX--merge-test.json" <<'JSON'
 {"name":"TMUX--merge-test","created_at":"2026-08-03T10:00:00Z","cwd":"/tmp/test","purpose":"original","agent":"claude","launch_command":"cctrl start --resume aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","cctrl_managed":true,"conversation_id":null}
 JSON
-    CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" session backfill-ids --apply >/dev/null 2>&1
+    local before
+    before="$(shasum -a 256 "$meta/TMUX--merge-test.json" | awk '{print $1}')"
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$TMPDIR/bf-merge-host-id" "$ROOT/cctrl" session backfill-ids --apply >/dev/null 2>&1
     local result
-    result="$(cat "$meta/TMUX--merge-test.json")"
+    result="$(session_record_json "TMUX--merge-test" "$meta")"
     assert_contains "$result" '"purpose": "original"'
     assert_contains "$result" '"agent": "claude"'
     assert_contains "$result" '"created_at": "2026-08-03T10:00:00Z"'
     assert_contains "$result" '"conversation_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"'
     assert_contains "$result" '"cctrl_managed": true'
-    echo "ok: _session_update_metadata_field preserves all other keys"
+    [[ "$before" == "$(shasum -a 256 "$meta/TMUX--merge-test.json" | awk '{print $1}')" ]] || fail "legacy input was rewritten during lazy promotion"
+    echo "ok: lazy promotion preserves all keys and leaves legacy input immutable"
 }
 
 test_update_metadata_field_missing_record() {
@@ -6816,7 +6880,7 @@ test_backfill_ids_fills_resume_flag() {
     out="$(CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" session backfill-ids --apply)"
     assert_contains "$out" "1 filled"
     local result
-    result="$(cat "$meta/TMUX--resume-test.json")"
+    result="$(session_record_json "TMUX--resume-test" "$meta")"
     assert_contains "$result" '"conversation_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"'
     echo "ok: backfill-ids fills the --resume case from fixture"
 }
@@ -6842,7 +6906,7 @@ test_backfill_ids_already_set() {
     cp "$ROOT/tests/fixtures/backfill/TMUX--already-set.json" "$meta/"
     local out
     out="$(CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" session backfill-ids --apply)"
-    assert_contains "$out" "1 already-set"
+    assert_contains "$out" "already-set"
     local result
     result="$(jq -r '.conversation_id' "$meta/TMUX--already-set.json")"
     [[ "$result" == "deadbeef-1234-5678-9abc-def012345678" ]] || fail "already-set record should keep its value"
@@ -6873,7 +6937,7 @@ test_backfill_ids_idempotent() {
     local out
     out="$(CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" session backfill-ids --apply)"
     assert_contains "$out" "0 filled"
-    assert_contains "$out" "1 already-set"
+    assert_contains "$out" "already-set"
     echo "ok: backfill-ids is idempotent (second run fills zero)"
 }
 
@@ -6958,7 +7022,8 @@ JSON
 }
 
 test_session_list_refresh_writes_on_change() {
-    # When the live session_id differs from stored conversation_id, the record is updated.
+    # Listing reports a discovered live id but intentionally leaves legacy
+    # metadata unchanged; promotion belongs to explicit mutating paths.
     local bin="$TMPDIR/refreshbin" sdir="$TMPDIR/refresh-sessions" pdir="$TMPDIR/refresh-projects"
     mkdir -p "$bin" "$sdir" "$pdir"
     make_fake_tmux "$bin/tmux"
@@ -6975,12 +7040,13 @@ JSON
     cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--refresh.json" <<'JSON'
 {"name":"TMUX--refresh","agent":"claude","cctrl_managed":true,"created_at":"2026-08-03T10:00:00Z","conversation_id":null,"transcript_path":null}
 JSON
-    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        TMUX_FAKE_SESSIONS="TMUX--refresh" TMUX_FAKE_PANE_PID=9999 "$ROOT/cctrl" session ls --json >/dev/null 2>&1
-    local result
+    local out result
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--refresh" TMUX_FAKE_PANE_PID=9999 "$ROOT/cctrl" session ls --json)"
     result="$(jq -r '.conversation_id // empty' "$CCTRL_SESSION_METADATA_DIR/TMUX--refresh.json")"
-    [[ "$result" == "live-uuid-refreshed" ]] || fail "expected conversation_id to be refreshed, got: $result"
-    echo "ok: session ls refresh writes conversation_id when live differs from stored"
+    [[ -z "$result" ]] || fail "read-only session ls rewrote legacy conversation_id: $result"
+    [[ "$(jq -r '.[0].session_id' <<< "$out")" == "live-uuid-refreshed" ]] || fail "session ls did not report discovered live id"
+    echo "ok: session ls reports discovered identity without metadata backfill"
 }
 
 test_session_list_refresh_skips_when_unchanged() {
@@ -7024,7 +7090,7 @@ test_launch_resume_captures_conversation_id() {
         "$ROOT/cctrl" start -d "$project" --resume a1b2c3d4-e5f6-7890-abcd-ef1234567890 2>&1)"
     assert_contains "$out" "detached session started"
     local result
-    result="$(jq -r '.conversation_id // empty' "$CCTRL_SESSION_METADATA_DIR/TMUX--resume-project.json")"
+    result="$(session_record_json "TMUX--resume-project" | jq -r '.conversation_id // empty')"
     [[ "$result" == "a1b2c3d4-e5f6-7890-abcd-ef1234567890" ]] || fail "expected conversation_id from --resume, got: $result"
     echo "ok: --resume <uuid> populates conversation_id on the record"
 }
@@ -7081,7 +7147,7 @@ test_resume_no_uuid_no_conversation_id() {
         CCTRL_RESUME_POLL_TIMEOUT=0 \
         "$ROOT/cctrl" start -d "$project" --resume 2>&1)"
     local result
-    result="$(jq -r '.conversation_id // empty' "$CCTRL_SESSION_METADATA_DIR/TMUX--noid-project.json" 2>/dev/null)"
+    result="$(session_record_json "TMUX--noid-project" | jq -r '.conversation_id // empty' 2>/dev/null)"
     [[ -z "$result" || "$result" == "null" ]] || fail "bare --resume should not set conversation_id, got: $result"
     echo "ok: --resume with no UUID writes no conversation_id"
 }
@@ -7099,10 +7165,196 @@ test_session_write_metadata_includes_new_fields() {
         "$ROOT/cctrl" start -d "$project" 2>&1)"
     assert_contains "$out" "detached session started"
     local meta
-    meta="$(cat "$CCTRL_SESSION_METADATA_DIR/TMUX--newfields-project.json")"
+    meta="$(session_record_json "TMUX--newfields-project")"
     printf '%s' "$meta" | jq -e 'has("conversation_id")' >/dev/null || fail "record missing conversation_id field"
     printf '%s' "$meta" | jq -e 'has("transcript_path")' >/dev/null || fail "record missing transcript_path field"
     echo "ok: _session_write_metadata emits conversation_id and transcript_path"
+}
+
+# ── Plan 058: provider-neutral task records ──────────────────────────
+
+test_task_record_host_id_is_stable_exclusive_and_private() {
+    local root="$TMPDIR/task-host-id" host_file="$TMPDIR/task-host-id/host-id" outputs="$TMPDIR/task-host-id/outputs"
+    rm -rf "$root"; mkdir -p "$root" "$outputs"
+    local -a pids=()
+    local i pid
+    for i in 1 2 3 4 5 6 7 8; do
+        (CCTRL_DATA_DIR="$root" CCTRL_HOST_ID_FILE="$host_file" cctrl_source_eval '_cctrl_host_id' > "$outputs/$i") &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" || fail "concurrent host-id creator failed"
+    done
+    [[ "$(cat "$outputs"/* | sort -u | wc -l | tr -d ' ')" == "1" ]] || fail "host-id creators did not converge on one winner"
+    [[ "$(cat "$outputs/1")" =~ ^[0-9a-f]{32}$ ]] || fail "host id has wrong format"
+    local mode
+    mode="$(stat -f %Lp "$host_file" 2>/dev/null || stat -c %a "$host_file")"
+    [[ "$mode" == "600" ]] || fail "host-id mode is $mode, expected 600"
+
+    local bad="$TMPDIR/task-host-id-bad"
+    printf 'malformed\n' > "$bad"
+    if CCTRL_HOST_ID_FILE="$bad" cctrl_source_eval '_cctrl_host_id' >/dev/null 2>&1; then
+        fail "malformed host id was accepted"
+    fi
+    rm -f "$bad"; ln -s "$host_file" "$bad"
+    if CCTRL_HOST_ID_FILE="$bad" cctrl_source_eval '_cctrl_host_id' >/dev/null 2>&1; then
+        fail "symlink host-id file was accepted"
+    fi
+    echo "ok: durable host id has exclusive winner semantics, stable value, mode 0600, and rejects malformed/symlink inputs"
+}
+
+test_task_record_schema_v2_and_provisional_promotion() {
+    local root="$TMPDIR/task-v2" meta="$TMPDIR/task-v2/meta" data="$TMPDIR/task-v2/data"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--task-v2" "/same/cwd" directory "/same/cwd" "same title" "purpose" "prompt" "cmd" "" codex "" ""'
+    local provisional record canonical
+    provisional="$(session_record_path "TMUX--task-v2" "$meta")"
+    [[ "${provisional##*/}" == launch-*.json ]] || fail "fresh launch was not provisional: $provisional"
+    record="$(cat "$provisional")"
+    printf '%s' "$record" | jq -e '
+        .schema_version == 2 and .provider == "codex" and .provider_task_id == null and
+        .origin == "cctrl" and (.host_id|type == "string") and
+        .registered_by_cctrl == true and .launched_by_cctrl == true and
+        .execution_runtime == "tmux" and .control_owner == "cctrl" and
+        .lifecycle_state == "provisional" and .restore_strategy == "tmux" and
+        (.last_observed_at|type == "string") and .tmux_session == "TMUX--task-v2" and
+        .lineage == {forked_from_id:null,parent_thread_id:null,derived_root_id:null,derived_root_basis:null} and
+        (.ownership_evidence|length == 1)
+    ' >/dev/null || fail "new launch does not satisfy schema-v2 shape"
+
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_update_metadata_field "TMUX--task-v2" conversation_id "provider/task:id?raw"'
+    canonical="$(session_record_path "TMUX--task-v2" "$meta")"
+    [[ "${canonical##*/}" =~ ^task-[0-9a-f]{64}\.json$ ]] || fail "promotion did not use a fixed digest key: $canonical"
+    [[ "${canonical##*/}" != *provider* && "${canonical##*/}" != *raw* ]] || fail "canonical filename leaked provider id"
+    [[ ! -e "$provisional" ]] || fail "provisional source was not retired after canonical commit"
+    jq -e '.provider_task_id == "provider/task:id?raw" and .conversation_id == "provider/task:id?raw" and .lifecycle_state == "active"' "$canonical" >/dev/null \
+        || fail "promotion did not persist stable identity"
+
+    local host_id key_alias_a key_alias_b key_other
+    host_id="$(jq -r '.host_id' "$canonical")"
+    # shellcheck disable=SC2016 # evaluated deliberately inside cctrl_source_eval
+    key_alias_a="$(CCTRL_HOST_PREFIX=alias-a CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_key codex "$(_cctrl_host_id)" "same-id"')"
+    # shellcheck disable=SC2016 # evaluated deliberately inside cctrl_source_eval
+    key_alias_b="$(CCTRL_HOST_PREFIX=alias-b CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_key codex "$(_cctrl_host_id)" "same-id"')"
+    # shellcheck disable=SC2016 # evaluated deliberately inside cctrl_source_eval
+    key_other="$(CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_key codex "$(_cctrl_host_id)" "different-id"')"
+    [[ "$key_alias_a" == "$key_alias_b" ]] || fail "mutable host alias changed task identity"
+    [[ "$key_alias_a" != "$key_other" ]] || fail "different provider ids collided despite matching cwd/title"
+    [[ "$host_id" =~ ^[0-9a-f]{32}$ ]] || fail "record host_id is malformed"
+    local other_data="$root/other-data" other_key
+    mkdir -p "$other_data"
+    # shellcheck disable=SC2016 # evaluated deliberately inside cctrl_source_eval
+    other_key="$(CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$other_data/host-id" cctrl_source_eval '_task_record_key codex "$(_cctrl_host_id)" "same-id"')"
+    [[ "$key_alias_a" != "$other_key" ]] || fail "different durable hosts produced the same task key"
+
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--claude-v2" /tmp directory /tmp label purpose prompt cmd "" claude "claude-session-id" ""'
+    jq -e '.provider == "claude" and .provider_task_id == "claude-session-id" and .origin == "cctrl" and .execution_runtime == "tmux"' \
+        "$(session_record_path "TMUX--claude-v2" "$meta")" >/dev/null || fail "Claude launch did not use provider-neutral v2 record"
+    echo "ok: schema-v2 launch is provisional, promotes atomically to digest identity, and ignores aliases/cwd/title"
+}
+
+test_task_record_legacy_validation_and_lazy_promotion() {
+    local root="$TMPDIR/task-legacy" meta="$TMPDIR/task-legacy/meta" data="$TMPDIR/task-legacy/data" legacy="$TMPDIR/task-legacy/meta/TMUX--legacy.json"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    cat > "$legacy" <<'JSON'
+{"name":"TMUX--legacy","agent":"codex","cctrl_managed":true,"control_surface":"app","conversation_id":"legacy-id","created_at":"2026-09-16T10:00:00Z","cwd":"/same","purpose":"same"}
+JSON
+    local before normalized canonical
+    before="$(shasum -a 256 "$legacy" | awk '{print $1}')"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    normalized="$(CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_normalize_json "$1"' "$legacy")"
+    printf '%s' "$normalized" | jq -e '
+        .schema_version == 2 and .provider == "codex" and .provider_task_id == "legacy-id" and
+        .control_owner == "unknown" and .execution_runtime == "unknown" and
+        .restore_strategy == null and .origin == "cctrl"
+    ' >/dev/null || fail "legacy app-intent record was not normalized conservatively"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    canonical="$(CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_promote_legacy "$1"' "$legacy")"
+    [[ -f "$canonical" ]] || fail "legacy promotion did not create canonical record"
+    [[ "$before" == "$(shasum -a 256 "$legacy" | awk '{print $1}')" ]] || fail "legacy compatibility input changed"
+    [[ "$(CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_session_metadata_file "TMUX--legacy"')" == "$canonical" ]] \
+        || fail "canonical-first lookup did not prefer promoted record"
+
+    printf '%s\n' '{"schema_version":3}' > "$meta/future.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_normalize_json "$1"' "$meta/future.json" >/dev/null 2>&1; then
+        fail "future schema version was accepted"
+    fi
+    jq '.schema_version="2"' "$canonical" > "$meta/wrong-type.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_normalize_json "$1"' "$meta/wrong-type.json" >/dev/null 2>&1; then
+        fail "wrong-type schema version was accepted"
+    fi
+    jq '.lineage.derived_root_id="root" | .lineage.derived_root_basis="provider-root"' "$canonical" > "$meta/bad-root.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_normalize_json "$1"' "$meta/bad-root.json" >/dev/null 2>&1; then
+        fail "provider-looking derived root basis was accepted"
+    fi
+    jq '(.ownership_evidence[0]) as $e | .ownership_evidence = [range(0;33) as $i | $e + {source:("source-" + ($i|tostring))}]' "$canonical" > "$meta/too-much-evidence.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    if CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_task_record_normalize_json "$1"' "$meta/too-much-evidence.json" >/dev/null 2>&1; then
+        fail "unbounded ownership evidence was accepted"
+    fi
+    cat > "$meta/TMUX--no-id.json" <<'JSON'
+{"name":"TMUX--no-id","agent":"codex","cctrl_managed":true,"control_surface":"tmux","conversation_id":null,"created_at":"2026-09-16T10:00:00Z"}
+JSON
+    local no_id_before
+    no_id_before="$(shasum -a 256 "$meta/TMUX--no-id.json" | awk '{print $1}')"
+    if CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_session_update_metadata_field "TMUX--no-id" purpose changed' >/dev/null 2>&1; then
+        fail "legacy mutation without stable provider identity succeeded"
+    fi
+    [[ "$no_id_before" == "$(shasum -a 256 "$meta/TMUX--no-id.json" | awk '{print $1}')" ]] || fail "identity-less legacy record was modified"
+    echo "ok: legacy normalization is conservative/read-only, promotion is lazy/canonical-first, and malformed/future schemas fail closed"
+}
+
+test_task_record_merge_conflict_preserves_evidence() {
+    local root="$TMPDIR/task-conflict" meta="$TMPDIR/task-conflict/meta" data="$TMPDIR/task-conflict/data"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--canonical" /tmp directory /tmp label purpose prompt cmd "" codex "shared-id" ""'
+    local canonical incoming
+    canonical="$(session_record_path "TMUX--canonical" "$meta")"
+    incoming="$meta/launch-interrupted.json"
+    jq '
+        .name="APP--observation" | .tmux_session=null | .origin="codex-app" |
+        .registered_by_cctrl=false | .launched_by_cctrl=false |
+        .execution_runtime="app-server" | .control_owner="app" | .restore_strategy="provider-managed" |
+        .ownership_evidence=[{source:"app-server",source_instance:"connection-1",source_cursor:"cursor-1",authority_class:"authoritative",observed_owner:"app",observed_runtime:"app-server",observed_state:"active",observed_at:"2026-09-16T11:00:00Z",reason:"thread response on app connection"}]
+    ' "$canonical" > "$incoming"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_record_promote_legacy "$1" "shared-id" >/dev/null' "$incoming"
+    jq -e '
+        .origin == "cctrl" and .provider_task_id == "shared-id" and
+        .execution_runtime == "conflict" and .control_owner == "conflict" and
+        .registered_by_cctrl == true and .launched_by_cctrl == true and
+        ([.ownership_evidence[].source] | index("cctrl-launch") != null) and
+        ([.ownership_evidence[].source] | index("app-server") != null)
+    ' "$canonical" >/dev/null || fail "no-clobber merge did not preserve canonical identity/origin and competing evidence"
+    [[ ! -e "$incoming" ]] || fail "committed interrupted-promotion source was not retired"
+    echo "ok: canonical merge is no-clobber, provenance-strengthening, and preserves authoritative conflicts"
+}
+
+test_task_record_identity_independent_close_continues() {
+    local root="$TMPDIR/task-close-no-id" meta="$TMPDIR/task-close-no-id/meta" data="$TMPDIR/task-close-no-id/data" bin="$TMPDIR/task-close-no-id/bin" log="$TMPDIR/task-close-no-id/tmux.log"
+    rm -rf "$root"; mkdir -p "$meta" "$data" "$bin"
+    make_fake_tmux "$bin/tmux"
+    : > "$log"
+    cat > "$meta/TMUX--no-provider-id.json" <<'JSON'
+{"name":"TMUX--no-provider-id","agent":"codex","cctrl_managed":true,"control_surface":"tmux","conversation_id":null,"created_at":"2026-09-16T10:00:00Z"}
+JSON
+    local before out
+    before="$(shasum -a 256 "$meta/TMUX--no-provider-id.json" | awk '{print $1}')"
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION=1 CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" session close TMUX--no-provider-id --now)"
+    assert_contains "$out" "Closed session: TMUX--no-provider-id"
+    assert_contains "$out" "Provider metadata was not updated"
+    grep -q 'kill-session' "$log" || fail "identity-independent tmux close did not run"
+    [[ "$before" == "$(shasum -a 256 "$meta/TMUX--no-provider-id.json" | awk '{print $1}')" ]] || fail "close rewrote identity-less legacy metadata"
+    echo "ok: identity-dependent provider archive refuses missing identity while identity-independent tmux close continues"
 }
 
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
@@ -7111,7 +7363,79 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_attest_live_tmux_process_matches
             test_session_attest_direct_metadata
             test_session_attest_stale_tmux_session_missing
+            test_session_attest_malformed_metadata_fails_human_mode
             test_session_runtime_mcp_attests_fixed_session
+            echo "ok"
+            exit 0
+            ;;
+        task-records)
+            test_task_record_host_id_is_stable_exclusive_and_private
+            test_task_record_schema_v2_and_provisional_promotion
+            test_task_record_legacy_validation_and_lazy_promotion
+            test_task_record_merge_conflict_preserves_evidence
+            test_task_record_identity_independent_close_continues
+            echo "ok"
+            exit 0
+            ;;
+        task-record-compat)
+            test_codex_rename_updates_app_title
+            test_codex_rename_prefers_prompt_match_over_stale_id
+            test_session_app_ls_codex_records
+            test_codex_close_archives_and_resolves_rollout_identity
+            test_session_release_to_app_quarantines_stale_codex_lock
+            test_update_metadata_field_preserves_keys
+            test_backfill_ids_fills_resume_flag
+            test_backfill_ids_idempotent
+            test_session_list_refresh_writes_on_change
+            test_session_list_refresh_skips_when_unchanged
+            echo "ok"
+            exit 0
+            ;;
+        task-record-launch)
+            test_detached_arg_parsing
+            test_start_peer_env_and_metadata
+            test_live_aware_index_picker
+            test_launch_resume_captures_conversation_id
+            test_resume_no_uuid_no_conversation_id
+            test_session_write_metadata_includes_new_fields
+            echo "ok"
+            exit 0
+            ;;
+        task-record-launch-basic)
+            test_detached_arg_parsing
+            echo "ok"
+            exit 0
+            ;;
+        task-record-launch-peer)
+            test_start_peer_env_and_metadata
+            test_live_aware_index_picker
+            echo "ok"
+            exit 0
+            ;;
+        task-record-launch-peer-only)
+            test_start_peer_env_and_metadata
+            echo "ok"
+            exit 0
+            ;;
+        task-record-launch-index)
+            test_live_aware_index_picker
+            echo "ok"
+            exit 0
+            ;;
+        task-record-launch-resume)
+            test_launch_resume_captures_conversation_id
+            test_resume_no_uuid_no_conversation_id
+            test_session_write_metadata_includes_new_fields
+            echo "ok"
+            exit 0
+            ;;
+        task-record-list)
+            test_session_list_codex_default_model
+            test_session_list_agent_not_mislabelled_by_prompt
+            test_session_list_agent_prefers_recorded_metadata
+            test_session_list_malformed_metadata_uses_unknown_defaults
+            test_session_list_refresh_writes_on_change
+            test_session_list_refresh_skips_when_unchanged
             echo "ok"
             exit 0
             ;;
@@ -7162,6 +7486,7 @@ test_session_autoheal_install_uninstall_plist
 test_session_list_codex_default_model
 test_session_list_agent_not_mislabelled_by_prompt
 test_session_list_agent_prefers_recorded_metadata
+test_session_list_malformed_metadata_uses_unknown_defaults
 test_session_list_last_active_from_updated_at
 test_session_list_last_active_from_transcript_mtime
 test_session_list_unresolvable_session
@@ -7220,6 +7545,7 @@ test_session_current_identity_json
 test_session_attest_live_tmux_process_matches
 test_session_attest_direct_metadata
 test_session_attest_stale_tmux_session_missing
+test_session_attest_malformed_metadata_fails_human_mode
 test_session_runtime_mcp_attests_fixed_session
 test_session_say_submit_and_no_submit
 test_session_say_body_file_preserves_newlines
@@ -7270,6 +7596,11 @@ test_launch_stdout_closes_promptly
 test_launch_metadata_write_warns
 test_resume_no_uuid_no_conversation_id
 test_session_write_metadata_includes_new_fields
+test_task_record_host_id_is_stable_exclusive_and_private
+test_task_record_schema_v2_and_provisional_promotion
+test_task_record_legacy_validation_and_lazy_promotion
+test_task_record_merge_conflict_preserves_evidence
+test_task_record_identity_independent_close_continues
 test_snapshot_header_and_session_shape
 test_snapshot_initial_prompt_absent
 test_snapshot_empty_fleet_guard_preserves

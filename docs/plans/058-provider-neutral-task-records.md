@@ -1,7 +1,7 @@
 ---
 id: 058
 title: Add provider-neutral task records and legacy compatibility
-status: in-progress
+status: done
 blocked-by: [057]
 priority: 58
 goal: codex-task-ownership-surfaces
@@ -9,9 +9,13 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-16
+reviewed: false
+qa: automated
 tui-fixture: n/a  # task records store tmux identifiers but never parse terminal pane text
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-16 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -102,3 +106,16 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented provider-neutral schema-v2 task records with durable host identity, digest-based canonical keys, provisional promotion, conservative legacy normalization, evidence-preserving conflict merges, and identity-aware lifecycle mutations. Updated listing, attestation, release, archive, rename, snapshot, backfill, documentation, and isolated test coverage while preserving immutable legacy records and read-only discovery behavior. The full test suite passed, and review fixes made malformed metadata fail closed without hiding live sessions. No deviations from the plan's Design section.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `docs/plans/058-provider-neutral-task-records.md` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `84ffd1f` — `feat(tasks): add provider-neutral task records`

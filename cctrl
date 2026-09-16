@@ -26,8 +26,11 @@ _peer_refresh_paths() {
 _peer_refresh_paths
 _session_refresh_paths() {
     SESSION_METADATA_DIR="${CCTRL_SESSION_METADATA_DIR:-$SCRIPT_DIR/data/sessions}"
+    CCTRL_HOST_ID_FILE="${CCTRL_HOST_ID_FILE:-${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}/host-id}"
 }
 _session_refresh_paths
+TASK_RECORD_SCHEMA_VERSION=2
+TASK_RECORD_MAX_EVIDENCE=32
 _autoheal_refresh_paths() {
     # Paths for the opt-in dead-bridge autoheal timer (plan 021). The launchd
     # agent dir is overridable (CCTRL_LAUNCH_AGENTS_DIR) so tests write a plist to
@@ -1418,17 +1421,429 @@ cmd_start() {
     _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$resume" "$resume_val" "$final_prompt" "$PWD"
 }
 
-_session_metadata_file() {
+_cctrl_host_id_read() {
+    local file="${1:-$CCTRL_HOST_ID_FILE}" value
+    [[ -e "$file" || -L "$file" ]] || return 1
+    [[ -f "$file" && ! -L "$file" ]] || {
+        echo "Invalid cctrl host-id file (must be a regular, non-symlink file): $file" >&2
+        return 1
+    }
+    value="$(tr -d '\r\n' < "$file" 2>/dev/null)"
+    [[ "$value" =~ ^[0-9a-f]{32}$ ]] || {
+        echo "Invalid cctrl host id in $file" >&2
+        return 1
+    }
+    printf '%s' "$value"
+}
+
+_cctrl_host_id() {
+    # Create-once machine identity. A hard-link publish gives concurrent
+    # creators an exclusive winner without ever replacing an existing file.
+    local file="$CCTRL_HOST_ID_FILE" dir candidate tmp i
+    if [[ -e "$file" || -L "$file" ]]; then
+        _cctrl_host_id_read "$file"
+        return $?
+    fi
+    dir="$(dirname "$file")"
+    mkdir -p "$dir" || return 1
+    candidate=""
+    if command -v openssl >/dev/null 2>&1; then
+        candidate="$(openssl rand -hex 16 2>/dev/null || true)"
+    fi
+    if ! [[ "$candidate" =~ ^[0-9a-f]{32}$ ]]; then
+        candidate="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-32 || true)"
+    fi
+    [[ "$candidate" =~ ^[0-9a-f]{32}$ ]] || return 1
+    tmp="$(mktemp "$dir/.host-id.XXXXXX")" || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    printf '%s\n' "$candidate" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if ln "$tmp" "$file" 2>/dev/null; then
+        rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+    # A losing creator can observe the winner between link(2) and write
+    # completion only on non-local filesystems. Retry briefly, never replace.
+    for i in 1 2 3 4 5; do
+        if _cctrl_host_id_read "$file" 2>/dev/null; then return 0; fi
+        sleep 0.01
+    done
+    _cctrl_host_id_read "$file"
+}
+
+_task_record_key() {
+    local provider="$1" host_id="$2" provider_task_id="$3"
+    [[ -n "$provider" && -n "$host_id" && -n "$provider_task_id" ]] || return 1
+    printf '%s\0%s\0%s' "$provider" "$host_id" "$provider_task_id" \
+        | shasum -a 256 | awk '{print "task-" $1}'
+}
+
+_task_record_file() {
+    local key path
+    key="$(_task_record_key "$1" "$2" "$3")" || return 1
+    [[ "$key" =~ ^task-[0-9a-f]{64}$ ]] || return 1
+    path="$SESSION_METADATA_DIR/$key.json"
+    case "$path" in
+        "$SESSION_METADATA_DIR"/task-*.json) printf '%s' "$path" ;;
+        *) return 1 ;;
+    esac
+}
+
+_task_record_normalize_json() {
+    # Validate schema v2 strictly and adapt a missing-version legacy task in
+    # memory. This function never rewrites its input.
+    local input="${1:--}" host_id input_tmp="" rc
+    if [[ "$input" == "-" ]]; then
+        input_tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-task-input.XXXXXX")" || return 1
+        cat > "$input_tmp"
+        input="$input_tmp"
+    fi
+    if ! host_id="$(_cctrl_host_id)"; then
+        [[ -n "$input_tmp" ]] && rm -f "$input_tmp"
+        return 1
+    fi
+    if python3 - "$input" "$host_id" "$TASK_RECORD_SCHEMA_VERSION" "$TASK_RECORD_MAX_EVIDENCE" <<'PY'
+import datetime as dt
+import json
+import re
+import sys
+
+path, host_id, wanted, max_evidence = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+try:
+    if path == "-":
+        data = json.load(sys.stdin)
+    else:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+except Exception as exc:
+    print(f"invalid task record JSON: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(data, dict):
+    print("task record must be a JSON object", file=sys.stderr)
+    raise SystemExit(1)
+
+rfc3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+origins = {"cctrl", "codex-app", "external-cli", "unknown"}
+runtimes = {"tmux", "app-server", "external-cli", "unknown", "conflict"}
+owners = {"cctrl", "app", "external", "unknown", "conflict"}
+states = {"provisional", "active", "released", "archived", "closed", "unknown", "conflict"}
+strategies = {"tmux", "provider-managed", "unknown"}
+authorities = {"authoritative", "corroborating", "diagnostic"}
+
+def nullable_string(value):
+    return value is None or isinstance(value, str)
+
+def fail(message):
+    print(f"invalid task record: {message}", file=sys.stderr)
+    raise SystemExit(1)
+
+version = data.get("schema_version")
+if version is None:
+    agent = data.get("agent")
+    provider = "claude" if agent in ("claude", "claude-code") else "codex" if agent in ("codex", "openai") else "unknown"
+    task_id = data.get("conversation_id") if isinstance(data.get("conversation_id"), str) and data.get("conversation_id") else None
+    managed = data.get("cctrl_managed") is True
+    surface = data.get("control_surface")
+    tmux = data.get("tmux_session") or data.get("name")
+    tmux = tmux if isinstance(tmux, str) and tmux else None
+    observed = data.get("created_at")
+    if not isinstance(observed, str) or not rfc3339.match(observed):
+        observed = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    terminal_receipt = managed and surface == "tmux"
+    evidence = []
+    if managed:
+        evidence.append({
+            "source": "legacy-cctrl-metadata",
+            "source_instance": data.get("name") if isinstance(data.get("name"), str) else None,
+            "source_cursor": None,
+            "authority_class": "authoritative" if terminal_receipt else "corroborating",
+            "observed_owner": "cctrl" if terminal_receipt else "unknown",
+            "observed_runtime": "tmux" if terminal_receipt else "unknown",
+            "observed_state": "active" if terminal_receipt else "unknown",
+            "observed_at": observed,
+            "reason": "legacy cctrl launch receipt" if terminal_receipt else "legacy registration without a current owner transaction",
+        })
+    normalized = dict(data)
+    normalized.update({
+        "schema_version": wanted,
+        "provider": provider,
+        "provider_task_id": task_id,
+        "origin": "cctrl" if managed else "unknown",
+        "host_id": host_id,
+        "registered_by_cctrl": managed,
+        "launched_by_cctrl": managed,
+        "execution_runtime": "tmux" if terminal_receipt else "unknown",
+        "control_owner": "cctrl" if terminal_receipt else "unknown",
+        "lifecycle_state": "active" if terminal_receipt else "unknown",
+        "restore_strategy": "tmux" if terminal_receipt and task_id else None,
+        "last_observed_at": observed,
+        "tmux_session": tmux,
+        "lineage": {"forked_from_id": None, "parent_thread_id": None, "derived_root_id": None, "derived_root_basis": None},
+        "ownership_evidence": evidence,
+    })
+    print(json.dumps(normalized, separators=(",", ":")))
+    raise SystemExit(0)
+
+if type(version) is not int:
+    fail("schema_version must be an integer")
+if version > wanted:
+    fail(f"unsupported future schema_version {version}")
+if version != wanted:
+    fail(f"unsupported task schema_version {version}; missing schema_version is the only legacy form")
+
+required_strings = ("provider", "origin", "host_id", "execution_runtime", "control_owner", "lifecycle_state", "last_observed_at")
+for field in required_strings:
+    if not isinstance(data.get(field), str) or not data[field]:
+        fail(f"{field} must be a non-empty string")
+if not nullable_string(data.get("provider_task_id")):
+    fail("provider_task_id must be a string or null")
+if not nullable_string(data.get("restore_strategy")):
+    fail("restore_strategy must be a string or null")
+if not nullable_string(data.get("tmux_session")):
+    fail("tmux_session must be a string or null")
+for field in ("registered_by_cctrl", "launched_by_cctrl"):
+    if type(data.get(field)) is not bool:
+        fail(f"{field} must be boolean")
+if data["origin"] not in origins: fail("unknown origin")
+if data["execution_runtime"] not in runtimes: fail("unknown execution_runtime")
+if data["control_owner"] not in owners: fail("unknown control_owner")
+if data["lifecycle_state"] not in states: fail("unknown lifecycle_state")
+if data.get("restore_strategy") is not None and data["restore_strategy"] not in strategies: fail("unknown restore_strategy")
+if not rfc3339.match(data["last_observed_at"]): fail("last_observed_at must be RFC 3339")
+
+lineage = data.get("lineage")
+if not isinstance(lineage, dict): fail("lineage must be an object")
+for field in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis"):
+    if not nullable_string(lineage.get(field)): fail(f"lineage.{field} must be string or null")
+if lineage.get("derived_root_id") is None and lineage.get("derived_root_basis") is not None:
+    fail("derived_root_basis requires derived_root_id")
+if lineage.get("derived_root_id") is not None and lineage.get("derived_root_basis") not in ("forked-from-traversal", "parent-thread-traversal"):
+    fail("derived roots require an explicit traversal basis")
+
+evidence = data.get("ownership_evidence")
+if not isinstance(evidence, list) or len(evidence) > max_evidence:
+    fail(f"ownership_evidence must be an array of at most {max_evidence} entries")
+for index, item in enumerate(evidence):
+    if not isinstance(item, dict): fail(f"ownership_evidence[{index}] must be an object")
+    if not isinstance(item.get("source"), str) or not item["source"]: fail("evidence source is required")
+    for field in ("source_instance", "source_cursor"):
+        if not nullable_string(item.get(field)): fail(f"evidence {field} must be string or null")
+    if item.get("authority_class") not in authorities: fail("unknown evidence authority_class")
+    if item.get("observed_owner") not in owners: fail("unknown evidence observed_owner")
+    if item.get("observed_runtime") not in runtimes: fail("unknown evidence observed_runtime")
+    if item.get("observed_state") not in states: fail("unknown evidence observed_state")
+    if not isinstance(item.get("observed_at"), str) or not rfc3339.match(item["observed_at"]): fail("evidence observed_at must be RFC 3339")
+    if not isinstance(item.get("reason"), str) or not item["reason"]: fail("evidence reason is required")
+print(json.dumps(data, separators=(",", ":")))
+PY
+    then
+        rc=0
+    else
+        rc=$?
+    fi
+    [[ -n "$input_tmp" ]] && rm -f "$input_tmp"
+    return "$rc"
+}
+
+_task_record_find_by_session() {
+    local session_name="$1" file match="" index_file referenced
+    [[ -d "$SESSION_METADATA_DIR" ]] || return 1
+    index_file="$(_session_record_index_file "$session_name")"
+    if [[ -f "$index_file" && ! -L "$index_file" ]]; then
+        referenced="$(head -1 "$index_file" 2>/dev/null || true)"
+        case "$referenced" in
+            task-*.json|launch-*.json)
+                file="$SESSION_METADATA_DIR/$referenced"
+                if [[ -f "$file" && ! -L "$file" ]] \
+                    && jq -e --arg name "$session_name" '(.schema_version == 2) and ((.tmux_session // .name // "") == $name)' "$file" >/dev/null 2>&1; then
+                    printf '%s' "$file"
+                    return 0
+                fi
+                ;;
+        esac
+    fi
+    # Canonical/provisional v2 records always beat a legacy tmux-named input.
+    for file in "$SESSION_METADATA_DIR"/task-*.json "$SESSION_METADATA_DIR"/launch-*.json; do
+        [[ -f "$file" && ! -L "$file" ]] || continue
+        if jq -e --arg name "$session_name" '(.schema_version == 2) and ((.tmux_session // .name // "") == $name)' "$file" >/dev/null 2>&1; then
+            if [[ -z "$match" || "$file" -nt "$match" ]]; then
+                match="$file"
+            fi
+        fi
+    done
+    [[ -n "$match" ]] || return 1
+    printf '%s' "$match"
+}
+
+_session_record_index_file() {
+    local digest
+    digest="$(printf '%s' "$1" | shasum -a 256 | awk '{print $1}')"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s/.session-index-%s.ref' "$SESSION_METADATA_DIR" "$digest"
+}
+
+_session_record_index_update() {
+    local session_name="$1" record_file="$2" base index_file tmp
+    [[ -n "$session_name" ]] || return 0
+    base="${record_file##*/}"
+    case "$base" in task-*.json|launch-*.json) ;; *) return 1 ;; esac
+    index_file="$(_session_record_index_file "$session_name")" || return 1
+    tmp="$(mktemp "$SESSION_METADATA_DIR/.session-index.XXXXXX")" || return 1
+    printf '%s\n' "$base" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$index_file"
+}
+
+_session_legacy_metadata_file() {
     local safe
     safe="$(printf '%s' "$1" | tr '/:' '__')"
     printf '%s/%s.json' "$SESSION_METADATA_DIR" "$safe"
+}
+
+_session_metadata_file() {
+    local session_name="$1" found legacy normalized provider task_id host_id canonical
+    found="$(_task_record_find_by_session "$session_name" 2>/dev/null || true)"
+    [[ -n "$found" ]] && { printf '%s' "$found"; return 0; }
+    legacy="$(_session_legacy_metadata_file "$session_name")"
+    if [[ -f "$legacy" && ! -L "$legacy" ]]; then
+        normalized="$(_task_record_normalize_json "$legacy" 2>/dev/null || true)"
+        if [[ -n "$normalized" ]]; then
+            provider="$(jq -r '.provider // empty' <<< "$normalized")"
+            task_id="$(jq -r '.provider_task_id // empty' <<< "$normalized")"
+            host_id="$(jq -r '.host_id // empty' <<< "$normalized")"
+            if [[ -n "$provider" && -n "$task_id" && -n "$host_id" ]]; then
+                canonical="$(_task_record_file "$provider" "$host_id" "$task_id" 2>/dev/null || true)"
+                [[ -f "$canonical" && ! -L "$canonical" ]] && { printf '%s' "$canonical"; return 0; }
+            fi
+        fi
+    fi
+    printf '%s' "$legacy"
 }
 
 _session_metadata_field() {
     local session_name="$1" field="$2" file
     file="$(_session_metadata_file "$session_name")"
     [[ -f "$file" ]] || return 0
-    jq -r --arg field "$field" '.[$field] // empty' "$file" 2>/dev/null
+    _task_record_normalize_json "$file" 2>/dev/null | jq -r --arg field "$field" '.[$field] // empty' 2>/dev/null
+}
+
+_task_record_promote_legacy() {
+    # Promote a legacy or provisional record after stable provider identity is
+    # known. The canonical write commits first; only a provisional source is
+    # retired. Legacy compatibility inputs are never modified or removed.
+    local source="$1" provider_task_id="${2:-}" normalized provider host_id canonical tmp now source_version
+    [[ -f "$source" && ! -L "$source" ]] || return 1
+    normalized="$(_task_record_normalize_json "$source")" || return 1
+    source_version="$(jq -r '.schema_version // empty' "$source" 2>/dev/null || true)"
+    provider="$(jq -r '.provider' <<< "$normalized")"
+    [[ -n "$provider_task_id" ]] || provider_task_id="$(jq -r '.provider_task_id // empty' <<< "$normalized")"
+    host_id="$(jq -r '.host_id' <<< "$normalized")"
+    [[ -n "$provider" && -n "$provider_task_id" && -n "$host_id" ]] || {
+        echo "Stable provider task identity is required before metadata mutation." >&2
+        return 1
+    }
+    if [[ "$source" == "$SESSION_METADATA_DIR"/task-*.json ]]; then
+        local existing_source_id
+        existing_source_id="$(jq -r '.provider_task_id // empty' "$source" 2>/dev/null || true)"
+        if [[ -n "$existing_source_id" && "$existing_source_id" != "$provider_task_id" ]]; then
+            echo "Refusing to re-key canonical task identity from $existing_source_id" >&2
+            return 1
+        fi
+    fi
+    canonical="$(_task_record_file "$provider" "$host_id" "$provider_task_id")" || return 1
+    if [[ "$source" == "$canonical" && "$source_version" == "$TASK_RECORD_SCHEMA_VERSION" \
+          && "$(jq -r '.provider_task_id // empty' "$source" 2>/dev/null)" == "$provider_task_id" ]]; then
+        printf '%s' "$canonical"
+        return 0
+    fi
+    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    tmp="$(mktemp "$SESSION_METADATA_DIR/.task-promote.XXXXXX")" || return 1
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    NORMALIZED_RECORD="$normalized" python3 - "$canonical" "$provider_task_id" "$now" "$TASK_RECORD_MAX_EVIDENCE" > "$tmp" <<'PY'
+import json
+import os
+import sys
+
+canonical_path, provider_task_id, now, max_evidence = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+incoming = json.loads(os.environ["NORMALIZED_RECORD"])
+incoming["provider_task_id"] = provider_task_id
+incoming["conversation_id"] = provider_task_id
+incoming["last_observed_at"] = now
+if incoming.get("lifecycle_state") == "provisional":
+    incoming["lifecycle_state"] = "active"
+evidence = list(incoming.get("ownership_evidence") or [])
+evidence.append({
+    "source": "cctrl-task-promotion",
+    "source_instance": incoming.get("provisional_launch_id") or incoming.get("tmux_session"),
+    "source_cursor": None,
+    "authority_class": "authoritative",
+    "observed_owner": incoming.get("control_owner", "unknown"),
+    "observed_runtime": incoming.get("execution_runtime", "unknown"),
+    "observed_state": incoming.get("lifecycle_state", "unknown"),
+    "observed_at": now,
+    "reason": "stable provider identity observed for an existing cctrl record",
+})
+incoming["ownership_evidence"] = evidence[-max_evidence:]
+
+try:
+    with open(canonical_path, encoding="utf-8") as handle:
+        canonical = json.load(handle)
+except FileNotFoundError:
+    canonical = None
+
+if canonical is None:
+    result = incoming
+else:
+    result = dict(incoming)
+    result.update(canonical)
+    # Immutable identity and established origin always remain canonical.
+    for field in ("schema_version", "provider", "provider_task_id", "host_id", "origin"):
+        result[field] = canonical[field]
+    authoritative = any(item.get("authority_class") == "authoritative" for item in incoming.get("ownership_evidence", []))
+    if authoritative:
+        result["registered_by_cctrl"] = bool(canonical.get("registered_by_cctrl") or incoming.get("registered_by_cctrl"))
+        result["launched_by_cctrl"] = bool(canonical.get("launched_by_cctrl") or incoming.get("launched_by_cctrl"))
+    for field in ("execution_runtime", "control_owner", "lifecycle_state"):
+        old, new = canonical.get(field, "unknown"), incoming.get(field, "unknown")
+        if old in (None, "unknown"):
+            result[field] = new
+        elif field == "lifecycle_state" and new == "provisional":
+            result[field] = old
+        elif new in (None, "unknown") or old == new:
+            result[field] = old
+        else:
+            result[field] = "conflict"
+    if canonical.get("restore_strategy") is None:
+        result["restore_strategy"] = incoming.get("restore_strategy")
+    result["tmux_session"] = canonical.get("tmux_session") or incoming.get("tmux_session")
+    old_lineage = canonical.get("lineage") or {}
+    new_lineage = incoming.get("lineage") or {}
+    result["lineage"] = {key: old_lineage.get(key) if old_lineage.get(key) is not None else new_lineage.get(key)
+                         for key in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis")}
+    combined = list(canonical.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
+    unique = []
+    seen = set()
+    for item in combined:
+        marker = json.dumps(item, sort_keys=True, separators=(",", ":"))
+        if marker not in seen:
+            seen.add(marker)
+            unique.append(item)
+    result["ownership_evidence"] = unique[-max_evidence:]
+    result["last_observed_at"] = now
+    result["conversation_id"] = result["provider_task_id"]
+print(json.dumps(result, indent=2, sort_keys=True))
+PY
+    if ! _task_record_normalize_json "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$canonical" || { rm -f "$tmp"; return 1; }
+    local indexed_session
+    indexed_session="$(jq -r '.tmux_session // .name // empty' "$canonical" 2>/dev/null || true)"
+    [[ -n "$indexed_session" ]] && _session_record_index_update "$indexed_session" "$canonical" 2>/dev/null || true
+    if [[ "$source" != "$canonical" && "$source_version" == "$TASK_RECORD_SCHEMA_VERSION" ]]; then
+        rm -f "$source" 2>/dev/null || true
+    fi
+    printf '%s' "$canonical"
 }
 
 _session_update_metadata_field() {
@@ -1436,16 +1851,82 @@ _session_update_metadata_field() {
     # Never creates a record that doesn't exist. Returns non-zero on missing
     # file or jq parse failure.
     local session_name="$1" field="$2" value="$3"
-    local file tmp
+    local file tmp version promoted stable_id
     file="$(_session_metadata_file "$session_name")"
     [[ -f "$file" ]] || return 1
+    version="$(jq -r '.schema_version // empty' "$file" 2>/dev/null || true)"
+    if [[ "$field" == "conversation_id" || "$field" == "provider_task_id" ]]; then
+        stable_id="$value"
+        if [[ "$file" == "$SESSION_METADATA_DIR"/task-*.json ]]; then
+            local existing_id
+            existing_id="$(jq -r '.provider_task_id // empty' "$file" 2>/dev/null || true)"
+            [[ -z "$existing_id" || "$existing_id" == "$stable_id" ]] || return 1
+        fi
+    else
+        stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
+    fi
+    if [[ "$version" != "$TASK_RECORD_SCHEMA_VERSION" || ( "$file" == "$SESSION_METADATA_DIR"/launch-*.json && -n "$stable_id" ) ]]; then
+        promoted="$(_task_record_promote_legacy "$file" "$stable_id")" || return 1
+        file="$promoted"
+    fi
     tmp="$(mktemp "$SESSION_METADATA_DIR/tmp.XXXXXX")" || return 1
-    if jq --arg f "$field" --arg v "$value" \
-        'if $v == "" then .[$f] = null else .[$f] = $v end' \
+    if jq --arg f "$field" --arg v "$value" --arg now "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+        'if ($f == "conversation_id" or $f == "provider_task_id") then
+             .provider_task_id = (if $v == "" then null else $v end)
+             | .conversation_id = (if $v == "" then null else $v end)
+         else .[$f] = (if $v == "" then null else $v end) end
+         | .last_observed_at = $now' \
         "$file" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$file"
+        if _task_record_normalize_json "$tmp" >/dev/null 2>&1; then
+            mv "$tmp" "$file"
+        else
+            rm -f "$tmp" 2>/dev/null
+            return 1
+        fi
     else
         rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+}
+
+_task_record_transition() {
+    local session_name="$1" runtime="$2" owner="$3" state="$4" restore="$5" source="$6" authority="$7" reason="$8"
+    local file stable_id promoted tmp now
+    file="$(_session_metadata_file "$session_name")"
+    [[ -f "$file" ]] || return 1
+    stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
+    if [[ "$(jq -r '.schema_version // empty' "$file" 2>/dev/null || true)" != "$TASK_RECORD_SCHEMA_VERSION" ]]; then
+        [[ -n "$stable_id" ]] || return 1
+        promoted="$(_task_record_promote_legacy "$file" "$stable_id")" || return 1
+        file="$promoted"
+    fi
+    tmp="$(mktemp "$SESSION_METADATA_DIR/.task-transition.XXXXXX")" || return 1
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    if jq \
+        --arg runtime "$runtime" --arg owner "$owner" --arg state "$state" \
+        --arg restore "$restore" --arg source "$source" --arg authority "$authority" \
+        --arg reason "$reason" --arg now "$now" --argjson max "$TASK_RECORD_MAX_EVIDENCE" '
+        .execution_runtime = $runtime
+        | .control_owner = $owner
+        | .lifecycle_state = $state
+        | .restore_strategy = (if $restore == "" then null else $restore end)
+        | .control_surface = (if $runtime == "tmux" then "tmux" elif $runtime == "app-server" then "app" else "unknown" end)
+        | .last_observed_at = $now
+        | .ownership_evidence = (((.ownership_evidence // []) + [{
+            source:$source,
+            source_instance:(.tmux_session // .name // null),
+            source_cursor:null,
+            authority_class:$authority,
+            observed_owner:$owner,
+            observed_runtime:$runtime,
+            observed_state:$state,
+            observed_at:$now,
+            reason:$reason
+          }]) | if length > $max then .[-$max:] else . end)
+        ' "$file" > "$tmp" 2>/dev/null && _task_record_normalize_json "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$file"
+    else
+        rm -f "$tmp"
         return 1
     fi
 }
@@ -1517,8 +1998,9 @@ _session_app_display_name() {
 _session_write_metadata() {
     local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8" peer="${9:-}" agent="${10:-}" conversation_id="${11:-}" transcript_path="${12:-}"
     mkdir -p "$SESSION_METADATA_DIR" || return 1
-    local tmp created_at host_label
-    tmp="$(mktemp)" || return 1
+    local tmp created_at host_label host_id provider lifecycle_state provider_task_id launch_id output_file
+    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    tmp="$(mktemp "$SESSION_METADATA_DIR/.task-write.XXXXXX")" || return 1
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     host_label="${CCTRL_HOST_PREFIX:-local}"
     # Persist the agent runtime so display/registry read it back rather than
@@ -1528,7 +2010,22 @@ _session_write_metadata() {
     if [[ -n "$agent" ]]; then
         agent="$(_normalize_agent "$agent" 2>/dev/null || printf '')"
     fi
+    provider="${agent:-unknown}"
+    host_id="$(_cctrl_host_id)" || { rm -f "$tmp"; return 1; }
+    provider_task_id="$conversation_id"
+    launch_id=""
+    lifecycle_state="active"
+    if [[ -n "$provider_task_id" ]]; then
+        output_file="$(_task_record_file "$provider" "$host_id" "$provider_task_id")" || { rm -f "$tmp"; return 1; }
+    else
+        lifecycle_state="provisional"
+        launch_id="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        [[ "$launch_id" =~ ^[0-9a-f-]{36}$ ]] || launch_id="$(openssl rand -hex 16 2>/dev/null || true)"
+        [[ -n "$launch_id" ]] || { rm -f "$tmp"; return 1; }
+        output_file="$SESSION_METADATA_DIR/launch-$launch_id.json"
+    fi
     jq -n \
+        --argjson schema_version "$TASK_RECORD_SCHEMA_VERSION" \
         --arg name "$session_name" \
         --arg created_at "$created_at" \
         --arg cwd "$cwd" \
@@ -1541,9 +2038,44 @@ _session_write_metadata() {
         --arg peer "$peer" \
         --arg agent "$agent" \
         --arg host "$host_label" \
+        --arg host_id "$host_id" \
+        --arg provider "$provider" \
+        --arg origin "cctrl" \
         --arg conversation_id "$conversation_id" \
         --arg transcript_path "$transcript_path" \
+        --arg lifecycle_state "$lifecycle_state" \
+        --arg launch_id "$launch_id" \
         '{
+            schema_version: $schema_version,
+            provider: $provider,
+            provider_task_id: (if $conversation_id == "" then null else $conversation_id end),
+            origin: $origin,
+            host_id: $host_id,
+            registered_by_cctrl: true,
+            launched_by_cctrl: true,
+            execution_runtime: "tmux",
+            control_owner: "cctrl",
+            lifecycle_state: $lifecycle_state,
+            restore_strategy: "tmux",
+            last_observed_at: $created_at,
+            lineage: {
+                forked_from_id: null,
+                parent_thread_id: null,
+                derived_root_id: null,
+                derived_root_basis: null
+            },
+            ownership_evidence: [{
+                source: "cctrl-launch",
+                source_instance: $name,
+                source_cursor: null,
+                authority_class: "authoritative",
+                observed_owner: "cctrl",
+                observed_runtime: "tmux",
+                observed_state: $lifecycle_state,
+                observed_at: $created_at,
+                reason: "cctrl launched the terminal writer"
+            }],
+            provisional_launch_id: (if $launch_id == "" then null else $launch_id end),
             name: $name,
             created_at: $created_at,
             cwd: $cwd,
@@ -1565,7 +2097,14 @@ _session_write_metadata() {
             pane_started: null,
             wrapper_pid: null,
             cctrl_managed: true
-        }' > "$tmp" && mv "$tmp" "$(_session_metadata_file "$session_name")"
+        }' > "$tmp" || { rm -f "$tmp"; return 1; }
+    _task_record_normalize_json "$tmp" >/dev/null 2>&1 || { rm -f "$tmp"; return 1; }
+    if [[ -n "$provider_task_id" && -f "$output_file" ]]; then
+        _task_record_promote_legacy "$tmp" "$provider_task_id" >/dev/null || { rm -f "$tmp"; return 1; }
+    else
+        mv "$tmp" "$output_file"
+    fi
+    _session_record_index_update "$session_name" "$output_file" 2>/dev/null || true
 }
 
 _prompt_tty_available() {
@@ -6441,13 +6980,24 @@ _session_attest() {
     if [[ ! -f "$file" ]]; then
         result="$(_session_attest_json false "" "$session" "" "" "" "" "" null "metadata-missing")"
     else
-        control_surface="$(jq -r '.control_surface // empty' "$file" 2>/dev/null)"
-        tmux_session="$(jq -r '.tmux_session // .name // empty' "$file" 2>/dev/null)"
-        pane_id="$(jq -r '.pane_id // empty' "$file" 2>/dev/null)"
-        expected_pid="$(jq -r '.pane_pid // .wrapper_pid // empty' "$file" 2>/dev/null)"
-        expected_started="$(jq -r '.pane_started // empty' "$file" 2>/dev/null)"
-        agent="$(jq -r '.agent // empty' "$file" 2>/dev/null)"
-        thread_id="$(jq -r '.conversation_id // empty' "$file" 2>/dev/null)"
+        local normalized_record
+        normalized_record="$(_task_record_normalize_json "$file" 2>/dev/null || true)"
+        if [[ -z "$normalized_record" ]]; then
+            result="$(_session_attest_json false "" "$session" "" "" "" "" "" null "metadata-invalid")"
+            if $json; then
+                printf '%s\n' "$result"
+            else
+                jq -r '"unverified: \(.reason // "unknown")"' <<< "$result"
+            fi
+            return 1
+        fi
+        control_surface="$(jq -r '.control_surface // (if .execution_runtime == "tmux" then "tmux" elif .execution_runtime == "app-server" then "app" else empty end)' <<< "$normalized_record")"
+        tmux_session="$(jq -r '.tmux_session // .name // empty' <<< "$normalized_record")"
+        pane_id="$(jq -r '.pane_id // empty' <<< "$normalized_record")"
+        expected_pid="$(jq -r '.pane_pid // .wrapper_pid // empty' <<< "$normalized_record")"
+        expected_started="$(jq -r '.pane_started // empty' <<< "$normalized_record")"
+        agent="$(jq -r '.agent // .provider // empty' <<< "$normalized_record")"
+        thread_id="$(jq -r '.provider_task_id // .conversation_id // empty' <<< "$normalized_record")"
         case "$control_surface" in
             direct|foreground|app)
                 result="$(_session_attest_json true "$control_surface" "$session" "" "" "" "$agent" "" null "")"
@@ -6492,6 +7042,17 @@ _session_attest() {
                 result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "control-surface-unknown" "$thread_id")"
                 ;;
         esac
+    fi
+
+    if [[ -n "${normalized_record:-}" ]]; then
+        result="$(jq --argjson task "$normalized_record" '. + {
+            task_record: ($task | {
+                schema_version, provider, provider_task_id, origin, host_id,
+                registered_by_cctrl, launched_by_cctrl, execution_runtime,
+                control_owner, lifecycle_state, restore_strategy,
+                last_observed_at, tmux_session, lineage, ownership_evidence
+            })
+        }' <<< "$result")"
     fi
 
     if $json; then
@@ -7001,16 +7562,25 @@ for path in glob.glob(os.path.join(metadata_dir, "*.json")):
             meta = json.load(f)
     except Exception:
         continue
-    if meta.get("agent") != "codex":
+    version = meta.get("schema_version")
+    if version not in (None, 2):
+        continue
+    provider = meta.get("provider") if version == 2 else meta.get("agent")
+    if provider not in ("codex", "openai"):
         continue
     name = meta.get("name") or os.path.splitext(os.path.basename(path))[0]
-    thread_id = meta.get("conversation_id")
+    thread_id = meta.get("provider_task_id") if version == 2 else meta.get("conversation_id")
     key = thread_id or f"metadata:{name}"
+    # Canonical schema-v2 records beat legacy aliases for the same provider id.
+    if key in records and records[key].get("schema_version") == 2 and version is None:
+        continue
     records[key] = {
         "name": name,
         "agent": "codex",
         "provider": "codex",
-        "runtime": "app",
+        "runtime": meta.get("execution_runtime", "unknown"),
+        "control_owner": meta.get("control_owner", "unknown"),
+        "lifecycle_state": meta.get("lifecycle_state", "unknown"),
         "source": "metadata",
         "dir": meta.get("cwd"),
         "purpose": clean_purpose(meta.get("purpose")),
@@ -7020,6 +7590,7 @@ for path in glob.glob(os.path.join(metadata_dir, "*.json")):
         "title": None,
         "archived": None,
         "updated_at": None,
+        "schema_version": version or 1,
     }
 
 threads = {}
@@ -7076,7 +7647,9 @@ if include_all:
             "name": None,
             "agent": "codex",
             "provider": "codex",
-            "runtime": "app",
+            "runtime": "unknown",
+            "control_owner": "unknown",
+            "lifecycle_state": "unknown",
             "source": "codex",
             "dir": row.get("cwd"),
             "purpose": None,
@@ -7086,6 +7659,7 @@ if include_all:
             "title": title,
             "archived": bool(row.get("archived")) if row.get("archived") is not None else False,
             "updated_at": row.get("recency_at") or row.get("updated_at") or row.get("recency_at_ms") or row.get("updated_at_ms"),
+            "schema_version": None,
         }
 
 lock_dir = os.path.join(codex_dir, "thread-writer-locks")
@@ -7093,12 +7667,18 @@ for rec in records.values():
     tid = rec.get("session_id")
     lock = os.path.join(lock_dir, f"{tid}.lock") if tid else None
     rec["writer_lock"] = bool(lock and os.path.exists(lock))
-    if rec.get("archived"):
+    if rec.get("archived") or rec.get("lifecycle_state") == "archived":
         rec["state"] = "archived"
+    elif rec.get("control_owner") == "conflict" or rec.get("runtime") == "conflict":
+        rec["state"] = "conflict"
     elif rec["writer_lock"]:
         rec["state"] = "locked"
-    else:
+    elif rec.get("control_owner") == "app":
         rec["state"] = "app-owned"
+    elif rec.get("control_owner") == "cctrl":
+        rec["state"] = "cctrl-owned"
+    else:
+        rec["state"] = "unknown"
 
 def sort_key(rec):
     return (
@@ -7447,6 +8027,7 @@ _session_list() {
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
+    local record_schema provider origin host_id registered_by_cctrl launched_by_cctrl execution_runtime control_owner lifecycle_state restore_strategy last_observed_at lineage_json evidence_json normalized_record
     for name in "${names[@]}"; do
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
@@ -7455,10 +8036,26 @@ _session_list() {
         local stored_conv_id="" stored_tpath=""
         local meta_file
         meta_file="$(_session_metadata_file "$name")"
+        purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""; stored_tpath=""
+        record_schema=""; provider=""; origin=""; host_id=""; registered_by_cctrl=false; launched_by_cctrl=false; execution_runtime=unknown; control_owner=unknown; lifecycle_state=unknown; restore_strategy=""; last_observed_at=""; lineage_json='{}'; evidence_json='[]'
         if [[ -f "$meta_file" ]]; then
-            { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r stored_tpath; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // ""), (.agent // ""), (.conversation_id // ""), (.transcript_path // "")' "$meta_file" 2>/dev/null) || true
-        else
-            purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""; stored_tpath=""
+            normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
+            if [[ -n "$normalized_record" ]]; then
+                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r stored_tpath; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.transcript_path // "")' <<< "$normalized_record" 2>/dev/null) || true
+                record_schema="$(jq -r '.schema_version // empty' <<< "$normalized_record")"
+                provider="$(jq -r '.provider // empty' <<< "$normalized_record")"
+                origin="$(jq -r '.origin // empty' <<< "$normalized_record")"
+                host_id="$(jq -r '.host_id // empty' <<< "$normalized_record")"
+                registered_by_cctrl="$(jq -r '.registered_by_cctrl // false' <<< "$normalized_record")"
+                launched_by_cctrl="$(jq -r '.launched_by_cctrl // false' <<< "$normalized_record")"
+                execution_runtime="$(jq -r '.execution_runtime // "unknown"' <<< "$normalized_record")"
+                control_owner="$(jq -r '.control_owner // "unknown"' <<< "$normalized_record")"
+                lifecycle_state="$(jq -r '.lifecycle_state // "unknown"' <<< "$normalized_record")"
+                restore_strategy="$(jq -r '.restore_strategy // empty' <<< "$normalized_record")"
+                last_observed_at="$(jq -r '.last_observed_at // empty' <<< "$normalized_record")"
+                lineage_json="$(jq -c '.lineage // {}' <<< "$normalized_record")"
+                evidence_json="$(jq -c '.ownership_evidence // []' <<< "$normalized_record")"
+            fi
         fi
         # Agent type: prefer the value recorded at spawn (authoritative — the
         # explicit --agent flag), fall back to the argv[0] sniff for sessions
@@ -7467,7 +8064,8 @@ _session_list() {
         # (not a whole-argv substring) is what stops a Claude prompt mentioning
         # codex from being classified codex.
         agent="$(_agent_from_cmd "$cmd")"
-        [[ -n "$agent_meta" ]] && agent="$agent_meta"
+        [[ -n "$agent_meta" && "$agent_meta" != "unknown" ]] && agent="$agent_meta"
+        [[ -n "$agent" && ( -z "$provider" || "$provider" == "unknown" ) ]] && provider="$agent"
         if [[ -n "$agent" ]]; then
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
             model="$(printf '%s' "$cmd" | grep -oE -- '--model(=| )[^ ]+' | head -1 | sed -E 's/^--model[= ]//' || true)"
@@ -7516,14 +8114,9 @@ _session_list() {
             session_id="$(_session_id "$name")"
             transcript="$(_session_transcript_path "$name")"
         fi
-        # Refresh conversation_id/transcript_path on the record when the live
-        # value is non-empty and differs from the stored value (plan 051).
-        if [[ -n "$session_id" && "$session_id" != "$stored_conv_id" ]]; then
-            _session_update_metadata_field "$name" conversation_id "$session_id" 2>/dev/null || true
-        fi
-        if [[ -n "$transcript" && "$transcript" != "$stored_tpath" ]]; then
-            _session_update_metadata_field "$name" transcript_path "$transcript" 2>/dev/null || true
-        fi
+        # Listing is intentionally read-only. Stable ids discovered here are
+        # returned in public JSON but are promoted only by an explicit mutation
+        # such as backfill/archive/title/release.
         last_active_ms="$(_session_last_active_ms "$name")"
         last_active_iso=""
         if [[ -n "$last_active_ms" ]]; then
@@ -7554,8 +8147,14 @@ _session_list() {
                 --arg last_active "$last_active_iso" --arg base "$base_state" \
                 --arg recap "$recap_text" --argjson want_recap "$recap" \
                 --arg display_label "$display_label" \
+                --arg schema "$record_schema" --arg provider "$provider" --arg origin "$origin" --arg host_id "$host_id" \
+                --arg execution_runtime "$execution_runtime" --arg control_owner "$control_owner" \
+                --arg lifecycle_state "$lifecycle_state" --arg restore_strategy "$restore_strategy" \
+                --arg last_observed_at "$last_observed_at" \
+                --argjson registered_by_cctrl "$registered_by_cctrl" --argjson launched_by_cctrl "$launched_by_cctrl" \
+                --argjson lineage "$lineage_json" --argjson ownership_evidence "$evidence_json" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -7726,7 +8325,7 @@ _session_release_to_app() {
     fi
 
     local name agent live_before live_after status thread_id rollout lock_state lock_action quarantine_path seconds
-    local ok lock
+    local ok lock record_file promoted
     for name in "${names[@]}"; do
         agent="$(_session_metadata_field "$name" agent)"
         [[ -n "$agent" ]] || agent="$(_agent_from_cmd "$(_session_agent_cmd "$name")")"
@@ -7750,8 +8349,18 @@ _session_release_to_app() {
             status="skipped-unsupported-agent"
         elif [[ -z "$thread_id" ]]; then
             ok=false
-            status="skipped-no-thread-id"
+            status="skipped-no-stable-provider-identity"
         else
+            record_file="$(_session_metadata_file "$name")"
+            if [[ ! -f "$record_file" ]]; then
+                ok=false
+                status="skipped-metadata-promotion-failed"
+            elif [[ "$dry_run" != "true" ]] && ! promoted="$(_task_record_promote_legacy "$record_file" "$thread_id" 2>/dev/null)"; then
+                ok=false
+                status="skipped-metadata-promotion-failed"
+            fi
+        fi
+        if [[ "$ok" == "true" ]]; then
             if [[ "$live_before" == "true" ]]; then
                 if [[ "$dry_run" == "true" ]]; then
                     status="would-release"
@@ -7792,9 +8401,12 @@ _session_release_to_app() {
                 lock_state="absent"
             fi
             if [[ "$dry_run" != "true" && "$ok" == "true" ]]; then
-                _session_update_metadata_field "$name" control_surface "app" 2>/dev/null || true
+                # Ending the tmux writer is authoritative for release, but is
+                # not evidence that the app acquired the task. Ownership and
+                # runtime therefore become unknown until an app-side event.
+                _task_record_transition "$name" unknown unknown released "" \
+                    cctrl-release authoritative "terminal writer exited; destination acquisition not observed" 2>/dev/null || true
                 _session_update_metadata_field "$name" released_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" 2>/dev/null || true
-                [[ -n "$thread_id" ]] && _session_update_metadata_field "$name" conversation_id "$thread_id" 2>/dev/null || true
             fi
         fi
 
@@ -7956,24 +8568,8 @@ _session_doctor() {
             fi
         fi
 
-        # Refresh conversation_id/transcript_path onto the record (plan 051).
-        # Doctor iterates live claude sessions, so this heals records the `ls`
-        # refresh hasn't seen yet.
-        local _dr_sid _dr_tpath _dr_stored_cid _dr_stored_tp
-        _dr_sid="$(_session_id "$name")"
-        if [[ -n "$_dr_sid" ]]; then
-            _dr_stored_cid="$(_session_metadata_field "$name" conversation_id)"
-            if [[ "$_dr_sid" != "$_dr_stored_cid" ]]; then
-                _session_update_metadata_field "$name" conversation_id "$_dr_sid" 2>/dev/null || true
-            fi
-            _dr_tpath="$(_session_transcript_path "$name")"
-            if [[ -n "$_dr_tpath" ]]; then
-                _dr_stored_tp="$(_session_metadata_field "$name" transcript_path)"
-                if [[ "$_dr_tpath" != "$_dr_stored_tp" ]]; then
-                    _session_update_metadata_field "$name" transcript_path "$_dr_tpath" 2>/dev/null || true
-                fi
-            fi
-        fi
+        # Doctor is audit-only unless --fix is supplied. In particular it does
+        # not backfill task identity while classifying bridge health.
 
         # For a MISMATCH, resolve the plan-013 sessionId and the launch target
         # from metadata so we can build the guided-relaunch command (report-only
@@ -8231,14 +8827,16 @@ _session_snapshot() {
             name="$(printf '%s' "$entry" | jq -r '.name')"
 
             # Read record fields from session metadata file
-            record_file="$SESSION_METADATA_DIR/${name}.json"
+            record_file="$(_session_metadata_file "$name")"
             cwd=""; target=""; target_kind=""; host=""; launch_command=""
             if [[ -f "$record_file" ]]; then
-                cwd="$(jq -r '.cwd // empty' "$record_file" 2>/dev/null || true)"
-                target="$(jq -r '.target // empty' "$record_file" 2>/dev/null || true)"
-                target_kind="$(jq -r '.target_kind // empty' "$record_file" 2>/dev/null || true)"
-                host="$(jq -r '.host // empty' "$record_file" 2>/dev/null || true)"
-                launch_command="$(jq -r '.launch_command // empty' "$record_file" 2>/dev/null || true)"
+                local normalized_record
+                normalized_record="$(_task_record_normalize_json "$record_file" 2>/dev/null || true)"
+                cwd="$(jq -r '.cwd // empty' <<< "$normalized_record" 2>/dev/null || true)"
+                target="$(jq -r '.target // empty' <<< "$normalized_record" 2>/dev/null || true)"
+                target_kind="$(jq -r '.target_kind // empty' <<< "$normalized_record" 2>/dev/null || true)"
+                host="$(jq -r '.host // .host_id // empty' <<< "$normalized_record" 2>/dev/null || true)"
+                launch_command="$(jq -r '.launch_command // empty' <<< "$normalized_record" 2>/dev/null || true)"
             fi
 
             # transcript_path from _session_list (key: transcript), renamed
@@ -8309,6 +8907,21 @@ _session_snapshot() {
                     peer: $entry.peer,
                     display_label: $entry.display_label,
                     conversation_id: $entry.session_id,
+                    task_record_schema_version: $entry.schema_version,
+                    provider: $entry.provider,
+                    provider_task_id: $entry.provider_task_id,
+                    origin: $entry.origin,
+                    host_id: $entry.host_id,
+                    registered_by_cctrl: $entry.registered_by_cctrl,
+                    launched_by_cctrl: $entry.launched_by_cctrl,
+                    execution_runtime: $entry.execution_runtime,
+                    control_owner: $entry.control_owner,
+                    lifecycle_state: $entry.lifecycle_state,
+                    restore_strategy: $entry.restore_strategy,
+                    last_observed_at: $entry.last_observed_at,
+                    tmux_session: $entry.name,
+                    lineage: $entry.lineage,
+                    ownership_evidence: $entry.ownership_evidence,
                     transcript_path: (if $transcript_path == "" then null else $transcript_path end),
                     transcript_bytes: $transcript_bytes,
                     cwd: (if $cwd == "" then null else $cwd end),
@@ -9636,7 +10249,9 @@ _session_close() {
     # both complete. Keep archival here, rather than in session-wrapper.sh:
     # release-to-app also ends the wrapper with EOF but deliberately preserves
     # the app task for continued use.
-    _session_archive_codex_task "$target" --quiet >/dev/null 2>&1 || true
+    local archive_result="" archive_status=""
+    archive_result="$(_session_archive_codex_task "$target" --json 2>/dev/null || true)"
+    archive_status="$(jq -r '.status // empty' <<< "$archive_result" 2>/dev/null || true)"
 
     if (( grace > 0 )); then
         local target_q
@@ -9657,6 +10272,11 @@ _session_close() {
         tmux kill-session -t "$target"
         echo -e "${GREEN}Closed session: $target${RESET}"
     fi
+    case "$archive_status" in
+        skipped-no-stable-provider-identity|skipped-metadata-promotion-failed)
+            echo -e "${DIM}Provider metadata was not updated ($archive_status); the tmux session close still completed.${RESET}"
+            ;;
+    esac
 }
 
 cmd_restart() {
@@ -9757,19 +10377,29 @@ cmd_rename() {
         return 1
     fi
 
-    # 1. Update cctrl metadata .purpose
-    local meta_file
+    # Resolve provider identity before touching legacy metadata. Schema-v2
+    # provisional records may be updated in place; a legacy input is promoted
+    # only when a stable provider id exists and is never rewritten itself.
+    local meta_file agent stable_id="" metadata_updated=false
     meta_file="$(_session_metadata_file "$target")"
+    agent="$(tmux show-option -qv -t "$target" @cctrl_agent 2>/dev/null || true)"
+    if [[ -z "$agent" || "$agent" == "1" ]]; then
+        agent="$(_session_metadata_field "$target" agent 2>/dev/null || true)"
+    fi
     if [[ -f "$meta_file" ]]; then
-        local tmp
-        tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-rename-XXXXXX")"
-        python3 -c "
-import json, sys
-with open(sys.argv[1]) as f: d = json.load(f)
-d['purpose'] = sys.argv[2]
-with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
-" "$meta_file" "$new_label" "$tmp" 2>/dev/null && mv "$tmp" "$meta_file"
-        rm -f "$tmp" 2>/dev/null
+        stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$meta_file" 2>/dev/null || true)"
+        if [[ "$agent" == "codex" ]]; then
+            local resolved_codex_id
+            resolved_codex_id="$(_session_codex_thread_id "$target" 2>/dev/null || true)"
+            [[ -n "$resolved_codex_id" ]] && stable_id="$resolved_codex_id"
+        elif [[ -z "$stable_id" && "$agent" == "claude" ]]; then
+            stable_id="$(_session_id "$target" 2>/dev/null || true)"
+        fi
+        if [[ "$(jq -r '.schema_version // empty' "$meta_file" 2>/dev/null || true)" == "$TASK_RECORD_SCHEMA_VERSION" ]]; then
+            _session_update_metadata_field "$target" purpose "$new_label" 2>/dev/null && metadata_updated=true
+        elif [[ -n "$stable_id" ]] && _task_record_promote_legacy "$meta_file" "$stable_id" >/dev/null 2>&1; then
+            _session_update_metadata_field "$target" purpose "$new_label" 2>/dev/null && metadata_updated=true
+        fi
     fi
 
     # 2. Update tmux @cctrl_purpose
@@ -9777,11 +10407,6 @@ with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
 
     # 3. For Claude Code sessions: append custom-title to transcript
     #    For Codex sessions: update the local Codex app thread title/name.
-    local agent
-    agent="$(tmux show-option -qv -t "$target" @cctrl_agent 2>/dev/null || true)"
-    if [[ -z "$agent" || "$agent" == "1" ]]; then
-        agent="$(_session_metadata_field "$target" agent 2>/dev/null || true)"
-    fi
     if [[ "$agent" == "codex" ]]; then
         local cwd display_name
         cwd="$(_session_metadata_field "$target" cwd 2>/dev/null || true)"
@@ -9806,6 +10431,9 @@ with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
         else
             echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux; no transcript found)"
         fi
+    fi
+    if [[ "$metadata_updated" != "true" && -f "$meta_file" ]]; then
+        echo -e "${DIM}Legacy provider metadata was not updated because no stable provider identity was available.${RESET}" >&2
     fi
 }
 
@@ -9848,15 +10476,7 @@ print(d.get('purpose', ''))
         if [[ -n "$claude_label" && "$claude_label" != "$meta_purpose" ]]; then
             # Update metadata
             if [[ -f "$meta_file" ]]; then
-                local tmp
-                tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-reconcile-XXXXXX")"
-                python3 -c "
-import json, sys
-with open(sys.argv[1]) as f: d = json.load(f)
-d['purpose'] = sys.argv[2]
-with open(sys.argv[3], 'w') as f: json.dump(d, f, indent=2)
-" "$meta_file" "$claude_label" "$tmp" 2>/dev/null && mv "$tmp" "$meta_file"
-                rm -f "$tmp" 2>/dev/null
+                _session_update_metadata_field "$name" purpose "$claude_label" 2>/dev/null || continue
             fi
             tmux set-option -t "$name" @cctrl_purpose "$claude_label" 2>/dev/null || true
             ((corrections++))
@@ -10068,24 +10688,25 @@ _session_archive_codex_task() {
     done
     [[ -n "$session_name" ]] || { echo -e "${RED}Usage: cctrl session archive <name> [--quiet] [--json]${RESET}" >&2; return 64; }
 
-    local agent thread_id archived=false status=""
+    local agent thread_id archived=false status="" record_file promoted
     agent="$(_session_metadata_field "$session_name" agent)"
     if [[ "$agent" != "codex" ]]; then
         status="skipped-not-codex"
     else
         thread_id="$(_session_codex_thread_id "$session_name")"
         if [[ -z "$thread_id" ]]; then
-            status="skipped-no-thread-id"
+            status="skipped-no-stable-provider-identity"
         else
-            # A live Codex rollout can be discovered before the async session
-            # listing/title sync has backfilled metadata. Persist the resolved
-            # id here so app-ls and later lifecycle commands see the same task.
-            _session_update_metadata_field "$session_name" conversation_id "$thread_id" 2>/dev/null || true
-            if ! _codex_thread_is_unarchived "$thread_id"; then
+            record_file="$(_session_metadata_file "$session_name")"
+            if [[ ! -f "$record_file" ]] || ! promoted="$(_task_record_promote_legacy "$record_file" "$thread_id" 2>/dev/null)"; then
+                status="skipped-metadata-promotion-failed"
+            elif ! _codex_thread_is_unarchived "$thread_id"; then
                 status="already-archived"
             elif _codex_set_thread_archived "$thread_id"; then
                 archived=true
                 status="archived"
+                _task_record_transition "$session_name" unknown unknown archived "" \
+                    codex-archive authoritative "provider archive mutation succeeded" 2>/dev/null || true
                 _session_update_metadata_field "$session_name" archived_at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" 2>/dev/null || true
             else
                 status="failed"
@@ -10108,18 +10729,23 @@ _session_archive_codex_task() {
 }
 
 _session_codex_set_display_name() {
-    local session_name="$1" display_name="$2" rollout thread_id
+    local session_name="$1" display_name="$2" rollout thread_id record_file promoted
     rollout="$(_session_codex_rollout_path "$session_name")"
     if [[ -n "$rollout" ]]; then
         thread_id="$(_codex_rollout_thread_id "$rollout")"
         if [[ -n "$thread_id" ]] && _codex_thread_is_unarchived "$thread_id"; then
+            record_file="$(_session_metadata_file "$session_name")"
+            [[ -f "$record_file" ]] || return 2
+            promoted="$(_task_record_promote_legacy "$record_file" "$thread_id" 2>/dev/null)" || return 2
             _codex_set_thread_title "$thread_id" "$display_name" || return $?
-            _session_update_metadata_field "$session_name" conversation_id "$thread_id" 2>/dev/null || true
             return 0
         fi
     fi
     thread_id="$(_session_metadata_field "$session_name" conversation_id)"
     if [[ -n "$thread_id" ]] && _codex_thread_is_unarchived "$thread_id"; then
+        record_file="$(_session_metadata_file "$session_name")"
+        [[ -f "$record_file" ]] || return 2
+        promoted="$(_task_record_promote_legacy "$record_file" "$thread_id" 2>/dev/null)" || return 2
         _codex_set_thread_title "$thread_id" "$display_name" && return 0
     fi
     return 2
@@ -10201,7 +10827,7 @@ _session_backfill_ids() {
     local uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     local n_filled=0 n_already=0 n_unrecoverable=0
     local -a json_items=()
-    local f name conv_id launch_cmd extracted
+    local f name conv_id launch_cmd extracted normalized provider host_id canonical
 
     for f in "$SESSION_METADATA_DIR"/*.json; do
         [[ -e "$f" ]] || continue
@@ -10219,8 +10845,21 @@ _session_backfill_ids() {
             extracted="$(printf '%s' "$launch_cmd" | grep -oE "(--resume|-r)[[:space:]]+${uuid_re}" | grep -oE "${uuid_re}" | head -1 || true)"
         fi
         if [[ -n "$extracted" ]]; then
+            normalized="$(_task_record_normalize_json "$f" 2>/dev/null || true)"
+            provider="$(jq -r '.provider // empty' <<< "$normalized" 2>/dev/null || true)"
+            host_id="$(jq -r '.host_id // empty' <<< "$normalized" 2>/dev/null || true)"
+            canonical="$(_task_record_file "$provider" "$host_id" "$extracted" 2>/dev/null || true)"
+            if [[ -n "$canonical" && -f "$canonical" ]]; then
+                n_already=$((n_already + 1))
+                $json && json_items+=("$(jq -n --arg n "$name" --arg s "already-set" --arg id "$extracted" '{name:$n,status:$s,conversation_id:$id}')")
+                continue
+            fi
             if $apply; then
-                _session_update_metadata_field "$name" conversation_id "$extracted" 2>/dev/null || true
+                _task_record_promote_legacy "$f" "$extracted" >/dev/null 2>&1 || {
+                    n_unrecoverable=$((n_unrecoverable + 1))
+                    $json && json_items+=("$(jq -n --arg n "$name" --arg s "unrecoverable" '{name:$n,status:$s,conversation_id:null}')")
+                    continue
+                }
             fi
             n_filled=$((n_filled + 1))
             $json && json_items+=("$(jq -n --arg n "$name" --arg s "filled" --arg id "$extracted" '{name:$n,status:$s,conversation_id:$id}')")

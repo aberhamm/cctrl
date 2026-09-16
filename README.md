@@ -211,9 +211,11 @@ cctrl session app-ls
 `release-to-app` sends EOF to the tmux session, waits for it to exit, preserves
 the unarchived Codex app task and cctrl metadata record, and quarantines only
 stale Codex writer locks that no live tmux session or Codex process appears to
-own. It is the explicit path for continuing work in the app; `app-ls` is the
-experimental app-owned Codex view, while `session ls` remains the default live
-tmux view.
+own. A successful release proves that the terminal writer ended; it does **not**
+prove that the app acquired the task. The task record therefore reports an
+unknown owner/runtime until an authoritative app-side event is observed.
+`app-ls` is the experimental Codex task view, while `session ls` remains the
+default live tmux view.
 
 ```bash
 cctrl start ~/dev/myapp           # tmux-backed; prompts to connect in a TTY
@@ -438,17 +440,46 @@ detach. Restore itself never captures panes or injects keystrokes.
 `launch_flags` back onto the spawn argv. A third of the fleet runs with
 explicit `--model`; without replay every session comes back on defaults.
 
-#### Persisted conversation_id
+#### Provider-neutral task records
 
-Each session record (`data/sessions/*.json`) carries a `conversation_id` field
-(Claude's `sessionId` / transcript UUID) that survives process death. It is
-populated at launch time for `--resume` launches, and by a best-effort background
-poll for fresh launches. `session ls` and `session doctor` refresh the stored
-value whenever they observe a non-empty live value that differs from the record.
+New records in `data/sessions/` use task schema version 2. They separate stable
+identity (`provider`, `provider_task_id`, `host_id`, and immutable `origin`) from
+the mutable runtime, control owner, lifecycle state, and restore strategy. A
+bounded `ownership_evidence` array records where each claim came from and its
+authority class; competing authoritative claims produce `conflict` rather than
+letting timestamps pick a winner. Fork ancestry and subagent ancestry are kept
+separate in `lineage.forked_from_id` and `lineage.parent_thread_id`. Any
+`derived_root_id` is explicitly labeled as traversal-derived, never as a
+provider-exposed root field.
 
-Records created before this field existed, and sessions whose conversation could
-not be resolved, carry `conversation_id: null`. A companion `transcript_path`
-field records the transcript file location.
+`host_id` is a durable random machine id stored in `data/host-id` (override with
+`CCTRL_HOST_ID_FILE`). The file is created once with mode `0600`; symlinks,
+non-regular files, and malformed ids are rejected. Canonical filenames are
+fixed-format SHA-256 digests of provider, host id, and provider task id, so raw
+provider ids, cwd values, titles, and mutable host aliases never enter the path.
+A fresh launch with no provider id starts as `launch-<id>.json` and is promoted
+atomically once identity is observed.
+
+During the schema-v2 compatibility period, public JSON and stored records retain
+legacy keys such as `conversation_id`, `cctrl_managed`, and `control_surface`.
+Those keys are compatibility aliases, not ownership proof:
+`cctrl_managed:true` does not mean app-owned, and `control_surface:"app"` in an
+old record may describe release intent rather than observed acquisition. Removal
+of these keys requires a separately reviewed future schema version.
+
+Records without `schema_version` remain immutable legacy inputs. Reads normalize
+them in memory and prefer an existing canonical v2 record. An explicit mutation
+promotes only a record with a stable provider id; the legacy file is left
+untouched. `session ls` and `session doctor` are intentionally read-only and no
+longer backfill metadata as a side effect. Identity-dependent operations such as
+archive, app release, and Codex title updates refuse records without stable
+provider identity, while an identity-independent tmux close still completes and
+reports that provider metadata was not updated.
+
+`conversation_id` remains the compatibility name for `provider_task_id`
+(Claude's `sessionId` / transcript UUID). Records whose provider identity has
+not appeared yet carry both values as `null`; `transcript_path` remains the
+compatibility location for a Claude transcript.
 
 ```bash
 cctrl session backfill-ids              # preview: show what would be filled (dry-run, default)
@@ -459,8 +490,10 @@ cctrl session backfill-ids --json       # structured output with per-record stat
 `backfill-ids` operates on all session records (live and dead). It extracts
 conversation UUIDs only from `--resume`/`-r` flags in the record's
 `launch_command`, never from bare UUIDs that may appear elsewhere (e.g. in
-scratchpad paths). Records with no recoverable UUID remain `null`. The verb
-reports three counts: filled, already-set, and unrecoverable.
+scratchpad paths). With `--apply`, a recoverable legacy record is lazily
+promoted to its canonical digest-keyed v2 record; the legacy input remains
+byte-for-byte unchanged. Records with no recoverable UUID remain unpromoted.
+The verb reports three counts: filled, already-set, and unrecoverable.
 
 #### The low-memory launch guard
 
