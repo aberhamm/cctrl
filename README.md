@@ -533,6 +533,37 @@ reports that provider metadata was not updated.
 not appeared yet carry both values as `null`; `transcript_path` remains the
 compatibility location for a Claude transcript.
 
+Refresh registered Codex ownership from live evidence with:
+
+```bash
+cctrl session reconcile-codex --dry-run --json  # proposal only; no writes
+cctrl session reconcile-codex --json            # digest-guarded registry events
+```
+
+One pass snapshots the registry, App Server, tmux, process table, and writer
+lock directory once each, then joins only exact provider task ids. A live,
+anchored cctrl tmux writer wins when App Server confirms absence; an explicit
+live App Server owner wins when tmux confirms absence; simultaneous claims are
+`conflict`. Available but inconclusive authority becomes `unknown`. If an
+authoritative source is unavailable or times out, reconciliation preserves the
+last owner and records stale/error evidence instead of treating failure as
+absence. Lock presence, cwd, title, recency, hooks, and argv matches remain
+corroborating or diagnostic and never select an owner.
+
+The command is non-destructive: it never sends EOF, kills a process, moves a
+writer lock, archives a task, changes provider settings, or rewrites immutable
+origin/launch provenance or lineage. The default waits until the complete
+evidence/result document exists before applying registry-only events; each
+event carries the canonical record digest so a concurrent hook or handoff makes
+the pass stale rather than overwriting newer state. Exit `0` means the proposal
+was built (and, outside dry-run, applied); `64` is usage, `65` is snapshot
+construction failure, and `75` means at least one registry CAS was rejected.
+
+`cctrl session reconcile` remains a deprecated alias for the legacy
+doctor-oriented flow and may inherit doctor repair flags. It is intentionally
+separate from `reconcile-codex`; use `session doctor --fix` only when destructive
+bridge/lock repair is actually intended.
+
 ```bash
 cctrl session backfill-ids              # preview: show what would be filled (dry-run, default)
 cctrl session backfill-ids --apply      # actually write the backfilled ids

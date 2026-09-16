@@ -9,6 +9,8 @@ importing this module or running ``capabilities`` never calls them.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
 import json
 import os
 import queue
@@ -849,6 +851,87 @@ def capability_report(
         return report, EXIT_INTERNAL
 
 
+def thread_snapshot_report(
+    *,
+    executable_override: str | None,
+    timeouts: Timeouts,
+) -> tuple[dict[str, Any], int]:
+    """Read the App Server thread inventory through one connection.
+
+    Reconciliation consumes this as a single indexed source snapshot.  The
+    adapter deliberately returns the provider response without inferring a
+    writer: only explicit runtime/ownership fields may become authoritative in
+    the caller.
+    """
+
+    observed_at = (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "unavailable",
+        "observed_at": observed_at,
+        "source_cursor": None,
+        "threads": [],
+        "errors": [],
+    }
+    runtime: Runtime | None = None
+    try:
+        runtime = discover_runtime(executable_override, validation_timeout=timeouts.connect)
+        with AppServerClient(
+            runtime,
+            socket_path=os.environ.get("CCTRL_CODEX_APP_SERVER_SOCKET") or None,
+            timeouts=timeouts,
+        ) as client:
+            client.initialize()
+            threads: list[dict[str, Any]] = []
+            next_cursor: str | None = None
+            seen_cursors: set[str] = set()
+            for _page in range(100):
+                params: dict[str, Any] = {"limit": 1_000}
+                if next_cursor is not None:
+                    params["cursor"] = next_cursor
+                result = client.thread_list(params)
+                if not isinstance(result, dict):
+                    raise AdapterError(EXIT_PROTOCOL, "request", "thread/list result must be an object")
+                page = result.get("data", result.get("threads"))
+                if not isinstance(page, list) or any(not isinstance(item, dict) for item in page):
+                    raise AdapterError(EXIT_PROTOCOL, "request", "thread/list result has no thread array")
+                threads.extend(page)
+                raw_cursor = result.get("nextCursor")
+                if raw_cursor is None:
+                    break
+                if not isinstance(raw_cursor, str) or not raw_cursor or raw_cursor in seen_cursors:
+                    raise AdapterError(EXIT_PROTOCOL, "request", "thread/list returned an invalid pagination cursor")
+                seen_cursors.add(raw_cursor)
+                next_cursor = raw_cursor
+            else:
+                raise AdapterError(EXIT_PROTOCOL, "request", "thread/list exceeded the 100-page snapshot limit")
+        snapshot_cursor = hashlib.sha256(
+            json.dumps(threads, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        ).hexdigest()
+        report.update(
+            {
+                "status": "available",
+                "source_cursor": snapshot_cursor,
+                "complete": True,
+                "threads": threads,
+                "runtime_facts": dict(client.runtime_facts),
+            }
+        )
+        return report, 0
+    except AdapterError as exc:
+        report["errors"].append(exc.as_dict())
+        return report, exc.exit_code
+    except Exception as exc:
+        error = AdapterError(EXIT_INTERNAL, "internal", f"unexpected adapter failure: {exc}")
+        report["errors"].append(error.as_dict())
+        return report, EXIT_INTERNAL
+
+
 def _human_report(report: Mapping[str, Any]) -> str:
     lines = [
         f"Codex CLI: {report.get('cli_version') or 'unknown'}",
@@ -907,6 +990,33 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         default=os.environ.get("CCTRL_CODEX_INACTIVITY_TIMEOUT", "10"),
     )
+    threads = subparsers.add_parser(
+        "threads",
+        help="capture one read-only App Server thread snapshot",
+        description="Capture a single indexed App Server thread inventory without mutating tasks.",
+    )
+    threads.add_argument("--json", action="store_true", help="emit codex_app_server_snapshot_v1 JSON")
+    threads.add_argument("--codex", help=argparse.SUPPRESS)
+    threads.add_argument(
+        "--connect-timeout",
+        type=_positive_float,
+        default=os.environ.get("CCTRL_CODEX_CONNECT_TIMEOUT", "3"),
+    )
+    threads.add_argument(
+        "--handshake-timeout",
+        type=_positive_float,
+        default=os.environ.get("CCTRL_CODEX_HANDSHAKE_TIMEOUT", "5"),
+    )
+    threads.add_argument(
+        "--request-timeout",
+        type=_positive_float,
+        default=os.environ.get("CCTRL_CODEX_REQUEST_TIMEOUT", "15"),
+    )
+    threads.add_argument(
+        "--inactivity-timeout",
+        type=_positive_float,
+        default=os.environ.get("CCTRL_CODEX_INACTIVITY_TIMEOUT", "10"),
+    )
     return parser
 
 
@@ -939,6 +1049,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.stdout.write("\n")
         else:
             print(_human_report(report))
+        return exit_code
+    if args.command == "threads":
+        timeouts = Timeouts(
+            connect=args.connect_timeout,
+            handshake=args.handshake_timeout,
+            request=args.request_timeout,
+            inactivity=args.inactivity_timeout,
+        )
+        report, exit_code = thread_snapshot_report(
+            executable_override=args.codex or os.environ.get("CCTRL_CODEX_BIN") or None,
+            timeouts=timeouts,
+        )
+        if args.json:
+            json.dump(report, sys.stdout, sort_keys=True, separators=(",", ":"))
+            sys.stdout.write("\n")
+        else:
+            print(
+                f"App Server thread snapshot: {report['status']} "
+                f"({len(report['threads'])} thread(s))"
+            )
+            for error in report["errors"]:
+                print(f"Error [{error['phase']}]: {error['reason']}", file=sys.stderr)
         return exit_code
     return EXIT_USAGE
 

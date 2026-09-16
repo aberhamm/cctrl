@@ -7349,13 +7349,427 @@ with open(path, "wb") as handle:
     return "$rc"
 }
 
+_session_reconcile_codex() {
+    # Non-destructive ownership reconciliation. Every external source is
+    # captured exactly once before any registry event is applied.
+    local json=false dry_run=false scratch observed_at pass_id app_rc=0 tmux_rc=0 ps_rc=0
+    local registry_file app_file tmux_file process_file locks_file result_file events_file
+    local apply_rc=0 record_key event_path result status
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            -h|--help)
+                echo "Usage: cctrl session reconcile-codex [--json] [--dry-run]"
+                echo ""
+                echo "Build one read-only ownership evidence snapshot for registered Codex tasks."
+                echo "The default applies only digest-guarded cctrl registry reconcile events;"
+                echo "--dry-run writes nothing and emits the same proposed result document."
+                echo ""
+                echo "This is separate from deprecated 'cctrl session reconcile', the legacy"
+                echo "doctor-oriented alias. It never fixes bridges, stops processes, moves locks,"
+                echo "archives tasks, changes provider settings, or rewrites origin/lineage."
+                echo ""
+                echo "Exit codes: 0 success; 64 usage; 65 snapshot construction failure;"
+                echo "            75 one or more digest-guarded registry events were rejected."
+                return 0
+                ;;
+            *) echo -e "${RED}Unknown reconcile-codex flag: $1${RESET}" >&2; return 64 ;;
+        esac
+    done
+
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-reconcile-codex.XXXXXX")" || return 65
+    registry_file="$scratch/registry.json"
+    app_file="$scratch/app-server.json"
+    tmux_file="$scratch/tmux.json"
+    process_file="$scratch/processes.json"
+    locks_file="$scratch/writer-locks.json"
+    result_file="$scratch/result.json"
+    events_file="$scratch/events.jsonl"
+    observed_at="${CCTRL_CODEX_RECONCILE_OBSERVED_AT:-$(date -u +"%Y-%m-%dT%H:%M:%SZ")}"
+    pass_id="${CCTRL_CODEX_RECONCILE_PASS_ID:-$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')}"
+    if ! [[ "$pass_id" =~ ^[A-Za-z0-9._:-]{8,128}$ ]]; then
+        rm -rf "$scratch"
+        echo "Invalid reconciliation pass id" >&2
+        return 65
+    fi
+
+    # Registry snapshot: one directory enumeration and one read per record.
+    if ! python3 - "$SESSION_METADATA_DIR" "$CCTRL_HOST_ID_FILE" "$observed_at" > "$registry_file" <<'PY'
+import hashlib, json, re, sys
+from pathlib import Path
+
+root, host_id_path, observed_at = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+records, errors = [], []
+paths=sorted(root.glob("task-*.json")) if root.is_dir() else []
+local_host_id=None
+if paths:
+    if host_id_path.is_symlink() or not host_id_path.is_file():
+        raise ValueError("local host id is unavailable")
+    local_host_id=host_id_path.read_text(encoding="utf-8").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}",local_host_id):
+        raise ValueError("local host id is malformed")
+for path in paths:
+    if path.is_symlink():
+        errors.append({"path": path.name, "error": "symlink-refused"})
+        continue
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw)
+    except Exception as exc:
+        errors.append({"path": path.name, "error": f"invalid-record:{exc}"})
+        continue
+    if not isinstance(value, dict) or value.get("schema_version") != 2:
+        errors.append({"path": path.name, "error": "unsupported-record-schema"})
+        continue
+    if value.get("provider") != "codex" or not isinstance(value.get("provider_task_id"), str) or not value["provider_task_id"]:
+        continue
+    if value.get("host_id") != local_host_id:
+        continue
+    identity=("codex\0"+local_host_id+"\0"+value["provider_task_id"]).encode()
+    if path.stem != "task-"+hashlib.sha256(identity).hexdigest():
+        errors.append({"path":path.name,"error":"noncanonical-record-key"})
+        continue
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    records.append({"record_key": path.stem, "record": value, "digest": hashlib.sha256(canonical).hexdigest()})
+cursor_body = json.dumps(records, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+print(json.dumps({
+    "schema_version": 1, "status": "available", "observed_at": observed_at,
+    "source_cursor": hashlib.sha256(cursor_body).hexdigest(), "records": records, "errors": errors,
+}, sort_keys=True, separators=(",", ":")))
+PY
+    then
+        rm -rf "$scratch"
+        return 65
+    fi
+
+    # App Server snapshot: one adapter process and one App Server connection.
+    if [[ -n "${CCTRL_CODEX_RECONCILE_APP_SERVER_FILE:-}" ]]; then
+        cp "$CCTRL_CODEX_RECONCILE_APP_SERVER_FILE" "$app_file" || app_rc=$?
+    elif [[ -n "${CCTRL_CODEX_RECONCILE_APP_SERVER_JSON:-}" ]]; then
+        printf '%s\n' "$CCTRL_CODEX_RECONCILE_APP_SERVER_JSON" > "$app_file"
+    else
+        python3 "$SCRIPT_DIR/lib/codex_app_server.py" threads --json > "$app_file" || app_rc=$?
+    fi
+    if ! jq -e 'type == "object" and (.status | type == "string")' "$app_file" >/dev/null 2>&1; then
+        jq -n --arg at "$observed_at" --arg error "app-server-snapshot-failed (exit $app_rc)" \
+            '{schema_version:1,status:"unavailable",observed_at:$at,source_cursor:null,threads:[],errors:[{reason:$error}]}' > "$app_file"
+    fi
+
+    # tmux snapshot: one list-panes invocation, never one query per task.
+    if [[ -n "${CCTRL_CODEX_RECONCILE_TMUX_FILE:-}" ]]; then
+        cp "$CCTRL_CODEX_RECONCILE_TMUX_FILE" "$tmux_file" || tmux_rc=$?
+    elif [[ -n "${CCTRL_CODEX_RECONCILE_TMUX_JSON:-}" ]]; then
+        printf '%s\n' "$CCTRL_CODEX_RECONCILE_TMUX_JSON" > "$tmux_file"
+    elif command -v tmux >/dev/null 2>&1; then
+        tmux list-panes -a -F '#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}\t#{pane_current_command}' > "$scratch/tmux.tsv" 2>"$scratch/tmux.err" || tmux_rc=$?
+        python3 - "$scratch/tmux.tsv" "$scratch/tmux.err" "$observed_at" "$tmux_rc" > "$tmux_file" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+rows_path, error_path, observed_at, rc = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+rows = []
+if rc == 0:
+    for line in rows_path.read_text(errors="replace").splitlines():
+        fields = line.split("\t", 4)
+        if len(fields) == 5:
+            rows.append(dict(zip(("session", "pane_id", "pane_pid", "start_command", "current_command"), fields)))
+body = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+error = error_path.read_text(errors="replace").strip() if rc else None
+print(json.dumps({"schema_version":1,"status":"available" if rc == 0 else "unavailable",
+ "observed_at":observed_at,"source_cursor":hashlib.sha256(body).hexdigest() if rc == 0 else None,
+ "panes":rows,"error":error}, sort_keys=True,separators=(",",":")))
+PY
+    else
+        jq -n --arg at "$observed_at" '{schema_version:1,status:"unavailable",observed_at:$at,source_cursor:null,panes:[],error:"tmux-not-found"}' > "$tmux_file"
+    fi
+    if (( tmux_rc != 0 )) && ! jq -e 'type == "object"' "$tmux_file" >/dev/null 2>&1; then
+        jq -n --arg at "$observed_at" '{schema_version:1,status:"unavailable",observed_at:$at,source_cursor:null,panes:[],error:"tmux-snapshot-failed"}' > "$tmux_file"
+    fi
+
+    # Process snapshot: one ps invocation for the whole pass.
+    if [[ -n "${CCTRL_CODEX_RECONCILE_PROCESS_FILE:-}" ]]; then
+        cp "$CCTRL_CODEX_RECONCILE_PROCESS_FILE" "$process_file" || ps_rc=$?
+    elif [[ -n "${CCTRL_CODEX_RECONCILE_PROCESS_JSON:-}" ]]; then
+        printf '%s\n' "$CCTRL_CODEX_RECONCILE_PROCESS_JSON" > "$process_file"
+    else
+        ps -axo pid=,ppid=,lstart=,command= > "$scratch/processes.txt" 2>"$scratch/processes.err" || ps_rc=$?
+        python3 - "$scratch/processes.txt" "$scratch/processes.err" "$observed_at" "$ps_rc" > "$process_file" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+rows_path, error_path, observed_at, rc = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+rows = []
+if rc == 0:
+    for line in rows_path.read_text(errors="replace").splitlines():
+        fields = line.strip().split(None, 7)
+        if len(fields) == 8 and fields[0].isdigit() and fields[1].isdigit():
+            rows.append({"pid":int(fields[0]),"ppid":int(fields[1]),"started":" ".join(fields[2:7]),"command":fields[7]})
+body=json.dumps(rows,sort_keys=True,separators=(",",":")).encode()
+error=error_path.read_text(errors="replace").strip() if rc else None
+print(json.dumps({"schema_version":1,"status":"available" if rc == 0 else "unavailable",
+ "observed_at":observed_at,"source_cursor":hashlib.sha256(body).hexdigest() if rc == 0 else None,
+ "processes":rows,"error":error},sort_keys=True,separators=(",",":")))
+PY
+    fi
+    if (( ps_rc != 0 )) && ! jq -e 'type == "object"' "$process_file" >/dev/null 2>&1; then
+        jq -n --arg at "$observed_at" '{schema_version:1,status:"unavailable",observed_at:$at,source_cursor:null,processes:[],error:"process-snapshot-failed"}' > "$process_file"
+    fi
+
+    # Writer locks are diagnostic only. Enumerate the directory once.
+    python3 - "$CODEX_DIR/thread-writer-locks" "$observed_at" > "$locks_file" <<'PY'
+import hashlib, json, sys
+from pathlib import Path
+root, observed_at = Path(sys.argv[1]), sys.argv[2]
+locks, error, status = [], None, "available"
+try:
+    if root.is_dir():
+        for path in sorted(root.iterdir()):
+            if path.is_file() and not path.is_symlink() and path.name.endswith(".lock"):
+                stat = path.stat()
+                locks.append({"provider_task_id":path.name[:-5],"name":path.name,"size":stat.st_size,"mtime_ns":stat.st_mtime_ns})
+except Exception as exc:
+    status, error = "unavailable", str(exc)
+body=json.dumps(locks,sort_keys=True,separators=(",",":")).encode()
+print(json.dumps({"schema_version":1,"status":status,"observed_at":observed_at,
+ "source_cursor":hashlib.sha256(body).hexdigest() if status == "available" else None,
+ "locks":locks,"error":error},sort_keys=True,separators=(",",":")))
+PY
+
+    # Join exact provider ids and build every proposed event before applying any.
+    if ! python3 - "$registry_file" "$app_file" "$tmux_file" "$process_file" "$locks_file" \
+        "$pass_id" "$observed_at" "$result_file" "$events_file" <<'PY'
+import hashlib, json, os, re, sys
+from pathlib import Path
+
+registry_path, app_path, tmux_path, process_path, locks_path, pass_id, observed_at, result_path, events_path = sys.argv[1:]
+def load(path):
+    with open(path, encoding="utf-8") as handle:
+        value=json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"snapshot is not an object: {path}")
+    return value
+registry, app, tmux, processes, locks = map(load, (registry_path, app_path, tmux_path, process_path, locks_path))
+
+def normalize_snapshot(snapshot, array_field, *, require_complete=False):
+    status=snapshot.get("status")
+    malformed=status not in {"available","unavailable"}
+    if status == "available" and not isinstance(snapshot.get(array_field),list): malformed=True
+    if require_complete and status == "available" and snapshot.get("complete") is False: malformed=True
+    if malformed:
+        snapshot["status"]="unavailable"
+        snapshot[array_field]=[]
+        errors=snapshot.get("errors") if isinstance(snapshot.get("errors"),list) else []
+        errors.append({"reason":f"malformed-or-incomplete-{array_field}-snapshot"})
+        snapshot["errors"]=errors
+
+if not isinstance(registry.get("records"),list):
+    raise ValueError("registry snapshot has no records array")
+normalize_snapshot(app,"threads",require_complete=True)
+normalize_snapshot(tmux,"panes")
+normalize_snapshot(processes,"processes")
+normalize_snapshot(locks,"locks")
+
+def cursor(source): return source.get("source_cursor")
+def err(source):
+    value=source.get("error") or source.get("errors")
+    return value if value else None
+def source(status, confidence, snapshot, matches=None, error=None):
+    return {"status":status,"confidence":confidence,"source_cursor":cursor(snapshot),
+            "matches":matches or [],"error":error if error is not None else err(snapshot)}
+
+app_threads={}
+for item in app.get("threads", []):
+    if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
+        app_threads[item["id"]]=item
+app_task_errors=app.get("task_errors") if isinstance(app.get("task_errors"), dict) else {}
+panes=tmux.get("panes") if isinstance(tmux.get("panes"), list) else []
+proc_rows=processes.get("processes") if isinstance(processes.get("processes"), list) else []
+lock_ids={item.get("provider_task_id") for item in locks.get("locks", []) if isinstance(item, dict)}
+children={}
+for item in proc_rows:
+    if isinstance(item,dict) and type(item.get("pid")) is int and type(item.get("ppid")) is int:
+        children.setdefault(item["ppid"],[]).append(item)
+def descendants(pid):
+    found=[]; stack=list(children.get(pid,[])); seen=set()
+    while stack:
+        item=stack.pop(); child=item["pid"]
+        if child in seen: continue
+        seen.add(child); found.append(item); stack.extend(children.get(child,[]))
+    return found
+def codex_command(command):
+    if not isinstance(command,str): return False
+    first=command.strip().split(None,1)[0] if command.strip() else ""
+    return os.path.basename(first) == "codex" or bool(re.search(r"(?:^|[ /])codex(?: |$)",command))
+def app_claim(item):
+    if not isinstance(item,dict): return False
+    owner=item.get("control_owner",item.get("controlOwner"))
+    runtime=item.get("execution_runtime",item.get("executionRuntime"))
+    state=item.get("runtime_state",item.get("runtimeState",item.get("status")))
+    active=item.get("active") is True or str(state).lower() in {"active","running","writing","open"}
+    return owner == "app" or (runtime == "app-server" and active)
+
+results=[]; event_rows=[]; global_errors=list(registry.get("errors") or [])
+for entry in registry.get("records", []):
+    record=entry["record"]; task_id=record["provider_task_id"]; digest=entry["digest"]
+    previous={k:record.get(k) for k in ("control_owner","execution_runtime","lifecycle_state","restore_strategy")}
+    # App Server: inventory without an explicit live runtime fact is ambiguous,
+    # never an ownership claim.
+    if task_id in app_task_errors:
+        app_source=source("unavailable","authoritative",app,error=app_task_errors[task_id])
+        app_live=False
+    elif app.get("status") != "available":
+        app_source=source("unavailable","authoritative",app)
+        app_live=False
+    elif task_id not in app_threads:
+        app_source=source("confirmed-absence","authoritative",app)
+        app_live=False
+    elif app_claim(app_threads[task_id]):
+        app_source=source("claimed","authoritative",app,[task_id])
+        app_live=True
+    else:
+        app_source=source("ambiguous","authoritative",app,[task_id],"inventory has no explicit live app-owner fact")
+        app_live=False
+
+    tmux_name=record.get("tmux_session")
+    exact_panes=[p for p in panes if isinstance(p,dict) and p.get("session") == tmux_name] if tmux_name else []
+    tmux_live=False
+    if tmux.get("status") != "available":
+        tmux_source=source("unavailable","authoritative",tmux)
+    elif not exact_panes:
+        tmux_source=source("confirmed-absence","authoritative",tmux)
+    elif record.get("launched_by_cctrl") is not True:
+        tmux_source=source("ambiguous","authoritative",tmux,[p.get("session") for p in exact_panes],"live name lacks a cctrl launch receipt")
+    elif not record.get("pane_id") or not record.get("pane_pid"):
+        tmux_source=source("ambiguous","authoritative",tmux,[p.get("session") for p in exact_panes],"cctrl launch receipt has no pane identity anchor")
+    else:
+        for pane in exact_panes:
+            pane_pid=str(pane.get("pane_pid", ""))
+            anchored=pane.get("pane_id") == record.get("pane_id") and pane_pid == str(record.get("pane_pid"))
+            proc_match=codex_command(pane.get("current_command"))
+            if pane_pid.isdigit(): proc_match=proc_match or any(codex_command(p.get("command")) for p in descendants(int(pane_pid)))
+            if anchored and proc_match: tmux_live=True; break
+        tmux_source=source("claimed" if tmux_live else "ambiguous","authoritative",tmux,[p.get("session") for p in exact_panes],None if tmux_live else "pane exists but exact anchored Codex writer is unproved")
+
+    argv_matches=[str(p.get("pid")) for p in proc_rows if isinstance(p,dict) and task_id in str(p.get("command", ""))]
+    process_source=source("corroborated" if argv_matches else "confirmed-absence","diagnostic",processes,argv_matches)
+    lock_source=source("corroborated" if task_id in lock_ids else "confirmed-absence","diagnostic",locks,[task_id] if task_id in lock_ids else [])
+    sources={"registry":source("available","authoritative",registry,[entry["record_key"]]),"app_server":app_source,"tmux":tmux_source,"process_table":process_source,"writer_locks":lock_source}
+
+    authority_unavailable=app_source["status"] == "unavailable" or tmux_source["status"] == "unavailable"
+    authority_ambiguous=app_source["status"] == "ambiguous" or tmux_source["status"] == "ambiguous"
+    if authority_unavailable:
+        owner=record.get("control_owner","unknown"); runtime=record.get("execution_runtime","unknown")
+        state=record.get("lifecycle_state","unknown"); restore=record.get("restore_strategy")
+        reason="authoritative source unavailable; preserved last confirmed owner with stale/error evidence"
+    elif app_live and tmux_live:
+        owner,runtime,state,restore="conflict","conflict","unknown",None
+        reason="simultaneous authoritative App Server and cctrl tmux owners"
+    elif tmux_live:
+        owner,runtime,state,restore="cctrl","tmux","active","tmux"
+        reason="live anchored cctrl tmux owner for exact provider task id"
+    elif app_live:
+        owner,runtime,state,restore="app","app-server","active","provider-managed"
+        reason="authoritative App Server live-owner state with confirmed tmux absence"
+    elif authority_ambiguous:
+        owner,runtime,state,restore="unknown","unknown","unknown",None
+        reason="available authoritative evidence is ambiguous; diagnostic evidence cannot choose an owner"
+    else:
+        owner,runtime,state,restore="unknown","unknown","unknown",None
+        reason="authoritative App Server and tmux snapshots confirm no current owner"
+    outcome={"control_owner":owner,"execution_runtime":runtime,"lifecycle_state":state,"restore_strategy":restore}
+    evidence={"schema_version":1,"pass_id":pass_id,"observed_at":observed_at,"expected_record_digest":digest,
+              "sources":sources,"chosen_outcome":outcome,"reason":reason}
+    results.append({"record_key":entry["record_key"],"provider_task_id":task_id,"host_id":record.get("host_id"),
+                    "expected_record_digest":digest,"sources":sources,"previous":previous,"chosen_outcome":outcome,"reason":reason})
+    source_key="cctrl-reconcile\0ownership"
+    previous_sequence=(record.get("registry_source_high_water") or {}).get(source_key,0)
+    sequence=previous_sequence+1 if type(previous_sequence) is int else 1
+    event_seed=f"{pass_id}\0{task_id}\0{digest}".encode()
+    payload={"authority_class":"authoritative","control_owner":owner,"execution_runtime":runtime,
+             "restore_strategy":restore,"reason":reason,
+             "set":{"control_surface":"tmux" if runtime == "tmux" else "app" if runtime == "app-server" else "unknown",
+                    "last_reconcile":evidence}}
+    # The reducer represents a new owner conflict with an unknown lifecycle;
+    # an existing legacy conflict may be preserved by omitting the transition.
+    if state != "conflict": payload["lifecycle_state"]=state
+    event={"version":1,"event_id":"reconcile-"+hashlib.sha256(event_seed).hexdigest(),"event_type":"reconcile",
+           "provider":"codex","provider_task_id":task_id,"host_id":record["host_id"],"source":"cctrl-reconcile",
+           "source_instance_id":"ownership","source_sequence":sequence,"source_cursor":pass_id,
+           "expected_record_digest":digest,"observed_at":observed_at,
+           "payload":payload}
+    event_rows.append({"record_key":entry["record_key"],"event":event})
+
+document={"schema_version":1,"kind":"codex_reconcile_result_v1","pass_id":pass_id,"observed_at":observed_at,
+          "source_cursors":{"registry":cursor(registry),"app_server":cursor(app),"tmux":cursor(tmux),
+                            "process_table":cursor(processes),"writer_locks":cursor(locks)},
+          "records":sorted(results,key=lambda x:(x["host_id"] or "",x["provider_task_id"])),"errors":global_errors}
+Path(result_path).write_text(json.dumps(document,sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")
+with open(events_path,"w",encoding="utf-8") as handle:
+    for row in event_rows: handle.write(json.dumps(row,sort_keys=True,separators=(",",":"))+"\n")
+PY
+    then
+        rm -rf "$scratch"
+        echo "Could not construct reconciliation evidence snapshot" >&2
+        return 65
+    fi
+
+    # Materialize and validate every event before the first registry write.
+    if ! python3 - "$events_file" "$scratch" > "$scratch/event-manifest.tsv" <<'PY'
+import json,sys
+from pathlib import Path
+source, root=sys.argv[1],Path(sys.argv[2])
+for index,line in enumerate(open(source,encoding="utf-8")):
+    row=json.loads(line)
+    if not isinstance(row,dict) or not isinstance(row.get("record_key"),str) or not isinstance(row.get("event"),dict):
+        raise SystemExit(1)
+    path=root/f"event-{index}.json"
+    path.write_text(json.dumps(row["event"],sort_keys=True,separators=(",",":"))+"\n",encoding="utf-8")
+    print(f"{row['record_key']}\t{path}")
+PY
+    then
+        rm -rf "$scratch"
+        echo "Could not materialize reconciliation registry events" >&2
+        return 65
+    fi
+
+    if ! $dry_run; then
+        while IFS=$'\t' read -r record_key event_path; do
+            if result="$(_task_registry_apply_event "$record_key" "$event_path")"; then
+                status="$(jq -r '.status // empty' <<< "$result")"
+                case "$status" in
+                    applied|duplicate) ;;
+                    stale) echo "reconcile-codex: stale digest rejected for $record_key" >&2; apply_rc=75 ;;
+                    *) echo "reconcile-codex: unexpected registry status for $record_key: $status" >&2; apply_rc=75 ;;
+                esac
+            else
+                echo "reconcile-codex: registry apply failed for $record_key" >&2
+                apply_rc=75
+            fi
+        done < "$scratch/event-manifest.tsv"
+    fi
+
+    if $json; then
+        cat "$result_file"
+    else
+        python3 - "$result_file" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1],encoding="utf-8"))
+print(f"Codex ownership reconciliation {d['pass_id']} ({len(d['records'])} task(s))")
+for item in d["records"]:
+    outcome=item["chosen_outcome"]
+    print(f"  {item['provider_task_id']}: {outcome['control_owner']}/{outcome['execution_runtime']} — {item['reason']}")
+PY
+    fi
+    rm -rf "$scratch"
+    return "$apply_rc"
+}
+
 cmd_session() {
     # Manage detached tmux sessions created by `cctrl start -d`.
     local action="${1:-ls}"
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | app-ls | archive | attest | mcp | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
+            echo "Usage: cctrl session <ls | app-ls | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
@@ -7372,6 +7786,10 @@ cmd_session() {
             echo "    --dry-run                    Show the release plan; act on nothing"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session doctor [--fix]   Audit/repair remote-control bridges (--json, --yes)"
+            echo "  cctrl session reconcile-codex  Refresh Codex ownership from read-only evidence"
+            echo "    --dry-run                    Build the same proposal but write no registry events"
+            echo "    --json                       Emit codex_reconcile_result_v1 JSON"
+            echo "  cctrl session reconcile        DEPRECATED alias for legacy doctor flow (may fix)"
             echo "  cctrl session autoheal         Heal DEAD bridges non-interactively (safety-gated)"
             echo "    --dry-run                    Report what would be healed; act on none"
             echo "    install [--interval SECONDS] Install a launchd timer (opt-in; default 900s)"
@@ -7426,6 +7844,7 @@ cmd_session() {
         mcp) _session_cmd_mcp "$@" ;;
         ingest-event) _session_ingest_event_stdin "$@" ;;
         release-to-app|release) _session_release_to_app "$@" ;;
+        reconcile-codex) _session_reconcile_codex "$@" ;;
         doctor|reconcile) _session_doctor "$@" ;;
         autoheal)  _session_autoheal "$@" ;;
         current|whoami|identity) _session_current "$@" ;;

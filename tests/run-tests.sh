@@ -7498,8 +7498,136 @@ test_task_registry_structural_boundary() {
     echo "ok: schema-v2 metadata and transition writers route through the single registry API"
 }
 
+test_codex_reconcile_ownership_evidence() {
+    local root="$TMPDIR/codex-reconcile" data="$TMPDIR/codex-reconcile/data"
+    local meta_a="$TMPDIR/codex-reconcile/meta-a" meta_b="$TMPDIR/codex-reconcile/meta-b"
+    local codex_home="$TMPDIR/codex-reconcile/codex" app="$TMPDIR/codex-reconcile/app.json"
+    local tmux_snapshot="$TMPDIR/codex-reconcile/tmux.json" process_snapshot="$TMPDIR/codex-reconcile/process.json"
+    local host="11111111111111111111111111111111" before after dry default invalid rc=0
+    rm -rf "$root"; mkdir -p "$data" "$meta_a" "$codex_home/thread-writer-locks"
+    printf '%s\n' "$host" > "$data/host-id"
+
+    python3 - "$meta_a" "$host" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+root,host=Path(sys.argv[1]),sys.argv[2]
+def add(task, owner="unknown", runtime="unknown", *, tmux=None, launched=False, origin="unknown", lineage=None, anchored=True):
+    record={
+      "schema_version":2,"provider":"codex","provider_task_id":task,"origin":origin,"host_id":host,
+      "registered_by_cctrl":True,"launched_by_cctrl":launched,"execution_runtime":runtime,
+      "control_owner":owner,"lifecycle_state":"active" if owner != "unknown" else "unknown",
+      "restore_strategy":"tmux" if runtime == "tmux" else "provider-managed" if runtime == "app-server" else None,
+      "last_observed_at":"2026-09-16T09:00:00Z","tmux_session":tmux,
+      "lineage":lineage or {"forked_from_id":None,"parent_thread_id":None,"derived_root_id":None,"derived_root_basis":None},
+      "ownership_evidence":[],"conversation_id":task,"control_surface":"tmux" if runtime == "tmux" else "app" if runtime == "app-server" else "unknown"
+    }
+    if tmux and anchored:
+        record.update({"pane_id":"%1","pane_pid":"4100" if task == "tmux-task" else "4200"})
+    raw=("codex\0"+host+"\0"+task).encode()
+    key="task-"+hashlib.sha256(raw).hexdigest()
+    (root/(key+".json")).write_text(json.dumps(record,sort_keys=True,indent=2)+"\n")
+add("tmux-task",tmux="TMUX--one",launched=True,origin="cctrl")
+add("unanchored-task",tmux="TMUX--legacy",launched=True,origin="cctrl",anchored=False)
+add("app-task",origin="cctrl")
+add("conflict-task",tmux="TMUX--two",launched=True,origin="cctrl")
+add("ambiguous-task",owner="cctrl",runtime="tmux",origin="cctrl")
+add("unavailable-task",owner="app",runtime="app-server",origin="codex-app")
+add("direct-task",origin="external-cli")
+add("stale-lock-task",origin="unknown")
+add("fork-task",origin="codex-app",lineage={"forked_from_id":"fork-parent","parent_thread_id":None,"derived_root_id":"fork-root","derived_root_basis":"forked-from-traversal"})
+PY
+    cp -R "$meta_a" "$meta_b"
+    : > "$codex_home/thread-writer-locks/stale-lock-task.lock"
+    cat > "$app" <<'JSON'
+{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-cursor-1","threads":[{"id":"app-task","control_owner":"app"},{"id":"conflict-task","control_owner":"app"},{"id":"ambiguous-task","source":"appServer"},{"id":"fork-task","executionRuntime":"app-server","runtimeState":"active"}],"task_errors":{"unavailable-task":{"reason":"thread/read timed out"}},"errors":[]}
+JSON
+    cat > "$tmux_snapshot" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"tmux-cursor-1","panes":[{"session":"TMUX--one","pane_id":"%1","pane_pid":"4100","start_command":"codex","current_command":"codex"},{"session":"TMUX--two","pane_id":"%1","pane_pid":"4200","start_command":"codex","current_command":"codex"},{"session":"TMUX--legacy","pane_id":"%9","pane_pid":"4900","start_command":"codex","current_command":"codex"}],"error":null}
+JSON
+    cat > "$process_snapshot" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"process-cursor-1","processes":[{"pid":5000,"ppid":1,"started":"Wed Sep 17 10:00:00 2026","command":"codex resume direct-task"}],"error":null}
+JSON
+
+    tree_hash() {
+        python3 - "$1" <<'PY'
+import hashlib,sys
+from pathlib import Path
+root=Path(sys.argv[1]); h=hashlib.sha256()
+for p in sorted(root.rglob("*")):
+    if p.is_file() and not p.is_symlink(): h.update(str(p.relative_to(root)).encode()+b"\0"+p.read_bytes())
+print(h.hexdigest())
+PY
+    }
+    before="$(tree_hash "$meta_a")"
+    dry="$(CCTRL_SESSION_METADATA_DIR="$meta_a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CODEX_HOME="$codex_home" CCTRL_CODEX_RECONCILE_APP_SERVER_FILE="$app" \
+        CCTRL_CODEX_RECONCILE_TMUX_FILE="$tmux_snapshot" CCTRL_CODEX_RECONCILE_PROCESS_FILE="$process_snapshot" \
+        CCTRL_CODEX_RECONCILE_PASS_ID="fixture-pass-0001" CCTRL_CODEX_RECONCILE_OBSERVED_AT="2026-09-17T10:00:00Z" \
+        "$ROOT/cctrl" session reconcile-codex --dry-run --json)"
+    after="$(tree_hash "$meta_a")"
+    [[ "$before" == "$after" ]] || fail "reconcile-codex --dry-run wrote registry state"
+
+    default="$(CCTRL_SESSION_METADATA_DIR="$meta_b" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CODEX_HOME="$codex_home" CCTRL_CODEX_RECONCILE_APP_SERVER_FILE="$app" \
+        CCTRL_CODEX_RECONCILE_TMUX_FILE="$tmux_snapshot" CCTRL_CODEX_RECONCILE_PROCESS_FILE="$process_snapshot" \
+        CCTRL_CODEX_RECONCILE_PASS_ID="fixture-pass-0001" CCTRL_CODEX_RECONCILE_OBSERVED_AT="2026-09-17T10:00:00Z" \
+        "$ROOT/cctrl" session reconcile-codex --json)"
+    [[ "$dry" == "$default" ]] || fail "dry-run and default proposed documents differ"
+    jq -e '
+      .schema_version == 1 and .kind == "codex_reconcile_result_v1" and .pass_id == "fixture-pass-0001" and
+      ([.records[] | select(.provider_task_id == "tmux-task")][0].chosen_outcome.control_owner == "cctrl") and
+      ([.records[] | select(.provider_task_id == "unanchored-task")][0].chosen_outcome.control_owner == "unknown") and
+      ([.records[] | select(.provider_task_id == "app-task")][0].chosen_outcome.control_owner == "app") and
+      ([.records[] | select(.provider_task_id == "conflict-task")][0].chosen_outcome.control_owner == "conflict") and
+      ([.records[] | select(.provider_task_id == "ambiguous-task")][0].chosen_outcome.control_owner == "unknown") and
+      ([.records[] | select(.provider_task_id == "unavailable-task")][0].chosen_outcome.control_owner == "app") and
+      ([.records[] | select(.provider_task_id == "direct-task")][0].chosen_outcome.control_owner == "unknown") and
+      ([.records[] | select(.provider_task_id == "stale-lock-task")][0].chosen_outcome.control_owner == "unknown") and
+      ([.records[] | .expected_record_digest] | all(test("^[0-9a-f]{64}$"))) and
+      ([.records[].sources | keys] | all(. == ["app_server","process_table","registry","tmux","writer_locks"]))
+    ' <<< "$default" >/dev/null || fail "reconcile-codex truth table/result schema is wrong: $default"
+
+    python3 - "$meta_b" <<'PY'
+import json,sys
+from pathlib import Path
+records={}
+for path in Path(sys.argv[1]).glob("task-*.json"):
+    value=json.loads(path.read_text()); records[value["provider_task_id"]]=value
+assert (records["tmux-task"]["control_owner"],records["tmux-task"]["execution_runtime"]) == ("cctrl","tmux")
+assert (records["app-task"]["control_owner"],records["app-task"]["execution_runtime"]) == ("app","app-server")
+assert records["conflict-task"]["control_owner"] == "conflict"
+assert records["ambiguous-task"]["control_owner"] == "unknown"
+assert records["unavailable-task"]["control_owner"] == "app"
+assert records["fork-task"]["origin"] == "codex-app"
+assert records["fork-task"]["lineage"] == {"forked_from_id":"fork-parent","parent_thread_id":None,"derived_root_id":"fork-root","derived_root_basis":"forked-from-traversal"}
+for value in records.values():
+    evidence=value["last_reconcile"]
+    assert evidence["pass_id"] == "fixture-pass-0001"
+    assert evidence["expected_record_digest"]
+    assert evidence["sources"]
+PY
+    [[ -e "$codex_home/thread-writer-locks/stale-lock-task.lock" ]] || fail "reconciliation removed a diagnostic writer lock"
+
+    # A malformed source aborts before the first registry event is applied.
+    invalid="$root/invalid.json"; printf '[]\n' > "$invalid"
+    before="$(tree_hash "$meta_a")"; rc=0
+    CCTRL_SESSION_METADATA_DIR="$meta_a" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CODEX_HOME="$codex_home" CCTRL_CODEX_RECONCILE_APP_SERVER_FILE="$app" \
+        CCTRL_CODEX_RECONCILE_TMUX_FILE="$invalid" CCTRL_CODEX_RECONCILE_PROCESS_FILE="$process_snapshot" \
+        CCTRL_CODEX_RECONCILE_PASS_ID="fixture-pass-0002" CCTRL_CODEX_RECONCILE_OBSERVED_AT="2026-09-17T10:01:00Z" \
+        "$ROOT/cctrl" session reconcile-codex --json >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "invalid complete snapshot did not exit 65 (rc=$rc)"
+    [[ "$before" == "$(tree_hash "$meta_a")" ]] || fail "failed snapshot partially mutated registry"
+    echo "ok: Codex reconciliation is exact-id, single-snapshot, non-destructive, CAS-guarded, and dry-run identical"
+}
+
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
+        codex-reconcile)
+            test_codex_reconcile_ownership_evidence
+            echo "ok"
+            exit 0
+            ;;
         codex-lifecycle)
             # Defined in the later Codex-hook section; dispatched there.
             ;;
@@ -7754,6 +7882,7 @@ test_task_registry_atomic_concurrent_updates
 test_task_registry_replay_order_and_guards
 test_task_registry_lock_stale_timeout_and_release_token
 test_task_registry_structural_boundary
+test_codex_reconcile_ownership_evidence
 test_snapshot_header_and_session_shape
 test_snapshot_initial_prompt_absent
 test_snapshot_empty_fleet_guard_preserves
@@ -8379,7 +8508,13 @@ for raw in sys.stdin:
             trace(f"client-error:{callback_reply.get('error', {}).get('code')}")
             time.sleep(1)
             continue
-        send({"id": message["id"], "result": {"method": method, "ok": True}})
+        if method == "thread/list" and os.environ.get("FAKE_CODEX_THREAD_LIST") == "1":
+            if message.get("params", {}).get("cursor") == "cursor-one":
+                send({"id": message["id"], "result": {"data": [{"id": "thread-two", "control_owner": "app"}], "nextCursor": None}})
+            else:
+                send({"id": message["id"], "result": {"data": [{"id": "thread-one", "control_owner": "app"}], "nextCursor": "cursor-one"}})
+        else:
+            send({"id": message["id"], "result": {"method": method, "ok": True}})
 
 if mode == "ignore-term":
     while True:
@@ -8572,6 +8707,14 @@ PY
     out="$(PATH=/usr/bin:/bin "$ROOT/cctrl" codex capabilities --help)" \
         || fail "Codex capabilities help command failed"
     assert_contains "$out" "capabilities"
+
+    rc=0
+    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" FAKE_CODEX_THREAD_LIST=1 \
+        python3 "$ROOT/lib/codex_app_server.py" threads --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "App Server thread snapshot failed: $out"
+    jq -e '.schema_version == 1 and .status == "available" and .complete == true and
+      (.source_cursor | test("^[0-9a-f]{64}$")) and (.threads | map(.id)) == ["thread-one","thread-two"]' \
+        <<< "$out" >/dev/null || fail "App Server thread snapshot schema is wrong: $out"
     echo "ok: Codex App Server adapter handles discovery, framing, failures, and cleanup"
 }
 

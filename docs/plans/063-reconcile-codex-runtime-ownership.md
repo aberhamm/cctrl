@@ -1,7 +1,7 @@
 ---
 id: 063
 title: Reconcile Codex runtime ownership from authoritative evidence
-status: in-progress
+status: done
 blocked-by: [059, 060, 062]
 priority: 63
 goal: codex-task-ownership-surfaces
@@ -9,9 +9,13 @@ allows-migrations: false
 needs-review: none
 review-required: eng
 created: 2026-09-15
+completed: 2026-09-17
+reviewed: false
+qa: automated
 tui-fixture: n/a  # reconciliation reads structured tmux metadata and never parses pane output
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-17 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -100,3 +104,17 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented snapshot-first, exact-id Codex ownership reconciliation across canonical local registry records, paginated App Server inventory, tmux metadata, process evidence, and diagnostic locks. Added conservative unavailable-versus-absent handling, conflict/unknown outcomes, last-owner preservation, digest-guarded registry events, byte-identical dry-run proposals, partial-failure isolation, stable help/exits, and documentation. Local unified review fixed three high-confidence issues: malformed available sources could imply false absence, reused tmux names lacked a current receipt anchor, and registry input lacked strict local-host/canonical-key filtering; the external reviewer was unavailable and the fallback is recorded in the review artifact. Health scored 10.0, all five verification checks passed, the final full suite passed 202 milestones, and the actual live `data/` digest remained unchanged.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `docs/plans/063-reconcile-codex-runtime-ownership.md` (modified)
+- `lib/codex_app_server.py` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `b6cdbdc` — `feat(codex): reconcile runtime ownership safely`
