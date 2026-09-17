@@ -205,6 +205,7 @@ the ChatGPT/Codex app:
 ```bash
 cctrl session release-to-app TMUX--myapp --yes
 cctrl session release-to-app --all --yes
+cctrl task ls
 cctrl session app-ls
 ```
 
@@ -214,8 +215,13 @@ stale Codex writer locks that no live tmux session or Codex process appears to
 own. A successful release proves that the terminal writer ended; it does **not**
 prove that the app acquired the task. The task record therefore reports an
 unknown owner/runtime until an authoritative app-side event is observed.
-`app-ls` is the experimental Codex task view, while `session ls` remains the
-default live tmux view.
+`task ls` is the provider-neutral local catalogue. It shows tmux observations,
+cctrl-registered tasks, and discoverable Codex tasks together, but keeps owner,
+runtime, lifecycle, and per-action capabilities separate. Its `--json` form is
+a versioned schema-v2 envelope with partial-source errors; listing is read-only
+apart from creating the durable local host id on first use. `app-ls` is the
+Codex filtered view (`--all` adds discovery-only and archived provider rows),
+while `session ls` remains the compatibility view for live tmux targets.
 
 ### Codex App Server diagnostics
 
@@ -280,7 +286,10 @@ cctrl start -d @myapp --agent codex
 cctrl start -d @myapp --purpose "review auth logs"
 
 cctrl session ls                  # list sessions (see below)
-cctrl session app-ls              # list released Codex app tasks
+cctrl task ls                     # list local tmux + provider tasks and capabilities
+cctrl task ls --json              # normalized, versioned provider-neutral inventory
+cctrl session app-ls              # Codex tasks registered by cctrl
+cctrl session app-ls --all        # include discovery-only and archived Codex tasks
 cctrl session current --json      # machine-readable identity for the current agent/process
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
 cctrl session close TMUX--myapp   # gracefully close a session

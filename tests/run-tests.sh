@@ -7621,8 +7621,193 @@ PY
     echo "ok: Codex reconciliation is exact-id, single-snapshot, non-destructive, CAS-guarded, and dry-run identical"
 }
 
+test_task_inventory_provider_neutral_readonly() {
+    local root="$TMPDIR/task-inventory" data="$TMPDIR/task-inventory/data" meta="$TMPDIR/task-inventory/meta"
+    local codex_home="$TMPDIR/task-inventory/codex" bin="$TMPDIR/task-inventory/bin"
+    local host="22222222222222222222222222222222" before after out apps all_apps unavailable rc=0
+    rm -rf "$root"; mkdir -p "$data" "$meta" "$codex_home/thread-writer-locks" "$bin"
+    printf '%s\n' "$host" > "$data/host-id"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  list-sessions)
+    printf '$1\037TMUX--owned\0371770000000\n$2\037TMUX--shared\0371770000001\n$3\037TMUX--recycled\0371770000002\n$4\037plain-shell\0371770000003\n$5\037TMUX--unanchored\0371770000004\n'
+    ;;
+  list-panes)
+    if [[ "$*" == *pane_current_path* ]]; then printf '/tmp/shared\n'; else printf '%%1\037100\n'; fi
+    ;;
+  *) exit 0 ;;
+esac
+SH
+    chmod +x "$bin/tmux"
+    python3 - "$meta" "$codex_home/state_5.sqlite" "$host" <<'PY'
+import hashlib,json,sqlite3,sys
+from pathlib import Path
+root,db,host=Path(sys.argv[1]),sys.argv[2],sys.argv[3]
+def add(name, task, owner="unknown", runtime="unknown", state="unknown", *, tmux=None, pane=None, pid=None, archived=False, launch=None):
+    record={"schema_version":2,"provider":"codex","provider_task_id":task,"origin":"cctrl","host_id":host,
+      "registered_by_cctrl":True,"launched_by_cctrl":True,"execution_runtime":runtime,"control_owner":owner,
+      "lifecycle_state":state,"restore_strategy":"tmux" if runtime=="tmux" else "provider-managed" if runtime=="app-server" else None,
+      "last_observed_at":"2026-09-17T10:00:00Z","tmux_session":tmux,"provisional_launch_id":launch,
+      "lineage":{"forked_from_id":None,"parent_thread_id":None,"derived_root_id":None,"derived_root_basis":None},
+      "ownership_evidence":[],"cwd":"/tmp/shared","display_label":name,"name":tmux,"pane_id":pane,"pane_pid":pid}
+    if task:
+        filename="task-"+hashlib.sha256(("codex\0"+host+"\0"+task).encode()).hexdigest()+".json"
+    else:
+        filename="launch-"+launch+".json"
+    (root/filename).write_text(json.dumps(record,sort_keys=True)+"\n")
+add("owned","owned-task","cctrl","tmux","active",tmux="TMUX--owned",pane="%1",pid="100")
+add("app","app-task","app","app-server","released")
+add("unknown","unknown-task")
+add("locked","lock-task")
+add("archive","archive-task","app","app-server","archived")
+add("conflict-a","conflict-a","cctrl","tmux","active",tmux="TMUX--shared",pane="%1",pid="100")
+add("conflict-b","conflict-b","cctrl","tmux","active",tmux="TMUX--shared",pane="%1",pid="100")
+add("stale","stale-task","cctrl","tmux","active",tmux="TMUX--recycled",pane="%9",pid="900")
+add("unanchored","unanchored-task","cctrl","tmux","active",tmux="TMUX--unanchored")
+add("provisional",None,"cctrl","tmux","provisional",tmux="TMUX--not-live",launch="launch-064")
+con=sqlite3.connect(db)
+con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY,title TEXT,cwd TEXT,archived INTEGER,updated_at TEXT)")
+for task,title,archived in [
+ ("owned-task","Owned",0),("app-task","App",0),("unknown-task","Unknown",0),("lock-task","Locked",0),
+ ("archive-task","Archived",1),("conflict-a","Conflict A",0),("conflict-b","Conflict B",0),
+ ("stale-task","Stale",0),("unanchored-task","Unanchored",0),("discovery-a","Discovery A",0),("discovery-b","Discovery B",0)]:
+    con.execute("INSERT INTO threads VALUES (?,?,?,?,?)",(task,title,"/tmp/shared",archived,"2026-09-17T11:00:00Z"))
+con.commit(); con.close()
+
+bad_task="invalid-schema-task"
+bad={"schema_version":2,"provider":"codex","provider_task_id":bad_task,"origin":"cctrl","host_id":host,
+  "registered_by_cctrl":True,"launched_by_cctrl":True,"execution_runtime":"tmux","control_owner":"definitely-not-an-owner",
+  "lifecycle_state":"active","restore_strategy":"tmux","last_observed_at":"2026-09-17T10:00:00Z","tmux_session":None,
+  "lineage":{"forked_from_id":None,"parent_thread_id":None,"derived_root_id":None,"derived_root_basis":None},"ownership_evidence":[]}
+bad_name="task-"+hashlib.sha256(("codex\0"+host+"\0"+bad_task).encode()).hexdigest()+".json"
+(root/bad_name).write_text(json.dumps(bad)+"\n")
+PY
+    cat > "$meta/TMUX--legacy-owned.json" <<'JSON'
+{"name":"TMUX--legacy-owned","agent":"codex","conversation_id":"owned-task","cctrl_managed":true,"created_at":"2026-09-16T10:00:00Z","cwd":"/tmp/wrong-alias"}
+JSON
+    cat > "$meta/legacy-dup-a.json" <<'JSON'
+{"name":"legacy-a","agent":"codex","conversation_id":"legacy-dup-task","cctrl_managed":false,"created_at":"2026-09-16T10:00:00Z","cwd":"/tmp/one"}
+JSON
+    cat > "$meta/legacy-dup-b.json" <<'JSON'
+{"name":"legacy-b","agent":"codex","conversation_id":"legacy-dup-task","cctrl_managed":false,"created_at":"2026-09-16T10:00:01Z","cwd":"/tmp/two"}
+JSON
+    : > "$codex_home/thread-writer-locks/lock-task.lock"
+    printf '{bad json\n' > "$meta/malformed.json"
+
+    tree_hash() {
+        python3 - "$1" <<'PY'
+import hashlib,sys
+from pathlib import Path
+root=Path(sys.argv[1]); digest=hashlib.sha256()
+for path in sorted(root.rglob("*")):
+    if path.is_file() and not path.is_symlink():
+        digest.update(str(path.relative_to(root)).encode()+b"\0"+path.read_bytes())
+print(digest.hexdigest())
+PY
+    }
+    before="$(tree_hash "$root")"
+    out="$(PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" CCTRL_CODEX_STATE_DB="$codex_home/state_5.sqlite" \
+        "$ROOT/cctrl" task ls --json)"
+    after="$(tree_hash "$root")"
+    [[ "$before" == "$after" ]] || fail "task inventory mutated metadata or provider state"
+    jq -e '
+      .schema_version == 2 and .host_id_initialized == false and
+      (.capabilities.handoff == {supported:false,reason:"not-implemented"}) and
+      (.capabilities.cctrl_restore == {supported:false,reason:"not-implemented"}) and
+      ([.rows[] | select(.provider_task_id=="owned-task")][0].action_capabilities.tmux_attach == {supported:true,reason:"available"}) and
+      ([.rows[] | select(.provider_task_id=="owned-task")][0].action_capabilities.app_open == {supported:false,reason:"owned-by-cctrl"}) and
+      ([.rows[] | select(.provider_task_id=="app-task")][0].action_capabilities.app_open == {supported:true,reason:"available"}) and
+      ([.rows[] | select(.provider_task_id=="archive-task")][0].action_capabilities.app_open == {supported:false,reason:"archived"}) and
+      ([.rows[] | select(.provider_task_id=="discovery-a")][0].registered_by_cctrl == false) and
+      ([.rows[] | select(.provider_task_id=="discovery-a")][0].lifecycle_state == "unknown") and
+      ([.rows[] | select(.provider_task_id=="discovery-a")][0].action_capabilities.app_open == {supported:false,reason:"unknown"}) and
+      ([.rows[] | select(.provider_task_id=="lock-task")][0].control_owner == "unknown") and
+      ([.rows[] | select(.provider_task_id=="lock-task")][0].diagnostic_evidence | any(.source=="codex-writer-lock")) and
+      ([.rows[] | select(.provider_task_id=="conflict-b")][0].lifecycle_state == "conflict") and
+      ([.rows[] | select(.provider_task_id=="stale-task")][0].lifecycle_state == "conflict") and
+      ([.rows[] | select(.provider_task_id=="legacy-dup-task")][0].lifecycle_state == "conflict") and
+      ([.rows[] | select(.provider_task_id=="invalid-schema-task")] | length == 0) and
+      ([.rows[] | select(.provider_task_id=="unanchored-task")][0].action_capabilities.tmux_attach.supported == false) and
+      ([.rows[] | select(.provider_task_id=="unanchored-task")][0].diagnostic_evidence | any(.reason=="unanchored-explicit-link")) and
+      ([.rows[] | select(.task_key | startswith("launch:"))] | length == 1) and
+      ([.rows[] | select(.task_key | startswith("tmux:"))] | length == 3) and
+      ([.rows[] | select(.cwd=="/tmp/shared" and .provider_task_id != null)] | length >= 10) and
+      (.source_errors | any(.source=="registry" and (.error|startswith("invalid-json:")))) and
+      (.source_errors | any(.source=="registry" and .error=="invalid-control-owner")) and
+      (all(.rows[]; has("title"))) and
+      ([.rows[].action_capabilities | keys] | all(. == ["app_open","cctrl_restore","handoff","tmux_attach"]))
+    ' <<< "$out" >/dev/null || fail "task inventory schema, fusion, state, or capability truth table is wrong: $out"
+
+    apps="$(PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" CCTRL_CODEX_STATE_DB="$codex_home/state_5.sqlite" \
+        "$ROOT/cctrl" session app-ls --json)"
+    all_apps="$(PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" CCTRL_CODEX_STATE_DB="$codex_home/state_5.sqlite" \
+        "$ROOT/cctrl" session app-ls --all --json)"
+    jq -e 'all(.[]; .registered_by_cctrl == true and .lifecycle_state != "archived") and (any(.[]; .session_id=="app-task"))' <<< "$apps" >/dev/null \
+        || fail "app-ls default is not the registered Codex task filter"
+    jq -e 'any(.[]; .session_id=="discovery-a") and any(.[]; .session_id=="archive-task")' <<< "$all_apps" >/dev/null \
+        || fail "app-ls --all omitted discovery-only or archived tasks"
+    local human_apps human_all_apps
+    human_apps="$(PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" CCTRL_CODEX_STATE_DB="$codex_home/state_5.sqlite" \
+        "$ROOT/cctrl" session app-ls)"
+    human_all_apps="$(PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" CCTRL_CODEX_STATE_DB="$codex_home/state_5.sqlite" \
+        "$ROOT/cctrl" session app-ls --all)"
+    [[ "$human_apps" == *"app-owned"* && "$human_apps" == *"cctrl-owned"* && "$human_apps" == *"conflict"* && "$human_apps" == *"unknown"* ]] \
+        || fail "app-ls human mode did not render ownership-derived states: $human_apps"
+    [[ "$human_all_apps" == *"archived"* ]] || fail "app-ls --all human mode omitted archived state"
+
+    rm -f "$codex_home/state_5.sqlite"
+    unavailable="$(PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" CCTRL_CODEX_STATE_DB="$codex_home/state_5.sqlite" \
+        "$ROOT/cctrl" task ls --json)"
+    jq -e '(.rows|length)>0 and .source_status.codex_provider=="unavailable" and ([.rows[]|select(.provider_task_id=="app-task")][0].action_capabilities.app_open.reason=="provider-unavailable")' <<< "$unavailable" >/dev/null \
+        || fail "provider source failure erased healthy rows or did not close capabilities"
+
+    local first_data="$root/first-data" first_meta="$root/first-meta" first_codex="$root/first-codex"
+    mkdir -p "$first_meta" "$first_codex"
+    PATH="$bin:$PATH" CCTRL_DATA_DIR="$first_data" CCTRL_HOST_ID_FILE="$first_data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$first_meta" CODEX_HOME="$first_codex" CCTRL_CODEX_STATE_DB="$first_codex/missing.sqlite" \
+        "$ROOT/cctrl" task ls --json > "$root/first.json"
+    [[ -f "$first_data/host-id" ]] || fail "task inventory did not initialize durable host id"
+    jq -e '.host_id_initialized==true' "$root/first.json" >/dev/null || fail "host-id initialization was not reported"
+
+    local bad_meta="$root/not-a-directory" failbin="$root/failbin"
+    printf x > "$bad_meta"; mkdir -p "$failbin"
+    cat > "$failbin/tmux" <<'SH'
+#!/usr/bin/env bash
+exit 9
+SH
+    chmod +x "$failbin/tmux"
+    rc=0
+    PATH="$failbin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$bad_meta" CODEX_HOME="$first_codex" CCTRL_CODEX_STATE_DB="$first_codex/missing.sqlite" \
+        "$ROOT/cctrl" task ls --json >/dev/null || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "total source failure should exit 69, got $rc"
+    rc=0
+    PATH="$failbin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$bad_meta" CODEX_HOME="$first_codex" CCTRL_CODEX_STATE_DB="$first_codex/missing.sqlite" \
+        "$ROOT/cctrl" session app-ls --json >/dev/null || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "app-ls JSON swallowed total source failure (rc=$rc)"
+    rc=0
+    PATH="$failbin:$PATH" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_SESSION_METADATA_DIR="$bad_meta" CODEX_HOME="$first_codex" CCTRL_CODEX_STATE_DB="$first_codex/missing.sqlite" \
+        "$ROOT/cctrl" session app-ls >/dev/null || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "app-ls human mode swallowed total source failure (rc=$rc)"
+    echo "ok: task inventory is provider-neutral, stable-identity fused, capability explicit, partial, and read-only"
+}
+
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
+        task-inventory)
+            test_task_inventory_provider_neutral_readonly
+            echo "ok"
+            exit 0
+            ;;
         codex-reconcile)
             test_codex_reconcile_ownership_evidence
             echo "ok"

@@ -1,7 +1,10 @@
 ---
 id: 064
 title: Add a local provider-neutral task inventory
-status: in-progress
+status: done
+completed: 2026-09-17
+reviewed: false
+qa: automated
 blocked-by: [058, 063]
 priority: 64
 goal: codex-task-ownership-surfaces
@@ -102,3 +105,16 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented a read-only, provider-neutral local task inventory with stable-identity fusion, explicit per-action capabilities, partial-source errors, compatibility filtering for app-ls, and comprehensive tests. Discovery-only tasks remain ownership-conservative, unanchored or stale tmux links cannot grant attach capability, and malformed registry records fail closed. The post-review full suite passed all 202 milestones.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `docs/plans/064-local-provider-neutral-task-inventory.md` (modified)
+
+**Commit:** `c7f1543` — `feat(cctrl): add provider-neutral task inventory`

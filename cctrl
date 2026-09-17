@@ -8618,6 +8618,7 @@ _codex_app_threads_json() {
 import glob
 import json
 import os
+import re
 import sqlite3
 import sys
 
@@ -9268,8 +9269,498 @@ _session_list() {
     return 0
 }
 
+_task_tmux_rows_json_readonly() {
+    # Inventory must not reuse _session_list: that compatibility surface also
+    # contains legacy enrichment paths. Capture only immutable tmux facts.
+    local raw line session_id name activity pane_raw pane_id pane_pid cwd recency rc=0
+    local -a rows=() errors=()
+    if ! command -v tmux >/dev/null 2>&1; then
+        jq -nc '{status:"unavailable",rows:[],errors:[{error:"tmux-not-found"}]}'
+        return 0
+    fi
+    raw="$(tmux list-sessions -F $'#{session_id}\037#{session_name}\037#{session_activity}' 2>/dev/null)" || rc=$?
+    if (( rc != 0 )); then
+        jq -nc --argjson rc "$rc" '{status:"unavailable",rows:[],errors:[{error:"list-sessions-failed",exit_code:$rc}]}'
+        return 0
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        IFS=$'\037' read -r session_id name activity <<< "$line"
+        if [[ ! "$session_id" =~ ^\$[0-9]+$ || -z "$name" ]]; then
+            errors+=("$(jq -nc --arg value "$line" '{error:"invalid-session-identity",value:$value}')")
+            continue
+        fi
+        cwd="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)" || cwd=""
+        pane_raw="$(tmux list-panes -t "$name" -F $'#{pane_id}\037#{pane_pid}' 2>/dev/null | head -1)" || pane_raw=""
+        if [[ -z "$cwd" && -z "$pane_raw" ]]; then
+            errors+=("$(jq -nc --arg name "$name" '{error:"session-read-failed",session:$name}')")
+        fi
+        IFS=$'\037' read -r pane_id pane_pid <<< "$pane_raw"
+        recency=""
+        if [[ "$activity" =~ ^[0-9]+$ ]]; then
+            recency="$(date -r "$activity" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"
+        fi
+        rows+=("$(jq -nc --arg session_id "$session_id" --arg name "$name" --arg cwd "$cwd" \
+            --arg pane_id "$pane_id" --arg pane_pid "$pane_pid" --arg recency "$recency" \
+            '{session_id:$session_id,name:$name,cwd:(if $cwd=="" then null else $cwd end),pane_id:(if $pane_id=="" then null else $pane_id end),pane_pid:(if $pane_pid=="" then null else $pane_pid end),recency:(if $recency=="" then null else $recency end)}')")
+    done <<< "$raw"
+    if [[ ${#rows[@]} -gt 0 ]]; then
+        printf '%s\n' "${rows[@]}" | jq -s --argjson errors "$(if [[ ${#errors[@]} -gt 0 ]]; then printf '%s\n' "${errors[@]}" | jq -s .; else printf '[]'; fi)" \
+            '{status:"available",rows:.,errors:$errors}'
+    else
+        jq -nc --argjson errors "$(if [[ ${#errors[@]} -gt 0 ]]; then printf '%s\n' "${errors[@]}" | jq -s .; else printf '[]'; fi)" \
+            '{status:"available",rows:[],errors:$errors}'
+    fi
+}
+
+_task_list_json() {
+    local scratch tmux_file host_id initialized=false db rc=0
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-task-list.XXXXXX")" || return 70
+    tmux_file="$scratch/tmux.json"
+    [[ -e "$CCTRL_HOST_ID_FILE" || -L "$CCTRL_HOST_ID_FILE" ]] || initialized=true
+    host_id="$(_cctrl_host_id)" || { rm -rf "$scratch"; return 70; }
+    _task_tmux_rows_json_readonly > "$tmux_file" || {
+        jq -nc '{status:"unavailable",rows:[],errors:[{error:"collector-crashed"}]}' > "$tmux_file"
+    }
+    db="$(_codex_state_db)"
+    python3 - "$SESSION_METADATA_DIR" "$host_id" "$initialized" "$tmux_file" "$db" "$CODEX_DIR" <<'PY' || rc=$?
+import datetime as dt
+import glob
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import sys
+from pathlib import Path
+
+metadata_dir, host_id, initialized_raw, tmux_path, db_path, codex_dir = sys.argv[1:7]
+host_id_initialized = initialized_raw == "true"
+MAX_EVIDENCE = 32
+
+def source_error(source, status, error, **extra):
+    value = {"source": source, "status": status, "error": error}
+    value.update(extra)
+    return value
+
+def nullable_string(value):
+    return value if isinstance(value, str) and value else None
+
+def legacy_record(value, path):
+    agent = value.get("agent")
+    provider = "claude" if agent in ("claude", "claude-code") else "codex" if agent in ("codex", "openai") else "unknown"
+    task_id = nullable_string(value.get("conversation_id"))
+    observed = nullable_string(value.get("created_at")) or "1970-01-01T00:00:00Z"
+    managed = value.get("cctrl_managed") is True
+    name = nullable_string(value.get("name")) or Path(path).stem
+    return {
+        "schema_version": 2, "provider": provider, "provider_task_id": task_id,
+        "origin": "cctrl" if managed else "unknown", "host_id": host_id,
+        "registered_by_cctrl": managed, "launched_by_cctrl": managed,
+        "execution_runtime": "unknown", "control_owner": "unknown",
+        "lifecycle_state": "unknown", "restore_strategy": None,
+        "last_observed_at": observed, "tmux_session": name,
+        "provisional_launch_id": None,
+        "lineage": {"forked_from_id": None, "parent_thread_id": None, "derived_root_id": None, "derived_root_basis": None},
+        "ownership_evidence": [], "cwd": value.get("cwd"), "purpose": value.get("purpose"),
+        "display_label": value.get("display_label"), "name": name,
+        "pane_id": value.get("pane_id"), "pane_pid": value.get("pane_pid") or value.get("wrapper_pid"),
+    }
+
+def validate_schema2(value):
+    origins = {"cctrl", "codex-app", "external-cli", "unknown"}
+    runtimes = {"tmux", "app-server", "external-cli", "unknown", "conflict"}
+    owners = {"cctrl", "app", "external", "unknown", "conflict"}
+    states = {"provisional", "active", "released", "archived", "closed", "unknown", "conflict"}
+    strategies = {"tmux", "provider-managed", "unknown"}
+    authorities = {"authoritative", "corroborating", "diagnostic"}
+    rfc3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+    required = ("provider", "origin", "host_id", "execution_runtime", "control_owner", "lifecycle_state", "last_observed_at")
+    for field in required:
+        if not isinstance(value.get(field), str) or not value[field]: return f"invalid-{field}"
+    if value["origin"] not in origins: return "invalid-origin"
+    if value["execution_runtime"] not in runtimes: return "invalid-execution-runtime"
+    if value["control_owner"] not in owners: return "invalid-control-owner"
+    if value["lifecycle_state"] not in states: return "invalid-lifecycle-state"
+    if not rfc3339.match(value["last_observed_at"]): return "invalid-last-observed-at"
+    if value.get("provider_task_id") is not None and not isinstance(value.get("provider_task_id"), str): return "invalid-provider-task-id"
+    if value.get("tmux_session") is not None and not isinstance(value.get("tmux_session"), str): return "invalid-tmux-session"
+    if value.get("restore_strategy") is not None and value.get("restore_strategy") not in strategies: return "invalid-restore-strategy"
+    for field in ("registered_by_cctrl", "launched_by_cctrl"):
+        if type(value.get(field)) is not bool: return f"invalid-{field}"
+    lineage = value.get("lineage")
+    if not isinstance(lineage, dict): return "invalid-lineage"
+    for field in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis"):
+        if lineage.get(field) is not None and not isinstance(lineage.get(field), str): return f"invalid-lineage-{field}"
+    evidence = value.get("ownership_evidence")
+    if not isinstance(evidence, list) or len(evidence) > MAX_EVIDENCE: return "invalid-ownership-evidence"
+    for item in evidence:
+        if not isinstance(item, dict): return "invalid-ownership-evidence-item"
+        if item.get("authority_class") not in authorities or item.get("observed_owner") not in owners or item.get("observed_runtime") not in runtimes or item.get("observed_state") not in states:
+            return "invalid-ownership-evidence-enum"
+        if not isinstance(item.get("source"), str) or not item["source"] or not isinstance(item.get("reason"), str) or not item["reason"]:
+            return "invalid-ownership-evidence-fields"
+        if not isinstance(item.get("observed_at"), str) or not rfc3339.match(item["observed_at"]):
+            return "invalid-ownership-evidence-time"
+        for field in ("source_instance", "source_cursor"):
+            if item.get(field) is not None and not isinstance(item.get(field), str): return f"invalid-ownership-evidence-{field}"
+    return None
+
+registry = []
+registry_errors = []
+registry_status = "available"
+root = Path(metadata_dir)
+try:
+    if root.exists() and not root.is_dir():
+        raise ValueError("metadata path is not a directory")
+    paths = sorted(root.glob("*.json")) if root.exists() else []
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            registry_errors.append(source_error("registry", "partial", "non-regular-record", path=path.name))
+            continue
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            registry_errors.append(source_error("registry", "partial", f"invalid-json:{exc}", path=path.name))
+            continue
+        if not isinstance(value, dict):
+            registry_errors.append(source_error("registry", "partial", "record-not-object", path=path.name))
+            continue
+        original_version = value.get("schema_version")
+        if original_version is None:
+            value = legacy_record(value, path)
+        elif value.get("schema_version") != 2:
+            registry_errors.append(source_error("registry", "partial", "unsupported-schema", path=path.name))
+            continue
+        if original_version == 2:
+            validation_error = validate_schema2(value)
+            if validation_error:
+                registry_errors.append(source_error("registry", "partial", validation_error, path=path.name))
+                continue
+        if value.get("host_id") != host_id:
+            continue
+        provider = value.get("provider")
+        task_id = nullable_string(value.get("provider_task_id"))
+        launch_id = nullable_string(value.get("provisional_launch_id"))
+        if not isinstance(provider, str) or not provider:
+            registry_errors.append(source_error("registry", "partial", "missing-provider", path=path.name))
+            continue
+        if task_id:
+            expected = "task-" + hashlib.sha256((provider + "\0" + host_id + "\0" + task_id).encode()).hexdigest() + ".json"
+            # Ignore legacy aliases once their canonical schema-v2 record exists,
+            # but retain legacy files for the compatibility window.
+            if original_version == 2 and path.name != expected:
+                registry_errors.append(source_error("registry", "partial", "noncanonical-key", path=path.name))
+                continue
+        elif original_version == 2 and path.name != f"launch-{launch_id}.json":
+            registry_errors.append(source_error("registry", "partial", "noncanonical-launch-key", path=path.name))
+            continue
+        elif not launch_id:
+            registry_errors.append(source_error("registry", "partial", "missing-stable-or-launch-id", path=path.name))
+            continue
+        value["_inventory_registry_source"] = "legacy" if original_version is None else "canonical"
+        registry.append(value)
+except Exception as exc:
+    registry_status = "unavailable"
+    registry_errors.append(source_error("registry", "unavailable", f"enumeration-failed:{exc}"))
+
+# Promotion deliberately leaves legacy inputs immutable. Once a canonical
+# record exists, it wins rather than making the alias look like contradictory
+# ownership evidence for the same stable identity.
+canonical_identities = {
+    (item.get("provider"), item.get("provider_task_id"))
+    for item in registry
+    if item.get("_inventory_registry_source") == "canonical" and item.get("provider_task_id")
+}
+registry = [
+    item for item in registry
+    if not (item.get("_inventory_registry_source") == "legacy" and
+            (item.get("provider"), item.get("provider_task_id")) in canonical_identities)
+]
+
+try:
+    tmux_doc = json.loads(Path(tmux_path).read_text(encoding="utf-8"))
+    if not isinstance(tmux_doc, dict) or tmux_doc.get("status") not in ("available", "unavailable") or not isinstance(tmux_doc.get("rows"), list):
+        raise ValueError("malformed collector document")
+except Exception as exc:
+    tmux_doc = {"status": "unavailable", "rows": [], "errors": [{"error": f"malformed-snapshot:{exc}"}]}
+tmux_errors = [source_error("tmux", "unavailable" if tmux_doc["status"] == "unavailable" else "partial", item.get("error", "unknown"), **{k:v for k,v in item.items() if k != "error"}) for item in tmux_doc.get("errors", []) if isinstance(item, dict)]
+
+provider_rows = {}
+provider_errors = []
+provider_status = "available"
+if not db_path or not os.path.isfile(db_path):
+    provider_status = "unavailable"
+    provider_errors.append(source_error("codex-provider", "unavailable", "state-db-not-found"))
+else:
+    try:
+        con = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        cols = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
+        if "id" not in cols:
+            raise ValueError("threads.id is unavailable")
+        wanted = [name for name in ("id", "title", "name", "cwd", "archived", "updated_at", "updated_at_ms", "recency_at", "recency_at_ms") if name in cols]
+        for row in con.execute("SELECT " + ", ".join(wanted) + " FROM threads"):
+            item = dict(row)
+            task_id = nullable_string(item.get("id"))
+            if task_id:
+                provider_rows[task_id] = item
+        con.close()
+    except Exception as exc:
+        provider_status = "unavailable"
+        provider_rows = {}
+        provider_errors.append(source_error("codex-provider", "unavailable", f"state-db-read-failed:{exc}"))
+
+source_errors = registry_errors + tmux_errors + provider_errors
+rows = {}
+
+def identity(provider, task_id=None, launch_id=None, tmux_id=None):
+    if task_id:
+        return f"provider:{provider}:{host_id}:{task_id}"
+    if launch_id:
+        return f"launch:{host_id}:{launch_id}"
+    return f"tmux:{host_id}:{tmux_id}"
+
+def base_row(key, provider, task_id=None):
+    return {
+        "task_key": key, "provider": provider, "provider_task_id": task_id,
+        "host_id": host_id, "origin": "unknown", "execution_runtime": "unknown",
+        "control_owner": "unknown", "lifecycle_state": "unknown", "restore_strategy": None,
+        "registered_by_cctrl": False, "launched_by_cctrl": False,
+        "registration_provenance": [], "launch_provenance": [],
+        "lineage": {"forked_from_id": None, "parent_thread_id": None, "derived_root_id": None, "derived_root_basis": None},
+        "ownership_evidence": [], "diagnostic_evidence": [], "recency": None,
+        "cwd": None, "title": None, "display_title": None, "tmux_session": None,
+        "_tmux_live": False, "_provider_seen": False, "_provider_archived": False,
+    }
+
+def merge_record(row, record, path_hint="registry"):
+    row.update({name: record.get(name) for name in ("origin", "execution_runtime", "control_owner", "lifecycle_state", "restore_strategy") if record.get(name) is not None})
+    row["registered_by_cctrl"] = record.get("registered_by_cctrl") is True
+    row["launched_by_cctrl"] = record.get("launched_by_cctrl") is True
+    if row["registered_by_cctrl"]:
+        row["registration_provenance"].append({"source": path_hint})
+    if row["launched_by_cctrl"]:
+        row["launch_provenance"].append({"source": path_hint, "launch_id": record.get("provisional_launch_id")})
+    lineage = record.get("lineage")
+    if isinstance(lineage, dict): row["lineage"] = lineage
+    evidence = record.get("ownership_evidence")
+    if isinstance(evidence, list): row["ownership_evidence"] = evidence[-MAX_EVIDENCE:]
+    row["recency"] = record.get("last_observed_at") or record.get("created_at")
+    row["cwd"] = record.get("cwd")
+    row["title"] = record.get("display_label") or record.get("purpose") or record.get("name")
+    row["display_title"] = row["title"]
+    row["tmux_session"] = nullable_string(record.get("tmux_session")) or nullable_string(record.get("name"))
+    row["_record_pane_id"] = nullable_string(record.get("pane_id"))
+    row["_record_pane_pid"] = nullable_string(record.get("pane_pid"))
+
+registry_seen = set()
+for record in registry:
+    provider = record.get("provider", "unknown")
+    task_id = nullable_string(record.get("provider_task_id"))
+    launch_id = nullable_string(record.get("provisional_launch_id"))
+    key = identity(provider, task_id=task_id, launch_id=launch_id)
+    duplicate_registry_identity = key in registry_seen
+    registry_seen.add(key)
+    row = rows.setdefault(key, base_row(key, provider, task_id))
+    merge_record(row, record)
+    if duplicate_registry_identity:
+        row["control_owner"] = "conflict"
+        row["execution_runtime"] = "conflict"
+        row["lifecycle_state"] = "conflict"
+        row["diagnostic_evidence"].append({"source":"registry","reason":"duplicate-stable-identity"})
+    row["provisional_launch_id"] = launch_id
+
+for task_id, provider in provider_rows.items():
+    key = identity("codex", task_id=task_id)
+    row = rows.setdefault(key, base_row(key, "codex", task_id))
+    row["_provider_seen"] = True
+    archived = bool(provider.get("archived")) if provider.get("archived") is not None else False
+    row["_provider_archived"] = archived
+    title = provider.get("title") or provider.get("name")
+    # Provider title is the user-visible task title when present; registry
+    # labels remain the fallback for providers without a title surface.
+    row["title"] = title or row["title"]
+    row["display_title"] = row["title"]
+    row["cwd"] = row["cwd"] or provider.get("cwd")
+    row["recency"] = provider.get("recency_at") or provider.get("updated_at") or provider.get("recency_at_ms") or provider.get("updated_at_ms") or row["recency"]
+    row["diagnostic_evidence"].append({"source":"codex-provider","reason":"provider-task-discovered"})
+    if not row["registered_by_cctrl"]:
+        # Presence in state_*.sqlite proves provider identity and archive state,
+        # not origin, current owner/runtime, or provider-managed availability.
+        if archived:
+            row["lifecycle_state"] = "archived"
+    elif archived:
+        row["lifecycle_state"] = "archived"
+
+tmux_by_name = {}
+for tmux in tmux_doc.get("rows", []):
+    if isinstance(tmux, dict) and nullable_string(tmux.get("name")) and nullable_string(tmux.get("session_id")):
+        tmux_by_name.setdefault(tmux["name"], []).append(tmux)
+
+claimed_tmux = set()
+for key, row in list(rows.items()):
+    name = row.get("tmux_session")
+    candidates = tmux_by_name.get(name, []) if name else []
+    if not candidates:
+        continue
+    if not row.get("_record_pane_id") or not row.get("_record_pane_pid"):
+        row["diagnostic_evidence"].append({"source":"tmux","reason":"unanchored-explicit-link"})
+        continue
+    exact = candidates
+    exact = [item for item in exact if item.get("pane_id") == row["_record_pane_id"]]
+    exact = [item for item in exact if str(item.get("pane_pid")) == str(row["_record_pane_pid"])]
+    if len(exact) != 1:
+        row["control_owner"] = "conflict"
+        row["execution_runtime"] = "conflict"
+        row["lifecycle_state"] = "conflict"
+        row["diagnostic_evidence"].append({"source":"tmux","reason":"explicit-link-ambiguous-or-stale"})
+        continue
+    tmux = exact[0]
+    token = tmux["session_id"]
+    if token in claimed_tmux:
+        row["control_owner"] = "conflict"
+        row["execution_runtime"] = "conflict"
+        row["lifecycle_state"] = "conflict"
+        row["diagnostic_evidence"].append({"source":"tmux","reason":"contradictory-explicit-link"})
+        for other in rows.values():
+            if other.get("_tmux_session_id") == token:
+                other["control_owner"] = other["execution_runtime"] = other["lifecycle_state"] = "conflict"
+                other["diagnostic_evidence"].append({"source":"tmux","reason":"contradictory-explicit-link"})
+        continue
+    claimed_tmux.add(token)
+    row["_tmux_live"] = True
+    row["_tmux_session_id"] = token
+    row["cwd"] = row["cwd"] or tmux.get("cwd")
+    row["recency"] = tmux.get("recency") or row["recency"]
+    row["diagnostic_evidence"].append({"source":"tmux","reason":"explicit-live-link","session_id":token})
+
+for name, items in tmux_by_name.items():
+    for tmux in items:
+        if tmux["session_id"] in claimed_tmux:
+            continue
+        key = identity("unknown", tmux_id=tmux["session_id"])
+        row = base_row(key, "unknown")
+        row.update({"execution_runtime":"tmux", "lifecycle_state":"active", "tmux_session":name,
+                    "cwd":tmux.get("cwd"), "recency":tmux.get("recency"), "title":name, "display_title":name,
+                    "_tmux_live":True, "_tmux_session_id":tmux["session_id"]})
+        row["diagnostic_evidence"].append({"source":"tmux","reason":"unregistered-live-session","session_id":tmux["session_id"]})
+        rows[key] = row
+
+lock_root = Path(codex_dir) / "thread-writer-locks"
+for row in rows.values():
+    task_id = row.get("provider_task_id")
+    if row.get("provider") == "codex" and task_id and (lock_root / f"{task_id}.lock").exists():
+        row["diagnostic_evidence"].append({"source":"codex-writer-lock","reason":"writer-lock-present"})
+
+def action(supported, reason): return {"supported": bool(supported), "reason": reason}
+
+for row in rows.values():
+    conflict = row["control_owner"] == "conflict" or row["execution_runtime"] == "conflict" or row["lifecycle_state"] == "conflict"
+    if conflict:
+        attach = action(False, "conflict")
+    elif tmux_doc["status"] != "available":
+        attach = action(False, "tmux-unavailable")
+    elif row["control_owner"] == "cctrl" and row["execution_runtime"] == "tmux" and row["_tmux_live"]:
+        attach = action(True, "available")
+    else:
+        attach = action(False, "no-live-cctrl-tmux-owner")
+    if row["lifecycle_state"] == "archived" or row["_provider_archived"]:
+        app_open = action(False, "archived")
+    elif provider_status != "available":
+        app_open = action(False, "provider-unavailable")
+    elif conflict:
+        app_open = action(False, "conflict")
+    elif row["control_owner"] == "cctrl":
+        app_open = action(False, "owned-by-cctrl")
+    elif row["control_owner"] == "external":
+        app_open = action(False, "owned-by-external")
+    elif row["_provider_seen"] and (row["control_owner"] == "app" or row["lifecycle_state"] == "inactive" or row["restore_strategy"] == "provider-managed"):
+        app_open = action(True, "available")
+    else:
+        app_open = action(False, "unknown")
+    row["action_capabilities"] = {
+        "tmux_attach": attach, "app_open": app_open,
+        "handoff": action(False, "not-implemented"), "cctrl_restore": action(False, "not-implemented")}
+    row["ownership_evidence"] = row["ownership_evidence"][-MAX_EVIDENCE:]
+    row["diagnostic_evidence"] = row["diagnostic_evidence"][-MAX_EVIDENCE:]
+    for internal in [name for name in row if name.startswith("_")]: del row[internal]
+
+statuses = {"registry": registry_status, "tmux": tmux_doc["status"], "codex_provider": provider_status}
+result = {
+    "schema_version": 2,
+    "capabilities": {
+        "task_list": {"supported": True, "reason": "available"},
+        "tmux_source": {"supported": tmux_doc["status"] == "available", "reason": tmux_doc["status"]},
+        "codex_provider_source": {"supported": provider_status == "available", "reason": provider_status},
+        "handoff": {"supported": False, "reason": "not-implemented"},
+        "cctrl_restore": {"supported": False, "reason": "not-implemented"},
+    },
+    "host_id": host_id, "host_id_initialized": host_id_initialized,
+    "source_status": statuses, "rows": sorted(rows.values(), key=lambda r: (str(r.get("recency") or ""), r["task_key"]), reverse=True),
+    "source_errors": source_errors,
+}
+print(json.dumps(result, sort_keys=True, indent=2))
+if all(value == "unavailable" for value in statuses.values()):
+    raise SystemExit(69)
+PY
+    rm -rf "$scratch"
+    return "$rc"
+}
+
+_task_list() {
+    local json=false a result rc=0
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            -h|--help|help)
+                echo "Usage: cctrl task ls [--json]"
+                echo ""
+                echo "List local tmux sessions and provider tasks without changing ownership."
+                echo "  --json    Emit the versioned task-list schema"
+                return 0
+                ;;
+            -*) echo -e "${RED}Unknown task-list flag: $a${RESET}" >&2; return 64 ;;
+            *) echo -e "${RED}Unexpected task-list argument: $a${RESET}" >&2; return 64 ;;
+        esac
+    done
+    result="$(_task_list_json)" || rc=$?
+    [[ -n "$result" ]] || return "${rc:-1}"
+    if $json; then
+        printf '%s\n' "$result"
+    else
+        if [[ "$(jq '.rows | length' <<< "$result")" == "0" ]]; then
+            echo -e "${DIM}No local tasks found.${RESET}"
+        else
+            echo -e "${DIM}OWNER and RUNTIME are independent; capabilities are computed per action.${RESET}"
+            printf '%-12s %-12s %-12s %-18s %-32s %s\n' "PROVIDER" "OWNER" "STATE" "RUNTIME" "TITLE" "TMUX"
+            jq -r '.rows[] | [(.provider // "-"),(.control_owner // "unknown"),(.lifecycle_state // "unknown"),(.execution_runtime // "unknown"),((.display_title // .provider_task_id // .task_key) | if length > 32 then .[0:29]+"..." else . end),(.tmux_session // "-")] | @tsv' <<< "$result" \
+                | while IFS=$'\t' read -r provider owner state runtime title tmux; do
+                    printf '%-12s %-12s %-12s %-18s %-32s %s\n' "$provider" "$owner" "$state" "$runtime" "$title" "$tmux"
+                done
+        fi
+        if [[ "$(jq '.source_errors | length' <<< "$result")" != "0" ]]; then
+            echo -e "${YELLOW}Some inventory sources were partial or unavailable; healthy rows are shown.${RESET}" >&2
+        fi
+    fi
+    return "$rc"
+}
+
+cmd_task() {
+    local action="${1:-ls}"
+    shift 2>/dev/null || true
+    case "$action" in
+        ls|list) _task_list "$@" ;;
+        -h|--help|help)
+            echo "Usage: cctrl task ls [--json]"
+            echo "List the provider-neutral local task inventory."
+            ;;
+        *) echo -e "${RED}Unknown task command: $action${RESET}" >&2; return 64 ;;
+    esac
+}
+
 _session_app_list() {
-    local json=false include_all=false a rows
+    local json=false include_all=false a inventory rows rc=0
     for a in "$@"; do
         case "$a" in
             --json) json=true ;;
@@ -9287,25 +9778,38 @@ _session_app_list() {
             -*) echo -e "${RED}Unknown app-ls flag: $a${RESET}" >&2; return 64 ;;
         esac
     done
-    rows="$(_codex_app_threads_json "$include_all")" || return 1
+    inventory="$(_task_list_json)" || rc=$?
+    [[ -n "$inventory" ]] || return "${rc:-1}"
+    if $include_all; then
+        rows="$(jq '[.rows[] | select(.provider == "codex")]' <<< "$inventory")"
+    else
+        rows="$(jq '[.rows[] | select(.provider == "codex" and .registered_by_cctrl == true and .lifecycle_state != "archived")]' <<< "$inventory")"
+    fi
+    rows="$(jq 'map(. + {
+        name:.tmux_session, agent:"codex", runtime:.execution_runtime,
+        state:(if .lifecycle_state == "archived" then "archived" elif .control_owner == "conflict" then "conflict" elif .control_owner == "app" then "app-owned" elif .control_owner == "cctrl" then "cctrl-owned" else .lifecycle_state end),
+        title:.display_title, dir:.cwd, session_id:.provider_task_id,
+        writer_lock:any(.diagnostic_evidence[]?; .source == "codex-writer-lock")
+    })' <<< "$rows")"
     if $json; then
         printf '%s\n' "$rows" | jq '.'
-        return 0
+        return "$rc"
     fi
     if [[ "$(printf '%s\n' "$rows" | jq 'length' 2>/dev/null)" == "0" ]]; then
         echo -e "${DIM}No app-owned Codex tasks known to cctrl.${RESET}"
-        return 0
+        return "$rc"
     fi
-    echo -e "${DIM}App-owned tasks survive outside tmux. STATE locked means a writer lock exists.${RESET}"
+    echo -e "${DIM}Codex provider tasks; ownership and writer-lock diagnostics are reported separately.${RESET}"
     printf '%-15s %-10s %-40s %s\n' "SESSION" "STATE" "TITLE" "DIR"
     printf '%s\n' "$rows" | jq -r '.[] | [
-        (.name // "-"),
-        (.state // "-"),
-        ((.title // .purpose // "-") | if length > 40 then .[0:37] + "..." else . end),
-        (.dir // "-")
+        (.tmux_session // "-"),
+        (.state // "unknown"),
+        ((.display_title // .provider_task_id // "-") | if length > 40 then .[0:37] + "..." else . end),
+        (.cwd // "-")
     ] | @tsv' | while IFS=$'\t' read -r name state title dir; do
         printf '%-15s %-10s %-40s %s\n' "$name" "$state" "$title" "${dir/#$HOME/~}"
     done
+    return "$rc"
 }
 
 _session_release_to_app_names() {
@@ -12135,6 +12639,7 @@ cmd_help() {
     echo ""
     echo "  cctrl session ls            List sessions (dir, agent/shell, model, state, rc; --json)"
     echo "    --recap                   Add a one-line recap per session (costs a transcript read)"
+    echo "  cctrl task ls [--json]      List local tmux and provider tasks with action capabilities"
     echo "  cctrl session say <name> -- <msg>  Paste a message into a live session's pane and submit"
     echo "                              (direct chat, no mailbox; --no-submit, --body-file PATH|-,"
     echo "                              --json, --force-busy)"
@@ -14377,6 +14882,7 @@ _dispatch() {
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
         session|sess) cmd_session "$@" ;;
+        task|tasks) cmd_task "$@" ;;
         fleet) cmd_fleet "$@" ;;
         needs-me|needsme|needs_me) cmd_needs_me "$@" ;;
         close) cmd_session close "$@" ;;
