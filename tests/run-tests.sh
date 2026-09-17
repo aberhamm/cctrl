@@ -4201,6 +4201,179 @@ JSON
     assert_contains "$out" '"purpose": "verify identity"'
 }
 
+test_session_stop_exact_identity() (
+    # Every tmux command is forced through a private socket. This exercises the
+    # real tmux identity/command-queue semantics without touching live sessions.
+    local real_tmux socket bin out rows old_id fresh_id server_id rc=0
+    local concurrent_dir concurrent_file pid n
+    local -a concurrent_pids=()
+    real_tmux="$(command -v tmux)"
+    [[ -x "$real_tmux" ]] || fail "tmux is required for exact-stop integration coverage"
+    socket="cctrl-exact-stop-$$-$RANDOM"
+    bin="$TMPDIR/exact-stop-bin"
+    mkdir -p "$bin"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+real_tmux="${CCTRL_TEST_REAL_TMUX:?}"
+socket="${CCTRL_TEST_TMUX_SOCKET:?}"
+
+# Return the inspected execution, then replace it before cctrl reaches its
+# guarded effect command. "session" models same-server name reuse; "server"
+# models a full tmux restart that reuses both the name and native $N id.
+if [[ -n "${CCTRL_TEST_REPLACE_MODE:-}" && "${1:-}" == "display-message" \
+      && "$*" == *session_id* && "$*" == *@cctrl_server_instance_id* ]]; then
+    observed="$("$real_tmux" -L "$socket" "$@")"
+    name="${CCTRL_TEST_REPLACE_NAME:?}"
+    if [[ "$CCTRL_TEST_REPLACE_MODE" == "server" ]]; then
+        "$real_tmux" -L "$socket" kill-server
+    else
+        "$real_tmux" -L "$socket" kill-session -t "=$name"
+    fi
+    "$real_tmux" -L "$socket" new-session -d -s "$name" 'sleep 120'
+    if [[ "$CCTRL_TEST_REPLACE_MODE" == "server" && -n "${CCTRL_TEST_RESTORE_SERVER_ID:-}" ]]; then
+        "$real_tmux" -L "$socket" set-option -s @cctrl_server_instance_id \
+            "$CCTRL_TEST_RESTORE_SERVER_ID"
+    fi
+    printf '%s\n' "$observed"
+    exit 0
+fi
+
+exec "$real_tmux" -L "$socket" "$@"
+SH
+    chmod +x "$bin/tmux"
+    export CCTRL_TEST_REAL_TMUX="$real_tmux" CCTRL_TEST_TMUX_SOCKET="$socket"
+    # shellcheck disable=SC2329 # invoked by the EXIT trap
+    cleanup_exact_stop() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; }
+    trap cleanup_exact_stop EXIT
+
+    "$real_tmux" -L "$socket" new-session -d -s reused 'sleep 120'
+    "$real_tmux" -L "$socket" new-session -d -s bystander 'sleep 120'
+
+    # Concurrent first-time listers must converge on the one value installed
+    # by tmux's serialized command queue; no caller may mint a competing ID.
+    concurrent_dir="$TMPDIR/exact-stop-concurrent"
+    mkdir -p "$concurrent_dir"
+    for n in 1 2 3 4; do
+        PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json >"$concurrent_dir/$n.json" &
+        concurrent_pids+=("$!")
+    done
+    for pid in "${concurrent_pids[@]}"; do wait "$pid"; done
+    server_id="$("$real_tmux" -L "$socket" show-options -sqv @cctrl_server_instance_id)"
+    [[ "$server_id" =~ ^[0-9a-f]{32}$ ]] \
+        || fail "concurrent listing did not install a valid server identity: $server_id"
+    for concurrent_file in "$concurrent_dir"/*.json; do
+        jq -e --arg server_id "$server_id" \
+            'length == 2 and all(.[].execution_id; split(":") as $p | ($p | length) == 5 and $p[0] == "tmux-v1" and $p[1] == $server_id and ($p[2] | test("^[0-9]+$")) and ($p[3] | test("^[0-9]+$")) and ($p[4] | test("^\\$[0-9]+$")))' \
+            "$concurrent_file" >/dev/null \
+            || fail "concurrent listing did not converge on $server_id: $(cat "$concurrent_file")"
+    done
+
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    old_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+    [[ "$old_id" =~ ^tmux-v1:[0-9a-f]{32}:[0-9]+:[0-9]+:\$[0-9]+$ ]] \
+        || fail "listing did not expose a valid execution_id: $old_id"
+    jq -e '.[] | select(.name=="reused") | .session_id == null' <<< "$rows" >/dev/null \
+        || fail "provider session_id was repurposed as execution identity"
+
+    # A replacement with the same name in the same server receives a new $N.
+    "$real_tmux" -L "$socket" kill-session -t '=reused'
+    "$real_tmux" -L "$socket" new-session -d -s reused 'sleep 120'
+    rc=0
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$old_id" --json)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "stale same-server identity returned $rc: $out"
+    jq -e '.ok==false and .status=="stale-identity"' <<< "$out" >/dev/null \
+        || fail "stale same-server identity returned the wrong contract: $out"
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "stale identity stopped the same-name replacement"
+
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    fresh_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+
+    # Missing, malformed, unsupported, and name-mismatched identities fail
+    # closed. Neither the target nor an unrelated session is touched.
+    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --json)" || rc=$?
+    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="missing-identity"' <<< "$out" >/dev/null; then
+        fail "missing identity did not fail closed: rc=$rc out=$out"
+    fi
+    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id --json)" || rc=$?
+    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="missing-identity"' <<< "$out" >/dev/null; then
+        fail "valueless identity did not fail closed as JSON: rc=$rc out=$out"
+    fi
+    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id nonsense --json)" || rc=$?
+    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="malformed-identity"' <<< "$out" >/dev/null; then
+        fail "malformed identity did not fail closed: rc=$rc out=$out"
+    fi
+    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id 'tmux-v2:future' --json)" || rc=$?
+    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="unsupported-identity"' <<< "$out" >/dev/null; then
+        fail "unsupported identity did not fail closed: rc=$rc out=$out"
+    fi
+    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact bystander --execution-id "$fresh_id" --json)" || rc=$?
+    if [[ "$rc" -ne 75 ]] || ! jq -e '.status=="mismatched-identity"' <<< "$out" >/dev/null; then
+        fail "mismatched identity did not fail closed: rc=$rc out=$out"
+    fi
+    "$real_tmux" -L "$socket" has-session -t '=reused' || fail "invalid identity stopped its target"
+    "$real_tmux" -L "$socket" has-session -t '=bystander' || fail "invalid identity stopped a bystander"
+
+    # Force same-name replacement after inspection but before termination.
+    # The immutable $N target makes the effect-boundary command fail stale.
+    rc=0
+    out="$(CCTRL_TEST_REPLACE_MODE=session CCTRL_TEST_REPLACE_NAME=reused \
+        PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$fresh_id" --json)" || rc=$?
+    if [[ "$rc" -ne 69 ]] || ! jq -e '.status=="stale-identity"' <<< "$out" >/dev/null; then
+        fail "inspection/effect name-reuse race did not fail stale: rc=$rc out=$out"
+    fi
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "inspection/effect race stopped the replacement"
+
+    # A server restart can reuse $0 and restore the old valid-looking random
+    # option. Immutable server PID/start fields still reject the replacement,
+    # even when it appears after inspection.
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    fresh_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+    server_id="${fresh_id#tmux-v1:}"
+    server_id="${server_id%%:*}"
+    rc=0
+    out="$(CCTRL_TEST_REPLACE_MODE=server CCTRL_TEST_REPLACE_NAME=reused CCTRL_TEST_RESTORE_SERVER_ID="$server_id" \
+        PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$fresh_id" --json)" || rc=$?
+    if [[ "$rc" -ne 69 ]] || ! jq -e '.status=="stale-identity"' <<< "$out" >/dev/null; then
+        fail "tmux restart race did not fail stale: rc=$rc out=$out"
+    fi
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "stale pre-restart identity stopped the replacement server's session"
+
+    # A malformed pre-existing server annotation must never be upgraded into
+    # a claimed execution identity. The session remains visible but unstoppably
+    # fail-closed until a valid incarnation can be established.
+    "$real_tmux" -L "$socket" set-option -s @cctrl_server_instance_id invalid
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    jq -e '.[] | select(.name=="reused") | .execution_id == null' <<< "$rows" >/dev/null \
+        || fail "invalid server identity did not make execution_id null: $rows"
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "fail-closed listing changed the running session"
+    "$real_tmux" -L "$socket" set-option -su @cctrl_server_instance_id
+
+    # A fresh identity stops only its intended execution.
+    "$real_tmux" -L "$socket" new-session -d -s survivor 'sleep 120'
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    fresh_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$fresh_id" --json)"
+    jq -e '.ok==true and .status=="stopped"' <<< "$out" >/dev/null \
+        || fail "correct identity did not stop its execution: $out"
+    ! "$real_tmux" -L "$socket" has-session -t '=reused' 2>/dev/null \
+        || fail "correct identity left its execution alive"
+    "$real_tmux" -L "$socket" has-session -t '=survivor' \
+        || fail "correct identity stopped an unrelated session"
+
+    # Preserve the existing name-based manual command for CLI compatibility.
+    "$real_tmux" -L "$socket" new-session -d -s legacy-kill 'sleep 120'
+    PATH="$bin:$PATH" "$ROOT/cctrl" session kill legacy-kill >/dev/null
+    ! "$real_tmux" -L "$socket" has-session -t '=legacy-kill' 2>/dev/null \
+        || fail "legacy session kill no longer works"
+
+    echo "ok: exact stop binds server+session identity and fails closed across reuse/restart"
+)
+
 # --- planned session attest -------------------------------------------------
 
 test_session_attest_live_tmux_process_matches() {
@@ -8264,6 +8437,11 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        session-stop-exact)
+            test_session_stop_exact_identity
+            echo "ok"
+            exit 0
+            ;;
         task-records)
             test_task_record_host_id_is_stable_exclusive_and_private
             test_task_record_schema_v2_and_provisional_promotion
@@ -8458,6 +8636,7 @@ test_peer_mcp_send_deliver_outcomes
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
+test_session_stop_exact_identity
 test_session_attest_live_tmux_process_matches
 test_session_attest_direct_metadata
 test_session_attest_stale_tmux_session_missing

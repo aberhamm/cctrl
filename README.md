@@ -461,9 +461,32 @@ STATE is richer than attached/detached. Beyond the base activity states
 signal falls back to the base state instead of asserting something false.
 
 ```bash
-cctrl session ls --json           # machine-readable; adds session_id, last_active, bridge, peer
+cctrl session ls --json           # machine-readable; adds execution_id, session_id, last_active, bridge, peer
 cctrl session ls --recap          # add a one-line recap per session
 ```
+
+`session_id` remains the Claude/Codex conversation identity. Automation that
+needs to terminate the currently listed tmux process must instead carry the
+opaque `execution_id` from that same row into `stop-exact`:
+
+```bash
+row='{"name":"TMUX--api","execution_id":"tmux-v1:7b4d1234567890abcdef1234567890ab:9123:1789644000:$12"}'
+name="$(jq -r .name <<< "$row")"
+execution_id="$(jq -r .execution_id <<< "$row")"
+cctrl session stop-exact "$name" --execution-id "$execution_id" --json
+# {"ok":true,"status":"stopped",...}
+```
+
+The identity binds a random tmux-server guard plus tmux's immutable server PID,
+server start time, and native session ID. `stop-exact` rechecks all four in the
+same tmux command that performs the kill, and kills by native ID rather than by
+name. A stale identity therefore cannot stop a same-name replacement, including
+after a tmux server restart or restoration of the previous guard option.
+Missing, malformed, unsupported, stale, and name-mismatched identities fail
+closed with `ok:false`; no session is terminated. If cctrl cannot establish the
+identity contract, `execution_id` is `null` and the row is not safely stoppable.
+The legacy `session kill <name>` command remains available for interactive
+compatibility, but automation should not use it.
 
 `--recap` appends a compact summary of what each session was last doing, read
 from the transcript's compact-summary entry. It costs a bounded transcript read
