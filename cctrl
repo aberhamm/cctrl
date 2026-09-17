@@ -10814,264 +10814,6 @@ _session_doctor() {
     fi
     return 0
 }
-
-_session_snapshot() {
-    # Capture a point-in-time snapshot of the live fleet to JSON.
-    # Side-effect-free: no tmux mutation (no tmux write commands).
-    # Runs unattended via a launchd timer every 5 minutes so the fleet
-    # state survives an unplanned power loss.
-    #
-    # initial_prompt is deliberately NOT stored. Restoring by replaying a stored
-    # initial prompt is wrong: those prompts reference sibling sessions that no
-    # longer exist and actively mislead a restored session. Resuming the
-    # conversation is the only correct restore. Omitting the field from the
-    # snapshot is the enforcement.
-
-    local snapshot_dir="" allow_empty=false json_out=false quiet=false
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --dir)       snapshot_dir="${2:-}"; shift 2 ;;
-            --dir=*)     snapshot_dir="${1#--dir=}"; shift ;;
-            --allow-empty) allow_empty=true; shift ;;
-            --json)      json_out=true; shift ;;
-            --quiet)     quiet=true; shift ;;
-            -h|--help|help)
-                echo "Usage: cctrl session snapshot [--dir PATH] [--allow-empty] [--json] [--quiet]"
-                echo ""
-                echo "  Capture a point-in-time snapshot of the live fleet."
-                echo "  Writes data/snapshots/latest.json + a timestamped history file."
-                echo "  Safe to run unattended (no tmux mutation, no session side effects)."
-                echo ""
-                echo "    --dir PATH        Write snapshots to PATH instead of data/snapshots/"
-                echo "    --allow-empty     Write even when fleet is empty (default: preserve"
-                echo "                      existing latest.json when capture yields zero sessions)"
-                echo "    --json            Print the snapshot JSON to stdout after writing"
-                echo "    --quiet           Suppress informational output"
-                return 0
-                ;;
-            -*) echo -e "${RED}Unknown snapshot flag: $1${RESET}" >&2; return 64 ;;
-            *)  shift ;;
-        esac
-    done
-
-    [[ -n "$snapshot_dir" ]] || snapshot_dir="$SCRIPT_DIR/data/snapshots"
-    mkdir -p "$snapshot_dir" || return 1
-
-    # --- Capture the live fleet via _session_list --json ---
-    # Two failure modes:
-    #   1. tmux absent -> _session_list returns non-zero before producing JSON
-    #      -> write nothing, exit 0 with a note (NOT the same as empty fleet)
-    #   2. tmux installed, no server -> returns [] with rc 0 -> empty guard catches
-    local fleet_json rc=0
-    fleet_json="$(_session_list --json 2>/dev/null)" || rc=$?
-    if [[ $rc -ne 0 ]]; then
-        $quiet || echo "snapshot: tmux unavailable (rc=$rc); existing latest.json preserved."
-        return 0
-    fi
-
-    local session_count
-    session_count="$(printf '%s' "$fleet_json" | jq 'length')"
-
-    # --- Empty-fleet guard ---
-    if [[ "$session_count" -eq 0 ]] && ! $allow_empty; then
-        if [[ -f "$snapshot_dir/latest.json" ]]; then
-            local existing_count
-            existing_count="$(jq '.session_count // 0' "$snapshot_dir/latest.json" 2>/dev/null || echo 0)"
-            if [[ "$existing_count" -gt 0 ]]; then
-                local age_note=""
-                if [[ "$(uname -s)" == "Darwin" ]]; then
-                    local file_epoch now_epoch
-                    file_epoch="$(stat -f %m "$snapshot_dir/latest.json" 2>/dev/null || echo 0)"
-                    now_epoch="$(date +%s)"
-                    if [[ "$file_epoch" -gt 0 ]]; then
-                        local age_min=$(( (now_epoch - file_epoch) / 60 ))
-                        age_note=" (${age_min}m old)"
-                    fi
-                fi
-                $quiet || echo "snapshot: empty fleet, preserving existing latest.json${age_note} with ${existing_count} session(s)."
-                return 0
-            fi
-        fi
-        # First run with no existing latest.json and empty fleet: write normally
-    fi
-
-    # --- Build per-session snapshot entries ---
-    local sessions_out="[]"
-    if [[ "$session_count" -gt 0 ]]; then
-        local i name cwd target target_kind host launch_command transcript_path transcript_bytes
-        local record_file launch_flags_json
-        for (( i=0; i<session_count; i++ )); do
-            local entry
-            entry="$(printf '%s' "$fleet_json" | jq ".[$i]")"
-            name="$(printf '%s' "$entry" | jq -r '.name')"
-
-            # Read record fields from session metadata file
-            record_file="$(_session_metadata_file "$name")"
-            cwd=""; target=""; target_kind=""; host=""; launch_command=""
-            if [[ -f "$record_file" ]]; then
-                local normalized_record
-                normalized_record="$(_task_record_normalize_json "$record_file" 2>/dev/null || true)"
-                cwd="$(jq -r '.cwd // empty' <<< "$normalized_record" 2>/dev/null || true)"
-                target="$(jq -r '.target // empty' <<< "$normalized_record" 2>/dev/null || true)"
-                target_kind="$(jq -r '.target_kind // empty' <<< "$normalized_record" 2>/dev/null || true)"
-                host="$(jq -r '.host // .host_id // empty' <<< "$normalized_record" 2>/dev/null || true)"
-                launch_command="$(jq -r '.launch_command // empty' <<< "$normalized_record" 2>/dev/null || true)"
-            fi
-
-            # transcript_path from _session_list (key: transcript), renamed
-            transcript_path="$(printf '%s' "$entry" | jq -r '.transcript // empty')"
-
-            # transcript_bytes: stat the transcript file
-            transcript_bytes="null"
-            if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
-                local sz
-                sz="$(stat -f %z "$transcript_path" 2>/dev/null || stat -c %s "$transcript_path" 2>/dev/null || true)"
-                [[ -n "$sz" ]] && transcript_bytes="$sz"
-            fi
-
-            # Parse launch_flags from launch_command
-            launch_flags_json="{}"
-            if [[ -n "$launch_command" ]]; then
-                local lf_model lf_profile lf_permission_mode lf_sandbox lf_ask lf_no_bridge lf_peer
-                lf_model="$(printf '%s' "$launch_command" | grep -oE -- '--model(=| )[^ ]+' | head -1 | sed -E 's/^--model[= ]//' || true)"
-                lf_profile="$(printf '%s' "$launch_command" | grep -oE -- '--profile(=| )[^ ]+' | head -1 | sed -E 's/^--profile[= ]//' || true)"
-                lf_permission_mode="$(printf '%s' "$launch_command" | grep -oE -- '--permission-mode(=| )[^ ]+' | head -1 | sed -E 's/^--permission-mode[= ]//' || true)"
-                lf_sandbox="$(printf '%s' "$launch_command" | grep -oE -- '--sandbox(=| )[^ ]+' | head -1 | sed -E 's/^--sandbox[= ]//' || true)"
-                lf_ask="$(printf '%s' "$launch_command" | grep -oE -- '--ask-for-approval(=| )[^ ]+' | head -1 | sed -E 's/^--ask-for-approval[= ]//' || true)"
-                lf_no_bridge=""
-                [[ "$launch_command" == *"--no-bridge"* ]] && lf_no_bridge="true"
-                lf_peer="$(printf '%s' "$launch_command" | grep -oE -- '--peer(=| )[^ ]+' | head -1 | sed -E 's/^--peer[= ]//' || true)"
-
-                launch_flags_json="$(jq -n \
-                    --arg model "$lf_model" \
-                    --arg profile "$lf_profile" \
-                    --arg permission_mode "$lf_permission_mode" \
-                    --arg sandbox "$lf_sandbox" \
-                    --arg ask_for_approval "$lf_ask" \
-                    --arg no_bridge "$lf_no_bridge" \
-                    --arg peer "$lf_peer" \
-                    '[
-                        {key:"model", value:$model},
-                        {key:"profile", value:$profile},
-                        {key:"permission_mode", value:$permission_mode},
-                        {key:"sandbox", value:$sandbox},
-                        {key:"ask_for_approval", value:$ask_for_approval},
-                        {key:"no_bridge", value:$no_bridge},
-                        {key:"peer", value:$peer}
-                    ] | map(select(.value != "")) | from_entries')"
-            fi
-
-            # Build the snapshot entry -- map _session_list field names to snapshot names
-            # session_id -> conversation_id, transcript -> transcript_path
-            sessions_out="$(printf '%s' "$sessions_out" | jq \
-                --argjson entry "$entry" \
-                --arg cwd "$cwd" \
-                --arg target "$target" \
-                --arg target_kind "$target_kind" \
-                --arg host "$host" \
-                --arg transcript_path "$transcript_path" \
-                --argjson transcript_bytes "$transcript_bytes" \
-                --argjson launch_flags "$launch_flags_json" \
-                '. + [{
-                    name: $entry.name,
-                    state: $entry.state,
-                    attached: $entry.attached,
-                    managed: $entry.managed,
-                    remote_control: $entry.remote_control,
-                    agent: $entry.agent,
-                    model: $entry.model,
-                    last_active: $entry.last_active,
-                    purpose: $entry.purpose,
-                    created_at: $entry.created_at,
-                    peer: $entry.peer,
-                    display_label: $entry.display_label,
-                    conversation_id: $entry.session_id,
-                    task_record_schema_version: $entry.schema_version,
-                    provider: $entry.provider,
-                    provider_task_id: $entry.provider_task_id,
-                    origin: $entry.origin,
-                    host_id: $entry.host_id,
-                    registered_by_cctrl: $entry.registered_by_cctrl,
-                    launched_by_cctrl: $entry.launched_by_cctrl,
-                    execution_runtime: $entry.execution_runtime,
-                    control_owner: $entry.control_owner,
-                    lifecycle_state: $entry.lifecycle_state,
-                    restore_strategy: $entry.restore_strategy,
-                    last_observed_at: $entry.last_observed_at,
-                    tmux_session: $entry.name,
-                    lineage: $entry.lineage,
-                    ownership_evidence: $entry.ownership_evidence,
-                    transcript_path: (if $transcript_path == "" then null else $transcript_path end),
-                    transcript_bytes: $transcript_bytes,
-                    cwd: (if $cwd == "" then null else $cwd end),
-                    target: (if $target == "" then null else $target end),
-                    target_kind: (if $target_kind == "" then null else $target_kind end),
-                    host: (if $host == "" then null else $host end),
-                    launch_flags: $launch_flags
-                }]')"
-        done
-    fi
-
-    # --- Build resource_line directly from the three probes ---
-    # Do NOT call _res_health_line -- it runs _active_session_count which runs
-    # _session_list a second time. Build the string directly.
-    local mf sw ld mf_d sw_d
-    mf="$(_res_mem_free_pct)"; sw="$(_res_swap_used_mb)"; ld="$(_res_load1)"
-    [[ -n "$mf" ]] && mf_d="${mf}%" || mf_d="n/a"
-    [[ -n "$sw" ]] && sw_d="${sw}MB" || sw_d="n/a"
-    local resource_line
-    resource_line="$(printf 'mem %s free · swap %s used · load %s · %s sessions' \
-        "$mf_d" "$sw_d" "${ld:-n/a}" "$session_count")"
-
-    # --- Build the full snapshot ---
-    local generated_at hostname_val
-    generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    hostname_val="${CCTRL_HOST_PREFIX:-$(hostname -s 2>/dev/null || echo unknown)}"
-
-    local snapshot_json
-    snapshot_json="$(jq -n \
-        --argjson schema_version 1 \
-        --arg generated_at "$generated_at" \
-        --arg hostname "$hostname_val" \
-        --argjson session_count "$session_count" \
-        --arg resource_line "$resource_line" \
-        --argjson sessions "$sessions_out" \
-        '{
-            schema_version: $schema_version,
-            generated_at: $generated_at,
-            hostname: $hostname,
-            session_count: $session_count,
-            resource_line: $resource_line,
-            sessions: $sessions
-        }')"
-
-    # --- Atomic write: history file first, then latest.json ---
-    local ts_name history_file tmp_file
-    ts_name="$(date -u +%Y%m%dT%H%M%SZ)"
-    history_file="$snapshot_dir/${ts_name}.json"
-
-    # History file: same-dir mktemp + mv
-    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || return 1
-    printf '%s\n' "$snapshot_json" > "$tmp_file"
-    mv "$tmp_file" "$history_file"
-
-    # latest.json: same-dir mktemp + mv
-    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || return 1
-    printf '%s\n' "$snapshot_json" > "$tmp_file"
-    mv "$tmp_file" "$snapshot_dir/latest.json"
-
-    if $json_out; then
-        printf '%s\n' "$snapshot_json"
-    else
-        $quiet || echo "snapshot: ${session_count} session(s) written to ${snapshot_dir}/latest.json"
-    fi
-
-    # --- Retention pruning ---
-    _snapshot_retention_prune "$snapshot_dir"
-
-    return 0
-}
-
 _snapshot_retention_prune() {
     # Keep every history file younger than 7 days.
     # Older than 7 days: keep only the first file of each UTC day, up to 90 days.
@@ -11124,685 +10866,279 @@ _snapshot_retention_prune() {
         fi
     done
 }
-
-_session_restore() {
-    # Restore sessions from a fleet snapshot (plan 053). Reads a snapshot
-    # JSON (written by `cctrl session snapshot`, plan 052) and respawns
-    # sessions by resuming their conversations. Sessions with no
-    # conversation_id are skipped (never fresh-spawned). Sessions already
-    # live are skipped. Spawns go in human-released waves, gated on
-    # memory/swap thresholds.
-    #
-    # CONSTRAINTS: no pane mutation/capture, no stored-prompt replay, no
-    # --force to cctrl start. See plan 053 structural asserts.
-
-    local snapshot_path="" dry_run=false assume_yes=false stale_ok=false
-    local force_host=false json=false quiet=false
-    local -a only_patterns=()
-    local limit=""
-
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --from)
-                [[ $# -ge 2 ]] || { echo -e "${RED}--from needs a value${RESET}" >&2; return 2; }
-                if [[ "$2" == "latest" ]]; then
-                    snapshot_path=""  # will resolve to default
-                else
-                    snapshot_path="$2"
-                fi
-                shift 2 ;;
-            --only)
-                [[ $# -ge 2 ]] || { echo -e "${RED}--only needs a value${RESET}" >&2; return 2; }
-                only_patterns+=("$2")
-                shift 2 ;;
-            --dry-run)    dry_run=true; shift ;;
-            --limit)
-                [[ $# -ge 2 ]] || { echo -e "${RED}--limit needs a value${RESET}" >&2; return 2; }
-                limit="$2"; shift 2 ;;
-            --yes|-y)     assume_yes=true; shift ;;
-            --stale-ok)   stale_ok=true; shift ;;
-            --force-host) force_host=true; shift ;;
-            --json)       json=true; shift ;;
-            --quiet|-q)   quiet=true; shift ;;
-            -h|--help|help)
-                echo "Usage: cctrl session restore [--from PATH] [--only PATTERN] [--dry-run]"
-                echo "                             [--limit N] [--yes] [--stale-ok] [--force-host]"
-                echo "                             [--json] [--quiet]"
-                echo ""
-                echo "Restore sessions from a fleet snapshot by resuming their conversations."
-                echo "Sessions with no conversation_id are skipped (never fresh-spawned)."
-                echo ""
-                echo "  --from PATH       Snapshot file (default: data/snapshots/latest.json)"
-                echo "  --only PATTERN    Filter by name/label/purpose/cwd (repeatable, union)"
-                echo "  --dry-run         Show the plan; spawn nothing"
-                echo "  --limit N         Cap spawns in this invocation"
-                echo "  --yes             Skip interactive confirmation (required for non-TTY)"
-                echo "  --stale-ok        Accept snapshots older than 24h"
-                echo "  --force-host      Accept snapshots from a different host"
-                echo "  --json            Machine-readable output"
-                echo "  --quiet           Suppress informational output"
-                return 0 ;;
-            -*) echo -e "${RED}Unknown restore flag: $1${RESET}" >&2; return 2 ;;
-            *) echo -e "${RED}Unexpected argument: $1${RESET}" >&2; return 2 ;;
-        esac
-    done
-
-    # --- Resolve snapshot path ---
-    local snapshots_dir="$SCRIPT_DIR/data/snapshots"
-    if [[ -z "$snapshot_path" ]]; then
-        snapshot_path="$snapshots_dir/latest.json"
-    fi
-    if [[ ! -f "$snapshot_path" ]]; then
-        $json && jq -n --arg path "$snapshot_path" '{ok:false,error:"snapshot not found",path:$path}'
-        $json || echo -e "${RED}Snapshot not found: $snapshot_path${RESET}" >&2
-        return 2
-    fi
-
-    # --- History-beats-stale-latest ---
-    # If we're reading latest.json, check if a newer history file exists in the
-    # same directory. Plan 052 writes history before latest, so a crash can leave
-    # history newer than latest.
-    if [[ "$snapshot_path" == */latest.json ]]; then
-        local snap_dir latest_mtime newest_hist="" newest_hist_mtime=0 hist_f hist_mtime
-        snap_dir="$(dirname "$snapshot_path")"
-        latest_mtime="$(stat -f %m "$snapshot_path" 2>/dev/null || echo 0)"
-        for hist_f in "$snap_dir"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.json; do
-            [[ -f "$hist_f" ]] || continue
-            hist_mtime="$(stat -f %m "$hist_f" 2>/dev/null || echo 0)"
-            if [[ "$hist_mtime" -gt "$newest_hist_mtime" ]]; then
-                newest_hist_mtime="$hist_mtime"
-                newest_hist="$hist_f"
-            fi
-        done
-        if [[ -n "$newest_hist" && "$newest_hist_mtime" -gt "$latest_mtime" ]]; then
-            # Validate the newer history file before using it
-            if jq -e '.schema_version' "$newest_hist" >/dev/null 2>&1; then
-                $quiet || $json || echo -e "${DIM}Using newer history file: $(basename "$newest_hist") (latest.json is older)${RESET}"
-                snapshot_path="$newest_hist"
-            fi
-        fi
-    fi
-
-    # --- Read and validate snapshot ---
-    local snap_json
-    snap_json="$(cat "$snapshot_path" 2>/dev/null)" || {
-        $json && jq -n --arg path "$snapshot_path" '{ok:false,error:"cannot read snapshot",path:$path}'
-        $json || echo -e "${RED}Cannot read snapshot: $snapshot_path${RESET}" >&2
-        return 2
-    }
-
-    local schema_version
-    schema_version="$(printf '%s' "$snap_json" | jq -r '.schema_version // empty' 2>/dev/null)"
-    if [[ "$schema_version" != "1" ]]; then
-        local msg="Unknown snapshot schema_version: ${schema_version:-null} (expected 1)"
-        $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-        $json || echo -e "${RED}$msg${RESET}" >&2
-        return 2
-    fi
-
-    # --- Snapshot age check ---
-    local generated_at snap_epoch now_epoch snap_age_s max_age
-    generated_at="$(printf '%s' "$snap_json" | jq -r '.generated_at // empty')"
-    max_age="${CCTRL_RESTORE_MAX_SNAPSHOT_AGE:-86400}"
-    now_epoch="$(date +%s)"
-    snap_epoch=""
-    if [[ -n "$generated_at" ]]; then
-        snap_epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$generated_at" +%s 2>/dev/null || true)"
-    fi
-    if [[ -n "$snap_epoch" ]]; then
-        snap_age_s=$(( now_epoch - snap_epoch ))
-        local age_display
-        if [[ "$snap_age_s" -lt 60 ]]; then
-            age_display="${snap_age_s}s"
-        elif [[ "$snap_age_s" -lt 3600 ]]; then
-            age_display="$(( snap_age_s / 60 ))m"
-        elif [[ "$snap_age_s" -lt 86400 ]]; then
-            age_display="$(( snap_age_s / 3600 ))h"
-        else
-            age_display="$(( snap_age_s / 86400 ))d"
-        fi
-        $quiet || $json || echo -e "${DIM}Snapshot age: ${age_display} (generated ${generated_at})${RESET}"
-        if [[ "$snap_age_s" -gt "$max_age" ]] && ! $assume_yes && ! $stale_ok; then
-            local msg="Snapshot is ${age_display} old (threshold: $(( max_age / 3600 ))h). Use --yes or --stale-ok to accept."
-            $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-            $json || echo -e "${RED}$msg${RESET}" >&2
-            return 2
-        fi
+_snapshot_process_source() {
+    # One process-table read shared by capture and restore planning. Test seams
+    # are files, so fixtures exercise the same parser and policy path.
+    local output="$1" rc=0 observed_at
+    observed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ -n "${CCTRL_SNAPSHOT_PROCESS_FILE:-}" ]]; then
+        cp "$CCTRL_SNAPSHOT_PROCESS_FILE" "$output" || rc=$?
+    elif [[ -n "${CCTRL_RESTORE_PROCESS_FILE:-}" ]]; then
+        cp "$CCTRL_RESTORE_PROCESS_FILE" "$output" || rc=$?
     else
-        $quiet || $json || echo -e "${DIM}Snapshot age: unknown (no generated_at)${RESET}"
+        ps -axo pid=,ppid=,lstart=,command= > "${output}.rows" 2> "${output}.err" || rc=$?
+        python3 - "${output}.rows" "${output}.err" "$observed_at" "$rc" > "$output" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+rows_path,error_path,observed_at,rc=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3],int(sys.argv[4])
+rows=[]
+if rc == 0:
+    for line in rows_path.read_text(errors="replace").splitlines():
+        fields=line.strip().split(None,7)
+        if len(fields)==8 and fields[0].isdigit() and fields[1].isdigit():
+            rows.append({"pid":int(fields[0]),"ppid":int(fields[1]),"started":" ".join(fields[2:7]),"command":fields[7]})
+body=json.dumps(rows,sort_keys=True,separators=(",",":")).encode()
+error=error_path.read_text(errors="replace").strip() if rc else None
+print(json.dumps({"schema_version":1,"status":"available" if rc == 0 else "unavailable",
+ "observed_at":observed_at,"source_cursor":hashlib.sha256(body).hexdigest() if rc == 0 else None,
+ "processes":rows,"error":error},sort_keys=True,separators=(",",":")))
+PY
+        rm -f "${output}.rows" "${output}.err"
     fi
-
-    # --- Hostname check ---
-    local snap_hostname local_hostname
-    snap_hostname="$(printf '%s' "$snap_json" | jq -r '.hostname // empty')"
-    local_hostname="$(hostname -s 2>/dev/null || hostname 2>/dev/null)"
-    if [[ -n "$snap_hostname" && "$snap_hostname" != "$local_hostname" ]] && ! $force_host; then
-        local msg="Hostname mismatch: snapshot is from '$snap_hostname', this host is '$local_hostname'. Use --force-host to override."
-        $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-        $json || echo -e "${RED}$msg${RESET}" >&2
-        return 2
+    if (( rc != 0 )) || ! jq -e 'type == "object" and .status == "available" and (.processes | type == "array")' "$output" >/dev/null 2>&1; then
+        jq -n --arg at "$observed_at" --arg error "process-snapshot-failed (exit $rc)" \
+            '{schema_version:1,status:"unavailable",observed_at:$at,source_cursor:null,processes:[],error:$error}' > "$output"
+        return 69
     fi
-
-    # --- Extract sessions, order by last_active desc ---
-    local sessions_json
-    sessions_json="$(printf '%s' "$snap_json" | jq -c '
-        [.sessions[] | select(.managed == true)]
-        | sort_by(if (.last_active | type) == "string" and (.last_active | length) > 0
-                  then .last_active else "" end)
-        | reverse')" || {
-        $json && jq -n '{ok:false,error:"cannot parse sessions from snapshot"}'
-        $json || echo -e "${RED}Cannot parse sessions from snapshot${RESET}" >&2
-        return 2
-    }
-
-    local session_count
-    session_count="$(printf '%s' "$sessions_json" | jq 'length')"
-    if [[ "$session_count" -eq 0 ]]; then
-        $json && jq -n '{ok:true,restored:0,skipped:0,already_live:0,deferred:0,failed:0,sessions:[]}'
-        $json || echo -e "${DIM}No managed sessions in snapshot.${RESET}"
-        return 0
-    fi
-
-    # --- Build live set for already-live check ---
-    # Get live sessions and their conversation_ids from both session records
-    # (metadata JSON) and live session_id. Cap-fails-closed: if _session_list
-    # fails, we STOP.
-    local live_json live_rc=0
-    live_json="$(_session_list --json 2>/dev/null)" || live_rc=$?
-    if [[ $live_rc -ne 0 ]] || ! printf '%s' "$live_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        local msg="Cannot enumerate live sessions (session list unavailable). Refusing to restore."
-        $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-        $json || echo -e "${RED}$msg${RESET}" >&2
-        return 2
-    fi
-
-    # Build a set of conversation_ids that are already live.
-    # 1. From session records (metadata JSON): each live tmux session's metadata
-    #    may have a conversation_id field.
-    # 2. From live session_id in _session_list --json output.
-    local -a live_conv_ids=()
-    local live_name live_sid meta_conv_id
-    while IFS=$'\t' read -r live_name live_sid; do
-        [[ -n "$live_name" ]] || continue
-        # Check record first
-        meta_conv_id="$(_session_metadata_field "$live_name" conversation_id 2>/dev/null)"
-        if [[ -n "$meta_conv_id" && "$meta_conv_id" != "null" ]]; then
-            live_conv_ids+=("$meta_conv_id")
-        fi
-        # Then check live session_id
-        if [[ -n "$live_sid" && "$live_sid" != "null" ]]; then
-            live_conv_ids+=("$live_sid")
-        fi
-    done < <(printf '%s' "$live_json" | jq -r '.[] | [.name, (.session_id // "")] | @tsv')
-
-    local live_managed_count
-    live_managed_count="$(printf '%s' "$live_json" | jq '[.[] | select(.managed)] | length')"
-    [[ "$live_managed_count" =~ ^[0-9]+$ ]] || {
-        local msg="Cannot determine managed session count (count unavailable). Refusing to restore."
-        $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-        $json || echo -e "${RED}$msg${RESET}" >&2
-        return 2
-    }
-
-    local max_active="${CCTRL_RESTORE_MAX_ACTIVE:-8}"
-
-    # --- Build candidate list with dispositions ---
-    local -a plan_names=() plan_convids=() plan_cwds=() plan_purposes=()
-    local -a plan_labels=() plan_agents=() plan_dispositions=() plan_details=()
-    local -a plan_flags=() plan_tbytes=() plan_old_names=()
-    local i=0 spawns_planned=0 _sj
-    while IFS= read -r _sj; do
-        [[ -n "$_sj" ]] || continue
-        # Parse each compact-JSON line. One jq call per session extracts
-        # 16 fields as newline-separated values, avoiding the TSV
-        # empty-field collapsing bug (bash IFS=$'\t' read merges tabs).
-        local s_name="" s_convid="" s_cwd="" s_purpose="" s_label="" s_agent=""
-        local s_tbytes="0" s_tpath=""
-        local s_lf_model="" s_lf_perm="" s_lf_sandbox="" s_lf_approval=""
-        local s_lf_nobridge="" s_lf_peer="" s_lf_profile="" s_lf_agent=""
-        {
-            IFS= read -r s_name; IFS= read -r s_convid
-            IFS= read -r s_cwd; IFS= read -r s_purpose
-            IFS= read -r s_label; IFS= read -r s_agent
-            IFS= read -r s_tbytes; IFS= read -r s_tpath
-            IFS= read -r s_lf_model; IFS= read -r s_lf_perm
-            IFS= read -r s_lf_sandbox; IFS= read -r s_lf_approval
-            IFS= read -r s_lf_nobridge; IFS= read -r s_lf_peer
-            IFS= read -r s_lf_profile; IFS= read -r s_lf_agent
-        } < <(printf '%s' "$_sj" | jq -r '
-            .name, .convid, .cwd, .purpose, .label, .agent,
-            (.tbytes | tostring), .tpath,
-            .lf_model, .lf_perm, .lf_sandbox, .lf_approval,
-            .lf_nobridge, .lf_peer, .lf_profile, .lf_agent')
-        # jq -r prints the literal string "null" for JSON null values
-        local _f; for _f in s_convid s_tpath s_lf_model s_lf_perm s_lf_sandbox s_lf_approval s_lf_nobridge s_lf_peer s_lf_profile s_lf_agent; do
-            [[ "${!_f}" != "null" ]] || printf -v "$_f" '%s' ''
-        done
-
-        local disposition="" detail="" skip=false
-
-        # --- --only filter ---
-        if [[ ${#only_patterns[@]} -gt 0 ]]; then
-            local matched=false pat
-            local s_name_lc s_label_lc s_purpose_lc s_cwd_lc pat_lc
-            s_name_lc="$(printf '%s' "$s_name" | tr '[:upper:]' '[:lower:]')"
-            s_label_lc="$(printf '%s' "$s_label" | tr '[:upper:]' '[:lower:]')"
-            s_purpose_lc="$(printf '%s' "$s_purpose" | tr '[:upper:]' '[:lower:]')"
-            s_cwd_lc="$(printf '%s' "$s_cwd" | tr '[:upper:]' '[:lower:]')"
-            for pat in "${only_patterns[@]}"; do
-                pat_lc="$(printf '%s' "$pat" | tr '[:upper:]' '[:lower:]')"
-                if [[ "$s_name_lc" == *"$pat_lc"* || "$s_label_lc" == *"$pat_lc"* \
-                    || "$s_purpose_lc" == *"$pat_lc"* || "$s_cwd_lc" == *"$pat_lc"* ]]; then
-                    matched=true; break
-                fi
-            done
-            if ! $matched; then
-                disposition="filtered"
-                detail="no match for --only"
-                skip=true
-            fi
-        fi
-
-        # --- null conversation_id ---
-        if ! $skip && [[ -z "$s_convid" ]]; then
-            disposition="skipped"
-            if [[ -n "$s_tpath" ]]; then
-                detail="no conversation_id (transcript: $s_tpath)"
-            else
-                detail="no conversation_id"
-            fi
-            skip=true
-        fi
-
-        # --- already-live check ---
-        if ! $skip; then
-            local is_live=false cid
-            for cid in ${live_conv_ids[@]+"${live_conv_ids[@]}"}; do
-                if [[ "$cid" == "$s_convid" ]]; then
-                    is_live=true; break
-                fi
-            done
-            if $is_live; then
-                disposition="already-live"
-                detail="conversation $s_convid is live"
-                skip=true
-            fi
-        fi
-
-        # --- cap check ---
-        if ! $skip; then
-            if [[ $(( live_managed_count + spawns_planned )) -ge "$max_active" ]]; then
-                disposition="deferred"
-                detail="cap reached (${max_active} max active). Restore later: cctrl session restore --only $(printf '%q' "$s_name")"
-                skip=true
-            fi
-        fi
-
-        # --- --limit check ---
-        if ! $skip && [[ -n "$limit" ]] && [[ "$spawns_planned" -ge "$limit" ]]; then
-            disposition="deferred"
-            detail="--limit $limit reached"
-            skip=true
-        fi
-
-        # --- Build launch flags ---
-        local launch_flags_str=""
-        if ! $skip; then
-            # Fall back to top-level agent field if launch_flags.agent is empty
-            local eff_agent="$s_lf_agent"
-            [[ -n "$eff_agent" ]] || eff_agent="$s_agent"
-
-            launch_flags_str=""
-            [[ -n "$s_lf_model" ]] && launch_flags_str+=" --model $s_lf_model"
-            [[ -n "$s_lf_perm" ]] && launch_flags_str+=" --permission-mode $s_lf_perm"
-            [[ -n "$s_lf_sandbox" ]] && launch_flags_str+=" --sandbox $s_lf_sandbox"
-            [[ -n "$s_lf_approval" ]] && launch_flags_str+=" --ask-for-approval $s_lf_approval"
-            [[ "$s_lf_nobridge" == "true" ]] && launch_flags_str+=" --no-bridge"
-            [[ -n "$s_lf_peer" ]] && launch_flags_str+=" --peer $s_lf_peer"
-            [[ -n "$s_lf_profile" ]] && launch_flags_str+=" --profile $s_lf_profile"
-            [[ -n "$eff_agent" && "$eff_agent" != "claude" ]] && launch_flags_str+=" --agent $eff_agent"
-
-            disposition="restore"
-            spawns_planned=$(( spawns_planned + 1 ))
-        fi
-
-        plan_names+=("$s_name")
-        plan_convids+=("$s_convid")
-        plan_cwds+=("$s_cwd")
-        plan_purposes+=("$s_purpose")
-        plan_labels+=("$s_label")
-        plan_agents+=("$s_agent")
-        plan_dispositions+=("$disposition")
-        plan_details+=("$detail")
-        plan_flags+=("$launch_flags_str")
-        plan_tbytes+=("$s_tbytes")
-        plan_old_names+=("$s_name")
-
-        i=$(( i + 1 ))
-    done < <(printf '%s' "$sessions_json" | jq -c '.[] | {
-        name: (.name // ""),
-        convid: (.conversation_id // null),
-        cwd: (.cwd // ""),
-        purpose: (.purpose // ""),
-        label: (.display_label // ""),
-        agent: (.agent // ""),
-        tbytes: (.transcript_bytes // 0),
-        tpath: (.transcript_path // null),
-        lf_model: (.launch_flags.model // null),
-        lf_perm: (.launch_flags.permission_mode // null),
-        lf_sandbox: (.launch_flags.sandbox // null),
-        lf_approval: (.launch_flags.ask_for_approval // null),
-        lf_nobridge: ((.launch_flags.no_bridge // null) | tostring),
-        lf_peer: (.launch_flags.peer // null),
-        lf_profile: (.launch_flags.profile // null),
-        lf_agent: (.launch_flags.agent // null)
-    }')
-
-    local total_candidates=${#plan_names[@]}
-
-    # --- Compute wave assignments for restorable sessions ---
-    local wave_size="${CCTRL_RESTORE_WAVE_SIZE:-2}"
-    local -a plan_waves=()
-    local wave_num=1 wave_count=0
-    for (( idx=0; idx<total_candidates; idx++ )); do
-        if [[ "${plan_dispositions[$idx]}" == "restore" ]]; then
-            plan_waves+=("$wave_num")
-            wave_count=$(( wave_count + 1 ))
-            if [[ "$wave_count" -ge "$wave_size" ]]; then
-                wave_num=$(( wave_num + 1 ))
-                wave_count=0
-            fi
-        else
-            plan_waves+=("-")
-        fi
-    done
-
-    # --- Dry-run / plan rendering ---
-    local picker_threshold=1000000
-    if $dry_run || { [[ ! -t 0 || ! -t 1 ]] && ! $assume_yes; }; then
-        if $json; then
-            local -a json_plan_items=()
-            for (( idx=0; idx<total_candidates; idx++ )); do
-                local picker_expected="not expected"
-                if [[ "${plan_agents[$idx]}" == "codex" ]]; then
-                    picker_expected="n/a (codex)"
-                elif [[ "${plan_tbytes[$idx]}" -gt "$picker_threshold" ]] 2>/dev/null; then
-                    picker_expected="expected"
-                fi
-                json_plan_items+=("$(jq -n \
-                    --arg name "${plan_old_names[$idx]}" \
-                    --arg disposition "${plan_dispositions[$idx]}" \
-                    --arg detail "${plan_details[$idx]}" \
-                    --arg wave "${plan_waves[$idx]}" \
-                    --arg cwd "${plan_cwds[$idx]}" \
-                    --arg purpose "${plan_purposes[$idx]}" \
-                    --arg convid "${plan_convids[$idx]}" \
-                    --arg flags "${plan_flags[$idx]}" \
-                    --argjson tbytes "${plan_tbytes[$idx]:-0}" \
-                    --arg picker "$picker_expected" \
-                    '{name:$name, disposition:$disposition, detail:(if $detail=="" then null else $detail end),
-                      wave:(if $wave=="-" then null else ($wave|tonumber) end),
-                      argv:(if $disposition=="restore" then ("cctrl start -d " + $cwd + " -r " + $convid + " --purpose " + $purpose + $flags) else null end),
-                      transcript_bytes:$tbytes, picker:$picker}')")
-            done
-            if [[ ${#json_plan_items[@]} -gt 0 ]]; then
-                printf '%s\n' "${json_plan_items[@]}" | jq -s '{ok:true, dry_run:true, plan:.}'
-            else
-                jq -n '{ok:true, dry_run:true, plan:[]}'
-            fi
-        else
-            echo -e "${BOLD}Restore plan${RESET} ($total_candidates candidates, $spawns_planned to restore)"
-            echo ""
-            for (( idx=0; idx<total_candidates; idx++ )); do
-                local picker_expected="not expected"
-                if [[ "${plan_agents[$idx]}" == "codex" ]]; then
-                    picker_expected="n/a (codex)"
-                elif [[ "${plan_tbytes[$idx]}" -gt "$picker_threshold" ]] 2>/dev/null; then
-                    picker_expected="expected"
-                fi
-                if [[ "${plan_dispositions[$idx]}" == "restore" ]]; then
-                    echo -e "  [wave ${plan_waves[$idx]}] ${GREEN}restore${RESET} ${plan_old_names[$idx]}"
-                    echo -e "    argv: cctrl start -d ${plan_cwds[$idx]} -r ${plan_convids[$idx]} --purpose $(printf '%q' "${plan_purposes[$idx]}")${plan_flags[$idx]}"
-                    echo -e "    transcript_bytes: ${plan_tbytes[$idx]}, picker: $picker_expected"
-                else
-                    echo -e "  [-] ${DIM}${plan_dispositions[$idx]}${RESET} ${plan_old_names[$idx]}: ${plan_details[$idx]}"
-                fi
-            done
-        fi
-        if ! $dry_run && [[ ! -t 0 || ! -t 1 ]] && ! $assume_yes; then
-            $json || echo -e "${YELLOW}No TTY and no --yes; printing plan only.${RESET}" >&2
-        fi
-        $dry_run && return 0 || return 2
-    fi
-
-    # --- Interactive confirmation ---
-    if ! $assume_yes && [[ -t 0 && -t 1 ]]; then
-        echo -e "${BOLD}Restore plan${RESET}: $spawns_planned sessions to restore (${total_candidates} candidates total)"
-        for (( idx=0; idx<total_candidates; idx++ )); do
-            if [[ "${plan_dispositions[$idx]}" == "restore" ]]; then
-                echo -e "  [wave ${plan_waves[$idx]}] ${plan_old_names[$idx]} — ${plan_purposes[$idx]:-no purpose}"
-            fi
-        done
-        echo ""
-        local answer
-        printf 'Proceed with restore? [y/N] '
-        IFS= read -r answer || answer=""
-        case "$(printf '%s' "${answer:-n}" | tr '[:upper:]' '[:lower:]')" in
-            y|yes) ;;
-            *) echo -e "${DIM}Aborted.${RESET}"; return 0 ;;
-        esac
-    fi
-
-    # --- Wave executor ---
-    local mem_min="${CCTRL_MEM_FREE_MIN_PCT:-15}"
-    local swap_hi="${CCTRL_SWAP_USED_HI_MB:-8192}"
-    local wave_pause="${CCTRL_RESTORE_WAVE_PAUSE:-60}"
-    local current_wave=1 wave_spawned=0
-    local n_restored=0 n_failed=0 n_skipped=0 n_filtered=0 n_already_live=0 n_deferred=0
-    local had_failure=false
-
-    # Count non-restore dispositions
-    for (( idx=0; idx<total_candidates; idx++ )); do
-        case "${plan_dispositions[$idx]}" in
-            skipped)      n_skipped=$(( n_skipped + 1 )) ;;
-            filtered)     n_filtered=$(( n_filtered + 1 )) ;;
-            already-live) n_already_live=$(( n_already_live + 1 )) ;;
-            deferred)     n_deferred=$(( n_deferred + 1 )) ;;
-        esac
-    done
-
-    # If nothing to restore, report and exit
-    if [[ "$spawns_planned" -eq 0 ]]; then
-        if $json; then
-            jq -n --argjson restored 0 --argjson skipped "$n_skipped" \
-                --argjson already_live "$n_already_live" --argjson filtered "$n_filtered" \
-                --argjson deferred "$n_deferred" --argjson failed 0 \
-                '{ok:true, restored:$restored, skipped:$skipped, already_live:$already_live,
-                  filtered:$filtered, deferred:$deferred, failed:$failed}'
-        else
-            echo -e "${DIM}Nothing to restore.${RESET}"
-            _session_restore_report "$n_restored" "$n_skipped" "$n_already_live" "$n_filtered" "$n_deferred" "$n_failed"
-        fi
-        return 0
-    fi
-
-    # Pre-wave resource gate
-    local mem_free swap_used
-    mem_free="$(_res_mem_free_pct)"
-    swap_used="$(_res_swap_used_mb)"
-    if [[ "$mem_free" =~ ^[0-9]+$ && "$mem_free" -lt "$mem_min" ]]; then
-        local msg="Resource gate: free memory ${mem_free}% below ${mem_min}% threshold. Not starting restore."
-        $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-        $json || echo -e "${RED}$msg${RESET}" >&2
-        return 2
-    fi
-    if [[ "$swap_used" =~ ^[0-9]+$ && "$swap_used" -ge "$swap_hi" ]]; then
-        local msg="Resource gate: swap ${swap_used}MB at or above ${swap_hi}MB threshold. Not starting restore."
-        $json && jq -n --arg error "$msg" '{ok:false,error:$error}'
-        $json || echo -e "${RED}$msg${RESET}" >&2
-        return 2
-    fi
-
-    while true; do
-        # Collect indices for this wave
-        local -a wave_indices=()
-        for (( idx=0; idx<total_candidates; idx++ )); do
-            [[ "${plan_waves[$idx]}" == "$current_wave" ]] && wave_indices+=("$idx")
-        done
-        [[ ${#wave_indices[@]} -gt 0 ]] || break
-
-        $quiet || $json || echo -e "${BOLD}Wave $current_wave${RESET} (${#wave_indices[@]} sessions)"
-
-        for idx in "${wave_indices[@]}"; do
-            local old_name="${plan_old_names[$idx]}"
-            local s_cwd="${plan_cwds[$idx]}"
-            local s_convid="${plan_convids[$idx]}"
-            local s_purpose="${plan_purposes[$idx]}"
-            local s_label="${plan_labels[$idx]}"
-            local s_agent="${plan_agents[$idx]}"
-            local s_flags="${plan_flags[$idx]}"
-            local s_tbytes="${plan_tbytes[$idx]}"
-
-            # Build launch argv
-            local -a launch_argv=("-d" "$s_cwd" "-r" "$s_convid" "--purpose" "$s_purpose")
-            # Add --name for display label
-            [[ -n "$s_label" && "$s_label" != "null" ]] && launch_argv+=("--name" "$s_label")
-            # Parse flags string into array
-            local flag
-            for flag in $s_flags; do
-                launch_argv+=("$flag")
-            done
-
-            # SEAM: launch log for testing
-            if [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then
-                printf 'cctrl start'
-                for flag in "${launch_argv[@]}"; do
-                    printf ' %s' "$flag"
-                done
-                printf '\n'
-            fi >> "${CCTRL_RESTORE_LAUNCH_LOG:-/dev/null}"
-
-            if [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then
-                # Test mode: no actual spawn
-                local new_name="TMUX--restored-${old_name}"
-                $quiet || $json || echo -e "  ${GREEN}spawned${RESET} was $old_name (test mode)"
-                n_restored=$(( n_restored + 1 ))
-            else
-                # Real spawn via _launch_detached
-                local spawn_out spawn_rc=0
-                spawn_out="$(CCTRL_ATTACH_PROMPT=never _launch_detached "${launch_argv[@]}" 2>&1)" || spawn_rc=$?
-                if [[ $spawn_rc -eq 0 ]]; then
-                    local new_name
-                    new_name="$(printf '%s' "$spawn_out" | grep -oE 'CCTRL_SESSION=[^ ]+' | head -1 | cut -d= -f2 || true)"
-                    [[ -n "$new_name" ]] || new_name="(check session ls)"
-                    n_restored=$(( n_restored + 1 ))
-
-                    local picker_msg="picker: not expected"
-                    if [[ "$s_agent" == "codex" ]]; then
-                        picker_msg="picker: n/a (codex)"
-                    elif [[ "$s_tbytes" -gt "$picker_threshold" ]] 2>/dev/null; then
-                        picker_msg="picker expected: tmux attach -t $new_name (option 1 is preselected; press Enter)"
-                    fi
-
-                    $quiet || $json || {
-                        echo -e "  ${GREEN}restored${RESET} was $old_name -> now $new_name"
-                        echo -e "    purpose: $s_purpose"
-                        echo -e "    transcript_bytes: $s_tbytes, $picker_msg"
-                    }
-                else
-                    n_failed=$(( n_failed + 1 ))
-                    had_failure=true
-                    $quiet || $json || echo -e "  ${RED}FAILED${RESET} $old_name: exit $spawn_rc"
-                fi
-            fi
-        done
-
-        # Check if there's a next wave
-        local next_wave=$(( current_wave + 1 ))
-        local has_next=false
-        for (( idx=0; idx<total_candidates; idx++ )); do
-            [[ "${plan_waves[$idx]}" == "$next_wave" ]] && { has_next=true; break; }
-        done
-        $has_next || break
-
-        # Wave gate: resource re-check
-        mem_free="$(_res_mem_free_pct)"
-        swap_used="$(_res_swap_used_mb)"
-        if [[ "$mem_free" =~ ^[0-9]+$ && "$mem_free" -lt "$mem_min" ]]; then
-            $quiet || $json || echo -e "${YELLOW}Resource gate: free memory ${mem_free}% below threshold. Stopping after wave $current_wave.${RESET}"
-            # Mark remaining as deferred
-            for (( idx=0; idx<total_candidates; idx++ )); do
-                if [[ "${plan_waves[$idx]}" != "-" ]] && [[ "${plan_waves[$idx]}" -gt "$current_wave" ]] 2>/dev/null; then
-                    plan_dispositions[$idx]="deferred"
-                    n_deferred=$(( n_deferred + 1 ))
-                fi
-            done
-            break
-        fi
-        if [[ "$swap_used" =~ ^[0-9]+$ && "$swap_used" -ge "$swap_hi" ]]; then
-            $quiet || $json || echo -e "${YELLOW}Resource gate: swap ${swap_used}MB at threshold. Stopping after wave $current_wave.${RESET}"
-            for (( idx=0; idx<total_candidates; idx++ )); do
-                if [[ "${plan_waves[$idx]}" != "-" ]] && [[ "${plan_waves[$idx]}" -gt "$current_wave" ]] 2>/dev/null; then
-                    plan_dispositions[$idx]="deferred"
-                    n_deferred=$(( n_deferred + 1 ))
-                fi
-            done
-            break
-        fi
-
-        # Interactive: prompt for next wave
-        if ! $assume_yes && [[ -t 0 && -t 1 ]]; then
-            local answer
-            printf 'Release wave %d? [y/N/q] ' "$next_wave"
-            IFS= read -r answer || answer=""
-            case "$(printf '%s' "${answer:-n}" | tr '[:upper:]' '[:lower:]')" in
-                y|yes)
-                    current_wave=$next_wave
-                    continue
-                    ;;
-                *)
-                    $quiet || echo -e "${DIM}Stopped at wave $current_wave.${RESET}"
-                    for (( idx=0; idx<total_candidates; idx++ )); do
-                        if [[ "${plan_waves[$idx]}" != "-" ]] && [[ "${plan_waves[$idx]}" -gt "$current_wave" ]] 2>/dev/null; then
-                            plan_dispositions[$idx]="deferred"
-                            n_deferred=$(( n_deferred + 1 ))
-                        fi
-                    done
-                    break
-                    ;;
-            esac
-        else
-            # Non-interactive with --yes: pause then continue
-            [[ "$wave_pause" -gt 0 ]] && sleep "$wave_pause"
-            current_wave=$next_wave
-        fi
-    done
-
-    # --- Final report ---
-    if $json; then
-        jq -n --argjson restored "$n_restored" --argjson skipped "$n_skipped" \
-            --argjson already_live "$n_already_live" --argjson filtered "$n_filtered" \
-            --argjson deferred "$n_deferred" --argjson failed "$n_failed" \
-            --argjson ok "$(! $had_failure && echo true || echo false)" \
-            '{ok:$ok, restored:$restored, skipped:$skipped, already_live:$already_live,
-              filtered:$filtered, deferred:$deferred, failed:$failed}'
-    else
-        _session_restore_report "$n_restored" "$n_skipped" "$n_already_live" "$n_filtered" "$n_deferred" "$n_failed"
-    fi
-
-    $had_failure && return 1 || return 0
+    return 0
 }
 
-_session_restore_report() {
-    local restored="$1" skipped="$2" already_live="$3" filtered="$4" deferred="$5" failed="$6"
-    echo ""
-    echo -e "${BOLD}Restore summary${RESET}"
-    [[ "$restored" -gt 0 ]]    && echo -e "  ${GREEN}restored:     $restored${RESET}"
-    [[ "$already_live" -gt 0 ]] && echo -e "  already-live: $already_live"
-    [[ "$skipped" -gt 0 ]]     && echo -e "  skipped:      $skipped"
-    [[ "$filtered" -gt 0 ]]    && echo -e "  filtered:     $filtered"
-    [[ "$deferred" -gt 0 ]]    && echo -e "  ${YELLOW}deferred:     $deferred${RESET}"
-    [[ "$failed" -gt 0 ]]      && echo -e "  ${RED}failed:       $failed${RESET}"
+_snapshot_v1_to_v2() {
+    local snapshot="$1" host_id="$2" hostname_value="$3"
+    python3 "$SCRIPT_DIR/lib/snapshot_restore.py" adapt-v1 \
+        --snapshot "$snapshot" --host-id "$host_id" --hostname "$hostname_value"
+}
+
+_restore_plan_json() {
+    local snapshot="$1" catalogue="$2" process="$3" codex_evidence="$4" host_id="$5" hostname_value="$6"
+    local -a argv=(plan --snapshot "$snapshot" --catalogue "$catalogue" --process "$process" \
+        --host-id "$host_id" --hostname "$hostname_value")
+    [[ -n "$codex_evidence" ]] && argv+=(--codex-evidence "$codex_evidence")
+    python3 "$SCRIPT_DIR/lib/snapshot_restore.py" "${argv[@]}"
+}
+
+_session_snapshot() {
+    # Schema-v2 snapshots are references plus recovery policy, not a bag of
+    # tmux names. Capture is read-only and refuses to replace a healthy latest
+    # snapshot when any mandatory enumeration source is degraded.
+    local snapshot_dir="" allow_empty=false json_out=false quiet=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir) [[ $# -ge 2 ]] || return 64; snapshot_dir="$2"; shift 2 ;;
+            --dir=*) snapshot_dir="${1#--dir=}"; shift ;;
+            --allow-empty) allow_empty=true; shift ;;
+            --json) json_out=true; shift ;;
+            --quiet) quiet=true; shift ;;
+            -h|--help|help)
+                echo "Usage: cctrl session snapshot [--dir PATH] [--allow-empty] [--json] [--quiet]"
+                echo "Capture ownership-aware task references. Source failure preserves latest/history and exits 69."
+                return 0 ;;
+            *) echo -e "${RED}Unknown snapshot flag: $1${RESET}" >&2; return 64 ;;
+        esac
+    done
+    [[ -n "$snapshot_dir" ]] || snapshot_dir="$SCRIPT_DIR/data/snapshots"
+    mkdir -p "$snapshot_dir" || return 1
+
+    local scratch catalogue_file sessions_file process_file resources_file snapshot_file
+    local generated_at hostname_value host_id catalogue_rc=0 sessions_rc=0 process_rc=0 capture_rc=0
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-snapshot-v2.XXXXXX")" || return 1
+    catalogue_file="$scratch/catalogue.json"; sessions_file="$scratch/sessions.json"
+    process_file="$scratch/process.json"; resources_file="$scratch/resources.json"; snapshot_file="$scratch/snapshot.json"
+    generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    hostname_value="${CCTRL_HOST_PREFIX:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
+    host_id="$(_cctrl_host_id)" || { rm -rf "$scratch"; return 69; }
+
+    if [[ -n "${CCTRL_SNAPSHOT_CATALOGUE_FILE:-}" ]]; then
+        cp "$CCTRL_SNAPSHOT_CATALOGUE_FILE" "$catalogue_file" || catalogue_rc=$?
+    else
+        _task_list_json > "$catalogue_file" || catalogue_rc=$?
+    fi
+    if [[ -n "${CCTRL_SNAPSHOT_SESSIONS_FILE:-}" ]]; then
+        cp "$CCTRL_SNAPSHOT_SESSIONS_FILE" "$sessions_file" || sessions_rc=$?
+    else
+        _session_list --json > "$sessions_file" 2>/dev/null || sessions_rc=$?
+    fi
+    _snapshot_process_source "$process_file" || process_rc=$?
+    jq -n --arg mem "$(_res_mem_free_pct)" --arg swap "$(_res_swap_used_mb)" --arg load "$(_res_load1)" \
+        '{memory_free_percent:(if $mem=="" then null else ($mem|tonumber) end),swap_used_mb:(if $swap=="" then null else ($swap|tonumber) end),load_1m:(if $load=="" then null else ($load|tonumber) end)}' > "$resources_file"
+
+    if (( catalogue_rc != 0 )) || (( sessions_rc != 0 )) || ! jq -e 'type == "object" and .schema_version == 2' "$catalogue_file" >/dev/null 2>&1 || ! jq -e 'type == "array"' "$sessions_file" >/dev/null 2>&1; then
+        $quiet || echo "snapshot: mandatory catalogue/tmux source unavailable; existing snapshots preserved." >&2
+        rm -rf "$scratch"
+        return 69
+    fi
+    python3 "$SCRIPT_DIR/lib/snapshot_restore.py" capture --catalogue "$catalogue_file" --sessions "$sessions_file" \
+        --process "$process_file" --resources "$resources_file" --host-id "$host_id" \
+        --hostname "$hostname_value" --generated-at "$generated_at" --metadata-dir "$SESSION_METADATA_DIR" > "$snapshot_file" || capture_rc=$?
+    if (( capture_rc != 0 )); then
+        $quiet || echo "snapshot: capture quality degraded; existing latest/history preserved." >&2
+        $json_out && cat "$snapshot_file"
+        rm -rf "$scratch"
+        return 69
+    fi
+
+    local task_count existing_count=0
+    task_count="$(jq '.task_reference_count' "$snapshot_file")"
+    if (( task_count == 0 )) && ! $allow_empty && [[ -f "$snapshot_dir/latest.json" ]]; then
+        existing_count="$(jq '.task_reference_count // .session_count // 0' "$snapshot_dir/latest.json" 2>/dev/null || echo 0)"
+        if (( existing_count > 0 )); then
+            $quiet || echo "snapshot: empty task catalogue, preserving existing latest.json with ${existing_count} task reference(s)."
+            rm -rf "$scratch"
+            return 0
+        fi
+    fi
+
+    local ts_name history_file tmp_file
+    ts_name="$(date -u +%Y%m%dT%H%M%SZ)"; history_file="$snapshot_dir/${ts_name}.json"
+    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
+    cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$history_file" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
+    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
+    cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$snapshot_dir/latest.json" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
+    if $json_out; then cat "$snapshot_file"; else $quiet || echo "snapshot: ${task_count} task reference(s) written to ${snapshot_dir}/latest.json"; fi
+    _snapshot_retention_prune "$snapshot_dir"
+    rm -rf "$scratch"
+    return 0
+}
+
+_session_restore() {
+    # The planner is the only selector. Execution consumes only rows carrying
+    # both disposition=restore and the explicit restore capability.
+    local snapshot_path="" dry_run=false assume_yes=false stale_ok=false force_host=false json=false quiet=false limit=""
+    local -a only_patterns=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from) [[ $# -ge 2 ]] || return 64; [[ "$2" == latest ]] || snapshot_path="$2"; shift 2 ;;
+            --only) [[ $# -ge 2 ]] || return 64; only_patterns+=("$2"); shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            --limit) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || return 64; limit="$2"; shift 2 ;;
+            --yes|-y) assume_yes=true; shift ;;
+            --stale-ok) stale_ok=true; shift ;;
+            --force-host) force_host=true; shift ;;
+            --json) json=true; shift ;;
+            --quiet|-q) quiet=true; shift ;;
+            -h|--help|help)
+                echo "Usage: cctrl session restore [--from PATH] [--only PATTERN] [--dry-run] [--limit N] [--yes] [--stale-ok] [--force-host] [--json] [--quiet]"
+                echo "Plan or execute ownership-aware tmux resumes. Provider-managed tasks are never relaunched."
+                echo "Exit codes: 0 complete; 64 invalid input/schema; 69 evidence unavailable/absent; 75 ownership conflict; 1 execution failure."
+                return 0 ;;
+            *) echo -e "${RED}Unknown restore flag: $1${RESET}" >&2; return 64 ;;
+        esac
+    done
+    [[ -n "$snapshot_path" ]] || snapshot_path="$SCRIPT_DIR/data/snapshots/latest.json"
+    [[ -f "$snapshot_path" ]] || { $json && jq -n --arg path "$snapshot_path" '{ok:false,error:"snapshot not found",path:$path}'; return 64; }
+
+    local schema generated_at snap_hostname local_hostname host_id snap_epoch now_epoch age
+    schema="$(jq -r '.schema_version // empty' "$snapshot_path" 2>/dev/null)"
+    [[ "$schema" == 1 || "$schema" == 2 ]] || { $json && jq -n --arg schema "$schema" '{ok:false,error:"unsupported snapshot schema",schema:$schema}'; return 64; }
+    generated_at="$(jq -r '.generated_at // empty' "$snapshot_path")"
+    if [[ -n "$generated_at" ]] && ! $stale_ok && ! $assume_yes; then
+        snap_epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$generated_at" +%s 2>/dev/null || date -u -d "$generated_at" +%s 2>/dev/null || true)"
+        now_epoch="$(date +%s)"
+        if [[ -n "$snap_epoch" ]]; then
+            age=$(( now_epoch - snap_epoch ))
+            if (( age > ${CCTRL_RESTORE_MAX_SNAPSHOT_AGE:-86400} )); then
+                $json && jq -n '{ok:false,error:"snapshot is stale"}'
+                return 64
+            fi
+        fi
+    fi
+    local_hostname="${CCTRL_HOST_PREFIX:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
+    snap_hostname="$(jq -r '.hostname // empty' "$snapshot_path")"
+    if [[ -n "$snap_hostname" && "$snap_hostname" != "$local_hostname" ]] && ! $force_host; then
+        $json && jq -n --arg snapshot "$snap_hostname" --arg local "$local_hostname" '{ok:false,error:"snapshot hostname mismatch",snapshot_hostname:$snapshot,local_hostname:$local}'
+        return 64
+    fi
+    host_id="$(_cctrl_host_id)" || return 69
+
+    local scratch catalogue_file process_file codex_file plan_file plan_rc=0 catalogue_rc=0 process_rc=0 codex_rc=0
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-restore-v2.XXXXXX")" || return 1
+    catalogue_file="$scratch/catalogue.json"; process_file="$scratch/process.json"; codex_file="$scratch/codex.json"; plan_file="$scratch/plan.json"
+    if [[ -n "${CCTRL_RESTORE_CATALOGUE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CATALOGUE_FILE" "$catalogue_file" || catalogue_rc=$?; else _task_list_json > "$catalogue_file" || catalogue_rc=$?; fi
+    _snapshot_process_source "$process_file" || process_rc=$?
+    if jq -e 'any((.tasks // .sessions // [])[]?; (.provider == "codex") or (.agent == "codex"))' "$snapshot_path" >/dev/null 2>&1; then
+        if [[ -n "${CCTRL_RESTORE_CODEX_EVIDENCE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CODEX_EVIDENCE_FILE" "$codex_file" || codex_rc=$?; else _session_reconcile_codex --dry-run --json > "$codex_file" 2>/dev/null || codex_rc=$?; fi
+    else
+        printf '{"schema_version":1,"kind":"codex_reconcile_result_v1","records":[],"errors":[]}\n' > "$codex_file"
+    fi
+    if (( catalogue_rc != 0 )) || (( process_rc != 0 )) || (( codex_rc != 0 )); then
+        jq -n '{schema_version:1,kind:"restore_plan_v1",rows:[],error:"mandatory restore evidence unavailable"}' > "$plan_file"
+        plan_rc=69
+    else
+        _restore_plan_json "$snapshot_path" "$catalogue_file" "$process_file" "$codex_file" "$host_id" "$local_hostname" > "$plan_file" || plan_rc=$?
+    fi
+    if ! jq -e 'type == "object" and (.rows | type == "array")' "$plan_file" >/dev/null 2>&1; then
+        $json && jq -n '{ok:false,error:"restore planner failed"}'
+        rm -rf "$scratch"; return 1
+    fi
+
+    # Filters and limits can demote eligible rows but can never upgrade them.
+    local filtered="$scratch/filtered.json" patterns_json='[]'
+    if [[ ${#only_patterns[@]} -gt 0 ]]; then patterns_json="$(printf '%s\n' "${only_patterns[@]}" | jq -R . | jq -s .)"; fi
+    if ! jq --argjson patterns "$patterns_json" --arg limit "$limit" '
+      ($patterns | map(ascii_downcase)) as $needles
+      |
+      reduce .rows[] as $row ({base:., rows:[], used:0};
+        ($row | ((.tmux_session // "") + " " + (.display_label // "") + " " + (.purpose // "") + " " + (.cwd // "")) | ascii_downcase) as $haystack
+        | (if ($needles|length)==0 then true else ([$needles[] | . as $needle | $haystack | contains($needle)] | any) end) as $matched
+        | if ($row.disposition=="restore" and ($matched|not)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"filtered by --only",action_capabilities:{restore:{supported:false,reason:"filtered by --only"}}}]
+          elif ($row.disposition=="restore" and $limit!="" and .used >= ($limit|tonumber)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by --limit",action_capabilities:{restore:{supported:false,reason:"deferred by --limit"}}}]
+          else .rows += [$row] | if $row.disposition=="restore" then .used += 1 else . end end)
+      | .base + {rows:.rows} | .counts = (.rows | group_by(.disposition) | map({key:.[0].disposition,value:length}) | from_entries)' "$plan_file" > "$filtered"; then
+        rm -rf "$scratch"
+        return 1
+    fi
+    mv "$filtered" "$plan_file" || { rm -rf "$scratch"; return 1; }
+
+    if $json; then jq --argjson ok "$([[ $plan_rc -eq 0 ]] && echo true || echo false)" --argjson dry "$dry_run" '. + {ok:$ok,dry_run:$dry,plan:.rows}' "$plan_file"; else
+        echo -e "${BOLD}Restore plan${RESET} ($(jq '.rows|length' "$plan_file") task references)"
+        jq -r '.rows[] | "  [" + .disposition + "] " + (.tmux_session // .display_label // .provider_task_id // "unnamed") + ": " + .reason' "$plan_file"
+    fi
+    if (( plan_rc != 0 )); then rm -rf "$scratch"; return "$plan_rc"; fi
+    $dry_run && { rm -rf "$scratch"; return 0; }
+    if ! $assume_yes && [[ ! -t 0 || ! -t 1 ]]; then rm -rf "$scratch"; return 64; fi
+    if ! $assume_yes; then
+        printf 'Proceed with restore? [y/N] '; local answer; IFS= read -r answer || answer=""
+        answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
+        [[ "$answer" == y || "$answer" == yes ]] || { rm -rf "$scratch"; return 0; }
+    fi
+
+    local mem_free swap_used
+    mem_free="$(_res_mem_free_pct)"; swap_used="$(_res_swap_used_mb)"
+    if [[ "$mem_free" =~ ^[0-9]+$ ]] && (( mem_free < ${CCTRL_MEM_FREE_MIN_PCT:-15} )); then rm -rf "$scratch"; return 1; fi
+    if [[ "$swap_used" =~ ^[0-9]+$ ]] && (( swap_used >= ${CCTRL_SWAP_USED_HI_MB:-8192} )); then rm -rf "$scratch"; return 1; fi
+
+    local row_file restored=0 failed=0 index=0 wave_size="${CCTRL_RESTORE_WAVE_SIZE:-2}" wave_pause="${CCTRL_RESTORE_WAVE_PAUSE:-60}"
+    while IFS= read -r row_file; do
+        local cwd resume purpose label agent tmux_name launch_flags spawn_rc=0
+        cwd="$(jq -r '.cwd' <<< "$row_file")"; resume="$(jq -r '.resume_identity' <<< "$row_file")"
+        purpose="$(jq -r '.purpose // "restored task"' <<< "$row_file")"; label="$(jq -r '.display_label // empty' <<< "$row_file")"
+        agent="$(jq -r '.agent // .provider // empty' <<< "$row_file")"; tmux_name="$(jq -r '.tmux_session // empty' <<< "$row_file")"
+        local -a launch_argv=(-d "$cwd" -r "$resume" --purpose "$purpose")
+        [[ -n "$label" ]] && launch_argv+=(--name "$label")
+        [[ "$agent" == codex ]] && launch_argv+=(--agent codex)
+        while IFS=$'\t' read -r key value; do
+            case "$key" in
+                model) launch_argv+=(--model "$value") ;;
+                profile) launch_argv+=(--profile "$value") ;;
+                permission_mode) launch_argv+=(--permission-mode "$value") ;;
+                sandbox) launch_argv+=(--sandbox "$value") ;;
+                ask_for_approval) launch_argv+=(--ask-for-approval "$value") ;;
+                peer) launch_argv+=(--peer "$value") ;;
+                no_bridge) [[ "$value" == true ]] && launch_argv+=(--no-bridge) ;;
+            esac
+        done < <(jq -r '.launch_flags // {} | to_entries[] | [.key,(.value|tostring)] | @tsv' <<< "$row_file")
+        if [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then
+            printf 'cctrl start' >> "$CCTRL_RESTORE_LAUNCH_LOG"; printf ' %q' "${launch_argv[@]}" >> "$CCTRL_RESTORE_LAUNCH_LOG"; printf '\n' >> "$CCTRL_RESTORE_LAUNCH_LOG"
+        else
+            CCTRL_ATTACH_PROMPT=never _launch_detached "${launch_argv[@]}" >/dev/null 2>&1 || spawn_rc=$?
+        fi
+        if (( spawn_rc == 0 )); then restored=$((restored+1)); else failed=$((failed+1)); fi
+        index=$((index+1))
+        if (( wave_size > 0 && index % wave_size == 0 )) && (( wave_pause > 0 )); then sleep "$wave_pause"; fi
+    done < <(jq -c '.rows[] | select(.disposition == "restore" and .action_capabilities.restore.supported == true and .action_capabilities.restore.reason == "tmux-resume")' "$plan_file")
+    $quiet || $json || echo "Restore summary: restored=$restored failed=$failed"
+    rm -rf "$scratch"
+    (( failed == 0 )) || return 1
     return 0
 }
 

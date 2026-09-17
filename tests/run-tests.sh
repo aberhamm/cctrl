@@ -5852,6 +5852,223 @@ JSON
     echo "ok: exit codes"
 }
 
+# --- plan 068: ownership-aware snapshot / restore --------------------------
+
+test_snapshot_ownership_policy() {
+    local root="$TMPDIR/snapshot-ownership" data="$TMPDIR/snapshot-ownership/data"
+    local snapshots="$TMPDIR/snapshot-ownership/snapshots" host="0123456789abcdef0123456789abcdef"
+    local catalogue="$TMPDIR/snapshot-ownership/catalogue.json" sessions="$TMPDIR/snapshot-ownership/sessions.json"
+    local process="$TMPDIR/snapshot-ownership/process.json" codex="$TMPDIR/snapshot-ownership/codex.json"
+    local launch_log="$TMPDIR/snapshot-ownership/launch.log" before after out rc=0
+    mkdir -p "$root" "$data" "$snapshots"
+    printf '%s\n' "$host" > "$data/host-id"
+    cat > "$process" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"process-1","processes":[],"error":null}
+JSON
+    cat > "$catalogue" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
+ {"task_key":"provider:claude:$host:claude-1","provider":"claude","provider_task_id":"claude-1","host_id":"$host","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"registration_provenance":[{"source":"registry"}],"launch_provenance":[{"source":"launch-receipt"}],"lineage":{"forked_from_id":null,"parent_thread_id":null,"derived_root_id":null,"derived_root_basis":null},"ownership_evidence":[],"cwd":"/tmp/claude","display_title":"Claude owned","tmux_session":"TMUX--claude","action_capabilities":{"tmux_attach":{"supported":true,"reason":"available"}}},
+ {"task_key":"provider:codex:$host:app-1","provider":"codex","provider_task_id":"app-1","host_id":"$host","origin":"codex-app","execution_runtime":"app-server","control_owner":"app","lifecycle_state":"active","restore_strategy":"provider-managed","registered_by_cctrl":false,"launched_by_cctrl":false,"registration_provenance":[],"launch_provenance":[],"lineage":{"forked_from_id":null,"parent_thread_id":null,"derived_root_id":null,"derived_root_basis":null},"ownership_evidence":[],"cwd":"/tmp/app","display_title":"Native app","tmux_session":null,"action_capabilities":{"tmux_attach":{"supported":false,"reason":"no-live-cctrl-tmux-owner"}}},
+ {"task_key":"provider:codex:$host:released-1","provider":"codex","provider_task_id":"released-1","host_id":"$host","origin":"cctrl","execution_runtime":"app-server","control_owner":"app","lifecycle_state":"released","restore_strategy":"provider-managed","registered_by_cctrl":true,"launched_by_cctrl":true,"registration_provenance":[{"source":"registry"}],"launch_provenance":[{"source":"launch-receipt"}],"lineage":{"forked_from_id":null,"parent_thread_id":null,"derived_root_id":null,"derived_root_basis":null},"ownership_evidence":[],"cwd":"/tmp/released","display_title":"Released","tmux_session":null,"action_capabilities":{"tmux_attach":{"supported":false,"reason":"no-live-cctrl-tmux-owner"}}},
+ {"task_key":"provider:codex:$host:unknown-1","provider":"codex","provider_task_id":"unknown-1","host_id":"$host","origin":"unknown","execution_runtime":"unknown","control_owner":"unknown","lifecycle_state":"unknown","restore_strategy":null,"registered_by_cctrl":false,"launched_by_cctrl":false,"registration_provenance":[],"launch_provenance":[],"lineage":{"forked_from_id":null,"parent_thread_id":null,"derived_root_id":null,"derived_root_basis":null},"ownership_evidence":[],"cwd":"/tmp/unknown","display_title":"Observed only","tmux_session":null,"action_capabilities":{"tmux_attach":{"supported":false,"reason":"unknown"}}}
+]}
+JSON
+    cat > "$sessions" <<'JSON'
+[{"name":"TMUX--claude","agent":"claude","session_id":"claude-1","dir":"/tmp/claude","purpose":"restore me","display_label":"Claude owned","last_active":"2026-09-17T09:59:00Z","registered_by_cctrl":true,"launched_by_cctrl":true,"origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux"}]
+JSON
+    cat > "$codex" <<'JSON'
+{"schema_version":1,"kind":"codex_reconcile_result_v1","records":[],"errors":[]}
+JSON
+
+    before="$(find "$ROOT/data" -type f -exec shasum {} + 2>/dev/null | sort | shasum | awk '{print $1}')"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$catalogue" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$sessions" CCTRL_SNAPSHOT_PROCESS_FILE="$process" \
+      CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$snapshots" --json)"
+    jq -e --arg host "$host" '
+      .schema_version==2 and .host_id==$host and .task_reference_count==4 and .restore_candidate_count==1 and
+      .capture_quality.status=="complete" and
+      ([.tasks[] | select(.provider_task_id=="app-1" and .recovery_action=="provider-managed")] | length)==1 and
+      ([.tasks[] | select(.provider_task_id=="released-1" and .restore_strategy=="provider-managed")] | length)==1 and
+      ([.tasks[] | select(.provider_task_id=="claude-1" and .restore_strategy=="tmux-resume" and .resume_identity_kind=="claude-session-id")] | length)==1' \
+      <<< "$out" >/dev/null || fail "schema-v2 ownership snapshot is wrong: $out"
+    [[ "$(shasum "$snapshots/latest.json" | awk '{print $1}')" == "$(find "$snapshots" -name '20*.json' -type f -exec shasum {} \; | head -1 | awk '{print $1}')" ]] \
+      || fail "latest/history snapshot bytes differ"
+
+    # A mandatory source failure is degraded/nonzero and preserves both files;
+    # --allow-empty cannot weaken this quality gate.
+    local latest_hash history_count degraded="$TMPDIR/snapshot-ownership/degraded.json"
+    latest_hash="$(shasum "$snapshots/latest.json" | awk '{print $1}')"; history_count="$(find "$snapshots" -name '20*.json' | wc -l | tr -d ' ')"
+    jq '.source_status.tmux="unavailable"' "$catalogue" > "$degraded"
+    rc=0
+    CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$degraded" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$sessions" CCTRL_SNAPSHOT_PROCESS_FILE="$process" \
+      "$ROOT/cctrl" session snapshot --dir "$snapshots" --allow-empty --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "degraded snapshot did not exit 69 (rc=$rc)"
+    [[ "$latest_hash" == "$(shasum "$snapshots/latest.json" | awk '{print $1}')" ]] || fail "degraded capture replaced latest"
+    [[ "$history_count" == "$(find "$snapshots" -name '20*.json' | wc -l | tr -d ' ')" ]] || fail "degraded capture wrote history"
+
+    # Partial mandatory-source enumeration is also degraded, even when the
+    # aggregate source_status remains "available". It must preserve the same
+    # last-known-good files rather than silently replacing them with omissions.
+    jq '.source_errors += [{"source":"registry","status":"partial","error":"invalid-json:broken.json"}]' "$catalogue" > "$degraded"
+    rc=0
+    CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$degraded" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$sessions" CCTRL_SNAPSHOT_PROCESS_FILE="$process" \
+      "$ROOT/cctrl" session snapshot --dir "$snapshots" --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "partial registry enumeration did not exit 69 (rc=$rc)"
+    [[ "$latest_hash" == "$(shasum "$snapshots/latest.json" | awk '{print $1}')" ]] || fail "partial enumeration replaced latest"
+    [[ "$history_count" == "$(find "$snapshots" -name '20*.json' | wc -l | tr -d ' ')" ]] || fail "partial enumeration wrote history"
+
+    # Reboot evidence: the exact row still exists but no live tmux capability.
+    local current="$TMPDIR/snapshot-ownership/current.json"
+    jq '(.rows[] | select(.provider_task_id=="claude-1") | .action_capabilities.tmux_attach)={supported:false,reason:"no-live-cctrl-tmux-owner"}' "$catalogue" > "$current"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" CCTRL_RESTORE_LAUNCH_LOG="$launch_log" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json)"
+    jq -e '
+      ([.plan[] | select(.provider_task_id=="claude-1" and .disposition=="restore" and .action_capabilities.restore=={supported:true,reason:"tmux-resume"})] | length)==1 and
+      ([.plan[] | select(.provider_task_id=="app-1" and .disposition=="provider-managed")] | length)==1 and
+      ([.plan[] | select(.provider_task_id=="released-1" and .disposition=="provider-managed")] | length)==1 and
+      ([.plan[] | select(.provider_task_id=="unknown-1" and .disposition=="unknown")] | length)==1' <<< "$out" >/dev/null \
+      || fail "ownership-aware restore plan is wrong: $out"
+    : > "$launch_log"
+    CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" CCTRL_RESTORE_LAUNCH_LOG="$launch_log" \
+      CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 CCTRL_RESTORE_WAVE_PAUSE=0 \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --yes --quiet >/dev/null
+    [[ "$(wc -l < "$launch_log" | tr -d ' ')" == 1 ]] || fail "restore executed more than the exact eligible row"
+    assert_contains "$(cat "$launch_log")" "claude-1"
+    assert_not_contains "$(cat "$launch_log")" "app-1"
+    assert_not_contains "$(cat "$launch_log")" "released-1"
+
+    # --only is a strict demotion-only boundary. A non-matching filter must not
+    # leave the otherwise eligible row executable.
+    : > "$launch_log"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" CCTRL_RESTORE_LAUNCH_LOG="$launch_log" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --only definitely-not-claude --dry-run --json)"
+    jq -e 'any(.plan[]; .provider_task_id=="claude-1" and .disposition=="insufficient-evidence" and .reason=="filtered by --only")' <<< "$out" >/dev/null \
+      || fail "--only did not demote the non-matching restore candidate: $out"
+    CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" CCTRL_RESTORE_LAUNCH_LOG="$launch_log" \
+      CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session restore --from "$snapshots/latest.json" \
+      --only definitely-not-claude --yes --quiet >/dev/null
+    [[ ! -s "$launch_log" ]] || fail "--only launched a non-matching restore candidate"
+
+    # Resume authority is bound to the exact provider identity and its
+    # provider-specific kind, never merely to a nonempty resume token.
+    local mismatched_resume="$TMPDIR/snapshot-ownership/mismatched-resume.json"
+    jq '.tasks=[(.tasks[]|select(.provider_task_id=="claude-1")|.resume_identity="other-task"),(.tasks[]|select(.provider_task_id=="claude-1")|.resume_identity_kind="codex-thread-id")]|.task_reference_count=2' \
+      "$snapshots/latest.json" > "$mismatched_resume"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
+      "$ROOT/cctrl" session restore --from "$mismatched_resume" --dry-run --json)"
+    jq -e '([.plan[] | select(.provider_task_id=="claude-1" and .disposition=="insufficient-evidence" and .action_capabilities.restore.supported==false)] | length)==2' <<< "$out" >/dev/null \
+      || fail "mismatched resume identity/kind was granted restore authority: $out"
+
+    # Live wins over restore, absent evidence exits 69, duplicates conflict/75.
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$catalogue" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json)"
+    jq -e 'any(.plan[]; .provider_task_id=="claude-1" and .disposition=="already-live")' <<< "$out" >/dev/null || fail "live row did not override restore"
+    local absent="$TMPDIR/snapshot-ownership/absent.json" duplicate="$TMPDIR/snapshot-ownership/duplicate.json"
+    jq 'del(.rows[] | select(.provider_task_id=="claude-1"))' "$current" > "$absent"
+    rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$absent" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "absent live identity did not exit 69 (rc=$rc)"
+    jq -e 'any(.plan[]; .provider_task_id=="claude-1" and .disposition=="insufficient-evidence")' <<< "$out" >/dev/null || fail "absent identity was not explained"
+    jq '.rows += [.rows[] | select(.provider_task_id=="claude-1")]' "$current" > "$duplicate"
+    rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$duplicate" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "duplicate live identity did not exit 75 (rc=$rc)"
+    jq -e 'any(.plan[]; .provider_task_id=="claude-1" and .disposition=="conflict")' <<< "$out" >/dev/null || fail "duplicate identity was not a conflict"
+
+    local partial_current="$TMPDIR/snapshot-ownership/partial-current.json"
+    jq '.source_errors += [{"source":"registry","status":"partial","error":"invalid-json:broken.json"}]' "$current" > "$partial_current"
+    rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$partial_current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "partial restore-time registry evidence did not exit 69 (rc=$rc)"
+    jq -e 'any(.plan[]; .provider_task_id=="claude-1" and .disposition=="insufficient-evidence" and .action_capabilities.restore.supported==false)' <<< "$out" >/dev/null \
+      || fail "partial restore-time registry evidence left restore executable: $out"
+
+    # A stale pre-handoff Codex snapshot is overridden by current App Server ownership.
+    local handoff_snap="$TMPDIR/snapshot-ownership/handoff.json" handoff_catalog="$TMPDIR/snapshot-ownership/handoff-catalog.json" handoff_evidence="$TMPDIR/snapshot-ownership/handoff-evidence.json"
+    jq --arg host "$host" '.tasks=[(.tasks[]|select(.provider_task_id=="claude-1")|.provider="codex"|.provider_task_id="handoff-1"|.resume_identity_kind="codex-thread-id"|.resume_identity="handoff-1")]|.task_reference_count=1|.restore_candidate_count=1' "$snapshots/latest.json" > "$handoff_snap"
+    jq --arg host "$host" '.rows=[(.rows[]|select(.provider_task_id=="claude-1")|.provider="codex"|.provider_task_id="handoff-1"|.task_key=("provider:codex:"+$host+":handoff-1"))]' "$current" > "$handoff_catalog"
+    cat > "$handoff_evidence" <<JSON
+{"schema_version":1,"kind":"codex_reconcile_result_v1","records":[{"provider_task_id":"handoff-1","host_id":"$host","sources":{"registry":{"status":"available","source_cursor":"r1","error":null},"app_server":{"status":"claimed","source_cursor":"a1","error":null},"tmux":{"status":"confirmed-absence","source_cursor":"t1","error":null},"process_table":{"status":"confirmed-absence","source_cursor":"p1","error":null}},"chosen_outcome":{"control_owner":"app","execution_runtime":"app-server","lifecycle_state":"active","restore_strategy":"provider-managed"}}],"errors":[]}
+JSON
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$handoff_catalog" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$handoff_evidence" \
+      "$ROOT/cctrl" session restore --from "$handoff_snap" --dry-run --json)"
+    jq -e 'any(.plan[]; .provider_task_id=="handoff-1" and .disposition=="provider-managed" and .action_capabilities.restore.supported==false)' <<< "$out" >/dev/null \
+      || fail "post-handoff app ownership did not veto stale restore"
+
+    # Codex is restorable from an unknown current owner only when exact-host
+    # evidence proves both App Server and tmux absence. Ambiguous or terminal
+    # current evidence must close the capability.
+    local codex_restore_snap="$TMPDIR/snapshot-ownership/codex-restore.json"
+    local codex_restore_catalog="$TMPDIR/snapshot-ownership/codex-restore-catalog.json"
+    local codex_absent="$TMPDIR/snapshot-ownership/codex-absent.json"
+    local codex_ambiguous="$TMPDIR/snapshot-ownership/codex-ambiguous.json"
+    local codex_archived="$TMPDIR/snapshot-ownership/codex-archived.json"
+    jq --arg host "$host" '.tasks=[(.tasks[]|select(.provider_task_id=="claude-1")|.provider="codex"|.agent="codex"|.provider_task_id="codex-restore-1"|.resume_identity_kind="codex-thread-id"|.resume_identity="codex-restore-1")]|.task_reference_count=1|.restore_candidate_count=1' \
+      "$snapshots/latest.json" > "$codex_restore_snap"
+    jq --arg host "$host" '.rows=[(.rows[]|select(.provider_task_id=="claude-1")|.provider="codex"|.provider_task_id="codex-restore-1"|.task_key=("provider:codex:"+$host+":codex-restore-1")|.control_owner="unknown"|.execution_runtime="unknown"|.lifecycle_state="inactive"|.action_capabilities.tmux_attach={supported:false,reason:"no-live-cctrl-tmux-owner"})]' \
+      "$current" > "$codex_restore_catalog"
+    cat > "$codex_absent" <<JSON
+{"schema_version":1,"kind":"codex_reconcile_result_v1","records":[{"provider_task_id":"codex-restore-1","host_id":"$host","sources":{"registry":{"status":"available","source_cursor":"r2","error":null},"app_server":{"status":"confirmed-absence","source_cursor":"a2","error":null},"tmux":{"status":"confirmed-absence","source_cursor":"t2","error":null},"process_table":{"status":"confirmed-absence","source_cursor":"p2","error":null}},"chosen_outcome":{"control_owner":"unknown","execution_runtime":"unknown","lifecycle_state":"inactive","restore_strategy":"tmux-resume"}}],"errors":[]}
+JSON
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$codex_restore_catalog" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex_absent" \
+      "$ROOT/cctrl" session restore --from "$codex_restore_snap" --dry-run --json)"
+    jq -e 'any(.plan[]; .provider_task_id=="codex-restore-1" and .disposition=="restore" and .action_capabilities.restore.supported==true)' <<< "$out" >/dev/null \
+      || fail "authoritative Codex owner absence did not permit exact restore: $out"
+
+    jq '.records[0].sources.app_server.status="ambiguous"' "$codex_absent" > "$codex_ambiguous"
+    rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$codex_restore_catalog" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex_ambiguous" \
+      "$ROOT/cctrl" session restore --from "$codex_restore_snap" --dry-run --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "ambiguous Codex evidence did not exit 69 (rc=$rc)"
+    jq -e 'any(.plan[]; .provider_task_id=="codex-restore-1" and .disposition=="insufficient-evidence" and .action_capabilities.restore.supported==false)' <<< "$out" >/dev/null \
+      || fail "ambiguous Codex evidence left restore executable: $out"
+
+    jq '.records[0].chosen_outcome.lifecycle_state="archived"' "$codex_absent" > "$codex_archived"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$codex_restore_catalog" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex_archived" \
+      "$ROOT/cctrl" session restore --from "$codex_restore_snap" --dry-run --json)"
+    jq -e 'any(.plan[]; .provider_task_id=="codex-restore-1" and .disposition=="insufficient-evidence" and (.reason|contains("archived")))' <<< "$out" >/dev/null \
+      || fail "archived current Codex evidence left restore executable: $out"
+
+    # Legacy adapter: Claude may carry candidate provenance, Codex never does.
+    local legacy="$TMPDIR/snapshot-ownership/legacy.json" adapted
+    cat > "$legacy" <<'JSON'
+{"schema_version":1,"generated_at":"2026-09-17T10:00:00Z","hostname":"test-host","sessions":[
+ {"name":"TMUX--old-claude","managed":true,"agent":"claude","conversation_id":"old-claude","cwd":"/tmp/old"},
+ {"name":"TMUX--old-codex","managed":true,"agent":"codex","conversation_id":"old-codex","cwd":"/tmp/old"}]}
+JSON
+    adapted="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_NO_MAIN=1 bash -c 'source "$0"; _snapshot_v1_to_v2 "$1" "$2" test-host' "$ROOT/cctrl" "$legacy" "$host")"
+    jq -e '(.tasks[]|select(.provider_task_id=="old-claude")|.restore_strategy)=="tmux-resume" and (.tasks[]|select(.provider_task_id=="old-codex")|.restore_strategy)==null' <<< "$adapted" >/dev/null \
+      || fail "v1 adapter eligibility is wrong: $adapted"
+
+    # --force-host bypasses only the envelope hostname, never row host identity.
+    local foreign="$TMPDIR/snapshot-ownership/foreign.json"
+    jq '.hostname="other-host" | .tasks[0].host_id="ffffffffffffffffffffffffffffffff" | .tasks=[.tasks[0]] | .task_reference_count=1' "$snapshots/latest.json" > "$foreign"
+    rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
+      "$ROOT/cctrl" session restore --from "$foreign" --force-host --dry-run --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "foreign durable host evidence did not exit 75 (rc=$rc)"
+    jq -e '.plan[0].disposition=="insufficient-evidence" and (.plan[0].reason|contains("host id mismatch"))' <<< "$out" >/dev/null \
+      || fail "--force-host upgraded a foreign durable host id"
+
+    after="$(find "$ROOT/data" -type f -exec shasum {} + 2>/dev/null | sort | shasum | awk '{print $1}')"
+    [[ "$before" == "$after" ]] || fail "snapshot ownership tests changed the real cctrl data store"
+    echo "ok: snapshot/restore is schema-v2, ownership-aware, exact-id, source-gated, and non-destructive"
+}
+
 test_usage_cost_fixtures() {
     local base="$TMPDIR/fixtures"
     local claude_dir
@@ -8086,6 +8303,11 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        snapshot-ownership)
+            test_snapshot_ownership_policy
+            echo "ok"
+            exit 0
+            ;;
         *)
             fail "unknown focused test group: $CCTRL_TEST_ONLY"
             ;;
@@ -8255,39 +8477,9 @@ test_task_registry_replay_order_and_guards
 test_task_registry_lock_stale_timeout_and_release_token
 test_task_registry_structural_boundary
 test_codex_reconcile_ownership_evidence
-test_snapshot_header_and_session_shape
-test_snapshot_initial_prompt_absent
-test_snapshot_empty_fleet_guard_preserves
-test_snapshot_allow_empty_overrides
-test_snapshot_history_and_latest_agree
-test_snapshot_retention_pruning
-test_snapshot_no_tmux_mutation
-test_snapshot_tmux_absent_preserves
-test_snapshot_first_run_empty_writes
-test_snapshot_transcript_bytes_null_when_missing
-test_snapshot_managed_matches_session_ls
-test_snapshot_launch_flags_round_trip
-test_snapshot_conversation_id_from_session_id
-test_restore_ordering_by_last_active
-test_restore_only_filter
-test_restore_cap_on_total
-test_restore_null_conversation_id_skipped
-test_restore_dry_run_spawns_nothing
-test_restore_gate_stops_below_threshold
-test_restore_limit_caps_spawns
-test_restore_no_tty_no_yes_exits_2
-test_restore_unknown_schema_refused
-test_restore_stale_snapshot_refused
-test_restore_host_mismatch_refused
-test_restore_cap_fails_closed
-test_restore_picker_expected_routing
-test_restore_wave_pacing
-test_restore_already_live_skipped
-test_restore_launch_config_replay
+test_snapshot_ownership_policy
 test_restore_no_force_structural
 test_restore_no_pane_inference_structural
-test_restore_already_live_record_join
-test_restore_exit_codes
 fi
 
 # =====================================================================

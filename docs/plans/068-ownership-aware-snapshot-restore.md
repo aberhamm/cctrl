@@ -1,7 +1,10 @@
 ---
 id: 068
 title: Make snapshot and restore ownership-aware
-status: in-progress
+status: done
+completed: 2026-09-17
+reviewed: false
+qa: automated
 blocked-by: [064, 067]
 priority: 68
 goal: codex-task-ownership-surfaces
@@ -104,3 +107,17 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented ownership-aware schema-v2 snapshots, conservative schema-v1 adaptation, authoritative restore-time reconciliation, fail-closed capability selection, atomic capture-quality protection, and mixed-fleet regression coverage. The required full suite, focused ownership tests, structural assertions, and health gate passed. Design deviation: the pure snapshot/restore policy is delegated from `cctrl` to `lib/snapshot_restore.py` instead of being implemented inline in the shell script.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `tests/run-tests.sh` (modified)
+- `lib/snapshot_restore.py` (created)
+- `docs/plans/068-ownership-aware-snapshot-restore.md` (modified)
+
+**Commit:** `8d3a681` — `feat(cctrl): make snapshot restore ownership-aware`

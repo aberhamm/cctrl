@@ -487,10 +487,13 @@ session you are calling from, and excludes attached sessions unless you pass
 
 #### Fleet snapshots
 
-`cctrl session snapshot` captures the live fleet to a single JSON file —
-every session's name, state, conversation ID, transcript path, working
-directory, purpose, and launch flags. A launchd timer runs it every 5
-minutes so the fleet state survives an unplanned power loss.
+`cctrl session snapshot` captures the local provider-neutral task catalogue to
+a schema-v2 JSON file. Every row keeps its provider identity, durable host id,
+origin, runtime, control owner, lifecycle, restore strategy, launch/registration
+provenance, lineage, and an informational recovery disposition. Native Codex
+app tasks, discovery-only tasks, and tasks released to the app are retained as
+provider-managed references; snapshotting never starts, resumes, opens, or
+archives them. A launchd timer can run the capture every 5 minutes.
 
 ```bash
 cctrl session snapshot                # write data/snapshots/latest.json
@@ -498,12 +501,14 @@ cctrl session snapshot --json         # also print the snapshot to stdout
 cctrl session snapshot --dir /tmp/s   # custom snapshot directory
 ```
 
-Snapshots are written atomically (same-dir `mktemp` + `mv`) and carry an
-**empty-fleet guard**: if the capture yields zero sessions but the existing
-`latest.json` has sessions in it, the file is preserved. This prevents a
-snapshot taken at boot (or while the tmux server is down) from overwriting
-the only record of the fleet you are trying to restore. `--allow-empty`
-overrides.
+Snapshots are written atomically (same-dir `mktemp` + `mv`) and carry a capture
+quality gate. Registry, tmux, process, and—when Codex rows exist—provider
+inventory must all be readable before either history or `latest.json` is
+replaced. A failed source exits `69` and preserves both files byte-for-byte;
+`--allow-empty` does not bypass source failure. For a healthy, truly empty
+capture, the existing empty-fleet guard remains and `--allow-empty` overrides
+only that guard. `task_reference_count` and `restore_candidate_count` are
+reported separately.
 
 **Retention:** Every history file younger than 7 days is kept at full
 5-minute granularity. Older than 7 days, only the first file of each UTC
@@ -523,10 +528,12 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cctrl.session-snapsh
 
 #### Session restore
 
-`cctrl session restore` reads a fleet snapshot and respawns sessions by
-resuming their conversations. It is the rebuild command after a power loss
-or reboot — one command, gated on memory, waved, dry-runnable, and
-idempotent (re-run the same command to continue where you left off).
+`cctrl session restore` reads schema-v1 or schema-v2 snapshots, then recomputes
+every disposition from current exact-identity evidence before it can spawn
+anything. Snapshot recovery actions are only hints. Registry plus tmux/process
+evidence is mandatory for Claude; Codex additionally requires a complete App
+Server ownership pass. App ownership overrides a stale pre-handoff snapshot,
+contradictions are conflicts, and absent/ambiguous evidence fails closed.
 
 ```bash
 cctrl session restore --dry-run          # show the plan; spawn nothing
@@ -536,9 +543,27 @@ cctrl session restore --from <path>      # use a specific snapshot file
 cctrl session restore --limit 4          # cap spawns in this invocation
 ```
 
-**Resume the conversation; never replay `initial_prompt`.** Those stored
-prompts reference sibling sessions that no longer exist. A session with no
-`conversation_id` is reported and skipped, full stop.
+**Resume the conversation; never replay `initial_prompt`.** A spawn requires
+the closed schema-v2 predicate: exact provider id and durable host id,
+`cctrl` origin, both cctrl registration and launch provenance, cctrl/tmux
+ownership, `tmux-resume`, a supported provider resume identity, a resumable
+lifecycle, one unique current catalogue row, and no stronger live or conflict
+evidence. Names, titles, cwd, tmux-looking strings, and `cctrl_managed:true`
+never authorize restore. `--force-host` bypasses only an envelope hostname for
+inspection; it cannot make a foreign durable-host row eligible.
+
+Schema-v1 remains readable through a conservative adapter. Legacy Codex rows
+are always insufficient evidence. A legacy Claude row can become a candidate
+only when it was managed, has a nonempty conversation id, an absolute cwd, and
+matching host; it still needs the same unique current-identity evidence at
+restore time.
+
+Dry-run, JSON, and human output use the same planner and report `restore`,
+`provider-managed`, `already-live`, `conflict`, `unknown`, or
+`insufficient-evidence` for each task. Exit `0` means the plan/execution was
+complete (including honest provider-managed skips), `64` means invalid input or
+schema, `69` means mandatory evidence was unavailable or absent, `75` means
+ownership conflict/stale evidence, and `1` means an internal or launch failure.
 
 **Waves and the resource gate.** Sessions spawn in waves of
 `CCTRL_RESTORE_WAVE_SIZE` (default 2). In interactive mode, the operator
@@ -548,16 +573,17 @@ In non-interactive mode (`--yes`), waves advance after a fixed pause
 The cap stops when live managed sessions reach `CCTRL_RESTORE_MAX_ACTIVE`
 (default 8).
 
-**Answering the resume picker.** When a session has a large transcript
-(above ~1 MB), Claude shows a resume picker. The restore report tells you
-which sessions to expect it for, with the `tmux attach -t <name>` command.
-Attach, press Enter (option 1 "Resume from summary" is preselected), and
-detach. Restore itself never captures panes or injects keystrokes.
-
 **Launch configuration replay.** Restore threads `model`, `permission-mode`,
 `profile`, `peer`, `sandbox`, `--no-bridge`, and `agent` from the snapshot's
 `launch_flags` back onto the spawn argv. A third of the fleet runs with
 explicit `--model`; without replay every session comes back on defaults.
+
+The durability layers are deliberately separate: tmux keeps a terminal writer
+alive only while the host and tmux server survive; a cctrl snapshot can recreate
+only an explicitly cctrl-owned terminal task after reboot; Codex provider tasks
+persist in Codex independently of tmux and are never duplicated by cctrl
+restore. None of these mechanisms wakes a powered-off host or makes an app task
+portable to another device on its own.
 
 #### Provider-neutral task records
 
