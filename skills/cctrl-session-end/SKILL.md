@@ -119,7 +119,17 @@ period (enough for the final output to render before the pane disappears). The
 agent process terminates with the pane — no cleanup needed after this command.
 For Codex sessions, this normal close also archives the associated Codex app
 task. Use `cctrl session release-to-app <name> --yes` when the app task should
-remain available for continued app use.
+remain available for continued app use. `release-to-app` is a verified,
+one-way ownership handoff: it checks the exact provider id and anchored tmux/PID
+owner, requests graceful exit, refreshes App Server and process evidence, and
+only then records app ownership. It never creates a replacement task or permits
+two writers. Inspect the structured `owner_exit` result when it fails. When it
+is `false`, the terminal owner remains and the command's remediation can be
+followed before retrying. When it is `true`, the old writer has exited but app
+ownership was not safely committed: run `cctrl session reconcile-codex --json`,
+follow the reported remediation, and do not open another writer while ownership
+is unknown or conflicted. Never force app ownership from a stale lock or cached
+registry state.
 
 **Do not use `cctrl session kill`** — that is an immediate hard kill with no
 grace period, meant for external cleanup, not self-close.

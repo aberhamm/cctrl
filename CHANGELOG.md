@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 2026-09-17
+
+### Added
+- A deterministic `codex-ownership-matrix` integration group now exercises the
+  three supported Codex ownership paths against the versioned lifecycle fixture
+  boundary: native app observation, cctrl app-owned creation, cctrl/tmux launch,
+  contested-writer refusal, verified release-to-app, provider-neutral fleet
+  display, and ownership-aware snapshot restore.
+
+### Changed
+- README, CLI help, zsh completions, and the bundled spawn/end/fleet skills now
+  share one ownership contract. `--remote unix://` is explicitly a terminal TUI
+  transport, not simultaneous desktop-app access; app `+` tasks are observed
+  only after creation; and only authorized terminal workers may be restored
+  after reboot.
+
 ## [Unreleased] - 2026-08-23
 
 Cross-machine messaging, session self-restart, portable hooks, and session

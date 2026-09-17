@@ -100,7 +100,11 @@ watching. Only agent *decisions* route to the human. The toggle is global for no
 ## The monitor → decide → sequence loop
 
 1. **Monitor** — pull the fleet view + needs-attention digest; read per-session
-   state (working / idle-done / waiting-input / blocked-dialog / unsent-draft) and
+   state. Start with provider-neutral `cctrl task ls` locally and `cctrl fleet`
+   across hosts; use `cctrl session ls` only when you specifically need live
+   tmux targets. Never infer ownership from cwd, title, host alias, or a legacy
+   remote row whose capabilities are unknown. Read working / idle-done /
+   waiting-input / blocked-dialog / unsent-draft state and
    **local machine health** (memory/swap/load). Treat `unsent-draft` as noise
    until confirmed: the detector often mistakes the input box's dim ghost-hint
    text for a real typed-but-unsent line, and sometimes a real draft *is*
@@ -111,6 +115,12 @@ watching. Only agent *decisions* route to the human. The toggle is global for no
    Respect the always-confirm set regardless of mode.
 3. **Sequence** — order commits/pushes across shared worktrees; relay results;
    close throwaways; leave work sessions open for review.
+
+App-owned and native app tasks are inventory entries, not tmux dispatch targets.
+Open them through their provider capability; do not attach, restore, or inject a
+second writer. Peer messaging for app tasks remains deferred until a stable
+provider identity design lands (plans 028/029 or a reviewed successor); never
+invent a shared-MCP identity shortcut from cwd, title, or an app task id.
 
 **Cadence:** relaxed idle cadence (~20 min) by default; tighten to a few minutes
 only when actively watching a live task complete. Use ScheduleWakeup to self-pace.

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "kind": "codex_three_path_matrix",
+  "compatibility_boundary": "codex-lifecycle-v1",
+  "fixture_versions": {
+    "cli_version": "0.153.4",
+    "app_version": "26.908.40834 (build 8881)"
+  },
+  "paths": [
+    {
+      "path": "cctrl-terminal-worker",
+      "command": "cctrl start -d --agent codex <dir>",
+      "origin": "cctrl",
+      "runtime": "tmux",
+      "owner": "cctrl",
+      "control_surface": "tmux-attach",
+      "disconnect": "survives-terminal-and-ssh-disconnect",
+      "reboot": "provider-resumable-authorized-terminal-restore-only",
+      "transition": "release-to-app",
+      "evidence_functions": ["test_detached_arg_parsing", "test_start_defaults_to_tmux", "test_codex_handoff_state_machine"],
+      "unsupported": ["simultaneous-app-writer", "app-plus-interception", "remote-as-shared-control"]
+    },
+    {
+      "path": "cctrl-app-owned",
+      "command": "cctrl start --agent codex --app-owned <dir>",
+      "origin": "cctrl",
+      "runtime": "app-server",
+      "owner": "app",
+      "control_surface": "codex-app",
+      "disconnect": "unaffected",
+      "reboot": "provider-resumable-no-tmux-restore",
+      "transition": "continue-in-app",
+      "evidence_functions": ["test_app_owned_launch"],
+      "unsupported": ["tmux-attach", "tmux-restore", "simultaneous-terminal-writer"]
+    },
+    {
+      "path": "native-app",
+      "command": "press + and submit the first prompt in the Codex app",
+      "origin": "codex-app",
+      "runtime": "unknown-until-authoritative-app-snapshot",
+      "owner": "unknown-until-authoritative-app-snapshot",
+      "control_surface": "codex-app",
+      "disconnect": "unaffected",
+      "reboot": "provider-resumable-no-tmux-restore",
+      "transition": "reconcile-authoritative-app-evidence-then-observe",
+      "evidence_functions": ["test_codex_lifecycle_ingestion", "test_codex_reconcile_ownership_evidence", "test_task_inventory_provider_neutral_readonly"],
+      "unsupported": ["pre-creation-interception", "tmux-attach", "tmux-restore", "override-app-settings"]
+    }
+  ]
+}

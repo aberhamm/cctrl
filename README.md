@@ -147,7 +147,7 @@ A launch is described by three independent axes:
 | **Location** | which machine runs it? | `--host <alias>` (default: local) |
 | **Durability** | does it survive disconnect? | tmux-backed by default; `--foreground` for direct one-offs; `-d` / `--detach` to start detached and return |
 | **Agent** | which CLI runs? | `--agent codex`, `--agent claude`, or the configured default |
-| **Bridge** | can the app drive it? | Claude bridge on by default; Codex app bridge is experimental and opt-in |
+| **Transport** | how does the terminal agent connect? | Claude remote-control bridge on by default; Codex `--remote` selects TUI transport only and does not grant app ownership |
 
 There's **one launch verb — `start`** — and the flags above pick the behavior. Interactive starts are tmux-backed by default so local and remote agents are durable and addressable. Managing tmux sessions (list/attach/kill) lives under `cctrl session`.
 
@@ -162,7 +162,7 @@ cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
 cctrl start -m "fix bug"          # launch with an initial prompt
 cctrl start --purpose "fix bug"   # store cleanup/review context without sending a prompt
 cctrl start --no-bridge           # launch without the phone-control bridge
-cctrl start --agent codex --remote unix://  # opt into Codex app-server bridge
+cctrl start --agent codex --remote unix://  # TUI transport; still one terminal writer
 ```
 
 `cctrl start` uses `--agent` first, then `CCTRL_AGENT`, then the active profile's `defaultAgent`, then the merged config `defaultAgent` from `data/config.json`, `~/.config/cctrl/config.json`, and `data/config.local.json`. If no agent is selected and the command has a TTY, it prompts with the available agents; non-interactive launches should pass `--agent claude|codex` or configure a default. Multiple detached sessions in the same folder get unique suffixes (e.g. `TMUX--homelab--2`).
@@ -193,18 +193,30 @@ Detached agent app titles are reconciled to `repo: description (TMUX--...)`.
 Claude gets this at launch through its `--name`/remote-control title surface.
 Codex has no equivalent title flag, so cctrl resolves the Codex rollout id and
 updates the local Codex app state row after the session appears. When Codex
-app bridging is desired, opt in explicitly with `--remote unix://` for one launch
+App Server transport is desired for the terminal TUI, opt in explicitly with
+`--remote unix://` for one launch
 or `CCTRL_CODEX_REMOTE_DEFAULT=unix://` for tmux-backed Codex launches in that
-environment. `--no-bridge` suppresses that default. `cctrl rename <session> "new
-description"` uses the same title path for live Codex sessions.
+environment. This changes transport, not ownership: it does not let the desktop
+app and tmux write the same task simultaneously. `--no-bridge` suppresses that
+default. `cctrl rename <session> "new description"` uses the same title path for
+live Codex sessions.
 
-For now, tmux is the default Codex control surface. The app-owned Codex path is
-explicit and should be used deliberately. There are three separate launch paths:
+For now, tmux is the default Codex control surface. App ownership is explicit.
+The following is the canonical decision table for the **three ownership paths**;
+CLI help, completions, and bundled skills mirror these same invariants.
+
+| Path | Creation command | Origin | Runtime owner | Control surface | Terminal/SSH disconnect | Host reboot | Safe transition | Unsupported actions |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| cctrl terminal worker | `cctrl start -d --agent codex <dir>` | `cctrl` | `cctrl` / `tmux` | attach to the cctrl tmux session | survives | tmux process stops; provider task remains resumable and only an authorized terminal-worker snapshot may restore it | `cctrl session release-to-app <name> --yes` | a second app writer, app `+` interception, or treating `--remote unix://` as shared control |
+| cctrl-launched app task | `cctrl start --agent codex --app-owned <dir>` | `cctrl` | `app` / `app-server` | Codex app | unaffected | provider task is resumable after the app/host returns; cctrl never spawns tmux for it | continue in the app | tmux attach/restore, simultaneous writers, or cctrl overriding omitted app defaults |
+| native app task (after first prompt) | press `+` and submit the first prompt in the Codex app | `codex-app` after an authoritative lifecycle signal | app control surface; cctrl records owner/runtime as unknown until an authoritative app snapshot proves `app` / `app-server` | Codex app | unaffected | provider task is resumable after the app/host returns; cctrl never spawns tmux for it | reconcile authoritative app evidence, then observe with `cctrl task ls` after Codex assigns an id | pre-creation interception, granting actions from SQLite discovery alone, tmux attach/restore, or cctrl overriding the app's model/permissions |
+
+`--remote unix://` is only a transport option for a terminal TUI. It is not a
+fourth ownership path and never enables simultaneous app and tmux access.
+
+An intentional app-owned launch can include settings and one first turn:
 
 ```bash
-cctrl start -d --agent codex ./my-project              # cctrl-owned tmux writer
-cctrl start --agent codex --remote unix:// ./my-project # App Server-backed TUI writer
-cctrl start --agent codex --app-owned ./my-project      # app-owned; cctrl exits
 cctrl start --agent codex --app-owned @myapp \
   --model gpt-6-astra --reasoning-effort high -m "Investigate the login flow"
 ```
@@ -226,8 +238,11 @@ succeeded but registry persistence did not, the result prints an exact
 still depends on Codex remote connections and that host being awake; no path
 promises two concurrent writers.
 
-A native app `+` task is different: cctrl observes it only after Codex exposes a
-provider id and does not intercept its creation. Once a tmux task has been
+A native app `+` task is different: the empty composer has no provider id.
+cctrl can register the task only after the first prompt gives Codex an id and
+does not intercept its creation. Read-only SQLite discovery keeps owner/runtime
+and app-open capability unknown; only a current authoritative app snapshot can
+prove `app` / `app-server`. Once a tmux task has been
 registered with the app-server, you can instead release that terminal owner and
 continue in the ChatGPT/Codex app:
 
@@ -1268,7 +1283,7 @@ and is surfaced through `cctrl usage`.
 | Initial prompt with `-m` | yes | yes |
 | `--yolo` | maps to `bypassPermissions` | native |
 | Native sandbox/approval flags | Claude permission mode | Codex `--sandbox` / `--ask-for-approval` |
-| App-server-backed TUI | n/a | `--remote unix://` passthrough |
+| App Server TUI transport | n/a | `--remote unix://` passthrough; terminal remains the single writer |
 | Usage and cost parsing | local JSONL | local JSONL |
 | Rate-limit reporting | statusline/history files | session JSONL `token_count` events |
 | Status line | external script | built-in TUI footer |

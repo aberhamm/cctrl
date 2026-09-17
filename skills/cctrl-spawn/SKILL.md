@@ -42,7 +42,28 @@ memory and attention. One session = one purpose.
 
 ## The procedure
 
-1. **Decide runtime + placement.** Pick the agent (`claude` for consultative /
+1. **Decide ownership, runtime, and placement.** For Codex, choose the owner
+   before creating anything. README's **three ownership paths** table is the
+   canonical semantic source:
+
+   - Use `cctrl start -d <dir> --agent codex ...` for a durable terminal worker
+     that cctrl/tmux owns and the user may attach to. It survives terminal and
+     SSH disconnects, but not a host reboot.
+   - Use `cctrl start --agent codex --app-owned <dir> ...` when the user wants a
+     new task owned and controlled by the Codex app. cctrl records the returned
+     provider id and exits; it creates no tmux writer. Omitted model, sandbox,
+     and permission values remain provider defaults.
+   - A task created with `+` in the Codex app has no provider id until the first
+     prompt. The app is its control surface, but cctrl keeps owner/runtime and
+     app-open capability unknown until current authoritative app evidence proves
+     them. cctrl cannot intercept creation or override app-selected
+     model/permissions; SQLite discovery alone never grants an action.
+
+   Never use `--remote unix://` to imply simultaneous app access. It selects the
+   transport for a terminal TUI; that terminal remains the single writer until
+   a verified `release-to-app` handoff.
+
+   Then pick the agent (`claude` for consultative /
    general work; `codex` when the user asks for it or wants an independent
    second engine). Pick the **explicit target directory** — the repo the work
    belongs to, not `$HOME`. Pick a short, descriptive `-n` label (the *purpose*;
@@ -53,13 +74,17 @@ memory and attention. One session = one purpose.
    count — too many heavy sessions thrashed memory before. If pressure is high,
    say so and ask before adding another.
 
-3. **Create it detached.** This is the robust path — create detached, then attach
+3. **Create terminal-owned work detached.** This is the robust terminal path — create detached, then attach
    *after* it boots. Never launch an agent interactively straight into a tab (see
    Gotchas):
 
    ```
    cctrl start -d <dir> --agent <claude|codex> -n "<label>" [-m "<brief>"]
    ```
+
+   For the app-owned choice from step 1, do not add `-d`, `--remote`, `--peer`,
+   or `-n`; run `cctrl start --agent codex --app-owned <dir> [-m "<brief>"]`
+   and verify the returned provider task id instead of looking for a tmux pane.
 
    - `-d` **requires** an explicit dir/shortcut — it refuses to default to
      `$HOME` (guardrail against dropping a full-access agent into `~/.ssh` etc.).

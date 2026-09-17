@@ -1,7 +1,10 @@
 ---
 id: 069
 title: Verify and document the three Codex ownership paths
-status: in-progress
+status: done
+completed: 2026-09-17
+reviewed: false
+qa: automated
 blocked-by: [066, 068]
 priority: 69
 goal: codex-task-ownership-surfaces
@@ -12,6 +15,7 @@ created: 2026-09-15
 tui-fixture: n/a  # lifecycle tests use fake tmux/process events and never parse terminal panes
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-17 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -105,3 +109,22 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented the version-bound, fixture-row-driven three-path Codex ownership matrix and aligned README, CLI help, completions, changelog, and bundled skills around the single-writer contract. Native-app discovery now remains capability-conservative until authoritative app evidence, focused tests use an isolated fake home with path-aware live-store digests, and both the focused matrix and complete real-PTY suite pass. No design deviations.
+
+**Files changed:**
+
+- `CHANGELOG.md` (modified)
+- `README.md` (modified)
+- `cctrl` (modified)
+- `completions/_cctrl` (modified)
+- `docs/plans/069-codex-ownership-operational-contract.md` (modified)
+- `skills/cctrl-fleet-manager/SKILL.md` (modified)
+- `skills/cctrl-session-end/SKILL.md` (modified)
+- `skills/cctrl-spawn/SKILL.md` (modified)
+- `tests/run-tests.sh` (modified)
+- `tests/fixtures/codex-ownership-matrix.json` (created)
+
+**Commit:** `3780910` — `docs(codex): codify the three ownership paths`

@@ -3,6 +3,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
+CCTRL_TEST_REAL_HOME="${HOME:?HOME must be set}"
+if [[ "${CCTRL_TEST_ONLY:-}" == "codex-ownership-matrix" ]]; then
+    mkdir -p "$TMPDIR/home"
+    export HOME="$TMPDIR/home"
+fi
 export CCTRL_DATA_DIR="$TMPDIR/data"
 export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
 export CCTRL_HOST_ID_FILE="$CCTRL_DATA_DIR/host-id"
@@ -40,6 +45,43 @@ export CCTRL_CONFIG_LOCAL="$TMPDIR/no-local-config.json"
 fail() {
     echo "FAIL: $*" >&2
     exit 1
+}
+
+ownership_live_store_digest() {
+    python3 - "$ROOT/data" "$ROOT/.active-profile" \
+        "$CCTRL_TEST_REAL_HOME/.config/cctrl" \
+        "$CCTRL_TEST_REAL_HOME/.codex/hooks.json" \
+        "$CCTRL_TEST_REAL_HOME/.codex/config.toml" \
+        "$CCTRL_TEST_REAL_HOME/.claude/settings.json" <<'PY'
+import hashlib
+import os
+import sys
+from pathlib import Path
+
+digest = hashlib.sha256()
+for root_arg in sys.argv[1:]:
+    root = Path(root_arg)
+    digest.update(root_arg.encode() + b"\0")
+    if root.is_symlink():
+        digest.update(b"symlink\0" + os.readlink(root).encode() + b"\0")
+        continue
+    if root.is_file():
+        digest.update(b"file\0" + root.read_bytes() + b"\0")
+        continue
+    if not root.exists():
+        digest.update(b"absent\0")
+        continue
+    digest.update(b"dir\0")
+    for path in sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root))):
+        relative = str(path.relative_to(root)).encode()
+        if path.is_symlink():
+            digest.update(b"link\0" + relative + b"\0" + os.readlink(path).encode() + b"\0")
+        elif path.is_dir():
+            digest.update(b"dir\0" + relative + b"\0")
+        elif path.is_file():
+            digest.update(b"file\0" + relative + b"\0" + path.read_bytes() + b"\0")
+print(digest.hexdigest())
+PY
 }
 
 assert_contains() {
@@ -7916,7 +7958,7 @@ def add(task, owner="unknown", runtime="unknown", *, tmux=None, launched=False, 
     (root/(key+".json")).write_text(json.dumps(record,sort_keys=True,indent=2)+"\n")
 add("tmux-task",tmux="TMUX--one",launched=True,origin="cctrl")
 add("unanchored-task",tmux="TMUX--legacy",launched=True,origin="cctrl",anchored=False)
-add("app-task",origin="cctrl")
+add("app-task",origin="codex-app")
 add("conflict-task",tmux="TMUX--two",launched=True,origin="cctrl")
 add("ambiguous-task",owner="cctrl",runtime="tmux",origin="cctrl")
 add("unavailable-task",owner="app",runtime="app-server",origin="codex-app")
@@ -7982,7 +8024,7 @@ records={}
 for path in Path(sys.argv[1]).glob("task-*.json"):
     value=json.loads(path.read_text()); records[value["provider_task_id"]]=value
 assert (records["tmux-task"]["control_owner"],records["tmux-task"]["execution_runtime"]) == ("cctrl","tmux")
-assert (records["app-task"]["control_owner"],records["app-task"]["execution_runtime"]) == ("app","app-server")
+assert (records["app-task"]["origin"],records["app-task"]["control_owner"],records["app-task"]["execution_runtime"]) == ("codex-app","app","app-server")
 assert records["conflict-task"]["control_owner"] == "conflict"
 assert records["ambiguous-task"]["control_owner"] == "unknown"
 assert records["unavailable-task"]["control_owner"] == "app"
@@ -8210,6 +8252,9 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
         codex-handoff)
             # Defined after the Codex App Server fixtures; dispatched there.
             ;;
+        codex-ownership-matrix)
+            # Defined after all Codex ownership-path fixtures; dispatched there.
+            ;;
         session-attest)
             test_session_attest_live_tmux_process_matches
             test_session_attest_direct_metadata
@@ -8314,7 +8359,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
-if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" ]]; then
+if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -9977,6 +10022,110 @@ PY
     [[ "$before" == "$after" ]] || fail "handoff tests changed the real cctrl live store"
     echo "ok: Codex handoff is exact-task, two-checkpoint, owner-exit-gated, idempotent, and attach-safe"
 }
+
+test_codex_ownership_matrix_contract() {
+    local fixture="$ROOT/tests/fixtures/codex-ownership-matrix.json" help
+
+    jq -e '
+      .schema_version == 1 and .kind == "codex_three_path_matrix" and
+      .compatibility_boundary == "codex-lifecycle-v1" and
+      .fixture_versions == {"cli_version":"0.153.4","app_version":"26.908.40834 (build 8881)"} and
+      (.paths | length) == 3 and
+      ([.paths[].path] | sort) == ["cctrl-app-owned","cctrl-terminal-worker","native-app"] and
+      (all(.paths[]; has("command") and has("origin") and has("runtime") and
+        has("owner") and has("control_surface") and has("disconnect") and
+        has("reboot") and has("transition") and has("unsupported") and
+        (.evidence_functions | type == "array" and length > 0))) and
+      ([.paths[] | select(.path=="cctrl-terminal-worker")][0] |
+        .origin=="cctrl" and .owner=="cctrl" and .runtime=="tmux" and
+        .transition=="release-to-app" and
+        .evidence_functions==["test_detached_arg_parsing","test_start_defaults_to_tmux","test_codex_handoff_state_machine"] and
+        (.unsupported | index("simultaneous-app-writer") != null)) and
+      ([.paths[] | select(.path=="cctrl-app-owned")][0] |
+        .origin=="cctrl" and .owner=="app" and .runtime=="app-server" and
+        .evidence_functions==["test_app_owned_launch"] and
+        (.unsupported | index("tmux-restore") != null)) and
+      ([.paths[] | select(.path=="native-app")][0] |
+        .origin=="codex-app" and .owner=="unknown-until-authoritative-app-snapshot" and
+        .runtime=="unknown-until-authoritative-app-snapshot" and
+        .transition=="reconcile-authoritative-app-evidence-then-observe" and
+        .evidence_functions==["test_codex_lifecycle_ingestion","test_codex_reconcile_ownership_evidence","test_task_inventory_provider_neutral_readonly"] and
+        (.unsupported | index("override-app-settings") != null))
+    ' "$fixture" >/dev/null || fail "three-path ownership fixture contract is invalid"
+
+    python3 "$ROOT/tests/fixtures/codex-lifecycle/validate.py" >/dev/null \
+        || fail "declared codex-lifecycle-v1 compatibility boundary is invalid"
+    jq -e --slurpfile matrix "$fixture" '
+      ($matrix[0].fixture_versions) as $versions |
+      (.fixtures | length > 0) and
+      all(.fixtures[]; .cli_version==$versions.cli_version and .app_version==$versions.app_version)
+    ' "$ROOT/tests/fixtures/codex-lifecycle/manifest.json" >/dev/null \
+        || fail "codex-lifecycle-v1 is not bound to the declared CLI/app versions"
+    rg -q "three ownership paths" "$ROOT/README.md" \
+        || fail "README is not the canonical three-path decision table"
+    rg -q -- "--app-owned" "$ROOT/README.md" "$ROOT/skills/cctrl-spawn/SKILL.md" "$ROOT/completions/_cctrl" \
+        || fail "app-owned path is missing from an operator surface"
+    rg -q "release-to-app" "$ROOT/skills/cctrl-session-end/SKILL.md" \
+        || fail "session-end skill omits verified app handoff"
+    rg -q "provider-neutral.*cctrl task ls|cctrl task ls.*provider-neutral" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
+        || fail "fleet-manager skill does not begin from provider-neutral task inventory"
+    if ! rg -q "Peer messaging for app tasks remains deferred" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
+        || ! rg -q "plans 028/029" "$ROOT/skills/cctrl-fleet-manager/SKILL.md"; then
+        fail "app-task peer identity deferral is undocumented"
+    fi
+    rg -q "transport.*not ownership|transport option.*not a" "$ROOT/README.md" \
+        || fail "README still implies --remote is simultaneous app access"
+    if rg -q "Codex app bridge|Codex app-server endpoint|Codex: launch through local app-server" \
+        "$ROOT/README.md" "$ROOT/cctrl" "$ROOT/completions/_cctrl"; then
+        fail "a stale --remote app-control description remains"
+    fi
+    help="$(CCTRL_DATA_DIR="$TMPDIR/ownership-help-data" "$ROOT/cctrl" help)"
+    [[ "$help" == *"Codex ownership paths"* && "$help" == *"zero tmux writers"* && "$help" == *"release-to-app"* ]] \
+        || fail "CLI help does not mirror the three-path ownership contract"
+
+    echo "ok: canonical three-path ownership contract is aligned across operator surfaces"
+}
+
+run_codex_ownership_matrix_paths() {
+    local fixture="$ROOT/tests/fixtures/codex-ownership-matrix.json" path
+    while IFS= read -r path; do
+        case "$path" in
+            cctrl-terminal-worker)
+                test_detached_arg_parsing
+                test_start_defaults_to_tmux
+                test_codex_handoff_state_machine
+                ;;
+            cctrl-app-owned)
+                test_app_owned_launch
+                ;;
+            native-app)
+                test_codex_lifecycle_ingestion
+                test_codex_reconcile_ownership_evidence
+                test_task_inventory_provider_neutral_readonly
+                ;;
+            *) fail "unknown ownership-matrix path: $path" ;;
+        esac
+    done < <(jq -r '.paths[].path' "$fixture")
+}
+
+if [[ "${CCTRL_TEST_ONLY:-}" == "codex-ownership-matrix" ]]; then
+    ownership_live_before="$(ownership_live_store_digest)"
+    test_codex_ownership_matrix_contract
+    test_codex_lifecycle_fixture_contract
+    run_codex_ownership_matrix_paths
+    test_fleet_v2_provider_neutral_federation
+    test_snapshot_ownership_policy
+    ownership_live_after="$(ownership_live_store_digest)"
+    [[ "$ownership_live_before" == "$ownership_live_after" ]] \
+        || fail "three-path ownership matrix changed the real cctrl live store"
+    echo "ok: three ownership paths are isolated, single-writer, exact-id, federated, and restore-safe"
+    echo "ok"
+    exit 0
+fi
+
+if [[ -z "${CCTRL_TEST_ONLY:-}" ]]; then
+    test_codex_ownership_matrix_contract
+fi
 
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-handoff" ]]; then
     test_codex_handoff_state_machine
