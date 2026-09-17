@@ -1,7 +1,7 @@
 ---
 id: 067
 title: Make Codex terminal-to-app handoff an explicit safe transition
-status: pending
+status: in-progress
 blocked-by: [063, 064, 065]
 priority: 67
 goal: codex-task-ownership-surfaces
