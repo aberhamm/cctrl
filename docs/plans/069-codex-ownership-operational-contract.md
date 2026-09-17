@@ -1,7 +1,7 @@
 ---
 id: 069
 title: Verify and document the three Codex ownership paths
-status: pending
+status: in-progress
 blocked-by: [066, 068]
 priority: 69
 goal: codex-task-ownership-surfaces
