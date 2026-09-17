@@ -1,7 +1,7 @@
 ---
 id: 068
 title: Make snapshot and restore ownership-aware
-status: pending
+status: in-progress
 blocked-by: [064, 067]
 priority: 68
 goal: codex-task-ownership-surfaces
