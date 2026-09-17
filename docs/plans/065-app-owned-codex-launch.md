@@ -87,7 +87,7 @@ produced:
 - kind: schema; name: app_owned_launch_result_v1; shape: "partial,task_creation_outcome,provider_task_id,host_id,owner,runtime,turn_outcome,registry_persisted,open_hint,error"; file: cctrl
 - kind: symbol; name: _launch_app_owned_codex; file: cctrl
 assumed:
-- from: 059; kind: symbol; name: _task_registry_apply_event; shape: "record_key,event_file"; file: cctrl
+- from: 059; kind: symbol; name: _task_registry_apply_event; file: cctrl
 - from: 060; kind: symbol; name: AppServerClient; file: lib/codex_app_server.py
 - from: 063; kind: symbol; name: _session_reconcile_codex; file: cctrl
 -->
