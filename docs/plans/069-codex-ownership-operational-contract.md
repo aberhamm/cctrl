@@ -87,8 +87,8 @@ Checks:
 produced:
 - kind: schema; name: codex_three_path_matrix; shape: "path,command,origin,runtime,owner,control_surface,disconnect,reboot,transition,unsupported"; file: tests/run-tests.sh
 assumed:
-- from: 066; kind: schema; name: fleet_v2; shape: "status,schema_version,capabilities,rows,error"; file: cctrl
-- from: 068; kind: schema; name: snapshot_v2; shape: "schema_version,generated_at,host_id,resource_metadata,tasks,task_reference_count,restore_candidate_count,capture_quality,source_errors"; file: cctrl
+- from: 066; kind: schema; name: fleet_v2; file: cctrl
+- from: 068; kind: schema; name: snapshot_v2; file: cctrl
 -->
 
 
