@@ -82,8 +82,8 @@ produced:
 - kind: schema; name: fleet_host_result_v2; shape: "status,schema_version,capabilities,rows,error"; file: cctrl
 - kind: symbol; name: _fleet_task_rows_json; file: cctrl
 assumed:
-- from: 064; kind: schema; name: task_list_v2; shape: "schema_version,capabilities,rows,source_errors"; file: cctrl
-- from: 064; kind: schema; name: task_list_row_v2; shape: "provider,provider_task_id,host_id,origin,execution_runtime,control_owner,lifecycle_state,restore_strategy,registered_by_cctrl,launched_by_cctrl,lineage,ownership_evidence,diagnostic_evidence,recency,cwd,title,tmux_session,action_capabilities"; file: cctrl
+- from: 064; kind: schema; name: task_list_v2; file: cctrl
+- from: 064; kind: schema; name: task_list_row_v2; file: cctrl
 - from: 064; kind: symbol; name: _task_list_json; file: cctrl
 -->
 
