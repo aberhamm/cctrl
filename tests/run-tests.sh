@@ -5977,24 +5977,44 @@ $expected"
 # host) — so NO real SSH ever happens. The local host is queried in-process via
 # the fake tmux/ps already used by the session-ls tests.
 make_fleet_ssh() {
-    # Fake ssh: last positional arg is the remote command, the one before it is
-    # the target. Emits $FLEET_FIXTURES/<target>.json when present; a target
-    # containing "offline" exits non-zero (unreachable); otherwise emits [].
+    # Fake ssh: fixtures may provide task/legacy stdout, stderr, and status
+    # separately. Existing <target>.json fixtures model an older cctrl: the task
+    # command returns the exact unsupported signature, then session ls reads it.
     local path="$1"
     cat > "$path" <<'SH'
 #!/usr/bin/env bash
 target="${@:(-2):1}"
+command="${@:(-1):1}"
 case "$target" in
+    *slow*)
+        sleep 20
+        exit 0
+        ;;
     *offline*)
         echo "ssh: connect to host $target port 22: Connection refused" >&2
         exit 255
         ;;
 esac
+kind=legacy
+[[ "$command" == *"task ls --json"* ]] && kind=task
+base="${FLEET_FIXTURES:-}/$target.$kind"
+if [[ -n "${FLEET_FIXTURES:-}" && -f "$base.stdout" ]]; then
+    cat "$base.stdout"
+    [[ -f "$base.stderr" ]] && cat "$base.stderr" >&2
+    [[ -f "$base.status" ]] && exit "$(cat "$base.status")"
+    exit 0
+fi
 fixture="${FLEET_FIXTURES:-}/$target.json"
-if [[ -n "${FLEET_FIXTURES:-}" && -f "$fixture" ]]; then
+if [[ "$kind" == task && -f "$fixture" ]]; then
+    printf 'Unknown command: task\nUsage: cctrl <command>\n'
+    exit 1
+fi
+if [[ "$kind" == legacy && -f "$fixture" ]]; then
     cat "$fixture"
     exit 0
 fi
+printf 'Unknown command: task\nUsage: cctrl <command>\n'
+[[ "$kind" == task ]] && exit 1
 echo "[]"
 exit 0
 SH
@@ -6005,8 +6025,9 @@ fleet_rootcopy() {
     # Copy cctrl into an isolated root so HOSTS_FILE (=<root>/data/hosts.json)
     # can be controlled per test without touching the repo's data/hosts.json.
     local root="$1" hosts_json="$2"
-    mkdir -p "$root/data"
+    mkdir -p "$root/data" "$root/lib"
     cp "$ROOT/cctrl" "$root/cctrl"
+    cp "$ROOT/lib/cctrl_fleet_collect.py" "$root/lib/cctrl_fleet_collect.py"
     chmod +x "$root/cctrl"
     printf '%s\n' "$hosts_json" > "$root/data/hosts.json"
 }
@@ -6052,8 +6073,8 @@ test_fleet_sorts_by_recency_across_hosts() {
     out="$(PATH="$bin:$PATH" FLEET_FIXTURES="$fix" CCTRL_TEST_HOSTNAME=fleet-local.example \
         "$root/cctrl" fleet --json)"
     # Sessions with a real last_active sort first, most-recent first.
-    first="$(printf '%s' "$out" | jq -r '[.[] | select(.last_active != null)][0].host')"
-    second="$(printf '%s' "$out" | jq -r '[.[] | select(.last_active != null)][1].host')"
+    first="$(printf '%s' "$out" | jq -r '[.[] | select(.host == "hA" or .host == "hB")][0].host')"
+    second="$(printf '%s' "$out" | jq -r '[.[] | select(.host == "hA" or .host == "hB")][1].host')"
     [[ "$first" == "hA" ]] || fail "most-recent host should sort first (got $first)"
     [[ "$second" == "hB" ]] || fail "older host should sort after newer (got $second)"
     echo "ok: fleet sorts by last-active across hosts"
@@ -6119,6 +6140,158 @@ test_fleet_version_skew_missing_fields() {
     legacy_line="$(printf '%s\n' "$human" | grep legacy || true)"
     assert_contains "$legacy_line" "-"
     echo "ok: fleet tolerates version-skew (missing last_active/state -> '-')"
+}
+
+test_fleet_v2_provider_neutral_federation() {
+    local root="$TMPDIR/fleet-v2-root" bin="$TMPDIR/fleet-v2-bin" fix="$TMPDIR/fleet-v2-fix"
+    local data="$TMPDIR/fleet-v2-data" meta="$TMPDIR/fleet-v2-meta" codex="$TMPDIR/fleet-v2-codex"
+    rm -rf "$root" "$bin" "$fix" "$data" "$meta" "$codex"
+    mkdir -p "$bin" "$fix" "$data" "$meta" "$codex"
+    make_fake_tmux "$bin/tmux"
+    make_fake_ps "$bin/ps"
+    make_fleet_ssh "$bin/ssh"
+    fleet_rootcopy "$root" '{
+      "new":{"hostname":"new.invalid","user":"","federation_host_id":"fed-new","remote_host_id":"remote-new"},
+      "old":{"hostname":"old.invalid","user":""},
+      "bad":{"hostname":"bad.invalid","user":"","federation_host_id":"fed-bad","remote_host_id":null},
+      "invalidrow":{"hostname":"invalidrow.invalid","user":"","federation_host_id":"fed-invalidrow","remote_host_id":null},
+      "wrong":{"hostname":"wrong.invalid","user":"","federation_host_id":"fed-wrong","remote_host_id":null},
+      "partial":{"hostname":"partial.invalid","user":"","federation_host_id":"fed-partial","remote_host_id":"remote-partial"},
+      "duplicate":{"hostname":"duplicate.invalid","user":"","federation_host_id":"fed-duplicate","remote_host_id":"remote-duplicate"},
+      "mismatch":{"hostname":"mismatch.invalid","user":"","federation_host_id":"fed-mismatch","remote_host_id":"expected-remote"},
+      "large":{"hostname":"large.invalid","user":"","federation_host_id":"fed-large","remote_host_id":"remote-large"},
+      "off":{"hostname":"offline.invalid","user":"","federation_host_id":"fed-offline","remote_host_id":null}
+    }'
+    cat > "$fix/new.invalid.task.stdout" <<'JSON'
+{"schema_version":2,"host_id":"remote-new","capabilities":{"task_list":{"supported":true,"reason":"available"}},"source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
+ {"task_key":"provider:codex:remote-new:same-id","provider":"codex","provider_task_id":"same-id","host_id":"remote-new","origin":"codex-app","execution_runtime":"app-server","control_owner":"app","lifecycle_state":"active","registered_by_cctrl":false,"launched_by_cctrl":false,"recency":"2026-09-17T12:00:00Z","cwd":"/new","display_title":"Native app","action_capabilities":{"app_open":{"supported":true,"reason":"available"},"tmux_attach":{"supported":false,"reason":"no-live-cctrl-tmux-owner"},"handoff":{"supported":false,"reason":"not-implemented"},"cctrl_restore":{"supported":false,"reason":"not-implemented"}}},
+ {"task_key":"provider:codex:remote-new:tmux-id","provider":"codex","provider_task_id":"tmux-id","host_id":"remote-new","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","registered_by_cctrl":true,"launched_by_cctrl":true,"recency":"2026-09-17T11:00:00Z","cwd":"/tmux","display_title":"Managed tmux","tmux_session":"TMUX--managed","action_capabilities":{"app_open":{"supported":false,"reason":"owned-by-cctrl"},"tmux_attach":{"supported":true,"reason":"available"},"handoff":{"supported":false,"reason":"not-implemented"},"cctrl_restore":{"supported":false,"reason":"not-implemented"}}}
+]}
+JSON
+    sed 's/remote-new/unexpected-remote/g' "$fix/new.invalid.task.stdout" > "$fix/mismatch.invalid.task.stdout"
+    python3 - "$fix/large.invalid.task.stdout" <<'PY'
+import json,sys
+rows=[]
+for i in range(1200):
+    rows.append({"task_key":f"provider:codex:remote-large:large-{i}","provider":"codex","provider_task_id":f"large-{i}","host_id":"remote-large","origin":"unknown","execution_runtime":"unknown","control_owner":"unknown","lifecycle_state":"unknown","registered_by_cctrl":False,"launched_by_cctrl":False,"recency":None,"cwd":"/large","display_title":"x"*256,"action_capabilities":{"app_open":{"supported":False,"reason":"unknown"},"tmux_attach":{"supported":False,"reason":"unknown"},"handoff":{"supported":False,"reason":"not-implemented"},"cctrl_restore":{"supported":False,"reason":"not-implemented"}}})
+doc={"schema_version":2,"host_id":"remote-large","capabilities":{"task_list":{"supported":True,"reason":"available"}},"source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":rows}
+open(sys.argv[1],"w",encoding="utf-8").write(json.dumps(doc)+"\n")
+PY
+    cat > "$fix/partial.invalid.task.stdout" <<'JSON'
+{"schema_version":2,"host_id":"remote-partial","capabilities":{"task_list":{"supported":true,"reason":"available"}},"source_status":{"registry":"available","tmux":"available","codex_provider":"unavailable"},"source_errors":[{"source":"codex-provider","status":"unavailable","error":"state-db-not-found"}],"rows":[{"task_key":"tmux:remote-partial:$1","provider":"unknown","provider_task_id":null,"host_id":"remote-partial","origin":"unknown","execution_runtime":"tmux","control_owner":"unknown","lifecycle_state":"active","registered_by_cctrl":false,"launched_by_cctrl":false,"recency":null,"cwd":"/partial","display_title":"partial-tmux","action_capabilities":{"app_open":{"supported":false,"reason":"provider-unavailable"},"tmux_attach":{"supported":false,"reason":"no-live-cctrl-tmux-owner"},"handoff":{"supported":false,"reason":"not-implemented"},"cctrl_restore":{"supported":false,"reason":"not-implemented"}}}]}
+JSON
+    cat > "$fix/duplicate.invalid.task.stdout" <<'JSON'
+{"schema_version":2,"host_id":"remote-duplicate","capabilities":{"task_list":{"supported":true,"reason":"available"}},"source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[{"task_key":"provider:codex:remote-duplicate:same-id","provider":"codex","provider_task_id":"same-id","host_id":"remote-duplicate","origin":"unknown","execution_runtime":"unknown","control_owner":"unknown","lifecycle_state":"unknown","registered_by_cctrl":false,"launched_by_cctrl":false,"recency":"not-a-standard-date","cwd":"/duplicate","display_title":"Same id, other host","action_capabilities":{"app_open":{"supported":false,"reason":"unknown"},"tmux_attach":{"supported":false,"reason":"unknown"},"handoff":{"supported":false,"reason":"not-implemented"},"cctrl_restore":{"supported":false,"reason":"not-implemented"}}}]}
+JSON
+    printf '[{"name":"legacy","dir":"/legacy","state":"idle","attached":false,"last_active":null,"session_id":"legacy-session"}]\n' > "$fix/old.invalid.json"
+    printf '\033[31mUnknown command: task\033[0m\nUsage: cctrl <command>\n' > "$fix/old.invalid.task.stdout"
+    printf '1\n' > "$fix/old.invalid.task.status"
+    printf '{definitely not json\n' > "$fix/bad.invalid.task.stdout"
+    printf '[{"name":"must-not-fallback"}]\n' > "$fix/bad.invalid.json"
+    printf '%s\n' '{"schema_version":2,"host_id":"remote-invalid","capabilities":{},"source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[{"task_key":"bad","provider":"codex","origin":"unknown","execution_runtime":"unknown","control_owner":"app","lifecycle_state":"active","action_capabilities":{}}]}' > "$fix/invalidrow.invalid.task.stdout"
+    printf '[{"name":"invalid-row-must-not-fallback"}]\n' > "$fix/invalidrow.invalid.json"
+    printf 'Unknown command: task\nUsage: cctrl <command>\n' > "$fix/wrong.invalid.task.stdout"
+    printf 'warning\n' > "$fix/wrong.invalid.task.stderr"
+    printf '1\n' > "$fix/wrong.invalid.task.status"
+    printf '[{"name":"must-not-fallback-either"}]\n' > "$fix/wrong.invalid.json"
+
+    local before after out legacy human
+    before="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    out="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
+        CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet --json-v2)" || fail "fleet v2 failed"
+    after="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    [[ "$before" == "$after" ]] || fail "fleet v2 tests changed the real cctrl live store"
+    jq -e '
+      (keys == ["capabilities","error","rows","schema_version","status"]) and
+      .schema_version == 2 and .status == "partial" and
+      ([.rows[] | select(.host=="new" and .provider_task_id=="same-id")] | length == 1) and
+      ([.rows[] | select(.host=="duplicate" and .provider_task_id=="same-id")] | length == 1) and
+      ([.rows[] | select(.host=="new" and .provider_task_id=="tmux-id")][0].action_hint == "tmux-attach") and
+      ([.rows[] | select(.host=="new" and .provider_task_id=="same-id")][0].action_hint == "app-open") and
+      ([.rows[] | select(.host=="old")][0].remote_schema_version == 1) and
+      ([.rows[] | select(.host=="old")][0].host_identity_state == "identity-uninitialized") and
+      ([.rows[] | select(.host=="partial")][0].remote_status == "partial") and
+      ([.rows[] | select(.host=="mismatch")][0] |
+        .host_marker == true and .remote_status == "identity-conflict" and .remote_error.code == "remote-host-id-mismatch") and
+      ([.rows[] | select(.host=="mismatch" and .provider_task_id!=null)] | length == 0) and
+      ([.rows[] | select(.host=="bad")][0].remote_status == "malformed") and
+      ([.rows[] | select(.host=="bad" and .name=="must-not-fallback")] | length == 0) and
+      ([.rows[] | select(.host=="invalidrow")][0].remote_status == "malformed") and
+      ([.rows[] | select(.host=="invalidrow" and .name=="invalid-row-must-not-fallback")] | length == 0) and
+      ([.rows[] | select(.host=="wrong")][0].remote_status == "unavailable") and
+      ([.rows[] | select(.host=="wrong" and .name=="must-not-fallback-either")] | length == 0) and
+      ([.rows[] | select(.host=="large")] | length == 1200) and
+      ([.rows[] | select(.host=="off")][0].offline == true) and
+      (all(.rows[]; has("name") and has("host") and has("managed") and has("agent") and has("claude") and has("model") and has("dir") and has("state") and has("attached") and has("remote_control") and has("bridge") and has("session_id") and has("transcript") and has("last_active") and has("purpose") and has("created_at") and has("peer") and has("display_label")))
+    ' <<< "$out" >/dev/null || fail "fleet v2 ownership, compatibility, or failure envelope is wrong: $out"
+
+    legacy="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
+        CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet --json)"
+    jq -e 'type=="array" and any(.[]; .host=="new") and any(.[]; .host=="old")' <<< "$legacy" >/dev/null \
+        || fail "fleet --json no longer returns the compatibility array"
+    human="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
+        CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet)"
+    assert_contains "$human" "OWNER"
+    assert_contains "$human" "RUNTIME"
+    assert_contains "$human" "ORIGIN"
+    assert_contains "$human" "app-open"
+    assert_contains "$human" "tmux-attach"
+    local native_line
+    native_line="$(printf '%s\n' "$human" | grep 'Native app' || true)"
+    assert_contains "$native_line" "active"
+    assert_not_contains "$native_line" " ok "
+
+    # Host ids are initialized atomically for new registrations, survive alias
+    # changes, and legacy registrations migrate only on explicit refresh.
+    local host_data="$TMPDIR/fleet-v2-host-data" first_id renamed_id
+    rm -rf "$host_data"; mkdir -p "$host_data"
+    PATH="$bin:/usr/bin:/bin" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" "$root/cctrl" host add alpha new.invalid >/dev/null
+    first_id="$(jq -r '.alpha.federation_host_id' "$host_data/hosts.json")"
+    [[ "$first_id" =~ ^[0-9a-f]{32}$ ]] || fail "host add did not create a federation id"
+    [[ "$(stat -f %Lp "$host_data/hosts.json")" == 600 ]] || fail "host registry is not private"
+    PATH="$bin:/usr/bin:/bin" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" "$root/cctrl" host rename alpha beta >/dev/null
+    renamed_id="$(jq -r '.beta.federation_host_id' "$host_data/hosts.json")"
+    [[ "$first_id" == "$renamed_id" ]] || fail "alias rename changed federation identity"
+    printf '{"legacy":{"hostname":"new.invalid","user":""}}\n' > "$host_data/hosts.json"
+    PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" \
+        "$root/cctrl" host refresh-identity legacy >/dev/null
+    jq -e '.legacy.federation_host_id | test("^[0-9a-f]{32}$")' "$host_data/hosts.json" >/dev/null \
+        || fail "refresh-identity did not initialize legacy registration"
+    [[ "$(jq -r '.legacy.remote_host_id' "$host_data/hosts.json")" == remote-new ]] \
+        || fail "refresh-identity did not map authoritative remote host id"
+    local identity_before identity_after identity_rc=0
+    jq '.legacy.remote_host_id="different-remote"' "$host_data/hosts.json" > "$host_data/hosts.tmp"
+    mv "$host_data/hosts.tmp" "$host_data/hosts.json"
+    identity_before="$(shasum -a 256 "$host_data/hosts.json" | awk '{print $1}')"
+    PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" \
+        "$root/cctrl" host refresh-identity legacy >/dev/null 2>&1 || identity_rc=$?
+    (( identity_rc != 0 )) || fail "refresh-identity replaced an immutable remote identity"
+    identity_after="$(shasum -a 256 "$host_data/hosts.json" | awk '{print $1}')"
+    [[ "$identity_before" == "$identity_after" ]] || fail "failed identity refresh mutated the host registration"
+
+    # The helper enforces a whole-process timeout and emits a structured marker.
+    local timeout_hosts="$TMPDIR/fleet-timeout-hosts.json" timeout_results="$TMPDIR/fleet-timeout-results" timeout_path
+    printf '{"slow":{"hostname":"slow.invalid","user":"","federation_host_id":"fed-slow","remote_host_id":null}}\n' > "$timeout_hosts"
+    rm -rf "$timeout_results"
+    timeout_path="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" python3 "$ROOT/lib/cctrl_fleet_collect.py" collect \
+        --hosts-file "$timeout_hosts" --output-dir "$timeout_results" --workers 4 --timeout .1)" || fail "timeout collector crashed"
+    jq -e '.status=="timeout" and .error.code=="timeout"' "$timeout_path" >/dev/null \
+        || fail "timed-out worker did not emit a structured timeout envelope"
+    [[ -f "$timeout_results/host-00000/task.stdout" && -f "$timeout_results/host-00000/task.stderr" && -f "$timeout_results/host-00000/task.status" ]] \
+        || fail "collector did not isolate stdout/stderr/status for the timed-out host"
+
+    local empty_root="$TMPDIR/fleet-v2-empty-root" empty_data="$TMPDIR/fleet-v2-empty-data"
+    rm -rf "$empty_root" "$empty_data"; mkdir -p "$empty_root/lib" "$empty_data"
+    cp "$ROOT/cctrl" "$empty_root/cctrl"; chmod +x "$empty_root/cctrl"
+    cp "$ROOT/lib/cctrl_fleet_collect.py" "$empty_root/lib/cctrl_fleet_collect.py"
+    PATH="$bin:/usr/bin:/bin" CCTRL_DATA_DIR="$empty_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_HOST_ID_FILE="$empty_data/host-id" CODEX_HOME="$codex" CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" \
+        "$empty_root/cctrl" fleet --json-v2 >/dev/null
+    [[ ! -e "$empty_root/data/hosts.json" ]] || fail "fleet listing initialized host registry identity state"
+    echo "ok: fleet v2 federates provider-neutral tasks with stable host identity and exact legacy fallback"
 }
 
 test_session_say_submit_and_no_submit() {
@@ -7903,6 +8076,15 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        fleet-v2)
+            test_fleet_merges_multiple_hosts
+            test_fleet_sorts_by_recency_across_hosts
+            test_fleet_offline_host_non_fatal
+            test_fleet_version_skew_missing_fields
+            test_fleet_v2_provider_neutral_federation
+            echo "ok"
+            exit 0
+            ;;
         *)
             fail "unknown focused test group: $CCTRL_TEST_ONLY"
             ;;
@@ -7967,6 +8149,7 @@ test_fleet_merges_multiple_hosts
 test_fleet_sorts_by_recency_across_hosts
 test_fleet_offline_host_non_fatal
 test_fleet_version_skew_missing_fields
+test_fleet_v2_provider_neutral_federation
 test_peer_registry_manual_alias_and_identity
 test_peer_derived_tmux_and_shadowing
 test_peer_validation_and_errors

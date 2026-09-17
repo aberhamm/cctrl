@@ -252,6 +252,22 @@ apart from creating the durable local host id on first use. `app-ls` is the
 Codex filtered view (`--all` adds discovery-only and archived provider rows),
 while `session ls` remains the compatibility view for live tmux targets.
 
+`cctrl fleet` federates that same provider-neutral inventory across registered
+hosts. Human output shows owner, runtime, origin, and the safe next action.
+`fleet --json` remains the compatibility top-level array; `fleet --json-v2`
+returns the versioned envelope with per-host schema, capabilities, and inline
+partial/offline markers. A remote falls back to legacy `session ls --json` only
+when it returns the exact old-client `Unknown command: task` signature. Legacy
+rows remain visible with schema version 1 and unknown app ownership; malformed,
+timed-out, or partially unavailable providers never masquerade as legacy data.
+
+Host aliases are routing/display labels, not identity. New `host add`
+registrations receive an immutable local federation id and an initially null
+remote id. Use `cctrl host refresh-identity <alias>` to initialize a legacy
+registration and map the remote host's authoritative id when its task inventory
+supports one; `cctrl host rename <old> <new>` changes the alias without changing
+either id. Fleet listing itself never migrates or rewrites host identity.
+
 ### Codex App Server diagnostics
 
 Before enabling app-owned task flows, inspect the installed runtime and the
@@ -317,6 +333,8 @@ cctrl start -d @myapp --purpose "review auth logs"
 cctrl session ls                  # list sessions (see below)
 cctrl task ls                     # list local tmux + provider tasks and capabilities
 cctrl task ls --json              # normalized, versioned provider-neutral inventory
+cctrl fleet --json                # compatibility array across all registered hosts
+cctrl fleet --json-v2             # versioned task/ownership/capability envelope
 cctrl session app-ls              # Codex tasks registered by cctrl
 cctrl session app-ls --all        # include discovery-only and archived Codex tasks
 cctrl session current --json      # machine-readable identity for the current agent/process

@@ -1,7 +1,10 @@
 ---
 id: 066
 title: Federate provider-neutral tasks across cctrl hosts
-status: in-progress
+status: done
+completed: 2026-09-17
+reviewed: false
+qa: automated
 blocked-by: [064]
 priority: 66
 goal: codex-task-ownership-surfaces
@@ -12,6 +15,7 @@ created: 2026-09-15
 tui-fixture: n/a  # fleet reads structured task/session JSON and never parses terminal panes
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-17 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -101,3 +105,17 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented provider-neutral cross-host fleet aggregation with versioned envelopes, exact legacy fallback, durable federation identities, bounded four-worker SSH collection, timeout cleanup, and compatibility JSON. Added mixed-version, failure, collision, alias migration, large-payload, identity-conflict, and live-store-isolation coverage. The bounded Python collector replaces the older sequential `_fleet_remote_sessions` and `_fleet_tag` design seams.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `docs/plans/066-cross-host-task-fleet.md` (modified)
+- `tests/run-tests.sh` (modified)
+- `lib/cctrl_fleet_collect.py` (created)
+
+**Commit:** `8f299fa` — `feat(cctrl): federate provider-neutral task fleet`

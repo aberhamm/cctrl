@@ -11,7 +11,7 @@ PLUGINS_DIR="$SCRIPT_DIR/plugins"
 COSTS_DIR="$SCRIPT_DIR/costs"
 SPENDING_LOG="$COSTS_DIR/spending.jsonl"
 SHORTCUTS_FILE="$SCRIPT_DIR/data/shortcuts.json"
-HOSTS_FILE="$SCRIPT_DIR/data/hosts.json"
+HOSTS_FILE="${CCTRL_HOSTS_FILE:-$SCRIPT_DIR/data/hosts.json}"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
 CONFIG_USER_FILE="${CCTRL_USER_CONFIG:-}"
 if [[ -z "$CONFIG_USER_FILE" && -n "${HOME:-}" ]]; then
@@ -12981,12 +12981,14 @@ cmd_help() {
     echo -e "${BOLD}Remote Hosts${RESET}"
     echo "  cctrl whoami                          Show this machine + which aliases mean 'local'"
     echo "  cctrl host add <alias> <host> [user]  Register a host (use this machine's name = local)"
-    echo "  cctrl host list                       List registered hosts (marks local)"
+    echo "  cctrl host list                       List registered hosts and durable identities"
+    echo "  cctrl host rename <old> <new>         Change only the routing/display alias"
+    echo "  cctrl host refresh-identity <alias>   Initialize/map a legacy host identity"
     echo "  cctrl host rm <alias>                 Remove a host"
     echo "  cctrl host doctor <alias>             Check SSH, tmux, selected agent, cctrl on remote"
     echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
     echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
-    echo "  cctrl fleet [--json]                   Aggregate sessions across local + all hosts, by recency"
+    echo "  cctrl fleet [--json|--json-v2]         Aggregate provider-neutral tasks across all hosts"
     echo "  cctrl needs-me [--json]                Digest of sessions that NEWLY need you since last run"
     echo ""
     echo -e "${BOLD}Chrome CDP${RESET}"
@@ -13808,7 +13810,36 @@ cmd_chrome() {
 
 _hosts_init() {
     mkdir -p "$(dirname "$HOSTS_FILE")"
-    [[ -f "$HOSTS_FILE" ]] || echo "{}" > "$HOSTS_FILE"
+    if [[ ! -f "$HOSTS_FILE" ]]; then
+        local tmp
+        tmp="$(mktemp "$(dirname "$HOSTS_FILE")/.hosts.XXXXXX")" || return 1
+        chmod 600 "$tmp" 2>/dev/null || true
+        printf '{}\n' > "$tmp" && mv -f "$tmp" "$HOSTS_FILE"
+    fi
+}
+
+_hosts_atomic_filter() {
+    # Usage: _hosts_atomic_filter <jq-filter> [jq args...].  A same-directory
+    # private temp plus atomic rename prevents readers from seeing half a host
+    # registration and carries the safe mode onto first creation.
+    local filter="$1"; shift
+    _hosts_init || return 1
+    local tmp
+    tmp="$(mktemp "$(dirname "$HOSTS_FILE")/.hosts.XXXXXX")" || return 1
+    chmod 600 "$tmp" 2>/dev/null || true
+    if jq "$@" "$filter" "$HOSTS_FILE" > "$tmp"; then
+        mv -f "$tmp" "$HOSTS_FILE"
+    else
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+_host_federation_id() {
+    python3 - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
 }
 
 _local_names() {
@@ -14048,26 +14079,6 @@ _remote_exec() {
 # Read-only: aggregates `session ls --json` across local + registered hosts.
 # Cross-host prune/repair stays out of scope (prune/doctor remain per-host).
 
-_fleet_remote_sessions() {
-    # Capture `cctrl session ls --json` from a remote host over SSH and echo the
-    # remote JSON array on stdout. Non-zero exit => host is unreachable. This is
-    # a dedicated, non-exec path (distinct from _remote_exec, which replaces the
-    # process) so fleet can collect output; the interactive --host path is
-    # unchanged. The remote invocation itself is what tests stub (fake `ssh`).
-    local host_alias="$1" lookup hostname user ssh_target
-    lookup="$(_host_lookup "$host_alias")"
-    [[ -z "$lookup" ]] && return 1
-    hostname="${lookup%% *}"
-    user="${lookup#* }"
-    if [[ -n "$user" ]]; then
-        ssh_target="${user}@${hostname}"
-    else
-        ssh_target="$hostname"
-    fi
-    ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
-        "source ~/.zprofile 2>/dev/null; cctrl session ls --json" 2>/dev/null
-}
-
 _fleet_remote_peers() {
     local host_alias="$1" lookup hostname user ssh_target
     lookup="$(_host_lookup "$host_alias")"
@@ -14079,103 +14090,91 @@ _fleet_remote_peers() {
         "source ~/.zprofile 2>/dev/null; cctrl peer ls --json" 2>/dev/null
 }
 
-_fleet_tag() {
-    # Tag every session object in a JSON array with its host and default the
-    # recency/state fields. `// null` keeps a remote running an OLDER cctrl
-    # (whose `session ls --json` lacks last_active/state) from crashing the
-    # merge or the sort — those cells simply become null (rendered '-').
-    # Echoes '[]' for anything that isn't a JSON array.
-    local raw="$1" label="$2"
-    printf '%s' "$raw" | jq -c --arg host "$label" \
-        'if type == "array" then map(. + {host: $host, last_active: (.last_active // null), state: (.state // null)}) else [] end' \
-        2>/dev/null || echo '[]'
+_fleet_task_rows_json() {
+    local fleet_file="$1"
+    jq '.rows' "$fleet_file"
 }
 
-cmd_fleet() {
-    # Aggregate `session ls` across local + every registered host into one
-    # host-labeled view, sorted by last-active (most recent first). An
-    # unreachable host is reported inline (offline marker) without failing the
-    # whole command (overall exit stays 0).
-    local json=false a
+cmd_fleet() (
+    # Snapshot local task inventory once, collect every remote under bounded
+    # process deadlines, then file-feed the transport envelopes into one v2
+    # normalizer. Listing never mutates host identity or provider state.
+    local json=false json_v2=false a
     for a in "$@"; do
         case "$a" in
             --json) json=true ;;
+            --json-v2) json_v2=true ;;
             -h|--help|help)
-                echo "Usage: cctrl fleet [--json]"
+                echo "Usage: cctrl fleet [--json|--json-v2]"
                 echo ""
-                echo "  Aggregate 'cctrl session ls' across local + every host in data/hosts.json,"
-                echo "  label each row with its host, and sort by last-active (most recent first)."
-                echo "  Unreachable hosts are marked 'offline' without failing the command;"
-                echo "  a host on an older cctrl (missing last-active/state) renders those as '-'."
+                echo "  Aggregate provider-neutral task inventory across local + registered hosts."
+                echo "  --json keeps the compatibility top-level array; --json-v2 emits the"
+                echo "  versioned fleet envelope, task ownership, host capabilities, and failures."
+                echo "  Older hosts fall back only on the exact unsupported 'task' response."
                 return 0
                 ;;
+            *) echo -e "${RED}Unknown fleet flag: $a${RESET}" >&2; return 64 ;;
         esac
     done
+    if $json && $json_v2; then
+        echo -e "${RED}Choose only one of --json or --json-v2.${RESET}" >&2
+        return 64
+    fi
 
-    local -a arrays=() offline=()
-    local host_json rc alias hostname
-
-    # Local host: query in-process (reuses local tmux inspection).
-    host_json="$(_session_list --json 2>/dev/null)" || host_json="[]"
-    [[ -n "$host_json" ]] || host_json="[]"
-    arrays+=("$(_fleet_tag "$host_json" "local")")
-
-    # Registered hosts, skipping any alias that resolves to THIS machine (it is
-    # already represented by the local entry above).
+    local scratch local_rc=0 collector_rc=0
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-fleet.XXXXXX")" || return 70
+    trap 'rm -rf "$scratch"' EXIT
+    _local_names > "$scratch/local-names"
     if [[ -f "$HOSTS_FILE" ]]; then
-        while IFS=$'\t' read -r alias hostname; do
-            [[ -n "$alias" ]] || continue
-            _host_is_local "$hostname" && continue
-            # `|| rc=$?` keeps `set -e` from aborting when a host is offline;
-            # a non-zero ssh exit is exactly how we detect unreachable.
-            rc=0
-            host_json="$(_fleet_remote_sessions "$alias")" || rc=$?
-            if [[ $rc -eq 0 && -n "$host_json" ]] \
-                && printf '%s' "$host_json" | jq -e 'type == "array"' >/dev/null 2>&1; then
-                arrays+=("$(_fleet_tag "$host_json" "$alias")")
-            else
-                offline+=("$alias")
-            fi
-        done < <(jq -r 'to_entries[] | "\(.key)\t\(.value.hostname)"' "$HOSTS_FILE" 2>/dev/null)
+        jq --rawfile local "$scratch/local-names" '
+            ($local | split("\n") | map(select(length>0) | ascii_downcase | rtrimstr(".local"))) as $locals
+            | with_entries(select((.value.hostname // "" | ascii_downcase | rtrimstr(".local")) as $h | ($locals | index($h)) == null))
+        ' "$HOSTS_FILE" > "$scratch/remote-hosts.json" || return 70
+    else
+        printf '{}\n' > "$scratch/remote-hosts.json"
     fi
 
-    # Merge tagged arrays; sort sessions by last_active desc (nulls last), then
-    # append one offline marker object per unreachable host.
-    local sessions_sorted offline_json merged
-    sessions_sorted="$(printf '%s\n' "${arrays[@]}" | jq -s '
-        (add // [])
-        | sort_by(if (.last_active | type) == "string" then .last_active else "" end)
-        | reverse')"
-    offline_json="[]"
-    if [[ ${#offline[@]} -gt 0 ]]; then
-        offline_json="$(printf '%s\n' "${offline[@]}" | jq -R . | jq -s 'map({host: ., offline: true})')"
-    fi
-    merged="$(jq -n --argjson sessions "$sessions_sorted" --argjson offline "$offline_json" '$sessions + $offline')"
+    _task_list_json > "$scratch/local-task.json" || local_rc=$?
+    [[ -s "$scratch/local-task.json" ]] || printf '{}\n' > "$scratch/local-task.json"
 
+    # Guard the helper explicitly: set -e must never make an offline host abort
+    # healthy local/remote rows before structured markers can be emitted.
+    python3 "$SCRIPT_DIR/lib/cctrl_fleet_collect.py" collect \
+        --hosts-file "$scratch/remote-hosts.json" --output-dir "$scratch/results" \
+        --workers 4 --timeout 10 > "$scratch/result-paths" || collector_rc=$?
+    if (( collector_rc != 0 )); then
+        echo -e "${RED}Fleet collector failed before it could produce bounded host results.${RESET}" >&2
+        return 70
+    fi
+    python3 "$SCRIPT_DIR/lib/cctrl_fleet_collect.py" merge --local-file "$scratch/local-task.json" \
+        < "$scratch/result-paths" > "$scratch/fleet-v2.json" || {
+            return 70
+        }
+
+    if $json_v2; then
+        cat "$scratch/fleet-v2.json"
+        return 0
+    fi
     if $json; then
-        printf '%s\n' "$merged"
+        _fleet_task_rows_json "$scratch/fleet-v2.json"
         return 0
     fi
 
-    # At-a-glance local health so the operator can spot memory/load pressure
-    # before spawning more sessions (companion to the start guardrail).
     echo -e "${DIM}local: $(_res_health_line)${RESET}"
-    printf '%-8s %-16s %-14s %-7s %-8s %s\n' HOST NAME STATE ATTACH LAST DIR
-    local h n st at la dir epoch disp_dir
-    while IFS=$'\t' read -r h n st at la dir; do
-        if [[ "$la" != "-" ]]; then
-            epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$la" +%s 2>/dev/null || true)"
-            [[ -n "$epoch" ]] && la="$(_fmt_age_ms "$(( epoch * 1000 ))")"
+    printf '%-10s %-18s %-10s %-12s %-12s %-12s %-11s %s\n' HOST TASK OWNER RUNTIME ORIGIN STATE ACTION DIR
+    local h n owner runtime origin st action dir marker disp_dir
+    while IFS=$'\t' read -r h n owner runtime origin st action dir marker; do
+        if [[ "$marker" == "true" ]]; then
+            printf '%-10s %-18s %-10s %-12s %-12s %-12s %-11s %s\n' "$h" "-" "unknown" "unknown" "unknown" "$st" "none" "-"
+            continue
         fi
         disp_dir="${dir/#$HOME/~}"
-        printf '%-8s %-16s %-14s %-7s %-8s %s\n' "$h" "$n" "$st" "$at" "$la" "$disp_dir"
-    done < <(printf '%s' "$merged" | jq -r '.[] |
-        if .offline == true then
-            [ .host, "-", "offline", "-", "-", "-" ]
-        else
-            [ .host, (.name // "-"), (.state // "-"), (if .attached then "yes" else "no" end), (.last_active // "-"), (.dir // "-") ]
-        end | @tsv')
-}
+        printf '%-10s %-18s %-10s %-12s %-12s %-12s %-11s %s\n' "$h" "$n" "$owner" "$runtime" "$origin" "$st" "$action" "$disp_dir"
+    done < <(jq -r '.rows[] | [(.host // "-"),(.display_label // .name // .session_id // "-"),(.control_owner // "unknown"),(.execution_runtime // "unknown"),(.origin // "unknown"),(if .offline == true then "offline" else (.lifecycle_state // .state // .remote_status // "unknown") end),(if (.action_hint // "none") == "none" then "-" else .action_hint end),(.dir // "-"),(.host_marker // false)] | @tsv' "$scratch/fleet-v2.json")
+    if [[ "$local_rc" -ne 0 ]]; then
+        echo -e "${YELLOW}Local inventory was partial or unavailable; healthy fleet rows are still shown.${RESET}" >&2
+    fi
+)
 
 # Attention-state set for the needs-me digest (plan 022): states in which a
 # session is waiting on the human. Rich-state (plan 016) has no distinct
@@ -14337,12 +14336,18 @@ cmd_host() {
                 return 1
             fi
             _hosts_init
-            local tmp
-            tmp=$(mktemp)
-            jq --arg name "$name" --arg hostname "$hostname" --arg user "$user" \
-                '. + {($name): {hostname: $hostname, user: $user}}' \
-                "$HOSTS_FILE" > "$tmp" && mv "$tmp" "$HOSTS_FILE"
+            if jq -e --arg name "$name" 'has($name)' "$HOSTS_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}Host '$name' already exists; use 'cctrl host rename' to change its alias.${RESET}" >&2
+                return 1
+            fi
+            local federation_host_id
+            federation_host_id="$(_host_federation_id)" || return 1
+            _hosts_atomic_filter \
+                '. + {($name): {hostname: $hostname, user: $user, federation_host_id: $federation_host_id, remote_host_id: null}}' \
+                --arg name "$name" --arg hostname "$hostname" --arg user "$user" --arg federation_host_id "$federation_host_id" \
+                || return 1
             echo -e "${GREEN}Added host: ${BOLD}$name${RESET}${GREEN} → $hostname${RESET}"
+            echo -e "${DIM}  federation_host_id=$federation_host_id (remote id not mapped yet)${RESET}"
             [[ -n "$user" ]] && echo -e "${DIM}  user=$user${RESET}" || true
             ;;
         list|ls)
@@ -14352,8 +14357,8 @@ cmd_host() {
                 return
             fi
             echo -e "${BOLD}Registered Hosts${RESET}"
-            local _name _hostname _user
-            while IFS= read -r _name && IFS= read -r _hostname && IFS= read -r _user; do
+            local _name _hostname _user _federation_id _remote_id
+            while IFS= read -r _name && IFS= read -r _hostname && IFS= read -r _user && IFS= read -r _federation_id && IFS= read -r _remote_id; do
                 local label="$_hostname"
                 [[ -n "$_user" ]] && label="${_user}@${_hostname}"
                 if _host_is_local "$_hostname"; then
@@ -14361,8 +14366,83 @@ cmd_host() {
                 else
                     echo -e "  ${GREEN}$_name${RESET}  ${DIM}→${RESET}  $label"
                 fi
-            done < <(jq -r 'to_entries[] | .key, .value.hostname, (.value.user // "")' "$HOSTS_FILE" 2>/dev/null)
+                if [[ -n "$_federation_id" ]]; then
+                    echo -e "    ${DIM}federation=$_federation_id remote=${_remote_id:-unmapped}${RESET}"
+                else
+                    echo -e "    ${YELLOW}identity-uninitialized${RESET} ${DIM}(run: cctrl host refresh-identity $_name)${RESET}"
+                fi
+            done < <(jq -r 'to_entries[] | .key, .value.hostname, (.value.user // ""), (.value.federation_host_id // ""), (.value.remote_host_id // "")' "$HOSTS_FILE" 2>/dev/null)
             echo -e "  ${DIM}local, self${RESET}  ${DIM}→  this machine (built-in)${RESET}"
+            ;;
+        rename)
+            local old="${1:-}" new="${2:-}"
+            if [[ -z "$old" || -z "$new" ]]; then
+                echo -e "${RED}Usage: cctrl host rename <old-alias> <new-alias>${RESET}" >&2
+                return 1
+            fi
+            _hosts_init
+            if ! jq -e --arg old "$old" 'has($old)' "$HOSTS_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}Host '$old' not found.${RESET}" >&2
+                return 1
+            fi
+            if jq -e --arg new "$new" 'has($new)' "$HOSTS_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}Host '$new' already exists.${RESET}" >&2
+                return 1
+            fi
+            _hosts_atomic_filter '. as $root | $root + {($new): $root[$old]} | del(.[$old])' --arg old "$old" --arg new "$new" || return 1
+            echo -e "${GREEN}Renamed host: $old → $new${RESET}"
+            ;;
+        refresh-identity)
+          (
+            local name="${1:-}"
+            if [[ -z "$name" ]]; then
+                echo -e "${RED}Usage: cctrl host refresh-identity <alias>${RESET}" >&2
+                return 1
+            fi
+            _hosts_init
+            if ! jq -e --arg name "$name" 'has($name)' "$HOSTS_FILE" >/dev/null 2>&1; then
+                echo -e "${RED}Host '$name' not found.${RESET}" >&2
+                return 1
+            fi
+            local scratch one_hosts result_path result status observed federation
+            scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-host-identity.XXXXXX")" || return 1
+            trap 'rm -rf "$scratch"' EXIT
+            one_hosts="$scratch/hosts.json"
+            jq --arg name "$name" '{($name): .[$name]}' "$HOSTS_FILE" > "$one_hosts"
+            if ! python3 "$SCRIPT_DIR/lib/cctrl_fleet_collect.py" collect \
+                --hosts-file "$one_hosts" --output-dir "$scratch/results" --workers 1 --timeout 10 \
+                > "$scratch/paths"; then
+                rm -rf "$scratch"
+                echo -e "${RED}Could not refresh identity for '$name'.${RESET}" >&2
+                return 1
+            fi
+            result_path="$(head -1 "$scratch/paths")"
+            result="$(cat "$result_path" 2>/dev/null || true)"
+            status="$(jq -r '.status // "unavailable"' <<< "$result" 2>/dev/null || echo unavailable)"
+            case "$status" in
+                ok|partial|legacy) ;;
+                *)
+                    rm -rf "$scratch"
+                    echo -e "${RED}Could not refresh identity for '$name' (status: $status).${RESET}" >&2
+                    return 1 ;;
+            esac
+            observed="$(jq -r '.capabilities.observed_remote_host_id // empty' <<< "$result")"
+            federation="$(jq -r --arg name "$name" '.[$name].federation_host_id // empty' "$HOSTS_FILE")"
+            local registered_remote
+            registered_remote="$(jq -r --arg name "$name" '.[$name].remote_host_id // empty' "$HOSTS_FILE")"
+            if [[ -n "$registered_remote" && -n "$observed" && "$registered_remote" != "$observed" ]]; then
+                rm -rf "$scratch"
+                echo -e "${RED}Refusing to replace remote host identity for '$name' ($registered_remote != $observed).${RESET}" >&2
+                return 1
+            fi
+            [[ -n "$federation" ]] || federation="$(_host_federation_id)"
+            _hosts_atomic_filter \
+                '.[$name].federation_host_id = $federation | .[$name].remote_host_id = (if $observed == "" then null else $observed end)' \
+                --arg name "$name" --arg federation "$federation" --arg observed "$observed" || { rm -rf "$scratch"; return 1; }
+            rm -rf "$scratch"
+            echo -e "${GREEN}Refreshed host identity: $name${RESET}"
+            echo -e "${DIM}  federation_host_id=$federation remote_host_id=${observed:-unmapped (legacy host)}${RESET}"
+          )
             ;;
         rm|remove|delete)
             local name="${1:-}"
@@ -14374,9 +14454,7 @@ cmd_host() {
                 echo -e "${RED}Host '$name' not found.${RESET}"
                 return 1
             fi
-            local tmp
-            tmp=$(mktemp)
-            jq --arg n "$name" 'del(.[$n])' "$HOSTS_FILE" > "$tmp" && mv "$tmp" "$HOSTS_FILE"
+            _hosts_atomic_filter 'del(.[$n])' --arg n "$name" || return 1
             echo -e "${GREEN}Removed host: $name${RESET}"
             ;;
         doctor)
@@ -14585,6 +14663,8 @@ cmd_host() {
             echo ""
             echo "  cctrl host add <alias> <hostname> [user]"
             echo "  cctrl host list"
+            echo "  cctrl host rename <old-alias> <new-alias>"
+            echo "  cctrl host refresh-identity <alias>"
             echo "  cctrl host rm <alias>"
             echo "  cctrl host doctor <alias> [--agent claude|codex]"
             echo ""
@@ -14593,7 +14673,7 @@ cmd_host() {
             ;;
         *)
             echo -e "${RED}Unknown host subcommand: $action${RESET}"
-            echo "Available: add, list, rm, doctor, help"
+            echo "Available: add, list, rename, refresh-identity, rm, doctor, help"
             return 1
             ;;
     esac
