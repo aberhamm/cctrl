@@ -4207,6 +4207,15 @@ test_session_stop_exact_identity() (
     local real_tmux socket bin out rows old_id fresh_id server_id rc=0
     local concurrent_dir concurrent_file pid n
     local -a concurrent_pids=()
+    assert_stop_exact_error() {
+        local expected_rc="$1" expected_status="$2" description="$3" case_out case_rc=0
+        shift 3
+        case_out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact "$@" --json)" || case_rc=$?
+        if [[ "$case_rc" -ne "$expected_rc" ]] \
+            || ! jq -e --arg status "$expected_status" '.ok==false and .status==$status' <<< "$case_out" >/dev/null; then
+            fail "$description did not fail closed: rc=$case_rc out=$case_out"
+        fi
+    }
     real_tmux="$(command -v tmux)"
     [[ -x "$real_tmux" ]] || fail "tmux is required for exact-stop integration coverage"
     socket="cctrl-exact-stop-$$-$RANDOM"
@@ -4292,25 +4301,20 @@ SH
 
     # Missing, malformed, unsupported, and name-mismatched identities fail
     # closed. Neither the target nor an unrelated session is touched.
-    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --json)" || rc=$?
-    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="missing-identity"' <<< "$out" >/dev/null; then
-        fail "missing identity did not fail closed: rc=$rc out=$out"
-    fi
-    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id --json)" || rc=$?
-    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="missing-identity"' <<< "$out" >/dev/null; then
-        fail "valueless identity did not fail closed as JSON: rc=$rc out=$out"
-    fi
-    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id nonsense --json)" || rc=$?
-    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="malformed-identity"' <<< "$out" >/dev/null; then
-        fail "malformed identity did not fail closed: rc=$rc out=$out"
-    fi
-    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id 'tmux-v2:future' --json)" || rc=$?
-    if [[ "$rc" -ne 64 ]] || ! jq -e '.status=="unsupported-identity"' <<< "$out" >/dev/null; then
-        fail "unsupported identity did not fail closed: rc=$rc out=$out"
-    fi
-    rc=0; out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact bystander --execution-id "$fresh_id" --json)" || rc=$?
-    if [[ "$rc" -ne 75 ]] || ! jq -e '.status=="mismatched-identity"' <<< "$out" >/dev/null; then
-        fail "mismatched identity did not fail closed: rc=$rc out=$out"
+    assert_stop_exact_error 64 missing-name "missing name" --execution-id "$fresh_id"
+    assert_stop_exact_error 64 missing-identity "missing identity" reused
+    assert_stop_exact_error 64 missing-identity "valueless identity" reused --execution-id
+    assert_stop_exact_error 64 malformed-identity "malformed identity" reused --execution-id nonsense
+    assert_stop_exact_error 64 malformed-identity "malformed tmux identity" reused --execution-id tmux-v1:bad
+    assert_stop_exact_error 64 unsupported-identity "unsupported identity" reused --execution-id tmux-v2:future
+    assert_stop_exact_error 64 invalid-input "unknown flag" reused --bogus --execution-id "$fresh_id"
+    assert_stop_exact_error 64 invalid-input "multiple names" reused bystander --execution-id "$fresh_id"
+    assert_stop_exact_error 75 mismatched-identity "mismatched identity" bystander --execution-id "$fresh_id"
+
+    rc=0
+    out="$(cctrl_source_eval '_session_require_tmux(){ return 1; }; _session_stop_exact reused --execution-id "$1" --json' "$fresh_id")" || rc=$?
+    if [[ "$rc" -ne 1 ]] || ! jq -e '.ok==false and .status=="tmux-unavailable"' <<< "$out" >/dev/null; then
+        fail "tmux-unavailable error did not preserve the JSON contract: rc=$rc out=$out"
     fi
     "$real_tmux" -L "$socket" has-session -t '=reused' || fail "invalid identity stopped its target"
     "$real_tmux" -L "$socket" has-session -t '=bystander' || fail "invalid identity stopped a bystander"

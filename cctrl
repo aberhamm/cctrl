@@ -1667,6 +1667,18 @@ _cctrl_host_id_read() {
     printf '%s' "$value"
 }
 
+_random_hex_128() {
+    local value=""
+    if command -v openssl >/dev/null 2>&1; then
+        value="$(openssl rand -hex 16 2>/dev/null || true)"
+    fi
+    if ! [[ "$value" =~ ^[0-9a-f]{32}$ ]]; then
+        value="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-32 || true)"
+    fi
+    [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s' "$value"
+}
+
 _cctrl_host_id() {
     # Create-once machine identity. A hard-link publish gives concurrent
     # creators an exclusive winner without ever replacing an existing file.
@@ -1677,14 +1689,7 @@ _cctrl_host_id() {
     fi
     dir="$(dirname "$file")"
     mkdir -p "$dir" || return 1
-    candidate=""
-    if command -v openssl >/dev/null 2>&1; then
-        candidate="$(openssl rand -hex 16 2>/dev/null || true)"
-    fi
-    if ! [[ "$candidate" =~ ^[0-9a-f]{32}$ ]]; then
-        candidate="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-32 || true)"
-    fi
-    [[ "$candidate" =~ ^[0-9a-f]{32}$ ]] || return 1
+    candidate="$(_random_hex_128)" || return 1
     tmp="$(mktemp "$dir/.host-id.XXXXXX")" || return 1
     chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     printf '%s\n' "$candidate" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -11479,18 +11484,6 @@ _session_attach() {
     fi
 }
 
-_session_random_identity_component() {
-    local value=""
-    if command -v openssl >/dev/null 2>&1; then
-        value="$(openssl rand -hex 16 2>/dev/null || true)"
-    fi
-    if ! [[ "$value" =~ ^[0-9a-f]{32}$ ]]; then
-        value="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-32 || true)"
-    fi
-    [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
-    printf '%s' "$value"
-}
-
 _session_execution_server_id_ensure() {
     # The check-and-set runs inside tmux's serialized command queue. Concurrent
     # listers cannot overwrite the winner. The public identity also includes
@@ -11498,11 +11491,10 @@ _session_execution_server_id_ensure() {
     local value candidate
     value="$(tmux show-options -sqv @cctrl_server_instance_id 2>/dev/null || true)"
     if [[ -z "$value" ]]; then
-        candidate="$(_session_random_identity_component)" || return 1
-        tmux if-shell -F '#{@cctrl_server_instance_id}' \
-            'display-message' \
-            "set-option -s @cctrl_server_instance_id $candidate" \
-            >/dev/null 2>&1 || return 1
+        candidate="$(_random_hex_128)" || return 1
+        # -o is tmux's atomic first-writer-wins option. A concurrent loser is
+        # expected to fail here, then read and validate the winner below.
+        tmux set-option -so @cctrl_server_instance_id "$candidate" >/dev/null 2>&1 || true
         value="$(tmux show-options -sqv @cctrl_server_instance_id 2>/dev/null || true)"
     fi
     [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
@@ -11527,11 +11519,15 @@ _session_stop_exact_error() {
 }
 
 _session_stop_exact() {
-    _session_require_tmux || return 1
-    local name="" execution_id="" json=false arg
+    local name="" execution_id="" json=false
     # Select the output contract before validating any other argument so a
     # malformed invocation still returns JSON regardless of flag order.
-    for arg in "$@"; do [[ "$arg" == "--json" ]] && json=true; done
+    _arg_has_json "$@" && json=true
+    if ! _session_require_tmux 2>/dev/null; then
+        _session_stop_exact_error "$json" tmux-unavailable "" "" \
+            "tmux not found. Install with: brew install tmux" 1
+        return $?
+    fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --execution-id)
@@ -12719,7 +12715,9 @@ cmd_help() {
     echo "                              no name = the session you're inside, killed after"
     echo "                              a short grace period (--in N, --now, --force);"
     echo "                              Codex close also archives its app task"
-    echo "  cctrl session kill <name>   Kill a detached session immediately"
+    echo "  cctrl session kill <name>   Kill by mutable name (legacy/manual)"
+    echo "  cctrl session stop-exact <name> --execution-id ID [--json]"
+    echo "                              Stop only the execution returned by session ls --json"
     echo ""
     echo -e "${BOLD}Peers${RESET}"
     echo "  cctrl peer overview [--as NAME]     Start here: identity + reachable peers + unread mail"

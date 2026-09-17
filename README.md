@@ -366,7 +366,7 @@ cctrl session app-ls --all        # include discovery-only and archived Codex ta
 cctrl session current --json      # machine-readable identity for the current agent/process
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
 cctrl session close TMUX--myapp   # gracefully close a session
-cctrl session kill TMUX--myapp    # kill a session immediately
+cctrl session kill TMUX--myapp    # legacy/manual: kill by mutable name
 ```
 
 #### Letting the agent close its own session
@@ -470,7 +470,7 @@ needs to terminate the currently listed tmux process must instead carry the
 opaque `execution_id` from that same row into `stop-exact`:
 
 ```bash
-row='{"name":"TMUX--api","execution_id":"tmux-v1:7b4d1234567890abcdef1234567890ab:9123:1789644000:$12"}'
+row="$(cctrl session ls --json | jq -c '.[] | select(.name=="TMUX--api")')"
 name="$(jq -r .name <<< "$row")"
 execution_id="$(jq -r .execution_id <<< "$row")"
 cctrl session stop-exact "$name" --execution-id "$execution_id" --json
@@ -653,11 +653,12 @@ of these keys requires a separately reviewed future schema version.
 Records without `schema_version` remain immutable legacy inputs. Reads normalize
 them in memory and prefer an existing canonical v2 record. An explicit mutation
 promotes only a record with a stable provider id; the legacy file is left
-untouched. `session ls` and `session doctor` are intentionally read-only and no
-longer backfill metadata as a side effect. Identity-dependent operations such as
-archive, app release, and Codex title updates refuse records without stable
-provider identity, while an identity-independent tmux close still completes and
-reports that provider metadata was not updated.
+untouched. `session ls` and `session doctor` no longer backfill task metadata as
+a side effect. JSON session listing may lazily establish an in-memory tmux server
+guard used only for exact execution identities. Identity-dependent operations
+such as archive, app release, and Codex title updates refuse records without
+stable provider identity, while an identity-independent tmux close still
+completes and reports that provider metadata was not updated.
 
 `conversation_id` remains the compatibility name for `provider_task_id`
 (Claude's `sessionId` / transcript UUID). Records whose provider identity has
