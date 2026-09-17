@@ -4583,8 +4583,10 @@ PY
 }
 
 test_session_release_to_app_quarantines_stale_codex_lock() {
-    # A dead tmux-backed Codex record with a leftover writer lock can be released
-    # to the app by moving the stale lock aside, preserving the metadata record.
+    # Legacy metadata without a pane/PID/start receipt is not sufficient to
+    # authorize a handoff. The strict state machine must reject it before
+    # touching the writer lock; the anchored success case is covered by the
+    # codex-handoff fixture below.
     local bin="$TMPDIR/release-bin" meta="$TMPDIR/release-meta" codex_home="$TMPDIR/release-codex" backup="$TMPDIR/release-backup"
     mkdir -p "$bin" "$meta" "$codex_home/thread-writer-locks" "$backup"
     make_fake_tmux "$bin/tmux"
@@ -4602,22 +4604,18 @@ con.commit()
 PY
     : > "$codex_home/thread-writer-locks/thread-release-1.lock"
 
-    local out control released lock_path
+    local out control rc=0
     out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" CODEX_HOME="$codex_home" \
-        CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" "$ROOT/cctrl" session release-to-app TMUX--release --yes --json)"
-    assert_contains "$out" '"status": "released"'
-    assert_contains "$out" '"lock_action": "quarantined"'
-    [[ ! -e "$codex_home/thread-writer-locks/thread-release-1.lock" ]] || fail "stale lock was not removed from live lock dir"
-    lock_path="$backup/thread-release-1.lock"
-    [[ -e "$lock_path" ]] || fail "stale lock was not quarantined to $lock_path"
+        CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" "$ROOT/cctrl" session release-to-app TMUX--release --yes --json)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "unanchored legacy release unexpectedly succeeded"
+    assert_contains "$out" '"error": "non-transferable-state"'
+    [[ -e "$codex_home/thread-writer-locks/thread-release-1.lock" ]] || fail "rejected release touched the writer lock"
     control="$(session_record_json "TMUX--release" "$meta" | jq -r '.control_surface')"
-    released="$(session_record_json "TMUX--release" "$meta" | jq -r '.released_at // empty')"
-    [[ "$control" == "unknown" ]] || fail "release incorrectly claimed app ownership: $control"
-    [[ "$(session_record_json "TMUX--release" "$meta" | jq -r '.control_owner')" == "unknown" ]] || fail "release owner should remain unknown"
-    [[ -n "$released" ]] || fail "metadata released_at not set"
+    [[ "$control" == "null" ]] || fail "rejected release changed control surface: $control"
+    [[ "$(session_record_json "TMUX--release" "$meta" | jq -r '.control_owner')" == "null" ]] || fail "rejected release changed owner"
     [[ "$(sqlite3 "$codex_home/state_5.sqlite" "SELECT archived FROM threads WHERE id='thread-release-1'")" == "0" ]] \
         || fail "release-to-app archived the Codex task"
-    echo "ok: release-to-app quarantines stale Codex writer lock"
+    echo "ok: release-to-app rejects unanchored legacy ownership before lock repair"
 }
 
 test_session_prune_dry_run_closes_nothing() {
@@ -7992,6 +7990,9 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
         app-owned-launch)
             # Defined in the later Codex App Server section; dispatched there.
             ;;
+        codex-handoff)
+            # Defined after the Codex App Server fixtures; dispatched there.
+            ;;
         session-attest)
             test_session_attest_live_tmux_process_matches
             test_session_attest_direct_metadata
@@ -8091,7 +8092,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
-if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" ]]; then
+if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" ]]; then
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -9561,6 +9562,236 @@ SH
     echo "ok: app-owned launch is at-most-once, writer-free, recoverable, and settings-safe"
 }
 
+test_codex_handoff_state_machine() {
+    local root="$TMPDIR/codex-handoff" bin="$TMPDIR/codex-handoff/bin" data="$TMPDIR/codex-handoff/data"
+    local meta="$TMPDIR/codex-handoff/meta" codex_home="$TMPDIR/codex-handoff/codex" backup="$TMPDIR/codex-handoff/backup"
+    local app="$TMPDIR/codex-handoff/app.json" app_missing="$TMPDIR/codex-handoff/app-missing.json"
+    local app_archived="$TMPDIR/codex-handoff/app-archived.json" app_unavailable="$TMPDIR/codex-handoff/app-unavailable.json"
+    local app_conflict="$TMPDIR/codex-handoff/app-conflict.json" tmux_snapshot="$TMPDIR/codex-handoff/tmux.json"
+    local proc_snapshot="$TMPDIR/codex-handoff/process.json" tmux_absent="$TMPDIR/codex-handoff/tmux-absent.json"
+    local proc_absent="$TMPDIR/codex-handoff/process-absent.json" state="$TMPDIR/codex-handoff/tmux-live" proc="$TMPDIR/codex-handoff/process-live"
+    local host="77777777777777777777777777777777" started="Wed Sep 17 10:00:00 2026" out rc=0 record before after
+    handoff_tree_digest() {
+        find "$1" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}'
+    }
+    rm -rf "$root"; mkdir -p "$bin" "$data" "$meta" "$codex_home/thread-writer-locks" "$backup"
+    printf '%s\n' "$host" > "$data/host-id"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+state="${FAKE_HANDOFF_TMUX_STATE:?}"; proc="${FAKE_HANDOFF_PROCESS_STATE:?}"
+case "${1:-}" in
+  has-session) [[ -e "$state" ]] ;;
+  display-message) [[ -e "$state" ]] && cat "$state" ;;
+  list-panes) printf '%%1:4100\n' ;;
+  list-sessions) [[ -e "$state" ]] && printf 'TMUX--handoff\n' ;;
+  run-shell)
+    command="$2"; output="${command#*> }"; output="${output% 2>/dev/null}"
+    if [[ "$command" == *'ps -ax -o pid='* ]]; then
+      printf '4100 1 session-wrapper.sh\n4200 4100 codex\n' > "$output"
+    elif [[ -e "$proc" ]]; then
+      printf 'Wed Sep 17 10:00:00 2026\n' > "$output"
+    else
+      : > "$output"
+    fi
+    ;;
+  send-keys)
+    if [[ "${FAKE_HANDOFF_BLOCK_EXIT:-0}" != 1 ]]; then
+      rm -f "$proc"
+      if [[ "${FAKE_HANDOFF_REUSE_AFTER_SEND:-0}" == 1 ]]; then printf '\$99\n' > "$state"; else rm -f "$state"; fi
+      if [[ -n "${FAKE_HANDOFF_MUTATE_RECORD:-}" ]]; then
+        /usr/bin/python3 -c 'import json,sys; p=sys.argv[1]; v=json.load(open(p)); v["lifecycle_state"]=sys.argv[2]; open(p,"w").write(json.dumps(v)+"\n")' "$FAKE_HANDOFF_MUTATE_RECORD" "$FAKE_HANDOFF_MUTATE_STATE"
+      fi
+    fi
+    ;;
+  *) exit 0 ;;
+esac
+SH
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *'lstart='* && -e "${FAKE_HANDOFF_PROCESS_STATE:?}" ]]; then
+  printf 'Wed Sep 17 10:00:00 2026\n'
+fi
+exit 0
+SH
+    chmod +x "$bin/tmux" "$bin/ps"
+    cat > "$app" <<'JSON'
+{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-handoff-1","threads":[{"id":"handoff-task","archived":false,"cwd":"/tmp/handoff"}],"errors":[]}
+JSON
+    cat > "$app_missing" <<'JSON'
+{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-missing","threads":[],"errors":[]}
+JSON
+    cat > "$app_archived" <<'JSON'
+{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-archived","threads":[{"id":"handoff-task","archived":true}],"errors":[]}
+JSON
+    cat > "$app_unavailable" <<'JSON'
+{"schema_version":1,"status":"unavailable","complete":false,"observed_at":"2026-09-17T10:00:00Z","source_cursor":null,"threads":[],"errors":[{"reason":"fixture unavailable"}]}
+JSON
+    cat > "$app_conflict" <<'JSON'
+{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-conflict","threads":[{"id":"handoff-task","archived":false,"control_owner":"app"}],"errors":[]}
+JSON
+    cat > "$tmux_snapshot" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"tmux-handoff-1","panes":[{"session":"TMUX--handoff","pane_id":"%1","pane_pid":"4100","start_command":"session-wrapper.sh","current_command":"codex"}],"error":null}
+JSON
+    cat > "$proc_snapshot" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"proc-handoff-1","processes":[{"pid":4100,"ppid":1,"started":"Wed Sep 17 10:00:00 2026","command":"session-wrapper.sh"},{"pid":4200,"ppid":4100,"started":"Wed Sep 17 10:00:01 2026","command":"codex"}],"error":null}
+JSON
+    cat > "$tmux_absent" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:01Z","source_cursor":"tmux-handoff-2","panes":[],"error":null}
+JSON
+    cat > "$proc_absent" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:01Z","source_cursor":"proc-handoff-2","processes":[],"error":null}
+JSON
+    make_record() {
+        local origin="${1:-cctrl}" owner="${2:-cctrl}" runtime="${3:-tmux}"
+        rm -rf "$meta"; mkdir -p "$meta"
+        python3 - "$meta" "$host" "$origin" "$owner" "$runtime" "$started" <<'PY'
+import hashlib,json,sys
+from pathlib import Path
+root,host,origin,owner,runtime,started=Path(sys.argv[1]),*sys.argv[2:]
+task="handoff-task"; now="2026-09-17T10:00:00Z"
+record={"schema_version":2,"provider":"codex","provider_task_id":task,"origin":origin,"host_id":host,
+ "registered_by_cctrl":origin=="cctrl","launched_by_cctrl":origin=="cctrl","execution_runtime":runtime,"control_owner":owner,
+ "lifecycle_state":"active","restore_strategy":"tmux" if runtime=="tmux" else "provider-managed","last_observed_at":now,
+ "tmux_session":"TMUX--handoff","pane_id":"%1","pane_pid":"4100","pane_started":started,"wrapper_pid":"4100",
+ "lineage":{"forked_from_id":None,"parent_thread_id":None,"derived_root_id":None,"derived_root_basis":None},
+ "ownership_evidence":[{"source":"cctrl-launch","source_instance":"TMUX--handoff","source_cursor":"launch-1","authority_class":"authoritative",
+ "observed_owner":owner,"observed_runtime":runtime,"observed_state":"active","observed_at":now,"reason":"fixture launch receipt"}],
+ "lifecycle_observations":[],"registry_event_ids":[],"registry_source_high_water":{},"ownership_observations":[],
+ "name":"TMUX--handoff","agent":"codex","conversation_id":task,"cwd":"/tmp/handoff","control_surface":"tmux","cctrl_managed":True}
+key="task-"+hashlib.sha256(("codex\0"+host+"\0"+task).encode()).hexdigest()
+(root/(key+".json")).write_text(json.dumps(record,sort_keys=True,indent=2)+"\n")
+PY
+        record="$(find "$meta" -name 'task-*.json' -print -quit)"
+    }
+    run_release() {
+        local -a release_cmd=("$ROOT/cctrl" session release-to-app TMUX--handoff)
+        [[ "${HANDOFF_NO_YES:-0}" == 1 ]] || release_cmd+=(--yes)
+        release_cmd+=(--wait 0 --json)
+        PATH="$bin:/usr/bin:/bin" FAKE_HANDOFF_TMUX_STATE="$state" FAKE_HANDOFF_PROCESS_STATE="$proc" \
+          CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex_home" \
+          CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" CCTRL_CODEX_RECONCILE_APP_SERVER_FILE="${HANDOFF_APP_FILE:-$app}" \
+          CCTRL_CODEX_RECONCILE_TMUX_FILE="${HANDOFF_RECONCILE_TMUX_FILE:-$tmux_snapshot}" CCTRL_CODEX_RECONCILE_PROCESS_FILE="${HANDOFF_RECONCILE_PROCESS_FILE:-$proc_snapshot}" \
+          CCTRL_CODEX_HANDOFF_POST_RECONCILE_TMUX_FILE="${HANDOFF_POST_TMUX_FILE:-$tmux_absent}" \
+          CCTRL_CODEX_HANDOFF_POST_RECONCILE_PROCESS_FILE="${HANDOFF_POST_PROCESS_FILE:-$proc_absent}" \
+          CCTRL_CODEX_HANDOFF_PREFLIGHT_FILE="${HANDOFF_APP_FILE:-$app}" CCTRL_CODEX_HANDOFF_POSTFLIGHT_FILE="${HANDOFF_APP_FILE:-$app}" \
+          CCTRL_CODEX_HANDOFF_CONFIRM_RESPONSE="${CCTRL_CODEX_HANDOFF_CONFIRM_RESPONSE:-}" \
+          CCTRL_CODEX_HANDOFF_ATTEMPT_ID="handoff-attempt-0001" "${release_cmd[@]}"
+    }
+
+    before="$(handoff_tree_digest "$ROOT/data")"
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; : > "$codex_home/thread-writer-locks/handoff-task.lock"
+    out="$(run_release)" || fail "verified handoff failed: $out"
+    jq -e 'length==1 and .[0].kind=="codex_handoff_result_v1" and .[0].status=="handed-off" and
+      .[0].provider_task_id=="handoff-task" and .[0].owner_exit==true and .[0].provider_postcondition.verified==true and
+      .[0].previous_state.control_owner=="cctrl" and .[0].resulting_state.control_owner=="app" and
+      .[0].resulting_state.execution_runtime=="app-server"' <<< "$out" >/dev/null || fail "handoff result contract is wrong: $out"
+    jq -e '.origin=="cctrl" and .provider_task_id=="handoff-task" and .control_owner=="app" and
+      .execution_runtime=="app-server" and .restore_strategy=="provider-managed"' "$record" >/dev/null || fail "handoff registry transition is wrong"
+    [[ "$(find "$meta" -name 'task-*.json' | wc -l | tr -d ' ')" == 1 ]] || fail "handoff created a duplicate canonical task record"
+    [[ ! -e "$codex_home/thread-writer-locks/handoff-task.lock" && -e "$backup/handoff-task.lock" ]] || fail "stale lock was not quarantined after owner exit"
+    out="$(run_release)" || fail "app-owned retry was not idempotent"
+    jq -e '.[0].status=="already-app-owned" and .[0].ok==true' <<< "$out" >/dev/null || fail "app-owned retry result is wrong: $out"
+
+    rc=0
+    out="$(PATH="$bin:/usr/bin:/bin" FAKE_HANDOFF_TMUX_STATE="$state" FAKE_HANDOFF_PROCESS_STATE="$proc" \
+      CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex_home" \
+      "$ROOT/cctrl" session attach TMUX--handoff 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 && "$out" == *"app-owned"* && "$out" == *"no longer owns"* ]] || fail "attach did not guard released app-owned task: $out"
+
+    make_record codex-app app app-server; rc=0
+    out="$(run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "native observed app task was transferable"
+    jq -e '.[0].error=="non-transferable-origin"' <<< "$out" >/dev/null || fail "wrong-origin failure is not actionable: $out"
+
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(FAKE_HANDOFF_BLOCK_EXIT=1 run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "blocked owner exit unexpectedly committed"
+    jq -e '.[0].error=="owner-exit-timeout" and .[0].owner_exit==false' <<< "$out" >/dev/null || fail "timeout result is wrong: $out"
+    jq -e '.control_owner=="cctrl" and .execution_runtime=="tmux"' "$record" >/dev/null || fail "timeout falsely committed app ownership"
+
+    # Confirmation is after exact identity/provider preflight and before EOF.
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(HANDOFF_NO_YES=1 CCTRL_CODEX_HANDOFF_CONFIRM_RESPONSE=n run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 && -e "$state" && -e "$proc" ]] || fail "confirmation decline sent EOF or unexpectedly succeeded"
+    jq -e '.[0].status=="declined" and .[0].error=="confirmation-declined" and .[0].provider_task_id=="handoff-task"' <<< "$out" >/dev/null \
+      || fail "confirmation decline result is wrong: $out"
+
+    # Provider preflight fails closed for missing, archived, and unavailable.
+    local provider_fixture expected_error
+    for provider_fixture in "$app_missing" "$app_archived" "$app_unavailable"; do
+        make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+        out="$(HANDOFF_APP_FILE="$provider_fixture" run_release 2>/dev/null)" || rc=$?
+        [[ "$rc" -ne 0 && -e "$state" ]] || fail "provider failure sent EOF or unexpectedly succeeded: $provider_fixture"
+        case "$provider_fixture" in
+          *missing*) expected_error="provider-task-missing" ;;
+          *archived*) expected_error="provider-task-archived" ;;
+          *) expected_error="provider-unavailable" ;;
+        esac
+        jq -e --arg error "$expected_error" '.[0].error==$error and .[0].owner_exit==false' <<< "$out" >/dev/null \
+          || fail "provider failure result is wrong ($expected_error): $out"
+    done
+
+    # Simultaneous authoritative app and tmux claims are a conflict, not a handoff.
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(HANDOFF_APP_FILE="$app_conflict" run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 && -e "$state" ]] || fail "ownership conflict sent EOF or unexpectedly succeeded"
+    jq -e '.[0].error=="ownership-conflict"' <<< "$out" >/dev/null || fail "ownership conflict result is wrong: $out"
+
+    # Reusing the tmux name/session identity after EOF must not authorize commit.
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(FAKE_HANDOFF_REUSE_AFTER_SEND=1 run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "reused tmux identity unexpectedly committed"
+    jq -e '.[0].error=="owner-process-mismatch" and .[0].owner_exit==false' <<< "$out" >/dev/null || fail "tmux reuse result is wrong: $out"
+    jq -e '.control_owner=="cctrl"' "$record" >/dev/null || fail "tmux reuse falsely committed app ownership"
+
+    # A fresh postflight writer snapshot vetoes the handoff after old-owner exit.
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(HANDOFF_POST_TMUX_FILE="$tmux_snapshot" HANDOFF_POST_PROCESS_FILE="$proc_snapshot" run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "postflight competing writer unexpectedly committed"
+    jq -e '.[0].error=="postflight-competing-writer" and .[0].owner_exit==true' <<< "$out" >/dev/null || fail "postflight competing-writer result is wrong: $out"
+
+    # Only a same-task lifecycle-hook SessionEnd delta is admissible. An
+    # unrelated concurrent archive-style mutation is reported as conflict.
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(FAKE_HANDOFF_MUTATE_RECORD="$record" FAKE_HANDOFF_MUTATE_STATE=archived run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "concurrent non-SessionEnd mutation unexpectedly committed"
+    jq -e '.[0].error=="record-changed-during-shutdown" and .[0].owner_exit==true' <<< "$out" >/dev/null || fail "concurrent mutation result is wrong: $out"
+
+    # Reducer failure occurs after verified exit but preserves the original
+    # owner record for deterministic reconciliation/retry.
+    make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME=1 run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "injected reducer failure unexpectedly succeeded"
+    jq -e '.[0].error=="registry-handoff-rejected" and .[0].owner_exit==true' <<< "$out" >/dev/null || fail "reducer failure result is wrong: $out"
+    jq -e '.control_owner=="cctrl" and .origin=="cctrl"' "$record" >/dev/null || fail "reducer failure corrupted ownership/provenance"
+
+    # Retry after interruption between owner exit and registry commit: exact
+    # provider id remains, no new task is created, and the missing old process
+    # is treated as a recoverable checkpoint.
+    make_record cctrl cctrl tmux; rm -f "$state" "$proc"; rc=0
+    out="$(HANDOFF_RECONCILE_TMUX_FILE="$tmux_absent" HANDOFF_RECONCILE_PROCESS_FILE="$proc_absent" run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "interrupted handoff recovery failed: $out"
+    jq -e '.[0].status=="handed-off" and .[0].owner_exit==true and .[0].provider_task_id=="handoff-task"' <<< "$out" >/dev/null \
+      || fail "interrupted recovery result is wrong: $out"
+    [[ "$(find "$meta" -name 'task-*.json' | wc -l | tr -d ' ')" == 1 ]] || fail "interrupted recovery duplicated provider task"
+
+    # Cached app-owned state is not enough for an idempotent success claim.
+    make_record cctrl app app-server; rc=0
+    out="$(HANDOFF_APP_FILE="$app_missing" run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "app-owned no-op ignored missing provider task"
+    jq -e '.[0].error=="app-owned-provider-unverified"' <<< "$out" >/dev/null || fail "app-owned provider verification failure is wrong: $out"
+
+    after="$(handoff_tree_digest "$ROOT/data")"
+    [[ "$before" == "$after" ]] || fail "handoff tests changed the real cctrl live store"
+    echo "ok: Codex handoff is exact-task, two-checkpoint, owner-exit-gated, idempotent, and attach-safe"
+}
+
+if [[ "${CCTRL_TEST_ONLY:-}" == "codex-handoff" ]]; then
+    test_codex_handoff_state_machine
+    echo "ok"
+    exit 0
+fi
+
 if [[ "${CCTRL_TEST_ONLY:-}" == "app-owned-launch" ]]; then
     test_app_owned_launch
     echo "ok"
@@ -9585,6 +9816,7 @@ test_codex_lifecycle_fixture_contract
 test_codex_lifecycle_ingestion
 test_codex_app_server_adapter
 test_app_owned_launch
+test_codex_handoff_state_machine
 test_codex_hook_installation_is_additive_and_observer_is_bounded
 
 echo "ok"

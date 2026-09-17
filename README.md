@@ -238,12 +238,23 @@ cctrl task ls
 cctrl session app-ls
 ```
 
-`release-to-app` sends EOF to the tmux session, waits for it to exit, preserves
-the unarchived Codex app task and cctrl metadata record, and quarantines only
-stale Codex writer locks that no live tmux session or Codex process appears to
-own. A successful release proves that the terminal writer ended; it does **not**
-prove that the app acquired the task. The task record therefore reports an
-unknown owner/runtime until an authoritative app-side event is observed.
+`release-to-app` is a one-way writer handoff, not simultaneous access. It
+resolves the exact cctrl-launched provider task, verifies the anchored tmux/PID
+owner and an app-openable App Server record, shows the provider id for
+confirmation, sends one graceful EOF, and waits for that exact owner to end.
+Only after a fresh App Server postflight does one digest-guarded registry event
+set the owner/runtime to `app`/`app-server` with provider-managed restore. The
+provider task id and `origin:cctrl` never change and no replacement task is
+created. A stale writer lock may be quarantined only after the owner exit has
+been proved; lock presence is not ownership proof.
+
+If an approval or unsent input keeps the terminal alive, the command reports
+`owner-exit-timeout` and leaves cctrl ownership unchanged. Reopen the terminal,
+resolve the blocking prompt, exit normally, and retry. If the process exits
+after EOF but before the registry commit, run `cctrl session reconcile-codex
+--json` and retry the same `release-to-app` target; reconciliation preserves the
+provider identity and origin. Once handed off, `cctrl session attach <old-name>`
+prints an app-opening hint and will not recreate tmux automatically.
 `task ls` is the provider-neutral local catalogue. It shows tmux observations,
 cctrl-registered tasks, and discoverable Codex tasks together, but keeps owner,
 runtime, lifecycle, and per-action capabilities separate. Its `--json` form is

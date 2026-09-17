@@ -1,7 +1,10 @@
 ---
 id: 067
 title: Make Codex terminal-to-app handoff an explicit safe transition
-status: in-progress
+status: done
+completed: 2026-09-17
+reviewed: false
+qa: automated
 blocked-by: [063, 064, 065]
 priority: 67
 goal: codex-task-ownership-surfaces
@@ -12,6 +15,7 @@ created: 2026-09-15
 tui-fixture: n/a  # no pane-text parsing; tmux is inspected only as process/ownership evidence
 reviews:
   - type=eng verdict=approved date=2026-09-16 by=mstack-review
+  - type=code verdict=pass date=2026-09-17 by=mstack-code-review
 ---
 
 ## Plain-English Summary
@@ -101,3 +105,16 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented exact-task Codex ownership handoff with anchored owner exit, fresh provider/tmux/process reconciliation, digest-guarded registry transition, idempotent app-owned retries, and attach protection. Added exhaustive handoff tests and updated documentation; all six review findings were fixed with no Design-section deviations.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `docs/plans/067-safe-codex-ownership-handoff.md` (modified)
+- `tests/run-tests.sh` (modified)
+
+**Commit:** `4f01b9e` — `feat(codex): make ownership handoff explicit and safe`
