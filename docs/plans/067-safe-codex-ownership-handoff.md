@@ -78,13 +78,13 @@ produced:
 - kind: schema; name: codex_handoff_result_v1; shape: "attempt_id,provider_task_id,previous_state,requested_transition,owner_exit,provider_postcondition,resulting_state,required_action,error"; file: cctrl
 - kind: symbol; name: _session_release_to_app; file: cctrl
 assumed:
-- from: 059; kind: schema; name: task_registry_event; shape: "event_id,event_type,provider,provider_task_id,host_id,source,source_instance_id,source_sequence,source_cursor,expected_record_digest,observed_at,payload"; file: cctrl
-- from: 059; kind: symbol; name: _task_registry_apply_event; shape: "record_key,event_file"; file: cctrl
+- from: 059; kind: schema; name: task_registry_event; file: cctrl
+- from: 059; kind: symbol; name: _task_registry_apply_event; file: cctrl
 - from: 060; kind: symbol; name: AppServerClient; file: lib/codex_app_server.py
-- from: 063; kind: schema; name: codex_reconcile_result_v1; shape: "pass_id,observed_at,expected_record_digest,sources,outcome,reason,errors"; file: cctrl
+- from: 063; kind: schema; name: codex_reconcile_result_v1; file: cctrl
 - from: 063; kind: symbol; name: _session_reconcile_codex; file: cctrl
 - from: 064; kind: symbol; name: _task_list_json; file: cctrl
-- from: 065; kind: schema; name: app_owned_launch_result_v1; shape: "partial,task_creation_outcome,provider_task_id,host_id,owner,runtime,turn_outcome,registry_persisted,open_hint,error"; file: cctrl
+- from: 065; kind: schema; name: app_owned_launch_result_v1; file: cctrl
 -->
 
 
