@@ -1,7 +1,7 @@
 ---
 id: 065
 title: Launch app-owned Codex tasks through cctrl
-status: pending
+status: in-progress
 blocked-by: [059, 060, 063]
 priority: 65
 goal: codex-task-ownership-surfaces
