@@ -1,7 +1,7 @@
 ---
 id: 066
 title: Federate provider-neutral tasks across cctrl hosts
-status: pending
+status: in-progress
 blocked-by: [064]
 priority: 66
 goal: codex-task-ownership-surfaces
