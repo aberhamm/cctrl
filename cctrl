@@ -1433,7 +1433,7 @@ _launch_app_owned_codex() {
         rm -f "$receipt_file"
     fi
     if [[ -n "$provider_task_id" ]]; then
-        if _task_register_app_owned_launch "$provider_task_id" "$cwd"; then persisted=true; else persisted=false; rc=${rc:-1}; (( rc == 0 )) && rc=74; fi
+        if _task_register_app_owned_launch "$provider_task_id" "$cwd"; then persisted=true; else persisted=false; (( rc == 0 )) && rc=74; fi
     fi
     if [[ "$persisted" == false ]]; then
         if [[ "$host_label" == local ]]; then recovery="cctrl session recover-app-owned $provider_task_id"; else recovery="cctrl --host $host_label session recover-app-owned $provider_task_id"; fi
@@ -9336,15 +9336,15 @@ _session_list() {
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
         # Read all needed metadata fields in one jq call (was six separate calls).
-        local stored_conv_id="" stored_tpath=""
+        local stored_conv_id=""
         local meta_file
         meta_file="$(_session_metadata_file "$name")"
-        purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""; stored_tpath=""
+        purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""
         record_schema=""; provider=""; origin=""; host_id=""; registered_by_cctrl=false; launched_by_cctrl=false; execution_runtime=unknown; control_owner=unknown; lifecycle_state=unknown; restore_strategy=""; last_observed_at=""; lineage_json='{}'; evidence_json='[]'
         if [[ -f "$meta_file" ]]; then
             normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
             if [[ -n "$normalized_record" ]]; then
-                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r stored_tpath; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.transcript_path // "")' <<< "$normalized_record" 2>/dev/null) || true
+                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // "")' <<< "$normalized_record" 2>/dev/null) || true
                 record_schema="$(jq -r '.schema_version // empty' <<< "$normalized_record")"
                 provider="$(jq -r '.provider // empty' <<< "$normalized_record")"
                 origin="$(jq -r '.origin // empty' <<< "$normalized_record")"
@@ -11109,10 +11109,10 @@ _session_restore() {
 
     local row_file restored=0 failed=0 index=0 wave_size="${CCTRL_RESTORE_WAVE_SIZE:-2}" wave_pause="${CCTRL_RESTORE_WAVE_PAUSE:-60}"
     while IFS= read -r row_file; do
-        local cwd resume purpose label agent tmux_name launch_flags spawn_rc=0
+        local cwd resume purpose label agent spawn_rc=0
         cwd="$(jq -r '.cwd' <<< "$row_file")"; resume="$(jq -r '.resume_identity' <<< "$row_file")"
         purpose="$(jq -r '.purpose // "restored task"' <<< "$row_file")"; label="$(jq -r '.display_label // empty' <<< "$row_file")"
-        agent="$(jq -r '.agent // .provider // empty' <<< "$row_file")"; tmux_name="$(jq -r '.tmux_session // empty' <<< "$row_file")"
+        agent="$(jq -r '.agent // .provider // empty' <<< "$row_file")"
         local -a launch_argv=(-d "$cwd" -r "$resume" --purpose "$purpose")
         [[ -n "$label" ]] && launch_argv+=(--name "$label")
         [[ "$agent" == codex ]] && launch_argv+=(--agent codex)

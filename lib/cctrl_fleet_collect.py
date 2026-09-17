@@ -301,10 +301,10 @@ def collect(args: argparse.Namespace) -> int:
     budget = math.ceil(len(items) / max(1, min(4, args.workers))) * args.timeout + 2
     paths: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, max(1, args.workers))) as executor:
-        futures = {
-            executor.submit(_collect_one, index, alias, value, args): index
+        futures = [
+            executor.submit(_collect_one, index, alias, value, args)
             for index, (alias, value) in enumerate(items)
-        }
+        ]
         try:
             for future in concurrent.futures.as_completed(futures, timeout=budget):
                 paths.append(future.result())
@@ -343,8 +343,6 @@ def _legacy_defaults(row: dict[str, Any], alias: str) -> dict[str, Any]:
     }
     for field in LEGACY_FIELDS:
         result.setdefault(field, defaults[field])
-    if "recap" in row:
-        result["recap"] = row["recap"]
     return result
 
 
