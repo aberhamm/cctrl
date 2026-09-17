@@ -1,7 +1,10 @@
 ---
 id: 065
 title: Launch app-owned Codex tasks through cctrl
-status: in-progress
+status: done
+completed: 2026-09-17
+reviewed: false
+qa: automated
 blocked-by: [059, 060, 063]
 priority: 65
 goal: codex-task-ownership-surfaces
@@ -106,3 +109,18 @@ assumed:
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+## Implementation Notes
+
+Implemented app-owned Codex launches through App Server with strict compatibility checks, settings normalization, durable launch receipts, authoritative registry provenance, safe exact-ID recovery, remote routing, documentation, completions, and comprehensive regression coverage. Review strengthened option-aware mode detection, hook-race handling, receipt-and-cwd-gated recovery, and global non-Codex rejection. The post-review focused tests, full integration suite, and health gate all pass.
+
+**Files changed:**
+
+- `README.md` (modified)
+- `cctrl` (modified)
+- `completions/_cctrl` (modified)
+- `lib/codex_app_server.py` (modified)
+- `tests/run-tests.sh` (modified)
+- `docs/plans/065-app-owned-codex-launch.md` (modified)
+
+**Commit:** `2c39225` — `feat(codex): launch app-owned tasks through cctrl`

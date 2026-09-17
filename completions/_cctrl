@@ -212,6 +212,8 @@ _cctrl() {
                 '--no-tmux[Launch directly without tmux]' \
                 {--resume,-r}'[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
+                '--app-owned[Create a Codex App Server task and leave no tmux writer]' \
+                '--reasoning-effort[Codex reasoning effort]:effort:(none minimal low medium high xhigh max ultra)' \
                 {--name,-n}'[Session display name]:name:' \
                 '--peer[Peer mailbox identity]:peer:_cctrl_peers' \
                 '--purpose[Session purpose metadata]:purpose:' \
@@ -233,6 +235,7 @@ _cctrl() {
             if (( CURRENT == 3 )); then
                 local -a session_cmds=(
                     'ls:List sessions (dir, agent/shell, model, state)'
+                    'recover-app-owned:Verify an App Server task and retry registry persistence'
                     'attach:Reattach to a session'
                     'current:Show this process/session identity'
                     'say:Paste a direct chat message into a live tmux session'

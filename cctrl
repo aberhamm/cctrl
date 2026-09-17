@@ -1237,6 +1237,223 @@ _start_args_have_explicit_target() {
     return 1
 }
 
+_start_requests_app_owned() {
+    # This is a mode-selection parse, not a token search: option values may
+    # themselves be the literal string "--app-owned".
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --) return 1 ;;
+            --app-owned) return 0 ;;
+            --agent|--profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|-c|--config)
+                (( $# >= 2 )) || return 1
+                shift 2
+                ;;
+            --resume|-r)
+                shift
+                if [[ $# -gt 0 && "$1" != -* && "$1" != @* ]]; then shift; fi
+                ;;
+            *) shift ;;
+        esac
+    done
+    return 1
+}
+
+_task_app_owned_receipt_dir() {
+    printf '%s/app-owned-launch-receipts' "$SESSION_METADATA_DIR"
+}
+
+_task_find_app_owned_receipt() {
+    local provider_task_id="$1" dir receipt
+    dir="$(_task_app_owned_receipt_dir)"
+    [[ -d "$dir" ]] || return 1
+    for receipt in "$dir"/receipt.*; do
+        [[ -f "$receipt" && ! -L "$receipt" ]] || continue
+        if jq -e --arg id "$provider_task_id" '
+          .schema_version == 1 and .kind == "cctrl-app-owned-launch-receipt" and
+          .provider == "codex" and .provider_task_id == $id and
+          (.cwd | type == "string" and startswith("/"))
+        ' "$receipt" >/dev/null 2>&1; then
+            printf '%s' "$receipt"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_task_register_app_owned_launch() {
+    local provider_task_id="$1" cwd="$2" host_id record_file record_key now base_event launch_event result digest expected
+    host_id="$(_cctrl_host_id)" || return 1
+    record_file="$(_task_record_file codex "$host_id" "$provider_task_id")" || return 1
+    record_key="${record_file##*/}"; record_key="${record_key%.json}"
+    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    base_event="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || return 1
+    launch_event="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || { rm -f "$base_event"; return 1; }
+    if [[ -f "$record_file" && ! -L "$record_file" ]]; then
+        expected="$(_task_registry_record_digest "$record_file")" || { rm -f "$base_event" "$launch_event"; return 1; }
+    else
+        expected="$TASK_REGISTRY_ABSENT_DIGEST"
+    fi
+    jq -n --arg provider_task_id "$provider_task_id" --arg host_id "$host_id" --arg observed "$now" --arg cwd "$cwd" --arg expected "$expected" '
+      {version:1,event_id:("app-register:"+$host_id+":"+$provider_task_id),event_type:"register",
+       provider:"codex",provider_task_id:$provider_task_id,host_id:$host_id,
+       source:"cctrl-app-launch",source_instance_id:$provider_task_id,source_sequence:null,source_cursor:null,
+       expected_record_digest:$expected,observed_at:$observed,
+       payload:{authority_class:"authoritative",record:{
+         schema_version:2,provider:"codex",provider_task_id:$provider_task_id,origin:"cctrl",host_id:$host_id,
+         registered_by_cctrl:true,launched_by_cctrl:true,execution_runtime:"unknown",control_owner:"unknown",
+         lifecycle_state:"active",restore_strategy:null,last_observed_at:$observed,tmux_session:null,
+         lineage:{forked_from_id:null,parent_thread_id:null,derived_root_id:null,derived_root_basis:null},
+         ownership_evidence:[],cwd:$cwd,agent:"codex",conversation_id:$provider_task_id,
+         control_surface:"unknown",cctrl_managed:true
+       }}}
+    ' > "$base_event" || { rm -f "$base_event" "$launch_event"; return 1; }
+    result="$(_task_registry_apply_event "$record_key" "$base_event")" || { rm -f "$base_event" "$launch_event"; return 1; }
+    case "$(jq -r '.status' <<< "$result")" in created|applied|duplicate) ;; *) rm -f "$base_event" "$launch_event"; return 1 ;; esac
+    digest="$(_task_registry_record_digest "$record_file")" || { rm -f "$base_event" "$launch_event"; return 1; }
+    jq -n --arg provider_task_id "$provider_task_id" --arg host_id "$host_id" --arg observed "$now" --arg expected "$digest" '
+      {version:1,event_id:("app-launch:"+$host_id+":"+$provider_task_id),event_type:"launch",
+       provider:"codex",provider_task_id:$provider_task_id,host_id:$host_id,
+       source:"cctrl-app-launch",source_instance_id:$provider_task_id,source_sequence:null,source_cursor:null,
+       expected_record_digest:$expected,observed_at:$observed,
+       payload:{authority_class:"authoritative",control_owner:"app",execution_runtime:"app-server",
+         lifecycle_state:"active",restore_strategy:"provider-managed",reason:"cctrl created the task through App Server",
+         set:{}}}
+    ' > "$launch_event" || { rm -f "$base_event" "$launch_event"; return 1; }
+    result="$(_task_registry_apply_event "$record_key" "$launch_event")" || { rm -f "$base_event" "$launch_event"; return 1; }
+    rm -f "$base_event" "$launch_event"
+    case "$(jq -r '.status' <<< "$result")" in applied|duplicate) return 0 ;; *) return 1 ;; esac
+}
+
+_app_owned_target_dir() {
+    local target="${1:-}" key dir
+    if [[ -z "$target" ]]; then
+        (cd "$PWD" && pwd -P)
+        return
+    fi
+    if [[ "$target" == @* ]]; then
+        key="$(_shortcut_lookup_key "${target#@}")"
+        [[ -n "$key" ]] || { echo -e "${RED}Shortcut '$target' not found.${RESET}" >&2; return 1; }
+        dir="$(jq -r --arg k "$key" '.[$k].dir // empty' "$SHORTCUTS_FILE")"
+    else
+        dir="$target"
+    fi
+    dir="${dir/#\~/$HOME}"
+    [[ -d "$dir" ]] || { echo -e "${RED}Directory does not exist: $dir${RESET}" >&2; return 1; }
+    (cd "$dir" && pwd -P)
+}
+
+_launch_app_owned_codex() {
+    local json=false profile="" profile_explicit=false target="" message="" message_set=false
+    local cli_model="" cli_effort="" cli_sandbox="" cli_approval="" yolo=false yolo_explicit=false
+    local agent="${CCTRL_AGENT:-codex}" arg pf="" profile_model="" profile_effort="" profile_sandbox="" profile_approval=""
+    while [[ $# -gt 0 ]]; do
+        arg="$1"
+        case "$arg" in
+            --app-owned) shift ;;
+            --json) json=true; shift ;;
+            --agent) [[ $# -ge 2 ]] || { echo "--agent needs a value" >&2; return 64; }; agent="$(_normalize_agent "$2")" || return 64; shift 2 ;;
+            --profile) [[ $# -ge 2 ]] || { echo "--profile needs a value" >&2; return 64; }; profile="$2"; profile_explicit=true; shift 2 ;;
+            --model) [[ $# -ge 2 ]] || { echo "--model needs a value" >&2; return 64; }; cli_model="$2"; shift 2 ;;
+            --reasoning-effort) [[ $# -ge 2 ]] || { echo "--reasoning-effort needs a value" >&2; return 64; }; cli_effort="$2"; shift 2 ;;
+            --sandbox|-s) [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }; cli_sandbox="$2"; shift 2 ;;
+            --ask-for-approval|-a) [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }; cli_approval="$2"; shift 2 ;;
+            --yolo|--dangerously-bypass-approvals-and-sandbox) yolo=true; yolo_explicit=true; shift ;;
+            --message|--prompt|-m) [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }; message="$2"; message_set=true; shift 2 ;;
+            -d|--detach|--foreground|--no-tmux|--tmux|--resume|-r|--remote|--remote-auth-token-env|--peer|--purpose|--name|-n|--permission-mode|--no-bridge|-f|--force|--health-check|--skip-health-check)
+                echo -e "${RED}$arg is incompatible with --app-owned.${RESET}" >&2; return 64 ;;
+            --|-*) echo -e "${RED}Unsupported --app-owned argument: $arg${RESET}" >&2; return 64 ;;
+            *) [[ -z "$target" ]] || { echo -e "${RED}--app-owned accepts only one target.${RESET}" >&2; return 64; }; target="$arg"; shift ;;
+        esac
+    done
+    agent="$(_normalize_agent "$agent")" || return 64
+    [[ "$agent" == codex ]] || { echo -e "${RED}--app-owned is available only for Codex.${RESET}" >&2; return 64; }
+
+    if [[ -z "$profile" && "$profile_explicit" == false && "$target" == @* ]]; then
+        local shortcut_key
+        shortcut_key="$(_shortcut_lookup_key "${target#@}")"
+        [[ -n "$shortcut_key" ]] && profile="$(jq -r --arg k "$shortcut_key" '.[$k].profile // empty' "$SHORTCUTS_FILE")"
+    fi
+    [[ -n "$profile" ]] || profile="$(_active_profile)"
+    if [[ -n "$profile" && "$profile_explicit" == true ]] && ! _profile_exists "$profile"; then
+        echo -e "${RED}Profile '$profile' not found.${RESET}" >&2
+        return 64
+    fi
+    if [[ -n "$profile" ]] && _profile_exists "$profile"; then
+        pf="$(_profile_path "$profile")"
+        profile_model="$(_profile_model_for_agent codex "$pf")"
+        profile_effort="$(jq -r '.agents.codex.reasoningEffort // .agents.codex.reasoning_effort // empty' "$pf" 2>/dev/null)"
+        local -a pargs=()
+        while IFS= read -r arg; do [[ -n "$arg" ]] && pargs+=("$arg"); done < <(_profile_args_for_agent codex "$pf")
+        local i=0
+        while (( i < ${#pargs[@]} )); do
+            case "${pargs[$i]}" in
+                --sandbox|-s) (( i + 1 < ${#pargs[@]} )) || { echo "Profile sandbox needs a value" >&2; return 64; }; profile_sandbox="${pargs[$((i+1))]}"; ((i+=2)) ;;
+                --ask-for-approval|-a) (( i + 1 < ${#pargs[@]} )) || { echo "Profile approval needs a value" >&2; return 64; }; profile_approval="${pargs[$((i+1))]}"; ((i+=2)) ;;
+                --yolo|--dangerously-bypass-approvals-and-sandbox) [[ "$yolo" == true || -n "$cli_sandbox$cli_approval" ]] || yolo=true; ((i++)) ;;
+                *) echo -e "${RED}Profile argument '${pargs[$i]}' is unsupported with --app-owned.${RESET}" >&2; return 64 ;;
+            esac
+        done
+    fi
+    local model="${cli_model:-$profile_model}" effort="${cli_effort:-$profile_effort}"
+    local sandbox="${cli_sandbox:-$profile_sandbox}" approval="${cli_approval:-$profile_approval}"
+    if $yolo_explicit; then
+        sandbox="danger-full-access"; approval="never"
+    elif $yolo; then
+        [[ -z "$sandbox$approval" ]] || { echo -e "${RED}--yolo cannot be combined with sandbox or approval settings.${RESET}" >&2; return 64; }
+        sandbox="danger-full-access"; approval="never"
+    fi
+    [[ -z "$sandbox" || "$sandbox" =~ ^(read-only|workspace-write|danger-full-access)$ ]] || { echo -e "${RED}Unsupported sandbox: $sandbox${RESET}" >&2; return 64; }
+    [[ -z "$approval" || "$approval" =~ ^(untrusted|on-request|never)$ ]] || { echo -e "${RED}Unsupported approval policy: $approval${RESET}" >&2; return 64; }
+    [[ -z "$effort" || "$effort" =~ ^(none|minimal|low|medium|high|xhigh|max|ultra)$ ]] || { echo -e "${RED}Unsupported reasoning effort: $effort${RESET}" >&2; return 64; }
+    local cwd
+    cwd="$(_app_owned_target_dir "$target")" || return 64
+
+    local host_id receipt_dir receipt_file
+    host_id="$(_cctrl_host_id)" || return 1
+    receipt_dir="$(_task_app_owned_receipt_dir)"
+    mkdir -p "$receipt_dir" || return 1
+    chmod 700 "$receipt_dir" 2>/dev/null || return 1
+    receipt_file="$(umask 077; mktemp "$receipt_dir/receipt.XXXXXX")" || return 1
+    local -a adapter=(python3 "$SCRIPT_DIR/lib/codex_app_server.py" launch --cwd "$cwd" --receipt-file "$receipt_file")
+    [[ -n "$model" ]] && adapter+=(--model "$model")
+    [[ -n "$effort" ]] && adapter+=(--reasoning-effort "$effort")
+    [[ -n "$sandbox" ]] && adapter+=(--sandbox "$sandbox")
+    [[ -n "$approval" ]] && adapter+=(--approval-policy "$approval")
+    $message_set && adapter+=(--message "$message")
+    local adapter_out rc=0 provider_task_id="" persisted=unknown host_label recovery hint result partial=false owner=unknown runtime=unknown
+    adapter_out="$("${adapter[@]}")" || rc=$?
+    [[ -n "$adapter_out" ]] || adapter_out='{"schema_version":1,"task_creation_outcome":"unknown","provider_task_id":null,"turn_outcome":"unknown","errors":[{"reason":"adapter produced no result"}]}'
+    provider_task_id="$(jq -r '.provider_task_id // empty' <<< "$adapter_out" 2>/dev/null || true)"
+    if [[ "$(jq -r '.task_creation_outcome // "unknown"' <<< "$adapter_out" 2>/dev/null)" == created && -n "$provider_task_id" ]]; then
+        owner=app; runtime=app-server
+    fi
+    host_label="${CCTRL_HOST_PREFIX:-local}"
+    if [[ -z "$provider_task_id" || "$(jq -r '.launch_receipt_persisted // false' <<< "$adapter_out" 2>/dev/null)" != true ]]; then
+        rm -f "$receipt_file"
+    fi
+    if [[ -n "$provider_task_id" ]]; then
+        if _task_register_app_owned_launch "$provider_task_id" "$cwd"; then persisted=true; else persisted=false; rc=${rc:-1}; (( rc == 0 )) && rc=74; fi
+    fi
+    if [[ "$persisted" == false ]]; then
+        if [[ "$host_label" == local ]]; then recovery="cctrl session recover-app-owned $provider_task_id"; else recovery="cctrl --host $host_label session recover-app-owned $provider_task_id"; fi
+        partial=true
+    elif [[ "$(jq -r '.task_creation_outcome' <<< "$adapter_out")" == unknown && -z "$provider_task_id" ]]; then
+        recovery="Inspect the Codex app/task inventory on host '$host_label'; do not rerun creation automatically."
+        partial=true
+    else recovery=""; fi
+    if (( rc != 0 )) && [[ -n "$provider_task_id" ]]; then partial=true; fi
+    hint="Open the task in the Codex app connected to host '$host_label' (the host must be awake); this does not promise concurrent writable access."
+    result="$(jq -c --arg host_id "$host_id" --arg host "$host_label" --arg persisted "$persisted" --arg recovery "$recovery" --arg hint "$hint" --argjson partial "$partial" '
+      . + {partial:$partial,host_id:$host_id,host:$host,owner:$owner,runtime:$runtime,registry_persisted:(if $persisted=="true" then true elif $persisted=="false" then false else "unknown" end),
+           recovery_command:(if $recovery=="" then null else $recovery end),open_hint:$hint,error:(if (.errors|length)>0 then .errors[0].reason else null end)}
+    ' --arg owner "$owner" --arg runtime "$runtime" <<< "$adapter_out")"
+    if $json; then printf '%s\n' "$result" | jq .; else
+        jq -r '"Task creation: \(.task_creation_outcome)\nTask id: \(.provider_task_id // "unknown")\nHost: \(.host)\nOwner/runtime: \(.owner)/\(.runtime)\nFirst turn: \(.turn_outcome)\nRegistry persisted: \(.registry_persisted)\n\(.open_hint)" + (if .recovery_command then "\nRecovery: \(.recovery_command)" else "" end)' <<< "$result"
+    fi
+    return "$rc"
+}
+
 cmd_start() {
     # Unified launch verb. Interactive starts are tmux-backed by default so
     # local and remote sessions are durable and addressable. Use
@@ -1245,6 +1462,14 @@ cmd_start() {
     #   cctrl start @name           tmux-backed via shortcut
     #   cctrl start --foreground    direct foreground, current dir
     #   cctrl start -d <dir|@name>  detached tmux session, do not auto-attach
+    if [[ "${1:-}" == -h || "${1:-}" == --help || "${1:-}" == help ]]; then
+        cmd_help
+        return 0
+    fi
+    if _start_requests_app_owned "$@"; then
+        _launch_app_owned_codex "$@"
+        return
+    fi
     local detach=false arg
     local foreground=false
     [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && foreground=true
@@ -1965,10 +2190,10 @@ else:
         merged.update(record)
         incoming_origin = incoming.get("origin")
         trusted_origin_upgrade = (
-            record.get("origin") == "unknown"
+            record.get("origin") in ({"unknown", "codex-app"} if event["source"] == "cctrl-app-launch" else {"unknown"})
             and authority == "authoritative"
             and (
-                (incoming_origin == "cctrl" and incoming.get("launched_by_cctrl") is True and event["source"] == "legacy-promotion")
+                (incoming_origin == "cctrl" and incoming.get("launched_by_cctrl") is True and event["source"] in {"legacy-promotion", "cctrl-app-launch"})
                 or (incoming_origin in {"codex-app", "external-cli"} and event["source"] == "lifecycle-hook")
             )
         )
@@ -7769,13 +7994,15 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | app-ls | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
+            echo "Usage: cctrl session <ls | app-ls | recover-app-owned | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
             echo "  cctrl session app-ls           List app-owned Codex tasks known to cctrl"
             echo "    --all                        Include all local Codex app threads"
             echo "    --json                       Machine-readable output"
+            echo "  cctrl session recover-app-owned <provider-task-id>"
+            echo "                                 Verify an exact App Server task and retry only its registry launch event"
             echo "  cctrl session archive <name>   Archive a completed cctrl Codex task"
             echo "  cctrl session attest <name>    Verify a recorded tmux owner against its live pane"
             echo "    --json                       Machine-readable control-surface attestation"
@@ -7839,6 +8066,7 @@ cmd_session() {
             ;;
         ls|list)   _session_list "$@" ;;
         app-ls|apps|app-list) _session_app_list "$@" ;;
+        recover-app-owned) _session_recover_app_owned "$@" ;;
         archive) _session_archive_codex_task "$@" ;;
         attest) _session_attest "$@" ;;
         mcp) _session_cmd_mcp "$@" ;;
@@ -9757,6 +9985,44 @@ cmd_task() {
             ;;
         *) echo -e "${RED}Unknown task command: $action${RESET}" >&2; return 64 ;;
     esac
+}
+
+_session_recover_app_owned() {
+    local provider_task_id="${1:-}" json=false out rc=0 cwd="" receipt=""
+    [[ -n "$provider_task_id" ]] || { echo "Usage: cctrl session recover-app-owned <provider-task-id> [--json]" >&2; return 64; }
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true ;;
+            *) echo "Unknown recover-app-owned argument: $1" >&2; return 64 ;;
+        esac
+        shift
+    done
+    if ! receipt="$(_task_find_app_owned_receipt "$provider_task_id")"; then
+        rc=65
+        out="$(jq -nc --arg id "$provider_task_id" '{schema_version:1,provider_task_id:$id,verified:false,registry_persisted:false,error:"no cctrl app-owned launch receipt exists for this task",errors:[]}')"
+    else
+        cwd="$(jq -r '.cwd' "$receipt")"
+        out="$(python3 "$SCRIPT_DIR/lib/codex_app_server.py" recover "$provider_task_id" --expected-cwd "$cwd")" || rc=$?
+    fi
+    if (( rc == 0 )) && [[ "$(jq -r '.verified // false' <<< "$out" 2>/dev/null)" == true ]]; then
+        if ! _task_register_app_owned_launch "$provider_task_id" "$cwd"; then
+            rc=74
+            out="$(jq -c '. + {registry_persisted:false,error:"registry persistence failed"}' <<< "$out")"
+        else
+            out="$(jq -c '. + {registry_persisted:true,error:null}' <<< "$out")"
+        fi
+    else
+        if [[ -n "$out" ]] && jq -e 'type == "object"' <<< "$out" >/dev/null 2>&1; then
+            out="$(jq -c '. + {registry_persisted:false,error:(.error // (if (.errors|length)>0 then .errors[0].reason else "task verification failed" end))}' <<< "$out")"
+        else
+            out='{"verified":false,"registry_persisted":false,"error":"task verification failed"}'
+        fi
+    fi
+    if $json; then printf '%s\n' "$out" | jq .; else
+        if (( rc == 0 )); then echo "Recovered app-owned task registry entry: $provider_task_id"; else echo "Could not recover app-owned task $provider_task_id: $(jq -r '.error' <<< "$out")" >&2; fi
+    fi
+    return "$rc"
 }
 
 _session_app_list() {
@@ -12619,6 +12885,8 @@ cmd_help() {
     echo "  cctrl start [@name]         Launch selected agent in tmux and attach when interactive"
     echo "    --agent claude|codex      Select runtime (default: $(_default_agent_label))"
     echo "    --profile NAME            Use a profile's model + env for this launch only"
+    echo "    --app-owned              Create a Codex task through App Server and exit (no tmux writer)"
+    echo "    --reasoning-effort LEVEL Codex effort: none|minimal|low|medium|high|xhigh|max|ultra"
     echo "    --foreground, --no-tmux   Launch directly without tmux"
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
@@ -12634,6 +12902,7 @@ cmd_help() {
     echo "    --remote-auth-token-env E Codex: env var containing remote auth token"
     echo "                              Extra flags are appended to the selected agent"
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
+    echo "  cctrl start --agent codex --app-owned [dir|@name] [-m TEXT] [--json]"
     echo "  cctrl start --profile NAME  Launch with that profile's model + env (this launch only;"
     echo "                              does not change the global default — see 'cctrl use')"
     echo ""
@@ -13626,13 +13895,17 @@ _remote_exec() {
             # Detached start (-d) launches on the remote, then auto-attaches over
             # a second connection. Foreground start is plain interactive.
             local is_detach=false
+            local is_app_owned=false
+            if _start_requests_app_owned "${@:2}"; then is_app_owned=true; fi
             for a in "$@"; do
                 [[ "$a" == "--" ]] && break
                 case "$a" in
                     -d|--detach) is_detach=true; break ;;
                 esac
             done
-            if $is_detach; then
+            if $is_app_owned; then
+                use_tty=false
+            elif $is_detach; then
                 detach_and_attach=true
             else
                 use_tty=true
@@ -13662,6 +13935,7 @@ _remote_exec() {
             ;;
         start|s)
             remote_tmux_launch=true
+            if _start_requests_app_owned "${remote_args[@]:1}"; then remote_tmux_launch=false; fi
             ;;
     esac
     if $remote_tmux_launch; then

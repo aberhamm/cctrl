@@ -72,6 +72,7 @@ block exists; `agents.<agent>.env`, `agents.<agent>.model`, and
     },
     "codex": {
       "model": "gpt-5.5",
+      "reasoningEffort": "high",
       "env": {
         "CODEX_HOME": "/Users/me/.codex-work"
       },
@@ -198,9 +199,37 @@ environment. `--no-bridge` suppresses that default. `cctrl rename <session> "new
 description"` uses the same title path for live Codex sessions.
 
 For now, tmux is the default Codex control surface. The app-owned Codex path is
-experimental and should be used deliberately. Once a Codex task has been
-registered with the app-server, you can release the tmux owner and continue in
-the ChatGPT/Codex app:
+explicit and should be used deliberately. There are three separate launch paths:
+
+```bash
+cctrl start -d --agent codex ./my-project              # cctrl-owned tmux writer
+cctrl start --agent codex --remote unix:// ./my-project # App Server-backed TUI writer
+cctrl start --agent codex --app-owned ./my-project      # app-owned; cctrl exits
+cctrl start --agent codex --app-owned @myapp \
+  --model gpt-6-astra --reasoning-effort high -m "Investigate the login flow"
+```
+
+`--app-owned` creates exactly one task through the connected Codex App Server,
+optionally starts one initial turn, records the exact returned provider task id,
+and exits without creating tmux or leaving a Codex CLI/TUI writer. Only model,
+reasoning effort, cwd, sandbox, and approval settings are normalized; CLI values
+override the selected profile and omitted values remain provider defaults.
+`--yolo` explicitly means `danger-full-access` plus `never` approval. It is not
+inferred. App-owned launch cannot be combined with detach/foreground/resume,
+`--remote`, peer/name/purpose options, raw `-c`, or arbitrary passthrough flags.
+
+Use `--json` for the stable launch result, including creation/turn outcomes,
+provider task id, connected host, owner/runtime, registry persistence, and the
+app-opening hint. An ambiguous timeout is never retried. If task creation
+succeeded but registry persistence did not, the result prints an exact
+`session recover-app-owned` command for the creation host. Cross-device access
+still depends on Codex remote connections and that host being awake; no path
+promises two concurrent writers.
+
+A native app `+` task is different: cctrl observes it only after Codex exposes a
+provider id and does not intercept its creation. Once a tmux task has been
+registered with the app-server, you can instead release that terminal owner and
+continue in the ChatGPT/Codex app:
 
 ```bash
 cctrl session release-to-app TMUX--myapp --yes

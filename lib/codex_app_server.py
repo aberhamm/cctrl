@@ -932,6 +932,227 @@ def thread_snapshot_report(
         return report, EXIT_INTERNAL
 
 
+def _method_supported(report: Mapping[str, Any], method: str) -> bool:
+    fact = report.get("methods", {}).get(method, {})
+    return isinstance(fact, dict) and fact.get("status") == "supported"
+
+
+def _thread_id(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    thread = value.get("thread")
+    candidates = [thread.get("id") if isinstance(thread, dict) else None, value.get("threadId"), value.get("id")]
+    return next((item for item in candidates if isinstance(item, str) and item), None)
+
+
+def _thread_cwd(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    thread = value.get("thread")
+    candidates = [thread.get("cwd") if isinstance(thread, dict) else None, value.get("cwd")]
+    return next((item for item in candidates if isinstance(item, str) and item), None)
+
+
+def _write_launch_receipt(path: str, provider_task_id: str, cwd: str) -> None:
+    """Atomically persist the cctrl provenance needed for safe recovery."""
+
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "kind": "cctrl-app-owned-launch-receipt",
+        "provider": "codex",
+        "provider_task_id": provider_task_id,
+        "cwd": cwd,
+        "created_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def launch_report(
+    *,
+    executable_override: str | None,
+    timeouts: Timeouts,
+    cwd: str,
+    model: str | None,
+    reasoning_effort: str | None,
+    sandbox: str | None,
+    approval_policy: str | None,
+    message: str | None,
+    receipt_file: str,
+) -> tuple[dict[str, Any], int]:
+    """Create one durable App Server thread and optionally start one turn.
+
+    Requests are intentionally never retried.  Once a mutating request has
+    been written, any transport/protocol failure is reported as ambiguous.
+    """
+
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "task_creation_outcome": "not-attempted",
+        "provider_task_id": None,
+        "launch_receipt_persisted": False,
+        "turn_outcome": "not-requested" if message is None else "not-attempted",
+        "errors": [],
+    }
+    capabilities, capability_rc = capability_report(
+        executable_override=executable_override, timeouts=timeouts
+    )
+    required = ["thread/start"] + (["turn/start"] if message is not None else [])
+    unsupported = [method for method in required if not _method_supported(capabilities, method)]
+    if capability_rc != 0 or unsupported:
+        report["errors"] = list(capabilities.get("errors", []))
+        if unsupported:
+            report["errors"].append(
+                {
+                    "code": EXIT_USAGE,
+                    "phase": "capability",
+                    "reason": "required App Server capability is not proven: " + ", ".join(unsupported),
+                }
+            )
+        return report, capability_rc or EXIT_USAGE
+
+    runtime: Runtime | None = None
+    try:
+        runtime = discover_runtime(executable_override, validation_timeout=timeouts.connect)
+        with AppServerClient(
+            runtime,
+            socket_path=os.environ.get("CCTRL_CODEX_APP_SERVER_SOCKET") or None,
+            timeouts=timeouts,
+        ) as client:
+            client.initialize()
+            params: dict[str, Any] = {"cwd": cwd, "ephemeral": False}
+            if model is not None:
+                params["model"] = model
+            if sandbox is not None:
+                params["sandbox"] = sandbox
+            if approval_policy is not None:
+                params["approvalPolicy"] = approval_policy
+            if reasoning_effort is not None:
+                # App Server v2 exposes effort on turn/start.  The config key
+                # makes it sticky for an empty thread without accepting raw
+                # caller-supplied config.
+                params["config"] = {"model_reasoning_effort": reasoning_effort}
+            try:
+                started = client.thread_start(params)
+            except AdapterError as exc:
+                report["task_creation_outcome"] = "unknown"
+                report["errors"].append(exc.as_dict())
+                return report, exc.exit_code
+            provider_task_id = _thread_id(started)
+            if provider_task_id is None:
+                report["task_creation_outcome"] = "unknown"
+                report["errors"].append(
+                    AdapterError(EXIT_PROTOCOL, "request", "thread/start response contained no task id").as_dict()
+                )
+                return report, EXIT_PROTOCOL
+            report["task_creation_outcome"] = "created"
+            report["provider_task_id"] = provider_task_id
+            try:
+                _write_launch_receipt(receipt_file, provider_task_id, cwd)
+                report["launch_receipt_persisted"] = True
+            except Exception as exc:
+                report["errors"].append(
+                    AdapterError(EXIT_INTERNAL, "receipt", f"launch receipt persistence failed: {exc}").as_dict()
+                )
+                return report, EXIT_INTERNAL
+            if message is not None:
+                options: dict[str, Any] = {}
+                if model is not None:
+                    options["model"] = model
+                if reasoning_effort is not None:
+                    options["effort"] = reasoning_effort
+                if approval_policy is not None:
+                    options["approvalPolicy"] = approval_policy
+                try:
+                    client.turn_start(
+                        provider_task_id,
+                        [{"type": "text", "text": message}],
+                        **options,
+                    )
+                    report["turn_outcome"] = "started"
+                except AdapterError as exc:
+                    report["turn_outcome"] = "unknown"
+                    report["errors"].append(exc.as_dict())
+                    return report, exc.exit_code
+        return report, 0
+    except AdapterError as exc:
+        report["errors"].append(exc.as_dict())
+        return report, exc.exit_code
+    except Exception as exc:
+        error = AdapterError(EXIT_INTERNAL, "internal", f"unexpected adapter failure: {exc}")
+        report["errors"].append(error.as_dict())
+        return report, EXIT_INTERNAL
+
+
+def recover_report(
+    *, executable_override: str | None, timeouts: Timeouts, provider_task_id: str, expected_cwd: str
+) -> tuple[dict[str, Any], int]:
+    """Verify an exact provider id before the shell retries registry persistence."""
+
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "provider_task_id": provider_task_id,
+        "verified": False,
+        "errors": [],
+    }
+    capabilities, capability_rc = capability_report(
+        executable_override=executable_override, timeouts=timeouts
+    )
+    if capability_rc != 0 or not _method_supported(capabilities, "thread/read"):
+        report["errors"] = list(capabilities.get("errors", []))
+        report["errors"].append(
+            {"code": EXIT_USAGE, "phase": "capability", "reason": "thread/read capability is not proven"}
+        )
+        return report, capability_rc or EXIT_USAGE
+    try:
+        runtime = discover_runtime(executable_override, validation_timeout=timeouts.connect)
+        with AppServerClient(
+            runtime,
+            socket_path=os.environ.get("CCTRL_CODEX_APP_SERVER_SOCKET") or None,
+            timeouts=timeouts,
+        ) as client:
+            client.initialize()
+            value = client.thread_read(provider_task_id)
+        observed = _thread_id(value)
+        if observed is None:
+            raise AdapterError(EXIT_PROTOCOL, "request", "thread/read response contained no task id")
+        if observed != provider_task_id:
+            raise AdapterError(EXIT_PROTOCOL, "request", "thread/read returned a different task id")
+        observed_cwd = _thread_cwd(value)
+        if observed_cwd is None:
+            raise AdapterError(EXIT_PROTOCOL, "request", "thread/read response contained no cwd")
+        if os.path.realpath(observed_cwd) != os.path.realpath(expected_cwd):
+            raise AdapterError(EXIT_PROTOCOL, "request", "thread/read cwd did not match the cctrl launch receipt")
+        report["verified"] = True
+        report["cwd"] = expected_cwd
+        return report, 0
+    except AdapterError as exc:
+        report["errors"].append(exc.as_dict())
+        return report, exc.exit_code
+    except Exception as exc:
+        error = AdapterError(EXIT_INTERNAL, "internal", f"unexpected adapter failure: {exc}")
+        report["errors"].append(error.as_dict())
+        return report, EXIT_INTERNAL
+
+
 def _human_report(report: Mapping[str, Any]) -> str:
     lines = [
         f"Codex CLI: {report.get('cli_version') or 'unknown'}",
@@ -1017,6 +1238,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         default=os.environ.get("CCTRL_CODEX_INACTIVITY_TIMEOUT", "10"),
     )
+    launch = subparsers.add_parser(
+        "launch", help="create one app-owned Codex task", description="Create one durable App Server task without a terminal writer."
+    )
+    launch.add_argument("--cwd", required=True)
+    launch.add_argument("--model")
+    launch.add_argument("--reasoning-effort")
+    launch.add_argument("--sandbox", choices=("read-only", "workspace-write", "danger-full-access"))
+    launch.add_argument("--approval-policy", choices=("untrusted", "on-request", "never"))
+    launch.add_argument("--message")
+    launch.add_argument("--receipt-file", required=True, help=argparse.SUPPRESS)
+    launch.add_argument("--codex", help=argparse.SUPPRESS)
+    recover = subparsers.add_parser(
+        "recover", help="verify an app-owned task by exact provider id", description="Verify an exact App Server task before registry recovery."
+    )
+    recover.add_argument("provider_task_id")
+    recover.add_argument("--expected-cwd", required=True, help=argparse.SUPPRESS)
+    recover.add_argument("--codex", help=argparse.SUPPRESS)
+    for command in (launch, recover):
+        command.add_argument("--connect-timeout", type=_positive_float, default=os.environ.get("CCTRL_CODEX_CONNECT_TIMEOUT", "3"))
+        command.add_argument("--handshake-timeout", type=_positive_float, default=os.environ.get("CCTRL_CODEX_HANDSHAKE_TIMEOUT", "5"))
+        command.add_argument("--request-timeout", type=_positive_float, default=os.environ.get("CCTRL_CODEX_REQUEST_TIMEOUT", "15"))
+        command.add_argument("--inactivity-timeout", type=_positive_float, default=os.environ.get("CCTRL_CODEX_INACTIVITY_TIMEOUT", "10"))
     return parser
 
 
@@ -1025,7 +1268,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = build_parser().parse_args(raw_argv)
     except AdapterError as exc:
-        report = _empty_report()
+        if raw_argv[:1] == ["launch"]:
+            report = {
+                "schema_version": 1,
+                "task_creation_outcome": "not-attempted",
+                "provider_task_id": None,
+                "turn_outcome": "not-attempted",
+                "errors": [],
+            }
+        elif raw_argv[:1] == ["recover"]:
+            report = {
+                "schema_version": 1,
+                "provider_task_id": raw_argv[1] if len(raw_argv) > 1 else None,
+                "verified": False,
+                "errors": [],
+            }
+        else:
+            report = _empty_report()
         report["errors"].append(exc.as_dict())
         if "--json" in raw_argv:
             json.dump(report, sys.stdout, sort_keys=True, separators=(",", ":"))
@@ -1071,6 +1330,35 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             for error in report["errors"]:
                 print(f"Error [{error['phase']}]: {error['reason']}", file=sys.stderr)
+        return exit_code
+    if args.command in {"launch", "recover"}:
+        timeouts = Timeouts(
+            connect=args.connect_timeout,
+            handshake=args.handshake_timeout,
+            request=args.request_timeout,
+            inactivity=args.inactivity_timeout,
+        )
+        if args.command == "launch":
+            report, exit_code = launch_report(
+                executable_override=args.codex or os.environ.get("CCTRL_CODEX_BIN") or None,
+                timeouts=timeouts,
+                cwd=args.cwd,
+                model=args.model,
+                reasoning_effort=args.reasoning_effort,
+                sandbox=args.sandbox,
+                approval_policy=args.approval_policy,
+                message=args.message,
+                receipt_file=args.receipt_file,
+            )
+        else:
+            report, exit_code = recover_report(
+                executable_override=args.codex or os.environ.get("CCTRL_CODEX_BIN") or None,
+                timeouts=timeouts,
+                provider_task_id=args.provider_task_id,
+                expected_cwd=args.expected_cwd,
+            )
+        json.dump(report, sys.stdout, sort_keys=True, separators=(",", ":"))
+        sys.stdout.write("\n")
         return exit_code
     return EXIT_USAGE
 

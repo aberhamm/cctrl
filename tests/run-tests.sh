@@ -7816,6 +7816,9 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
         codex-lifecycle)
             # Defined in the later Codex-hook section; dispatched there.
             ;;
+        app-owned-launch)
+            # Defined in the later Codex App Server section; dispatched there.
+            ;;
         session-attest)
             test_session_attest_live_tmux_process_matches
             test_session_attest_direct_metadata
@@ -7906,7 +7909,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
-if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" ]]; then
+if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" ]]; then
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -9167,6 +9170,220 @@ PY
     echo "ok: Codex hooks install additively and observer remains bounded and fail-open"
 }
 
+test_app_owned_launch() {
+    local root="$TMPDIR/app-owned-launch" bin="$TMPDIR/app-owned-launch/bin" fake="$TMPDIR/app-owned-launch/bin/codex"
+    local trace="$root/trace.jsonl" counter="$root/counter" tmux_log="$root/tmux.log" data="$root/data" meta="$root/meta"
+    mkdir -p "$bin" "$data" "$meta"
+    cat > "$fake" <<'PY'
+#!/usr/bin/python3
+import datetime,hashlib,json,os,sys,time
+from pathlib import Path
+args=sys.argv[1:]; mode=os.environ.get("FAKE_APP_MODE","success")
+trace=Path(os.environ["FAKE_APP_TRACE"]); counter=Path(os.environ["FAKE_APP_COUNTER"])
+tasks=counter.with_name("tasks.json")
+if args == ["--version"]: print("codex-cli 1.2.3"); raise SystemExit
+if args[:3] == ["app-server","daemon","version"]: print('{"cliVersion":"1.2.3","appServerVersion":"1.2.3"}'); raise SystemExit
+if args[:2] == ["app-server","generate-json-schema"]:
+    out=Path(args[args.index("--out")+1]); out.mkdir(parents=True,exist_ok=True)
+    methods=["thread/start","thread/read","thread/list","turn/start"]
+    (out/"ClientRequest.json").write_text(json.dumps({"title":"ClientRequest","oneOf":[{"properties":{"method":{"enum":[m]}}} for m in methods]}))
+    raise SystemExit
+if args[:2] != ["app-server","proxy"]: raise SystemExit(2)
+def send(v): print(json.dumps(v,separators=(",",":")),flush=True)
+for line in sys.stdin:
+    m=json.loads(line); method=m.get("method")
+    if method: trace.open("a").write(json.dumps({"method":method,"params":m.get("params")})+"\n")
+    if method == "initialize":
+        send({"id":m["id"],"result":{"userAgent":"codex-cli/1.2.3","codexHome":"/tmp/fake","platformFamily":"unix","platformOs":"macos"}})
+    elif method == "initialized": pass
+    elif method == "thread/start":
+        n=int(counter.read_text())+1 if counter.exists() else 1; counter.write_text(str(n))
+        if mode == "thread-timeout": time.sleep(1); continue
+        task_id=f"thread-{n}"; known=json.loads(tasks.read_text()) if tasks.exists() else {}
+        known[task_id]=m.get("params",{}).get("cwd"); tasks.write_text(json.dumps(known))
+        send({"id":m["id"],"result":{"thread":{"id":task_id,"cwd":known[task_id]}}})
+    elif method == "turn/start":
+        if mode == "hook-before-register":
+            task_id=m["params"]["threadId"]; host=Path(os.environ["CCTRL_HOST_ID_FILE"]).read_text().strip()
+            key=hashlib.sha256(("codex\0"+host+"\0"+task_id).encode()).hexdigest()
+            now=datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+            record={"schema_version":2,"provider":"codex","provider_task_id":task_id,"origin":"codex-app","host_id":host,
+              "registered_by_cctrl":False,"launched_by_cctrl":False,"execution_runtime":"unknown","control_owner":"unknown",
+              "lifecycle_state":"active","restore_strategy":None,"last_observed_at":now,"tmux_session":None,
+              "lineage":{"forked_from_id":None,"parent_thread_id":None,"derived_root_id":None,"derived_root_basis":None},
+              "ownership_evidence":[],"lifecycle_observations":[],"registry_event_ids":[],"registry_source_high_water":{},
+              "ownership_observations":[],"cwd":json.loads(tasks.read_text())[task_id],"agent":"codex","conversation_id":task_id}
+            Path(os.environ["CCTRL_SESSION_METADATA_DIR"],f"task-{key}.json").write_text(json.dumps(record))
+        if mode == "turn-timeout": time.sleep(1); continue
+        send({"id":m["id"],"result":{"turn":{"id":"turn-1"}}})
+    elif method == "thread/read":
+        task_id=m["params"]["threadId"]; known=json.loads(tasks.read_text()) if tasks.exists() else {}
+        send({"id":m["id"],"result":{"thread":{"id":task_id,"cwd":known.get(task_id,os.getcwd())}}})
+PY
+    chmod +x "$fake"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${FAKE_TMUX_LOG:?}"
+exit 91
+SH
+    chmod +x "$bin/tmux"
+    : > "$trace"; : > "$tmux_log"
+    local before after out rc=0 record
+    before="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" start --agent codex --app-owned "$root" --model gpt-6-astra --reasoning-effort high \
+        --sandbox workspace-write --ask-for-approval on-request -m "do it" --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "app-owned success failed: $out"
+    jq -e '.task_creation_outcome=="created" and .provider_task_id=="thread-1" and .turn_outcome=="started" and
+      .owner=="app" and .runtime=="app-server" and .registry_persisted==true and .partial==false' <<< "$out" >/dev/null \
+      || fail "app-owned result contract is wrong: $out"
+    [[ "$(jq -s '[.[]|select(.method=="thread/start")]|length' "$trace")" == 1 ]] || fail "thread/start was not emitted exactly once"
+    [[ "$(jq -s '[.[]|select(.method=="turn/start")]|length' "$trace")" == 1 ]] || fail "turn/start was not emitted exactly once"
+    local canonical_root
+    canonical_root="$(cd "$root" && pwd -P)"
+    jq -s -e '[.[]|select(.method=="thread/start")][0].params |
+      .cwd==$cwd and .model=="gpt-6-astra" and .sandbox=="workspace-write" and .approvalPolicy=="on-request" and
+      .config.model_reasoning_effort=="high"' --arg cwd "$canonical_root" "$trace" >/dev/null || fail "normalized settings were not mapped: $(cat "$trace")"
+    jq -s -e '[.[]|select(.method=="turn/start")][0].params.effort=="high"' "$trace" >/dev/null || fail "turn effort was not mapped"
+    [[ ! -s "$tmux_log" ]] || fail "app-owned launch invoked tmux"
+    record="$(find "$meta" -name 'task-*.json' -print -quit)"
+    jq -e '.provider_task_id=="thread-1" and .origin=="cctrl" and .registered_by_cctrl==true and
+      .launched_by_cctrl==true and .execution_runtime=="app-server" and .control_owner=="app" and
+      .restore_strategy=="provider-managed" and .tmux_session==null' "$record" >/dev/null || fail "app-owned record is wrong"
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" start --agent codex --app-owned "$root" --json)" || fail "second same-cwd app launch failed"
+    [[ "$(jq -r '.provider_task_id' <<< "$out")" == thread-2 ]] || fail "same-cwd launch was deduplicated by cwd"
+    [[ "$(find "$meta" -name 'task-*.json' | wc -l | tr -d ' ')" == 2 ]] || fail "same-cwd provider identities did not remain distinct"
+
+    : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=hook-before-register \
+        FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" CCTRL_DATA_DIR="$data" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" start --agent codex --app-owned "$root" -m hi --json)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "hook-race launch failed: $out"
+    record="$(find "$meta" -name 'task-*.json' -print -quit)"
+    jq -e '.origin=="cctrl" and .registered_by_cctrl==true and .launched_by_cctrl==true and
+      .control_owner=="app" and .execution_runtime=="app-server"' "$record" >/dev/null \
+      || fail "hook-before-register race lost cctrl provenance"
+    local profiles="$root/profiles"
+    mkdir -p "$profiles"
+    printf '%s\n' '{"agents":{"codex":{"model":"profile-model","reasoningEffort":"low","args":["--sandbox","workspace-write","--ask-for-approval","untrusted"]}}}' > "$profiles/app.json"
+    # shellcheck disable=SC2016
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval \
+        'PROFILES_DIR="$1"; shift; _launch_app_owned_codex "$@"' "$profiles" --app-owned "$root" --profile app \
+        --model cli-model --reasoning-effort high --sandbox read-only --json)" || fail "profile-normalized app launch failed"
+    jq -e '.task_creation_outcome=="created" and .registry_persisted==true' <<< "$out" >/dev/null || fail "profile launch result is wrong"
+    jq -s -e '[.[]|select(.method=="thread/start")][-1].params |
+      .model=="cli-model" and .config.model_reasoning_effort=="high" and .sandbox=="read-only" and .approvalPolicy=="untrusted"' "$trace" >/dev/null \
+      || fail "CLI-over-profile precedence was not preserved"
+
+    : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=thread-timeout CCTRL_CODEX_REQUEST_TIMEOUT=.05 \
+        FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" CCTRL_DATA_DIR="$data" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" start --agent codex --app-owned "$root" --json)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "ambiguous thread/start unexpectedly succeeded"
+    jq -e '.task_creation_outcome=="unknown" and .provider_task_id==null and .registry_persisted=="unknown" and
+      (.recovery_command|contains("do not rerun creation automatically"))' <<< "$out" >/dev/null || fail "ambiguous creation result is wrong: $out"
+    [[ "$(jq -s '[.[]|select(.method=="thread/start")]|length' "$trace")" == 1 ]] || fail "ambiguous thread/start was retried"
+    jq -s -e '[.[]|select(.method=="thread/start")][0].params | keys == ["cwd","ephemeral"]' "$trace" >/dev/null \
+      || fail "omitted app-owned settings did not retain provider defaults"
+
+    : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=turn-timeout CCTRL_CODEX_REQUEST_TIMEOUT=.05 \
+        FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" CCTRL_DATA_DIR="$data" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" start --agent codex --app-owned "$root" -m hi --json)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "ambiguous turn unexpectedly succeeded"
+    jq -e '.task_creation_outcome=="created" and .provider_task_id=="thread-1" and .turn_outcome=="unknown" and .registry_persisted==true and .partial==true' <<< "$out" >/dev/null \
+      || fail "ambiguous turn result is wrong: $out"
+    [[ "$(jq -s '[.[]|select(.method=="turn/start")]|length' "$trace")" == 1 ]] || fail "ambiguous turn was retried"
+
+    : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+        CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME=1 CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" start --agent codex --app-owned "$root" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "registry persistence failure unexpectedly succeeded"
+    jq -e '.provider_task_id=="thread-1" and .registry_persisted==false and .recovery_command=="cctrl session recover-app-owned thread-1"' <<< "$out" >/dev/null \
+      || fail "partial recovery result is wrong: $out"
+    local recovery_cwd="$root/recovery-cwd"
+    mkdir -p "$recovery_cwd"
+    out="$(cd "$recovery_cwd" && PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" session recover-app-owned thread-1 --json)" || fail "known-id recovery failed"
+    jq -e '.verified==true and .registry_persisted==true' <<< "$out" >/dev/null || fail "recovery output is wrong"
+    record="$(find "$meta" -name 'task-*.json' -print -quit)"
+    [[ "$(jq -r '.cwd' "$record")" == "$canonical_root" ]] || fail "recovery substituted its shell cwd"
+    rc=0
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" session recover-app-owned native-task --json)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "unrelated native task was relabeled as cctrl-launched"
+    jq -e '.verified==false and (.error|contains("no cctrl app-owned launch receipt"))' <<< "$out" >/dev/null \
+      || fail "unrelated native recovery failure was not explicit: $out"
+
+    for bad in detach foreground resume remote peer purpose name permission raw-config; do
+        local -a bad_args=()
+        case "$bad" in
+            detach) bad_args=(--detach) ;;
+            foreground) bad_args=(--foreground) ;;
+            resume) bad_args=(--resume) ;;
+            remote) bad_args=(--remote unix://) ;;
+            peer) bad_args=(--peer peer1) ;;
+            purpose) bad_args=(--purpose nope) ;;
+            name) bad_args=(--name nope) ;;
+            permission) bad_args=(--permission-mode bypassPermissions) ;;
+            raw-config) bad_args=(-c raw=true) ;;
+        esac
+        if PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+            CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+            "$ROOT/cctrl" start --agent codex --app-owned "$root" "${bad_args[@]}" >/dev/null 2>&1; then
+            fail "incompatible app-owned args were accepted: $bad"
+        fi
+    done
+    if CCTRL_AGENT=claude PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" start --app-owned "$root" >/dev/null 2>&1; then
+        fail "CCTRL_AGENT=claude was ignored by app-owned launch"
+    fi
+    if PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+        CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        "$ROOT/cctrl" --agent claude start --app-owned "$root" >/dev/null 2>&1; then
+        fail "global --agent claude was ignored by app-owned launch"
+    fi
+    if CCTRL_TEST_ONLY=app-owned-launch cctrl_source_eval '_start_requests_app_owned --message --app-owned'; then
+        fail "--app-owned option value selected app-owned mode locally"
+    fi
+    local hosts="$root/hosts.json" ssh_log="$root/ssh.log"
+    printf '{"remote":{"hostname":"example.invalid","user":"tester"}}\n' > "$hosts"
+    cat > "$bin/ssh" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "${FAKE_SSH_LOG:?}"
+SH
+    chmod +x "$bin/ssh"
+    # Positional parameters expand inside cctrl_source_eval's child shell.
+    # shellcheck disable=SC2016
+    PATH="$bin:/usr/bin:/bin" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
+      'HOSTS_FILE="$1"; _remote_exec remote start --agent codex --app-owned "$2" --json' "$hosts" "$root" >/dev/null
+    assert_not_contains "$(cat "$ssh_log")" " -t "
+    assert_not_contains "$(cat "$ssh_log")" "--purpose"
+    assert_contains "$(cat "$ssh_log")" "CCTRL_HOST_PREFIX=remote"
+    assert_contains "$(cat "$ssh_log")" "--app-owned"
+    # shellcheck disable=SC2016 # positional parameter belongs to the sourced shell
+    PATH="$bin:/usr/bin:/bin" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
+      'HOSTS_FILE="$1"; _remote_exec remote start --message --app-owned --purpose fixed' "$hosts" >/dev/null
+    assert_contains "$(cat "$ssh_log")" "-t tester@example.invalid"
+    after="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    [[ "$before" == "$after" ]] || fail "app-owned tests changed the real cctrl live store"
+    echo "ok: app-owned launch is at-most-once, writer-free, recoverable, and settings-safe"
+}
+
+if [[ "${CCTRL_TEST_ONLY:-}" == "app-owned-launch" ]]; then
+    test_app_owned_launch
+    echo "ok"
+    exit 0
+fi
+
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-lifecycle" ]]; then
     test_codex_lifecycle_fixture_contract
     test_codex_lifecycle_ingestion
@@ -9184,6 +9401,7 @@ test_session_pane_has_dialog_refactored
 test_codex_lifecycle_fixture_contract
 test_codex_lifecycle_ingestion
 test_codex_app_server_adapter
+test_app_owned_launch
 test_codex_hook_installation_is_additive_and_observer_is_bounded
 
 echo "ok"
