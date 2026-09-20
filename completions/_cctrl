@@ -236,6 +236,7 @@ _cctrl() {
                 local -a session_cmds=(
                     'ls:List sessions (dir, agent/shell, model, state)'
                     'recover-app-owned:Verify an App Server task and retry registry persistence'
+                    'recover-terminal-identity:Prove or recover an exact provisional terminal receipt'
                     'attach:Reattach to a session'
                     'current:Show this process/session identity'
                     'say:Paste a direct chat message into a live tmux session'
@@ -250,6 +251,14 @@ _cctrl() {
                 _arguments \
                     '--json[Machine-readable output]' \
                     '--recap[Add a one-line recap per session]'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == recover-terminal-identity ]]; then
+                _arguments \
+                    '--launch-id[Exact provisional launch ID]:launch ID:' \
+                    '--launch-event-file[Original completed launch rollout]:file:_files' \
+                    '--launch-event-id[Exact original CommandExecution event ID]:event ID:' \
+                    '--dry-run[Read-only identity proof (default)]' \
+                    '--apply[Repair local receipt after fresh proof; keeps terminal ownership]' \
+                    '--json[Machine-readable proof and result]'
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == say ]]; then
                 _arguments \
                     '--no-submit[Paste without pressing Enter]' \

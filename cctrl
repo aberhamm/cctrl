@@ -431,17 +431,12 @@ _profile_model_for_agent() {
     command -v jq >/dev/null 2>&1 || return 0
 
     model="$(jq -r --arg agent "$agent" '
-        (.agents[$agent].model // .model // empty)
+        if has("agents") then .agents[$agent].model // empty
+        elif $agent == "claude" then .model // empty
+        else empty end
     ' "$pf" 2>/dev/null)"
     [[ -n "$model" ]] || return 0
 
-    # Existing profiles are Claude-oriented. Avoid accidentally passing a Claude
-    # model alias such as "sonnet" into Codex when the active default is reused.
-    if [[ "$agent" == "codex" ]]; then
-        case "$(printf '%s' "$model" | tr '[:upper:]' '[:lower:]')" in
-            *claude*|*sonnet*|*opus*|*haiku*|anthropic/*) return 0 ;;
-        esac
-    fi
     printf '%s' "$model"
 }
 
@@ -2180,6 +2175,8 @@ else:
         if record.get(field) != event[field]:
             print(f"event identity mismatch for {field}", file=sys.stderr); raise SystemExit(2)
     if event["event_type"] == "register":
+        if payload.get("require_absent") is True:
+            emit("stale", record, "recovery requires an absent canonical destination")
         incoming = copy.deepcopy(payload.get("record"))
         if not isinstance(incoming, dict) or incoming.get("schema_version") != schema:
             print("register event requires a current-schema payload.record", file=sys.stderr); raise SystemExit(2)
@@ -2415,13 +2412,75 @@ _task_registry_apply_event() {
     return "$rc"
 }
 
-_task_record_promote_legacy() {
+_task_record_promote_legacy() (
+    # A launch receipt update and its promotion share the launch lock. Retire
+    # only the exact source whose current contents were read under that lock.
+    local source="$1" provider_task_id="${2:-}" expected="${3:-}" receipt="${4:-}" proof="${5:-}" key
+    if [[ "$source" == "$SESSION_METADATA_DIR"/launch-*.json ]]; then
+        key="${source##*/}"; key="${key%.json}"
+        # Older interrupted-promotion staging names were not UUIDs. Keep
+        # their compatibility path serialized without accepting a lock path.
+        [[ "$key" =~ ^launch-[0-9a-f-]+$ ]] || key="launch-$(printf '%s' "$source" | shasum -a 256 | awk '{print $1}')"
+        _task_registry_lock_acquire "$key" || return $?
+        trap '_task_registry_lock_release "$TASK_REGISTRY_LOCK_FILE" "$TASK_REGISTRY_LOCK_TOKEN"' EXIT
+    fi
+    _task_record_promote_legacy_locked "$source" "$provider_task_id" "$expected" "$receipt" "$proof"
+)
+
+_task_record_promote_legacy_locked() {
     # Promote a legacy or provisional record after stable provider identity is
     # known. The canonical write commits first; only a provisional source is
     # retired. Legacy compatibility inputs are never modified or removed.
-    local source="$1" provider_task_id="${2:-}" normalized provider host_id canonical tmp now source_version
+    # Caller holds the launch lock (wrapper above, or recovery after reproof).
+    local source="$1" provider_task_id="${2:-}" expected="${3:-}" receipt="${4:-}" proof="${5:-}"
+    local normalized provider host_id canonical tmp now source_version
     [[ -f "$source" && ! -L "$source" ]] || return 1
+    if [[ -n "$expected" ]]; then
+        [[ "$(_task_registry_record_digest "$source")" == "$expected" ]] || {
+            echo "Launch receipt changed after identity verification; retry recovery." >&2
+            return 75
+        }
+    fi
     normalized="$(_task_record_normalize_json "$source")" || return 1
+    if [[ -n "$receipt" ]]; then
+        [[ -n "$expected" && "$source" == "$SESSION_METADATA_DIR"/launch-*.json && -f "$receipt" && ! -L "$receipt" ]] || return 1
+        [[ -n "$proof" && -f "$proof" && ! -L "$proof" ]] || return 1
+        normalized="$(NORMALIZED_RECORD="$normalized" python3 - "$receipt" "$proof" "$provider_task_id" "$expected" <<'PYRECEIPT'
+import json, os, sys
+record = json.loads(os.environ["NORMALIZED_RECORD"])
+with open(sys.argv[1], encoding="utf-8") as handle:
+    receipt = json.load(handle)
+allowed = {"control_surface", "tmux_session", "pane_id", "pane_pid", "wrapper_pid", "pane_started"}
+if not isinstance(receipt, dict) or set(receipt) != allowed:
+    raise SystemExit("Recovery receipt must contain exactly the terminal anchor fields")
+if not (record.get("lifecycle_state") == "provisional" and record.get("provider_task_id") is None
+        and record.get("conversation_id") is None and record.get("origin") == "cctrl"
+        and record.get("launched_by_cctrl") is True and record.get("control_owner") == "cctrl"
+        and record.get("execution_runtime") == "tmux"):
+    raise SystemExit("Recovery requires a provisional cctrl terminal launch")
+for field, value in receipt.items():
+    if not isinstance(value, str) or not value or record.get(field) not in (None, "", value):
+        raise SystemExit("Recovery cannot replace an existing terminal anchor")
+if receipt["control_surface"] != "tmux" or receipt["tmux_session"] != record.get("name"):
+    raise SystemExit("Recovery receipt session mismatch")
+if not all(receipt[f].isdecimal() for f in ("pane_pid", "wrapper_pid")):
+    raise SystemExit("Recovery receipt PID must be numeric")
+if not (receipt["pane_id"].startswith("%") and receipt["pane_id"][1:].isdecimal()):
+    raise SystemExit("Recovery receipt pane must be a tmux pane ID")
+with open(sys.argv[2], encoding="utf-8") as handle:
+    proof = json.load(handle)
+if not (isinstance(proof, dict) and proof.get("verified") is True
+        and proof.get("provider_task_id") == sys.argv[3]
+        and proof.get("expected_source_digest") == sys.argv[4]
+        and proof.get("receipt") == receipt
+        and proof.get("evidence_kind") == "live-native-codex-writable-root-rollout"):
+    raise SystemExit("Recovery proof does not match the source, identity, and receipt")
+record.update(receipt)
+record["terminal_identity_proof"] = proof
+print(json.dumps(record))
+PYRECEIPT
+)" || return 1
+    fi
     source_version="$(jq -r '.schema_version // empty' "$source" 2>/dev/null || true)"
     provider="$(jq -r '.provider' <<< "$normalized")"
     [[ -n "$provider_task_id" ]] || provider_task_id="$(jq -r '.provider_task_id // empty' <<< "$normalized")"
@@ -2485,11 +2544,11 @@ PY
     event_id="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
     jq -n --slurpfile record "$tmp" --arg id "$event_id" --arg provider "$provider" \
         --arg task "$provider_task_id" --arg host "$host_id" --arg observed "$now" \
-        --arg expected "$TASK_REGISTRY_ABSENT_DIGEST" '
+        --arg expected "$TASK_REGISTRY_ABSENT_DIGEST" --arg receipt "$receipt" '
         {version:1,event_id:$id,event_type:"register",provider:$provider,provider_task_id:$task,
          host_id:$host,source:"legacy-promotion",source_instance_id:($record[0].tmux_session // $record[0].name // "promotion"),
          source_sequence:null,source_cursor:null,expected_record_digest:$expected,observed_at:$observed,
-         payload:{authority_class:"authoritative",record:$record[0]}}
+         payload:{authority_class:"authoritative",record:$record[0],require_absent:($receipt != "")}}
     ' > "$event_file" || { rm -f "$tmp" "$event_file"; return 1; }
     result="$(_task_registry_apply_event "$record_key" "$event_file")" || { rm -f "$tmp" "$event_file"; return 1; }
     rm -f "$tmp" "$event_file"
@@ -2503,9 +2562,62 @@ PY
     printf '%s' "$canonical"
 }
 
+_session_update_provisional_field() (
+    # Identity-less launch receipts cannot enter the stable-ID event reducer.
+    # Serialize read/validate/replace using the same launch lock as promotion.
+    local file="$1" session_name="$2" field="$3" value="$4" key tmp=""
+    [[ "$file" == "$SESSION_METADATA_DIR"/launch-*.json ]] || return 1
+    key="${file##*/}"; key="${key%.json}"
+    _task_registry_lock_acquire "$key" || return $?
+    trap '[[ -z "$tmp" ]] || rm -f "$tmp"; _task_registry_lock_release "$TASK_REGISTRY_LOCK_FILE" "$TASK_REGISTRY_LOCK_TOKEN"' EXIT
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    _task_record_normalize_json "$file" >/dev/null 2>&1 || return 1
+    tmp="$(mktemp "$SESSION_METADATA_DIR/.launch-update.XXXXXX")" || return 1
+    python3 - "$file" "$session_name" "$field" "$value" "$key" > "$tmp" <<'PYUPDATE'
+import json, sys
+path, session, field, value, key = sys.argv[1:]
+with open(path, encoding="utf-8") as handle:
+    record = json.load(handle)
+if not (record.get("schema_version") == 2 and record.get("lifecycle_state") == "provisional"
+        and record.get("provider_task_id") is None and record.get("conversation_id") is None
+        and record.get("origin") == "cctrl" and record.get("launched_by_cctrl") is True
+        and record.get("control_owner") == "cctrl" and record.get("execution_runtime") == "tmux"
+        and record.get("name") == session
+        and key == "launch-" + str(record.get("provisional_launch_id"))):
+    raise SystemExit("Not a matching provisional cctrl launch receipt")
+receipt = {"control_surface", "tmux_session", "pane_id", "pane_pid", "wrapper_pid", "pane_started"}
+allowed = receipt | {"health_status", "health_reason", "health_info", "purpose"}
+updates = json.loads(value) if field == "_terminal_anchor_receipt" else {field: value}
+if not isinstance(updates, dict) or (field == "_terminal_anchor_receipt" and set(updates) != receipt):
+    raise SystemExit("Terminal receipt must contain exactly the anchor fields")
+for field, value in updates.items():
+    if field not in allowed or not isinstance(value, str):
+        raise SystemExit("Field is not mutable on a provisional launch receipt")
+    if field in receipt:
+        if not value or record.get(field) not in (None, "", value):
+            raise SystemExit("Cannot replace an existing launch anchor")
+        if field == "control_surface" and value != "tmux":
+            raise SystemExit("Provisional launch receipt must remain terminal-owned")
+        if field == "tmux_session" and value != session:
+            raise SystemExit("Launch receipt session mismatch")
+        if field in {"pane_pid", "wrapper_pid"} and not value.isdecimal():
+            raise SystemExit("Launch receipt PID must be numeric")
+        if field == "pane_id" and not (value.startswith("%") and value[1:].isdecimal()):
+            raise SystemExit("Launch receipt pane must be a tmux pane ID")
+    record[field] = value or None
+print(json.dumps(record, indent=2, sort_keys=True))
+PYUPDATE
+    local rc=$?
+    (( rc == 0 )) || return "$rc"
+    _task_record_normalize_json "$tmp" >/dev/null 2>&1 || return 1
+    chmod 600 "$tmp" || return 1
+    [[ "${CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME:-0}" != "1" ]] || return 76
+    mv "$tmp" "$file"
+)
+
 _session_update_metadata_field() {
-    # Legacy inputs retain their compatibility promotion path. Every schema-v2
-    # update is expressed as an event so the lock covers read/reduce/write.
+    # Stable records update through events. Identity-less launch receipts use
+    # a restricted locked path until provider identity permits promotion.
     local session_name="$1" field="$2" value="$3"
     local file version promoted stable_id record_key event_file event_id now sequence source_instance result
     file="$(_session_metadata_file "$session_name")"
@@ -2520,6 +2632,10 @@ _session_update_metadata_field() {
         fi
     else
         stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
+    fi
+    if [[ "$version" == "$TASK_RECORD_SCHEMA_VERSION" && "$file" == "$SESSION_METADATA_DIR"/launch-*.json && -z "$stable_id" ]]; then
+        _session_update_provisional_field "$file" "$session_name" "$field" "$value"
+        return $?
     fi
     if [[ "$version" != "$TASK_RECORD_SCHEMA_VERSION" || ( "$file" == "$SESSION_METADATA_DIR"/launch-*.json && -n "$stable_id" ) ]]; then
         promoted="$(_task_record_promote_legacy "$file" "$stable_id")" || return 1
@@ -2537,7 +2653,7 @@ _session_update_metadata_field() {
         {version:1,event_id:$id,event_type:"observe",provider:$provider,provider_task_id:$task,
          host_id:$host,source:"cctrl-metadata",source_instance_id:$instance,
          source_sequence:$sequence,source_cursor:null,expected_record_digest:null,observed_at:$observed,
-         payload:{authority_class:"authoritative",set:{($field):(if $value == "" then null else $value end)}}}
+         payload:{authority_class:"authoritative",set:(if $field == "_terminal_anchor_receipt" then ($value | fromjson) else {($field):(if $value == "" then null else $value end)} end)}}
     ' > "$event_file" || { rm -f "$event_file"; return 1; }
     result="$(_task_registry_apply_event "$record_key" "$event_file")" || { rm -f "$event_file"; return 1; }
     rm -f "$event_file"
@@ -2895,9 +3011,10 @@ _res_load1() {
 
 _active_session_count() {
     # Count of live cctrl-managed tmux sessions on THIS machine.
-    local n
-    n="$(_session_list --json 2>/dev/null | jq '[.[] | select(.managed)] | length' 2>/dev/null)"
-    [[ "$n" =~ ^[0-9]+$ ]] && printf '%d' "$n" || printf '0'
+    # Resource context must never discover provider transcripts or telemetry.
+    # The tmux marker is set at creation; legacy unmarked sessions are omitted.
+    tmux list-sessions -F '#{@cctrl_managed}' 2>/dev/null |
+        awk '$0 == "1" {n++} END {print n+0}' || true
 }
 
 _res_health_line() {
@@ -2969,7 +3086,18 @@ _launch_resource_guardrail() {
     esac
 }
 
+_launch_quote() (
+    # Bash 3.2 does not refresh its multibyte quoting state for a temporary
+    # LC_ALL=C assignment on printf. Export it inside this isolated subshell.
+    export LC_ALL=C
+    printf '%q' "$1"
+)
+
 _launch_detached() {
+    # Quote each shell argument byte-for-byte in the C locale. Older Bash
+    # multibyte %q can mix raw UTF-8 bytes with octal escapes; jq then replaces
+    # invalid UTF-8 in the launch receipt, losing the exact bootstrap evidence.
+    # Scope the locale to printf only, never the provider or running session.
     # Launch a cctrl session in a detached tmux session (survives SSH
     # disconnect). Invoked by `cctrl start -d`. No GUI — just tmux.
     #
@@ -3209,13 +3337,13 @@ _launch_detached() {
     local cctrl_q extras_q="" env_q="" base_env_q="CCTRL_TMUX_CONTEXT=1" shell_cmd session_name display_label context_name
     local -a child_args=()
     local metadata_cwd="" metadata_target=""
-    cctrl_q="$(printf '%q' "$SCRIPT_DIR/cctrl")"
+    cctrl_q="$(_launch_quote "$SCRIPT_DIR/cctrl")"
     local env_name env_val
     for env_name in CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_DEVICE_TAG CCTRL_DATA_DIR CCTRL_SESSION_METADATA_DIR; do
         env_val="${!env_name:-}"
-        [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(printf '%q' "$env_val")"
+        [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(_launch_quote "$env_val")"
     done
-    [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(printf '%q' "$peer_name")"
+    [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(_launch_quote "$peer_name")"
     if [[ -n "$peer_name" ]]; then
         if [[ "$passthrough_count" -gt 0 ]]; then
             local inserted_peer=false
@@ -3241,7 +3369,7 @@ _launch_detached() {
         :
     else
         for a in "${child_args[@]}"; do
-            extras_q+=" $(printf '%q' "$a")"
+            extras_q+=" $(_launch_quote "$a")"
         done
     fi
 
@@ -3321,20 +3449,20 @@ _launch_detached() {
         final_purpose="$(_prompt_session_purpose "$default_purpose")"
     fi
 
-    env_q="$base_env_q CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=$(printf '%q' "$session_name")"
-    [[ -n "$metadata_target" ]] && env_q+=" CCTRL_SESSION_TARGET=$(printf '%q' "$metadata_target")"
-    [[ -n "$final_purpose" ]] && env_q+=" CCTRL_SESSION_PURPOSE=$(printf '%q' "$final_purpose")"
+    env_q="$base_env_q CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=$(_launch_quote "$session_name")"
+    [[ -n "$metadata_target" ]] && env_q+=" CCTRL_SESSION_TARGET=$(_launch_quote "$metadata_target")"
+    [[ -n "$final_purpose" ]] && env_q+=" CCTRL_SESSION_PURPOSE=$(_launch_quote "$final_purpose")"
     env_q="${env_q# } "
 
     local cc_name_q
-    cc_name_q="$(printf '%q' "$session_name")"
+    cc_name_q="$(_launch_quote "$session_name")"
     if [[ "$target_kind" == "shortcut" ]]; then
         local name_q
-        name_q="$(printf '%q' "${metadata_target#@}")"
+        name_q="$(_launch_quote "${metadata_target#@}")"
         shell_cmd="${env_q}$cctrl_q @$name_q --foreground --name $cc_name_q$extras_q"
     else
         local dir_q
-        dir_q="$(printf '%q' "$metadata_cwd")"
+        dir_q="$(_launch_quote "$metadata_cwd")"
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
@@ -3355,7 +3483,9 @@ _launch_detached() {
     tmux set-option -t "$session_name" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
     # Bind this registry record to the newly-created tmux pane. A later
     # attestation rejects a recycled session name or a replaced pane.
-    _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null || true
+    if ! _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null; then
+        echo -e "${YELLOW}⚠  Could not persist the launch pane receipt; session remains running. Attestation/release will require identity recovery.${RESET}" >&2
+    fi
 
     # Post-spawn health check (plan 056): poll the pane for known blocking
     # prompts and auto-dismiss safe ones. Only for detached spawns (not
@@ -7687,19 +7817,21 @@ PY
     elif [[ -n "${CCTRL_CODEX_RECONCILE_TMUX_JSON:-}" ]]; then
         printf '%s\n' "$CCTRL_CODEX_RECONCILE_TMUX_JSON" > "$tmux_file"
     elif command -v tmux >/dev/null 2>&1; then
-        tmux list-panes -a -F '#{session_name}\t#{pane_id}\t#{pane_pid}\t#{pane_start_command}\t#{pane_current_command}' > "$scratch/tmux.tsv" 2>"$scratch/tmux.err" || tmux_rc=$?
-        python3 - "$scratch/tmux.tsv" "$scratch/tmux.err" "$observed_at" "$tmux_rc" > "$tmux_file" <<'PY'
+        tmux -u list-panes -a -F '#{pane_id}|#{pane_pid}|#{==:#{pane_current_command},codex}|#{session_name}' > "$scratch/tmux.tsv" 2>"$scratch/tmux.err" || tmux_rc=$?
+        python3 - "$scratch/tmux.tsv" "$scratch/tmux.err" "$observed_at" "$tmux_rc" "$SCRIPT_DIR/lib" > "$tmux_file" <<'PY'
 import hashlib, json, sys
 from pathlib import Path
+sys.path.insert(0, sys.argv[5])
+from tmux_snapshot import parse_panes
 rows_path, error_path, observed_at, rc = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], int(sys.argv[4])
 rows = []
-if rc == 0:
-    for line in rows_path.read_text(errors="replace").splitlines():
-        fields = line.split("\t", 4)
-        if len(fields) == 5:
-            rows.append(dict(zip(("session", "pane_id", "pane_pid", "start_command", "current_command"), fields)))
-body = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
 error = error_path.read_text(errors="replace").strip() if rc else None
+if rc == 0:
+    try:
+        rows = parse_panes(rows_path.read_text(encoding="utf-8"))
+    except (ValueError, UnicodeError) as exc:
+        rc, error = 1, str(exc)
+body = json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
 print(json.dumps({"schema_version":1,"status":"available" if rc == 0 else "unavailable",
  "observed_at":observed_at,"source_cursor":hashlib.sha256(body).hexdigest() if rc == 0 else None,
  "panes":rows,"error":error}, sort_keys=True,separators=(",",":")))
@@ -7891,7 +8023,7 @@ for entry in registry.get("records", []):
     elif tmux_live:
         owner,runtime,state,restore="cctrl","tmux","active","tmux"
         reason="live anchored cctrl tmux owner for exact provider task id"
-    elif app_live:
+    elif app_live and tmux_source["status"] == "confirmed-absence":
         owner,runtime,state,restore="app","app-server","active","provider-managed"
         reason="authoritative App Server live-owner state with confirmed tmux absence"
     elif authority_ambiguous:
@@ -8004,6 +8136,8 @@ cmd_session() {
             echo "  cctrl session recover-app-owned <provider-task-id>"
             echo "                                 Verify an exact App Server task and retry only its registry launch event"
             echo "  cctrl session archive <name>   Archive a completed cctrl Codex task"
+            echo "  cctrl session recover-terminal-identity --launch-id ID [--dry-run|--apply] [--json]"
+            echo "                                 Prove/recover a provisional Codex terminal receipt"
             echo "  cctrl session attest <name>    Verify a recorded tmux owner against its live pane"
             echo "    --json                       Machine-readable control-surface attestation"
             echo "  cctrl session release-to-app <session>|--all"
@@ -8069,6 +8203,7 @@ cmd_session() {
         recover-app-owned) _session_recover_app_owned "$@" ;;
         archive) _session_archive_codex_task "$@" ;;
         attest) _session_attest "$@" ;;
+        recover-terminal-identity) _session_recover_terminal_identity "$@" ;;
         mcp) _session_cmd_mcp "$@" ;;
         ingest-event) _session_ingest_event_stdin "$@" ;;
         release-to-app|release) _session_release_to_app "$@" ;;
@@ -8204,19 +8339,17 @@ _session_find_agent_in_process_table() {
 }
 
 _session_capture_tmux_attestation_anchor() {
-    # Called immediately after cctrl creates a tmux session. The pane PID and
-    # its start time make the metadata record resistant to a recycled tmux name.
-    local session="$1" line pane_id pane_pid pane_started
+    # Publish the complete receipt in one transaction; never expose half an
+    # anchor if a process probe or metadata publication fails.
+    local session="$1" line pane_id pane_pid pane_started receipt
     line="$(tmux list-panes -t "$session" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)"
     IFS=: read -r pane_id pane_pid <<< "$line"
-    [[ -n "$pane_id" && "$pane_pid" =~ ^[0-9]+$ ]] || return 1
+    [[ "$pane_id" =~ ^%[0-9]+$ && "$pane_pid" =~ ^[0-9]+$ ]] || return 1
     pane_started="$(_session_tmux_host_process_started "$session" "$pane_pid")"
-    _session_update_metadata_field "$session" control_surface tmux || return 1
-    _session_update_metadata_field "$session" tmux_session "$session" || return 1
-    _session_update_metadata_field "$session" pane_id "$pane_id" || return 1
-    _session_update_metadata_field "$session" pane_pid "$pane_pid" || return 1
-    _session_update_metadata_field "$session" wrapper_pid "$pane_pid" || return 1
-    _session_update_metadata_field "$session" pane_started "$pane_started" || return 1
+    [[ -n "$pane_started" ]] || return 1
+    receipt="$(jq -nc --arg session "$session" --arg pane "$pane_id" --arg pid "$pane_pid" --arg started "$pane_started" '
+        {control_surface:"tmux",tmux_session:$session,pane_id:$pane,pane_pid:$pid,wrapper_pid:$pid,pane_started:$started}')" || return 1
+    _session_update_metadata_field "$session" _terminal_anchor_receipt "$receipt"
 }
 
 _session_attest_json() {
@@ -8252,6 +8385,71 @@ _session_attest_json() {
             checked_at: $checked_at
         }'
 }
+
+_session_terminal_identity_proof() {
+    local id="$1"; shift
+    python3 "$SCRIPT_DIR/lib/terminal_identity.py" --metadata-dir "$SESSION_METADATA_DIR" \
+        --launch-id "$id" --host-id-file "$CCTRL_HOST_ID_FILE" --codex-home "$CODEX_DIR" "$@"
+}
+
+_session_recover_terminal_identity() (
+    # A narrowly scoped receipt recovery, never a writer handoff. Default is
+    # read-only proof; --apply repeats proof under the provisional launch lock.
+    local launch_id="" apply=false json=false proof result rc=0
+    local -a event_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --launch-id) [[ $# -ge 2 ]] || return 64; launch_id="$2"; shift 2 ;;
+            --launch-event-file|--launch-event-id) [[ $# -ge 2 ]] || return 64; event_args+=("$1" "$2"); shift 2 ;;
+            --apply) apply=true; shift ;;
+            --dry-run) apply=false; shift ;;
+            --json) json=true; shift ;;
+            -h|--help)
+                echo "Usage: cctrl session recover-terminal-identity --launch-id ID [--dry-run|--apply] [--json]"
+                echo "Prove exact live Codex root identity; optionally repair only the local launch receipt."
+                echo "Optional: --launch-event-file PATH --launch-event-id ID (exact original completed launch)."
+                echo "Never transfers ownership, changes provider state/locks, or stops the terminal."
+                return 0 ;;
+            *) return 64 ;;
+        esac
+    done
+    [[ "$launch_id" =~ ^[0-9a-f-]{16,64}$ ]] || { echo "An exact provisional --launch-id is required." >&2; return 64; }
+    local file="$SESSION_METADATA_DIR/launch-$launch_id.json" scratch="" lock_file="" lock_token=""
+    if $apply; then
+        [[ -f "$file" && ! -L "$file" ]] || { echo "Provisional receipt unavailable." >&2; return 66; }
+        _task_registry_lock_acquire "launch-$launch_id" || return $?
+        lock_file="$TASK_REGISTRY_LOCK_FILE"; lock_token="$TASK_REGISTRY_LOCK_TOKEN"
+        trap '_task_registry_lock_release "$lock_file" "$lock_token"; [[ -z "$scratch" ]] || rm -rf "$scratch"' EXIT
+    fi
+    proof="$(_session_terminal_identity_proof "$launch_id" ${event_args[@]+"${event_args[@]}"})" || rc=$?
+    if [[ -z "$proof" ]]; then
+        proof='{"verified":false,"reason":"identity-probe-failed","provider_task_id":null}'
+        rc=1
+    fi
+    result="$(jq --argjson apply "$apply" '. + {applied:false, mode:(if $apply then "apply" else "dry-run" end)}' <<< "$proof")" || return 65
+    if $apply && (( rc == 0 )) && jq -e '.verified == true' <<< "$proof" >/dev/null; then
+        scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-terminal-recovery.XXXXXX")" || return 1
+        printf '%s\n' "$proof" > "$scratch/proof.json"
+        jq '.receipt' <<< "$proof" > "$scratch/receipt.json" || return 65
+        local task digest canonical promoted
+        task="$(jq -r '.provider_task_id' <<< "$proof")"
+        digest="$(jq -r '.expected_source_digest' <<< "$proof")"
+        canonical="$(_task_record_file codex "$(jq -r '.host_id' "$file")" "$task")" || return 1
+        if [[ -e "$canonical" || -L "$canonical" ]]; then
+            result="$(jq '. + {verified:false,reason:"canonical-task-already-exists"}' <<< "$result")"
+            rc=75
+        elif promoted="$(_task_record_promote_legacy_locked "$file" "$task" "$digest" "$scratch/receipt.json" "$scratch/proof.json")"; then
+            result="$(jq --arg record "$promoted" '. + {applied:true,record:$record}' <<< "$result")"
+        else
+            rc=$?
+            result="$(jq '. + {reason:"guarded-promotion-rejected"}' <<< "$result")"
+        fi
+    fi
+    if $json; then printf '%s\n' "$result"; else
+        jq -r '"Identity proof: \(.verified) | applied: \(.applied) | task: \(.provider_task_id // "unknown")\n\(.reason // "Terminal ownership retained; use attest and release dry-run next.")"' <<< "$result"
+    fi
+    return "$rc"
+)
 
 _session_attest() {
     local session="" json=false current=""
@@ -8673,18 +8871,22 @@ _codex_thread_is_unarchived() {
     [[ -n "$thread_id" ]] || return 1
     [[ -n "$db" && -f "$db" ]] || return 0
     python3 - "$db" "$thread_id" <<'PY'
+from pathlib import Path
 import sqlite3
 import sys
+import time
 
 db, thread_id = sys.argv[1], sys.argv[2]
 try:
-    con = sqlite3.connect(db)
-    try:
-        row = con.execute("SELECT archived FROM threads WHERE id = ?", (thread_id,)).fetchone()
-    except sqlite3.OperationalError:
-        row = con.execute("SELECT 0 FROM threads WHERE id = ?", (thread_id,)).fetchone()
+    deadline = time.monotonic() + 0.1
+    con = sqlite3.connect(Path(db).resolve().as_uri() + '?mode=ro', uri=True, timeout=0.05)
+    con.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+    columns = {r[1] for r in con.execute("PRAGMA table_info(threads)")}
+    field = "archived" if "archived" in columns else "0"
+    row = con.execute(f"SELECT {field} FROM threads WHERE id = ?", (thread_id,)).fetchone()
 except Exception:
-    sys.exit(0)
+    # Unavailable state is not evidence that a task is safe to title/archive.
+    sys.exit(1)
 if row is None:
     sys.exit(1)
 sys.exit(0 if row[0] in (0, None, "") else 1)
@@ -9227,8 +9429,11 @@ _session_rich_state() {
     # a flaky one can be turned off without removing the STATE column:
     #   CCTRL_STATE_DETECT_BLOCKED_DIALOG / _UNSENT_DRAFT / _WAITING_INPUT /
     #   _IDLE_DONE = 0 to disable.
-    local sess="$1" base
-    base="$(_session_base_state "$sess")"
+    local sess="$1" base agent="${2:-}"
+    [[ -n "$agent" ]] || agent="$(_session_metadata_field "$sess" agent)"
+    [[ -n "$agent" && "$agent" != "unknown" ]] || agent="$(_agent_from_cmd "$(_session_agent_cmd "$sess")")"
+    base="-"
+    [[ "$agent" == "claude" ]] && base="$(_session_base_state "$sess")"
 
     local en_blocked="${CCTRL_STATE_DETECT_BLOCKED_DIALOG:-1}"
     local en_draft="${CCTRL_STATE_DETECT_UNSENT_DRAFT:-1}"
@@ -9244,7 +9449,7 @@ _session_rich_state() {
         if [[ "${copy_mode:-0}" != "1" ]]; then
             capture="$(tmux capture-pane -p -S -40 -t "$sess" 2>/dev/null || true)"
             if [[ -n "$capture" ]]; then
-                if [[ "$en_blocked" == "1" ]] && _session_pane_has_dialog "$capture"; then
+                if [[ "$en_blocked" == "1" ]] && _session_pane_has_dialog "$capture" "$agent"; then
                     printf '%s' 'blocked-dialog'; return 0
                 fi
                 if [[ "$en_draft" == "1" && "$base" == "idle" ]] && _session_pane_has_draft "$capture"; then
@@ -9371,8 +9576,7 @@ _session_list() {
         [[ -n "$agent" && ( -z "$provider" || "$provider" == "unknown" ) ]] && provider="$agent"
         if [[ -n "$agent" ]]; then
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
-            model="$(printf '%s' "$cmd" | grep -oE -- '--model(=| )[^ ]+' | head -1 | sed -E 's/^--model[= ]//' || true)"
-            model="${model#claude-}"; model="${model%%\[*}"
+            model="$(printf '%s' "$cmd" | python3 "$SCRIPT_DIR/lib/agent_model.py" "$agent")"
             [[ -z "$model" ]] && model="?"
             kind="$agent ($model)"
             if [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
@@ -9391,7 +9595,7 @@ _session_list() {
 
         # Remote-control bridge state (claude only): live | dead | off | - .
         rc_state="-"; bridge_id=""
-        if [[ "$cmd" == *claude* ]]; then
+        if [[ "$agent" == "claude" && "$(_agent_from_cmd "$cmd")" == "claude" ]]; then
             if [[ "$cmd" != *--remote-control* ]]; then
                 rc_state="off"
             else
@@ -9413,14 +9617,15 @@ _session_list() {
                 rollout="$(_session_codex_rollout_path "$name")"
                 [[ -n "$rollout" ]] && session_id="$(_codex_rollout_thread_id "$rollout")"
             fi
-        else
+        elif [[ "$agent" == "claude" ]]; then
             session_id="$(_session_id "$name")"
             transcript="$(_session_transcript_path "$name")"
         fi
         # Listing is intentionally read-only. Stable ids discovered here are
         # returned in public JSON but are promoted only by an explicit mutation
         # such as backfill/archive/title/release.
-        last_active_ms="$(_session_last_active_ms "$name")"
+        last_active_ms=""
+        [[ "$agent" == "claude" ]] && last_active_ms="$(_session_last_active_ms "$name")"
         last_active_iso=""
         if [[ -n "$last_active_ms" ]]; then
             last_active_iso="$(date -r "$(( last_active_ms / 1000 ))" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
@@ -9433,12 +9638,12 @@ _session_list() {
         # (plan 014, from the per-pid status field), falling back to the base
         # state whenever a detector's signal is ambiguous or unavailable.
         # Distinct from attached/detached (which is retained separately).
-        base_state="$(_session_rich_state "$name")"
+        base_state="$(_session_rich_state "$name" "$agent")"
 
         # Recap (opt-in via --recap): costs a bounded transcript read per
         # session, so it's computed only when requested. Empty when none.
         recap_text=""
-        $recap && recap_text="$(_session_recap "$name")"
+        if $recap && [[ "$agent" == "claude" ]]; then recap_text="$(_session_recap "$name")"; fi
 
         if $json; then
             json_items+=("$(jq -n \
@@ -10422,13 +10627,10 @@ _session_release_to_app_one() {
     provider_postcondition="$(jq -c '{verified:.ok,source_cursor,reason:"exact-provider-task-app-openable"}' <<< "$provider_check")"
     status="handed-off"; ok=true
 
-    local lock quarantine_path=""
-    lock="$(_codex_thread_writer_lock_path "$provider_task_id" 2>/dev/null || true)"
-    if [[ -n "$lock" && -f "$lock" ]] && _codex_writer_lock_is_stale "$provider_task_id"; then
-        quarantine_path="$(_codex_quarantine_writer_lock "$provider_task_id" 2>/dev/null || true)"
-    fi
+    # App Server may already hold this task's provider lock without its ID in
+    # argv. Preserve provider lock files; the provider owns their lifecycle.
     _codex_handoff_result "$attempt_id" "$name" "$provider_task_id" "$previous" "$status" true "$provider_postcondition" "$resulting" "Open this exact task in the Codex app; do not recreate a tmux owner." "" true \
-        | jq -c --arg quarantine "$quarantine_path" '. + {lock_action:(if $quarantine=="" then "none" else "quarantined" end),quarantine_path:(if $quarantine=="" then null else $quarantine end)}'
+        | jq -c '. + {lock_action:"none",quarantine_path:null}'
     rm -rf "$scratch"; return 0
 }
 
@@ -11115,7 +11317,10 @@ _session_restore() {
         agent="$(jq -r '.agent // .provider // empty' <<< "$row_file")"
         local -a launch_argv=(-d "$cwd" -r "$resume" --purpose "$purpose")
         [[ -n "$label" ]] && launch_argv+=(--name "$label")
-        [[ "$agent" == codex ]] && launch_argv+=(--agent codex)
+        case "$agent" in
+            claude|codex) launch_argv+=(--agent "$agent") ;;
+            *) failed=$((failed+1)); continue ;;
+        esac
         while IFS=$'\t' read -r key value; do
             case "$key" in
                 model) launch_argv+=(--model "$value") ;;
@@ -11127,6 +11332,31 @@ _session_restore() {
                 no_bridge) [[ "$value" == true ]] && launch_argv+=(--no-bridge) ;;
             esac
         done < <(jq -r '.launch_flags // {} | to_entries[] | [.key,(.value|tostring)] | @tsv' <<< "$row_file")
+        if [[ "$agent" == codex ]]; then
+            # Confirmation and wave pauses can outlive an ownership snapshot.
+            # Repeat the existing closed restore predicate immediately before
+            # each exact task launch; never reuse the initial plan as authority.
+            local current_plan="$scratch/current-plan.json" current_snapshot="$scratch/current-snapshot.json" current_rc=0
+            if [[ -n "${CCTRL_RESTORE_CATALOGUE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CATALOGUE_FILE" "$catalogue_file" || current_rc=$?; else _task_list_json > "$catalogue_file" || current_rc=$?; fi
+            _snapshot_process_source "$process_file" || current_rc=$?
+            if [[ -n "${CCTRL_RESTORE_CODEX_EVIDENCE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CODEX_EVIDENCE_FILE" "$codex_file" || current_rc=$?; else _session_reconcile_codex --dry-run --json > "$codex_file" 2>/dev/null || current_rc=$?; fi
+            if (( current_rc == 0 )); then
+                jq -n --argjson selected "$row_file" '{schema_version:2,tasks:[$selected]}' > "$current_snapshot" || current_rc=$?
+            fi
+            if (( current_rc == 0 )); then
+                _restore_plan_json "$current_snapshot" "$catalogue_file" "$process_file" "$codex_file" "$host_id" "$local_hostname" > "$current_plan" || current_rc=$?
+            fi
+            if (( current_rc != 0 )) || ! jq -e --argjson selected "$row_file" '
+                [.rows[] | select(.provider == $selected.provider and .host_id == $selected.host_id
+                    and .provider_task_id == $selected.provider_task_id and .resume_identity == $selected.resume_identity
+                    and .disposition == "restore" and .action_capabilities.restore.supported == true
+                    and .action_capabilities.restore.reason == "tmux-resume")] | length == 1
+                ' "$current_plan" >/dev/null 2>&1; then
+                echo "Skipping restore: fresh exact-task ownership no longer authorizes $resume" >&2
+                failed=$((failed+1))
+                continue
+            fi
+        fi
         if [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then
             printf 'cctrl start' >> "$CCTRL_RESTORE_LAUNCH_LOG"; printf ' %q' "${launch_argv[@]}" >> "$CCTRL_RESTORE_LAUNCH_LOG"; printf '\n' >> "$CCTRL_RESTORE_LAUNCH_LOG"
         else
@@ -11963,84 +12193,15 @@ _session_created_at_ms() {
 }
 
 _session_codex_rollout_path() {
-    # Resolve a codex session's rollout log under $CODEX_SESSIONS_DIR. Prefer an
-    # exact initial-prompt match when present, then a stored conversation_id,
-    # then cwd + initial prompt, then cwd. The cwd-only fallback is inherently
-    # ambiguous for same-repo concurrent sessions, so launch/ls paths backfill
-    # conversation_id as soon as possible.
-    local sess="$1" cwd f meta_cwd meta_id meta_ts meta_ts_floor stored_id initial_prompt created_at first_cwd_match=""
-    stored_id="$(_session_metadata_field "$sess" conversation_id)"
-    created_at="$(_session_metadata_field "$sess" created_at)"
-    initial_prompt="$(_session_metadata_field "$sess" initial_prompt)"
-    if [[ -n "$stored_id" && -d "$CODEX_SESSIONS_DIR" ]]; then
-        while IFS= read -r f; do
-            [[ -n "$f" ]] || continue
-            meta_id="$(_codex_rollout_thread_id "$f")"
-            [[ "$meta_id" == "$stored_id" ]] || continue
-            _codex_thread_is_unarchived "$meta_id" || continue
-            if [[ -n "$initial_prompt" ]] && ! _codex_rollout_matches_prompt "$f" "$initial_prompt"; then
-                continue
-            fi
-            if [[ -n "$created_at" ]]; then
-                meta_ts="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.timestamp // .timestamp // empty' 2>/dev/null)"
-                if [[ "$meta_ts" == *.*Z ]]; then
-                    meta_ts_floor="${meta_ts%%.*}Z"
-                else
-                    meta_ts_floor="$meta_ts"
-                fi
-                [[ -n "$meta_ts_floor" && "$meta_ts_floor" < "$created_at" ]] && continue
-            fi
-            printf '%s' "$f"
-            return 0
-        done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
-    fi
-
-    if [[ -n "$initial_prompt" && -d "$CODEX_SESSIONS_DIR" ]]; then
-        while IFS= read -r f; do
-            [[ -n "$f" ]] || continue
-            meta_id="$(_codex_rollout_thread_id "$f")"
-            _codex_thread_is_unarchived "$meta_id" || continue
-            if [[ -n "$created_at" ]]; then
-                meta_ts="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.timestamp // .timestamp // empty' 2>/dev/null)"
-                if [[ "$meta_ts" == *.*Z ]]; then
-                    meta_ts_floor="${meta_ts%%.*}Z"
-                else
-                    meta_ts_floor="$meta_ts"
-                fi
-                [[ -n "$meta_ts_floor" && "$meta_ts_floor" < "$created_at" ]] && continue
-            fi
-            if _codex_rollout_matches_prompt "$f" "$initial_prompt"; then
-                printf '%s' "$f"
-                return 0
-            fi
-        done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
-    fi
-
+    # One bounded read-only process, not Python/SQLite per rollout. Stable IDs
+    # survive resume; ambiguous or budget-exhausted discovery stays unknown.
+    local sess="$1" cwd metadata db
+    [[ -d "$CODEX_SESSIONS_DIR" ]] || return 0
+    metadata="$(_session_metadata_file "$sess")"
+    [[ -f "$metadata" ]] || return 0
     cwd="$(tmux list-panes -t "$sess" -F '#{pane_current_path}' 2>/dev/null | head -1)"
-    [[ -n "$cwd" ]] || cwd="$(_session_metadata_field "$sess" cwd)"
-    [[ -n "$cwd" && -d "$CODEX_SESSIONS_DIR" ]] || return 0
-    while IFS= read -r f; do
-        [[ -n "$f" ]] || continue
-        meta_cwd="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.cwd // empty' 2>/dev/null)"
-        [[ "$meta_cwd" == "$cwd" ]] || continue
-        if [[ -n "$created_at" ]]; then
-            meta_ts="$(head -1 "$f" 2>/dev/null | jq -r 'select(.type=="session_meta") | .payload.timestamp // .timestamp // empty' 2>/dev/null)"
-            if [[ "$meta_ts" == *.*Z ]]; then
-                meta_ts_floor="${meta_ts%%.*}Z"
-            else
-                meta_ts_floor="$meta_ts"
-            fi
-            [[ -n "$meta_ts_floor" && "$meta_ts_floor" < "$created_at" ]] && continue
-        fi
-        meta_id="$(_codex_rollout_thread_id "$f")"
-        _codex_thread_is_unarchived "$meta_id" || continue
-        [[ -z "$first_cwd_match" ]] && first_cwd_match="$f"
-        if [[ -n "$initial_prompt" ]] && _codex_rollout_matches_prompt "$f" "$initial_prompt"; then
-            printf '%s' "$f"
-            return 0
-        fi
-    done < <(find "$CODEX_SESSIONS_DIR" -type f -name 'rollout-*.jsonl' 2>/dev/null | sort -r)
-    [[ -n "$first_cwd_match" ]] && printf '%s' "$first_cwd_match"
+    db="$(_codex_state_db)"
+    python3 "$SCRIPT_DIR/lib/codex_rollout.py" "$CODEX_SESSIONS_DIR" "$metadata" "$db" "$cwd" 2>/dev/null || true
     return 0
 }
 
@@ -12054,7 +12215,7 @@ import sys
 
 db, thread_id, title = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
-    con = sqlite3.connect(db)
+    con = sqlite3.connect(db, timeout=0.05)
     cur = con.execute(
         "UPDATE threads SET title = ?, name = ? WHERE id = ?",
         (title, title, thread_id),
@@ -12099,6 +12260,7 @@ _session_codex_thread_id() {
         thread_id="$(_codex_rollout_thread_id "$rollout")"
         [[ -n "$thread_id" ]] && { printf '%s' "$thread_id"; return 0; }
     fi
+    [[ -z "$(_session_metadata_field "$session_name" initial_prompt)" ]] || return 0
     thread_id="$(_session_metadata_field "$session_name" conversation_id)"
     [[ -n "$thread_id" ]] && printf '%s' "$thread_id"
 }
@@ -12179,6 +12341,9 @@ _session_codex_set_display_name() {
             return 0
         fi
     fi
+    # A failed prompted-launch lookup may be ambiguous or point at a recycled
+    # session's stale id. Do not turn unknown correlation into a title mutation.
+    [[ -z "$(_session_metadata_field "$session_name" initial_prompt)" ]] || return 2
     thread_id="$(_session_metadata_field "$session_name" conversation_id)"
     if [[ -n "$thread_id" ]] && _codex_thread_is_unarchived "$thread_id"; then
         record_file="$(_session_metadata_file "$session_name")"
@@ -12193,13 +12358,20 @@ _session_codex_schedule_display_name_sync() {
     local session_name="$1" display_name="$2" created_at="$3"
     [[ -n "$session_name" && -n "$display_name" ]] || return 0
     (
-        local _elapsed=0 _timeout="${CCTRL_CODEX_TITLE_POLL_TIMEOUT:-30}" _interval="${CCTRL_CODEX_TITLE_POLL_INTERVAL:-2}" _rec_created
-        while [[ "$_elapsed" -lt "$_timeout" ]]; do
-            sleep "$_interval"
-            _elapsed=$((_elapsed + _interval))
+        local _timeout="${CCTRL_CODEX_TITLE_POLL_TIMEOUT:-30}" _interval="${CCTRL_CODEX_TITLE_POLL_INTERVAL:-2}" _rec_created
+        [[ "$_timeout" =~ ^[0-9]+$ && "$_interval" =~ ^[1-9][0-9]*$ ]] || exit 0
+        local _deadline=$((SECONDS + _timeout)) _remaining _sleep
+        while (( SECONDS < _deadline )); do
+            _remaining=$((_deadline - SECONDS))
+            _sleep="$_interval"
+            (( _sleep > _remaining )) && _sleep="$_remaining"
+            sleep "$_sleep"
+            (( SECONDS < _deadline )) || break
             _rec_created="$(_session_metadata_field "$session_name" created_at 2>/dev/null)"
             [[ "$_rec_created" == "$created_at" ]] || break
-            if _session_codex_set_display_name "$session_name" "$display_name" 2>/dev/null; then
+            _remaining=$((_deadline - SECONDS))
+            (( _remaining > 0 )) || break
+            if CCTRL_CODEX_LOOKUP_TIMEOUT="$_remaining" _session_codex_set_display_name "$session_name" "$display_name" 2>/dev/null; then
                 break
             fi
         done

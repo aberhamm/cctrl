@@ -95,17 +95,23 @@ assert_not_contains() {
 }
 
 session_record_path() {
-    local name="$1" dir="${2:-$CCTRL_SESSION_METADATA_DIR}" file legacy match=""
-    for file in "$dir"/task-*.json "$dir"/launch-*.json; do
-        [[ -f "$file" ]] || continue
-        if jq -e --arg name "$name" '(.tmux_session // .name // "") == $name' "$file" >/dev/null 2>&1; then
-            if [[ -z "$match" || "$file" -nt "$match" ]]; then match="$file"; fi
-        fi
-    done
-    [[ -n "$match" ]] && { printf '%s' "$match"; return 0; }
-    legacy="$dir/$(printf '%s' "$name" | tr '/:' '__').json"
-    [[ -f "$legacy" ]] && { printf '%s' "$legacy"; return 0; }
-    return 1
+    # Fixture helper only: fake tmux permits repeated names within one second.
+    # Bash 3.2 -nt loses the fractional mtime and can select an older fixture.
+    python3 - "$1" "${2:-$CCTRL_SESSION_METADATA_DIR}" <<'PYFIXTURE'
+import json, pathlib, sys
+name, directory = sys.argv[1], pathlib.Path(sys.argv[2])
+files = []
+for path in list(directory.glob('task-*.json')) + list(directory.glob('launch-*.json')):
+    value = json.loads(path.read_text())
+    if value.get('tmux_session', value.get('name', '')) == name:
+        files.append(path)
+if files:
+    print(max(files, key=lambda path: path.stat().st_mtime_ns)); sys.exit(0)
+legacy = directory / (name.replace('/', '_').replace(':', '_') + '.json')
+if legacy.is_file():
+    print(legacy); sys.exit(0)
+sys.exit(1)
+PYFIXTURE
 }
 
 session_record_json() {
@@ -4417,10 +4423,15 @@ if [[ "$*" == *4444* ]]; then echo "codex --yolo"; exit 0; fi
 exec /bin/ps "$@"
 SH
     chmod +x "$bin/ps"
-    make_codex_rollout "$ch" "/tmp/demo" yes >/dev/null
+    local metadata="$TMPDIR/bg-metadata" rollout thread_id
+    mkdir -p "$metadata"
+    rollout="$(make_codex_rollout "$ch" "/tmp/demo" yes)"
+    thread_id="$(head -1 "$rollout" | jq -r '.payload.id')"
+    jq -n --arg id "$thread_id" '{name:"TMUX--busycx",agent:"codex",cwd:"/tmp/demo",conversation_id:$id}' \
+        > "$metadata/TMUX--busycx.json"
 
     local out
-    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" \
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" CCTRL_SESSION_METADATA_DIR="$metadata" \
         CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/bg-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/bg-nope" \
         TMUX_FAKE_SESSIONS="TMUX--busycx" TMUX_FAKE_PANE_PID=4444 "$ROOT/cctrl" session prune --json)"
     [[ "$out" == "[]" ]] || fail "bug-guard: busy codex session without a Claude transcript must not be flagged; got: $out"
@@ -4439,15 +4450,26 @@ if [[ "$*" == *4545* ]]; then echo "codex --yolo"; exit 0; fi
 exec /bin/ps "$@"
 SH
     chmod +x "$bin/ps"
-    make_codex_rollout "$ch" "/tmp/demo" no >/dev/null
+    local metadata="$TMPDIR/cnp-metadata" rollout thread_id
+    mkdir -p "$metadata"
+    rollout="$(make_codex_rollout "$ch" "/tmp/demo" no)"
+    thread_id="$(head -1 "$rollout" | jq -r '.payload.id')"
+    jq -n --arg id "$thread_id" '{name:"TMUX--emptycx",agent:"codex",cwd:"/tmp/demo",conversation_id:$id}' \
+        > "$metadata/TMUX--emptycx.json"
 
     local out
-    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" \
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" CCTRL_SESSION_METADATA_DIR="$metadata" \
         CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/cnp-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/cnp-nope" \
         TMUX_FAKE_SESSIONS="TMUX--emptycx" TMUX_FAKE_PANE_PID=4545 "$ROOT/cctrl" session prune --json)"
     assert_contains "$out" '"name": "TMUX--emptycx"'
     assert_contains "$out" '"reason": "never-prompted"'
-    echo "ok: codex never-prompted (rollout fixture) flagged as prune candidate"
+    # The same cwd alone cannot authorize pruning an unbound terminal.
+    rm "$metadata/TMUX--emptycx.json"
+    out="$(PATH="$bin:$PATH" CODEX_HOME="$ch" CCTRL_SESSION_METADATA_DIR="$metadata" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/cnp-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/cnp-nope" \
+        TMUX_FAKE_SESSIONS="TMUX--emptycx" TMUX_FAKE_PANE_PID=4545 "$ROOT/cctrl" session prune --json)"
+    [[ "$out" == "[]" ]] || fail "unbound same-cwd Codex rollout must not authorize pruning; got: $out"
+    echo "ok: exact Codex receipt permits never-prompted classification; unbound cwd stays unknown"
 }
 
 test_codex_rename_updates_app_title() {
@@ -4490,7 +4512,7 @@ PY
 
 test_codex_rename_prefers_prompt_match_over_stale_id() {
     # A recycled tmux name can briefly carry a stale but unarchived Codex
-    # conversation_id. The exact current prompt is a stronger identity signal.
+    # conversation_id. The exact current prompt in the launch cwd is a stronger identity signal.
     local bin="$TMPDIR/codex-stale-bin" meta="$TMPDIR/codex-stale-meta" codex_home="$TMPDIR/codex-stale-home"
     mkdir -p "$bin" "$meta" "$codex_home/sessions/2026/08/24"
     make_fake_tmux "$bin/tmux"
@@ -4502,7 +4524,7 @@ JSON
 {"timestamp":"2026-08-24T10:01:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"old prompt"}}
 JSONL
     cat > "$codex_home/sessions/2026/08/24/rollout-2026-08-24T10-02-00-thread-new.jsonl" <<'JSONL'
-{"timestamp":"2026-08-24T10:02:00.000Z","type":"session_meta","payload":{"id":"thread-new","cwd":"/tmp/other-cwd"}}
+{"timestamp":"2026-08-24T10:02:00.000Z","type":"session_meta","payload":{"id":"thread-new","cwd":"/tmp/demo"}}
 {"timestamp":"2026-08-24T10:02:01.000Z","type":"event_msg","payload":{"type":"user_message","message":"current prompt"}}
 JSONL
     python3 - "$codex_home/state_5.sqlite" <<'PY'
@@ -7969,7 +7991,7 @@ PY
     cp -R "$meta_a" "$meta_b"
     : > "$codex_home/thread-writer-locks/stale-lock-task.lock"
     cat > "$app" <<'JSON'
-{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-cursor-1","threads":[{"id":"app-task","control_owner":"app"},{"id":"conflict-task","control_owner":"app"},{"id":"ambiguous-task","source":"appServer"},{"id":"fork-task","executionRuntime":"app-server","runtimeState":"active"}],"task_errors":{"unavailable-task":{"reason":"thread/read timed out"}},"errors":[]}
+{"schema_version":1,"status":"available","complete":true,"observed_at":"2026-09-17T10:00:00Z","source_cursor":"app-cursor-1","threads":[{"id":"unanchored-task","control_owner":"app"},{"id":"tmux-task","source":"appServer"},{"id":"app-task","control_owner":"app"},{"id":"conflict-task","control_owner":"app"},{"id":"ambiguous-task","source":"appServer"},{"id":"fork-task","executionRuntime":"app-server","runtimeState":"active"}],"task_errors":{"unavailable-task":{"reason":"thread/read timed out"}},"errors":[]}
 JSON
     cat > "$tmux_snapshot" <<'JSON'
 {"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"tmux-cursor-1","panes":[{"session":"TMUX--one","pane_id":"%1","pane_pid":"4100","start_command":"codex","current_command":"codex"},{"session":"TMUX--two","pane_id":"%1","pane_pid":"4200","start_command":"codex","current_command":"codex"},{"session":"TMUX--legacy","pane_id":"%9","pane_pid":"4900","start_command":"codex","current_command":"codex"}],"error":null}
@@ -8007,6 +8029,10 @@ PY
       .schema_version == 1 and .kind == "codex_reconcile_result_v1" and .pass_id == "fixture-pass-0001" and
       ([.records[] | select(.provider_task_id == "tmux-task")][0].chosen_outcome.control_owner == "cctrl") and
       ([.records[] | select(.provider_task_id == "unanchored-task")][0].chosen_outcome.control_owner == "unknown") and
+      ([.records[] | select(.provider_task_id == "unanchored-task")][0].sources.tmux.status == "ambiguous") and
+      ([.records[] | select(.provider_task_id == "unanchored-task")][0].sources.app_server.status == "claimed") and
+      ([.records[] | select(.provider_task_id == "tmux-task")][0].sources.app_server.status == "ambiguous") and
+      ([.records[] | select(.provider_task_id == "app-task")][0].sources.tmux.status == "confirmed-absence") and
       ([.records[] | select(.provider_task_id == "app-task")][0].chosen_outcome.control_owner == "app") and
       ([.records[] | select(.provider_task_id == "conflict-task")][0].chosen_outcome.control_owner == "conflict") and
       ([.records[] | select(.provider_task_id == "ambiguous-task")][0].chosen_outcome.control_owner == "unknown") and
@@ -8026,6 +8052,7 @@ for path in Path(sys.argv[1]).glob("task-*.json"):
 assert (records["tmux-task"]["control_owner"],records["tmux-task"]["execution_runtime"]) == ("cctrl","tmux")
 assert (records["app-task"]["origin"],records["app-task"]["control_owner"],records["app-task"]["execution_runtime"]) == ("codex-app","app","app-server")
 assert records["conflict-task"]["control_owner"] == "conflict"
+assert records["unanchored-task"]["control_owner"] == "unknown"
 assert records["ambiguous-task"]["control_owner"] == "unknown"
 assert records["unavailable-task"]["control_owner"] == "app"
 assert records["fork-task"]["origin"] == "codex-app"
@@ -8233,6 +8260,25 @@ SH
 
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
+        session-prune)
+            test_session_prune_never_prompted_claude
+            test_session_prune_fresh_active_not_candidate
+            test_session_prune_codex_no_claude_transcript_bug_guard
+            test_session_prune_codex_never_prompted
+            test_session_prune_dry_run_closes_nothing
+            echo "ok"
+            exit 0
+            ;;
+        codex-adapter) ;;
+        provider-neutral)
+            python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+            test_session_list_codex_default_model
+            test_session_list_agent_not_mislabelled_by_prompt
+            test_session_list_agent_prefers_recorded_metadata
+            test_session_list_malformed_metadata_uses_unknown_defaults
+            echo "ok"
+            exit 0
+            ;;
         task-inventory)
             test_task_inventory_provider_neutral_readonly
             echo "ok"
@@ -8359,7 +8405,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
-if [[ "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
+if [[ "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -8994,6 +9040,7 @@ PY
 }
 
 test_codex_app_server_adapter() {
+    local -x CCTRL_CODEX_APP_SERVER_TRANSPORT=jsonl
     local fake_root="$TMPDIR/codex-app-server" fake="$TMPDIR/codex-app-server/codex"
     local trace="$TMPDIR/codex-app-server/rpc-trace" pid_file="$TMPDIR/codex-app-server/proxy.pid"
     mkdir -p "$fake_root"
@@ -9592,6 +9639,7 @@ PY
 }
 
 test_app_owned_launch() {
+    local -x CCTRL_CODEX_APP_SERVER_TRANSPORT=jsonl
     local root="$TMPDIR/app-owned-launch" bin="$TMPDIR/app-owned-launch/bin" fake="$TMPDIR/app-owned-launch/bin/codex"
     local trace="$root/trace.jsonl" counter="$root/counter" tmux_log="$root/tmux.log" data="$root/data" meta="$root/meta"
     mkdir -p "$bin" "$data" "$meta"
@@ -9925,7 +9973,8 @@ PY
     jq -e '.origin=="cctrl" and .provider_task_id=="handoff-task" and .control_owner=="app" and
       .execution_runtime=="app-server" and .restore_strategy=="provider-managed"' "$record" >/dev/null || fail "handoff registry transition is wrong"
     [[ "$(find "$meta" -name 'task-*.json' | wc -l | tr -d ' ')" == 1 ]] || fail "handoff created a duplicate canonical task record"
-    [[ ! -e "$codex_home/thread-writer-locks/handoff-task.lock" && -e "$backup/handoff-task.lock" ]] || fail "stale lock was not quarantined after owner exit"
+    [[ -e "$codex_home/thread-writer-locks/handoff-task.lock" && ! -e "$backup/handoff-task.lock" ]] || fail "handoff must preserve provider-owned writer lock"
+    jq -e '.[0].lock_action=="none" and .[0].quarantine_path==null' <<< "$out" >/dev/null || fail "handoff must not claim provider lock cleanup"
     out="$(run_release)" || fail "app-owned retry was not idempotent"
     jq -e '.[0].status=="already-app-owned" and .[0].ok==true' <<< "$out" >/dev/null || fail "app-owned retry result is wrong: $out"
 
@@ -10139,6 +10188,12 @@ if [[ "${CCTRL_TEST_ONLY:-}" == "app-owned-launch" ]]; then
     exit 0
 fi
 
+if [[ "${CCTRL_TEST_ONLY:-}" == "codex-adapter" ]]; then
+    test_codex_app_server_adapter
+    python3 -m unittest discover -s "$ROOT/tests" -p "test_codex_websocket*.py"
+    exit 0
+fi
+
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-lifecycle" ]]; then
     test_codex_lifecycle_fixture_contract
     test_codex_lifecycle_ingestion
@@ -10161,3 +10216,7 @@ test_codex_handoff_state_machine
 test_codex_hook_installation_is_additive_and_observer_is_bounded
 
 echo "ok"
+
+if [[ -z "${CCTRL_TEST_ONLY:-}" ]]; then
+    python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+fi

@@ -68,6 +68,11 @@ Two modes, one **global toggle** the human flips with a word ("go manual" /
 stops. (When you are already the fleet manager, handle these toggles from this
 loaded doctrine — do not re-invoke the skill.)
 
+**Provider selection:** honor the user's chosen runtime for workers and reviewers.
+Otherwise use cctrl's environment/profile/config preference resolution; task type
+is not a reason to substitute another provider. Missing telemetry remains unknown,
+and a provider-specific bridge failure applies only to that provider.
+
 **Mode A — Auto-pilot ON (default):** decide reversible, agent-level things
 yourself and just report — drive tmux pickers, choose build/plan options, sequence
 work, dispatch fixers, run (delegate) validation. Do not bounce agent-level choices

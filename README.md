@@ -6,7 +6,7 @@ A CLI for managing local coding-agent sessions, profiles, costs, and developer e
 
 - **Profile switching** — swap between settings configs (API keys, models, hooks, permissions) with one command
 - **Session launching** — start Claude Code or Codex with consistent flags, resume previous sessions, jump into projects via named shortcuts, or run detached so it survives SSH disconnect
-- **Session health** — a rich per-session STATE (waiting-input, blocked-dialog, unsent-draft, idle-done), plus `session doctor`/`autoheal` to repair broken remote-control bridges and `session prune` to retire stale sessions
+- **Session health** — provider-specific evidence for per-session STATE (waiting-input, blocked-dialog, unsent-draft, idle-done), plus `session doctor`/`autoheal` to repair Claude remote-control bridges and `session prune` to retire stale sessions
 - **Peer messaging** — sessions address each other by name: a durable local mailbox (`peer send`/`check`/`recv`/`ack`/`reply`) for async work, direct live-tmux chat (`peer say`) for a running agent, tmux doorbell nudges, and a stdio MCP bridge so tool-calling agents get the same surface
 - **Fleet view** — `cctrl fleet` merges every host's sessions into one recency-sorted list; `cctrl needs-me` reports only what newly needs your attention since the last check
 - **Remote hosts** — run any cctrl command on another machine over SSH; start a detached session on your Mac from your phone and auto-attach
@@ -108,8 +108,10 @@ they do not sync to other machines:
 
 Legacy profiles with no `agents` block keep their old Claude behavior: top-level
 `env` and `model` apply to Claude. When launching Codex with a legacy profile,
-CCTRL ignores Claude-looking top-level models such as `sonnet`, `opus`, and
-`haiku`, and does not export the legacy top-level env.
+CCTRL ignores the legacy top-level model and env. With an `agents` block,
+models come only from `agents.<agent>.model`; an omitted model stays with the
+runtime's default. Explicit per-agent model identifiers are passed through
+without guessing their provider from the name.
 
 **Provider-prefixed model ids don't move with `model`.** A profile routing through
 Bedrock or an API gateway pins full provider ids in `env` (`ANTHROPIC_MODEL`,
@@ -260,8 +262,9 @@ confirmation, sends one graceful EOF, and waits for that exact owner to end.
 Only after a fresh App Server postflight does one digest-guarded registry event
 set the owner/runtime to `app`/`app-server` with provider-managed restore. The
 provider task id and `origin:cctrl` never change and no replacement task is
-created. A stale writer lock may be quarantined only after the owner exit has
-been proved; lock presence is not ownership proof.
+created. Provider writer-lock files remain untouched: an app writer may hold
+them without exposing the task ID in process arguments. Lock presence alone is
+not ownership proof.
 
 If an approval or unsent input keeps the terminal alive, the command reports
 `owner-exit-timeout` and leaves cctrl ownership unchanged. Reopen the terminal,
@@ -294,6 +297,34 @@ registration and map the remote host's authoritative id when its task inventory
 supports one; `cctrl host rename <old> <new>` changes the alias without changing
 either id. Fleet listing itself never migrates or rewrites host identity.
 
+Session discovery is best-effort and read-only. Resource checks count tmux's
+managed markers without collecting provider telemetry (legacy unmarked sessions
+are omitted from that contextual count). Codex rollout correlation uses a single
+read-only process with a 2-second limit, at most 10,000 files, 16 MiB total reads,
+and 1 MiB per line. `CCTRL_CODEX_LOOKUP_TIMEOUT` can lower that limit (0 disables
+rollout lookup). Partial scans and ambiguous matches remain unknown. Fresh
+launches require the recorded cwd and, when supplied, the exact initial prompt;
+explicit resume IDs retain their identity across older rollouts. Title polling
+counts lookup time toward its deadline; an already-started registry/title write
+can finish after that deadline. Model labels reflect known leading command
+options only; missing or ambiguous model/state/recency evidence is not filled in
+from another provider's files or from prompt text.
+
+Fresh terminal launches persist pane/PID/start-time anchors atomically before
+provider identity is available. For older provisional receipts missing those
+anchors, `cctrl session recover-terminal-identity --launch-id <id> --dry-run --json`
+can prove the exact root thread from live process and writable file-descriptor
+evidence. It never joins by cwd/title/prompt. Explicit `--apply` repairs only the
+local receipt under lock and retains terminal ownership; it does not perform app
+handoff. See [the recovery procedure](docs/findings/terminal-receipt-recovery.md)
+for evidence requirements, refusal conditions, and separate attestation/release
+checks. A lossy historical bootstrap can optionally be checked against an exact
+original Codex Desktop completed launch event using `--launch-event-file PATH`
+and `--launch-event-id ID`. This narrow path verifies the original invocation,
+session output, generation and full live bootstrap using a nonexecuting literal
+parser. It never treats replacement characters as wildcards; unsupported launch
+forms remain blocked.
+
 ### Codex App Server diagnostics
 
 Before enabling app-owned task flows, inspect the installed runtime and the
@@ -305,7 +336,11 @@ cctrl codex capabilities --json
 ```
 
 This is read-only discovery: it connects through `codex app-server proxy`,
-performs `initialize`/`initialized`, and generates the local protocol schema.
+upgrades the raw proxy connection to WebSocket, performs
+`initialize`/`initialized`, and generates the local protocol schema.
+For a known legacy newline-JSON endpoint, explicitly set
+`CCTRL_CODEX_APP_SERVER_TRANSPORT=jsonl` (default: `websocket`). Transport
+failures never trigger automatic reconnects or request replay.
 It never calls `thread/start`, `turn/start`, or any other task-mutating method.
 This transport is the desktop daemon connection; it is deliberately distinct
 from both a newly spawned standalone `codex app-server --stdio` process and a
@@ -1191,9 +1226,9 @@ The host registry lives in `data/hosts.json` (gitignored, machine-local). Each m
 
 ### Fleet view
 
-`cctrl fleet` runs `session ls` on the local machine and on every host in
-`data/hosts.json`, labels each row with its host, and sorts the merged result by
-last-active, most recent first.
+`cctrl fleet` queries the provider-neutral task inventory on the local machine
+and registered hosts, with compatibility fallback for older cctrl hosts. It
+labels each row with its host and sorts available recency evidence first.
 
 ```bash
 cctrl fleet                 # every host's sessions in one recency-sorted list

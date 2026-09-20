@@ -1,6 +1,6 @@
 # cctrl — agent instructions
 
-cctrl is a CLI for managing Claude Code agent sessions (fleet view, per-session
+cctrl is a CLI for managing coding-agent sessions (fleet view, per-session
 state, profiles, costs, peer messaging). See [README.md](./README.md).
 
 ## Fleet roles

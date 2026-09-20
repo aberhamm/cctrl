@@ -63,9 +63,14 @@ memory and attention. One session = one purpose.
    transport for a terminal TUI; that terminal remains the single writer until
    a verified `release-to-app` handoff.
 
-   Then pick the agent (`claude` for consultative /
-   general work; `codex` when the user asks for it or wants an independent
-   second engine). Pick the **explicit target directory** — the repo the work
+   Follow the user's explicit agent selection for all workers and reviewers.
+   Otherwise let cctrl resolve `CCTRL_AGENT`, the selected profile's
+   `defaultAgent`, then the configured default. Do not assign a provider based
+   on task type. If no preference exists, ask which supported runtime to use;
+   noninteractive starts require `--agent` or a configured default. Omit model
+   flags unless requested or supplied by an agent-specific profile, allowing
+   the selected runtime to use its own default.
+   Pick the **explicit target directory** — the repo the work
    belongs to, not `$HOME`. Pick a short, descriptive `-n` label (the *purpose*;
    the tmux id is derived from the dir, not the label).
 
@@ -97,9 +102,16 @@ memory and attention. One session = one purpose.
      restart/deploy/push without explicit go-ahead.*
 
 4. **Verify boot.** Confirm it came up: `cctrl session ls` (or capture the pane).
-   A live session shows a real state (`working`/`idle`/`waiting-input`). `codex`
-   sessions report `(?)` model and `-` state with no telemetry — that is normal,
-   not a failure. If the session vanished within ~15s, see Gotchas.
+   Available telemetry may show `working`/`idle`/`waiting-input` or a known
+   blocking dialog. A model of `?` or state of `-` means unknown for either
+   provider; it is not evidence of failure or readiness. Confirm the actual
+   pane when needed; never borrow another provider's status or model. If the session vanished within ~15s, see Gotchas.
+
+   For terminal-to-app handoff, require `session attest` and the separate
+   `release-to-app` checks. If a provisional receipt lacks pane anchors or the
+   provider ID, use the documented `recover-terminal-identity --launch-id <id>
+   --dry-run --json` proof path; never assign an app inventory candidate by cwd,
+   title, prompt, or recency. Receipt repair keeps the terminal as the writer.
 
 5. **Open it in a tab (optional).** If a human will watch/consult it, open a
    terminal tab that **attaches** to the now-live session, using the mechanism in

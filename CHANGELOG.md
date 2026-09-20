@@ -4,6 +4,49 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased] - 2026-09-21
+
+### Added
+- Inspect local and cross-host coding-agent tasks with `task ls` and
+  `fleet --json-v2`, including provider identity, ownership, lifecycle, and
+  per-action capabilities. Stable task records and a locked event reducer
+  preserve concurrent observations and expose ownership conflicts.
+- Launch Codex tasks directly in the app with `start --agent codex --app-owned`,
+  observe lifecycle events through additively installed hooks, and reconcile
+  exact task ownership with `session reconcile-codex`. App Server calls use
+  bounded transport and capability checks.
+- Preview and perform an explicit single-writer terminal-to-app handoff with
+  `session release-to-app`. Ownership-aware snapshots restore only authorized
+  terminal workers; app tasks remain provider-managed references.
+- Recover a provisional terminal receipt with `session recover-terminal-identity`,
+  read-only by default. Recovery requires exact live process/root-rollout proof,
+  atomically preserves its evidence, and refuses existing canonical destinations.
+  Lossy historical commands additionally require a verified original launch event.
+
+### Changed
+- Spawn and fleet skills honor explicit provider selection and configured
+  preferences for workers and reviewers. Agent-aware profiles isolate model
+  settings, while explicit CLI model flags take precedence.
+- Codex rollout discovery is bounded and leaves ambiguous identity unknown.
+  Resource checks count managed tmux sessions without scanning transcripts.
+  Model labels conservatively report command evidence rather than prompt text.
+
+### Fixed
+- Restore passes the snapshot provider explicitly and refreshes exact Codex
+  ownership immediately before each launch, including later restore waves.
+- App handoff preserves provider writer-lock files after ownership transfer.
+- Secret detection cannot be overridden by a legacy scanner fallback.
+- Codex sessions no longer inherit stale Claude model, bridge, recency, or recap
+  metadata. Prompted identity discovery cannot silently reuse an unrelated ID.
+- Fresh launches save all terminal anchors atomically before provider identity
+  is known. Unicode prompts survive detached-command serialization on older Bash.
+- Snapshot restore explicitly selects each task's provider and rechecks exact
+  Codex ownership before every launch, including after confirmation and wave
+  pauses, so a newly app-owned task is not resumed as a second terminal writer.
+- App Server proxy initialization uses validated WebSocket framing, with explicit
+  legacy JSONL selection. Malformed tmux snapshots no longer imply absence, and
+  ambiguous terminal evidence cannot authorize an app-only ownership claim.
+
 ## [Unreleased] - 2026-09-17
 
 ### Added

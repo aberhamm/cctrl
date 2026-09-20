@@ -1,13 +1,14 @@
 ---
 id: 054
 title: Portable hook installation — resolve hooks via PATH, not absolute paths
-status: pending
+status: skipped
 blocked-by: []
 priority: 54
 allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-08-21
+skipped-reason: implementation shipped in 53994fb; Codex additive-merge hardening is superseded by plan 061
 ---
 
 ## Requirements

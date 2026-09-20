@@ -27,6 +27,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from codex_websocket import WebSocket, ProtocolError
+
 
 CAPABILITY_SCHEMA_VERSION = 1
 PROTOCOL_VERSION = 2
@@ -215,7 +218,7 @@ def discover_runtime(
 
 
 class AppServerClient:
-    """Synchronous newline-delimited JSON-RPC client for one App Server proxy."""
+    """Synchronous JSON-RPC client for one App Server control-socket proxy."""
 
     def __init__(
         self,
@@ -232,7 +235,13 @@ class AppServerClient:
         self.timeouts.validate()
         self.server_request_callback = server_request_callback
         self.notification_callback = notification_callback
-        self.process: subprocess.Popen[str] | None = None
+        self.transport = os.environ.get("CCTRL_CODEX_APP_SERVER_TRANSPORT", "websocket")
+        if self.transport not in {"websocket", "jsonl"}:
+            raise AdapterError(EXIT_USAGE, "usage", "App Server transport must be websocket or jsonl")
+        self._write_lock = threading.Lock()
+        self._write_context = threading.local()
+        self._websocket = WebSocket(self._read_exact, self._write_transport)
+        self.process: subprocess.Popen[bytes] | None = None
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._stderr: list[str] = []
         self._reader: threading.Thread | None = None
@@ -304,8 +313,7 @@ class AppServerClient:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
+                bufsize=0,
                 start_new_session=True,
             )
         except OSError as exc:
@@ -316,24 +324,55 @@ class AppServerClient:
         self._stderr_reader = threading.Thread(
             target=self._read_stderr, name="codex-app-server-stderr", daemon=True
         )
-        self._reader.start()
         self._stderr_reader.start()
+
+    def _read_exact(self, size: int, deadline: float) -> bytes:
+        assert self.process is not None and self.process.stdout is not None
+        fd = self.process.stdout.fileno()
+        result = bytearray()
+        while len(result) < size:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("WebSocket read deadline expired")
+            readable, _, _ = select.select([fd], [], [], None if remaining == float("inf") else remaining)
+            if not readable:
+                raise TimeoutError("WebSocket read deadline expired")
+            chunk = os.read(fd, size - len(result))
+            if not chunk:
+                raise EOFError("App Server proxy closed its output")
+            result.extend(chunk)
+        return bytes(result)
+
+    def _write_transport(self, payload: bytes, deadline: float) -> None:
+        self._write_bytes(payload, deadline=min(deadline, time.monotonic() + self.timeouts.request),
+                          phase=getattr(self._write_context, "phase", "transport"),
+                          timeout_exit=getattr(self._write_context, "code", EXIT_REQUEST_TIMEOUT))
 
     def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
         try:
-            for line in self.process.stdout:
+            if self.transport == "websocket":
+                self._websocket.handshake(self._handshake_deadline)
+                self._events.put(("ready", None))
+                messages = iter(lambda: self._websocket.receive_text(float("inf")), None)
+            else:
+                self._events.put(("ready", None))
+                messages = self.process.stdout
+            for line in messages:
                 if not line.strip():
                     continue
-                try:
-                    value = json.loads(line)
-                except json.JSONDecodeError as exc:
-                    self._events.put(("malformed", {"line": line.rstrip("\n"), "error": str(exc)}))
-                    return
+                value = json.loads(line)
                 if not isinstance(value, dict):
-                    self._events.put(("malformed", {"line": line.rstrip("\n"), "error": "not an object"}))
-                    return
+                    raise ProtocolError("JSON-RPC message is not an object")
                 self._events.put(("message", value))
+        except AdapterError as exc:
+            self._events.put(("error", exc))
+        except TimeoutError:
+            self._events.put(("error", AdapterError(EXIT_HANDSHAKE, "handshake", "transport handshake timeout expired")))
+        except (ProtocolError, ValueError, UnicodeError) as exc:
+            self._events.put(("malformed", {"error": str(exc)}))
+        except (EOFError, OSError):
+            pass
         finally:
             self._events.put(("eof", None))
 
@@ -341,7 +380,7 @@ class AppServerClient:
         assert self.process is not None and self.process.stderr is not None
         for line in self.process.stderr:
             if sum(map(len, self._stderr)) < 16_384:
-                self._stderr.append(line)
+                self._stderr.append(line.decode("utf-8", errors="replace"))
 
     def _stderr_text(self) -> str:
         return "".join(self._stderr).strip()
@@ -360,22 +399,47 @@ class AppServerClient:
         phase: str,
         timeout_exit: int,
     ) -> None:
+        text = json.dumps(message, separators=(",", ":"))
+        if self.transport == "websocket":
+            self._write_context.phase, self._write_context.code = phase, timeout_exit
+            try:
+                self._websocket.send_text(text, deadline)
+            except TimeoutError as exc:
+                raise AdapterError(timeout_exit, phase, f"{phase} timeout expired while framing") from exc
+            except ProtocolError as exc:
+                raise AdapterError(EXIT_PROTOCOL, phase, str(exc)) from exc
+            except EOFError as exc:
+                raise AdapterError(EXIT_EOF, "transport", str(exc)) from exc
+            finally:
+                del self._write_context.phase, self._write_context.code
+        else:
+            self._write_bytes((text + "\n").encode("utf-8"), deadline=deadline,
+                              phase=phase, timeout_exit=timeout_exit)
+
+    def _write_bytes(self, payload: bytes, *, deadline: float, phase: str, timeout_exit: int) -> None:
         if self.process is None or self.process.stdin is None:
             raise AdapterError(EXIT_CONNECT, "connect", "App Server proxy is not connected")
-        payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        fd = self.process.stdin.fileno()
-        offset = 0
-        while offset < len(payload):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AdapterError(timeout_exit, phase, f"{phase} timeout expired while writing")
-            try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._write_lock.acquire(timeout=remaining):
+            raise AdapterError(timeout_exit, phase, f"{phase} timeout expired while writing")
+        try:
+            fd = self.process.stdin.fileno()
+            offset = 0
+            while offset < len(payload):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise AdapterError(timeout_exit, phase, f"{phase} timeout expired while writing")
                 _, writable, _ = select.select([], [fd], [], remaining)
                 if not writable:
                     raise AdapterError(timeout_exit, phase, f"{phase} timeout expired while writing")
-                offset += os.write(fd, payload[offset:])
-            except (BrokenPipeError, OSError) as exc:
-                raise AdapterError(EXIT_EOF, "transport", "App Server proxy closed its input") from exc
+                try:
+                    offset += os.write(fd, payload[offset:])
+                except BlockingIOError:
+                    continue
+                except OSError as exc:
+                    raise AdapterError(EXIT_EOF, "transport", "App Server proxy closed its input") from exc
+        finally:
+            self._write_lock.release()
 
     def notify(
         self,
@@ -508,6 +572,8 @@ class AppServerClient:
                 event, value = self._events.get(timeout=min(hard_remaining, idle_remaining))
             except queue.Empty:
                 continue
+            if event == "error":
+                raise value
             if event == "malformed":
                 raise AdapterError(EXIT_PROTOCOL, "protocol", "malformed JSON from App Server", details=value)
             if event == "eof":
@@ -619,6 +685,19 @@ class AppServerClient:
         request_id = self._next_id
         self._next_id += 1
         deadline = time.monotonic() + self.timeouts.handshake
+        self._handshake_deadline = deadline
+        assert self._reader is not None
+        self._reader.start()
+        try:
+            event, value = self._events.get(timeout=max(0, deadline - time.monotonic()))
+        except queue.Empty:
+            raise AdapterError(EXIT_HANDSHAKE, "handshake", "transport handshake timeout expired")
+        if event == "error":
+            raise value
+        if event == "malformed":
+            raise AdapterError(EXIT_PROTOCOL, "handshake", "invalid WebSocket upgrade", details=value)
+        if event != "ready":
+            raise AdapterError(EXIT_EOF, "handshake", "App Server transport did not become ready")
         self._send(
             {
                 "id": request_id,
@@ -707,6 +786,12 @@ class AppServerClient:
                     pass
                 process.wait(timeout=self.timeouts.terminate)
         finally:
+            for reader in (self._reader, self._stderr_reader):
+                if reader is not None and reader.ident is not None:
+                    reader.join(timeout=self.timeouts.terminate)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
             self.process = None
 
 
