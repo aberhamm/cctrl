@@ -273,6 +273,52 @@ after EOF but before the registry commit, run `cctrl session reconcile-codex
 --json` and retry the same `release-to-app` target; reconciliation preserves the
 provider identity and origin. Once handed off, `cctrl session attach <old-name>`
 prints an app-opening hint and will not recreate tmux automatically.
+
+### Recover an idle Codex task stuck open elsewhere
+
+Codex can leave an idle task loaded in the managed remote-control App Server
+after its desktop client disconnects. The task may appear as `notLoaded` in an
+inventory while the daemon still holds both its rollout and
+`~/.codex/thread-writer-locks/<THREAD_ID>.lock`. Do not delete or move a lock
+held by a live process, and do not stop the shared daemon to release one task.
+
+First resolve the exact provider task id and inspect both holders:
+
+```bash
+THREAD_ID=<exact-provider-task-id>
+LOCK="$HOME/.codex/thread-writer-locks/$THREAD_ID.lock"
+ROLLOUT=$(find "$HOME/.codex/sessions" -type f -name "*-$THREAD_ID.jsonl" -print -quit)
+lsof -nP -- "$LOCK"
+test -n "$ROLLOUT" && lsof -nP -- "$ROLLOUT"
+```
+
+Proceed only when authoritative App Server evidence says there is no active
+turn and the managed App Server owns both files after the client disconnected.
+`notLoaded`, title, recency, or lock presence alone are not enough. Then connect
+to that same App Server and perform a reversible archive/unarchive cycle:
+
+```bash
+python3 - "$THREAD_ID" <<'PY'
+import sys
+
+sys.path.insert(0, "lib")
+from codex_app_server import AppServerClient, discover_runtime
+
+thread_id = sys.argv[1]
+runtime = discover_runtime(override=None)
+with AppServerClient(runtime) as client:
+    client.initialize()
+    client.request("thread/archive", {"threadId": thread_id})
+    client.request("thread/unarchive", {"threadId": thread_id})
+PY
+```
+
+Run this from the cctrl repository. It preserves the chat and returns it to the
+normal task list. Verify that `lsof` reports no holder for either file and that
+the task is non-archived and `notLoaded`. If the lock file has no process holder
+and no provider record or rollout, it is an orphan-lock case instead; use
+`cctrl session doctor --fix --yes` and its evidence-gated quarantine flow.
+
 `task ls` is the provider-neutral local catalogue. It shows tmux observations,
 cctrl-registered tasks, and discoverable Codex tasks together, but keeps owner,
 runtime, lifecycle, and per-action capabilities separate. Its `--json` form is

@@ -127,6 +127,25 @@ second writer. Peer messaging for app tasks remains deferred until a stable
 provider identity design lands (plans 028/029 or a reviewed successor); never
 invent a shared-MCP identity shortcut from cwd, title, or an app task id.
 
+### Codex task stuck "open in another app"
+
+Treat this as writer ownership, not a stale-file cleanup. Resolve the exact task
+id, use `lsof` on both its writer-lock file and rollout, and establish that the
+current App Server instance has no active turn. A `notLoaded` inventory status by
+itself is insufficient: a disconnected desktop client can leave an idle task
+loaded in the remote-control daemon.
+
+If the managed App Server owns both files after the client disconnected and the
+task is idle, use the reversible App Server `thread/archive` then
+`thread/unarchive` recovery documented in the README. This shuts down only that
+task instance while preserving its history and returning it to the normal task
+list. Verify afterward that neither file has a process holder and that the task
+is non-archived and `notLoaded`.
+
+Never delete or move a lock held by a live process, kill the shared daemon to
+release one task, or run this recovery while a turn is active. An unheld orphan
+lock is a different case; use the evidence-gated `session doctor --fix` path.
+
 **Cadence:** relaxed idle cadence (~20 min) by default; tighten to a few minutes
 only when actively watching a live task complete. Use ScheduleWakeup to self-pace.
 
