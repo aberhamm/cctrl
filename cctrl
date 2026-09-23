@@ -1662,6 +1662,18 @@ _cctrl_host_id_read() {
     printf '%s' "$value"
 }
 
+_random_hex_128() {
+    local value=""
+    if command -v openssl >/dev/null 2>&1; then
+        value="$(openssl rand -hex 16 2>/dev/null || true)"
+    fi
+    if ! [[ "$value" =~ ^[0-9a-f]{32}$ ]]; then
+        value="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-32 || true)"
+    fi
+    [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s' "$value"
+}
+
 _cctrl_host_id() {
     # Create-once machine identity. A hard-link publish gives concurrent
     # creators an exclusive winner without ever replacing an existing file.
@@ -1672,14 +1684,7 @@ _cctrl_host_id() {
     fi
     dir="$(dirname "$file")"
     mkdir -p "$dir" || return 1
-    candidate=""
-    if command -v openssl >/dev/null 2>&1; then
-        candidate="$(openssl rand -hex 16 2>/dev/null || true)"
-    fi
-    if ! [[ "$candidate" =~ ^[0-9a-f]{32}$ ]]; then
-        candidate="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -d '-' | cut -c1-32 || true)"
-    fi
-    [[ "$candidate" =~ ^[0-9a-f]{32}$ ]] || return 1
+    candidate="$(_random_hex_128)" || return 1
     tmp="$(mktemp "$dir/.host-id.XXXXXX")" || return 1
     chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     printf '%s\n' "$candidate" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -8126,7 +8131,7 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | app-ls | recover-app-owned | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill>"
+            echo "Usage: cctrl session <ls | app-ls | recover-app-owned | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill | stop-exact>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
@@ -8193,7 +8198,9 @@ cmd_session() {
             echo "                                 (delayed kill so the caller can finish output)"
             echo "    --in SECONDS | --now         Grace period (default 5s for own session)"
             echo "    --force                      Allow closing non-cctrl sessions"
-            echo "  cctrl session kill <name>      Kill a session immediately"
+            echo "  cctrl session kill <name>      Kill a session immediately by name (legacy/manual)"
+            echo "  cctrl session stop-exact <name> --execution-id ID [--json]"
+            echo "                                 Stop only the exact execution returned by ls --json"
             echo ""
             echo "Create a session with:  cctrl start [dir flags] or cctrl start -d <dir | @shortcut>"
             return 0
@@ -8220,6 +8227,7 @@ cmd_session() {
         close|stop) _session_close "$@" ;;
         reconcile-names) _session_reconcile_names "$@" ;;
         kill|k|rm) _session_kill "${1:-}" ;;
+        stop-exact) _session_stop_exact "$@" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
             echo -e "${DIM}Run 'cctrl session --help' for usage.${RESET}" >&2
@@ -9521,9 +9529,42 @@ _session_list() {
         esac
     done
 
-    local -a names=()
-    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
-        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    # JSON listing issues an execution identity, not merely a display name or
+    # provider conversation id. The token combines a random server guard with
+    # tmux's immutable server PID, server start time, and native $N session id.
+    # A replacement server therefore differs even if it restores the guard and
+    # reuses the same socket, name, and $N id.
+    local execution_server_id=""
+    if $json; then
+        execution_server_id="$(_session_execution_server_id_ensure 2>/dev/null || true)"
+    fi
+
+    local -a names=() execution_ids=()
+    local listed_tmux_id listed_name listed_server_id listed_server_pid listed_server_started execution_id line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" == *'|'* ]]; then
+            # Four fixed-grammar fields precede the opaque name. The sentinel
+            # keeps Bash read from trimming a trailing pipe in that name.
+            IFS='|' read -r listed_tmux_id listed_server_id listed_server_pid \
+                listed_server_started listed_name <<< "${line}."
+            listed_name="${listed_name%.}"
+        else
+            # Compatibility with older/fake tmux implementations that ignore
+            # -F: keep listing the row, but do not claim it is safely stoppable.
+            listed_tmux_id=""; listed_name="$line"; listed_server_id=""
+            listed_server_pid=""; listed_server_started=""
+        fi
+        [[ -n "$listed_name" ]] || continue
+        execution_id=""
+        if [[ -n "$execution_server_id" && "$listed_server_id" == "$execution_server_id" \
+              && "$listed_server_pid" =~ ^[0-9]+$ && "$listed_server_started" =~ ^[0-9]+$ \
+              && "$listed_tmux_id" =~ ^\$[0-9]+$ ]]; then
+            execution_id="tmux-v1:${execution_server_id}:${listed_server_pid}:${listed_server_started}:${listed_tmux_id}"
+        fi
+        names+=("$listed_name")
+        execution_ids+=("$execution_id")
+    done < <(tmux -u list-sessions -F '#{session_id}|#{@cctrl_server_instance_id}|#{pid}|#{start_time}|#{session_name}' 2>/dev/null)
 
     if [[ ${#names[@]} -eq 0 ]]; then
         $json && { echo "[]"; return 0; }
@@ -9536,7 +9577,9 @@ _session_list() {
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
     local record_schema provider origin host_id registered_by_cctrl launched_by_cctrl execution_runtime control_owner lifecycle_state restore_strategy last_observed_at lineage_json evidence_json normalized_record
-    for name in "${names[@]}"; do
+    for i in "${!names[@]}"; do
+        name="${names[i]}"
+        execution_id="${execution_ids[i]}"
         dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
         attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
@@ -9621,9 +9664,10 @@ _session_list() {
             session_id="$(_session_id "$name")"
             transcript="$(_session_transcript_path "$name")"
         fi
-        # Listing is intentionally read-only. Stable ids discovered here are
-        # returned in public JSON but are promoted only by an explicit mutation
-        # such as backfill/archive/title/release.
+        # Provider discovery here remains metadata-read-only. Stable provider
+        # ids are returned in public JSON but promoted only by an explicit
+        # mutation such as backfill/archive/title/release. JSON listing's sole
+        # tmux annotation is the server-incarnation option initialized above.
         last_active_ms=""
         [[ "$agent" == "claude" ]] && last_active_ms="$(_session_last_active_ms "$name")"
         last_active_iso=""
@@ -9652,6 +9696,7 @@ _session_list() {
                 --arg purpose "$purpose" --arg created_at "$created_at" \
                 --arg peer "$peer" --arg rc "$rc_state" --arg bridge "$bridge_id" \
                 --arg session_id "$session_id" --arg transcript "$transcript" \
+                --arg execution_id "$execution_id" \
                 --arg last_active "$last_active_iso" --arg base "$base_state" \
                 --arg recap "$recap_text" --argjson want_recap "$recap" \
                 --arg display_label "$display_label" \
@@ -9662,7 +9707,7 @@ _session_list() {
                 --argjson registered_by_cctrl "$registered_by_cctrl" --argjson launched_by_cctrl "$launched_by_cctrl" \
                 --argjson lineage "$lineage_json" --argjson ownership_evidence "$evidence_json" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -11672,6 +11717,157 @@ _session_attach() {
     fi
 }
 
+_session_execution_server_id_ensure() {
+    # The check-and-set runs inside tmux's serialized command queue. Concurrent
+    # listers cannot overwrite the winner. The public identity also includes
+    # tmux's PID/start time, so restoring this option after restart is harmless.
+    local value candidate
+    value="$(tmux show-options -sqv @cctrl_server_instance_id 2>/dev/null || true)"
+    if [[ -z "$value" ]]; then
+        candidate="$(_random_hex_128)" || return 1
+        # -o is tmux's atomic first-writer-wins option. A concurrent loser is
+        # expected to fail here, then read and validate the winner below.
+        tmux set-option -so @cctrl_server_instance_id "$candidate" >/dev/null 2>&1 || true
+        value="$(tmux show-options -sqv @cctrl_server_instance_id 2>/dev/null || true)"
+    fi
+    [[ "$value" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s' "$value"
+}
+
+_session_stop_exact_json() {
+    local ok="$1" status="$2" name="$3" execution_id="$4" message="$5"
+    jq -nc --argjson ok "$ok" --arg status "$status" --arg name "$name" \
+        --arg execution_id "$execution_id" --arg error "$message" \
+        '{ok:$ok,status:$status,name:(if $name=="" then null else $name end),execution_id:(if $execution_id=="" then null else $execution_id end)} + (if $error=="" then {} else {error:$error} end)'
+}
+
+_session_stop_exact_error() {
+    local json="$1" status="$2" name="$3" execution_id="$4" message="$5" code="$6"
+    if $json; then
+        _session_stop_exact_json false "$status" "$name" "$execution_id" "$message"
+    else
+        echo -e "${RED}$message${RESET}" >&2
+    fi
+    return "$code"
+}
+
+_session_stop_exact() {
+    local name="" execution_id="" json=false
+    # Select the output contract before validating any other argument so a
+    # malformed invocation still returns JSON regardless of flag order.
+    _arg_has_json "$@" && json=true
+    if ! _session_require_tmux 2>/dev/null; then
+        _session_stop_exact_error "$json" tmux-unavailable "" "" \
+            "tmux not found. Install with: brew install tmux" 1
+        return $?
+    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --execution-id)
+                if [[ $# -lt 2 || "$2" == --* ]]; then
+                    _session_stop_exact_error "$json" missing-identity "$name" "" \
+                        "--execution-id needs a value." 64
+                    return $?
+                fi
+                execution_id="$2"; shift 2
+                ;;
+            --json) json=true; shift ;;
+            -h|--help)
+                echo "Usage: cctrl session stop-exact <name> --execution-id ID [--json]"
+                echo "Stops only the tmux execution identified by session ls --json."
+                return 0
+                ;;
+            -*)
+                _session_stop_exact_error "$json" invalid-input "$name" "$execution_id" \
+                    "Unknown flag: $1" 64
+                return $?
+                ;;
+            *)
+                if [[ -n "$name" ]]; then
+                    _session_stop_exact_error "$json" invalid-input "$name" "$execution_id" \
+                        "Only one session name expected." 64
+                    return $?
+                fi
+                name="$1"; shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        _session_stop_exact_error "$json" missing-name "" "$execution_id" \
+            "cctrl session stop-exact needs a session name." 64
+        return $?
+    fi
+    if [[ -z "$execution_id" ]]; then
+        _session_stop_exact_error "$json" missing-identity "$name" "" \
+            "cctrl session stop-exact needs --execution-id from session ls --json." 64
+        return $?
+    fi
+    if [[ "$execution_id" != tmux-v1:* ]]; then
+        if [[ "$execution_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*: ]]; then
+            _session_stop_exact_error "$json" unsupported-identity "$name" "$execution_id" \
+                "Unsupported execution identity." 64
+        else
+            _session_stop_exact_error "$json" malformed-identity "$name" "$execution_id" \
+                "Malformed execution identity." 64
+        fi
+        return $?
+    fi
+    if [[ ! "$execution_id" =~ ^tmux-v1:([0-9a-f]{32}):([0-9]+):([0-9]+):(\$[0-9]+)$ ]]; then
+        _session_stop_exact_error "$json" malformed-identity "$name" "$execution_id" \
+            "Malformed tmux-v1 execution identity." 64
+        return $?
+    fi
+
+    local expected_server_id="${BASH_REMATCH[1]}" expected_server_pid="${BASH_REMATCH[2]}"
+    local expected_server_started="${BASH_REMATCH[3]}" tmux_session_id="${BASH_REMATCH[4]}"
+    local observed observed_session_id observed_name observed_server_id observed_server_pid observed_server_started
+    observed="$(tmux -u display-message -p -t "$tmux_session_id" \
+        '#{session_id}|#{@cctrl_server_instance_id}|#{pid}|#{start_time}|#{session_name}' 2>/dev/null || true)"
+    if [[ -z "$observed" ]]; then
+        _session_stop_exact_error "$json" stale-identity "$name" "$execution_id" \
+            "Execution identity is stale; its tmux session no longer exists." 69
+        return $?
+    fi
+    IFS='|' read -r observed_session_id observed_server_id observed_server_pid \
+        observed_server_started observed_name <<< "${observed}."
+    observed_name="${observed_name%.}"
+    if [[ "$observed_server_id" != "$expected_server_id" \
+          || "$observed_server_pid" != "$expected_server_pid" \
+          || "$observed_server_started" != "$expected_server_started" \
+          || "$observed_session_id" != "$tmux_session_id" ]]; then
+        _session_stop_exact_error "$json" stale-identity "$name" "$execution_id" \
+            "Execution identity is stale; the tmux server or session instance changed." 69
+        return $?
+    fi
+    if [[ "$observed_name" != "$name" ]]; then
+        _session_stop_exact_error "$json" mismatched-identity "$name" "$execution_id" \
+            "Execution identity belongs to '$observed_name', not '$name'." 75
+        return $?
+    fi
+
+    # This is the effect boundary. Every server/session component is checked in
+    # the same tmux command queue entry that kills by immutable $N id. A server
+    # restart between the inspection above and this command takes the false
+    # branch, so a replacement session cannot be killed.
+    local guard rc=0
+    guard="#{&&:#{==:#{@cctrl_server_instance_id},$expected_server_id},#{&&:#{==:#{pid},$expected_server_pid},#{&&:#{==:#{start_time},$expected_server_started},#{==:#{session_id},$tmux_session_id}}}}"
+    tmux if-shell -F -t "$tmux_session_id" "$guard" \
+        "kill-session -t '$tmux_session_id'" "run-shell 'exit 75'" \
+        >/dev/null 2>&1 || rc=$?
+    if (( rc != 0 )); then
+        _session_stop_exact_error "$json" stale-identity "$name" "$execution_id" \
+            "Execution identity became stale before it could be stopped." 69
+        return $?
+    fi
+
+    if $json; then
+        _session_stop_exact_json true stopped "$name" "$execution_id" ""
+    else
+        echo -e "${GREEN}Stopped exact session: $name${RESET}"
+    fi
+}
+
 _session_kill() {
     _session_require_tmux || return 1
     local kill_target="$1"
@@ -12695,7 +12891,9 @@ cmd_help() {
     echo "                              no name = the session you're inside, killed after"
     echo "                              a short grace period (--in N, --now, --force);"
     echo "                              Codex close also archives its app task"
-    echo "  cctrl session kill <name>   Kill a detached session immediately"
+    echo "  cctrl session kill <name>   Kill by mutable name (legacy/manual)"
+    echo "  cctrl session stop-exact <name> --execution-id ID [--json]"
+    echo "                              Stop only the execution returned by session ls --json"
     echo ""
     echo -e "${BOLD}Peers${RESET}"
     echo "  cctrl peer overview [--as NAME]     Start here: identity + reachable peers + unread mail"

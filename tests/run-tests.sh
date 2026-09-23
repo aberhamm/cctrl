@@ -199,6 +199,7 @@ if [[ -n "${TMUX_LOG:-}" ]]; then
         printf '\n'
     } >> "$TMUX_LOG"
 fi
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 if [[ "${1:-}" == "new-session" ]]; then
     printf 'SHELL_CMD=%s\n' "${@: -1}" >> "${TMUX_LOG:?}"
 fi
@@ -1901,6 +1902,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -1953,6 +1955,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -2023,6 +2026,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -2113,6 +2117,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -2322,6 +2327,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -2398,6 +2404,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -2602,6 +2609,7 @@ JSON
     mkdir -p "$quiet_tmux_dir"
     cat > "$quiet_tmux_dir/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) exit 0 ;;
     *) exit 1 ;;
@@ -2775,6 +2783,7 @@ test_peer_sender_snapshot() {
     mkdir -p "$TMPDIR/comet" "$TMPDIR/orchestrator" "$quiet"
     cat > "$quiet/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) exit 0 ;;
     *) exit 1 ;;
@@ -3169,7 +3178,7 @@ test_peer_overview() {
     : > "$log"
     PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json >/dev/null
     local count
-    count="$(grep -c 'TMUX list-sessions' "$log" || true)"
+    count="$(grep -Ec 'TMUX (-u )?list-sessions' "$log" || true)"
     [[ "$count" -eq 1 ]] || fail "expected exactly 1 session enumeration for peer overview, got $count"
 
     # (3) derived_skipped passthrough: with tmux unavailable the manual identity and
@@ -3368,7 +3377,7 @@ test_peer_reply_single_enumeration() {
     : > "$log"
     PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id" --as orchestrator --json -- "reply" >/dev/null
     local count
-    count="$(grep -c 'TMUX list-sessions' "$log" || true)"
+    count="$(grep -Ec 'TMUX (-u )?list-sessions' "$log" || true)"
     [[ "$count" -eq 1 ]] || fail "expected exactly 1 session enumeration for one reply, got $count"
 
     echo "ok: one reply enumerates sessions exactly once (cached resolver)"
@@ -4207,6 +4216,199 @@ JSON
     assert_contains "$out" '"purpose": "verify identity"'
 }
 
+test_session_stop_exact_identity() (
+    # Every tmux command is forced through a private socket. This exercises the
+    # real tmux identity/command-queue semantics without touching live sessions.
+    local real_tmux socket bin out rows old_id fresh_id server_id rc=0
+    local concurrent_dir concurrent_file pid n
+    local -a concurrent_pids=()
+    assert_stop_exact_error() {
+        local expected_rc="$1" expected_status="$2" description="$3" case_out case_rc=0
+        shift 3
+        case_out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact "$@" --json)" || case_rc=$?
+        if [[ "$case_rc" -ne "$expected_rc" ]] \
+            || ! jq -e --arg status "$expected_status" '.ok==false and .status==$status' <<< "$case_out" >/dev/null; then
+            fail "$description did not fail closed: rc=$case_rc out=$case_out"
+        fi
+    }
+    real_tmux="$(command -v tmux)"
+    [[ -x "$real_tmux" ]] || fail "tmux is required for exact-stop integration coverage"
+    socket="cctrl-exact-stop-$$-$RANDOM"
+    bin="$TMPDIR/exact-stop-bin"
+    mkdir -p "$bin"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+real_tmux="${CCTRL_TEST_REAL_TMUX:?}"
+socket="${CCTRL_TEST_TMUX_SOCKET:?}"
+
+# Return the inspected execution, then replace it before cctrl reaches its
+# guarded effect command. "session" models same-server name reuse; "server"
+# models a full tmux restart that reuses both the name and native $N id.
+if [[ -n "${CCTRL_TEST_REPLACE_MODE:-}" \
+      && ( "${1:-}" == "display-message" || ( "${1:-}" == "-u" && "${2:-}" == "display-message" ) ) \
+      && "$*" == *session_id* && "$*" == *@cctrl_server_instance_id* ]]; then
+    observed="$("$real_tmux" -L "$socket" "$@")"
+    name="${CCTRL_TEST_REPLACE_NAME:?}"
+    if [[ "$CCTRL_TEST_REPLACE_MODE" == "server" ]]; then
+        "$real_tmux" -L "$socket" kill-server
+    else
+        "$real_tmux" -L "$socket" kill-session -t "=$name"
+    fi
+    "$real_tmux" -L "$socket" new-session -d -s "$name" 'sleep 120'
+    if [[ "$CCTRL_TEST_REPLACE_MODE" == "server" && -n "${CCTRL_TEST_RESTORE_SERVER_ID:-}" ]]; then
+        "$real_tmux" -L "$socket" set-option -s @cctrl_server_instance_id \
+            "$CCTRL_TEST_RESTORE_SERVER_ID"
+    fi
+    printf '%s\n' "$observed"
+    exit 0
+fi
+
+exec "$real_tmux" -L "$socket" "$@"
+SH
+    chmod +x "$bin/tmux"
+    export CCTRL_TEST_REAL_TMUX="$real_tmux" CCTRL_TEST_TMUX_SOCKET="$socket"
+    # shellcheck disable=SC2329 # invoked by the EXIT trap
+    cleanup_exact_stop() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; }
+    trap cleanup_exact_stop EXIT
+
+    "$real_tmux" -L "$socket" new-session -d -s reused 'sleep 120'
+    "$real_tmux" -L "$socket" new-session -d -s bystander 'sleep 120'
+
+    # Concurrent first-time listers must converge on the one value installed
+    # by tmux's serialized command queue; no caller may mint a competing ID.
+    concurrent_dir="$TMPDIR/exact-stop-concurrent"
+    mkdir -p "$concurrent_dir"
+    for n in 1 2 3 4; do
+        PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json >"$concurrent_dir/$n.json" &
+        concurrent_pids+=("$!")
+    done
+    for pid in "${concurrent_pids[@]}"; do wait "$pid"; done
+    server_id="$("$real_tmux" -L "$socket" show-options -sqv @cctrl_server_instance_id)"
+    [[ "$server_id" =~ ^[0-9a-f]{32}$ ]] \
+        || fail "concurrent listing did not install a valid server identity: $server_id"
+    for concurrent_file in "$concurrent_dir"/*.json; do
+        jq -e --arg server_id "$server_id" \
+            'length == 2 and all(.[].execution_id; split(":") as $p | ($p | length) == 5 and $p[0] == "tmux-v1" and $p[1] == $server_id and ($p[2] | test("^[0-9]+$")) and ($p[3] | test("^[0-9]+$")) and ($p[4] | test("^\\$[0-9]+$")))' \
+            "$concurrent_file" >/dev/null \
+            || fail "concurrent listing did not converge on $server_id: $(cat "$concurrent_file")"
+    done
+
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    old_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+    [[ "$old_id" =~ ^tmux-v1:[0-9a-f]{32}:[0-9]+:[0-9]+:\$[0-9]+$ ]] \
+        || fail "listing did not expose a valid execution_id: $old_id"
+    jq -e '.[] | select(.name=="reused") | .session_id == null' <<< "$rows" >/dev/null \
+        || fail "provider session_id was repurposed as execution identity"
+
+    # A replacement with the same name in the same server receives a new $N.
+    "$real_tmux" -L "$socket" kill-session -t '=reused'
+    "$real_tmux" -L "$socket" new-session -d -s reused 'sleep 120'
+    rc=0
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$old_id" --json)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "stale same-server identity returned $rc: $out"
+    jq -e '.ok==false and .status=="stale-identity"' <<< "$out" >/dev/null \
+        || fail "stale same-server identity returned the wrong contract: $out"
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "stale identity stopped the same-name replacement"
+
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    fresh_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+
+    # Missing, malformed, unsupported, and name-mismatched identities fail
+    # closed. Neither the target nor an unrelated session is touched.
+    assert_stop_exact_error 64 missing-name "missing name" --execution-id "$fresh_id"
+    assert_stop_exact_error 64 missing-identity "missing identity" reused
+    assert_stop_exact_error 64 missing-identity "valueless identity" reused --execution-id
+    assert_stop_exact_error 64 malformed-identity "malformed identity" reused --execution-id nonsense
+    assert_stop_exact_error 64 malformed-identity "malformed tmux identity" reused --execution-id tmux-v1:bad
+    assert_stop_exact_error 64 unsupported-identity "unsupported identity" reused --execution-id tmux-v2:future
+    assert_stop_exact_error 64 invalid-input "unknown flag" reused --bogus --execution-id "$fresh_id"
+    assert_stop_exact_error 64 invalid-input "multiple names" reused bystander --execution-id "$fresh_id"
+    assert_stop_exact_error 75 mismatched-identity "mismatched identity" bystander --execution-id "$fresh_id"
+
+    rc=0
+    out="$(cctrl_source_eval '_session_require_tmux(){ return 1; }; _session_stop_exact reused --execution-id "$1" --json' "$fresh_id")" || rc=$?
+    if [[ "$rc" -ne 1 ]] || ! jq -e '.ok==false and .status=="tmux-unavailable"' <<< "$out" >/dev/null; then
+        fail "tmux-unavailable error did not preserve the JSON contract: rc=$rc out=$out"
+    fi
+    "$real_tmux" -L "$socket" has-session -t '=reused' || fail "invalid identity stopped its target"
+    "$real_tmux" -L "$socket" has-session -t '=bystander' || fail "invalid identity stopped a bystander"
+
+    # Force same-name replacement after inspection but before termination.
+    # The immutable $N target makes the effect-boundary command fail stale.
+    rc=0
+    out="$(CCTRL_TEST_REPLACE_MODE=session CCTRL_TEST_REPLACE_NAME=reused \
+        PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$fresh_id" --json)" || rc=$?
+    if [[ "$rc" -ne 69 ]] || ! jq -e '.status=="stale-identity"' <<< "$out" >/dev/null; then
+        fail "inspection/effect name-reuse race did not fail stale: rc=$rc out=$out"
+    fi
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "inspection/effect race stopped the replacement"
+
+    # A server restart can reuse $0 and restore the old valid-looking random
+    # option. Immutable server PID/start fields still reject the replacement,
+    # even when it appears after inspection.
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    fresh_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+    server_id="${fresh_id#tmux-v1:}"
+    server_id="${server_id%%:*}"
+    rc=0
+    out="$(CCTRL_TEST_REPLACE_MODE=server CCTRL_TEST_REPLACE_NAME=reused CCTRL_TEST_RESTORE_SERVER_ID="$server_id" \
+        PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$fresh_id" --json)" || rc=$?
+    if [[ "$rc" -ne 69 ]] || ! jq -e '.status=="stale-identity"' <<< "$out" >/dev/null; then
+        fail "tmux restart race did not fail stale: rc=$rc out=$out"
+    fi
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "stale pre-restart identity stopped the replacement server's session"
+
+    # A malformed pre-existing server annotation must never be upgraded into
+    # a claimed execution identity. The session remains visible but unstoppably
+    # fail-closed until a valid incarnation can be established.
+    "$real_tmux" -L "$socket" set-option -s @cctrl_server_instance_id invalid
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    jq -e '.[] | select(.name=="reused") | .execution_id == null' <<< "$rows" >/dev/null \
+        || fail "invalid server identity did not make execution_id null: $rows"
+    "$real_tmux" -L "$socket" has-session -t '=reused' \
+        || fail "fail-closed listing changed the running session"
+    "$real_tmux" -L "$socket" set-option -su @cctrl_server_instance_id
+
+    # A fresh identity stops only its intended execution.
+    "$real_tmux" -L "$socket" new-session -d -s survivor 'sleep 120'
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    fresh_id="$(jq -r '.[] | select(.name=="reused") | .execution_id' <<< "$rows")"
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact reused --execution-id "$fresh_id" --json)"
+    jq -e '.ok==true and .status=="stopped"' <<< "$out" >/dev/null \
+        || fail "correct identity did not stop its execution: $out"
+    ! "$real_tmux" -L "$socket" has-session -t '=reused' 2>/dev/null \
+        || fail "correct identity left its execution alive"
+    "$real_tmux" -L "$socket" has-session -t '=survivor' \
+        || fail "correct identity stopped an unrelated session"
+
+    # C locale must preserve UTF-8 names and a delimiter in the opaque name.
+    # The fixed identity header remains parseable and the exact stop uses the
+    # same name that listing returned.
+    local unicode_name='rü|pipe|' unicode_id
+    "$real_tmux" -L "$socket" new-session -d -s "$unicode_name" 'sleep 120'
+    rows="$(LC_ALL=C PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    unicode_id="$(jq -r --arg name "$unicode_name" '.[] | select(.name==$name) | .execution_id' <<< "$rows")"
+    [[ "$unicode_id" =~ ^tmux-v1:[0-9a-f]{32}:[0-9]+:[0-9]+:\$[0-9]+$ ]] \
+        || fail "C-locale listing lost UTF-8/delimited session identity: $rows"
+    out="$(LC_ALL=C PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact "$unicode_name" --execution-id "$unicode_id" --json)"
+    jq -e '.ok==true and .status=="stopped"' <<< "$out" >/dev/null \
+        || fail "C-locale exact stop rejected listed UTF-8/delimited session: $out"
+    ! "$real_tmux" -L "$socket" has-session -t "=$unicode_name" 2>/dev/null \
+        || fail "C-locale exact stop left the named execution alive"
+
+    # Preserve the existing name-based manual command for CLI compatibility.
+    "$real_tmux" -L "$socket" new-session -d -s legacy-kill 'sleep 120'
+    PATH="$bin:$PATH" "$ROOT/cctrl" session kill legacy-kill >/dev/null
+    ! "$real_tmux" -L "$socket" has-session -t '=legacy-kill' 2>/dev/null \
+        || fail "legacy session kill no longer works"
+
+    echo "ok: exact stop binds server+session identity and fails closed across reuse/restart"
+)
+
 # --- planned session attest -------------------------------------------------
 
 test_session_attest_live_tmux_process_matches() {
@@ -4733,6 +4935,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) printf 'TMUX--self\nTMUX--attach\n'; exit 0;;
     list-panes)
@@ -4790,6 +4993,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -4881,6 +5085,7 @@ test_snapshot_empty_fleet_guard_preserves() {
     mkdir -p "$bin" "$snapdir"
     cat > "$bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) exit 0;;
     *) exit 0;;
@@ -4912,6 +5117,7 @@ test_snapshot_allow_empty_overrides() {
     mkdir -p "$bin" "$snapdir"
     cat > "$bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) exit 0;;
     *) exit 0;;
@@ -5025,6 +5231,7 @@ test_snapshot_first_run_empty_writes() {
     mkdir -p "$bin" "$snapdir"
     cat > "$bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) exit 0;;
     *) exit 0;;
@@ -5053,6 +5260,7 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
     list-panes)
@@ -5173,6 +5381,7 @@ SH
     # Fake tmux that reports controllable session lists
     cat > "$dir/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions)
         if [[ -n "${TMUX_FAKE_SESSIONS:-}" ]]; then
@@ -5383,6 +5592,7 @@ JSON
     done
     cat > "$dir/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions)
         for s in TMUX--live1 TMUX--live2 TMUX--live3 TMUX--live4 TMUX--live5 TMUX--live6; do
@@ -5705,6 +5915,7 @@ test_restore_already_live_skipped() {
 JSON
     cat > "$dir/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) printf 'TMUX--already-live\n'; exit 0 ;;
     list-panes)
@@ -5806,6 +6017,7 @@ test_restore_already_live_record_join() {
     # No live session file — session_id will be empty
     cat > "$dir/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) printf 'TMUX--record-holder\n'; exit 0 ;;
     list-panes)
@@ -5867,6 +6079,7 @@ SNAP
 JSON
     cat > "$dir/bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) printf 'TMUX--live-only\n'; exit 0 ;;
     list-panes)
@@ -7420,6 +7633,7 @@ test_active_session_count_excludes_unmanaged() {
     # falsely marks every session as cctrl_managed.
     cat > "$bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "$1" in
     list-sessions)
         IFS=$'\n'
@@ -8086,6 +8300,7 @@ test_task_inventory_provider_neutral_readonly() {
     printf '%s\n' "$host" > "$data/host-id"
     cat > "$bin/tmux" <<'SH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
   list-sessions)
     printf '$1\037TMUX--owned\0371770000000\n$2\037TMUX--shared\0371770000001\n$3\037TMUX--recycled\0371770000002\n$4\037plain-shell\0371770000003\n$5\037TMUX--unanchored\0371770000004\n'
@@ -8310,6 +8525,11 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        session-stop-exact)
+            test_session_stop_exact_identity
+            echo "ok"
+            exit 0
+            ;;
         task-records)
             test_task_record_host_id_is_stable_exclusive_and_private
             test_task_record_schema_v2_and_provisional_promotion
@@ -8504,6 +8724,7 @@ test_peer_mcp_send_deliver_outcomes
 test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
+test_session_stop_exact_identity
 test_session_attest_live_tmux_process_matches
 test_session_attest_direct_metadata
 test_session_attest_stale_tmux_session_missing
@@ -8720,6 +8941,7 @@ test_health_check_needs_human_path() {
 
     cat > "$hc_bin/tmux" <<'FAKESH'
 #!/usr/bin/env bash
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     capture-pane)
         # Show a login-unavailable needs-human modal (no auto-dismiss match)
@@ -9864,6 +10086,7 @@ test_codex_handoff_state_machine() {
     cat > "$bin/tmux" <<'SH'
 #!/usr/bin/env bash
 state="${FAKE_HANDOFF_TMUX_STATE:?}"; proc="${FAKE_HANDOFF_PROCESS_STATE:?}"
+if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
   has-session) [[ -e "$state" ]] ;;
   display-message) [[ -e "$state" ]] && cat "$state" ;;

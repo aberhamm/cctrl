@@ -245,6 +245,7 @@ _cctrl() {
                     'prune:Propose stale / never-prompted sessions'
                     'close:Gracefully close a session (default: the one you are inside)'
                     'kill:Kill a detached session'
+                    'stop-exact:Stop only the execution identified by session ls --json'
                 )
                 _describe "session commands" session_cmds
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == ls ]]; then
@@ -271,6 +272,11 @@ _cctrl() {
                     '--in[Grace period in seconds]:seconds:' \
                     '--now[Kill immediately, no grace period]' \
                     '--force[Allow closing non-cctrl sessions]' \
+                    '*:session:_cctrl_tmux_sessions'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == stop-exact ]]; then
+                _arguments \
+                    '--execution-id[Opaque identity from session ls --json]:execution identity:' \
+                    '--json[Machine-readable result]' \
                     '*:session:_cctrl_tmux_sessions'
             elif (( CURRENT == 4 )) && [[ "${words[3]}" == (attach|a|kill|k|rm) ]]; then
                 local -a sessions

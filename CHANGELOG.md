@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] - 2026-09-21
 
 ### Added
+- Stop a listed tmux execution through `session stop-exact` with its opaque
+  `execution_id`. Exact server and session checks reject stale or reused names.
 - Inspect local and cross-host coding-agent tasks with `task ls` and
   `fleet --json-v2`, including provider identity, ownership, lifecycle, and
   per-action capabilities. Stable task records and a locked event reducer

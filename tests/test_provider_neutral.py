@@ -129,6 +129,7 @@ _launch_detached --force --agent codex --purpose 'unicode — purpose' "$HOME" -
     def test_list_does_not_borrow_claude_model_bridge_or_recency(self):
         result = self.shell('''
             tmux() {
+                if [[ "${1:-}" == "-u" ]]; then shift; fi
                 case "$1" in
                     list-sessions) echo demo ;;
                     list-panes) echo /repo ;;
