@@ -11,6 +11,12 @@
 
 set -uo pipefail
 
+# One brace group ending in `exit`: this process lives as long as the
+# session, so bash must never read past the loop from a file that may have
+# been rewritten in place since launch. A partially written file fails to
+# parse instead of running half a wrapper.
+{
+
 _agent="$1"; shift
 _marker="$1"; shift
 _flags=("$@")
@@ -102,3 +108,4 @@ while true; do
     break
 done
 exit "$_rc"
+}

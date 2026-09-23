@@ -8953,6 +8953,53 @@ test_health_check_detects_startup_exit() {
     echo "ok: health check fails fast when the agent exits during startup"
 }
 
+test_cctrl_partial_file_fails_before_running() {
+    # A cctrl read mid-update (git checkout unlinks and then streams the new
+    # file) must fail loudly without running anything. Truncated at a
+    # function boundary, the old layout never reached `main` and exited 0.
+    local dir="$TMPDIR/partial-cctrl" n out rc=0
+    mkdir -p "$dir/lib" "$dir/data"
+    cp -R "$ROOT/lib/." "$dir/lib/"
+    n="$(grep -n '^_session_say() {' "$ROOT/cctrl" | cut -d: -f1)"
+    head -n "$((n - 1))" "$ROOT/cctrl" > "$dir/cctrl"
+    chmod +x "$dir/cctrl"
+    out="$(CCTRL_DATA_DIR="$dir/data" "$dir/cctrl" peer send nobody --allow-unknown -- hi 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "truncated cctrl must not exit 0: $out"
+    [[ ! -e "$dir/data/messages.jsonl" ]] || fail "truncated cctrl must not act before failing"
+    [[ -z "$(ls -A "$dir/data")" ]] || fail "truncated cctrl wrote state: $(ls -A "$dir/data")"
+
+    echo "ok: a partially written cctrl fails without running"
+}
+
+test_running_scripts_ignore_inplace_rewrite() {
+    # A long-lived process must not execute bytes written into its script
+    # after launch. The session wrapper lives as long as its session; cctrl
+    # itself must stop reading at its final exit.
+    local dir="$TMPDIR/inplace" pid
+    mkdir -p "$dir/lib"
+    cp "$ROOT/lib/session-wrapper.sh" "$dir/lib/session-wrapper.sh"
+    printf '#!/usr/bin/env bash\nsleep 2\n' > "$dir/claude"
+    chmod +x "$dir/claude" "$dir/lib/session-wrapper.sh"
+    ( PATH="$dir:$PATH" CCTRL_EARLY_EXIT_WINDOW_SECONDS=0 \
+        "$dir/lib/session-wrapper.sh" claude "$dir/marker" --x >/dev/null 2>&1 ) &
+    pid=$!
+    sleep 0.5
+    python3 - "$dir/lib/session-wrapper.sh" "$dir/PWNED" <<'PY'
+import sys
+path, flag = sys.argv[1], sys.argv[2]
+old = open(path).read()
+with open(path, "w") as f:  # same inode, like cp or a shell redirect
+    f.write("#" * len(old) + ("\ntouch %s\n" % flag) * 50)
+PY
+    wait "$pid" || true
+    [[ ! -e "$dir/PWNED" ]] || fail "running session wrapper executed bytes rewritten into its file"
+
+    tail -n 6 "$ROOT/cctrl" | grep -q '^    exit \$?$' || fail "cctrl must exit right after main"
+    [[ "$(tail -n 1 "$ROOT/cctrl")" == "}" ]] || fail "cctrl body must be a single brace group"
+
+    echo "ok: running wrapper and cctrl never read bytes rewritten after launch"
+}
+
 test_session_wrapper_reports_startup_exit() {
     # The wrapper propagates the agent's exit status and, for a startup death,
     # prints the marker line the health check keys on.
@@ -10387,6 +10434,8 @@ test_health_check_timeout_path
 test_health_check_ready_requires_visible_prompt
 test_health_check_detects_startup_exit
 test_session_wrapper_reports_startup_exit
+test_cctrl_partial_file_fails_before_running
+test_running_scripts_ignore_inplace_rewrite
 test_health_check_bypass_flag
 test_session_pane_has_dialog_refactored
 test_codex_lifecycle_fixture_contract

@@ -32,6 +32,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Updating cctrl while it runs is now safe. `cctrl` and the session wrapper
+  are each parsed as a single unit that ends in `exit`. A partially written
+  file, such as one read during a git checkout, now fails before running
+  anything; a cut at a function boundary used to exit 0 silently. A
+  long-lived process also no longer executes bytes rewritten into its file
+  after launch.
 - `start -d` now reports a session ready only once the agent's input prompt is
   on screen, with no numbered selector such as Codex's update prompt. It used
   to report "ready" after 3 seconds of a blank, still-booting pane. An agent

@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The whole program is one brace group that ends in `exit`. Bash must parse
+# a compound command completely before running any of it, so:
+# - a partially written file (read mid-update: git checkout unlinks and then
+#   streams the new file) fails with a syntax error before doing anything.
+#   Before this, a cut at a function boundary never reached `main` and exited
+#   0 silently.
+# - a running cctrl never reads past `exit`, so an in-place rewrite of this
+#   file cannot feed a long-lived process new bytes at its old offset.
+{
+
 # cctrl — Coding Agent Controller
 # Manages settings profiles, tracks token usage locally, extensible via plugins.
 
@@ -15051,4 +15061,8 @@ _dispatch() {
 
 # CCTRL_NO_MAIN lets tests source this file to exercise individual functions
 # without running the CLI. Normal invocation is unaffected.
-[[ -n "${CCTRL_NO_MAIN:-}" ]] || main "$@"
+if [[ -z "${CCTRL_NO_MAIN:-}" ]]; then
+    main "$@"
+    exit $?
+fi
+}
