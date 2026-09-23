@@ -3489,8 +3489,9 @@ _launch_detached() {
 
     # Post-spawn health check (plan 056): poll the pane for known blocking
     # prompts and auto-dismiss safe ones. Only for detached spawns (not
-    # attach-after) and not when explicitly bypassed. Always returns 0 —
-    # results go to session metadata (health_status field).
+    # attach-after) and not when explicitly bypassed. Results go to session
+    # metadata (health_status field); an agent that exited during startup
+    # fails the launch instead of being reported as a started session.
     # CCTRL_NO_HEALTH_CHECK=1 env var also skips (for tests and scripting).
     if [[ "$no_health_check" != "true" && "${CCTRL_NO_HEALTH_CHECK:-}" != "1" \
           && "${CCTRL_ATTACH_AFTER_START:-}" != "1" ]]; then
@@ -3499,7 +3500,10 @@ _launch_detached() {
                 _HC_SCRIPT_DIR="$SCRIPT_DIR/lib"
                 source "$SCRIPT_DIR/lib/health-check.sh"
             fi
-            _health_check_run "$session_name" "$detach_agent" "$health_check_timeout"
+            if ! _health_check_run "$session_name" "$detach_agent" "$health_check_timeout"; then
+                echo -e "${RED}Detached session $session_name did not start: the agent exited during startup.${RESET}" >&2
+                return 1
+            fi
         fi
     fi
 

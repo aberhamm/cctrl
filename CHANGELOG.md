@@ -32,6 +32,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `start -d` now reports a session ready only once the agent's input prompt is
+  on screen, with no numbered selector such as Codex's update prompt. It used
+  to report "ready" after 3 seconds of a blank, still-booting pane. An agent
+  that exits during startup now fails the launch with its exit status and
+  error output instead of printing "detached session started". The session
+  wrapper keeps that pane open briefly (`CCTRL_EARLY_EXIT_HOLD_SECONDS`) so
+  the error stays readable.
 - Deliver long multi-line `session say`, `peer say`, nudge, and inline bodies
   exactly. Pastes now use bracketed paste with LF preserved, so newlines no
   longer reach Claude Code as Enter presses that split and dropped the message

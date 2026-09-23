@@ -8868,6 +8868,112 @@ FAKESH
     echo "ok: health check timeout path returns 0"
 }
 
+_hc_readiness_fixture() {
+    # Fake tmux whose visible screen comes from files: screen.N for the Nth
+    # capture (last one repeats). has-session fails when $dir/gone exists.
+    # Metadata writes go to $dir/meta.log.
+    local dir="$1"
+    mkdir -p "$dir/bin"
+    echo 0 > "$dir/count"
+    : > "$dir/meta.log"
+    cat > "$dir/bin/tmux" <<FAKESH
+#!/usr/bin/env bash
+case "\${1:-}" in
+    has-session) [[ -e "$dir/gone" ]] && exit 1; exit 0 ;;
+    capture-pane)
+        n=\$(( \$(cat "$dir/count") + 1 )); echo "\$n" > "$dir/count"
+        f="$dir/screen.\$n"
+        [[ -f "\$f" ]] || f="\$(ls "$dir"/screen.* | sort -t. -k2 -n | tail -1)"
+        cat "\$f"; exit 0 ;;
+    *) exit 0 ;;
+esac
+FAKESH
+    chmod +x "$dir/bin/tmux"
+}
+
+_hc_readiness_run() {
+    local dir="$1" agent="$2" timeout="$3"
+    (
+        RED="" GREEN="" YELLOW="" BOLD="" DIM="" RESET=""
+        _session_update_metadata_field() { printf '%s=%s\n' "$2" "$3" >> "$dir/meta.log"; }
+        _tmux_run_with_timeout() { TMUX_RUN_OUTPUT="$(tmux "$@" 2>/dev/null)" || return $?; }
+        _HC_SCRIPT_DIR="$ROOT/lib"; _HC_PATTERNS_LOADED=""
+        source "$ROOT/lib/health-check.sh"
+        PATH="$dir/bin:$PATH" CCTRL_HC_POLL_INTERVAL=0 _health_check_run "test-session" "$agent" "$timeout"
+    ) 2>/dev/null
+}
+
+test_health_check_ready_requires_visible_prompt() {
+    # A blank, still-booting pane is not ready; ready is reported only once
+    # the composer prompt is on screen for consecutive polls.
+    local dir="$TMPDIR/hcready" rc=0
+    _hc_readiness_fixture "$dir"
+    : > "$dir/screen.1"; : > "$dir/screen.2"; : > "$dir/screen.3"; : > "$dir/screen.4"
+    printf 'Loading...\n' > "$dir/screen.5"; printf 'Loading...\n' > "$dir/screen.6"
+    printf '  Claude Code\n────\n❯ \n────\n  ? for shortcuts\n' > "$dir/screen.7"
+    _hc_readiness_run "$dir" claude 30 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "ready path should return 0, got $rc"
+    grep -qx 'health_status=ready' "$dir/meta.log" || fail "expected health_status=ready: $(cat "$dir/meta.log")"
+    (( $(cat "$dir/count") >= 7 )) || fail "declared ready before the prompt was drawn (captures: $(cat "$dir/count"))"
+
+    # Codex's update selector ("› 1. Update now") and a composer drawn behind
+    # a numbered modal are never ready.
+    dir="$TMPDIR/hcready-codex"
+    _hc_readiness_fixture "$dir"
+    printf '  Update available!\n› 1. Update now\n  2. Skip\n› Ask Codex to do anything\n' > "$dir/screen.1"
+    _hc_readiness_run "$dir" codex 4 || true
+    grep -qx 'health_status=timeout' "$dir/meta.log" || fail "codex selector must not be ready: $(cat "$dir/meta.log")"
+
+    dir="$TMPDIR/hcready-codex-idle"
+    _hc_readiness_fixture "$dir"
+    printf '  OpenAI Codex\n› Ask Codex to do anything\n  ? for shortcuts\n' > "$dir/screen.1"
+    _hc_readiness_run "$dir" codex 10 || fail "codex idle composer should be ready"
+    grep -qx 'health_status=ready' "$dir/meta.log" || fail "codex idle composer should be ready: $(cat "$dir/meta.log")"
+
+    echo "ok: health check reports ready only when the agent prompt is visible"
+}
+
+test_health_check_detects_startup_exit() {
+    # An agent that dies during startup fails the check (rc 1, exited) instead
+    # of timing out or being reported ready.
+    local dir="$TMPDIR/hcexit" rc=0
+    _hc_readiness_fixture "$dir"
+    printf 'Error: bad flag\n\ncctrl: claude exited with status 3 after 0s during startup\n' > "$dir/screen.1"
+    _hc_readiness_run "$dir" claude 30 || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "startup exit should return 1, got $rc"
+    grep -qx 'health_status=exited' "$dir/meta.log" || fail "expected exited: $(cat "$dir/meta.log")"
+
+    dir="$TMPDIR/hcgone"; rc=0
+    _hc_readiness_fixture "$dir"
+    : > "$dir/screen.1"; touch "$dir/gone"
+    _hc_readiness_run "$dir" claude 30 || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "vanished session should return 1, got $rc"
+    grep -qx 'health_status=exited' "$dir/meta.log" || fail "expected exited for vanished session"
+
+    echo "ok: health check fails fast when the agent exits during startup"
+}
+
+test_session_wrapper_reports_startup_exit() {
+    # The wrapper propagates the agent's exit status and, for a startup death,
+    # prints the marker line the health check keys on.
+    local bin="$TMPDIR/wrapexit-bin" out rc=0
+    mkdir -p "$bin"
+    printf '#!/usr/bin/env bash\necho "Error: bad flag" >&2\nexit 3\n' > "$bin/claude"
+    chmod +x "$bin/claude"
+    out="$(PATH="$bin:$PATH" CCTRL_EARLY_EXIT_HOLD_SECONDS=0 \
+        "$ROOT/lib/session-wrapper.sh" claude "$TMPDIR/wrapexit-marker" --flag 2>&1 </dev/null)" || rc=$?
+    [[ "$rc" -eq 3 ]] || fail "wrapper should exit with the agent status 3, got $rc"
+    assert_contains "$out" "cctrl: claude exited with status 3 after"
+
+    rc=0
+    out="$(PATH="$bin:$PATH" CCTRL_EARLY_EXIT_WINDOW_SECONDS=0 \
+        "$ROOT/lib/session-wrapper.sh" claude "$TMPDIR/wrapexit-marker" --flag 2>&1 </dev/null)" || rc=$?
+    [[ "$rc" -eq 3 ]] || fail "wrapper should still propagate status outside the window, got $rc"
+    assert_not_contains "$out" "during startup"
+
+    echo "ok: session wrapper reports startup exits and propagates status"
+}
+
 test_health_check_bypass_flag() {
     # --no-health-check must be parsed by _launch_detached and skip the check.
     # We verify by checking that the flag is accepted in the arg parser.
@@ -10278,6 +10384,9 @@ test_health_check_pattern_matching
 test_health_check_transition_guard
 test_health_check_needs_human_path
 test_health_check_timeout_path
+test_health_check_ready_requires_visible_prompt
+test_health_check_detects_startup_exit
+test_session_wrapper_reports_startup_exit
 test_health_check_bypass_flag
 test_session_pane_has_dialog_refactored
 test_codex_lifecycle_fixture_contract
