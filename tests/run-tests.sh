@@ -2717,7 +2717,7 @@ assert_modal_detection() {
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="$session" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:05Z" "$ROOT/cctrl" peer deliver "$peer" --json)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected benign $peer output (no modal marker) to nudge, not defer"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-$peer-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-nudge-$peer-"
     assert_contains "$(cat "$log")" "send-keys -t $session Enter"
 }
 
@@ -3449,7 +3449,7 @@ test_peer_deliver_tmux_nudge_lifecycle() {
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:01Z" "$ROOT/cctrl" peer deliver comet --json)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].queued == 2 and .results[0].submitted == true' >/dev/null || fail "expected JSON nudged result"
     assert_contains "$(cat "$log")" "load-buffer -b cctrl-nudge-comet-"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-nudge-comet-"
     assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
     assert_contains "$(cat "$log")" "delete-buffer -b cctrl-nudge-comet-"
     assert_not_contains "$(cat "$log")" "secret body A"
@@ -3536,7 +3536,7 @@ test_peer_deliver_busy_no_submit_and_inline() {
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:02Z" "$ROOT/cctrl" peer deliver comet --json --no-submit)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == false' >/dev/null || fail "expected --no-submit nudge"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-nudge-comet-"
     assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
 
     inline_id="$(printf 'inline body\n' | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --body-file - --json | jq -r '.id')"
@@ -3547,7 +3547,7 @@ test_peer_deliver_busy_no_submit_and_inline() {
     # the reply/ack commands, then the original body verbatim after `---`.
     assert_contains "$(cat "$log")" "[cctrl peer message] from: orchestrator (orchestrator)"
     assert_contains "$(cat "$log")" "inline body"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-inline-comet-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-inline-comet-"
     assert_not_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
 }
 
@@ -3715,7 +3715,7 @@ test_peer_inline_pastes_into_recipient_pane() {
     : > "$log"
     PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet TMUX--bsender" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
     buf="$(cat "$log")"
-    assert_contains "$buf" "paste-buffer -b cctrl-inline-comet-"
+    assert_contains "$buf" "paste-buffer -p -r -b cctrl-inline-comet-"
     assert_contains "$buf" "-t TMUX--comet"
     assert_not_contains "$buf" "cctrl-inline-bsender"
     echo "ok: inline delivery pastes into the recipient's pane, not the sender's"
@@ -3914,7 +3914,7 @@ test_peer_deliver_failures_all_and_concurrency() {
         wait "$pid" || failed=1
     done
     [[ "$failed" -eq 0 ]] || fail "expected concurrent deliver commands to complete"
-    count="$(grep -c 'paste-buffer -b cctrl-nudge-comet-' "$log" || true)"
+    count="$(grep -c 'paste-buffer -p -r -b cctrl-nudge-comet-' "$log" || true)"
     [[ "$count" -eq 1 ]] || fail "expected concurrent deliver to paste one nudge, got $count"
     messages="$(jq -s '.' "$data/messages.jsonl")"
     printf '%s\n' "$messages" | jq -e '.[0].status == "queued" and .[0].nudge_count == 1' >/dev/null || fail "expected concurrent deliver to record one nudge"
@@ -3967,7 +3967,7 @@ test_peer_orchestrator_status_nudge_watch() {
       (.results | map(select(.peer == "comet" and .status == "nudged")) | length) == 1
       and (.results | map(select(.peer == "offline" and .status == "skipped")) | length) == 1
     ' >/dev/null || fail "expected stale nudge to nudge tmux peer and skip polling peer through adapter"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-nudge-comet-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-nudge-comet-"
 
     delivered_id="$(CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:00Z" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "delivered stale" | jq -r '.id')"
     mark_message_delivered "$data/messages.jsonl" "$delivered_id"
@@ -6587,7 +6587,7 @@ test_session_say_submit_and_no_submit() {
     printf '%s\n' "$out" | jq -e '.ok == true and .session == "TMUX--demo" and .submitted == true and .status == "ok"' >/dev/null \
         || fail "expected session say submit ok result"
     assert_contains "$(cat "$log")" "BUFFER hello there"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
     assert_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
     # No mailbox file is created or touched by a direct say.
     [[ ! -e "$TMPDIR/data/messages.jsonl" ]] || fail "session say must not write messages.jsonl"
@@ -6597,7 +6597,7 @@ test_session_say_submit_and_no_submit() {
         "$ROOT/cctrl" session say TMUX--demo --no-submit --json -- "no enter please")"
     printf '%s\n' "$out" | jq -e '.ok == true and .submitted == false and .status == "ok"' >/dev/null \
         || fail "expected session say --no-submit result"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
     assert_not_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
 
     echo "ok: session say pastes with Enter by default and honors --no-submit"
@@ -6625,6 +6625,75 @@ test_session_say_body_file_preserves_newlines() {
     assert_contains "$(cat "$log")" "BUFFER from stdin"
 
     echo "ok: session say --body-file (PATH and -) preserves multi-line bodies and trailing newline"
+}
+
+test_session_say_long_body_bracketed_exact() {
+    # A long multi-line body must reach the pane as ONE bracketed paste with LF
+    # preserved (-p -r); a plain paste turns every newline into Enter, which
+    # split and mostly dropped long messages in Claude Code.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local log="$TMPDIR/say-long.log" bf="$TMPDIR/say-long.txt" raw="$TMPDIR/say-long.raw" out i
+    for (( i = 0; i < 600; i++ )); do
+        printf 'row %03d — ünïcødé ✓ "q" '\''s'\'' $HOME `bt` \\ back\ttab\n' "$i"
+    done > "$bf"
+    printf 'no trailing newline' >> "$bf"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_BUFFER_FILE="$raw" \
+        TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+        "$ROOT/cctrl" session say TMUX--demo --body-file "$bf" --json)"
+    printf '%s\n' "$out" | jq -e '.ok == true and .submitted == true' >/dev/null \
+        || fail "expected long session say to submit: $out"
+    cmp -s "$bf" "$raw" || fail "long say body was not loaded byte-for-byte"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
+    assert_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
+
+    echo "ok: session say delivers a long multi-line body exactly as one bracketed paste"
+}
+
+test_tmux_paste_buffer_names_unique_per_invocation() {
+    # Concurrent senders in the same second must never share a buffer name, or
+    # one pastes the other's text and then deletes it mid-paste.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    # One log per sender: the fake tmux writes each argument separately, so a
+    # shared log interleaves concurrent lines.
+    local names i
+    for i in 1 2 3 4; do
+        PATH="$TMPDIR:$PATH" TMUX_LOG="$TMPDIR/say-concurrent.$i.log" TMUX_FAKE_SESSIONS="TMUX--demo" TMUX_FAKE_HAS_SESSION="TMUX--demo" \
+            "$ROOT/cctrl" session say TMUX--demo --no-submit --json -- "msg $i" > "$TMPDIR/say-concurrent.$i.out" &
+    done
+    wait
+    names="$(cat "$TMPDIR"/say-concurrent.*.log | grep -o 'paste-buffer -p -r -b cctrl-say-TMUX--demo-[^ ]*' | sort)"
+    [[ "$(printf '%s\n' "$names" | wc -l | tr -d ' ')" == 4 ]] \
+        || fail "expected 4 pastes, got: $names; outputs: $(cat "$TMPDIR"/say-concurrent.*.out)"
+    [[ "$(printf '%s\n' "$names" | sort -u | wc -l | tr -d ' ')" == 4 ]] || fail "paste buffer names collided: $names"
+
+    echo "ok: concurrent session say invocations use distinct tmux buffers"
+}
+
+test_peer_socket_deliver_payload_exact() {
+    # The Claude socket adapter must send the exact payload: a here-string
+    # appended a newline, and the node fallback spliced the path into JS.
+    local capture="$TMPDIR/socat.in" payload got
+    mkdir -p "$TMPDIR/socatbin"
+    cat > "$TMPDIR/socatbin/socat" <<'SH'
+#!/usr/bin/env bash
+cat > "${SOCAT_CAPTURE:?}"
+SH
+    chmod +x "$TMPDIR/socatbin/socat"
+    payload=$'first line\nsecond "quoted" ✓\n\n'"$(printf 'x%.0s' {1..5000})"
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        PATH="$TMPDIR/socatbin:$PATH" SOCAT_CAPTURE="$capture" \
+            _peer_socket_deliver "$TMPDIR/fake.sock" "$payload"
+    ) || fail "socket deliver returned non-zero"
+    got="$(jq -j '.message.content' "$capture"; printf '.')"
+    got="${got%.}"
+    [[ "$got" == "$payload" ]] || fail "socket payload was altered (len ${#got} vs ${#payload})"
+    jq -e '.type == "user" and .message.role == "user"' "$capture" >/dev/null || fail "bad socket frame"
+
+    echo "ok: socket delivery sends the exact payload"
 }
 
 test_session_say_modal_deferral_not_overridden_by_force_busy() {
@@ -6723,7 +6792,7 @@ SH
         "$ROOT/cctrl" session say TMUX--demo --json -- "should paste")"
     printf '%s\n' "$out" | jq -e '.ok == true and .status == "ok"' >/dev/null \
         || fail "expected a benign numbered-list pane to accept the paste"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
     echo "ok: session say blocks on a Claude modal and still pastes on a benign numbered list"
 }
 
@@ -6747,7 +6816,7 @@ test_session_say_unknown_readiness_requires_force_busy() {
         "$ROOT/cctrl" session say TMUX--demo --force-busy --json -- "hi")"
     printf '%s\n' "$out" | jq -e '.ok == true and .status == "ok"' >/dev/null \
         || fail "expected --force-busy to permit paste under unknown readiness"
-    assert_contains "$(cat "$log")" "paste-buffer -b cctrl-say-TMUX--demo-"
+    assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
     echo "ok: session say gates unknown readiness behind --force-busy"
 }
 
@@ -8511,6 +8580,9 @@ test_session_attest_malformed_metadata_fails_human_mode
 test_session_runtime_mcp_attests_fixed_session
 test_session_say_submit_and_no_submit
 test_session_say_body_file_preserves_newlines
+test_session_say_long_body_bracketed_exact
+test_tmux_paste_buffer_names_unique_per_invocation
+test_peer_socket_deliver_payload_exact
 test_session_say_modal_deferral_not_overridden_by_force_busy
 test_session_say_claude_modal_blocks_and_benign_pane_passes
 test_session_say_unknown_readiness_requires_force_busy

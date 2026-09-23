@@ -32,6 +32,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Deliver long multi-line `session say`, `peer say`, nudge, and inline bodies
+  exactly. Pastes now use bracketed paste with LF preserved, so newlines no
+  longer reach Claude Code as Enter presses that split and dropped the message
+  and swallowed the submit. Paste buffers are unique per invocation, and the
+  Claude socket adapter no longer appends a newline to the payload.
 - Restore passes the snapshot provider explicitly and refreshes exact Codex
   ownership immediately before each launch, including later restore waves.
 - App handoff preserves provider writer-lock files after ownership transfer.
