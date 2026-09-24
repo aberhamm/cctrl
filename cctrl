@@ -2212,9 +2212,37 @@ else:
             merged["origin"] = incoming_origin
         merged["registered_by_cctrl"] = bool(record.get("registered_by_cctrl") or incoming.get("registered_by_cctrl"))
         merged["launched_by_cctrl"] = bool(record.get("launched_by_cctrl") or incoming.get("launched_by_cctrl"))
+        # A newer cctrl terminal launch of an existing task (e.g. resumed into
+        # another tmux session) carries its current terminal anchors; the
+        # stored ones describe an earlier execution and would mislabel
+        # whichever session later reuses that tmux name.
+        last_launch = max((str(e.get("observed_at") or "") for e in record.get("ownership_evidence") or []
+                           if isinstance(e, dict) and e.get("source") == "cctrl-launch"), default="")
+        incoming_created = str(incoming.get("created_at") or "")
+        terminal_relaunch = bool(
+            event["source"] == "legacy-promotion" and incoming.get("provisional_launch_id")
+            and incoming.get("control_surface") == "tmux" and incoming.get("execution_runtime") == "tmux"
+            and incoming.get("control_owner") == "cctrl"
+            and incoming.get("tmux_session") and incoming.get("name") == incoming.get("tmux_session")
+            and incoming_created >= last_launch)
+        # Plan 070 S4: when that relaunch is strictly newer than the handoff to
+        # the app or the recorded end, cctrl owns the terminal writer again.
+        # This is an ownership change, not a contradiction. A real second
+        # writer (app live while tmux is live) is still caught by reconcile.
+        ended_at = max((str(item.get("observed_at") or "")
+                        for item in list(record.get("ownership_evidence") or []) + list(record.get("ownership_observations") or [])
+                        if isinstance(item, dict)
+                        and ((item.get("observed_owner") or item.get("proposed_owner")) == "app"
+                             or (item.get("observed_state") or item.get("proposed_state")) in ("closed", "released", "archived"))),
+                       default="")
+        reclaim = bool(
+            terminal_relaunch and incoming.get("launched_by_cctrl") is True and ended_at and incoming_created > ended_at
+            and ((record.get("control_owner"), record.get("execution_runtime")) in (("app", "app-server"), ("unknown", "unknown"))
+                 or record.get("lifecycle_state") in ("closed", "released")))
         for field in ("execution_runtime", "control_owner"):
             old, new = record.get(field, "unknown"), incoming.get(field, "unknown")
-            if old in (None, "unknown"): merged[field] = new
+            if reclaim: merged[field] = new
+            elif old in (None, "unknown"): merged[field] = new
             elif new in (None, "unknown") or old == new: merged[field] = old
             else: merged[field] = "conflict"
         # Lifecycle order is reduced from explicit observations below rather
@@ -2222,23 +2250,23 @@ else:
         merged["lifecycle_state"] = record.get("lifecycle_state", incoming.get("lifecycle_state", "unknown"))
         if record.get("restore_strategy") is None:
             merged["restore_strategy"] = incoming.get("restore_strategy")
+        if reclaim:
+            merged["lifecycle_state"] = "active"
+            merged["restore_strategy"] = "tmux"
+            merged["control_surface"] = "tmux"
         old_lineage, new_lineage = record.get("lineage") or {}, incoming.get("lineage") or {}
         merged["lineage"] = {k: old_lineage.get(k) if old_lineage.get(k) is not None else new_lineage.get(k)
                              for k in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis")}
-        # A newer cctrl terminal launch of an existing task (e.g. resumed into
-        # another tmux session) carries its current terminal anchors; the
-        # stored ones describe an earlier execution and would mislabel
-        # whichever session later reuses that tmux name.
-        last_launch = max((str(e.get("observed_at") or "") for e in record.get("ownership_evidence") or []
-                           if isinstance(e, dict) and e.get("source") == "cctrl-launch"), default="")
-        if (event["source"] == "legacy-promotion" and incoming.get("provisional_launch_id")
-                and incoming.get("control_surface") == "tmux" and incoming.get("execution_runtime") == "tmux"
-                and incoming.get("control_owner") == "cctrl" and incoming.get("tmux_session")
-                and incoming.get("name") == incoming.get("tmux_session")
-                and str(incoming.get("created_at") or "") >= last_launch):
+        if terminal_relaunch:
             for field in ("name", "tmux_session", "control_surface", "pane_id", "pane_pid", "wrapper_pid", "pane_started"):
                 merged[field] = incoming.get(field)
         combined = list(record.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
+        if reclaim:
+            combined.append({"source": "cctrl-reclaim", "source_instance": str(incoming.get("tmux_session")),
+                             "source_cursor": None, "authority_class": "authoritative",
+                             "observed_owner": "cctrl", "observed_runtime": "tmux", "observed_state": "active",
+                             "observed_at": incoming_created,
+                             "reason": "cctrl relaunched the terminal writer after the app handoff or recorded end"})
         unique = {canonical(item): item for item in combined}
         merged["ownership_evidence"] = [unique[k] for k in sorted(unique)][-max_evidence:]
         record = merged
@@ -2663,6 +2691,13 @@ _session_update_metadata_field() {
     if [[ "$version" == "$TASK_RECORD_SCHEMA_VERSION" && "$file" == "$SESSION_METADATA_DIR"/launch-*.json && -z "$stable_id" ]]; then
         _session_update_provisional_field "$file" "$session_name" "$field" "$value"
         return $?
+    fi
+    if [[ "$field" == "_terminal_anchor_receipt" && "$version" != "$TASK_RECORD_SCHEMA_VERSION" ]]; then
+        # A pane-anchor receipt describes the execution that is running now.
+        # A legacy name-keyed file describes an older conversation that once
+        # used this tmux name; promoting it here would give that conversation
+        # the live pane's anchor and make it contradict the real one (plan 070 S4).
+        return 1
     fi
     if [[ "$version" != "$TASK_RECORD_SCHEMA_VERSION" || ( "$file" == "$SESSION_METADATA_DIR"/launch-*.json && -n "$stable_id" ) ]]; then
         promoted="$(_task_record_promote_legacy "$file" "$stable_id")" || return 1

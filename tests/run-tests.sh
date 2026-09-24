@@ -8445,6 +8445,74 @@ test_task_record_relaunch_moves_terminal_anchors() {
     echo "ok: relaunching a task moves its terminal anchors; older receipts cannot roll them back"
 }
 
+test_task_record_relaunch_reclaims_and_reopens() {
+    # Plan 070 S4: a cctrl terminal relaunch that is newer than the handoff to
+    # the app (or than the recorded end) takes ownership back instead of
+    # merging into `conflict`; an older one keeps the conservative conflict.
+    local root="$TMPDIR/task-reclaim" meta="$TMPDIR/task-reclaim/meta" data="$TMPDIR/task-reclaim/data"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    export_env() { CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$@"; }
+    canonical_for() { # name task-id agent -> canonical path, handed off to the app at 2026-09-20T10:00:00Z
+        # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+        export_env cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" "$3" "$2" ""' "$1" "$2" "$3"
+        local file; file="$(session_record_path "$1" "$meta")"
+        jq '.control_owner="app" | .execution_runtime="app-server" | .restore_strategy="provider-managed" |
+            .pane_id="%1" | .pane_pid="100" | .wrapper_pid="100" | .pane_started="old" |
+            .ownership_evidence=[{source:"cctrl-launch",source_instance:"x",source_cursor:null,authority_class:"authoritative",observed_owner:"cctrl",observed_runtime:"tmux",observed_state:"active",observed_at:"2026-09-20T08:00:00Z",reason:"launch"}] |
+            .ownership_observations=[{source:"cctrl-handoff",source_instance_id:"h",authority_class:"authoritative",proposed_owner:"app",proposed_runtime:"app-server",proposed_state:"active",observed_at:"2026-09-20T10:00:00Z",basis_record_digest:"d",event_fingerprint:"f",source_sequence:1,source_cursor:null}]' \
+            "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+        printf '%s' "$file"
+    }
+    relaunch() { # canonical-file uuid created_at -> promote a newer/older launch receipt
+        local receipt="$meta/launch-$2.json"
+        jq --arg id "$2" --arg at "$3" '
+            .provider_task_id=null | .conversation_id=null | .lifecycle_state="provisional" |
+            .provisional_launch_id=$id | .created_at=$at | .control_owner="cctrl" | .execution_runtime="tmux" |
+            .control_surface="tmux" | .restore_strategy="tmux" | .launched_by_cctrl=true | .origin="cctrl" |
+            .pane_id="%9" | .pane_pid="900" | .wrapper_pid="900" | .pane_started="new" |
+            .ownership_evidence=[] | del(.ownership_observations)' "$1" > "$receipt"
+        # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+        export_env cctrl_source_eval '_task_record_promote_legacy "$1" "$2" >/dev/null' "$receipt" "$(jq -r '.provider_task_id' "$1")"
+    }
+
+    local newer older closed
+    newer="$(canonical_for TMUX--reclaim reclaim-id codex)"
+    relaunch "$newer" 11111111-2222-3333-4444-555555555555 "2026-09-23T16:33:00Z"
+    jq -e '.control_owner=="cctrl" and .execution_runtime=="tmux" and .lifecycle_state=="active" and
+           .restore_strategy=="tmux" and .pane_id=="%9" and any(.ownership_evidence[]; .source=="cctrl-reclaim")' \
+        "$newer" >/dev/null || fail "a relaunch newer than the app handoff did not reclaim the task: $(jq -c '{control_owner,execution_runtime,lifecycle_state,restore_strategy}' "$newer")"
+
+    older="$(canonical_for TMUX--older older-id codex)"
+    relaunch "$older" 22222222-3333-4444-5555-666666666666 "2026-09-20T09:00:00Z"
+    jq -e '.control_owner=="conflict" and .execution_runtime=="conflict"' "$older" >/dev/null \
+        || fail "a relaunch older than the app handoff silently took ownership: $(jq -c '{control_owner,execution_runtime}' "$older")"
+
+    # A task ended on purpose (plan 070 S3) is reopened by a newer relaunch.
+    closed="$(canonical_for TMUX--closed closed-id claude)"
+    jq '.control_owner="cctrl" | .execution_runtime="tmux" | .restore_strategy="tmux" | .ownership_observations=[]' \
+        "$closed" > "$closed.tmp" && mv "$closed.tmp" "$closed"
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    export_env cctrl_source_eval '_task_record_transition_file "$1" TMUX--closed unknown unknown closed "" cctrl-terminate authoritative "killed"' "$closed" \
+        || fail "could not record the fixture task closed"
+    [[ "$(jq -r '.lifecycle_state' "$closed")" == closed ]] || fail "fixture task was not closed"
+    relaunch "$closed" 33333333-4444-5555-6666-777777777777 "2999-01-01T00:00:00Z"
+    jq -e '.lifecycle_state=="active" and .control_owner=="cctrl" and .execution_runtime=="tmux"' "$closed" >/dev/null \
+        || fail "a newer relaunch did not reopen a closed task: $(jq -c '{control_owner,execution_runtime,lifecycle_state}' "$closed")"
+
+    # A pane-anchor receipt never promotes a legacy name-keyed record: that
+    # would give an older conversation the live pane's anchor.
+    cat > "$meta/TMUX--legacy.json" <<'JSON'
+{"name":"TMUX--legacy","agent":"claude","cctrl_managed":true,"conversation_id":"legacy-conv","dir":"/tmp","created_at":"2026-09-06T10:00:00Z"}
+JSON
+    local rc=0 receipt='{"control_surface":"tmux","tmux_session":"TMUX--legacy","pane_id":"%5","pane_pid":"500","wrapper_pid":"500","pane_started":"now"}'
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    export_env cctrl_source_eval '_session_update_metadata_field TMUX--legacy _terminal_anchor_receipt "$1"' "$receipt" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "an anchor receipt was applied to a legacy record"
+    [[ ! -e "$(export_env cctrl_source_eval '_task_record_file claude "$(_cctrl_host_id)" legacy-conv')" ]] \
+        || fail "an anchor receipt promoted a legacy conversation to a canonical record"
+    echo "ok: newer terminal relaunches reclaim app-handed-off or closed tasks; anchor receipts never promote legacy records"
+}
+
 test_task_record_identity_independent_close_continues() {
     local root="$TMPDIR/task-close-no-id" meta="$TMPDIR/task-close-no-id/meta" data="$TMPDIR/task-close-no-id/data" bin="$TMPDIR/task-close-no-id/bin" log="$TMPDIR/task-close-no-id/tmux.log"
     rm -rf "$root"; mkdir -p "$meta" "$data" "$bin"
@@ -8980,6 +9048,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_task_record_legacy_validation_and_lazy_promotion
             test_task_record_merge_conflict_preserves_evidence
             test_task_record_relaunch_moves_terminal_anchors
+            test_task_record_relaunch_reclaims_and_reopens
             test_task_record_identity_independent_close_continues
             test_task_registry_atomic_concurrent_updates
             test_task_registry_replay_order_and_guards
@@ -9238,6 +9307,7 @@ test_task_record_schema_v2_and_provisional_promotion
 test_task_record_legacy_validation_and_lazy_promotion
 test_task_record_merge_conflict_preserves_evidence
 test_task_record_relaunch_moves_terminal_anchors
+test_task_record_relaunch_reclaims_and_reopens
 test_tmux_inventory_survives_sanitized_formats
 test_task_record_identity_independent_close_continues
 test_task_registry_atomic_concurrent_updates

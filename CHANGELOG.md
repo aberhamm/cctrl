@@ -34,6 +34,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Relaunching a task in a cctrl terminal after handing it to the Codex app, or
+  after it was recorded closed, takes ownership back (`cctrl-reclaim`
+  evidence) instead of merging into an ownership `conflict`. A relaunch older
+  than the handoff still conflicts. A pane-anchor receipt no longer promotes a
+  legacy name-keyed record. That promotion gave an older conversation the live
+  pane's anchor, which made two records contradict each other on one pane.
+  (plan 070 S4)
 - `session kill`, `session close`, and `session stop-exact` record the task as
   `closed`, so `session restore` no longer resurrects sessions ended on
   purpose. `kill --keep-restorable` opts out. The new
