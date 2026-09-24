@@ -47,6 +47,14 @@ fail() {
     exit 1
 }
 
+# Live Claude sessions' statusline hook rewrites these two files every few
+# seconds (hooks/statusline.sh). They are not written by any code under test,
+# so the "tests did not touch the real live store" guards ignore them.
+live_data_digest() {
+    find "$ROOT/data" -type f ! -name 'rate-limits.json' ! -name 'rate-limits-history.jsonl' \
+        -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}'
+}
+
 ownership_live_store_digest() {
     python3 - "$ROOT/data" "$ROOT/.active-profile" \
         "$CCTRL_TEST_REAL_HOME/.config/cctrl" \
@@ -73,6 +81,8 @@ for root_arg in sys.argv[1:]:
         continue
     digest.update(b"dir\0")
     for path in sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root))):
+        if path.name in {"rate-limits.json", "rate-limits-history.jsonl"}:
+            continue  # statusline hook output from live sessions; see live_data_digest
         relative = str(path.relative_to(root)).encode()
         if path.is_symlink():
             digest.update(b"link\0" + relative + b"\0" + os.readlink(path).encode() + b"\0")
@@ -6268,7 +6278,7 @@ JSON
 {"schema_version":1,"kind":"codex_reconcile_result_v1","records":[],"errors":[]}
 JSON
 
-    before="$(find "$ROOT/data" -type f -exec shasum {} + 2>/dev/null | sort | shasum | awk '{print $1}')"
+    before="$(live_data_digest)"
     out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$catalogue" \
       CCTRL_SNAPSHOT_SESSIONS_FILE="$sessions" CCTRL_SNAPSHOT_PROCESS_FILE="$process" \
       CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$snapshots" --json)"
@@ -6452,7 +6462,7 @@ JSON
     jq -e '.plan[0].disposition=="insufficient-evidence" and (.plan[0].reason|contains("host id mismatch"))' <<< "$out" >/dev/null \
       || fail "--force-host upgraded a foreign durable host id"
 
-    after="$(find "$ROOT/data" -type f -exec shasum {} + 2>/dev/null | sort | shasum | awk '{print $1}')"
+    after="$(live_data_digest)"
     [[ "$before" == "$after" ]] || fail "snapshot ownership tests changed the real cctrl data store"
     echo "ok: snapshot/restore is schema-v2, ownership-aware, exact-id, source-gated, and non-destructive"
 }
@@ -6799,11 +6809,11 @@ JSON
     printf '[{"name":"must-not-fallback-either"}]\n' > "$fix/wrong.invalid.json"
 
     local before after out legacy human
-    before="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    before="$(live_data_digest)"
     out="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
         CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet --json-v2)" || fail "fleet v2 failed"
-    after="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    after="$(live_data_digest)"
     [[ "$before" == "$after" ]] || fail "fleet v2 tests changed the real cctrl live store"
     jq -e '
       (keys == ["capabilities","error","rows","schema_version","status"]) and
@@ -10300,7 +10310,7 @@ SH
     chmod +x "$bin/tmux"
     : > "$trace"; : > "$tmux_log"
     local before after out rc=0 record
-    before="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    before="$(live_data_digest)"
     out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" start --agent codex --app-owned "$root" --model gpt-6-astra --reasoning-effort high \
@@ -10444,7 +10454,7 @@ SH
     PATH="$bin:/usr/bin:/bin" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
       'HOSTS_FILE="$1"; _remote_exec remote start --message --app-owned --purpose fixed' "$hosts" >/dev/null
     assert_contains "$(cat "$ssh_log")" "-t tester@example.invalid"
-    after="$(find "$ROOT/data" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}')"
+    after="$(live_data_digest)"
     [[ "$before" == "$after" ]] || fail "app-owned tests changed the real cctrl live store"
     echo "ok: app-owned launch is at-most-once, writer-free, recoverable, and settings-safe"
 }

@@ -34,6 +34,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- The test suite's "did not touch the real live store" guards ignore
+  `data/rate-limits.json` and `data/rate-limits-history.jsonl`. Live Claude
+  sessions' statusline hook rewrites them every few seconds, which failed the
+  suite whenever any session was active.
 - Detached Codex sessions started with `--resume <id>` resume that task instead
   of opening a new one with the id as the first prompt. In-place restarts keep
   Codex `-c` config options and no longer resend the initial prompt.
