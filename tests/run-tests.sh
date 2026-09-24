@@ -8513,6 +8513,79 @@ JSON
     echo "ok: newer terminal relaunches reclaim app-handed-off or closed tasks; anchor receipts never promote legacy records"
 }
 
+test_task_resolve_conflicts_digest_guarded() {
+    # Plan 070 S5: resolve-conflicts is dry-run by default, writes only what a
+    # fresh evidence pass still supports, and every write is digest-guarded.
+    local root="$TMPDIR/resolve-conflicts" meta="$TMPDIR/resolve-conflicts/meta" data="$TMPDIR/resolve-conflicts/data"
+    local sessions="$TMPDIR/resolve-conflicts/claude-sessions" codex_id="01a0bde7-4a5f-7ba0-bbfb-a1e4e4df4af4"
+    local started="Wed Sep 23 17:40:22 2026" out before rc
+    rm -rf "$root"; mkdir -p "$meta" "$data" "$sessions"
+    resolve_env() {
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+            CCTRL_CLAUDE_SESSIONS_DIR="$sessions" CCTRL_RESOLVE_PANES_FILE="$root/panes.json" \
+            CCTRL_RESOLVE_PROCESS_FILE="$root/process.json" CCTRL_RESOLVE_CODEX_EVIDENCE_FILE="$root/codex.json" "$@"
+    }
+    anchored() { # name task-id agent pane_id pane_pid [owner runtime state]
+        # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+        resolve_env cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" "$3" "$2" ""' "$1" "$2" "$3"
+        local file; file="$(resolve_env cctrl_source_eval '_task_record_file "$1" "$(_cctrl_host_id)" "$2"' "$3" "$2")"
+        jq --arg p "$4" --arg pid "$5" --arg s "$started" --arg o "${6:-cctrl}" --arg r "${7:-tmux}" --arg l "${8:-active}" \
+            '.pane_id=$p | .pane_pid=$pid | .pane_started=$s | .control_owner=$o | .execution_runtime=$r | .lifecycle_state=$l' \
+            "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+        printf '%s' "$file"
+    }
+    local f_live f_old f_stale f_codex
+    f_live="$(anchored TMUX--homelab live-id claude %0 100)"
+    f_old="$(anchored TMUX--homelab old-id claude %0 100)"
+    f_stale="$(anchored TMUX--homelab stale-id claude %47 700)"
+    f_codex="$(anchored TMUX--cctrl "$codex_id" codex %15 3338 conflict conflict active)"
+    cat > "$root/panes.json" <<'JSON'
+{"status":"available","panes":[{"session_name":"TMUX--homelab","pane_id":"%0","pane_pid":"100"},{"session_name":"TMUX--cctrl","pane_id":"%15","pane_pid":"3338"}]}
+JSON
+    jq -n --arg s "$started" --arg id "$codex_id" '{status:"available",source_cursor:"c",processes:[
+        {pid:100,ppid:1,started:$s,command:"bash session-wrapper.sh claude"},
+        {pid:101,ppid:100,started:$s,command:"claude --resume live-id"},
+        {pid:3338,ppid:1,started:$s,command:"bash session-wrapper.sh codex"},
+        {pid:3339,ppid:3338,started:$s,command:("codex resume --yolo " + $id)}]}' > "$root/process.json"
+    printf '{"pid":101,"sessionId":"live-id"}\n' > "$sessions/101.json"
+    jq -n --arg id "$codex_id" '{records:[{provider_task_id:$id,sources:{app_server:{status:"confirmed-absence"}}}]}' > "$root/codex.json"
+
+    before="$(cat "$f_old" "$f_stale" "$f_codex" | shasum -a 256)"
+    out="$(resolve_env "$ROOT/cctrl" task resolve-conflicts --json)" || fail "resolve-conflicts dry run failed: $out"
+    jq -e '.apply==false and .counts.close==2 and .counts.own==1 and
+           any(.rows[]; .provider_task_id=="old-id" and .reason=="superseded-by live-id") and
+           any(.rows[]; .provider_task_id=="stale-id" and .reason=="stale-anchor") and
+           any(.rows[]; .provider_task_id=="live-id" and .action=="none")' <<< "$out" >/dev/null \
+        || fail "resolve-conflicts dry run planned the wrong actions: $out"
+    [[ "$before" == "$(cat "$f_old" "$f_stale" "$f_codex" | shasum -a 256)" ]] || fail "resolve-conflicts dry run wrote the registry"
+
+    out="$(resolve_env "$ROOT/cctrl" task resolve-conflicts --apply --json)" || fail "resolve-conflicts --apply failed: $out"
+    jq -e '[.applied[].apply_status] == ["applied","applied","applied"]' <<< "$out" >/dev/null \
+        || fail "resolve-conflicts did not apply every supported action: $(jq -c '.applied' <<< "$out")"
+    jq -e '.lifecycle_state=="closed" and any(.ownership_evidence[]; .source=="cctrl-resolve")' "$f_old" >/dev/null \
+        || fail "superseded record was not closed"
+    [[ "$(jq -r '.lifecycle_state' "$f_stale")" == closed ]] || fail "stale-anchor record was not closed"
+    jq -e '.control_owner=="cctrl" and .execution_runtime=="tmux" and .lifecycle_state=="active"' "$f_codex" >/dev/null \
+        || fail "live Codex owner was not restored: $(jq -c '{control_owner,execution_runtime,lifecycle_state}' "$f_codex")"
+    jq -e '.control_owner=="cctrl" and .lifecycle_state=="active"' "$f_live" >/dev/null || fail "the live record was changed"
+
+    # Without App Server evidence a Codex conflict is left alone.
+    local f_codex2; f_codex2="$(anchored TMUX--cctrl2 01a0bde3-91f6-7643-8593-bdca02fb5f7d codex %17 5429 conflict conflict active)"
+    printf '{"records":[]}\n' > "$root/codex.json"
+    jq '.panes += [{"session_name":"TMUX--cctrl2","pane_id":"%17","pane_pid":"5429"}]' "$root/panes.json" > "$root/p.tmp" && mv "$root/p.tmp" "$root/panes.json"
+    out="$(resolve_env "$ROOT/cctrl" task resolve-conflicts --apply --json)" || true
+    [[ "$(jq -r '.control_owner' "$f_codex2")" == conflict ]] || fail "a Codex conflict was resolved without App Server evidence"
+
+    # The digest guard: a transition decided against an older digest is refused.
+    rc=0
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    resolve_env cctrl_source_eval '_task_record_transition_file "$1" TMUX--homelab unknown unknown closed "" cctrl-resolve authoritative stale "$2"' \
+        "$f_live" "0000000000000000000000000000000000000000000000000000000000000000" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a digest-mismatched transition was not refused with 75 (rc=$rc)"
+    [[ "$(jq -r '.lifecycle_state' "$f_live")" == active ]] || fail "a digest-mismatched transition wrote the record"
+    echo "ok: resolve-conflicts is dry-run by default, evidence-gated, and digest-guarded"
+}
+
 test_task_record_identity_independent_close_continues() {
     local root="$TMPDIR/task-close-no-id" meta="$TMPDIR/task-close-no-id/meta" data="$TMPDIR/task-close-no-id/data" bin="$TMPDIR/task-close-no-id/bin" log="$TMPDIR/task-close-no-id/tmux.log"
     rm -rf "$root"; mkdir -p "$meta" "$data" "$bin"
@@ -9049,6 +9122,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_task_record_merge_conflict_preserves_evidence
             test_task_record_relaunch_moves_terminal_anchors
             test_task_record_relaunch_reclaims_and_reopens
+            test_task_resolve_conflicts_digest_guarded
             test_task_record_identity_independent_close_continues
             test_task_registry_atomic_concurrent_updates
             test_task_registry_replay_order_and_guards
@@ -9308,6 +9382,7 @@ test_task_record_legacy_validation_and_lazy_promotion
 test_task_record_merge_conflict_preserves_evidence
 test_task_record_relaunch_moves_terminal_anchors
 test_task_record_relaunch_reclaims_and_reopens
+test_task_resolve_conflicts_digest_guarded
 test_tmux_inventory_survives_sanitized_formats
 test_task_record_identity_independent_close_continues
 test_task_registry_atomic_concurrent_updates

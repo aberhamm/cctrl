@@ -457,6 +457,20 @@ purpose. Each records a `closed` lifecycle on the task records anchored to the
 session's panes, so `session restore` never brings it back after a reboot.
 `session kill --keep-restorable` skips that write.
 
+`cctrl task resolve-conflicts [--apply] [--json]` settles task records whose
+tmux claim is contradicted by live evidence. The evidence comes from one pass
+over the tmux pane inventory, the process table, Claude's session files, and
+Codex App Server ownership. It closes a record whose pane is gone while
+another execution holds its tmux name (`stale-anchor`), or whose pane now runs
+a different conversation (`superseded-by <id>`). It restores cctrl ownership
+when the anchored pane runs exactly that task (`live-owner`). Codex changes
+also need App Server evidence that the app is not running the task. A tmux
+name with no live session is never touched here: that is restore's job.
+
+It is dry-run by default. `--apply` collects evidence again, writes only the
+actions that still hold, and rejects any write whose record changed since the
+decision (exit `75`).
+
 For sessions that ended before this existed, or were killed outside cctrl, run
 `session mark-closed`. It is dry-run by default and refuses a name that is
 still live. A closed task also gives up its old tmux name, so a new session

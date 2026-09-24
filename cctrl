@@ -2730,9 +2730,11 @@ _task_record_transition() {
 
 # Apply one digest-guarded ownership/lifecycle transition to an exact record
 # file. $2.. are the same as _task_record_transition: the session name is used
-# as the event source instance.
+# as the event source instance. An optional ${10} is the record digest the
+# caller decided against; the write is refused (75) if the record has changed.
 _task_record_transition_file() {
     local file="$1" session_name="$2" runtime="$3" owner="$4" state="$5" restore="$6" source="$7" authority="$8" reason="$9"
+    local decided_digest="${10:-}"
     local stable_id promoted now record_key event_file event_id expected sequence result
     [[ -f "$file" ]] || return 1
     stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
@@ -2745,6 +2747,10 @@ _task_record_transition_file() {
     event_file="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || return 1
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     expected="$(_task_registry_record_digest "$file")" || { rm -f "$event_file"; return 1; }
+    if [[ -n "$decided_digest" && "$expected" != "$decided_digest" ]]; then
+        rm -f "$event_file"
+        return 75
+    fi
     event_id="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
     sequence="$(_task_registry_next_sequence "$file" "$source" "$session_name")" || { rm -f "$event_file"; return 1; }
     jq -n --arg id "$event_id" --arg provider "$(jq -r '.provider' "$file")" \
@@ -10317,14 +10323,129 @@ _task_list() {
     return "$rc"
 }
 
+# ── Stale ownership conflicts (plan 070 S5) ──────────────────────────
+# `task resolve-conflicts` settles records whose tmux claim is contradicted by
+# live evidence: the pane is gone while the name is held by another execution,
+# or the pane runs a different conversation. lib/conflict_resolve.py decides
+# from one evidence pass; nothing is written without --apply, and each write
+# is guarded by the record digest the decision was made against.
+
+_task_resolve_conflicts_plan() {
+    local scratch="$1" host_id
+    host_id="$(_cctrl_host_id)" || return 69
+    if [[ -n "${CCTRL_RESOLVE_PANES_FILE:-}" ]]; then
+        cp "$CCTRL_RESOLVE_PANES_FILE" "$scratch/panes.json" || return 69
+    else
+        # A partial tmux read is treated as unavailable: a missing row would
+        # look exactly like a gone pane.
+        _task_tmux_rows_json_readonly | jq '{
+            status: (if .status == "available" and ((.errors // []) | length) == 0 then "available" else "unavailable" end),
+            panes: [.rows[] | {session_name: .name, pane_id, pane_pid}]}' > "$scratch/panes.json" || return 69
+    fi
+    if [[ -n "${CCTRL_RESOLVE_PROCESS_FILE:-}" ]]; then
+        cp "$CCTRL_RESOLVE_PROCESS_FILE" "$scratch/process.json" || return 69
+    else
+        _snapshot_process_source "$scratch/process.json" || true
+    fi
+    if [[ -n "${CCTRL_RESOLVE_CODEX_EVIDENCE_FILE:-}" ]]; then
+        cp "$CCTRL_RESOLVE_CODEX_EVIDENCE_FILE" "$scratch/codex.json" || return 69
+    else
+        _session_reconcile_codex --dry-run --json > "$scratch/codex.json" 2>/dev/null || true
+        jq -e 'type == "object"' "$scratch/codex.json" >/dev/null 2>&1 || printf '{}\n' > "$scratch/codex.json"
+    fi
+    python3 "$SCRIPT_DIR/lib/conflict_resolve.py" plan --records-dir "$SESSION_METADATA_DIR" \
+        --panes "$scratch/panes.json" --process "$scratch/process.json" \
+        --claude-sessions "$CLAUDE_SESSIONS_DIR" --codex "$scratch/codex.json" --host-id "$host_id"
+}
+
+_task_resolve_conflicts() {
+    local apply=false json=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply) apply=true; shift ;;
+            --json) json=true; shift ;;
+            -h|--help|help)
+                echo "Usage: cctrl task resolve-conflicts [--apply] [--json]"
+                echo ""
+                echo "  Settle task records whose tmux claim is contradicted by live evidence."
+                echo "    close  stale-anchor     pane gone; the name is held by another execution"
+                echo "    close  superseded-by X  the pane runs a different conversation X"
+                echo "    own    live-owner       the pane runs exactly this task"
+                echo "  Codex changes also need App Server evidence that the app is not live."
+                echo "  Dry-run by default. --apply re-collects evidence and writes only the"
+                echo "  actions that still hold, guarded by each record's digest."
+                echo "  Exit: 0 ok; 69 evidence unavailable; 75 a guarded write was rejected."
+                return 0 ;;
+            *) echo -e "${RED}Unknown resolve-conflicts argument: $1${RESET}" >&2; return 64 ;;
+        esac
+    done
+    local scratch plan fresh rc=0
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-resolve.XXXXXX")" || return 1
+    plan="$(_task_resolve_conflicts_plan "$scratch")" || rc=$?
+    if (( rc != 0 )) || ! jq -e '.kind == "conflict_resolution_plan_v1"' <<< "$plan" >/dev/null 2>&1; then
+        rm -rf "$scratch"
+        echo -e "${RED}Could not collect conflict evidence.${RESET}" >&2
+        return 69
+    fi
+    local -a results=()
+    local failed=0 row record digest action reason name status
+    if $apply; then
+        # Evidence is collected again at apply time. An action is written only
+        # if the fresh pass reaches the same decision on the same record digest.
+        fresh="$(_task_resolve_conflicts_plan "$scratch")" || fresh='{}'
+        while IFS= read -r row; do
+            [[ -n "$row" ]] || continue
+            record="$(jq -r '.record' <<< "$row")"; digest="$(jq -r '.record_digest' <<< "$row")"
+            action="$(jq -r '.action' <<< "$row")"; reason="$(jq -r '.reason' <<< "$row")"
+            name="$(jq -r '.tmux_session' <<< "$row")"
+            status="applied"
+            if ! jq -e --arg r "$record" --arg d "$digest" --arg a "$action" --arg why "$reason" \
+                'any(.rows[]?; .record == $r and .record_digest == $d and .action == $a and .reason == $why)' <<< "$fresh" >/dev/null 2>&1; then
+                status="changed"
+            elif [[ "$action" == close ]]; then
+                _task_record_transition_file "$SESSION_METADATA_DIR/$record" "$name" unknown unknown closed "" \
+                    cctrl-resolve authoritative "$reason" "$digest" 2>/dev/null || status="rejected"
+            else
+                _task_record_transition_file "$SESSION_METADATA_DIR/$record" "$name" tmux cctrl active tmux \
+                    cctrl-resolve authoritative "live-owner: the anchored pane runs this task" "$digest" 2>/dev/null || status="rejected"
+            fi
+            [[ "$status" == applied ]] || failed=$((failed + 1))
+            results+=("$(jq -c --arg status "$status" '. + {apply_status: $status}' <<< "$row")")
+        done < <(jq -c '.rows[] | select(.action == "close" or .action == "own")' <<< "$plan")
+        plan="$(jq --argjson applied "$(if (( ${#results[@]} > 0 )); then printf '%s\n' "${results[@]}" | jq -s .; else printf '[]'; fi)" \
+            '. + {apply: true, applied: $applied}' <<< "$plan")"
+    else
+        plan="$(jq '. + {apply: false}' <<< "$plan")"
+    fi
+    rm -rf "$scratch"
+    if $json; then
+        printf '%s\n' "$plan"
+    else
+        jq -r '"sources: tmux=\(.sources.tmux) process=\(.sources.process) codex=\(.sources.codex)",
+            (.rows[] | select(.action != "none") | "\(.action)\t\(.provider)\t\(.provider_task_id[0:13])\t\(.tmux_session)\t\(.reason)")' <<< "$plan"
+        if $apply; then
+            jq -r '.applied[] | "\(.apply_status)\t\(.provider_task_id[0:13])\t\(.action) \(.reason)"' <<< "$plan"
+        else
+            echo -e "${DIM}Dry run. Apply with: cctrl task resolve-conflicts --apply${RESET}"
+        fi
+    fi
+    if jq -e '.sources.tmux != "available" or .sources.process != "available"' <<< "$plan" >/dev/null; then
+        return 69
+    fi
+    (( failed == 0 )) || return 75
+}
+
 cmd_task() {
     local action="${1:-ls}"
     shift 2>/dev/null || true
     case "$action" in
         ls|list) _task_list "$@" ;;
+        resolve-conflicts) _task_resolve_conflicts "$@" ;;
         -h|--help|help)
             echo "Usage: cctrl task ls [--json]"
-            echo "List the provider-neutral local task inventory."
+            echo "       cctrl task resolve-conflicts [--apply] [--json]"
+            echo "List the provider-neutral local task inventory, or settle stale"
+            echo "ownership conflicts from live tmux, process, and provider evidence."
             ;;
         *) echo -e "${RED}Unknown task command: $action${RESET}" >&2; return 64 ;;
     esac

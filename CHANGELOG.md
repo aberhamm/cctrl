@@ -7,6 +7,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] - 2026-09-21
 
 ### Added
+- `task resolve-conflicts [--apply] [--json]` settles stale ownership
+  conflicts from live evidence. A record whose pane is gone while another
+  execution holds its tmux name is closed (`stale-anchor`). A record whose pane
+  now runs another conversation is closed (`superseded-by`). A record whose
+  pane runs exactly its task gets cctrl ownership back (`live-owner`). Codex
+  changes also need App Server confirmed-absence. It is dry-run by default;
+  `--apply` re-collects evidence and every write is guarded by the digest the
+  decision was made against. (plan 070 S5)
 - Stop a listed tmux execution through `session stop-exact` with its opaque
   `execution_id`. Exact server and session checks reject stale or reused names.
 - Inspect local and cross-host coding-agent tasks with `task ls` and
