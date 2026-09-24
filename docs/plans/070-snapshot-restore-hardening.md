@@ -94,3 +94,30 @@ This plan fixes the capture, records intentional ends, stops new conflicts from 
 - Moving `data/` state to `$XDG_STATE_HOME` (see plan 071 follow-ups).
 - A Claude SessionEnd hook that records `/exit`. It would be useful later, but it must filter by exit reason so a reboot's SIGTERM never counts as an intentional end.
 - Keeping `data/snapshots/` out of livesync. That is an operational choice for Matthew.
+
+## Implementation Notes
+
+Commits on main (not pushed):
+- `27fb1db`: test harness ignores the statusline rate-limit files in the live-store guards
+- `4fd3ac7`: S1
+- `c9216ea`: S2
+- `cccb5e8`: S3
+- `1a0f922`: S4
+- `015cfc3`: S5
+
+The full suite passes at `015cfc3`: 145 shell checks and 93 Python tests.
+
+Operational steps, 2026-09-25 (Matthew approved in chat):
+- **Backfill:** `session mark-closed --apply` closed mcp (6bbb07ed), mcp--2 (c8133901), and portal (83eff643). obsidian was live again (56474c30), so it was refused as expected.
+- **Resolve:** `task resolve-conflicts --apply` closed homelab 12b80645 (superseded by e55c2cd9), scraper 64f5fc95 (superseded by c0b252e0), and obsidian 5e25447b (stale anchor). All three were digest-guarded and all applied.
+- **Restore dry run:**
+  - 0 `[restore]` rows.
+  - Killed sessions are no longer offered.
+  - homelab and scraper are `[already-live]`.
+  - 3 `[conflict]` rows remain, all live Codex tasks: cctrl, homelab--2, rentkompass.
+- **Timer:** loaded at StartInterval 900. A kickstarted run exited 0 and wrote about 110 KB.
+
+Still open:
+- The 3 live Codex conflicts, plus 95ce and the other Codex rows, need the Codex App Server: its control socket is missing. Open the Codex desktop app, then run `cctrl task resolve-conflicts` (dry run) and `--apply`.
+- Watch the timer for a day, then move it to 300 s.
+- The focused `CCTRL_TEST_ONLY=codex-ownership-matrix` group already failed at 4f353cb. The full suite runs the same contract and passes.
