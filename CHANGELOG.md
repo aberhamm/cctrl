@@ -40,6 +40,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Relaunching an existing task under a different tmux session moves its record
   and name index to the new session, so `session ls` no longer shows another
   task's provider, purpose, or state for a reused tmux name.
+- The read-only tmux inventory (task list, snapshots) parses sessions on
+  tmux 3.7, which prints control-character field separators as `_`; every
+  session was previously rejected and snapshots always reported degraded.
 - Restore passes the snapshot provider explicitly and refreshes exact Codex
   ownership immediately before each launch, including later restore waves.
 - App handoff preserves provider writer-lock files after ownership transfer.

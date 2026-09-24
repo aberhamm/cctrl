@@ -9768,24 +9768,27 @@ _task_tmux_rows_json_readonly() {
         jq -nc '{status:"unavailable",rows:[],errors:[{error:"tmux-not-found"}]}'
         return 0
     fi
-    raw="$(tmux list-sessions -F $'#{session_id}\037#{session_name}\037#{session_activity}' 2>/dev/null)" || rc=$?
+    # tmux 3.7 prints control characters in -F output as "_", so fields are
+    # joined with ":". Names may contain ":", but the id ($N) and activity
+    # (digits) never do, so the name is everything between them.
+    raw="$(tmux list-sessions -F '#{session_id}:#{session_name}:#{session_activity}' 2>/dev/null)" || rc=$?
     if (( rc != 0 )); then
         jq -nc --argjson rc "$rc" '{status:"unavailable",rows:[],errors:[{error:"list-sessions-failed",exit_code:$rc}]}'
         return 0
     fi
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
-        IFS=$'\037' read -r session_id name activity <<< "$line"
+        session_id="${line%%:*}"; name="${line#*:}"; activity="${name##*:}"; name="${name%:*}"
         if [[ ! "$session_id" =~ ^\$[0-9]+$ || -z "$name" ]]; then
             errors+=("$(jq -nc --arg value "$line" '{error:"invalid-session-identity",value:$value}')")
             continue
         fi
         cwd="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)" || cwd=""
-        pane_raw="$(tmux list-panes -t "$name" -F $'#{pane_id}\037#{pane_pid}' 2>/dev/null | head -1)" || pane_raw=""
+        pane_raw="$(tmux list-panes -t "$name" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)" || pane_raw=""
         if [[ -z "$cwd" && -z "$pane_raw" ]]; then
             errors+=("$(jq -nc --arg name "$name" '{error:"session-read-failed",session:$name}')")
         fi
-        IFS=$'\037' read -r pane_id pane_pid <<< "$pane_raw"
+        IFS=: read -r pane_id pane_pid <<< "$pane_raw"
         recency=""
         if [[ "$activity" =~ ^[0-9]+$ ]]; then
             recency="$(date -r "$activity" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)"

@@ -5101,6 +5101,45 @@ JSON
 JSON
 }
 
+test_tmux_inventory_survives_sanitized_formats() {
+    # tmux 3.7 prints control characters in -F output as "_". The read-only
+    # inventory must still parse every session, including names with ":".
+    local bin="$TMPDIR/tmux-sanitize-bin"
+    mkdir -p "$bin"
+    cat > "$bin/tmux" <<'SH'
+#!/usr/bin/env bash
+fmt=""; target=""; cmd="$1"; shift
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -F) fmt="$2"; shift 2 ;;
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+emit() { printf '%s\n' "$1" | LC_ALL=C tr '\001-\011\013-\037' '_'; }
+case "$cmd" in
+    list-sessions)
+        for entry in '$3|TMUX--ms--demo|1790000000' '$7|odd:name.x|1790000001'; do
+            IFS='|' read -r id name activity <<< "$entry"
+            out="${fmt//'#{session_id}'/$id}"; out="${out//'#{session_name}'/$name}"; out="${out//'#{session_activity}'/$activity}"
+            emit "$out"
+        done ;;
+    list-panes)
+        out="${fmt//'#{pane_id}'/%9}"; out="${out//'#{pane_pid}'/4242}"; out="${out//'#{pane_current_path}'//tmp/$target}"
+        emit "$out" ;;
+esac
+SH
+    chmod +x "$bin/tmux"
+    local out
+    out="$(PATH="$bin:$PATH" cctrl_source_eval '_task_tmux_rows_json_readonly')"
+    jq -e '
+        .status == "available" and (.errors | length) == 0 and (.rows | length) == 2 and
+        (.rows[0] | .session_id == "$3" and .name == "TMUX--ms--demo" and .pane_id == "%9" and .pane_pid == "4242" and .recency != null) and
+        (.rows[1] | .session_id == "$7" and .name == "odd:name.x")
+    ' <<< "$out" >/dev/null || fail "tmux inventory mis-parsed sanitized -F output: $out"
+    echo "ok: tmux inventory parses sanitized -F output and names containing ':'"
+}
+
 test_snapshot_header_and_session_shape() {
     local bin="$TMPDIR/sh-bin" sdir="$TMPDIR/sh-sess" pdir="$TMPDIR/sh-proj" meta="$TMPDIR/sh-meta"
     local snapdir="$TMPDIR/sh-snapshots"
@@ -8898,6 +8937,7 @@ test_task_record_schema_v2_and_provisional_promotion
 test_task_record_legacy_validation_and_lazy_promotion
 test_task_record_merge_conflict_preserves_evidence
 test_task_record_relaunch_moves_terminal_anchors
+test_tmux_inventory_survives_sanitized_formats
 test_task_record_identity_independent_close_continues
 test_task_registry_atomic_concurrent_updates
 test_task_registry_replay_order_and_guards
