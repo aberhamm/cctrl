@@ -11103,13 +11103,50 @@ _session_doctor() {
     fi
     return 0
 }
+_snapshot_history_files() {
+    # Timestamped history files, oldest first (names are UTC timestamps).
+    local dir="$1" f
+    for f in "$dir"/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.json; do
+        [[ -f "$f" ]] || continue
+        printf '%s\n' "$f"
+    done | sort
+}
+
 _snapshot_retention_prune() {
     # Keep every history file younger than 7 days.
     # Older than 7 days: keep only the first file of each UTC day, up to 90 days.
     # Delete the rest. Never delete latest.json. Never use a glob that reaches
     # outside the dir. Only match timestamped filenames.
+    # Then enforce count and byte caps (plan 070 S2), deleting oldest first but
+    # never the newest history file.
     local dir="$1"
     [[ -d "$dir" ]] || return 0
+    _snapshot_retention_prune_age "$dir"
+    _snapshot_retention_prune_caps "$dir"
+}
+
+_snapshot_retention_prune_caps() {
+    local dir="$1" max_count="${CCTRL_SNAPSHOT_HISTORY_MAX:-200}" max_bytes="${CCTRL_SNAPSHOT_HISTORY_MAX_BYTES:-104857600}"
+    [[ "$max_count" =~ ^[0-9]+$ && "$max_bytes" =~ ^[0-9]+$ ]] || return 0
+    local -a newest_first=()
+    local f kept=0 bytes=0 size full=false
+    while IFS= read -r f; do newest_first+=("$f"); done < <(_snapshot_history_files "$dir" | sort -r)
+    (( ${#newest_first[@]} > 0 )) || return 0
+    for f in "${newest_first[@]}"; do
+        size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"; [[ "$size" =~ ^[0-9]+$ ]] || size=0
+        # Once a cap is reached every older file goes, so history stays a
+        # contiguous newest-first window.
+        if ! $full && { (( kept == 0 )) || { (( kept < max_count )) && (( bytes + size <= max_bytes )); }; }; then
+            kept=$((kept + 1)); bytes=$((bytes + size))
+        else
+            full=true
+            rm -f "$f"
+        fi
+    done
+}
+
+_snapshot_retention_prune_age() {
+    local dir="$1"
 
     local now_epoch cutoff_7d cutoff_90d
     now_epoch="$(date +%s)"
@@ -11266,8 +11303,21 @@ _session_snapshot() {
         return 69
     fi
 
+    # Size guard (plan 070 S2): a snapshot is task references plus policy. A
+    # capture above the cap means something is recording bulk data again, so
+    # refuse it and keep the existing latest/history instead of filling disk.
+    local max_bytes="${CCTRL_SNAPSHOT_MAX_BYTES:-5242880}" snapshot_bytes
+    snapshot_bytes="$(wc -c < "$snapshot_file" | tr -d ' ')"
+    if [[ "$max_bytes" =~ ^[0-9]+$ ]] && (( snapshot_bytes > max_bytes )); then
+        $quiet || echo "snapshot: capture is ${snapshot_bytes} bytes, above CCTRL_SNAPSHOT_MAX_BYTES=${max_bytes}; existing latest/history preserved." >&2
+        rm -rf "$scratch"
+        return 69
+    fi
+
     local task_count existing_count=0
-    task_count="$(jq '.task_reference_count' "$snapshot_file")"
+    # The empty-fleet guard counts the whole catalogue, not only the rows kept
+    # after discovery-only references are summarised.
+    task_count="$(jq '.catalogue_task_count // .task_reference_count' "$snapshot_file")"
     if (( task_count == 0 )) && ! $allow_empty && [[ -f "$snapshot_dir/latest.json" ]]; then
         existing_count="$(jq '.task_reference_count // .session_count // 0' "$snapshot_dir/latest.json" 2>/dev/null || echo 0)"
         if (( existing_count > 0 )); then
@@ -11277,13 +11327,26 @@ _session_snapshot() {
         fi
     fi
 
-    local ts_name history_file tmp_file
-    ts_name="$(date -u +%Y%m%dT%H%M%SZ)"; history_file="$snapshot_dir/${ts_name}.json"
-    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
-    cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$history_file" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
+    # History only on change (plan 070 S2): content_digest covers the fields
+    # restore consumes, so an unchanged fleet refreshes latest.json only.
+    local ts_name history_file tmp_file new_digest newest_history newest_digest="" write_history=true
+    new_digest="$(jq -r '.content_digest // empty' "$snapshot_file")"
+    newest_history="$(_snapshot_history_files "$snapshot_dir" | tail -1)"
+    if [[ -n "$new_digest" && -n "$newest_history" ]]; then
+        newest_digest="$(jq -r '.content_digest // empty' "$newest_history" 2>/dev/null || true)"
+        [[ "$newest_digest" == "$new_digest" ]] && write_history=false
+    fi
+    task_count="$(jq '.task_reference_count' "$snapshot_file")"
+    if $write_history; then
+        ts_name="$(date -u +%Y%m%dT%H%M%SZ)"; history_file="$snapshot_dir/${ts_name}.json"
+        tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
+        cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$history_file" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
+    fi
     tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
     cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$snapshot_dir/latest.json" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
-    if $json_out; then cat "$snapshot_file"; else $quiet || echo "snapshot: ${task_count} task reference(s) written to ${snapshot_dir}/latest.json"; fi
+    if $json_out; then cat "$snapshot_file"; else
+        $quiet || echo "snapshot: ${task_count} task reference(s) written to ${snapshot_dir}/latest.json$($write_history || printf ' (unchanged; no history file)')"
+    fi
     _snapshot_retention_prune "$snapshot_dir"
     rm -rf "$scratch"
     return 0

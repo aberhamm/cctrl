@@ -34,6 +34,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `session snapshot` no longer grows without bound. On the live fleet a capture
+  went from 40 MB to about 100 KB. The changes:
+  - Labels are capped at 200 characters, with a hash of the full title.
+  - Discovery-only Codex tasks are counted rather than stored.
+  - A history file is written only when the restore-relevant `content_digest`
+    changes.
+  - History is capped by count and bytes.
+  - A capture over `CCTRL_SNAPSHOT_MAX_BYTES` (default 5 MB) is refused with
+    exit 69 and the existing files are kept. (plan 070 S2)
 - `session snapshot` records the conversation actually running in a tmux
   session when several registry records claim the same name. The live
   session's provider id decides; if no record matches it, the row is marked

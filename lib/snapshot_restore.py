@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -22,6 +23,19 @@ VALID_DISPOSITIONS = {
 }
 RESUME_KINDS = {"claude-session-id", "codex-thread-id"}
 RESUMABLE_STATES = {"active", "inactive", "provisional", "resumable"}
+# Codex provider titles are the whole first prompt (pastes included, up to
+# hundreds of KB). A snapshot only needs a readable label plus a hash that
+# identifies the full text.
+LABEL_MAX_CHARS = 200
+# Fields restore planning and launch replay actually consume. content_digest
+# covers only these, so timestamps and activity never force a new history file.
+DIGEST_TASK_FIELDS = (
+    "provider", "provider_task_id", "host_id", "origin", "execution_runtime", "control_owner",
+    "lifecycle_state", "restore_strategy", "registered_by_cctrl", "launched_by_cctrl", "lineage",
+    "tmux_session", "resume_identity_kind", "resume_identity", "cwd", "purpose", "display_label",
+    "display_label_sha256", "agent", "launch_flags", "live", "recovery_action", "recovery_reason",
+    "shadowed_task_ids",
+)
 
 
 def load(path: str) -> Any:
@@ -66,6 +80,46 @@ def action_for(row: dict[str, Any]) -> tuple[str, str]:
     if owner == "unknown" or runtime == "unknown" or state == "unknown":
         return "unknown", "snapshot ownership is unknown"
     return "insufficient-evidence", "snapshot is informational until current ownership evidence is joined"
+
+
+def bounded(value: Any) -> tuple[str | None, str | None]:
+    """Return (label capped at LABEL_MAX_CHARS, sha256 of the full text when cut)."""
+    value = text(value)
+    if value is None or len(value) <= LABEL_MAX_CHARS:
+        return value, None
+    return value[:LABEL_MAX_CHARS - 1] + "\u2026", hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+
+
+def apply_label_bounds(row: dict[str, Any]) -> None:
+    row["purpose"], _ = bounded(row.get("purpose"))
+    row["display_label"], digest = bounded(row.get("display_label"))
+    if digest:
+        row["display_label_sha256"] = digest
+
+
+def actionable(row: dict[str, Any]) -> bool:
+    """False for discovery-only rows the restore planner can never act on.
+
+    The planner returns `unknown` for any row whose owner or runtime is unknown,
+    so a catalogue row with no cctrl provenance, no tmux name, and no known
+    owner or runtime only costs bytes. Those are counted, not stored.
+    """
+    if row.get("registered_by_cctrl") is True or row.get("launched_by_cctrl") is True or text(row.get("tmux_session")):
+        return True
+    return row.get("control_owner") not in (None, "unknown") or row.get("execution_runtime") not in (None, "unknown")
+
+
+def content_digest(document: dict[str, Any]) -> str:
+    tasks = [{field: task.get(field) for field in DIGEST_TASK_FIELDS} for task in document["tasks"]]
+    tasks.sort(key=lambda task: json.dumps([task.get("provider"), task.get("provider_task_id"), task.get("tmux_session")], sort_keys=True))
+    basis = {
+        "schema_version": document["schema_version"],
+        "host_id": document["host_id"],
+        "capture_status": document["capture_quality"]["status"],
+        "omitted": document["omitted_task_references"],
+        "tasks": tasks,
+    }
+    return hashlib.sha256(json.dumps(basis, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def select_tmux_source(candidates: list[dict[str, Any]], session: dict[str, Any]) -> tuple[dict[str, Any], list[str], str | None]:
@@ -204,6 +258,7 @@ def capture(args: argparse.Namespace) -> int:
             "last_active": text(session.get("last_active")),
             "live": True,
         }
+        apply_label_bounds(row)
         if shadowed:
             row["shadowed_task_ids"] = shadowed
         if ambiguity:
@@ -218,6 +273,7 @@ def capture(args: argparse.Namespace) -> int:
         tasks.append(row)
 
     # Provider-managed and discovery-only tasks do not necessarily have tmux rows.
+    omitted: dict[str, int] = {}
     for source in rows:
         if not isinstance(source, dict):
             continue
@@ -259,6 +315,11 @@ def capture(args: argparse.Namespace) -> int:
             "last_active": text(source.get("recency")),
             "live": source.get("action_capabilities", {}).get("tmux_attach", {}).get("supported") is True,
         }
+        if not actionable(row):
+            key = f"{provider}:{row.get('lifecycle_state') or 'unknown'}"
+            omitted[key] = omitted.get(key, 0) + 1
+            continue
+        apply_label_bounds(row)
         row["recovery_action"], row["recovery_reason"] = action_for(row)
         tasks.append(row)
 
@@ -290,12 +351,15 @@ def capture(args: argparse.Namespace) -> int:
         "resource_metadata": load(args.resources),
         "tasks": tasks,
         "task_reference_count": len(tasks),
+        "catalogue_task_count": len(rows),
+        "omitted_task_references": {"count": sum(omitted.values()), "by_provider_state": dict(sorted(omitted.items()))},
         "restore_candidate_count": candidates,
         "capture_quality": capture_quality,
         "source_errors": errors,
         # Compatibility counters remain informational; restore never consumes them.
         "session_count": len(tasks),
     }
+    document["content_digest"] = content_digest(document)
     dump(document)
     return 0 if complete else 69
 

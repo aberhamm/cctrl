@@ -610,9 +610,23 @@ session you are calling from, and excludes attached sessions unless you pass
 a schema-v2 JSON file. Every row keeps its provider identity, durable host id,
 origin, runtime, control owner, lifecycle, restore strategy, launch/registration
 provenance, lineage, and an informational recovery disposition. Native Codex
-app tasks, discovery-only tasks, and tasks released to the app are retained as
-provider-managed references; snapshotting never starts, resumes, opens, or
-archives them. A launchd timer can run the capture every 5 minutes.
+app tasks and tasks released to the app are retained as provider-managed
+references; snapshotting never starts, resumes, opens, or archives them. A
+launchd timer can run the capture every 5 minutes.
+
+Snapshots stay small (about 100 KB for ~3,000 known tasks):
+
+- Labels and purposes are capped at 200 characters. A cut label carries
+  `display_label_sha256` of the full text.
+- Discovery-only tasks that restore can never act on are counted in
+  `omitted_task_references` rather than stored. These are tasks with no cctrl
+  provenance, no tmux session, and unknown owner and runtime.
+  `catalogue_task_count` is the full catalogue size.
+- When several registry records claim one tmux session, the live session's
+  provider id picks the row. Others are listed in `shadowed_task_ids`; if none
+  matches, the row is `ambiguous-tmux-claim` and never restorable.
+- A capture larger than `CCTRL_SNAPSHOT_MAX_BYTES` (default 5 MB) is refused
+  with exit `69`, and the existing files are kept.
 
 ```bash
 cctrl session snapshot                # write data/snapshots/latest.json
@@ -629,9 +643,18 @@ capture, the existing empty-fleet guard remains and `--allow-empty` overrides
 only that guard. `task_reference_count` and `restore_candidate_count` are
 reported separately.
 
-**Retention:** Every history file younger than 7 days is kept at full
-5-minute granularity. Older than 7 days, only the first file of each UTC
-day is kept, up to 90 days. Steady-state disk usage is under 30 MB.
+**History and retention:** `latest.json` is rewritten on every run. A
+timestamped history file is written only when `content_digest` changes. That
+digest covers just the fields restore uses, so timestamps and activity alone
+never add history.
+
+Retention rules:
+- Every history file younger than 7 days is kept.
+- Between 7 and 90 days old, only the first file of each UTC day is kept.
+- History is then capped at `CCTRL_SNAPSHOT_HISTORY_MAX` files (default 200)
+  and `CCTRL_SNAPSHOT_HISTORY_MAX_BYTES` (default 100 MB), removing the oldest
+  first.
+- The newest history file and `latest.json` are never removed.
 
 **Timer install** (per-user LaunchAgent, not installed automatically):
 

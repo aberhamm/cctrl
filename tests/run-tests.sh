@@ -6301,6 +6301,83 @@ JSON
     echo "ok: snapshot picks the live row per tmux name and only labels live rows already-live"
 }
 
+test_snapshot_size_controls() {
+    # Plan 070 S2: bounded labels, discovery-only rows summarised, history only
+    # on change, retention caps, and a size guard that preserves last-known-good.
+    local root="$TMPDIR/snapshot-size" host="0123456789abcdef0123456789abcdef" out rc big
+    mkdir -p "$root/data" "$root/snapshots"
+    printf '%s\n' "$host" > "$root/data/host-id"
+    cat > "$root/process.json" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-24T10:00:00Z","source_cursor":"p","processes":[],"error":null}
+JSON
+    big="$(python3 -c 'print("x" * 5000)')"
+    write_catalogue() { # $1 = purpose of the live session
+        cat > "$root/catalogue.json" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
+ {"provider":"claude","provider_task_id":"live-1","host_id":"$host","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"Live","tmux_session":"TMUX--live","action_capabilities":{"tmux_attach":{"supported":true}}},
+ {"provider":"codex","provider_task_id":"app-1","host_id":"$host","origin":"codex-app","execution_runtime":"app-server","control_owner":"app","lifecycle_state":"active","restore_strategy":"provider-managed","registered_by_cctrl":false,"launched_by_cctrl":false,"cwd":"/tmp/a","display_title":"$big","tmux_session":null},
+ {"provider":"codex","provider_task_id":"seen-1","host_id":"$host","origin":"unknown","execution_runtime":"unknown","control_owner":"unknown","lifecycle_state":"unknown","restore_strategy":null,"registered_by_cctrl":false,"launched_by_cctrl":false,"cwd":"/tmp/s","display_title":"$big","tmux_session":null},
+ {"provider":"codex","provider_task_id":"old-1","host_id":"$host","origin":"unknown","execution_runtime":"unknown","control_owner":"unknown","lifecycle_state":"archived","restore_strategy":null,"registered_by_cctrl":false,"launched_by_cctrl":false,"cwd":"/tmp/o","display_title":"old","tmux_session":null}
+]}
+JSON
+        printf '[{"name":"TMUX--live","agent":"claude","session_id":"live-1","dir":"/tmp/x","purpose":"%s","last_active":"%s"}]\n' "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$root/sessions.json"
+    }
+    snap() {
+        CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+          CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+          CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$root/snapshots" "$@"
+    }
+    history_count() { find "$root/snapshots" -name '20*.json' -type f | wc -l | tr -d ' '; }
+
+    write_catalogue "first"
+    out="$(snap --json)" || fail "size-controlled snapshot failed: $out"
+    jq -e '
+      .task_reference_count==2 and .catalogue_task_count==4 and
+      .omitted_task_references=={"count":2,"by_provider_state":{"codex:archived":1,"codex:unknown":1}} and
+      ([.tasks[] | select(.provider_task_id=="app-1")][0] | (.display_label|length)==200 and (.display_label_sha256|test("^[0-9a-f]{64}$")))' \
+      <<< "$out" >/dev/null || fail "snapshot rows were not slimmed: $(jq -c '{task_reference_count,omitted_task_references}' <<< "$out")"
+    [[ "$(jq -r '.tasks[] | select(.provider_task_id=="app-1") | .display_label_sha256' <<< "$out")" \
+        == "$(printf '%s' "$big" | shasum -a 256 | awk '{print $1}')" ]] || fail "label hash does not identify the full title"
+    [[ "$(history_count)" == 1 ]] || fail "first snapshot did not write one history file"
+
+    # Unchanged restore-relevant content (only last_active moved): latest is
+    # refreshed, no new history file.
+    local first_generated; first_generated="$(jq -r '.generated_at' "$root/snapshots/latest.json")"
+    sleep 1; write_catalogue "first"
+    out="$(snap)" || fail "unchanged snapshot failed"
+    assert_contains "$out" "unchanged; no history file"
+    [[ "$(history_count)" == 1 ]] || fail "unchanged snapshot wrote a history file"
+    [[ "$(jq -r '.generated_at' "$root/snapshots/latest.json")" != "$first_generated" ]] || fail "latest.json was not refreshed"
+
+    # A restore-relevant change writes history again.
+    sleep 1; write_catalogue "second"
+    snap --quiet || fail "changed snapshot failed"
+    [[ "$(history_count)" == 2 ]] || fail "changed snapshot did not write history"
+
+    # Size guard: over the cap exits 69 and preserves latest/history.
+    local latest_hash; latest_hash="$(shasum "$root/snapshots/latest.json" | awk '{print $1}')"
+    sleep 1; write_catalogue "third"
+    rc=0; CCTRL_SNAPSHOT_MAX_BYTES=100 snap --quiet 2>/dev/null || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "oversized snapshot did not exit 69 (rc=$rc)"
+    [[ "$latest_hash" == "$(shasum "$root/snapshots/latest.json" | awk '{print $1}')" ]] || fail "oversized snapshot replaced latest"
+    [[ "$(history_count)" == 2 ]] || fail "oversized snapshot wrote history"
+
+    # Retention caps: newest-first window by count, then by bytes; the newest
+    # history file and latest.json always survive.
+    local caps="$root/caps" i
+    mkdir -p "$caps"; printf '{}' > "$caps/latest.json"
+    for i in 1 2 3 4 5; do printf '%0100d' 0 > "$caps/2026092${i}T000000Z.json"; done
+    CCTRL_SNAPSHOT_HISTORY_MAX=3 cctrl_source_eval '_snapshot_retention_prune "$1"' "$caps"
+    [[ "$(ls "$caps" | tr '\n' ' ')" == "20260923T000000Z.json 20260924T000000Z.json 20260925T000000Z.json latest.json " ]] \
+        || fail "count cap kept the wrong files: $(ls "$caps" | tr '\n' ' ')"
+    CCTRL_SNAPSHOT_HISTORY_MAX_BYTES=150 cctrl_source_eval '_snapshot_retention_prune "$1"' "$caps"
+    [[ "$(ls "$caps" | tr '\n' ' ')" == "20260925T000000Z.json latest.json " ]] \
+        || fail "byte cap kept the wrong files: $(ls "$caps" | tr '\n' ' ')"
+    CCTRL_SNAPSHOT_HISTORY_MAX_BYTES=10 cctrl_source_eval '_snapshot_retention_prune "$1"' "$caps"
+    [[ -f "$caps/20260925T000000Z.json" && -f "$caps/latest.json" ]] || fail "caps removed the newest history file or latest.json"
+    echo "ok: snapshots are slim, write history only on change, cap retention, and refuse oversized captures"
+}
+
 test_snapshot_ownership_policy() {
     local root="$TMPDIR/snapshot-ownership" data="$TMPDIR/snapshot-ownership/data"
     local snapshots="$TMPDIR/snapshot-ownership/snapshots" host="0123456789abcdef0123456789abcdef"
@@ -6332,7 +6409,9 @@ JSON
       CCTRL_SNAPSHOT_SESSIONS_FILE="$sessions" CCTRL_SNAPSHOT_PROCESS_FILE="$process" \
       CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$snapshots" --json)"
     jq -e --arg host "$host" '
-      .schema_version==2 and .host_id==$host and .task_reference_count==4 and .restore_candidate_count==1 and
+      .schema_version==2 and .host_id==$host and .task_reference_count==3 and .restore_candidate_count==1 and
+      .catalogue_task_count==4 and .omitted_task_references=={"count":1,"by_provider_state":{"codex:unknown":1}} and
+      (.content_digest|test("^[0-9a-f]{64}$")) and ([.tasks[] | select(.provider_task_id=="unknown-1")] | length)==0 and
       .capture_quality.status=="complete" and
       ([.tasks[] | select(.provider_task_id=="app-1" and .recovery_action=="provider-managed")] | length)==1 and
       ([.tasks[] | select(.provider_task_id=="released-1" and .restore_strategy=="provider-managed")] | length)==1 and
@@ -6376,7 +6455,7 @@ JSON
       ([.plan[] | select(.provider_task_id=="claude-1" and .disposition=="restore" and .action_capabilities.restore=={supported:true,reason:"tmux-resume"})] | length)==1 and
       ([.plan[] | select(.provider_task_id=="app-1" and .disposition=="provider-managed")] | length)==1 and
       ([.plan[] | select(.provider_task_id=="released-1" and .disposition=="provider-managed")] | length)==1 and
-      ([.plan[] | select(.provider_task_id=="unknown-1" and .disposition=="unknown")] | length)==1' <<< "$out" >/dev/null \
+      ([.plan[] | select(.provider_task_id=="unknown-1")] | length)==0' <<< "$out" >/dev/null \
       || fail "ownership-aware restore plan is wrong: $out"
     : > "$launch_log"
     CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
@@ -8897,6 +8976,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
         snapshot-ownership)
             test_snapshot_ownership_policy
             test_snapshot_tmux_row_selection
+            test_snapshot_size_controls
             test_restore_no_force_structural
             test_restore_no_pane_inference_structural
             echo "ok"
@@ -9080,6 +9160,7 @@ test_task_registry_structural_boundary
 test_codex_reconcile_ownership_evidence
 test_snapshot_ownership_policy
 test_snapshot_tmux_row_selection
+test_snapshot_size_controls
 test_restore_no_force_structural
 test_restore_no_pane_inference_structural
 fi
