@@ -56,15 +56,42 @@ def action_for(row: dict[str, Any]) -> tuple[str, str]:
     strategy = row.get("restore_strategy")
     if "conflict" in (owner, runtime, state):
         return "conflict", "snapshot contains contradictory ownership evidence"
-    if row.get("live") is True or (
-        owner == "cctrl" and runtime == "tmux" and state == "active" and row.get("tmux_session")
-    ):
+    # Only an observed live tmux session is already live. A cctrl/tmux/active
+    # record whose pane is gone (killed, crashed, rebooted) is exactly what the
+    # restore planner must judge, so it must not be labelled live here.
+    if row.get("live") is True:
         return "already-live", "task had a live cctrl tmux owner at capture time"
     if owner == "app" or runtime == "app-server" or strategy == "provider-managed" or state == "released":
         return "provider-managed", "provider owns persistence; cctrl must not relaunch it"
     if owner == "unknown" or runtime == "unknown" or state == "unknown":
         return "unknown", "snapshot ownership is unknown"
     return "insufficient-evidence", "snapshot is informational until current ownership evidence is joined"
+
+
+def select_tmux_source(candidates: list[dict[str, Any]], session: dict[str, Any]) -> tuple[dict[str, Any], list[str], str | None]:
+    """Pick the catalogue row that owns a live tmux session.
+
+    Several registry records can claim one tmux name (a resumed or relaunched
+    conversation leaves its predecessor behind). The live session's own
+    provider id decides; catalogue order never does. Returns (source,
+    shadowed task ids, ambiguity reason or None).
+    """
+    ids = [text(c.get("provider_task_id")) or "" for c in candidates]
+    live_id = text(session.get("provider_task_id")) or text(session.get("session_id"))
+    if live_id:
+        exact = [c for c in candidates if text(c.get("provider_task_id")) == live_id]
+        if len(exact) == 1:
+            return exact[0], sorted(i for i in ids if i and i != live_id), None
+        if len(exact) > 1:
+            return {}, sorted(i for i in ids if i), "ambiguous-tmux-claim: duplicate records for the live task"
+        if candidates:
+            return {}, sorted(i for i in ids if i), "ambiguous-tmux-claim: no record matches the live task"
+        return {}, [], None
+    if len(candidates) == 1:
+        return candidates[0], [], None
+    if len(candidates) > 1:
+        return {}, sorted(i for i in ids if i), "ambiguous-tmux-claim: several records and no live task id"
+    return {}, [], None
 
 
 def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]:
@@ -126,10 +153,10 @@ def capture(args: argparse.Namespace) -> int:
     if not isinstance(rows, list) or not isinstance(sessions, list):
         raise ValueError("catalogue rows or session list is malformed")
 
-    by_tmux: dict[str, dict[str, Any]] = {}
+    by_tmux: dict[str, list[dict[str, Any]]] = {}
     for item in rows:
         if isinstance(item, dict) and text(item.get("tmux_session")):
-            by_tmux.setdefault(item["tmux_session"], item)
+            by_tmux.setdefault(item["tmux_session"], []).append(item)
 
     tasks: list[dict[str, Any]] = []
     seen: set[tuple[str, str | None, str | None]] = set()
@@ -139,7 +166,7 @@ def capture(args: argparse.Namespace) -> int:
         if not isinstance(session, dict):
             continue
         name = text(session.get("name"))
-        source = by_tmux.get(name or "", {})
+        source, shadowed, ambiguity = select_tmux_source(by_tmux.get(name or "", []), session)
         agent = text(session.get("agent"))
         provider = text(source.get("provider")) or ("claude" if agent in ("claude", "claude-code") else "codex" if agent in ("codex", "openai") else "unknown")
         task_id = text(source.get("provider_task_id")) or text(session.get("provider_task_id")) or text(session.get("session_id"))
@@ -177,7 +204,15 @@ def capture(args: argparse.Namespace) -> int:
             "last_active": text(session.get("last_active")),
             "live": True,
         }
-        row["recovery_action"], row["recovery_reason"] = action_for(row)
+        if shadowed:
+            row["shadowed_task_ids"] = shadowed
+        if ambiguity:
+            # Several records claim this tmux name and none is provably the one
+            # running in it. Never let session-level fields make it restorable.
+            row["control_owner"] = row["execution_runtime"] = row["lifecycle_state"] = "unknown"
+            row["recovery_action"], row["recovery_reason"] = "unknown", ambiguity
+        else:
+            row["recovery_action"], row["recovery_reason"] = action_for(row)
         key = (provider, task_id, name)
         seen.add(key)
         tasks.append(row)

@@ -34,6 +34,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `session snapshot` records the conversation actually running in a tmux
+  session when several registry records claim the same name. The live
+  session's provider id decides; if no record matches it, the row is marked
+  `ambiguous-tmux-claim` and is never restorable. Rows it doesn't pick are
+  listed in `shadowed_task_ids`. A cctrl/tmux/active record whose pane is gone
+  is no longer labelled `already-live`. (plan 070 S1)
 - The test suite's "did not touch the real live store" guards ignore
   `data/rate-limits.json` and `data/rate-limits-history.jsonl`. Live Claude
   sessions' statusline hook rewrites them every few seconds, which failed the

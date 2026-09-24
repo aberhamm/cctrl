@@ -6252,6 +6252,55 @@ JSON
 
 # --- plan 068: ownership-aware snapshot / restore --------------------------
 
+test_snapshot_tmux_row_selection() {
+    # Plan 070 S1: when several registry rows claim one tmux name, the live
+    # session's own provider id picks the row; catalogue order never does.
+    local root="$TMPDIR/snapshot-tmux-select" host="0123456789abcdef0123456789abcdef"
+    mkdir -p "$root/data" "$root/snapshots"
+    printf '%s\n' "$host" > "$root/data/host-id"
+    cat > "$root/process.json" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-24T10:00:00Z","source_cursor":"p","processes":[],"error":null}
+JSON
+    row() { # id tmux attach
+        printf '{"provider":"claude","provider_task_id":"%s","host_id":"%s","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"%s","tmux_session":"%s","action_capabilities":{"tmux_attach":{"supported":%s}}}' \
+            "$1" "$host" "$1" "$2" "$3"
+    }
+    # Stale record listed FIRST so the old setdefault() would have picked it.
+    cat > "$root/catalogue.json" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
+ $(row stale-1 TMUX--pick false), $(row live-1 TMUX--pick false),
+ $(row old-a TMUX--mismatch false), $(row old-b TMUX--noid false), $(row old-c TMUX--noid false),
+ $(row gone-1 TMUX--gone false)
+]}
+JSON
+    cat > "$root/sessions.json" <<'JSON'
+[{"name":"TMUX--pick","agent":"claude","session_id":"live-1","dir":"/tmp/x"},
+ {"name":"TMUX--mismatch","agent":"claude","session_id":"brand-new","dir":"/tmp/x","control_owner":"cctrl","execution_runtime":"tmux","lifecycle_state":"active","registered_by_cctrl":true,"launched_by_cctrl":true},
+ {"name":"TMUX--noid","agent":"claude","dir":"/tmp/x"}]
+JSON
+    local out
+    out="$(CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+      CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$root/snapshots" --json)" \
+      || fail "snapshot with shared tmux names failed: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--pick")] | length==1 and .[0].provider_task_id=="live-1"
+           and .[0].resume_identity=="live-1" and .[0].shadowed_task_ids==["stale-1"]
+           and .[0].recovery_action=="already-live"' <<< "$out" >/dev/null \
+      || fail "snapshot did not pick the live row for a shared tmux name: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--mismatch")] | length==1 and .[0].control_owner=="unknown"
+           and .[0].recovery_action=="unknown" and (.[0].recovery_reason|startswith("ambiguous-tmux-claim"))
+           and .[0].shadowed_task_ids==["old-a"]' <<< "$out" >/dev/null \
+      || fail "a stale-only tmux claim was not marked ambiguous: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--noid")] | length==1 and .[0].control_owner=="unknown"
+           and .[0].shadowed_task_ids==["old-b","old-c"]' <<< "$out" >/dev/null \
+      || fail "several claims without a live id were not marked ambiguous: $out"
+    # A cctrl/tmux/active record whose pane is gone is not already-live.
+    jq -e '[.tasks[] | select(.provider_task_id=="gone-1")] | length==1 and .[0].live==false
+           and .[0].recovery_action=="insufficient-evidence"' <<< "$out" >/dev/null \
+      || fail "a dead cctrl/tmux/active record was labelled already-live: $out"
+    echo "ok: snapshot picks the live row per tmux name and only labels live rows already-live"
+}
+
 test_snapshot_ownership_policy() {
     local root="$TMPDIR/snapshot-ownership" data="$TMPDIR/snapshot-ownership/data"
     local snapshots="$TMPDIR/snapshot-ownership/snapshots" host="0123456789abcdef0123456789abcdef"
@@ -8847,6 +8896,9 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             ;;
         snapshot-ownership)
             test_snapshot_ownership_policy
+            test_snapshot_tmux_row_selection
+            test_restore_no_force_structural
+            test_restore_no_pane_inference_structural
             echo "ok"
             exit 0
             ;;
@@ -9027,6 +9079,7 @@ test_task_registry_lock_stale_timeout_and_release_token
 test_task_registry_structural_boundary
 test_codex_reconcile_ownership_evidence
 test_snapshot_ownership_policy
+test_snapshot_tmux_row_selection
 test_restore_no_force_structural
 test_restore_no_pane_inference_structural
 fi
