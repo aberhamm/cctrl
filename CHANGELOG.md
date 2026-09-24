@@ -34,6 +34,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Detached Codex sessions started with `--resume <id>` resume that task instead
+  of opening a new one with the id as the first prompt. In-place restarts keep
+  Codex `-c` config options and no longer resend the initial prompt.
 - Restore passes the snapshot provider explicitly and refreshes exact Codex
   ownership immediately before each launch, including later restore waves.
 - App handoff preserves provider writer-lock files after ownership transfer.

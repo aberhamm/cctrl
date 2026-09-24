@@ -4814,6 +4814,78 @@ PY
     echo "ok: plain tmux Codex exit preserves app task"
 }
 
+test_codex_wrapper_resume_and_restart_args() {
+    # Codex positional args (resume subcommand, id, prompt) must reach codex
+    # after its options on first launch, and an in-place restart must reuse
+    # only the options -- including `-c key=value`, which is Codex's --config.
+    local rootcopy="$TMPDIR/codex-resume-wrapper" bin="$TMPDIR/codex-resume-bin" log="$TMPDIR/codex-resume.log"
+    local marker="$TMPDIR/codex-resume-marker"
+    mkdir -p "$rootcopy/lib" "$bin"
+    cp "$ROOT/lib/session-wrapper.sh" "$rootcopy/lib/session-wrapper.sh"
+    chmod +x "$rootcopy/lib/session-wrapper.sh"
+    cat > "$bin/codex" <<'SH'
+#!/usr/bin/env bash
+{
+    echo "RUN"
+    i=0
+    for arg in "$@"; do printf 'ARG[%d]=%s\n' "$i" "$arg"; i=$((i + 1)); done
+} >> "$CODEX_FAKE_LOG"
+if [[ -n "${CODEX_FAKE_RESTART_ID:-}" && ! -f "$CODEX_FAKE_LOG.restarted" ]]; then
+    : > "$CODEX_FAKE_LOG.restarted"
+    printf '%s' "$CODEX_FAKE_RESTART_ID" > "$CCTRL_RESTART_MARKER"
+fi
+exit 0
+SH
+    chmod +x "$bin/codex"
+
+    local opts=(--yolo --cd /tmp/demo -c 'mcp_servers.x.command="/bin/x"')
+
+    # First launch resumes by id with a prompt.
+    : > "$log"
+    PATH="$bin:$PATH" CODEX_FAKE_LOG="$log" CCTRL_RESTART_MARKER="$marker" \
+        "$rootcopy/lib/session-wrapper.sh" codex "$marker" "${opts[@]}" --cctrl-initial resume thread-1 "next step" >/dev/null
+    local out
+    out="$(cat "$log")"
+    assert_contains "$out" "ARG[0]=resume"
+    assert_contains "$out" "ARG[1]=--yolo"
+    assert_contains "$out" "ARG[4]=-c"
+    assert_contains "$out" 'ARG[5]=mcp_servers.x.command="/bin/x"'
+    assert_contains "$out" "ARG[6]=thread-1"
+    assert_contains "$out" "ARG[7]=next step"
+    assert_not_contains "$out" "--cctrl-initial"
+
+    # Fresh launch with a prompt, then an in-place restart.
+    : > "$log"
+    rm -f "$log.restarted"
+    PATH="$bin:$PATH" CODEX_FAKE_LOG="$log" CODEX_FAKE_RESTART_ID=thread-2 CCTRL_RESTART_MARKER="$marker" \
+        "$rootcopy/lib/session-wrapper.sh" codex "$marker" "${opts[@]}" --cctrl-initial "first prompt" >/dev/null
+    local first second
+    first="$(awk '/^RUN$/{n++} n==1' "$log")"
+    second="$(awk '/^RUN$/{n++} n==2' "$log")"
+    assert_contains "$first" "ARG[0]=--yolo"
+    assert_contains "$first" "ARG[5]=first prompt"
+    assert_contains "$second" "ARG[0]=resume"
+    assert_contains "$second" "ARG[4]=-c"
+    assert_contains "$second" 'ARG[5]=mcp_servers.x.command="/bin/x"'
+    assert_contains "$second" "ARG[6]=thread-2"
+    assert_not_contains "$second" "first prompt"
+    assert_not_contains "$second" "ARG[7]="
+
+    # cctrl's tmux launch path hands the wrapper the resume id, not a prompt.
+    make_fake_agent "$bin/codex" codex
+    out="$(cd /tmp && PATH="$bin:$PATH" CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--resume \
+        "$ROOT/cctrl" start --foreground --agent codex --no-bridge --resume thread-3 2>/dev/null)"
+    assert_contains "$out" "ARG[0]=resume"
+    assert_contains "$out" "ARG[1]=--yolo"
+    assert_contains "$out" "=thread-3"
+    assert_not_contains "$out" "--cctrl-initial"
+    local last
+    last="$(grep '^ARG\[' <<< "$out" | tail -1)"
+    [[ "$last" == *"=thread-3" ]] || fail "resume id must be codex's last argument, got: $last"
+
+    echo "ok: codex wrapper resumes by id and restarts with options intact"
+}
+
 test_codex_close_archives_and_resolves_rollout_identity() {
     # Close must archive even when the async session-list/title sync has not
     # yet backfilled conversation_id; the matching live rollout is sufficient.
@@ -8755,6 +8827,7 @@ test_codex_rename_updates_app_title
 test_codex_rename_prefers_prompt_match_over_stale_id
 test_session_app_ls_codex_records
 test_codex_wrapper_exit_preserves_app_task
+test_codex_wrapper_resume_and_restart_args
 test_codex_close_archives_and_resolves_rollout_identity
 test_session_release_to_app_quarantines_stale_codex_lock
 test_session_prune_dry_run_closes_nothing

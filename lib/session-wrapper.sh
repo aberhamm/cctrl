@@ -8,12 +8,28 @@
 #
 # Usage (called by _launch_exec_agent, not directly):
 #   session-wrapper.sh <agent> <marker-path> [flags...]
+#   session-wrapper.sh codex <marker-path> [options...] --cctrl-initial [resume] [args...]
+#
+# For codex, everything after --cctrl-initial is used for the first launch
+# only (`codex resume <options> <id> [prompt]` or `codex <options> [prompt]`).
+# Restarts reuse just the options, so Codex's own `-c key=value` flags and
+# positional arguments never collide with the restart's `resume <id>`.
 
 set -uo pipefail
 
 _agent="$1"; shift
 _marker="$1"; shift
 _flags=("$@")
+_initial=()
+if [[ "$_agent" == "codex" ]]; then
+    for (( _i = 0; _i < ${#_flags[@]}; _i++ )); do
+        if [[ "${_flags[_i]}" == "--cctrl-initial" ]]; then
+            _initial=("${_flags[@]:_i+1}")
+            _flags=("${_flags[@]:0:_i}")
+            break
+        fi
+    done
+fi
 
 _resume_flag=""
 _child_pid=""
@@ -47,9 +63,12 @@ while true; do
             claude "${_flags[@]}" &
             _child_pid=$!
             wait $_child_pid 2>/dev/null || true
+        elif [[ ${#_initial[@]} -gt 0 && "${_initial[0]}" == "resume" ]]; then
+            echo -e "\033[2mcodex resume ${_flags[*]} ${_initial[*]:1}\033[0m"
+            codex resume "${_flags[@]}" "${_initial[@]:1}"
         else
-            echo -e "\033[2mcodex ${_flags[*]}\033[0m"
-            codex "${_flags[@]}"
+            echo -e "\033[2mcodex ${_flags[*]} ${_initial[*]:-}\033[0m"
+            codex "${_flags[@]}" ${_initial[@]+"${_initial[@]}"}
         fi
     fi
 
@@ -65,19 +84,23 @@ while true; do
         _resume_flag="$(cat "$_marker")"
         rm -f "$_marker"
 
-        # Strip resume flags from _flags so they don't conflict with
-        # the wrapper's own --resume on subsequent launches.
-        _clean_flags=()
-        _skip_next=false
-        for _f in "${_flags[@]}"; do
-            if $_skip_next; then _skip_next=false; continue; fi
-            case "$_f" in
-                --resume|-r) _skip_next=true; continue ;;
-                --continue|-c|--last) continue ;;
-            esac
-            _clean_flags+=("$_f")
-        done
-        _flags=("${_clean_flags[@]}")
+        # Strip Claude's resume flags from _flags so they don't conflict
+        # with the wrapper's own --resume on subsequent launches. Codex
+        # options carry no resume arguments (see --cctrl-initial), and its
+        # `-c` means `--config`, not `--continue`.
+        if [[ "$_agent" == "claude" ]]; then
+            _clean_flags=()
+            _skip_next=false
+            for _f in "${_flags[@]}"; do
+                if $_skip_next; then _skip_next=false; continue; fi
+                case "$_f" in
+                    --resume|-r) _skip_next=true; continue ;;
+                    --continue|-c|--last) continue ;;
+                esac
+                _clean_flags+=("$_f")
+            done
+            _flags=("${_clean_flags[@]}")
+        fi
 
         echo ""
         echo -e "\033[32m✓\033[0m Restart requested — relaunching with fresh config..."

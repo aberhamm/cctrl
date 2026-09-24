@@ -779,34 +779,33 @@ _launch_exec_agent() {
         )
     fi
 
+    # Positional arguments (resume subcommand, session id, prompt) stay apart
+    # from LAUNCH_FLAGS: the tmux wrapper reuses only the options when it
+    # restarts in place with `codex resume <options> <id>`.
+    local -a _codex_initial=()
     if [[ "$resume" == "true" ]]; then
+        _codex_initial=("resume")
         if [[ -n "$resume_val" ]]; then
-            [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$resume_val" "$final_prompt") || LAUNCH_FLAGS+=("$resume_val")
-        else
-            [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("--last" "$final_prompt")
-        fi
-        if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]]; then
-            local _restart_marker="${TMPDIR:-/tmp}/cctrl-restart-${CCTRL_SESSION_NAME:-$$}"
-            rm -f "$_restart_marker"
-            export CCTRL_RESTART_MARKER="$_restart_marker"
-            echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]}${RESET}"
-            exec "$SCRIPT_DIR/lib/session-wrapper.sh" codex "$_restart_marker" "${LAUNCH_FLAGS[@]}"
-        else
-            echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]}${RESET}"
-            exec codex resume "${LAUNCH_FLAGS[@]}"
+            _codex_initial+=("$resume_val")
+        elif [[ -n "$final_prompt" ]]; then
+            _codex_initial+=("--last")
         fi
     fi
+    [[ -n "$final_prompt" ]] && _codex_initial+=("$final_prompt")
 
-    [[ -n "$final_prompt" ]] && LAUNCH_FLAGS+=("$final_prompt")
     if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" ]]; then
         local _restart_marker="${TMPDIR:-/tmp}/cctrl-restart-${CCTRL_SESSION_NAME:-$$}"
         rm -f "$_restart_marker"
         export CCTRL_RESTART_MARKER="$_restart_marker"
-        echo -e "${DIM}codex ${LAUNCH_FLAGS[*]}${RESET}"
-        exec "$SCRIPT_DIR/lib/session-wrapper.sh" codex "$_restart_marker" "${LAUNCH_FLAGS[@]}"
+        echo -e "${DIM}codex ${LAUNCH_FLAGS[*]} ${_codex_initial[*]:-}${RESET}"
+        exec "$SCRIPT_DIR/lib/session-wrapper.sh" codex "$_restart_marker" "${LAUNCH_FLAGS[@]}" \
+            --cctrl-initial ${_codex_initial[@]+"${_codex_initial[@]}"}
+    elif [[ "$resume" == "true" ]]; then
+        echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]} ${_codex_initial[*]:1}${RESET}"
+        exec codex resume "${LAUNCH_FLAGS[@]}" "${_codex_initial[@]:1}"
     else
-        echo -e "${DIM}codex ${LAUNCH_FLAGS[*]}${RESET}"
-        exec codex "${LAUNCH_FLAGS[@]}"
+        echo -e "${DIM}codex ${LAUNCH_FLAGS[*]} ${_codex_initial[*]:-}${RESET}"
+        exec codex "${LAUNCH_FLAGS[@]}" ${_codex_initial[@]+"${_codex_initial[@]}"}
     fi
 }
 
