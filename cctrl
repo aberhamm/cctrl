@@ -2215,6 +2215,19 @@ else:
         old_lineage, new_lineage = record.get("lineage") or {}, incoming.get("lineage") or {}
         merged["lineage"] = {k: old_lineage.get(k) if old_lineage.get(k) is not None else new_lineage.get(k)
                              for k in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis")}
+        # A newer cctrl terminal launch of an existing task (e.g. resumed into
+        # another tmux session) carries its current terminal anchors; the
+        # stored ones describe an earlier execution and would mislabel
+        # whichever session later reuses that tmux name.
+        last_launch = max((str(e.get("observed_at") or "") for e in record.get("ownership_evidence") or []
+                           if isinstance(e, dict) and e.get("source") == "cctrl-launch"), default="")
+        if (event["source"] == "legacy-promotion" and incoming.get("provisional_launch_id")
+                and incoming.get("control_surface") == "tmux" and incoming.get("execution_runtime") == "tmux"
+                and incoming.get("control_owner") == "cctrl" and incoming.get("tmux_session")
+                and incoming.get("name") == incoming.get("tmux_session")
+                and str(incoming.get("created_at") or "") >= last_launch):
+            for field in ("name", "tmux_session", "control_surface", "pane_id", "pane_pid", "wrapper_pid", "pane_started"):
+                merged[field] = incoming.get(field)
         combined = list(record.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
         unique = {canonical(item): item for item in combined}
         merged["ownership_evidence"] = [unique[k] for k in sorted(unique)][-max_evidence:]

@@ -8076,6 +8076,46 @@ test_task_record_merge_conflict_preserves_evidence() {
     echo "ok: canonical merge is no-clobber, provenance-strengthening, and preserves authoritative conflicts"
 }
 
+test_task_record_relaunch_moves_terminal_anchors() {
+    # Resuming an existing task into a different tmux session must move the
+    # record's terminal anchors (and name index) to the new session; an older
+    # launch receipt promoted late must not move them back.
+    local root="$TMPDIR/task-relaunch" meta="$TMPDIR/task-relaunch/meta" data="$TMPDIR/task-relaunch/data"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--old" /tmp directory /tmp label purpose prompt cmd "" claude "shared-id" ""'
+    local canonical
+    canonical="$(session_record_path "TMUX--old" "$meta")"
+    jq '.pane_id="%1" | .pane_pid="100" | .wrapper_pid="100" | .pane_started="old"' "$canonical" > "$canonical.tmp" && mv "$canonical.tmp" "$canonical"
+
+    jq '
+        .name="TMUX--new" | .tmux_session="TMUX--new" | .provider_task_id=null | .conversation_id=null |
+        .lifecycle_state="provisional" | .provisional_launch_id="11111111-2222-3333-4444-555555555555" |
+        .created_at="2999-01-01T00:00:00Z" | .pane_id="%9" | .pane_pid="900" | .wrapper_pid="900" | .pane_started="new" |
+        .ownership_evidence=[]
+    ' "$canonical" > "$meta/launch-11111111-2222-3333-4444-555555555555.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_record_promote_legacy "$1" "shared-id" >/dev/null' "$meta/launch-11111111-2222-3333-4444-555555555555.json"
+    jq -e '.name == "TMUX--new" and .tmux_session == "TMUX--new" and .pane_id == "%9" and .pane_pid == "900" and .provider_task_id == "shared-id"' \
+        "$canonical" >/dev/null || fail "relaunch under a new tmux session kept the previous terminal anchors"
+    [[ "$(CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval '_session_metadata_file "TMUX--new"')" == "$canonical" ]] \
+        || fail "new tmux session name does not resolve to the relaunched task"
+
+    jq '.ownership_evidence += [{source:"cctrl-launch",source_instance:"TMUX--new",source_cursor:null,authority_class:"authoritative",observed_owner:"cctrl",observed_runtime:"tmux",observed_state:"provisional",observed_at:"2999-01-01T00:00:00Z",reason:"cctrl launched the terminal writer"}]' \
+        "$canonical" > "$canonical.tmp" && mv "$canonical.tmp" "$canonical"
+    jq '
+        .name="TMUX--stale" | .tmux_session="TMUX--stale" | .provider_task_id=null | .conversation_id=null |
+        .lifecycle_state="provisional" | .provisional_launch_id="66666666-7777-8888-9999-000000000000" |
+        .created_at="2000-01-01T00:00:00Z" | .ownership_evidence=[]
+    ' "$canonical" > "$meta/launch-66666666-7777-8888-9999-000000000000.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_record_promote_legacy "$1" "shared-id" >/dev/null' "$meta/launch-66666666-7777-8888-9999-000000000000.json"
+    jq -e '.tmux_session == "TMUX--new"' "$canonical" >/dev/null || fail "an older launch receipt moved the terminal anchors back"
+    echo "ok: relaunching a task moves its terminal anchors; older receipts cannot roll them back"
+}
+
 test_task_record_identity_independent_close_continues() {
     local root="$TMPDIR/task-close-no-id" meta="$TMPDIR/task-close-no-id/meta" data="$TMPDIR/task-close-no-id/data" bin="$TMPDIR/task-close-no-id/bin" log="$TMPDIR/task-close-no-id/tmux.log"
     rm -rf "$root"; mkdir -p "$meta" "$data" "$bin"
@@ -8607,6 +8647,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_task_record_schema_v2_and_provisional_promotion
             test_task_record_legacy_validation_and_lazy_promotion
             test_task_record_merge_conflict_preserves_evidence
+            test_task_record_relaunch_moves_terminal_anchors
             test_task_record_identity_independent_close_continues
             test_task_registry_atomic_concurrent_updates
             test_task_registry_replay_order_and_guards
@@ -8856,6 +8897,7 @@ test_task_record_host_id_is_stable_exclusive_and_private
 test_task_record_schema_v2_and_provisional_promotion
 test_task_record_legacy_validation_and_lazy_promotion
 test_task_record_merge_conflict_preserves_evidence
+test_task_record_relaunch_moves_terminal_anchors
 test_task_record_identity_independent_close_continues
 test_task_registry_atomic_concurrent_updates
 test_task_registry_replay_order_and_guards

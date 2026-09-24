@@ -37,6 +37,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Detached Codex sessions started with `--resume <id>` resume that task instead
   of opening a new one with the id as the first prompt. In-place restarts keep
   Codex `-c` config options and no longer resend the initial prompt.
+- Relaunching an existing task under a different tmux session moves its record
+  and name index to the new session, so `session ls` no longer shows another
+  task's provider, purpose, or state for a reused tmux name.
 - Restore passes the snapshot provider explicitly and refreshes exact Codex
   ownership immediately before each launch, including later restore waves.
 - App handoff preserves provider writer-lock files after ownership transfer.
