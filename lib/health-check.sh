@@ -7,8 +7,13 @@
 #
 # Exports: _health_check_run <session_name> <agent_type> <timeout_seconds>
 #
-# Always returns 0. Status is communicated through session metadata
-# (health_status field), not exit codes.
+# Returns 0, except 1 when the agent exited during startup (health_status
+# "exited"). Status is also recorded in session metadata (health_status).
+#
+# "ready" needs positive evidence: the agent's input prompt visible, with no
+# blocking modal, on consecutive polls. A blank or still-booting pane is not
+# ready; the old "no modal seen for 3s" rule reported ready before Claude
+# had drawn its composer, so a brief sent right after start was lost.
 #
 # Compatible with bash 3.2 (macOS default) — no associative arrays.
 
@@ -36,12 +41,33 @@ _hc_mark_dismissed() {
     fi
 }
 
+# The agent's input line: Claude Code draws "❯", Codex "›". Callers pass the
+# visible screen only (scrollback keeps dismissed dialogs). Any numbered
+# selector on screen ("❯ 1. Yes", Codex's "› 1. Update now") is a modal that
+# would swallow input, even when a composer line is drawn behind it.
+_hc_prompt_visible() {
+    local screen="$1"
+    printf '%s\n' "$screen" | grep -E '^[[:space:]│|]*[❯›][[:space:]]+[0-9]+\.' >/dev/null 2>&1 && return 1
+    printf '%s\n' "$screen" | grep -E '^[[:space:]│|]*[❯›]([[:space:]]|$)' >/dev/null 2>&1
+}
+
+_hc_report_exit() {
+    local session_name="$1" reason="$2" capture="$3"
+    _session_update_metadata_field "$session_name" health_status "exited" 2>/dev/null || true
+    _session_update_metadata_field "$session_name" health_reason "$reason" 2>/dev/null || true
+    echo -e "${RED}✗${RESET}  Health check: agent exited during startup — $reason" >&2
+    if [[ -n "$capture" ]]; then
+        echo -e "${DIM}  Last 20 lines of pane:${RESET}" >&2
+        printf '%s\n' "$capture" | grep -v '^[[:space:]]*$' | tail -20 >&2
+    fi
+}
+
 _health_check_run() {
     local session_name="$1"
     local agent_type="${2:-claude}"
     local timeout_seconds="${3:-30}"
     local poll_interval="${CCTRL_HC_POLL_INTERVAL:-1}"
-    local stable_threshold="${CCTRL_HC_STABLE_THRESHOLD:-3}"
+    local stable_threshold="${CCTRL_HC_STABLE_THRESHOLD:-2}"
     # elapsed_incr: always at least 1 to prevent infinite loops when poll_interval=0
     local elapsed_incr="$poll_interval"
     (( elapsed_incr < 1 )) && elapsed_incr=1
@@ -60,6 +86,11 @@ _health_check_run() {
     echo -e "${DIM}  Health check: polling $session_name (${timeout_seconds}s timeout)...${RESET}" >&2
 
     while (( elapsed < timeout_seconds )); do
+        # A session that is gone died during startup; nothing will become ready.
+        if ! _tmux_run_with_timeout has-session -t "$session_name" 2>/dev/null; then
+            _hc_report_exit "$session_name" "tmux session ended during startup" "$last_capture"
+            return 1
+        fi
         # Capture the last 40 lines of pane output
         if ! _tmux_run_with_timeout capture-pane -p -S -40 -t "$session_name" 2>/dev/null; then
             # Pane not ready yet — keep trying
@@ -68,6 +99,15 @@ _health_check_run() {
             continue
         fi
         capture="$TMUX_RUN_OUTPUT"
+
+        # session-wrapper.sh prints this line and holds the pane open when the
+        # agent exits during startup, so its error output can be reported.
+        local exit_line
+        exit_line="$(printf '%s\n' "$capture" | grep -E '^cctrl: (claude|codex) exited with status' | tail -1)" || true
+        if [[ -n "$exit_line" ]]; then
+            _hc_report_exit "$session_name" "$exit_line" "$capture"
+            return 1
+        fi
 
         # Match against pattern table
         local matched=false
@@ -109,7 +149,13 @@ _health_check_run() {
             fi
         done
 
-        if ! $matched; then
+        local screen=""
+        if ! $matched && _tmux_run_with_timeout capture-pane -p -t "$session_name" 2>/dev/null; then
+            screen="$TMUX_RUN_OUTPUT"
+        fi
+        if ! $matched && ! _hc_prompt_visible "$screen"; then
+            stable_count=0
+        elif ! $matched; then
             stable_count=$((stable_count + 1))
             if (( stable_count >= stable_threshold )); then
                 _session_update_metadata_field "$session_name" health_status "ready" 2>/dev/null || true

@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The whole program is one brace group that ends in `exit`. Bash must parse
+# a compound command completely before running any of it, so:
+# - a partially written file (read mid-update: git checkout unlinks and then
+#   streams the new file) fails with a syntax error before doing anything.
+#   Before this, a cut at a function boundary never reached `main` and exited
+#   0 silently.
+# - a running cctrl never reads past `exit`, so an in-place rewrite of this
+#   file cannot feed a long-lived process new bytes at its old offset.
+{
+
 # cctrl — Coding Agent Controller
 # Manages settings profiles, tracks token usage locally, extensible via plugins.
 
@@ -3506,8 +3516,9 @@ _launch_detached() {
 
     # Post-spawn health check (plan 056): poll the pane for known blocking
     # prompts and auto-dismiss safe ones. Only for detached spawns (not
-    # attach-after) and not when explicitly bypassed. Always returns 0 —
-    # results go to session metadata (health_status field).
+    # attach-after) and not when explicitly bypassed. Results go to session
+    # metadata (health_status field); an agent that exited during startup
+    # fails the launch instead of being reported as a started session.
     # CCTRL_NO_HEALTH_CHECK=1 env var also skips (for tests and scripting).
     if [[ "$no_health_check" != "true" && "${CCTRL_NO_HEALTH_CHECK:-}" != "1" \
           && "${CCTRL_ATTACH_AFTER_START:-}" != "1" ]]; then
@@ -3516,7 +3527,10 @@ _launch_detached() {
                 _HC_SCRIPT_DIR="$SCRIPT_DIR/lib"
                 source "$SCRIPT_DIR/lib/health-check.sh"
             fi
-            _health_check_run "$session_name" "$detach_agent" "$health_check_timeout"
+            if ! _health_check_run "$session_name" "$detach_agent" "$health_check_timeout"; then
+                echo -e "${RED}Detached session $session_name did not start: the agent exited during startup.${RESET}" >&2
+                return 1
+            fi
         fi
     fi
 
@@ -5574,20 +5588,19 @@ _peer_claude_socket_for() {
 }
 
 _peer_socket_deliver() {
-    local socket_path="$1" payload="$2"
+    local socket_path="$1" payload="$2" frame
+    # printf, not <<<: a here-string appends a newline, so the delivered
+    # content would no longer be the exact payload.
+    frame="$(printf '%s' "$payload" | jq -Rsc '{type:"user",message:{role:"user",content:.}}')" || return 1
     if command -v socat >/dev/null 2>&1; then
-        printf '{"type":"user","message":{"role":"user","content":%s}}\n' \
-            "$(jq -Rs '.' <<< "$payload")" \
-            | socat -t2 - UNIX-CONNECT:"$socket_path" >/dev/null 2>&1
+        printf '%s\n' "$frame" | socat -t2 - UNIX-CONNECT:"$socket_path" >/dev/null 2>&1
         return $?
     fi
     if command -v node >/dev/null 2>&1; then
-        local escaped
-        escaped="$(jq -Rs '.' <<< "$payload")"
-        node -e "
+        CCTRL_SOCKET_PATH="$socket_path" CCTRL_SOCKET_FRAME="$frame" node -e "
 const net=require('net');
-const c=net.createConnection('$socket_path',()=>{
-  c.write(JSON.stringify({type:'user',message:{role:'user',content:$escaped}})+'\n');
+const c=net.createConnection(process.env.CCTRL_SOCKET_PATH,()=>{
+  c.write(process.env.CCTRL_SOCKET_FRAME+'\n');
   c.end();
 });
 c.on('error',()=>process.exit(1));
@@ -5694,6 +5707,19 @@ _peer_pane_ready_for_delivery() {
     return 0
 }
 
+# Exact paste contract shared by peer delivery and `session say`:
+# - `-p` wraps the paste in bracketed-paste markers whenever the pane asked for
+#   them (Claude Code and Codex both do). Without it every newline reaches the
+#   TUI as a bare CR, i.e. Enter: a long multi-line body was split, mostly
+#   dropped, and the final Enter was swallowed instead of submitting.
+# - `-r` keeps LF bytes as LF instead of rewriting them to CR.
+# Buffer names are per invocation: a seconds timestamp alone let two
+# concurrent senders overwrite (and then delete) each other's buffer.
+_tmux_paste_buffer_name() {
+    local kind="$1" owner="$2"
+    printf 'cctrl-%s-%s-%s-%s-%s' "$kind" "$owner" "$(date +%s)" "$$" "$RANDOM$RANDOM"
+}
+
 _peer_tmux_paste() {
     local target="$1" buffer="$2" payload="$3" submit="${4:-true}"
     if ! _tmux_run_stdin_with_timeout "$payload" load-buffer -b "$buffer" -; then
@@ -5701,7 +5727,7 @@ _peer_tmux_paste() {
         [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux load-buffer failed"
         return 1
     fi
-    if ! _tmux_run_with_timeout paste-buffer -b "$buffer" -t "$target"; then
+    if ! _tmux_run_with_timeout paste-buffer -p -r -b "$buffer" -t "$target"; then
         PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux paste-buffer failed}"
         [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux paste-buffer failed"
         _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
@@ -6011,9 +6037,9 @@ _peer_deliver_one_locked() {
     fi
 
     if [[ -n "$inline_id" ]]; then
-        buffer="cctrl-inline-${peer}-$(date +%s)"
+        buffer="$(_tmux_paste_buffer_name inline "$peer")"
     else
-        buffer="cctrl-nudge-${peer}-$(date +%s)"
+        buffer="$(_tmux_paste_buffer_name nudge "$peer")"
     fi
     if ! _peer_tmux_paste "$target" "$buffer" "$payload" "$submit"; then
         PEER_DELIVER_STATUS="failed"
@@ -8614,7 +8640,7 @@ _session_tmux_paste() {
         [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux load-buffer failed"
         return 1
     fi
-    if ! _tmux_run_with_timeout paste-buffer -b "$buffer" -t "$target"; then
+    if ! _tmux_run_with_timeout paste-buffer -p -r -b "$buffer" -t "$target"; then
         SESSION_SAY_REASON="${TMUX_RUN_ERROR:-tmux paste-buffer failed}"
         [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux paste-buffer failed"
         _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
@@ -8743,7 +8769,8 @@ _session_say() {
         return 1
     fi
 
-    local buffer="cctrl-say-${sess}-$(date +%s)"
+    local buffer
+    buffer="$(_tmux_paste_buffer_name say "$sess")"
     if ! _session_tmux_paste "$sess" "$buffer" "$body" "$submit"; then
         local paste_reason="${SESSION_SAY_REASON:-tmux paste failed}"
         $json && _session_say_json false "$sess" false paste-failed "$paste_reason" || echo -e "${RED}Failed to send to $sess:${RESET} $paste_reason" >&2
@@ -15247,4 +15274,8 @@ _dispatch() {
 
 # CCTRL_NO_MAIN lets tests source this file to exercise individual functions
 # without running the CLI. Normal invocation is unaffected.
-[[ -n "${CCTRL_NO_MAIN:-}" ]] || main "$@"
+if [[ -z "${CCTRL_NO_MAIN:-}" ]]; then
+    main "$@"
+    exit $?
+fi
+}
