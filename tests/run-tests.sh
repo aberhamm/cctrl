@@ -4226,6 +4226,89 @@ JSON
     assert_contains "$out" '"purpose": "verify identity"'
 }
 
+test_session_terminate_records_closed() (
+    # Plan 070 S3: kill, close, and stop-exact record `closed` on the task
+    # records anchored to the killed panes, so restore never resurrects a
+    # session ended on purpose. Real tmux on a private socket; temp registry.
+    local real_tmux socket bin root meta data rows exec_id out rc
+    real_tmux="$(command -v tmux)"
+    [[ -x "$real_tmux" ]] || fail "tmux is required for terminate-record coverage"
+    socket="cctrl-terminate-$$-$RANDOM"
+    root="$TMPDIR/terminate-records"; bin="$root/bin"; meta="$root/meta"; data="$root/data"
+    rm -rf "$root"; mkdir -p "$bin" "$meta" "$data"
+    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$real_tmux" "$socket" > "$bin/tmux"
+    chmod +x "$bin/tmux"
+    # shellcheck disable=SC2329 # invoked by the EXIT trap
+    cleanup_terminate() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; }
+    trap cleanup_terminate EXIT
+    export CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id"
+
+    record_for() { # name task-id [pane_id pane_pid]
+        # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+        cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "$2" ""' "$1" "$2"
+        local file; file="$(CCTRL_SESSION_METADATA_DIR="$meta" cctrl_source_eval '_task_record_file claude "$(_cctrl_host_id)" "$1"' "$2")"
+        if [[ -n "${3:-}" ]]; then
+            jq --arg p "$3" --arg pid "$4" '.pane_id=$p | .pane_pid=$pid' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+        fi
+        printf '%s' "$file"
+    }
+    anchor_of() { "$real_tmux" -L "$socket" list-panes -s -t "=$1" -F '#{pane_id} #{pane_pid}' | head -1; }
+    state_of() { jq -r '.lifecycle_state' "$1"; }
+
+    local name anchor f_kill f_other f_keep f_close f_stop f_gone
+    for name in s-kill s-keep s-close s-stop s-live; do
+        "$real_tmux" -L "$socket" new-session -d -s "$name" 'sleep 120'
+    done
+    anchor="$(anchor_of s-kill)"; f_kill="$(record_for s-kill id-kill $anchor)"
+    f_other="$(record_for s-kill id-elsewhere %999 1)"
+    anchor="$(anchor_of s-keep)"; f_keep="$(record_for s-keep id-keep $anchor)"
+    anchor="$(anchor_of s-close)"; f_close="$(record_for s-close id-close $anchor)"
+    anchor="$(anchor_of s-stop)"; f_stop="$(record_for s-stop id-stop $anchor)"
+    f_gone="$(record_for s-gone id-gone %77 7)"
+
+    PATH="$bin:$PATH" "$ROOT/cctrl" session kill s-kill >/dev/null || fail "session kill failed"
+    [[ "$(state_of "$f_kill")" == closed ]] || fail "kill did not record the anchored task closed: $(jq -c . "$f_kill")"
+    jq -e '.control_owner=="unknown" and .execution_runtime=="unknown" and
+           any(.ownership_evidence[]?; .source=="cctrl-terminate")' "$f_kill" >/dev/null \
+        || fail "kill did not record authoritative cctrl-terminate evidence: $(jq -c . "$f_kill")"
+    [[ "$(state_of "$f_other")" == active ]] || fail "kill closed a record anchored to a different pane"
+
+    PATH="$bin:$PATH" "$ROOT/cctrl" session kill s-keep --keep-restorable >/dev/null || fail "kill --keep-restorable failed"
+    "$real_tmux" -L "$socket" has-session -t '=s-keep' 2>/dev/null && fail "kill --keep-restorable did not kill"
+    [[ "$(state_of "$f_keep")" == active ]] || fail "kill --keep-restorable recorded the task closed"
+
+    PATH="$bin:$PATH" "$ROOT/cctrl" session close s-close >/dev/null || fail "session close failed"
+    [[ "$(state_of "$f_close")" == closed ]] || fail "close did not record the anchored task closed"
+
+    rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
+    exec_id="$(jq -r '.[] | select(.name=="s-stop") | .execution_id' <<< "$rows")"
+    PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact s-stop --execution-id "$exec_id" --json >/dev/null \
+        || fail "stop-exact failed"
+    [[ "$(state_of "$f_stop")" == closed ]] || fail "stop-exact did not record the anchored task closed"
+
+    # Backfill: a name with no live session. Dry run changes nothing; --apply
+    # closes; a live name is refused.
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session mark-closed s-gone --json)" || fail "mark-closed dry run failed: $out"
+    jq -e '.apply==false and ([.records[] | select(.provider_task_id=="id-gone" and .action=="would-close")] | length)==1' <<< "$out" >/dev/null \
+        || fail "mark-closed dry run did not list the record: $out"
+    [[ "$(state_of "$f_gone")" == active ]] || fail "mark-closed dry run wrote the registry"
+    PATH="$bin:$PATH" "$ROOT/cctrl" session mark-closed s-gone --apply >/dev/null || fail "mark-closed --apply failed"
+    [[ "$(state_of "$f_gone")" == closed ]] || fail "mark-closed --apply did not close the record"
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session mark-closed s-gone --json)"
+    jq -e '.records==[]' <<< "$out" >/dev/null || fail "mark-closed is not idempotent: $out"
+    record_for s-live id-live >/dev/null
+    rc=0; PATH="$bin:$PATH" "$ROOT/cctrl" session mark-closed s-live --apply >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "mark-closed on a live session did not refuse with 75 (rc=$rc)"
+
+    # A closed record no longer claims its tmux name: reusing the name is not
+    # an ownership conflict in the task catalogue.
+    "$real_tmux" -L "$socket" new-session -d -s s-kill 'sleep 120'
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" task ls --json 2>/dev/null || true)"
+    jq -e '[.rows[] | select(.provider_task_id=="id-kill")][0] | .control_owner!="conflict" and .lifecycle_state=="closed"' <<< "$out" >/dev/null \
+        || fail "a closed record still conflicts with a reused tmux name: $(jq -c '[.rows[] | select(.provider_task_id=="id-kill")]' <<< "$out")"
+    echo "ok: kill, close, and stop-exact record closed; mark-closed backfills; ended tasks release their tmux name"
+)
+
 test_session_stop_exact_identity() (
     # Every tmux command is forced through a private socket. This exercises the
     # real tmux identity/command-queue semantics without touching live sessions.
@@ -8514,6 +8597,8 @@ test_task_registry_structural_boundary() {
     local update transition direct_rewrite
     update="$(awk '/^_session_update_metadata_field\(\)/,/^}/' "$ROOT/cctrl")"
     transition="$(awk '/^_task_record_transition\(\)/,/^}/' "$ROOT/cctrl")"
+    [[ "$transition" == *'_task_record_transition_file'* ]] || fail "session-name transition bypasses the exact-file transition"
+    transition="$(awk '/^_task_record_transition_file\(\)/,/^}/' "$ROOT/cctrl")"
     [[ "$update" == *'_task_registry_apply_event'* && "$transition" == *'_task_registry_apply_event'* ]] \
         || fail "schema-v2 metadata writers bypass the task registry boundary"
     direct_rewrite="mv \"\$tmp\" \"\$file\""
@@ -8885,6 +8970,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             ;;
         session-stop-exact)
             test_session_stop_exact_identity
+            test_session_terminate_records_closed
             echo "ok"
             exit 0
             ;;
@@ -9088,6 +9174,7 @@ test_session_close_self_graceful
 test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
 test_session_stop_exact_identity
+test_session_terminate_records_closed
 test_session_attest_live_tmux_process_matches
 test_session_attest_direct_metadata
 test_session_attest_stale_tmux_session_missing

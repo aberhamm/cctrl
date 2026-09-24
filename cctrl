@@ -2688,9 +2688,17 @@ _session_update_metadata_field() {
 }
 
 _task_record_transition() {
-    local session_name="$1" runtime="$2" owner="$3" state="$4" restore="$5" source="$6" authority="$7" reason="$8"
-    local file stable_id promoted now record_key event_file event_id expected sequence result
+    local session_name="$1" file
     file="$(_session_metadata_file "$session_name")"
+    _task_record_transition_file "$file" "$@"
+}
+
+# Apply one digest-guarded ownership/lifecycle transition to an exact record
+# file. $2.. are the same as _task_record_transition: the session name is used
+# as the event source instance.
+_task_record_transition_file() {
+    local file="$1" session_name="$2" runtime="$3" owner="$4" state="$5" restore="$6" source="$7" authority="$8" reason="$9"
+    local stable_id promoted now record_key event_file event_id expected sequence result
     [[ -f "$file" ]] || return 1
     stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
     if [[ "$(jq -r '.schema_version // empty' "$file" 2>/dev/null || true)" != "$TASK_RECORD_SCHEMA_VERSION" ]]; then
@@ -8237,6 +8245,8 @@ cmd_session() {
             echo "    --in SECONDS | --now         Grace period (default 5s for own session)"
             echo "    --force                      Allow closing non-cctrl sessions"
             echo "  cctrl session kill <name>      Kill a session immediately by name (legacy/manual)"
+            echo "                                 Records it closed so restore skips it (--keep-restorable to skip)"
+            echo "  cctrl session mark-closed <name> [--apply]  Record an already-ended session as closed"
             echo "  cctrl session stop-exact <name> --execution-id ID [--json]"
             echo "                                 Stop only the exact execution returned by ls --json"
             echo ""
@@ -8264,7 +8274,8 @@ cmd_session() {
         restore)   _session_restore "$@" ;;
         close|stop) _session_close "$@" ;;
         reconcile-names) _session_reconcile_names "$@" ;;
-        kill|k|rm) _session_kill "${1:-}" ;;
+        kill|k|rm) _session_kill "$@" ;;
+        mark-closed) _session_mark_closed "$@" ;;
         stop-exact) _session_stop_exact "$@" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
@@ -10124,6 +10135,11 @@ for key, row in list(rows.items()):
     candidates = tmux_by_name.get(name, []) if name else []
     if not candidates:
         continue
+    if row.get("lifecycle_state") in ("closed", "archived"):
+        # An ended task no longer claims its old tmux name; a later session
+        # reusing the name is not a contradiction (plan 070 S3).
+        row["diagnostic_evidence"].append({"source":"tmux","reason":"ended-task-name-reused"})
+        continue
     if not row.get("_record_pane_id") or not row.get("_record_pane_pid"):
         row["diagnostic_evidence"].append({"source":"tmux","reason":"unanchored-explicit-link"})
         continue
@@ -11955,7 +11971,8 @@ _session_stop_exact() {
     # the same tmux command queue entry that kills by immutable $N id. A server
     # restart between the inspection above and this command takes the false
     # branch, so a replacement session cannot be killed.
-    local guard rc=0
+    local guard rc=0 stop_anchors
+    stop_anchors="$(_session_pane_anchors "$tmux_session_id")"
     guard="#{&&:#{==:#{@cctrl_server_instance_id},$expected_server_id},#{&&:#{==:#{pid},$expected_server_pid},#{&&:#{==:#{start_time},$expected_server_started},#{==:#{session_id},$tmux_session_id}}}}"
     tmux if-shell -F -t "$tmux_session_id" "$guard" \
         "kill-session -t '$tmux_session_id'" "run-shell 'exit 75'" \
@@ -11965,6 +11982,7 @@ _session_stop_exact() {
             "Execution identity became stale before it could be stopped." 69
         return $?
     fi
+    _session_record_terminated "$name" "$stop_anchors" "session stopped by cctrl session stop-exact"
 
     if $json; then
         _session_stop_exact_json true stopped "$name" "$execution_id" ""
@@ -11973,17 +11991,161 @@ _session_stop_exact() {
     fi
 }
 
+# ── Intentional termination (plan 070 S3) ────────────────────────────
+# kill, close, and stop-exact end a session on purpose. Recording that as a
+# `closed` lifecycle on the task records anchored to the session's panes is
+# what keeps `session restore` from bringing it back after a reboot.
+
+_session_pane_anchors() {
+    # "<pane_id> <pane_pid>" for every pane of an exact tmux target (a
+    # "$N" session id or "=name"). Empty when the session is gone.
+    tmux list-panes -s -t "$1" -F '#{pane_id} #{pane_pid}' 2>/dev/null || true
+}
+
+_session_task_records_for_name() {
+    # Open (not closed/archived/released) canonical task records that claim
+    # tmux session $1. With $2 set to "<pane_id> <pane_pid>" lines, only records
+    # anchored to one of those panes; with $2 = "cctrl-tmux", only records
+    # owned by a cctrl tmux terminal.
+    [[ -d "$SESSION_METADATA_DIR" ]] || return 0
+    python3 - "$SESSION_METADATA_DIR" "$1" "${2:-}" <<'PY'
+import json, sys
+from pathlib import Path
+root, name, selector = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+anchors = set()
+if selector != "cctrl-tmux":
+    for line in selector.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            anchors.add((parts[0], parts[1]))
+    if not anchors:
+        raise SystemExit(0)
+for path in sorted(root.glob("task-*.json")):
+    if path.is_symlink():
+        continue
+    try:
+        record = json.loads(path.read_text())
+    except Exception:
+        continue
+    if record.get("schema_version") != 2 or (record.get("tmux_session") or record.get("name")) != name:
+        continue
+    if record.get("lifecycle_state") in ("closed", "archived", "released"):
+        continue
+    if selector == "cctrl-tmux":
+        if record.get("control_owner") != "cctrl" or record.get("execution_runtime") != "tmux":
+            continue
+    elif (str(record.get("pane_id") or ""), str(record.get("pane_pid") or "")) not in anchors:
+        continue
+    print(path)
+PY
+}
+
+_session_record_terminated() {
+    # Mark every task record anchored to the given panes closed. The session
+    # is already gone, so a registry failure is reported, not fatal.
+    local name="$1" anchors="$2" reason="$3" file failed=0
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        _task_record_transition_file "$file" "$name" unknown unknown closed "" \
+            cctrl-terminate authoritative "$reason" 2>/dev/null || failed=$((failed + 1))
+    done < <(_session_task_records_for_name "$name" "$anchors")
+    if (( failed > 0 )); then
+        echo -e "${YELLOW}⚠  Could not record the end of $failed task record(s) for $name; restore may still offer it. Fix with: cctrl session mark-closed $name --apply${RESET}" >&2
+    fi
+    return 0
+}
+
+_session_mark_closed() {
+    # Backfill for sessions that ended before plan 070 S3 (or were killed
+    # outside cctrl): close the cctrl/tmux records that still claim a tmux
+    # name with no live session. Dry-run unless --apply.
+    local name="" apply=false json=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply) apply=true; shift ;;
+            --json) json=true; shift ;;
+            -h|--help|help)
+                echo "Usage: cctrl session mark-closed <tmux-name> [--apply] [--json]"
+                echo ""
+                echo "  Record that a session ended on purpose, so restore skips it. Only for a"
+                echo "  name with no live tmux session. Closes the cctrl/tmux task records that"
+                echo "  still claim the name. Dry-run by default; --apply writes digest-guarded"
+                echo "  registry events."
+                return 0 ;;
+            -*) echo -e "${RED}Unknown mark-closed flag: $1${RESET}" >&2; return 64 ;;
+            *) [[ -z "$name" ]] || { echo -e "${RED}mark-closed takes one session name.${RESET}" >&2; return 64; }
+               name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || { echo -e "${RED}Usage: cctrl session mark-closed <tmux-name> [--apply] [--json]${RESET}" >&2; return 64; }
+    local sessions rc=0
+    sessions="$(tmux list-sessions -F '#{session_name}' 2>&1)" || rc=$?
+    if (( rc != 0 )); then
+        # No tmux server means no live session; any other failure means the
+        # inventory is unknown, and closing on unknown evidence is refused.
+        if [[ "$sessions" != *"no server running"* && "$sessions" != *"error connecting"* ]]; then
+            echo -e "${RED}tmux inventory unavailable; refusing to mark '$name' closed.${RESET}" >&2
+            return 69
+        fi
+        sessions=""
+    fi
+    if grep -Fxq -- "$name" <<< "$sessions"; then
+        echo -e "${RED}'$name' is a live tmux session. Close it with: cctrl session close $name${RESET}" >&2
+        return 75
+    fi
+    local -a items=()
+    local file action failed=0
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        action="would-close"
+        if $apply; then
+            if _task_record_transition_file "$file" "$name" unknown unknown closed "" \
+                cctrl-terminate authoritative "session ended; recorded by mark-closed" 2>/dev/null; then
+                action="closed"
+            else
+                action="rejected"; failed=$((failed + 1))
+            fi
+        fi
+        items+=("$(jq -c --arg action "$action" --arg record "${file##*/}" \
+            '{record:$record,provider,provider_task_id,lifecycle_state,action:$action}' "$file")")
+    done < <(_session_task_records_for_name "$name" cctrl-tmux)
+    if $json; then
+        { if (( ${#items[@]} > 0 )); then printf '%s\n' "${items[@]}"; fi; } | jq -s --arg name "$name" --argjson apply "$apply" \
+            '{name:$name,live:false,apply:$apply,records:.}'
+    elif (( ${#items[@]} == 0 )); then
+        echo "No open cctrl/tmux records claim '$name'."
+    else
+        printf '%s\n' "${items[@]}" | jq -r '"\(.action)  \(.provider) \(.provider_task_id)  (\(.lifecycle_state))  \(.record)"'
+        $apply || echo -e "${DIM}Dry run. Apply with: cctrl session mark-closed $name --apply${RESET}"
+    fi
+    (( failed == 0 )) || return 75
+}
+
 _session_kill() {
     _session_require_tmux || return 1
-    local kill_target="$1"
+    local kill_target="" keep_restorable=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --keep-restorable) keep_restorable=true ;;
+            *) [[ -z "$kill_target" ]] && kill_target="$arg" ;;
+        esac
+    done
     if [[ -z "$kill_target" ]]; then
         echo -e "${RED}cctrl session kill needs a session name.${RESET}" >&2
         echo -e "${DIM}List sessions with: cctrl session ls${RESET}" >&2
         return 1
     fi
     if tmux has-session -t "$kill_target" 2>/dev/null; then
-        tmux kill-session -t "$kill_target"
-        echo -e "${GREEN}Killed session: $kill_target${RESET}"
+        # Resolve the exact session tmux picked, so the recorded end names the
+        # session that actually died, then kill it by immutable id.
+        local resolved session_id session_name anchors
+        resolved="$(tmux display-message -p -t "$kill_target" '#{session_id} #{session_name}' 2>/dev/null || true)"
+        session_id="${resolved%% *}"; session_name="${resolved#* }"
+        [[ "$session_id" == \$* ]] || { session_id="$kill_target"; session_name="$kill_target"; }
+        anchors="$(_session_pane_anchors "$session_id")"
+        tmux kill-session -t "$session_id"
+        $keep_restorable || _session_record_terminated "$session_name" "$anchors" "session killed by cctrl session kill"
+        echo -e "${GREEN}Killed session: $session_name${RESET}"
     else
         echo -e "${RED}No session named '$kill_target'.${RESET}" >&2
         return 1
@@ -12218,7 +12380,8 @@ _session_close() {
     # both complete. Keep archival here, rather than in session-wrapper.sh:
     # release-to-app also ends the wrapper with EOF but deliberately preserves
     # the app task for continued use.
-    local archive_result="" archive_status=""
+    local archive_result="" archive_status="" close_anchors
+    close_anchors="$(_session_pane_anchors "=$target")"
     archive_result="$(_session_archive_codex_task "$target" --json 2>/dev/null || true)"
     archive_status="$(jq -r '.status // empty' <<< "$archive_result" 2>/dev/null || true)"
 
@@ -12229,9 +12392,12 @@ _session_close() {
         # the death of the calling pane/client.
         if ! tmux run-shell -b "sleep $grace; tmux kill-session -t $target_q" 2>/dev/null; then
             tmux kill-session -t "$target"
+            _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
             echo -e "${GREEN}Closed session: $target${RESET}"
             return 0
         fi
+        # The kill is scheduled; the close is already decided, so record it now.
+        _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
         if [[ "$target" == "$current" ]]; then
             echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s — wrap up now."
         else
@@ -12239,6 +12405,7 @@ _session_close() {
         fi
     else
         tmux kill-session -t "$target"
+        _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
         echo -e "${GREEN}Closed session: $target${RESET}"
     fi
     case "$archive_status" in

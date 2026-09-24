@@ -448,7 +448,19 @@ cctrl session current --json      # machine-readable identity for the current ag
 cctrl session attach myapp        # partial names work; full name is TMUX--myapp
 cctrl session close TMUX--myapp   # gracefully close a session
 cctrl session kill TMUX--myapp    # legacy/manual: kill by mutable name
+cctrl session mark-closed TMUX--old          # dry run: records that would be closed
+cctrl session mark-closed TMUX--old --apply  # record an already-ended session as closed
 ```
+
+`session close`, `session kill`, and `session stop-exact` end a session on
+purpose. Each records a `closed` lifecycle on the task records anchored to the
+session's panes, so `session restore` never brings it back after a reboot.
+`session kill --keep-restorable` skips that write.
+
+For sessions that ended before this existed, or were killed outside cctrl, run
+`session mark-closed`. It is dry-run by default and refuses a name that is
+still live. A closed task also gives up its old tmux name, so a new session
+reusing the name is not an ownership conflict.
 
 #### Letting the agent close its own session
 

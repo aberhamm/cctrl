@@ -34,6 +34,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `session kill`, `session close`, and `session stop-exact` record the task as
+  `closed`, so `session restore` no longer resurrects sessions ended on
+  purpose. `kill --keep-restorable` opts out. The new
+  `session mark-closed <name> [--apply]` backfills sessions that ended earlier;
+  it is dry-run by default and refuses live names. Closed and archived tasks no
+  longer claim their old tmux name, so a session reusing the name is not an
+  ownership conflict. (plan 070 S3)
 - `session snapshot` no longer grows without bound. On the live fleet a capture
   went from 40 MB to about 100 KB. The changes:
   - Labels are capped at 200 characters, with a hash of the full title.
