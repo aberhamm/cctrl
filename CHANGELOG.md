@@ -34,6 +34,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Lossy historical commands additionally require a verified original launch event.
 
 ### Changed
+- `cctrl start -d` answers Claude Code's folder-trust dialog with "Yes, I trust
+  this folder". The health check moves the selection off the default
+  "No, exit" and presses Enter only after the screen shows "Yes" selected. If
+  it can't select it, it reports `needs-human` and presses nothing. The
+  external-imports dialog and Codex's directory trust are still left to you.
+  (plan 072)
 - Spawn and fleet skills honor explicit provider selection and configured
   preferences for workers and reviewers. Agent-aware profiles isolate model
   settings, while explicit CLI model flags take precedence.

@@ -36,7 +36,8 @@ The readiness check took the dialog's `❯ No, …` option line for the composer
   - `codex-directory-trust`
   - `startup-selector` for an unrecognised selector
 - [x] The needs-human message and `health_info` say which option keeps the session, because the default choice is the destructive or deny one.
-- [x] Trust and import dialogs are never auto-answered.
+- [x] Import dialogs and Codex directory trust are never auto-answered.
+- [x] Claude's folder-trust dialog is answered "Yes, I trust this folder". Matthew decided this on 2026-09-25. The check moves the selection down and presses Enter only once the screen shows "Yes" selected; otherwise it reports needs-human.
 - [x] `_session_pane_has_dialog` and peer-delivery readiness see the same dialogs, because they share the table.
 - [x] Tests replay the real screen text from the three incidents, plus the Codex trust screen.
 

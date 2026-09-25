@@ -6,8 +6,9 @@
 # one entry:
 #   PATTERN  — extended regex anchored on modal chrome (❯ selector, dialog text)
 #   LABEL    — human-readable label for logging
-#   ACTION   — auto-dismiss | needs-human | info-only
-#   KEYS     — tmux send-keys sequence for auto-dismiss, or regex for extraction
+#   ACTION   — auto-dismiss | auto-select | needs-human | info-only
+#   KEYS     — tmux send-keys sequence for auto-dismiss, the option text to
+#              select for auto-select, or regex for extraction
 #   HINT     — needs-human only: what to choose to keep the session (the
 #              default option of several startup dialogs quits or denies)
 #
@@ -38,7 +39,7 @@ CLAUDE_HC_LABEL=(
     "startup-selector"
 )
 CLAUDE_HC_ACTION=(
-    "needs-human"
+    "auto-select"
     "needs-human"
     "auto-dismiss"
     "auto-dismiss"
@@ -47,7 +48,7 @@ CLAUDE_HC_ACTION=(
     "needs-human"
 )
 CLAUDE_HC_KEYS=(
-    ""
+    "Yes, I trust this folder"
     ""
     "Enter"
     "Enter"

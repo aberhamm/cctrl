@@ -54,6 +54,28 @@ _hc_prompt_visible() {
     printf '%s\n' "$screen" | grep -E '^[[:space:]│|]*[❯›]([[:space:]]|$)' >/dev/null 2>&1
 }
 
+# _hc_select_option <session> <option text>
+# Press Down until "❯ <option text>" is the selected line of the visible
+# screen, then Enter. Returns 1 without pressing Enter if the option never
+# becomes selected.
+_hc_select_option() {
+    local session_name="$1" option="$2" tries=0 screen
+    local selected="^[[:space:]│|]*[❯›][[:space:]]+${option}"
+    while (( tries < 6 )); do
+        if _tmux_run_with_timeout capture-pane -p -t "$session_name" 2>/dev/null; then
+            screen="$TMUX_RUN_OUTPUT"
+            if printf '%s\n' "$screen" | grep -E "$selected" >/dev/null 2>&1; then
+                _tmux_run_with_timeout send-keys -t "$session_name" Enter 2>/dev/null || return 1
+                return 0
+            fi
+        fi
+        _tmux_run_with_timeout send-keys -t "$session_name" Down 2>/dev/null || return 1
+        tries=$((tries + 1))
+        sleep "${CCTRL_HC_SELECT_DELAY:-0.2}"
+    done
+    return 1
+}
+
 _hc_report_exit() {
     local session_name="$1" reason="$2" capture="$3"
     _session_update_metadata_field "$session_name" health_status "exited" 2>/dev/null || true
@@ -127,6 +149,26 @@ _health_check_run() {
                             _tmux_run_with_timeout send-keys -t "$session_name" "${HC_KEYS[$i]}" 2>/dev/null || true
                         fi
                         # Already dismissed — wait for prompt to clear
+                        ;;
+                    auto-select)
+                        # Unnumbered selector whose default is destructive
+                        # (folder trust defaults to "No, exit"). Move the
+                        # selection down until KEYS (the wanted option) is the
+                        # selected line, and press Enter only once the screen
+                        # confirms it. Never Enter on anything else.
+                        if ! _hc_is_dismissed "$i" "$dismissed"; then
+                            dismissed="$(_hc_mark_dismissed "$i" "$dismissed")"
+                            if _hc_select_option "$session_name" "${HC_KEYS[$i]}"; then
+                                echo -e "${DIM}  Health check: answered ${HC_LABEL[$i]} with \"${HC_KEYS[$i]}\"${RESET}" >&2
+                            else
+                                _session_update_metadata_field "$session_name" health_status "needs-human" 2>/dev/null || true
+                                _session_update_metadata_field "$session_name" health_reason "${HC_LABEL[$i]}" 2>/dev/null || true
+                                [[ -n "${HC_HINT[$i]:-}" ]] && _session_update_metadata_field "$session_name" health_info "${HC_HINT[$i]}" 2>/dev/null
+                                echo -e "${YELLOW}⚠${RESET}  Health check: ${HC_LABEL[$i]} — could not select \"${HC_KEYS[$i]}\"; requires human intervention" >&2
+                                [[ -n "${HC_HINT[$i]:-}" ]] && echo -e "${DIM}  Info: ${HC_HINT[$i]}${RESET}" >&2
+                                return 0
+                            fi
+                        fi
                         ;;
                     needs-human)
                         # Extract info if regex provided

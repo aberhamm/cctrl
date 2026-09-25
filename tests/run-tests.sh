@@ -9716,7 +9716,11 @@ test_health_check_startup_selectors_need_human() {
             || fail "_session_pane_has_dialog missed the $2 dialog"
     }
 
-    screen=' Accessing workspace:
+    # Folder trust (Matthew, 2026-09-25): answer it automatically, but only by
+    # moving the selection to "Yes, I trust this folder" and pressing Enter
+    # once the screen shows that option selected. The default "No, exit" quits.
+    local trust_no trust_yes composer
+    trust_no=' Accessing workspace:
 
  /Users/matthew/dev/tiktok-remotion
 
@@ -9731,7 +9735,35 @@ test_health_check_startup_selectors_need_human() {
    Yes, I trust this folder
 
  Enter to confirm · Esc to cancel'
-    assert_selector claude folder-trust 'Yes, I trust this folder' "$screen"
+    trust_yes="${trust_no/ ❯ No, exit
+   Yes, I trust this folder/   No, exit
+ ❯ Yes, I trust this folder}"
+    composer='  Claude Code
+────
+❯ 
+────
+  ? for shortcuts'
+    dir="$TMPDIR/hcsel-folder-trust"
+    _hc_readiness_fixture "$dir"
+    printf '%s\n' "$trust_no" > "$dir/screen.1"; printf '%s\n' "$trust_no" > "$dir/screen.2"
+    printf '%s\n' "$trust_yes" > "$dir/screen.3"; printf '%s\n' "$composer" > "$dir/screen.4"
+    CCTRL_HC_SELECT_DELAY=0 _hc_readiness_run "$dir" claude 10 || fail "folder-trust auto-select failed"
+    [[ "$(grep -c 'send-keys' "$dir/tmux.log")" == 2 ]] \
+        && grep -n 'send-keys' "$dir/tmux.log" | head -1 | grep -q 'Down$' \
+        && grep -n 'send-keys' "$dir/tmux.log" | tail -1 | grep -q 'Enter$' \
+        || fail "folder trust was not answered as Down then Enter: $(cat "$dir/tmux.log")"
+    grep -qx 'health_status=ready' "$dir/meta.log" || fail "session after trusting the folder was not ready: $(cat "$dir/meta.log")"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    cctrl_source_eval '_session_pane_has_dialog "$1" claude' "$trust_no" || fail "_session_pane_has_dialog missed folder trust"
+
+    # If "Yes" never becomes the selected line, nothing is confirmed.
+    dir="$TMPDIR/hcsel-folder-trust-stuck"
+    _hc_readiness_fixture "$dir"
+    printf '%s\n' "$trust_no" > "$dir/screen.1"
+    CCTRL_HC_SELECT_DELAY=0 _hc_readiness_run "$dir" claude 10 || fail "stuck folder-trust check failed"
+    ! grep -q 'Enter' "$dir/tmux.log" || fail "Enter was pressed without \"Yes, I trust this folder\" selected: $(cat "$dir/tmux.log")"
+    grep -qx 'health_status=needs-human' "$dir/meta.log" && grep -qx 'health_reason=folder-trust' "$dir/meta.log" \
+        || fail "unselectable folder trust was not needs-human: $(cat "$dir/meta.log")"
 
     screen=' Allow external CLAUDE.md file imports?
 
@@ -9779,7 +9811,7 @@ test_health_check_startup_selectors_need_human() {
     ! hc_visible '❯ No, exit
    Yes, I trust this folder
  Enter to confirm · Esc to cancel' || fail "a selector footer counted as a visible prompt"
-    echo "ok: startup selectors (folder trust, external imports, Codex trust) are needs-human, named, and never auto-answered"
+    echo "ok: folder trust is answered Yes only after the selection is confirmed; import and Codex trust dialogs are needs-human, named, and never auto-answered"
 }
 
 test_health_check_detects_startup_exit() {
