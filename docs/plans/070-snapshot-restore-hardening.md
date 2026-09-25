@@ -10,6 +10,8 @@ review-required: eng
 created: 2026-09-24
 tui-fixture: n/a  # snapshot/restore tests use fixture catalogues, fake tmux, and temp registries
 approved-by: matthew (chat, 2026-09-24): implement steps 1-5; live --apply and loading the timer need a separate OK
+reviews:
+  - type=eng verdict=changes-requested date=2026-09-25 by=mstack-review
 ---
 
 ## Plain-English Summary
@@ -121,3 +123,31 @@ Still open:
 - The 3 live Codex conflicts, plus 95ce and the other Codex rows, need the Codex App Server: its control socket is missing. Open the Codex desktop app, then run `cctrl task resolve-conflicts` (dry run) and `--apply`.
 - Watch the timer for a day, then move it to 300 s.
 - The focused `CCTRL_TEST_ONLY=codex-ownership-matrix` group already failed at 4f353cb. The full suite runs the same contract and passes.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CHANGES REQUESTED | 9 issues, 1 critical gap |
+| Outside voice | Claude subagent (Codex out of credits) | Independent 2nd opinion | 1 | issues_found | 12 findings; 8 confirmed in code |
+
+Reviewed on 2026-09-25, at bd95d5b: the plan, plus commits 4fd3ac7, c9216ea, cccb5e8, 1a0f922, 015cfc3, 291c3ea and 27fb1db. These focused groups pass: `snapshot-ownership`, `session-stop-exact`, `task-records`, `task-record-list` and `codex-reconcile`. So do the unittests `test_conflict_resolve`, `test_restore_revalidation` and `test_tmux_snapshot`.
+
+Fixes needed before `done`:
+- **[P1] S1, dead tmux names** (`lib/snapshot_restore.py:283`). For a name with no live session, the second loop keeps the first catalogue row and silently drops the rest. It sets no `shadowed_task_ids` and no `ambiguous-tmux-claim`. After a reboot, a closed or superseded row can hide the active one. That is the case restore exists for.
+- **[P2] S3, `closed` written without checking the kill** (`cctrl:12302-12303`, `cctrl:12550-12551`, `cctrl:12563-12564`). `tmux kill-session` failures are ignored, and the grace path in `session close` (`cctrl:12555-12556`) records `closed` before the deferred kill runs. The plan says "written only after the kill succeeds". A kill that fails leaves a live conversation recorded closed, and restore will then skip it.
+- **[P2] S4, anchor release is not implemented.** The code blocks legacy promotion on anchor receipts (`cctrl:2695`). It never removes `pane_id`/`pane_pid` from the other schema-2 records that claim the pane. Either implement it or amend the requirement, with the reason.
+- **[P2] S5, stale-anchor skips the session-file check** (`lib/conflict_resolve.py`, `evaluate`). The code checks argv only. The plan says "no process or session file claims the task". A Claude conversation resumed in another pane with `/resume` has no id in argv, so its record would be closed.
+- **[P2] S5 / 291c3ea: App Server `ambiguous` counts as not-live when closing a gone pane.** For the same inputs, reconcile-codex yields owner `unknown`, not a close (`cctrl:8121-8122`). Keep `ambiguous` as not-live for `own` and `superseded-by` only, or check it against live App Server data before the next `--apply`.
+
+Follow-ups (not blocking):
+- **[P2, critical gap]** The first timer capture after a power cycle replaces `latest.json`. That capture has only registry rows (`launch_flags:{}`, nothing live). The empty-fleet guard (`cctrl:11492`) never trips, because the registry survives the reboot. The problem predates this plan, but the timer is now loaded. Restore defaults to `latest.json` (`cctrl:11551`). Guard it: skip or refuse to replace `latest.json` when the capture has zero live sessions and the current `latest.json` has some.
+- **[P3]** `_snapshot_retention_prune_age` can delete the newest history file, because history is now written only on change. It heals itself on the next run.
+- **[P3]** kill and close only close records that carry an anchor. When no record matches they print nothing, so pre-anchor sessions still come back on restore.
+- **[P3]** `--apply` re-runs the decision rather than re-checking source cursors. That is acceptable, but the plan text should say so.
+
+VERDICT: ENG CHANGES REQUESTED. Fix the P1 and the P2s, then re-run `/plan-eng-review`.
+
+**UNRESOLVED DECISIONS:**
+- Whether S4's anchor release should be implemented or struck from the requirements (Matthew)
+- Whether `ambiguous` App Server evidence may close a gone-pane Codex record (Matthew; 291c3ea chose yes)

@@ -1,7 +1,8 @@
 ---
 id: 072
 title: Never report ready while a startup selector is waiting
-status: in-progress
+status: done
+completed: 2026-09-25
 blocked-by: []
 priority: 72
 allows-migrations: false
@@ -10,6 +11,8 @@ review-required: eng
 created: 2026-09-25
 tui-fixture: required  # tests replay the real Claude and Codex dialog screens through the fake-tmux readiness harness
 approved-by: matthew (chat, 2026-09-25): queued after plan 070 step C
+reviews:
+  - type=eng verdict=approved date=2026-09-25 by=mstack-review
 ---
 
 ## Plain-English Summary
@@ -57,3 +60,24 @@ The readiness check took the dialog's `❯ No, …` option line for the composer
 
 - `session ls` showing rc `dead` while the dialog is up. The bridge is not registered until the dialog is answered, so this is a symptom, not a separate bug.
 - The existing `workspace-trust` auto-dismiss entry for the old numbered dialog (`Do you trust the files`, `❯ 1. Yes`). It presses Enter, and that dialog's default is "Yes". Whether cctrl should keep auto-answering even that is Matthew's call.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR | 2 issues, 0 critical gaps |
+| Outside voice | Claude subagent (Codex out of credits) | Independent 2nd opinion | 1 | issues_found | 2 findings on 072, both confirmed; neither blocks |
+
+Reviewed on 2026-09-25, at bd95d5b: the plan, 7344ad4, and bd95d5b (folder-trust auto-select). The `health-check` focused group passes, and it replays the real incident screens. The auto-select presses Enter only after the screen shows "❯ Yes, I trust this folder" selected. There is a test for that, and a test that nothing is pressed when the selection never lands. None of the new dialogs is auto-answered with Enter blindly.
+
+Follow-ups (not blocking):
+- **[P2] The patterns also match text above the visible screen.** The health check captures `-S -40` (`lib/health-check.sh:119`) and peer delivery `-S -15` (`cctrl:5701`). The new generic patterns (`Enter to confirm|Esc to cancel`, `Press enter to continue`, `Yes, I trust this folder`) are ordinary phrases, so a transcript that quotes them can:
+  - block peer delivery;
+  - mark the session `blocked-dialog`;
+  - after bd95d5b, send up to 6 `Down` keys into a resumed composer. Enter is never pressed.
+  Anchor the footer matches to the dialog chrome, or match against the visible screen only. Add a test with prose that must not match.
+- **[P3] An unrecognised numbered selector is answered with Enter instead of being reported.** The old `Continue from a previous|❯ 1\.` auto-dismiss entry (`lib/health-check-patterns.sh:27`) catches any numbered selector first, so it never reaches the `startup-selector` entry. This behaviour predates the plan, which put it out of scope under "Not in scope".
+
+VERDICT: ENG CLEARED.
+
+NO UNRESOLVED DECISIONS
