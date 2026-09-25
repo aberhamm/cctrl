@@ -9455,7 +9455,7 @@ _session_pane_has_dialog() {
         else
             # Fallback: inline pattern for environments without the lib dir
             printf '%s\n' "$capture" \
-                | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes|Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' \
+                | grep -E 'Do you want to (proceed|create|make)|Do you trust the files|❯ 1\. Yes|Is this a project you created or one you trust|Allow external CLAUDE\.md file imports|Enter to confirm|Do you trust the contents of this directory|Press [Ee]nter to continue|Allow Codex to |approve network access|tell Codex what to do differently|Hooks need review|PreToolUse hooks|Press t to trust|Trust all and continue' \
                 >/dev/null 2>&1
             return
         fi

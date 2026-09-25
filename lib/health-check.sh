@@ -44,10 +44,13 @@ _hc_mark_dismissed() {
 # The agent's input line: Claude Code draws "❯", Codex "›". Callers pass the
 # visible screen only (scrollback keeps dismissed dialogs). Any numbered
 # selector on screen ("❯ 1. Yes", Codex's "› 1. Update now") is a modal that
-# would swallow input, even when a composer line is drawn behind it.
+# would swallow input, even when a composer line is drawn behind it. So is an
+# unnumbered one: its selected option ("❯ No, exit") looks exactly like a
+# composer line, and only the selector footer tells them apart.
 _hc_prompt_visible() {
     local screen="$1"
     printf '%s\n' "$screen" | grep -E '^[[:space:]│|]*[❯›][[:space:]]+[0-9]+\.' >/dev/null 2>&1 && return 1
+    printf '%s\n' "$screen" | grep -E 'Enter to confirm|Esc to cancel|Press [Ee]nter to continue' >/dev/null 2>&1 && return 1
     printf '%s\n' "$screen" | grep -E '^[[:space:]│|]*[❯›]([[:space:]]|$)' >/dev/null 2>&1
 }
 
@@ -134,6 +137,9 @@ _health_check_run() {
                         _session_update_metadata_field "$session_name" health_status "needs-human" 2>/dev/null || true
                         _session_update_metadata_field "$session_name" health_reason "${HC_LABEL[$i]}" 2>/dev/null || true
                         echo -e "${YELLOW}⚠${RESET}  Health check: ${HC_LABEL[$i]} — requires human intervention" >&2
+                        if [[ -z "$extracted" && -n "${HC_HINT[$i]:-}" ]]; then
+                            extracted="${HC_HINT[$i]}"
+                        fi
                         if [[ -n "$extracted" ]]; then
                             _session_update_metadata_field "$session_name" health_info "$extracted" 2>/dev/null || true
                             echo -e "${DIM}  Info: $extracted${RESET}" >&2

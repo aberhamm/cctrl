@@ -42,6 +42,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- The post-spawn health check no longer reports "ready" while Claude Code or
+  Codex waits on a startup selector. Covered: Claude's folder-trust and
+  external CLAUDE.md import dialogs, Codex's directory trust dialog, and any
+  selector footer ("Enter to confirm", "Press enter to continue"). Each is
+  reported as `needs-human` with the dialog named. The message says which
+  option keeps the session, because the default choice quits or denies. None
+  of these dialogs is auto-answered. Peer delivery and dialog detection share
+  the same patterns, so messages are no longer pasted into these dialogs.
+  (plan 072)
 - Relaunching a task in a cctrl terminal after handing it to the Codex app, or
   after it was recorded closed, takes ownership back (`cctrl-reclaim`
   evidence) instead of merging into an ownership `conflict`. A relaunch older

@@ -9202,6 +9202,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        health-check) ;;
         snapshot-ownership)
             test_snapshot_ownership_policy
             test_snapshot_tmux_row_selection
@@ -9217,7 +9218,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
-if [[ "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
+if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
 test_launch_args
 test_agent_prompt_without_default
@@ -9417,6 +9418,14 @@ test_health_check_pattern_matching() {
     source "$ROOT/lib/health-check-patterns.sh"
     _hc_patterns_for_agent claude
 
+    # Look entries up by label: indices shift whenever a dialog is added.
+    hc_pattern() {
+        local i
+        for i in "${!HC_LABEL[@]}"; do
+            [[ "${HC_LABEL[$i]}" == "$1" ]] && { printf '%s' "${HC_PATTERN[$i]}"; return 0; }
+        done
+        fail "no health-check pattern labelled $1"
+    }
     # Workspace trust modal (should match)
     local trust_pane
     trust_pane="$(printf '%s\n' \
@@ -9425,7 +9434,7 @@ test_health_check_pattern_matching() {
         '│ ❯ 1. Yes                                         │' \
         '│   2. No                                          │' \
         '╰──────────────────────────────────────────────────╯')"
-    printf '%s\n' "$trust_pane" | grep -E "${HC_PATTERN[0]}" >/dev/null 2>&1 \
+    printf '%s\n' "$trust_pane" | grep -E "$(hc_pattern workspace-trust)" >/dev/null 2>&1 \
         || fail "workspace-trust pattern should match trust modal"
 
     # Conversation picker (should match)
@@ -9433,7 +9442,7 @@ test_health_check_pattern_matching() {
     picker_pane="$(printf '%s\n' \
         'Continue from a previous conversation?' \
         '❯ 1. Start new conversation')"
-    printf '%s\n' "$picker_pane" | grep -E "${HC_PATTERN[1]}" >/dev/null 2>&1 \
+    printf '%s\n' "$picker_pane" | grep -E "$(hc_pattern conversation-picker)" >/dev/null 2>&1 \
         || fail "conversation-picker pattern should match picker modal"
 
     # Seeded prompt text mentioning "trust" should NOT match
@@ -9441,7 +9450,7 @@ test_health_check_pattern_matching() {
     seeded_pane="$(printf '%s\n' \
         'Your task: ensure the files are trustworthy.' \
         'Continue from a previous plan and verify.')"
-    ! printf '%s\n' "$seeded_pane" | grep -E "${HC_PATTERN[0]}" >/dev/null 2>&1 \
+    ! printf '%s\n' "$seeded_pane" | grep -E "$(hc_pattern workspace-trust)" >/dev/null 2>&1 \
         || fail "workspace-trust pattern should NOT match seeded prompt prose"
 
     # Codex patterns
@@ -9450,12 +9459,12 @@ test_health_check_pattern_matching() {
     codex_modal="$(printf '%s\n' \
         'Allow Codex to run: npm test' \
         'tell Codex what to do differently')"
-    printf '%s\n' "$codex_modal" | grep -E "${HC_PATTERN[0]}" >/dev/null 2>&1 \
+    printf '%s\n' "$codex_modal" | grep -E "$(hc_pattern codex-approval-modal)" >/dev/null 2>&1 \
         || fail "codex-approval-modal pattern should match Codex modal"
 
     local codex_hooks
     codex_hooks="$(printf '%s\n' 'Hooks need review' 'Press t to trust')"
-    printf '%s\n' "$codex_hooks" | grep -E "${HC_PATTERN[1]}" >/dev/null 2>&1 \
+    printf '%s\n' "$codex_hooks" | grep -E "$(hc_pattern codex-hooks-trust)" >/dev/null 2>&1 \
         || fail "codex-hooks-trust pattern should match hooks modal"
 
     echo "ok: health check patterns match expected fixtures and reject prose"
@@ -9638,7 +9647,7 @@ case "\${1:-}" in
         f="$dir/screen.\$n"
         [[ -f "\$f" ]] || f="\$(ls "$dir"/screen.* | sort -t. -k2 -n | tail -1)"
         cat "\$f"; exit 0 ;;
-    *) exit 0 ;;
+    *) printf '%s\n' "\$*" >> "$dir/tmux.log"; exit 0 ;;
 esac
 FAKESH
     chmod +x "$dir/bin/tmux"
@@ -9684,6 +9693,93 @@ test_health_check_ready_requires_visible_prompt() {
     grep -qx 'health_status=ready' "$dir/meta.log" || fail "codex idle composer should be ready: $(cat "$dir/meta.log")"
 
     echo "ok: health check reports ready only when the agent prompt is visible"
+}
+
+test_health_check_startup_selectors_need_human() {
+    # Plan 072: unnumbered startup selectors put "❯ No, …" on screen, which
+    # looks exactly like the composer line. Screens below are the real ones
+    # from 2026-09-24 (folder trust, external CLAUDE.md imports) plus Codex
+    # 0.153.4's directory trust. None may be ready; each is needs-human, named,
+    # with the option that keeps the session; nothing is auto-answered.
+    local dir screen
+    assert_selector() { # agent label hint-fragment screen-text
+        dir="$TMPDIR/hcsel-$2"
+        _hc_readiness_fixture "$dir"
+        printf '%s\n' "$4" > "$dir/screen.1"
+        _hc_readiness_run "$dir" "$1" 6 || fail "$2 health check failed"
+        grep -qx 'health_status=needs-human' "$dir/meta.log" || fail "$2 was not needs-human: $(cat "$dir/meta.log")"
+        grep -qx "health_reason=$2" "$dir/meta.log" || fail "$2 was not named: $(cat "$dir/meta.log")"
+        grep -q "^health_info=.*$3" "$dir/meta.log" || fail "$2 did not say which option keeps the session: $(cat "$dir/meta.log")"
+        ! grep -q 'send-keys' "$dir/tmux.log" 2>/dev/null || fail "$2 was auto-answered: $(cat "$dir/tmux.log")"
+        # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+        cctrl_source_eval '_session_pane_has_dialog "$1" "$2"' "$4" "$1" \
+            || fail "_session_pane_has_dialog missed the $2 dialog"
+    }
+
+    screen=' Accessing workspace:
+
+ /Users/matthew/dev/tiktok-remotion
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open
+ source project, or work from your team). If not, take a moment to review what'"'"'s in this folder first.
+
+ Claude Code'"'"'ll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel'
+    assert_selector claude folder-trust 'Yes, I trust this folder' "$screen"
+
+    screen=' Allow external CLAUDE.md file imports?
+
+ This project'"'"'s CLAUDE.md imports files outside the current working directory. Never allow this for
+ third-party repositories.
+
+ External imports:
+   /Users/matthew/dev/obsidian-vault/AGENTS.md
+
+ Important: Only use Claude Code with files you trust. Accessing untrusted files may pose security risks.
+
+ ❯ No, disable external imports
+   Yes, allow external imports
+
+ Enter to confirm · Esc to cancel'
+    assert_selector claude external-imports 'Yes, allow external imports' "$screen"
+
+    screen='> You are in /Users/matthew/dev/new-project
+
+  Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of
+  prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue'
+    assert_selector codex codex-directory-trust 'Yes, continue' "$screen"
+
+    # An unrecognized selector is still never ready.
+    screen=' Pick one
+
+ ❯ Keep going
+   Stop
+
+ Enter to confirm · Esc to cancel'
+    assert_selector claude startup-selector 'pick an option' "$screen"
+
+    # The composer itself is still ready.
+    hc_visible() { ( _HC_SCRIPT_DIR="$ROOT/lib"; _HC_PATTERNS_LOADED=""; source "$ROOT/lib/health-check.sh"; _hc_prompt_visible "$1" ); }
+    hc_visible '  Claude Code
+────
+❯
+────
+  ? for shortcuts' || fail "plain composer is no longer ready"
+    ! hc_visible '❯ No, exit
+   Yes, I trust this folder
+ Enter to confirm · Esc to cancel' || fail "a selector footer counted as a visible prompt"
+    echo "ok: startup selectors (folder trust, external imports, Codex trust) are needs-human, named, and never auto-answered"
 }
 
 test_health_check_detects_startup_exit() {
@@ -11173,6 +11269,20 @@ if [[ "${CCTRL_TEST_ONLY:-}" == "codex-adapter" ]]; then
     exit 0
 fi
 
+if [[ "${CCTRL_TEST_ONLY:-}" == "health-check" ]]; then
+    test_health_check_patterns_syntax
+    test_health_check_pattern_matching
+    test_health_check_transition_guard
+    test_health_check_needs_human_path
+    test_health_check_timeout_path
+    test_health_check_ready_requires_visible_prompt
+    test_health_check_startup_selectors_need_human
+    test_health_check_detects_startup_exit
+    test_session_pane_has_dialog_refactored
+    echo "ok"
+    exit 0
+fi
+
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-lifecycle" ]]; then
     test_codex_lifecycle_fixture_contract
     test_codex_lifecycle_ingestion
@@ -11186,6 +11296,7 @@ test_health_check_transition_guard
 test_health_check_needs_human_path
 test_health_check_timeout_path
 test_health_check_ready_requires_visible_prompt
+test_health_check_startup_selectors_need_human
 test_health_check_detects_startup_exit
 test_session_wrapper_reports_startup_exit
 test_cctrl_partial_file_fails_before_running
