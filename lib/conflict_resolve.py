@@ -116,14 +116,24 @@ class Evidence:
         return any(task_id in str(p.get("command", "")) for p in self.proc.values())
 
     def codex_app(self, task_id: str) -> str:
-        """claimed | confirmed-absence | unavailable for the App Server source."""
+        """live | not-live | unavailable for the App Server as a writer of the task.
+
+        Mirrors reconcile-codex: `claimed` is an explicit live app owner;
+        `confirmed-absence` and `ambiguous` (the inventory answered but holds no
+        live app-owner fact) mean the app is not writing the task. A failed or
+        missing read is unavailable.
+        """
         if not self.codex_ok:
             return "unavailable"
         row = self.codex.get(task_id)
         sources = row.get("sources") if isinstance(row, dict) and isinstance(row.get("sources"), dict) else {}
         app = sources.get("app_server") if isinstance(sources.get("app_server"), dict) else {}
         status = app.get("status")
-        return status if status in ("claimed", "confirmed-absence") else "unavailable"
+        if status == "claimed":
+            return "live"
+        if status in ("confirmed-absence", "ambiguous"):
+            return "not-live"
+        return "unavailable"
 
 
 def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None]:
@@ -138,18 +148,22 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
         return "skip", "record has no pane anchor", None
     if name not in ev.live_names:
         return "skip", "tmux name is not live; restore territory, not a conflict", None
-    app = ev.codex_app(task_id) if provider == "codex" else "confirmed-absence"
+    if record.get("control_owner") == "app" or record.get("execution_runtime") == "app-server":
+        # Handed off to the app: the provider owns persistence. A leftover
+        # tmux name on such a record is not a terminal claim to settle here.
+        return "skip", "owned by the app; provider-managed", None
+    app = ev.codex_app(task_id) if provider == "codex" else "not-live"
     pane = ev.pane(record)
     if pane is None:
         if ev.argv_mentions(task_id):
             return "skip", "a process still references the task", None
-        if app != "confirmed-absence":
+        if app != "not-live":
             return "skip", f"Codex App Server evidence {app}", None
         return "close", "stale-anchor", None
     running = ev.running_task(pane, provider)
     if running is None:
         return "skip", "cannot prove which task the pane runs", None
-    if app != "confirmed-absence":
+    if app != "not-live":
         return "skip", f"Codex App Server evidence {app}", running
     if running != task_id:
         return "close", f"superseded-by {running}", running

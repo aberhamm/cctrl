@@ -87,12 +87,24 @@ class ConflictResolveTests(unittest.TestCase):
                           self.proc(3339, 3338, f'codex resume --yolo -c x=1 {CODEX_ID}')],
                          codex=evidence)
 
-    def test_codex_live_owner_needs_app_server_confirmed_absence(self):
-        self.assertEqual(self.codex_rows('confirmed-absence')[CODEX_ID]['action'], 'own')
+    def test_codex_live_owner_needs_app_server_evidence_the_app_is_not_writing(self):
+        # Same rule as reconcile-codex: ambiguous = the inventory answered with
+        # no live app-owner fact.
+        for status in ('confirmed-absence', 'ambiguous'):
+            self.assertEqual(self.codex_rows(status)[CODEX_ID]['action'], 'own', status)
         for status in ('unavailable', 'claimed'):
             row = self.codex_rows(status)[CODEX_ID]
             self.assertEqual(row['action'], 'skip', status)
             self.assertIn('App Server', row['reason'])
+
+    def test_app_owned_records_are_never_touched(self):
+        rec = record('01a0bde6-dfca-0000-0000-000000000000', 'TMUX--comet', '%47', '700', provider='codex',
+                     owner=('app', 'app-server', 'active'))
+        evidence = {'records': [{'provider_task_id': rec['provider_task_id'], 'host_id': HOST,
+                                 'sources': {'app_server': {'status': 'confirmed-absence'}}}]}
+        rows = self.plan([rec], [self.pane('TMUX--comet', '%1', 100)], [self.proc(100, 1, 'bash')], codex=evidence)
+        self.assertEqual(rows[rec['provider_task_id']]['action'], 'skip')
+        self.assertIn('owned by the app', rows[rec['provider_task_id']]['reason'])
 
     def test_partial_tmux_inventory_changes_nothing(self):
         rows = self.plan([record('stale-id', 'TMUX--scraper', '%47', '700')],

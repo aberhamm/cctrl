@@ -42,6 +42,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `task resolve-conflicts` never touches tasks owned by the Codex app. It
+  accepts the App Server's `ambiguous` answer (the inventory answered with no
+  live app-owner fact) as "the app is not writing", the same rule
+  `reconcile-codex` uses. Before this it closed app-owned tasks whose old tmux
+  pane was gone, and left live Codex conflicts unresolved even with the App
+  Server running. (plan 070 S5)
 - The post-spawn health check no longer reports "ready" while Claude Code or
   Codex waits on a startup selector. Covered: Claude's folder-trust and
   external CLAUDE.md import dialogs, Codex's directory trust dialog, and any
