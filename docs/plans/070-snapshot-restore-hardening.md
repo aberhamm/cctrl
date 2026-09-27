@@ -63,13 +63,19 @@ This plan fixes the capture, records intentional ends, stops new conflicts from 
 - [ ] **S3.** The planner already treats `closed` as not restorable.
 - [ ] **S3.** A new `cctrl session mark-closed <tmux-name> [--apply] [--json]`, dry-run by default, closes records for a name that has no live tmux session. It exists to backfill sessions killed before this change. It refuses when a live session holds the name or the tmux inventory is incomplete.
 - [ ] **S4.** A cctrl relaunch of a task whose record is owned by the app no longer merges into `conflict`. The relaunch registers as a digest-guarded ownership change back to `cctrl/tmux`, recorded as `reclaim-from-app` evidence. A real simultaneous writer is still caught, as `conflict`, by the existing reconcile rule (app live and tmux live).
-- [ ] **S4.** When a pane's conversation changes, the anchor is removed from the other records that claim the same pane. A pane changes conversation when it is resumed or relaunched with a different id.
+- [ ] ~~**S4.** When a pane's conversation changes, the anchor is removed from the other records that claim the same pane.~~ **Struck 2026-09-27 (Matthew, D5).** Two things cover it instead:
+  - The leak that created shared anchors is fixed: an anchor receipt never promotes a legacy record.
+  - `task resolve-conflicts` settles leftover duplicates with live evidence (`superseded-by`).
+
+  Releasing anchors in the registry reducer would mean cross-record writes with no live evidence.
 - [ ] **S5.** `cctrl task resolve-conflicts [--apply] [--json]`, dry-run by default, gathers one complete tmux inventory, the process table, the Claude session files and the Codex App Server evidence, each with a cursor. For each record in conflict, or with a contradictory or stale tmux link:
   - The anchored pane is missing from a complete inventory, no process or session file claims the task, and (for Codex) the app is confirmed not live → `closed`, reason `stale-anchor`, and the tmux claim is released.
   - The pane exists but its agent runs a different conversation → `closed`, reason `superseded-by <id>`.
   - The pane runs exactly this task, and (for Codex) the app is confirmed not live → `cctrl/tmux/active`.
   - Anything else → unchanged, with the reason printed.
-- [ ] **S5.** Every write carries the `expected_record_digest` read with the evidence. Before writing, the command checks the source cursors again and rejects the change if they moved.
+- [ ] **S5.** Every write carries the `expected_record_digest` read with the evidence. `--apply` then collects the evidence again and writes only the actions the fresh pass decides identically for the same record digest. This replaced checking the source cursors again: the process-table cursor changes on every process start, so no write could ever pass.
+- [ ] **S5 (D6, Matthew 2026-09-27).** Closing a Codex record needs App Server `confirmed-absence`. `ambiguous` (the inventory answered with no live app-owner fact) is enough to hand a live pane back to cctrl, the same rule as reconcile-codex, but never enough to close.
+- [ ] **S5.** A record is never closed while its conversation runs anywhere. That covers any command line mentioning it and any live Claude session file with its id.
 - [ ] Every step has focused regression tests and passes the relevant groups before its commit. Each step is its own commit on main, with a CHANGELOG entry. Nothing is pushed.
 
 ## Tasks
@@ -77,7 +83,7 @@ This plan fixes the capture, records intentional ends, stops new conflicts from 
 1. **S1: capture row selection and the `already-live` label.** Touches `lib/snapshot_restore.py` (`capture`, `action_for`) and `tests/run-tests.sh` (snapshot group).
 2. **S2: snapshot size.** Slim rows, history only on change, retention caps, size guard. Touches `lib/snapshot_restore.py`, `cctrl` (`_session_snapshot`, `_snapshot_retention_prune`), tests and README.
 3. **S3: record intentional ends.** `closed` on kill, close and stop-exact, plus `session mark-closed`. Touches `cctrl`, tests, README and help text.
-4. **S4: stop new conflicts.** Reclaim-from-app rule in the registry merge, anchor release on conversation change. Touches the `cctrl` registry reducer and merge, and tests.
+4. **S4: stop new conflicts.** Reclaim-from-app rule in the registry merge. Anchor receipts never promote legacy records. Anchor release was struck (D5). Touches the `cctrl` registry reducer and merge, and tests.
 5. **S5: `task resolve-conflicts`.** Evidence gathering, rules, digest-guarded apply. Touches `cctrl`, a new lib helper if needed, tests and README.
 6. **Operational steps.** Not code; each needs Matthew's OK in chat.
    - Backfill with `session mark-closed` for mcp, mcp--2, portal and obsidian: dry run first, then apply.
@@ -123,6 +129,22 @@ Still open:
 - The 3 live Codex conflicts, plus 95ce and the other Codex rows, need the Codex App Server: its control socket is missing. Open the Codex desktop app, then run `cctrl task resolve-conflicts` (dry run) and `--apply`.
 - Watch the timer for a day, then move it to 300 s.
 - The focused `CCTRL_TEST_ONLY=codex-ownership-matrix` group already failed at 4f353cb. The full suite runs the same contract and passes.
+
+## Review Follow-up (2026-09-27)
+
+Fixes for the 2026-09-25 eng review (`changes-requested`), each a separate commit on main:
+
+| Finding | Commit | What changed |
+|---|---|---|
+| Follow-up [P2, critical gap], D7 | `08fd052` | A capture with no live session never replaces a `latest.json` that had live sessions (post-reboot guard); `--allow-empty` overrides. |
+| D6 | `cb67013` | Closing a Codex record needs App Server `confirmed-absence`. |
+| P1 | `d639f46` | For a tmux name that is not live, an ended record never hides the open one, and several open claims are `ambiguous-tmux-claim`. |
+| P2 (S3 kill result) | `76a132b` | kill and close record `closed` only after the kill succeeds. A delayed close records via a detached waiter once the exact session id is gone. |
+| P3 (unanchored sessions) | `76a132b` | Unanchored leftovers get a `mark-closed` hint. |
+| P2 (S5 session files) | `fd836eb` | No close while a command line or a live Claude session file shows the task. |
+| P3 (retention) | `dfe3450` | Age retention never prunes the newest history file. |
+| P2 (S4 anchor release) | — | Struck with a reason (D5). |
+| P3 (cursor re-check) | — | The requirement text now describes the re-decide-and-compare-digest apply. |
 
 ## GSTACK REVIEW REPORT
 
