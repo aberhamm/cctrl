@@ -1,7 +1,8 @@
 ---
 id: 073
 title: Dimmed prompt suggestions are not unsent drafts
-status: in-progress
+status: done
+completed: 2026-09-27
 blocked-by: []
 priority: 73
 allows-migrations: false
@@ -11,7 +12,7 @@ created: 2026-09-27
 tui-fixture: required  # tests replay the exact escaped composer bytes Claude Code draws
 approved-by: matthew (chat, 2026-09-27): queued after the plan 070 re-review fixes
 reviews:
-  - type=eng verdict=changes-requested date=2026-09-27 by=mstack-review
+  - type=eng verdict=approved date=2026-09-27 by=mstack-review
 ---
 
 ## Plain-English Summary
@@ -42,28 +43,23 @@ Claude Code draws a predicted next prompt as dimmed "ghost text" in an empty com
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open | 6 issues (1 P2, 5 P3), 0 critical gaps |
-| Outside voice | Claude subagent | Independent 2nd opinion | 1 | issues_found | 1 new P3 folded in, 1 claim disproved |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | clean | Run 2: required items fixed; 2 new P3s, 0 critical gaps |
 
-Reviewed on 2026-09-27: plan 073 and commit c7c134e (`lib/pane_draft.pl`, `_session_pane_has_draft` / `_strip_sgr` at `cctrl:9484-9503`, callers at `cctrl:9555-9563` and `cctrl:11878-11884`). These pass with `LANG=en_US.UTF-8`: `CCTRL_TEST_ONLY=pane-draft`, `session-stop-exact`, `health-check` and `snapshot-ownership`, plus `python3 -m unittest discover -s tests -p 'test_*.py'` (97 tests).
+Re-review on 2026-09-27 of fix commit e1c2451 against the run-1 findings (commit c7c134e), scoped by the fleet manager's call scope-fm0927. These pass with `LANG=en_US.UTF-8`: `CCTRL_TEST_ONLY=pane-draft`, `session-stop-exact` and `health-check`, plus `python3 -m unittest discover -s tests -p 'test_*.py'` (97 tests). `perl -c lib/pane_draft.pl`, `bash -n cctrl` and `bash -n tests/run-tests.sh` are clean.
 
-Checked and correct. Each was run through `lib/pane_draft.pl`, and the tmux behaviour was checked against real tmux 3.7c on a private socket:
-- SGR forms: `\e[22m`, `\e[2;38;5;246m`, `\e[m`, `\e[1;2m` then `\e[22m`, and the split form tmux emits (`\e[2m\e[38;5;246m`). The extended-colour skip keeps `38;5;2` and `38;2;2;2;2` from reading as dim.
-- A composer inside a box border (`│ ❯ … │`): typed text counts, ghost text doesn't, an empty box doesn't. The reverse-video cursor is handled, and so is a `❯ yes` transcript line above an empty composer.
-- SGR state across lines: tmux 3.7c closes each line with `\e[0m` and sets attributes again at the start of the next, so resetting per line (`pane_draft.pl:18`) is correct.
-- Non-Claude panes: the draft detector only runs for a Claude idle base (rich state) or a Claude pane (autoheal), and Codex's `›` glyph never matches.
+Required items:
+- **[P2] Hint anchoring: fixed.** `lib/pane_draft.pl:16` anchors the placeholder to the start of the composer text (`^…[>❯]…(?:Try "|\? for shortcuts|esc to …)`), and `:53` applies it per line. Probed: `❯ check lib/ for the retry bug` gives 0 (draft), `│ ❯ Try "fix the parser" │` gives 1, and the fixtures `pane-empty-hint.txt` / `pane-ghost-suggestion.txt` still read as empty. The footer hints (`/ for commands`, `for newline`) are on non-glyph lines, so dropping them from the pattern is safe. Tests are at `tests/run-tests.sh:2335-2338`.
+- **[P3] rc > 1 means unverifiable, and autoheal fails closed: fixed.** `cctrl:9499` sends perl's stderr to `/dev/null` and documents 0/1/other. `cctrl:11885-11895` maps rc ∉ {0,1} to `skipped / unverifiable-input`. Rich state (`cctrl:9565`) falls through to the base and transcript states on rc > 1, which is the intended "keep the base". Tests: `tests/run-tests.sh:2345-2347` (missing script gives rc > 1) and the broken-`perl` autoheal case in `test_session_autoheal_skips_glyph_draft` (no repair sent).
+- **[P3] Colon SGR and OSC ended by ST: fixed in the detector.** `pane_draft.pl:24,28` accepts `[0-9;:]*` and keeps the first `:` sub-field. `:42` matches CSI with intermediates and OSC `…(?:\a|\e\\)`. Probed: `\e[2;4:3m` ghost gives 1, `\e[4:3m` and `\e[38:2::2:2:2m` typed text give 0, OSC 8 links (ST, BEL, unterminated) followed by an empty composer give 1. `_strip_sgr` (`cctrl:9502-9505`, dialog detector only) is unchanged. That is filed as 075's shared-escape-regex item.
 
-Findings:
-- **[P2] (confidence 8/10) `lib/pane_draft.pl:14,50`: the hint filter drops real drafts.** Verified. `if ($visible =~ $hint) { $found = 0; next }` matches anywhere in the line. So a typed draft such as `❯ check lib/ for the retry bug` (it contains `/ for`), or one containing `for commands` or `Try "`, reads as no draft. Autoheal then runs `_session_repair_bridge`, which sends `C-u` (`cctrl:10986`) and erases the draft. This behaviour predates the plan (the old `grep -Eiv` did the same), but it breaks this plan's requirement that "plain text with no dim at all" is still a draft. Now that the capture has escapes, the fix is small. **Fix:** check the hint only at the start of the typed text, e.g. `$typed =~ /^[\s\x{00A0}]*(?:Try "|\? for shortcuts|esc to (?:interrupt|cancel))/`. The dim placeholders are already excluded by their attribute, and a placeholder in a plain capture is still caught. Add tests where `❯ check lib/ for the retry bug` and `❯ list the for commands flags` are drafts and `❯ Try "…"` (plain) is not.
-- **[P3] (7/10) `cctrl:9497`: a perl failure reads as "no draft".** `printf '%s\n' "$capture" | perl "$SCRIPT_DIR/lib/pane_draft.pl"` exits 2 when the script is missing or fails to compile, and callers treat any non-zero as "empty composer". That fails open on autoheal's safety gate. Perl's warnings (for example on invalid UTF-8) also reach `session ls` stderr. **Fix:** capture rc. In autoheal, rc > 1 gives `skipped / unverifiable-input`. In rich state, rc > 1 keeps the base state. Send perl's stderr to `/dev/null`.
-- **[P3] (9/10) `lib/pane_draft.pl:22,39` and `cctrl:9502`: two escape forms that real tmux 3.7c emits are not parsed.** Verified: tmux writes `\e[4:3m` (curly underline) and `\e[5:3m` (overline) with colons, and OSC 8 links end in ST (`\e]8;;url\e\\`), not BEL. `[0-9;]*` and `\][^\a]*\a` miss both, so `\e.` removes only two bytes and the rest (`4:3m`, the URL) becomes visible text. A ghost drawn as `\e[2;4:3m` reads as a draft (verified, exit 0). **Fix:** accept `[0-9;:]*` and use the first `:` sub-field of each `;` parameter. Match OSC as `\e\].*?(?:\a|\e\\)`. Keep one escape regex that `pane_draft.pl` and `_strip_sgr` both use (DRY).
-- **[P3] (8/10) `lib/pane_draft.pl:49-52`: only the glyph line is judged.** Verified: a multi-line draft whose first composer line is empty (the text is on a continuation line) reads as no draft, and so does a draft that is only `>` or `|`. This predates the plan. **Fix:** after the last prompt line, also count non-dim text on the following lines up to the composer's bottom border (`─`), and stop removing a leading `>`/`|` from `$typed`, which never contains the glyph.
-- **[P3] (5/10, medium confidence: check whether this is real) the pasted-text placeholder.** If Claude Code draws `[Pasted text #1 +N lines]` dim, a draft made only of pasted text would now read as empty. **Fix:** check against a live escaped capture, and if needed add it to the fixture as a draft.
-- **[P3] (outside voice, 6/10) `lib/pane_draft.pl:54`: exit 1 has two meanings.** `exit($found ? 0 : 1)` returns 1 both for "empty composer seen" and for "no composer line at all". The second covers bash mode `!`, memory mode `#`, a shell prompt left by a crashed Claude, a pager, or the transcript view. Autoheal treats 1 as eligible and sends `C-u` and `/rc`. **Fix:** return a third code (e.g. 3) for "no composer in the last ~8 lines", which autoheal maps to `unverifiable-input`. Accept `!` and `#` as composer glyphs.
-- Outside voice, disproved: it said SGR state carries across lines in `capture-pane -e`. On tmux 3.7c it does not (see above).
+`set -e` / `pipefail` audit of the new bash: `draft_rc=0; _session_pane_has_draft … || draft_rc=$?` and the `(( ))` tests inside `if`/`elif` cannot abort. The `printf | perl 2>/dev/null` pipeline is only called in `||` / `&&` / `if` context. No new abort path.
 
-Performance: one `perl` per Claude session per `session ls`, plus one more for `_strip_sgr` when dialog detection is on. That is comparable to the two `grep`s it replaces, so no concern.
+Deferred items are filed accurately in 075: multi-line drafts, exit code 3 for "no composer", the pasted-text placeholder, and one shared escape regex.
 
-VERDICT: ENG NOT CLEARED: changes requested (1 P2). Required before approval: the P2 hint fix and its tests. The P3s can follow separately. eng review required
+New findings (P3, not blocking; not yet in 075):
+- **[P3] (7/10) `lib/pane_draft.pl:16,53`: a typed draft that starts with placeholder text is still read as empty.** Probed: `❯ Try "foo" as the new name`, `❯ ? for shortcuts, what does ctrl-r do` and `❯ esc to cancel the job please` all give 1. This predates the plan and is now much narrower (start of text only). Both production callers now pass an escaped capture, in which a real placeholder is dim and already excluded. **Fix:** apply `$hint` only when the line carries no SGR at all, i.e. a plain capture.
+- **[P3] (9/10) `tests/run-tests.sh`: e1c2451 dropped the executable bit (100755 → 100644).** `./tests/run-tests.sh` now fails with "permission denied". Every documented invocation uses `bash tests/run-tests.sh`, so nothing breaks today. **Fix:** `git update-index --chmod=+x tests/run-tests.sh`.
+
+VERDICT: ENG CLEARED. The P2 and the scoped P3s are verified with tests, with no regressions in the gate. The remaining P3s are in 075, and the two new ones above can join it.
 
 NO UNRESOLVED DECISIONS
