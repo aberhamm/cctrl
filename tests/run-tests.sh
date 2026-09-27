@@ -47,13 +47,23 @@ fail() {
     exit 1
 }
 
-# Live Claude sessions' statusline hook rewrites these two files every few
-# seconds (hooks/statusline.sh). They are not written by any code under test,
-# so the "tests did not touch the real live store" guards ignore them.
-live_data_digest() {
-    find "$ROOT/data" -type f ! -name 'rate-limits.json' ! -name 'rate-limits-history.jsonl' \
+# Files the live fleet rewrites while the suite runs; no code under test writes
+# them, so the "tests did not touch the real live store" guards ignore them:
+#   rate-limits*.json(l)  statusline hook of every live Claude session
+#   messages.jsonl        live peer mailbox (other sessions sending messages)
+#   snapshots/latest.json, snapshots/<UTC>Z.json, snapshots/.snapshot-*
+#                         the launchd snapshot timer (every 5 minutes). Only
+#                         these names: `session snapshot` without --dir writes
+#                         the real directory, so every test must pass --dir
+#                         (enforced by test_snapshot_calls_pass_dir).
+live_tree_digest() {
+    find "$1" -type f ! -name 'rate-limits.json' ! -name 'rate-limits-history.jsonl' \
+        ! -name 'messages.jsonl' \
+        ! -path '*/snapshots/latest.json' ! -path '*/snapshots/.snapshot-*' \
+        ! -path '*/snapshots/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.json' \
         -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}'
 }
+live_data_digest() { live_tree_digest "$ROOT/data"; }
 
 ownership_live_store_digest() {
     python3 - "$ROOT/data" "$ROOT/.active-profile" \
@@ -63,6 +73,7 @@ ownership_live_store_digest() {
         "$CCTRL_TEST_REAL_HOME/.claude/settings.json" <<'PY'
 import hashlib
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -81,8 +92,11 @@ for root_arg in sys.argv[1:]:
         continue
     digest.update(b"dir\0")
     for path in sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root))):
-        if path.name in {"rate-limits.json", "rate-limits-history.jsonl"}:
-            continue  # statusline hook output from live sessions; see live_data_digest
+        if path.name in {"rate-limits.json", "rate-limits-history.jsonl", "messages.jsonl"} or (
+                path.parent.name == "snapshots"
+                and (path.name == "latest.json" or path.name.startswith(".snapshot-")
+                     or re.fullmatch(r"\d{8}T\d{6}Z\.json", path.name))):
+            continue  # written by the live fleet, not by tests; see live_tree_digest
         relative = str(path.relative_to(root)).encode()
         if path.is_symlink():
             digest.update(b"link\0" + relative + b"\0" + os.readlink(path).encode() + b"\0")
@@ -6747,6 +6761,17 @@ JSON
     echo "ok: a capture with no live sessions never replaces a latest.json that had them"
 }
 
+test_snapshot_calls_pass_dir() {
+    # `session snapshot` without --dir writes the REAL data/snapshots (it does
+    # not follow CCTRL_DATA_DIR; plan 078), and the live-store guards ignore the
+    # timer's file names there. So every snapshot call in this file must pass
+    # --dir. The pattern is split so this check does not match itself.
+    local pattern="session ""snapshot" offenders
+    offenders="$(grep -n "$pattern" "$ROOT/tests/run-tests.sh" | grep -v -- '--dir' || true)"
+    [[ -z "$offenders" ]] || fail "session snapshot calls without --dir would write the real store: $offenders"
+    echo "ok: every session snapshot call in the tests passes --dir"
+}
+
 test_snapshot_ownership_policy() {
     local root="$TMPDIR/snapshot-ownership" data="$TMPDIR/snapshot-ownership/data"
     local snapshots="$TMPDIR/snapshot-ownership/snapshots" host="0123456789abcdef0123456789abcdef"
@@ -9498,6 +9523,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             exit 0
             ;;
         snapshot-ownership)
+            test_snapshot_calls_pass_dir
             test_snapshot_ownership_policy
             test_snapshot_tmux_row_selection
             test_snapshot_size_controls
@@ -9687,6 +9713,7 @@ test_task_registry_replay_order_and_guards
 test_task_registry_lock_stale_timeout_and_release_token
 test_task_registry_structural_boundary
 test_codex_reconcile_ownership_evidence
+test_snapshot_calls_pass_dir
 test_snapshot_ownership_policy
 test_snapshot_tmux_row_selection
 test_snapshot_size_controls
@@ -11012,7 +11039,7 @@ PY
     assert_contains "$out" "trust/hash: untrusted"
     assert_contains "$out" "trust/hash: unknown — cctrl hooks run notify"
 
-    live_before="$(tree_digest "$ROOT/data")"
+    live_before="$(live_tree_digest "$ROOT/data")"
     local observer="$ROOT/hooks/codex-session-observer.py" payload="$TMPDIR/hooks-061-oversized"
     for body in '' 'null' '[]' '{bad' '{"hook_event_name":"Unknown","session_id":"id"}' \
         '{"hook_event_name":"SessionStart"}' '{"hook_event_name":"SessionStart","session_id":"fixture-id"}'; do
@@ -11031,7 +11058,7 @@ rc=p.wait(timeout=4)
 assert rc == 0
 assert time.monotonic()-started < 3.5
 PY
-    live_after="$(tree_digest "$ROOT/data")"
+    live_after="$(live_tree_digest "$ROOT/data")"
     [[ "$live_before" == "$live_after" ]] || fail "isolated observer test changed the real cctrl live store"
 
     real_hooks_after="$(file_digest "$HOME/.codex/hooks.json")"
@@ -11259,9 +11286,7 @@ test_codex_handoff_state_machine() {
     local proc_snapshot="$TMPDIR/codex-handoff/process.json" tmux_absent="$TMPDIR/codex-handoff/tmux-absent.json"
     local proc_absent="$TMPDIR/codex-handoff/process-absent.json" state="$TMPDIR/codex-handoff/tmux-live" proc="$TMPDIR/codex-handoff/process-live"
     local host="77777777777777777777777777777777" started="Wed Sep 17 10:00:00 2026" out rc=0 record before after
-    handoff_tree_digest() {
-        find "$1" -type f -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}'
-    }
+    handoff_tree_digest() { live_tree_digest "$1"; }
     rm -rf "$root"; mkdir -p "$bin" "$data" "$meta" "$codex_home/thread-writer-locks" "$backup"
     printf '%s\n' "$host" > "$data/host-id"
     cat > "$bin/tmux" <<'SH'
