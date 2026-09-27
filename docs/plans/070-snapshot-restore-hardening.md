@@ -1,7 +1,8 @@
 ---
 id: 070
 title: Harden snapshot size, closed sessions, and restore conflicts
-status: in-progress
+status: done
+completed: 2026-09-27
 blocked-by: []
 priority: 70
 allows-migrations: false
@@ -11,7 +12,7 @@ created: 2026-09-24
 tui-fixture: n/a  # snapshot/restore tests use fixture catalogues, fake tmux, and temp registries
 approved-by: matthew (chat, 2026-09-24): implement steps 1-5; live --apply and loading the timer need a separate OK
 reviews:
-  - type=eng verdict=changes-requested date=2026-09-25 by=mstack-review
+  - type=eng verdict=approved date=2026-09-27 by=mstack-review
 ---
 
 ## Plain-English Summary
@@ -49,34 +50,34 @@ This plan fixes the capture, records intentional ends, stops new conflicts from 
 
 **Acceptance criteria:**
 
-- [ ] **S1.** When several catalogue rows claim one tmux name, capture picks the one whose `provider_task_id` equals that session's live `session_id` from `session ls --json`. If there is no live id and exactly one row, it takes that row. If several rows remain and none matches, the snapshot row is marked `unknown`, reason `ambiguous-tmux-claim`, and is never restorable.
-- [ ] **S1.** The rows it doesn't pick are listed on the chosen row as `shadowed_task_ids`, so the evidence isn't silently dropped.
-- [ ] **S1.** `action_for` returns `already-live` only when `live` is true.
-- [ ] **S2 (slim).** `display_label` and `purpose` are capped at 200 characters. When a label is cut, a `display_label_sha256` of the full text is added.
-- [ ] **S2 (slim).** Rows the planner can never act on are summarised in `omitted_task_references`, as a count per provider/state. These are rows not registered or launched by cctrl, with no tmux name, and with unknown owner and runtime.
-- [ ] **S2 (slim).** The empty-catalogue guard counts the full catalogue (`catalogue_task_count`), not only the rows kept.
-- [ ] **S2 (history on change).** Each snapshot carries `content_digest`, a sha256 over only the fields restore uses. Timestamps, activity, byte counts and resource data are left out. `latest.json` is always rewritten. A history file is written only when the digest differs from the newest history file.
-- [ ] **S2 (retention).** On top of the age rules, history is capped by count (`CCTRL_SNAPSHOT_HISTORY_MAX`, default 200) and by bytes (`CCTRL_SNAPSHOT_HISTORY_MAX_BYTES`, default 100 MB). The newest history file and `latest.json` are never removed.
-- [ ] **S2 (size guard).** A capture larger than `CCTRL_SNAPSHOT_MAX_BYTES` (default 5 MB) is refused with exit 69, and the existing latest and history files are kept.
-- [ ] **S3.** `session kill`, `session close` and `session stop-exact` write a digest-guarded `closed` transition (source `cctrl-terminate`, authoritative). It goes to every registry record anchored to the killed pane, and is written only after the kill succeeds.
-- [ ] **S3.** `kill --keep-restorable` skips that write.
-- [ ] **S3.** The planner already treats `closed` as not restorable.
-- [ ] **S3.** A new `cctrl session mark-closed <tmux-name> [--apply] [--json]`, dry-run by default, closes records for a name that has no live tmux session. It exists to backfill sessions killed before this change. It refuses when a live session holds the name or the tmux inventory is incomplete.
-- [ ] **S4.** A cctrl relaunch of a task whose record is owned by the app no longer merges into `conflict`. The relaunch registers as a digest-guarded ownership change back to `cctrl/tmux`, recorded as `reclaim-from-app` evidence. A real simultaneous writer is still caught, as `conflict`, by the existing reconcile rule (app live and tmux live).
+- [x] **S1.** When several catalogue rows claim one tmux name, capture picks the one whose `provider_task_id` equals that session's live `session_id` from `session ls --json`. If there is no live id and exactly one row, it takes that row. If several rows remain and none matches, the snapshot row is marked `unknown`, reason `ambiguous-tmux-claim`, and is never restorable.
+- [x] **S1.** The rows it doesn't pick are listed on the chosen row as `shadowed_task_ids`, so the evidence isn't silently dropped.
+- [x] **S1.** `action_for` returns `already-live` only when `live` is true.
+- [x] **S2 (slim).** `display_label` and `purpose` are capped at 200 characters. When a label is cut, a `display_label_sha256` of the full text is added.
+- [x] **S2 (slim).** Rows the planner can never act on are summarised in `omitted_task_references`, as a count per provider/state. These are rows not registered or launched by cctrl, with no tmux name, and with unknown owner and runtime.
+- [x] **S2 (slim).** The empty-catalogue guard counts the full catalogue (`catalogue_task_count`), not only the rows kept.
+- [x] **S2 (history on change).** Each snapshot carries `content_digest`, a sha256 over only the fields restore uses. Timestamps, activity, byte counts and resource data are left out. `latest.json` is always rewritten. A history file is written only when the digest differs from the newest history file.
+- [x] **S2 (retention).** On top of the age rules, history is capped by count (`CCTRL_SNAPSHOT_HISTORY_MAX`, default 200) and by bytes (`CCTRL_SNAPSHOT_HISTORY_MAX_BYTES`, default 100 MB). The newest history file and `latest.json` are never removed.
+- [x] **S2 (size guard).** A capture larger than `CCTRL_SNAPSHOT_MAX_BYTES` (default 5 MB) is refused with exit 69, and the existing latest and history files are kept.
+- [x] **S3.** `session kill`, `session close` and `session stop-exact` write a digest-guarded `closed` transition (source `cctrl-terminate`, authoritative). It goes to every registry record anchored to the killed pane, and is written only after the kill succeeds.
+- [x] **S3.** `kill --keep-restorable` skips that write.
+- [x] **S3.** The planner already treats `closed` as not restorable.
+- [x] **S3.** A new `cctrl session mark-closed <tmux-name> [--apply] [--json]`, dry-run by default, closes records for a name that has no live tmux session. It exists to backfill sessions killed before this change. It refuses when a live session holds the name or the tmux inventory is incomplete.
+- [x] **S4.** A cctrl relaunch of a task whose record is owned by the app no longer merges into `conflict`. The relaunch registers as a digest-guarded ownership change back to `cctrl/tmux`, recorded as `reclaim-from-app` evidence. A real simultaneous writer is still caught, as `conflict`, by the existing reconcile rule (app live and tmux live).
 - [ ] ~~**S4.** When a pane's conversation changes, the anchor is removed from the other records that claim the same pane.~~ **Struck 2026-09-27 (Matthew, D5).** Two things cover it instead:
   - The leak that created shared anchors is fixed: an anchor receipt never promotes a legacy record.
   - `task resolve-conflicts` settles leftover duplicates with live evidence (`superseded-by`).
 
   Releasing anchors in the registry reducer would mean cross-record writes with no live evidence.
-- [ ] **S5.** `cctrl task resolve-conflicts [--apply] [--json]`, dry-run by default, gathers one complete tmux inventory, the process table, the Claude session files and the Codex App Server evidence, each with a cursor. For each record in conflict, or with a contradictory or stale tmux link:
+- [x] **S5.** `cctrl task resolve-conflicts [--apply] [--json]`, dry-run by default, gathers one complete tmux inventory, the process table, the Claude session files and the Codex App Server evidence, each with a cursor. For each record in conflict, or with a contradictory or stale tmux link:
   - The anchored pane is missing from a complete inventory, no process or session file claims the task, and (for Codex) the app is confirmed not live → `closed`, reason `stale-anchor`, and the tmux claim is released.
   - The pane exists but its agent runs a different conversation → `closed`, reason `superseded-by <id>`.
   - The pane runs exactly this task, and (for Codex) the app is confirmed not live → `cctrl/tmux/active`.
   - Anything else → unchanged, with the reason printed.
-- [ ] **S5.** Every write carries the `expected_record_digest` read with the evidence. `--apply` then collects the evidence again and writes only the actions the fresh pass decides identically for the same record digest. This replaced checking the source cursors again: the process-table cursor changes on every process start, so no write could ever pass.
-- [ ] **S5 (D6, Matthew 2026-09-27).** Closing a Codex record needs App Server `confirmed-absence`. `ambiguous` (the inventory answered with no live app-owner fact) is enough to hand a live pane back to cctrl, the same rule as reconcile-codex, but never enough to close.
-- [ ] **S5.** A record is never closed while its conversation runs anywhere. That covers any command line mentioning it and any live Claude session file with its id.
-- [ ] Every step has focused regression tests and passes the relevant groups before its commit. Each step is its own commit on main, with a CHANGELOG entry. Nothing is pushed.
+- [x] **S5.** Every write carries the `expected_record_digest` read with the evidence. `--apply` then collects the evidence again and writes only the actions the fresh pass decides identically for the same record digest. This replaced checking the source cursors again: the process-table cursor changes on every process start, so no write could ever pass.
+- [x] **S5 (D6, Matthew 2026-09-27).** Closing a Codex record needs App Server `confirmed-absence`. `ambiguous` (the inventory answered with no live app-owner fact) is enough to hand a live pane back to cctrl, the same rule as reconcile-codex, but never enough to close.
+- [x] **S5.** A record is never closed while its conversation runs anywhere. That covers any command line mentioning it and any live Claude session file with its id.
+- [x] Every step has focused regression tests and passes the relevant groups before its commit. Each step is its own commit on main, with a CHANGELOG entry. Nothing is pushed.
 
 ## Tasks
 
@@ -150,26 +151,30 @@ Fixes for the 2026-09-25 eng review (`changes-requested`), each a separate commi
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CHANGES REQUESTED | 9 issues, 1 critical gap |
-| Outside voice | Claude subagent (Codex out of credits) | Independent 2nd opinion | 1 | issues_found | 12 findings; 8 confirmed in code |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | CLEAR | Re-review: 9 prior findings closed, 0 critical gaps, 4 new P3 follow-ups |
+| Outside voice | Claude subagent (Codex out of credits) | Independent 2nd opinion | 1 | issues_found | 2026-09-25 run; its confirmed findings are in the table below |
 
-Reviewed on 2026-09-25, at bd95d5b: the plan, plus commits 4fd3ac7, c9216ea, cccb5e8, 1a0f922, 015cfc3, 291c3ea and 27fb1db. These focused groups pass: `snapshot-ownership`, `session-stop-exact`, `task-records`, `task-record-list` and `codex-reconcile`. So do the unittests `test_conflict_resolve`, `test_restore_revalidation` and `test_tmux_snapshot`.
+Re-reviewed on 2026-09-27 at afa62bd. Checked the fix commits 08fd052, cb67013, d639f46, 76a132b, fd836eb, dfe3450 and afa62bd with `git show` and the current code. D5, D6 and D7 are Matthew's decisions and were not reopened. These focused groups pass with `LANG=en_US.UTF-8`: `snapshot-ownership`, `session-stop-exact`, `task-records` and `health-check`. So does `python3 -m unittest tests.test_conflict_resolve tests.test_restore_revalidation tests.test_tmux_snapshot` (18 tests). `bash -n cctrl` is clean, and shellcheck reports 19 warnings both at 4232663 and now, so the fixes add none. The full suite is run separately. `codex-ownership-matrix` already failed on its own at 4f353cb, before these fixes.
 
-Fixes needed before `done`:
-- **[P1] S1, dead tmux names** (`lib/snapshot_restore.py:283`). For a name with no live session, the second loop keeps the first catalogue row and silently drops the rest. It sets no `shadowed_task_ids` and no `ambiguous-tmux-claim`. After a reboot, a closed or superseded row can hide the active one. That is the case restore exists for.
-- **[P2] S3, `closed` written without checking the kill** (`cctrl:12302-12303`, `cctrl:12550-12551`, `cctrl:12563-12564`). `tmux kill-session` failures are ignored, and the grace path in `session close` (`cctrl:12555-12556`) records `closed` before the deferred kill runs. The plan says "written only after the kill succeeds". A kill that fails leaves a live conversation recorded closed, and restore will then skip it.
-- **[P2] S4, anchor release is not implemented.** The code blocks legacy promotion on anchor receipts (`cctrl:2695`). It never removes `pane_id`/`pane_pid` from the other schema-2 records that claim the pane. Either implement it or amend the requirement, with the reason.
-- **[P2] S5, stale-anchor skips the session-file check** (`lib/conflict_resolve.py`, `evaluate`). The code checks argv only. The plan says "no process or session file claims the task". A Claude conversation resumed in another pane with `/resume` has no id in argv, so its record would be closed.
-- **[P2] S5 / 291c3ea: App Server `ambiguous` counts as not-live when closing a gone pane.** For the same inputs, reconcile-codex yields owner `unknown`, not a close (`cctrl:8121-8122`). Keep `ambiguous` as not-live for `own` and `superseded-by` only, or check it against live App Server data before the next `--apply`.
+Status of the 2026-09-25 findings:
+- **[P1] S1, tmux names that are not live: fixed** (d639f46, `lib/snapshot_restore.py:283-344`). Ended records (`closed`/`archived`/`released`) no longer claim a name. When several open records claim a name, the row is `unknown` with the reason `ambiguous-tmux-claim` and lists `shadowed_task_ids`. Catalogue order no longer decides anything. Every row with a tmux name is actionable, so the omitted-rows path can't drop the evidence. Tested in `test_snapshot_tmux_row_selection`.
+- **[P2] S3, kill result: fixed** (76a132b). kill and close return 1 and write nothing when `tmux kill-session` fails. stop-exact already gated its write on the guarded kill. A delayed close records from a detached `nohup` waiter only once the exact `$N` session id is gone, giving up after grace plus 30 s. Tested with a failing kill and a 2 s delayed close.
+- **[P2] S4, anchor release: struck** with a reason (D5, afa62bd).
+- **[P2] S5, session files: fixed** (fd836eb). Both close paths (`stale-anchor` and `superseded-by`) skip a task when a command line or a live Claude session file shows it. Tested with the `/resume` fixture.
+- **[P2] S5 / 291c3ea, `ambiguous` App Server evidence: fixed per D6** (cb67013). Closing needs `confirmed-absence`. `ambiguous` is still enough for `own`. The unittest covers `confirmed-absence`, `ambiguous` and `unavailable`.
+- **[P2, critical gap] reboot capture replacing `latest.json`: fixed per D7** (08fd052, `cctrl:11523-11540`). A capture with no live session goes to history only, and `--allow-empty` overrides. If jq fails, the count reads as 0, so the guard errs toward keeping the old `latest.json`.
+- **[P3] age retention: fixed** (dfe3450).
+- **[P3] unanchored sessions: fixed** (76a132b). A kill or close that finds no anchored record now prints a `mark-closed` hint.
+- **[P3] cursor re-check wording: fixed** (afa62bd).
 
-Follow-ups (not blocking):
-- **[P2, critical gap]** The first timer capture after a power cycle replaces `latest.json`. That capture has only registry rows (`launch_flags:{}`, nothing live). The empty-fleet guard (`cctrl:11492`) never trips, because the registry survives the reboot. The problem predates this plan, but the timer is now loaded. Restore defaults to `latest.json` (`cctrl:11551`). Guard it: skip or refuse to replace `latest.json` when the capture has zero live sessions and the current `latest.json` has some.
-- **[P3]** `_snapshot_retention_prune_age` can delete the newest history file, because history is now written only on change. It heals itself on the next run.
-- **[P3]** kill and close only close records that carry an anchor. When no record matches they print nothing, so pre-anchor sessions still come back on restore.
-- **[P3]** `--apply` re-runs the decision rather than re-checking source cursors. That is acceptable, but the plan text should say so.
+Tests: every fix commit adds a focused regression test and a CHANGELOG entry. Performance: nothing to worry about. The fixes add one `jq` count over a `latest.json` of about 110 KB per capture, one cached read of each live Claude session file per resolve pass, and one 1 Hz waiter that only runs during a delayed close.
 
-VERDICT: ENG CHANGES REQUESTED. Fix the P1 and the P2s, then re-run `/plan-eng-review`.
+Follow-ups (P3, not blocking; none of them is a regression that closes or loses a live conversation):
+- **Delayed-close waiter while a Claude pane closes itself** (`cctrl:12249-12256`). The waiter is `nohup` plus `&` from the caller's process group. When `session close <self> --in N` runs from a Claude Code Bash tool, the harness may kill that group when the pane dies, and the only test closes from outside the pane. If the waiter dies, the record stays active: restore offers the session again, and `mark-closed` fixes it. To make it robust, append the record step to the `tmux run-shell -b` command so it runs on the tmux server. Also, if `close_session_id` is empty (`cctrl:12610`), nothing is recorded and no warning is printed.
+- **Session-file check fails open** (`lib/conflict_resolve.py:118-138`). A live `claude` process whose `sessions/<pid>.json` can't be read, or a Claude run through `node`, which `agent_of` misses, counts as not running the task. A stricter version would skip Claude closes whenever a live Claude process has no readable session file.
+- **Next to D7, not reopening it** (`lib/snapshot_restore.py:327`). If one session is live before restore runs (for example the new fleet manager), a timer capture can still replace `latest.json`. Its non-live rows then carry `launch_flags:{}`. The history file keeps the good capture. Filling non-live rows with `launch_flags_for(metadata_dir, name)` would remove the cause.
+- **Conservative ambiguity** (`lib/snapshot_restore.py:285-288`). An app-owned open record that still holds a dead tmux name makes a cctrl record with the same name ambiguous, so restore won't offer it. This errs toward safety.
 
-**UNRESOLVED DECISIONS:**
-- Whether S4's anchor release should be implemented or struck from the requirements (Matthew)
-- Whether `ambiguous` App Server evidence may close a gone-pane Codex record (Matthew; 291c3ea chose yes)
+VERDICT: ENG CLEARED. All P1 and P2 findings are fixed or resolved by Matthew's decisions (D5, D6, D7). Plan 070 is done. The operational follow-ups under Implementation Notes (the Codex App Server conflicts, and moving the timer to 300 s) still need Matthew's OK in chat.
+
+NO UNRESOLVED DECISIONS
