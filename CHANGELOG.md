@@ -48,6 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- For a tmux name that is not live, which is the normal state after a reboot,
+  `session snapshot` no longer lets catalogue order decide which record
+  represents it. An ended record never hides the open one. Several open
+  records claiming the name make the row `ambiguous-tmux-claim` (not
+  restorable), with the others listed in `shadowed_task_ids`. (plan 070 review P1)
 - `task resolve-conflicts` closes a Codex record only when the App Server
   confirms the app is not running that task (`confirmed-absence`). An
   `ambiguous` answer is still enough to hand a live pane back to cctrl, the

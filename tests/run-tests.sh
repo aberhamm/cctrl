@@ -6353,7 +6353,9 @@ JSON
 {"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
  $(row stale-1 TMUX--pick false), $(row live-1 TMUX--pick false),
  $(row old-a TMUX--mismatch false), $(row old-b TMUX--noid false), $(row old-c TMUX--noid false),
- $(row gone-1 TMUX--gone false)
+ $(row gone-1 TMUX--gone false),
+ $(row ended-1 TMUX--dead1 false | jq -c '.lifecycle_state="closed" | .control_owner="unknown" | .execution_runtime="unknown"'), $(row active-1 TMUX--dead1 false),
+ $(row open-a TMUX--dead2 false), $(row open-b TMUX--dead2 false)
 ]}
 JSON
     cat > "$root/sessions.json" <<'JSON'
@@ -6381,7 +6383,18 @@ JSON
     jq -e '[.tasks[] | select(.provider_task_id=="gone-1")] | length==1 and .[0].live==false
            and .[0].recovery_action=="insufficient-evidence"' <<< "$out" >/dev/null \
       || fail "a dead cctrl/tmux/active record was labelled already-live: $out"
-    echo "ok: snapshot picks the live row per tmux name and only labels live rows already-live"
+    # Names that are not live (after a reboot): an ended record never hides the
+    # open one, and several open claims are ambiguous, never catalogue order.
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--dead1" and .provider_task_id=="active-1")] | length==1
+           and .[0].control_owner=="cctrl" and .[0].recovery_action=="insufficient-evidence"' <<< "$out" >/dev/null \
+      || fail "a closed record hid the open record of a dead tmux name: $out"
+    jq -e 'any(.tasks[]; .provider_task_id=="ended-1" and .lifecycle_state=="closed")' <<< "$out" >/dev/null \
+      || fail "the ended record of a dead tmux name was dropped"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--dead2")] | length==1 and .[0].provider_task_id=="open-a"
+           and .[0].control_owner=="unknown" and (.[0].recovery_reason|startswith("ambiguous-tmux-claim"))
+           and .[0].shadowed_task_ids==["open-b"]' <<< "$out" >/dev/null \
+      || fail "several open claims on a dead tmux name were not ambiguous: $out"
+    echo "ok: snapshot picks the live row per tmux name, never lets catalogue order decide a dead name, and only labels live rows already-live"
 }
 
 test_snapshot_size_controls() {

@@ -23,6 +23,7 @@ VALID_DISPOSITIONS = {
 }
 RESUME_KINDS = {"claude-session-id", "codex-thread-id"}
 RESUMABLE_STATES = {"active", "inactive", "provisional", "resumable"}
+ENDED_STATES = {"closed", "archived", "released"}
 # Codex provider titles are the whole first prompt (pastes included, up to
 # hundreds of KB). A snapshot only needs a readable label plus a hash that
 # identifies the full text.
@@ -273,15 +274,29 @@ def capture(args: argparse.Namespace) -> int:
         tasks.append(row)
 
     # Provider-managed and discovery-only tasks do not necessarily have tmux rows.
+    # Rows whose tmux name is live were settled above (the live session picked
+    # its row). For a name that is not live (the normal state after a reboot)
+    # only open records compete for it: an ended record never hides another,
+    # and several open claims with nothing to tell them apart are ambiguous
+    # rather than decided by catalogue order.
     omitted: dict[str, int] = {}
+    live_names = {t.get("tmux_session") for t in tasks if t.get("tmux_session")}
+    open_claims: dict[str, list[dict[str, Any]]] = {}
+    for source in rows:
+        if isinstance(source, dict) and text(source.get("tmux_session")) and source.get("lifecycle_state") not in ENDED_STATES \
+                and source["tmux_session"] not in live_names:
+            open_claims.setdefault(source["tmux_session"], []).append(source)
     for source in rows:
         if not isinstance(source, dict):
             continue
         provider = text(source.get("provider")) or "unknown"
         task_id = text(source.get("provider_task_id"))
         tmux_name = text(source.get("tmux_session"))
-        if (provider, task_id, tmux_name) in seen or (tmux_name and any(t.get("tmux_session") == tmux_name for t in tasks)):
+        if (provider, task_id, tmux_name) in seen or (tmux_name and tmux_name in live_names):
             continue
+        claims = open_claims.get(tmux_name or "", []) if source.get("lifecycle_state") not in ENDED_STATES else []
+        if len(claims) > 1 and source is not claims[0]:
+            continue  # represented by the first claim's row, listed in its shadowed_task_ids
         strategy = source.get("restore_strategy")
         if strategy == "tmux":
             strategy = "tmux-resume"
@@ -320,7 +335,13 @@ def capture(args: argparse.Namespace) -> int:
             omitted[key] = omitted.get(key, 0) + 1
             continue
         apply_label_bounds(row)
-        row["recovery_action"], row["recovery_reason"] = action_for(row)
+        if len(claims) > 1:
+            row["shadowed_task_ids"] = sorted(text(c.get("provider_task_id")) or "" for c in claims[1:])
+            row["control_owner"] = row["execution_runtime"] = row["lifecycle_state"] = "unknown"
+            row["recovery_action"] = "unknown"
+            row["recovery_reason"] = "ambiguous-tmux-claim: several open records claim a tmux name that is not live"
+        else:
+            row["recovery_action"], row["recovery_reason"] = action_for(row)
         tasks.append(row)
 
     source_status = catalogue.get("source_status") if isinstance(catalogue.get("source_status"), dict) else {}
