@@ -48,6 +48,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `task resolve-conflicts` fails closed when a live Claude process has no
+  readable session file: that process might be running the task, so nothing
+  is closed. Claude Code launched through `node` (npm installs) is recognised
+  as Claude. (plan 070 re-review P3)
 - Snapshot rows for tmux sessions that are not live now carry their
   `launch_flags` too, so a capture taken while restore is only partly done
   still has what restore replays. The metadata index is read once per

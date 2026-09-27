@@ -85,7 +85,19 @@ class ConflictResolveTests(unittest.TestCase):
         self.assertEqual(rows['moved-id']['action'], 'skip')
         self.assertIn('running', rows['moved-id']['reason'])
         self.assertEqual(rows['moved-too']['action'], 'skip')
-        self.assertIn('running elsewhere', rows['moved-too']['reason'])
+        self.assertIn('elsewhere', rows['moved-too']['reason'])
+
+    def test_an_unreadable_claude_session_file_blocks_close(self):
+        # A live Claude process without a readable session file might be
+        # running the task; closing must fail closed. Node-launched Claude counts.
+        for command in ('claude', 'node /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js'):
+            rows = self.plan(
+                [record('maybe-id', 'TMUX--old', '%47', '700')],
+                [self.pane('TMUX--old', '%1', 50)],
+                [self.proc(50, 1, 'bash'), self.proc(600, 1, command)],
+                claude={})
+            self.assertEqual(rows['maybe-id']['action'], 'skip', command)
+            self.assertIn('may be running', rows['maybe-id']['reason'])
 
     def test_pid_reuse_with_a_different_start_time_is_not_the_same_pane(self):
         rows = self.plan([record('old-exec', 'TMUX--x', '%0', '100', started='Mon Sep  1 09:00:00 2026')],

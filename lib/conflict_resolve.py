@@ -49,9 +49,17 @@ def norm(value: Any) -> str:
 
 
 def agent_of(command: str) -> str:
-    first = command.split(None, 1)[0] if command.strip() else ""
-    base = first.rsplit("/", 1)[-1]
-    return base if base in ("claude", "codex") else ""
+    tokens = command.split()
+    if not tokens:
+        return ""
+    base = tokens[0].rsplit("/", 1)[-1]
+    if base in ("claude", "codex"):
+        return base
+    # npm installs run Claude Code as `node .../@anthropic-ai/claude-code/cli.js`.
+    if base in ("node", "bun") and len(tokens) > 1 and (
+            "@anthropic-ai/claude-code" in tokens[1] or tokens[1].rsplit("/", 1)[-1] == "claude"):
+        return "claude"
+    return ""
 
 
 class Evidence:
@@ -115,31 +123,45 @@ class Evidence:
     def argv_mentions(self, task_id: str) -> bool:
         return any(task_id in str(p.get("command", "")) for p in self.proc.values())
 
-    def claude_session_ids(self) -> set[str]:
-        """sessionId of every live Claude process with a session file.
+    def claude_session_ids(self) -> tuple[set[str], int]:
+        """(sessionId of every live Claude process, count of Claude processes without a readable session file).
 
         A conversation resumed with /resume, or relaunched in another pane,
         has no id on its command line; its session file is the only proof it
-        is running.
+        is running. A Claude process whose file can't be read proves nothing
+        either way.
         """
         if not hasattr(self, "_claude_ids"):
             ids: set[str] = set()
-            if self.claude_dir:
-                for pid, proc in self.proc.items():
-                    if agent_of(str(proc.get("command", ""))) != "claude":
-                        continue
+            unreadable = 0
+            for pid, proc in self.proc.items():
+                if agent_of(str(proc.get("command", ""))) != "claude":
+                    continue
+                session = None
+                if self.claude_dir:
                     try:
                         session = json.loads((self.claude_dir / f"{pid}.json").read_text())
                     except Exception:
-                        continue
-                    if isinstance(session, dict) and isinstance(session.get("sessionId"), str):
-                        ids.add(session["sessionId"])
-            self._claude_ids = ids
+                        session = None
+                if isinstance(session, dict) and isinstance(session.get("sessionId"), str) and session["sessionId"]:
+                    ids.add(session["sessionId"])
+                else:
+                    unreadable += 1
+            self._claude_ids = (ids, unreadable)
         return self._claude_ids
 
     def task_running(self, provider: str, task_id: str) -> bool:
-        """Any live process anywhere provably runs the task."""
-        return self.argv_mentions(task_id) or (provider == "claude" and task_id in self.claude_session_ids())
+        """True unless no live process can be running the task (fails closed).
+
+        For Claude, an unreadable session file of any live Claude process
+        means the task might be running there, so closing is not safe.
+        """
+        if self.argv_mentions(task_id):
+            return True
+        if provider == "claude":
+            ids, unreadable = self.claude_session_ids()
+            return task_id in ids or unreadable > 0
+        return False
 
     def codex_app(self, task_id: str) -> str:
         """App Server evidence for the task: claimed | confirmed-absence | ambiguous | unavailable.
@@ -179,7 +201,7 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
     pane = ev.pane(record)
     if pane is None:
         if ev.task_running(provider, task_id):
-            return "skip", "the task is running in another process", None
+            return "skip", "the task may be running in another process", None
         if app != "confirmed-absence":
             return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence", None
         return "close", "stale-anchor", None
@@ -188,7 +210,7 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
         return "skip", "cannot prove which task the pane runs", None
     if running != task_id:
         if ev.task_running(provider, task_id):
-            return "skip", f"pane runs {running}, but the task is running elsewhere", running
+            return "skip", f"pane runs {running}, but the task may be running elsewhere", running
         if app != "confirmed-absence":
             return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence", running
         return "close", f"superseded-by {running}", running
