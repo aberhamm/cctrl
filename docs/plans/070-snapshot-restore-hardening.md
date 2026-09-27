@@ -147,6 +147,20 @@ Fixes for the 2026-09-25 eng review (`changes-requested`), each a separate commi
 | P2 (S4 anchor release) | — | Struck with a reason (D5). |
 | P3 (cursor re-check) | — | The requirement text now describes the re-decide-and-compare-digest apply. |
 
+## Decision: restore does not trust an `ambiguous` App Server answer (Matthew, 2026-09-27)
+
+**What.** The restore planner (`lib/snapshot_restore.py`, `reconcile_record`) accepts only `claimed` or `confirmed-absence` from the Codex App Server. `ambiguous` means the inventory answered but holds no live app-owner fact. For restore that counts as missing evidence: the row is `insufficient-evidence`, not `restore`, and the dry run exits 69.
+
+**Why.** Restore *starts* a terminal writer. If the app might still be writing the thread, a second writer could corrupt the conversation. Only `confirmed-absence` proves the app isn't running it. Other paths deliberately accept `ambiguous`, but only for a pane that is already live:
+- `reconcile-codex` accepts it.
+- `task resolve-conflicts`' `live-owner` rule accepts it (D6).
+
+In both cases the terminal is already the writer, so nothing new is spawned.
+
+**Known cost.** Live cctrl Codex tasks for which the App Server answers `ambiguous` are not restored automatically after a reboot. On 2026-09-27 that was cctrl, rentkompass and homelab--2. Restore lists them as `insufficient-evidence`; bring them back by hand with `cctrl start -d <dir> --agent codex -r <thread-id>`.
+
+**Revisit** if the App Server gains an explicit "not loaded or owned" answer, or if Matthew accepts the risk.
+
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
