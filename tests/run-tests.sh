@@ -6461,6 +6461,60 @@ JSON
     echo "ok: snapshots are slim, write history only on change, cap retention, and refuse oversized captures"
 }
 
+test_snapshot_reboot_keeps_live_latest() {
+    # Plan 070 D7: after a power cycle no tmux session is live but registry
+    # rows survive. That capture must not replace a latest.json that had live
+    # sessions (restore reads latest by default); it goes to history only.
+    local root="$TMPDIR/snapshot-reboot" host="0123456789abcdef0123456789abcdef" out good
+    mkdir -p "$root/data" "$root/snapshots"
+    printf '%s\n' "$host" > "$root/data/host-id"
+    cat > "$root/process.json" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-27T10:00:00Z","source_cursor":"p","processes":[],"error":null}
+JSON
+    write_state() { # $1 = tmux_attach supported (true = live, false = rebooted)
+        cat > "$root/catalogue.json" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
+ {"provider":"claude","provider_task_id":"live-1","host_id":"$host","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"Live","tmux_session":"TMUX--live","action_capabilities":{"tmux_attach":{"supported":$1}}}
+]}
+JSON
+        if [[ "$1" == true ]]; then
+            printf '[{"name":"TMUX--live","agent":"claude","session_id":"live-1","dir":"/tmp/x"}]\n' > "$root/sessions.json"
+        else
+            printf '[]\n' > "$root/sessions.json"
+        fi
+    }
+    snap() {
+        CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+          CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+          CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$root/snapshots" "$@"
+    }
+    history_count() { find "$root/snapshots" -name '20*.json' -type f | wc -l | tr -d ' '; }
+
+    write_state true
+    snap --quiet || fail "live snapshot failed"
+    good="$(shasum "$root/snapshots/latest.json" | awk '{print $1}')"
+    jq -e '[.tasks[] | select(.live == true)] | length == 1' "$root/snapshots/latest.json" >/dev/null || fail "fixture latest has no live session"
+
+    sleep 1; write_state false
+    out="$(snap)" || fail "post-reboot snapshot failed: $out"
+    assert_contains "$out" "keeping latest.json with 1 live session(s)"
+    [[ "$good" == "$(shasum "$root/snapshots/latest.json" | awk '{print $1}')" ]] || fail "post-reboot capture replaced the good latest.json"
+    [[ "$(history_count)" == 2 ]] || fail "post-reboot capture was not kept in history"
+    # Repeated post-reboot captures still leave latest alone and add no history.
+    sleep 1; snap --quiet || fail "second post-reboot snapshot failed"
+    [[ "$good" == "$(shasum "$root/snapshots/latest.json" | awk '{print $1}')" ]] || fail "a later post-reboot capture replaced latest.json"
+    [[ "$(history_count)" == 2 ]] || fail "an unchanged post-reboot capture wrote history"
+
+    # --allow-empty is the explicit override.
+    sleep 1; snap --quiet --allow-empty || fail "--allow-empty snapshot failed"
+    [[ "$good" != "$(shasum "$root/snapshots/latest.json" | awk '{print $1}')" ]] || fail "--allow-empty did not replace latest.json"
+
+    # Once sessions are live again (e.g. restored), latest moves on normally.
+    sleep 1; write_state true; snap --quiet || fail "live-again snapshot failed"
+    jq -e '[.tasks[] | select(.live == true)] | length == 1' "$root/snapshots/latest.json" >/dev/null || fail "latest did not return to the live capture"
+    echo "ok: a capture with no live sessions never replaces a latest.json that had them"
+}
+
 test_snapshot_ownership_policy() {
     local root="$TMPDIR/snapshot-ownership" data="$TMPDIR/snapshot-ownership/data"
     local snapshots="$TMPDIR/snapshot-ownership/snapshots" host="0123456789abcdef0123456789abcdef"
@@ -9207,6 +9261,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_snapshot_ownership_policy
             test_snapshot_tmux_row_selection
             test_snapshot_size_controls
+            test_snapshot_reboot_keeps_live_latest
             test_restore_no_force_structural
             test_restore_no_pane_inference_structural
             echo "ok"
@@ -9394,6 +9449,7 @@ test_codex_reconcile_ownership_evidence
 test_snapshot_ownership_policy
 test_snapshot_tmux_row_selection
 test_snapshot_size_controls
+test_snapshot_reboot_keeps_live_latest
 test_restore_no_force_structural
 test_restore_no_pane_inference_structural
 fi

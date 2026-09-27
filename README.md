@@ -682,6 +682,11 @@ Retention rules:
   first.
 - The newest history file and `latest.json` are never removed.
 
+After a reboot no tmux session is live, but registry rows survive. A capture
+with no live session therefore never replaces a `latest.json` that had live
+sessions; it is kept in history only, so `session restore` still starts from
+the pre-reboot fleet. `--allow-empty` overrides this.
+
 **Timer install** (per-user LaunchAgent, not installed automatically):
 
 ```bash

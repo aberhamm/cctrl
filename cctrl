@@ -11514,6 +11514,24 @@ _session_snapshot() {
         tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
         cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$history_file" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
     fi
+    # Post-reboot guard (plan 070 D7): right after a power cycle no tmux
+    # session is live, but registry rows survive, so the capture is non-empty
+    # and would replace the last good latest.json that restore reads by
+    # default. A capture with no live session never replaces one that had
+    # live sessions; it is kept in history only. --allow-empty overrides.
+    local new_live old_live=0
+    new_live="$(jq '[.tasks[]? | select(.live == true)] | length' "$snapshot_file")"
+    if (( new_live == 0 )) && ! $allow_empty && [[ -f "$snapshot_dir/latest.json" ]]; then
+        old_live="$(jq '[.tasks[]? | select(.live == true)] | length' "$snapshot_dir/latest.json" 2>/dev/null || echo 0)"
+    fi
+    if (( new_live == 0 && old_live > 0 )); then
+        if $json_out; then cat "$snapshot_file"; else
+            $quiet || echo "snapshot: no live sessions (after a reboot?); keeping latest.json with ${old_live} live session(s)$($write_history && printf '; capture saved to history')."
+        fi
+        _snapshot_retention_prune "$snapshot_dir"
+        rm -rf "$scratch"
+        return 0
+    fi
     tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
     cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$snapshot_dir/latest.json" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
     if $json_out; then cat "$snapshot_file"; else

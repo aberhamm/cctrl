@@ -48,6 +48,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- The first `session snapshot` after a reboot no longer replaces the last good
+  `latest.json`. With no tmux session live, the capture still holds surviving
+  registry rows, so it slipped past the empty-fleet guard. `session restore`
+  would then have started from it by default. A capture with no live session
+  now goes to history only when `latest.json` has live sessions;
+  `--allow-empty` overrides. (plan 070 D7)
 - `task resolve-conflicts` never touches tasks owned by the Codex app. It
   accepts the App Server's `ambiguous` answer (the inventory answered with no
   live app-owner fact) as "the app is not writing", the same rule
