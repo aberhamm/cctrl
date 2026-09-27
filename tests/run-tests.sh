@@ -6493,6 +6493,15 @@ JSON
         || fail "byte cap kept the wrong files: $(ls "$caps" | tr '\n' ' ')"
     CCTRL_SNAPSHOT_HISTORY_MAX_BYTES=10 cctrl_source_eval '_snapshot_retention_prune "$1"' "$caps"
     [[ -f "$caps/20260925T000000Z.json" && -f "$caps/latest.json" ]] || fail "caps removed the newest history file or latest.json"
+    # Age pruning never removes the newest history file, however old it is:
+    # with history written only on change it is the last known state.
+    local aged="$root/aged"
+    mkdir -p "$aged"
+    printf '{}' > "$aged/20260101T000000Z.json"; printf '{}' > "$aged/20260102T000000Z.json"
+    touch -t 202601010000 "$aged/20260101T000000Z.json" "$aged/20260102T000000Z.json"
+    cctrl_source_eval '_snapshot_retention_prune "$1"' "$aged"
+    [[ "$(ls "$aged" | tr '\n' ' ')" == "20260102T000000Z.json " ]] \
+        || fail "age pruning removed the newest history file or kept an old one: $(ls "$aged" | tr '\n' ' ')"
     echo "ok: snapshots are slim, write history only on change, cap retention, and refuse oversized captures"
 }
 

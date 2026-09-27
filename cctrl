@@ -11335,6 +11335,10 @@ _snapshot_retention_prune_age() {
     done
 
     [[ ${#all_files[@]} -eq 0 ]] && return 0
+    # History is only written on change, so the newest file can be old; it is
+    # the last known state and is never pruned by age.
+    local newest_file
+    newest_file="$(printf '%s\n' "${all_files[@]}" | sort | tail -1)"
 
     # Sort files by name (chronological, since names are UTC timestamps)
     local -a sorted=()
@@ -11344,6 +11348,7 @@ _snapshot_retention_prune_age() {
     # so we use a newline-delimited string of kept day prefixes).
     local file_epoch base day kept_days=""
     for f in "${sorted[@]}"; do
+        [[ "$f" == "$newest_file" ]] && continue
         base="$(basename "$f")"
         day="${base:0:8}"
 

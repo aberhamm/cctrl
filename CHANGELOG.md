@@ -48,6 +48,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Snapshot retention never prunes the newest history file by age. Because
+  history is now written only on change, the newest file can be old and still
+  be the last known state. (plan 070 review P3)
 - `task resolve-conflicts` never closes a record whose conversation is running
   anywhere. Before closing it checks command lines and every live Claude
   process's session file, so a conversation resumed with `/resume` or
