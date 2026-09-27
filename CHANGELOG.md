@@ -48,6 +48,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `session kill` and `session close` record a task as `closed` only after the
+  tmux kill succeeds. A failed kill leaves the records untouched and exits
+  non-zero. A delayed close (`--in N`, or closing from inside the session)
+  records the end once that exact tmux session is gone, via a detached waiter,
+  instead of before the kill runs. When no record is anchored to the killed
+  pane but older records still claim the name, the command says so and points
+  to `session mark-closed`. (plan 070 review P2/P3)
 - For a tmux name that is not live, which is the normal state after a reboot,
   `session snapshot` no longer lets catalogue order decide which record
   represents it. An ended record never hides the open one. Several open

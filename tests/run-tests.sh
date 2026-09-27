@@ -4236,7 +4236,7 @@ test_session_terminate_records_closed() (
     socket="cctrl-terminate-$$-$RANDOM"
     root="$TMPDIR/terminate-records"; bin="$root/bin"; meta="$root/meta"; data="$root/data"
     rm -rf "$root"; mkdir -p "$bin" "$meta" "$data"
-    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$real_tmux" "$socket" > "$bin/tmux"
+    printf '#!/usr/bin/env bash\n[[ "${1:-}" == kill-session && -n "${CCTRL_TEST_FAIL_KILL:-}" ]] && exit 1\nexec %q -L %q "$@"\n' "$real_tmux" "$socket" > "$bin/tmux"
     chmod +x "$bin/tmux"
     # shellcheck disable=SC2329 # invoked by the EXIT trap
     cleanup_terminate() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; }
@@ -4256,7 +4256,7 @@ test_session_terminate_records_closed() (
     state_of() { jq -r '.lifecycle_state' "$1"; }
 
     local name anchor f_kill f_other f_keep f_close f_stop f_gone
-    for name in s-kill s-keep s-close s-stop s-live; do
+    for name in s-kill s-keep s-close s-stop s-live s-fail s-grace s-noanchor; do
         "$real_tmux" -L "$socket" new-session -d -s "$name" 'sleep 120'
     done
     anchor="$(anchor_of s-kill)"; f_kill="$(record_for s-kill id-kill $anchor)"
@@ -4279,6 +4279,28 @@ test_session_terminate_records_closed() (
 
     PATH="$bin:$PATH" "$ROOT/cctrl" session close s-close >/dev/null || fail "session close failed"
     [[ "$(state_of "$f_close")" == closed ]] || fail "close did not record the anchored task closed"
+
+    # A kill that fails records nothing: the conversation is still running.
+    local f_fail f_grace i
+    anchor="$(anchor_of s-fail)"; f_fail="$(record_for s-fail id-fail $anchor)"
+    rc=0; CCTRL_TEST_FAIL_KILL=1 PATH="$bin:$PATH" "$ROOT/cctrl" session kill s-fail >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "a failed kill reported success"
+    [[ "$(state_of "$f_fail")" == active ]] || fail "a failed kill recorded the task closed"
+    rc=0; CCTRL_TEST_FAIL_KILL=1 PATH="$bin:$PATH" "$ROOT/cctrl" session close s-fail >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 0 && "$(state_of "$f_fail")" == active ]] || fail "a failed close recorded the task closed (rc=$rc)"
+
+    # A delayed close records the end only after the session is actually gone.
+    anchor="$(anchor_of s-grace)"; f_grace="$(record_for s-grace id-grace $anchor)"
+    PATH="$bin:$PATH" "$ROOT/cctrl" session close s-grace --in 2 >/dev/null || fail "delayed close failed"
+    [[ "$(state_of "$f_grace")" == active ]] || fail "a delayed close recorded closed before the kill ran"
+    for i in $(seq 1 20); do [[ "$(state_of "$f_grace")" == closed ]] && break; sleep 0.5; done
+    ! "$real_tmux" -L "$socket" has-session -t '=s-grace' 2>/dev/null || fail "delayed close did not kill the session"
+    [[ "$(state_of "$f_grace")" == closed ]] || fail "a delayed close never recorded the end after the kill"
+
+    # A session whose records carry no pane anchor gets a hint instead of silence.
+    record_for s-noanchor id-noanchor >/dev/null
+    out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session kill s-noanchor 2>&1)" || fail "kill of an unanchored session failed"
+    assert_contains "$out" "session mark-closed s-noanchor --apply"
 
     rows="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json)"
     exec_id="$(jq -r '.[] | select(.name=="s-stop") | .execution_id' <<< "$rows")"

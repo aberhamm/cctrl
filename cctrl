@@ -8317,6 +8317,7 @@ cmd_session() {
         reconcile-names) _session_reconcile_names "$@" ;;
         kill|k|rm) _session_kill "$@" ;;
         mark-closed) _session_mark_closed "$@" ;;
+        record-terminated) _session_record_terminated_cmd "$@" ;;
         stop-exact) _session_stop_exact "$@" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
@@ -12217,16 +12218,58 @@ PY
 _session_record_terminated() {
     # Mark every task record anchored to the given panes closed. The session
     # is already gone, so a registry failure is reported, not fatal.
-    local name="$1" anchors="$2" reason="$3" file failed=0
+    local name="$1" anchors="$2" reason="$3" file failed=0 closed=0 unanchored
     while IFS= read -r file; do
         [[ -n "$file" ]] || continue
-        _task_record_transition_file "$file" "$name" unknown unknown closed "" \
-            cctrl-terminate authoritative "$reason" 2>/dev/null || failed=$((failed + 1))
+        if _task_record_transition_file "$file" "$name" unknown unknown closed "" \
+            cctrl-terminate authoritative "$reason" 2>/dev/null; then
+            closed=$((closed + 1))
+        else
+            failed=$((failed + 1))
+        fi
     done < <(_session_task_records_for_name "$name" "$anchors")
     if (( failed > 0 )); then
         echo -e "${YELLOW}⚠  Could not record the end of $failed task record(s) for $name; restore may still offer it. Fix with: cctrl session mark-closed $name --apply${RESET}" >&2
+    elif (( closed == 0 )); then
+        # Records without a pane anchor (older launches) can't be tied to the
+        # killed pane; say so rather than let restore surprise the user.
+        unanchored="$(_session_task_records_for_name "$name" cctrl-tmux | grep -c . || true)"
+        if (( unanchored > 0 )); then
+            echo -e "${YELLOW}⚠  No task record is anchored to this session's pane; restore may still offer $unanchored record(s) for $name. Record them closed with: cctrl session mark-closed $name --apply${RESET}" >&2
+        fi
     fi
     return 0
+}
+
+_session_record_terminated_after_exit() {
+    # Record the end once tmux session id $2 is gone (a deferred close). The
+    # waiter is detached and ignores SIGHUP so a self-closing pane can't take
+    # it down; if the session is still alive after $5 seconds nothing is written.
+    local name="$1" session_id="$2" anchors="$3" reason="$4" max_wait="$5"
+    [[ "$session_id" == \$* ]] || return 0
+    nohup "$SCRIPT_DIR/cctrl" session record-terminated "$name" --session-id "$session_id" \
+        --anchors "$anchors" --reason "$reason" --wait "$max_wait" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
+_session_record_terminated_cmd() {
+    # Internal: `session record-terminated <name> --session-id ID --anchors A --reason R --wait S`.
+    local name="" session_id="" anchors="" reason="" max_wait=60 waited=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --session-id) session_id="$2"; shift 2 ;;
+            --anchors) anchors="$2"; shift 2 ;;
+            --reason) reason="$2"; shift 2 ;;
+            --wait) max_wait="$2"; shift 2 ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+    [[ -n "$name" && "$session_id" == \$* && "$max_wait" =~ ^[0-9]+$ ]] || return 64
+    while tmux has-session -t "$session_id" 2>/dev/null; do
+        (( waited >= max_wait )) && return 75
+        sleep 1; waited=$((waited + 1))
+    done
+    _session_record_terminated "$name" "$anchors" "$reason"
 }
 
 _session_mark_closed() {
@@ -12317,7 +12360,10 @@ _session_kill() {
         session_id="${resolved%% *}"; session_name="${resolved#* }"
         [[ "$session_id" == \$* ]] || { session_id="$kill_target"; session_name="$kill_target"; }
         anchors="$(_session_pane_anchors "$session_id")"
-        tmux kill-session -t "$session_id"
+        if ! tmux kill-session -t "$session_id"; then
+            echo -e "${RED}Could not kill session '$session_name'; its task records are unchanged.${RESET}" >&2
+            return 1
+        fi
         $keep_restorable || _session_record_terminated "$session_name" "$anchors" "session killed by cctrl session kill"
         echo -e "${GREEN}Killed session: $session_name${RESET}"
     else
@@ -12554,8 +12600,9 @@ _session_close() {
     # both complete. Keep archival here, rather than in session-wrapper.sh:
     # release-to-app also ends the wrapper with EOF but deliberately preserves
     # the app task for continued use.
-    local archive_result="" archive_status="" close_anchors
+    local archive_result="" archive_status="" close_anchors close_session_id
     close_anchors="$(_session_pane_anchors "=$target")"
+    close_session_id="$(tmux display-message -p -t "=$target:" '#{session_id}' 2>/dev/null || true)"
     archive_result="$(_session_archive_codex_task "$target" --json 2>/dev/null || true)"
     archive_status="$(jq -r '.status // empty' <<< "$archive_result" 2>/dev/null || true)"
 
@@ -12565,20 +12612,28 @@ _session_close() {
         # run-shell -b runs on the tmux server, so the delayed kill survives
         # the death of the calling pane/client.
         if ! tmux run-shell -b "sleep $grace; tmux kill-session -t $target_q" 2>/dev/null; then
-            tmux kill-session -t "$target"
+            if ! tmux kill-session -t "$target"; then
+                echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
+                return 1
+            fi
             _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
             echo -e "${GREEN}Closed session: $target${RESET}"
             return 0
         fi
-        # The kill is scheduled; the close is already decided, so record it now.
-        _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
+        # The kill runs later on the tmux server. Record the end only once that
+        # exact session is gone; a detached waiter survives this pane's death.
+        _session_record_terminated_after_exit "$target" "$close_session_id" "$close_anchors" \
+            "session closed by cctrl session close" "$((grace + 30))"
         if [[ "$target" == "$current" ]]; then
             echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s — wrap up now."
         else
             echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s."
         fi
     else
-        tmux kill-session -t "$target"
+        if ! tmux kill-session -t "$target"; then
+            echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
+            return 1
+        fi
         _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
         echo -e "${GREEN}Closed session: $target${RESET}"
     fi
