@@ -72,6 +72,21 @@ class ConflictResolveTests(unittest.TestCase):
                          [self.proc(100, 1, 'bash'), self.proc(900, 1, 'claude --resume stale-id')])
         self.assertEqual(rows['stale-id']['action'], 'skip')
 
+    def test_a_conversation_resumed_elsewhere_is_never_closed(self):
+        # /resume in another pane: no id on any command line, only the
+        # session file of the other Claude process proves it is live.
+        rows = self.plan(
+            [record('moved-id', 'TMUX--old', '%47', '700'),
+             record('moved-too', 'TMUX--homelab', '%0', '100'), record('live-id', 'TMUX--homelab', '%0', '100')],
+            [self.pane('TMUX--old', '%1', 50), self.pane('TMUX--homelab', '%0', 100), self.pane('TMUX--other', '%5', 500)],
+            [self.proc(50, 1, 'bash'), self.proc(100, 1, 'bash wrapper'), self.proc(101, 100, 'claude'),
+             self.proc(500, 1, 'bash wrapper'), self.proc(501, 500, 'claude'), self.proc(502, 500, 'claude')],
+            claude={101: 'live-id', 501: 'moved-id', 502: 'moved-too'})
+        self.assertEqual(rows['moved-id']['action'], 'skip')
+        self.assertIn('running', rows['moved-id']['reason'])
+        self.assertEqual(rows['moved-too']['action'], 'skip')
+        self.assertIn('running elsewhere', rows['moved-too']['reason'])
+
     def test_pid_reuse_with_a_different_start_time_is_not_the_same_pane(self):
         rows = self.plan([record('old-exec', 'TMUX--x', '%0', '100', started='Mon Sep  1 09:00:00 2026')],
                          [self.pane('TMUX--x', '%0', 100)],

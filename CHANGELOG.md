@@ -48,6 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `task resolve-conflicts` never closes a record whose conversation is running
+  anywhere. Before closing it checks command lines and every live Claude
+  process's session file, so a conversation resumed with `/resume` or
+  relaunched in another pane is no longer closed as `stale-anchor` or
+  `superseded-by`. (plan 070 review P2)
 - `session kill` and `session close` record a task as `closed` only after the
   tmux kill succeeds. A failed kill leaves the records untouched and exits
   non-zero. A delayed close (`--in N`, or closing from inside the session)

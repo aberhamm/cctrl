@@ -115,6 +115,32 @@ class Evidence:
     def argv_mentions(self, task_id: str) -> bool:
         return any(task_id in str(p.get("command", "")) for p in self.proc.values())
 
+    def claude_session_ids(self) -> set[str]:
+        """sessionId of every live Claude process with a session file.
+
+        A conversation resumed with /resume, or relaunched in another pane,
+        has no id on its command line; its session file is the only proof it
+        is running.
+        """
+        if not hasattr(self, "_claude_ids"):
+            ids: set[str] = set()
+            if self.claude_dir:
+                for pid, proc in self.proc.items():
+                    if agent_of(str(proc.get("command", ""))) != "claude":
+                        continue
+                    try:
+                        session = json.loads((self.claude_dir / f"{pid}.json").read_text())
+                    except Exception:
+                        continue
+                    if isinstance(session, dict) and isinstance(session.get("sessionId"), str):
+                        ids.add(session["sessionId"])
+            self._claude_ids = ids
+        return self._claude_ids
+
+    def task_running(self, provider: str, task_id: str) -> bool:
+        """Any live process anywhere provably runs the task."""
+        return self.argv_mentions(task_id) or (provider == "claude" and task_id in self.claude_session_ids())
+
     def codex_app(self, task_id: str) -> str:
         """App Server evidence for the task: claimed | confirmed-absence | ambiguous | unavailable.
 
@@ -152,8 +178,8 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
     app = ev.codex_app(task_id) if provider == "codex" else "confirmed-absence"
     pane = ev.pane(record)
     if pane is None:
-        if ev.argv_mentions(task_id):
-            return "skip", "a process still references the task", None
+        if ev.task_running(provider, task_id):
+            return "skip", "the task is running in another process", None
         if app != "confirmed-absence":
             return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence", None
         return "close", "stale-anchor", None
@@ -161,6 +187,8 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
     if running is None:
         return "skip", "cannot prove which task the pane runs", None
     if running != task_id:
+        if ev.task_running(provider, task_id):
+            return "skip", f"pane runs {running}, but the task is running elsewhere", running
         if app != "confirmed-absence":
             return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence", running
         return "close", f"superseded-by {running}", running
