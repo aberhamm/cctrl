@@ -33,6 +33,13 @@ These are the P3 findings from the 2026-09-27 eng reviews of plans 073 (draft de
 - [ ] The wrapper's SIGKILL also kills the agent's descendants (MCP servers, tool processes).
 - [ ] `lib/session-wrapper.sh`: validate `CCTRL_WRAPPER_TERM_GRACE` against `^[0-9]+$` and fall back to 10. Today a value like `5s` exits inside the trap before the agent is signalled.
 
+### From the 073/074 re-review (2026-09-27)
+- [ ] A typed draft that *starts* with placeholder text (`❯ Try "foo…"`, `❯ esc to cancel…`) still reads as empty. Apply the hint check only to composer lines with no SGR at all.
+- [ ] Warn when a stop-exact process snapshot fails, as kill and close already do.
+- [ ] Warn when `reap_cmd` is empty on the delayed-close path.
+- [ ] A test running a Codex-agent pane through `session close`.
+- [ ] A test of the survivors report, for a process that survives SIGKILL.
+
 ## Rules
 
 Edit a copy of `cctrl` or `lib/*` and syntax-check it (`bash -n` / `perl -c`), then `mv` it into place. The live tree runs every session's hooks.
