@@ -4360,6 +4360,101 @@ test_session_terminate_records_closed() (
     echo "ok: kill, close, and stop-exact record closed; mark-closed backfills; ended tasks release their tmux name"
 )
 
+test_session_close_reaps_pane_processes() (
+    # Plan 074: tmux kill-session only hangs up the pty. The real wrapper then
+    # TERMs the agent; an agent that ignores SIGTERM used to keep the wrapper
+    # waiting forever and both survived as orphans. Private tmux socket, the
+    # real lib/session-wrapper.sh, and a fake agent that ignores TERM and HUP.
+    local real_tmux socket root bin agents out rc name pids p i
+    real_tmux="$(command -v tmux)"
+    [[ -x "$real_tmux" ]] || fail "tmux is required for pane reaping coverage"
+    socket="cctrl-reap-$$-$RANDOM"
+    root="$TMPDIR/reap"; bin="$root/bin"; agents="$root/agents"
+    rm -rf "$root"; mkdir -p "$bin" "$agents" "$root/meta" "$root/data"
+    printf '#!/usr/bin/env bash\nexec %q -L %q "$@"\n' "$real_tmux" "$socket" > "$bin/tmux"
+    # Stays a bash process running this script (not an exec'd sleep), so its
+    # argv names the test root and cleanup can always find it.
+    printf '#!/usr/bin/env bash\ntrap "" TERM HUP\nwhile :; do sleep 1; done\n' > "$agents/claude"
+    chmod +x "$bin/tmux" "$agents/claude"
+    # shellcheck disable=SC2329 # invoked by the EXIT trap
+    cleanup_reap() {
+        "$real_tmux" -L "$socket" kill-server 2>/dev/null || true
+        pkill -KILL -f "$root" 2>/dev/null || true
+    }
+    trap cleanup_reap EXIT
+    export CCTRL_SESSION_METADATA_DIR="$root/meta" CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id"
+
+    launch() { # name wrapper-grace
+        "$real_tmux" -L "$socket" new-session -d -s "$1" \
+            "CCTRL_WRAPPER_TERM_GRACE=$2 PATH=$(printf '%q' "$agents:$PATH") bash $(printf '%q' "$ROOT/lib/session-wrapper.sh") claude $(printf '%q' "$root/marker-$1") --probe $(printf '%q' "$root")"
+        for i in $(seq 1 30); do
+            pids="$(pane_tree "$1")"
+            [[ "$(wc -w <<< "$pids")" -ge 2 ]] && return 0
+            sleep 0.1
+        done
+        fail "$1 did not start the wrapper and agent: $pids"
+    }
+    pane_tree() { # the pane leader and all its descendants, except transient sleeps
+        local leader todo p kids all=""
+        leader="$("$real_tmux" -L "$socket" list-panes -s -t "=$1" -F '#{pane_pid}' 2>/dev/null)" || return 0
+        todo="$leader"
+        while [[ -n "${todo// /}" ]]; do
+            p="${todo%% *}"; todo="${todo#"$p"}"; todo="${todo# }"
+            [[ -n "$p" ]] || continue
+            [[ "$(ps -o command= -p "$p" 2>/dev/null)" == "sleep 1" ]] || all+="$p "
+            kids="$(pgrep -P "$p" | tr '\n' ' ')"
+            todo="$todo $kids"
+        done
+        printf '%s' "${all% }"
+    }
+    assert_gone() { # label pids timeout-tenths
+        local left
+        for i in $(seq 1 "$3"); do
+            left=""
+            for p in $2; do kill -0 "$p" 2>/dev/null && left+=" $p"; done
+            [[ -z "$left" ]] && return 0
+            sleep 0.1
+        done
+        left="${left# }"
+        fail "$1 left pane processes running: $left ($(ps -o pid=,command= -p "${left// /,}" 2>/dev/null | tr '\n' ';'))"
+    }
+
+    # 1. The wrapper alone: a plain tmux kill-session no longer strands it.
+    launch w-plain 1; pids="$(pane_tree w-plain)"
+    "$real_tmux" -L "$socket" kill-session -t '=w-plain'
+    assert_gone "plain tmux kill-session" "$pids" 40
+
+    # 2-5. cctrl paths, with the wrapper's own escalation pushed out of reach
+    #      so cctrl's reaper is what must end them.
+    for name in r-kill r-close r-now r-stop r-grace; do launch "$name" 600; done
+    pids="$(pane_tree r-kill)"
+    out="$(CCTRL_CLOSE_REAP_GRACE=1 PATH="$bin:$PATH" "$ROOT/cctrl" session kill r-kill 2>&1)" || fail "kill failed: $out"
+    assert_gone "session kill" "$pids" 10
+    assert_contains "$out" "ignored SIGTERM and were killed"
+
+    pids="$(pane_tree r-close)"
+    CCTRL_CLOSE_REAP_GRACE=1 PATH="$bin:$PATH" "$ROOT/cctrl" session close r-close --force >/dev/null 2>&1 || fail "close failed"
+    assert_gone "session close" "$pids" 10
+    pids="$(pane_tree r-now)"
+    CCTRL_CLOSE_REAP_GRACE=1 PATH="$bin:$PATH" "$ROOT/cctrl" session close r-now --now --force >/dev/null 2>&1 || fail "close --now failed"
+    assert_gone "session close --now" "$pids" 10
+
+    pids="$(pane_tree r-stop)"
+    local exec_id
+    exec_id="$(PATH="$bin:$PATH" "$ROOT/cctrl" session ls --json | jq -r '.[] | select(.name=="r-stop") | .execution_id')"
+    CCTRL_CLOSE_REAP_GRACE=1 PATH="$bin:$PATH" "$ROOT/cctrl" session stop-exact r-stop --execution-id "$exec_id" --json >/dev/null 2>&1 \
+        || fail "stop-exact failed"
+    assert_gone "session stop-exact" "$pids" 10
+
+    # Delayed close: the tmux-server job kills, then reaps.
+    pids="$(pane_tree r-grace)"
+    CCTRL_CLOSE_JOB_LOG="$root/close-job.log" CCTRL_CLOSE_REAP_GRACE=1 PATH="$bin:$PATH" "$ROOT/cctrl" session close r-grace --in 1 --force >/dev/null 2>&1 || fail "delayed close failed"
+    # The last session: its kill ends the tmux server, which must not take the
+    # record/reap step down with it.
+    assert_gone "delayed session close" "$pids" 150
+    echo "ok: kill, close, close --now, stop-exact, and delayed close leave no pane processes behind"
+)
+
 test_session_stop_exact_identity() (
     # Every tmux command is forced through a private socket. This exercises the
     # real tmux identity/command-queue semantics without touching live sessions.
@@ -9250,6 +9345,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
         session-stop-exact)
             test_session_stop_exact_identity
             test_session_terminate_records_closed
+            test_session_close_reaps_pane_processes
             echo "ok"
             exit 0
             ;;
@@ -9465,6 +9561,7 @@ test_session_close_stale_tmux_refuses_current
 test_session_current_identity_json
 test_session_stop_exact_identity
 test_session_terminate_records_closed
+test_session_close_reaps_pane_processes
 test_session_attest_live_tmux_process_matches
 test_session_attest_direct_metadata
 test_session_attest_stale_tmux_session_missing

@@ -48,6 +48,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Closing a session no longer leaves its wrapper and agent running. On tmux
+  hangup, `lib/session-wrapper.sh` stops the agent with SIGTERM and then
+  SIGKILL after `CCTRL_WRAPPER_TERM_GRACE` (10 s); before, it waited forever
+  on an agent that didn't exit. `session kill`, `session close` (immediate and
+  delayed) and `session stop-exact` record the pane's process tree before the
+  kill and make sure it exits: SIGTERM, then SIGKILL after
+  `CCTRL_CLOSE_REAP_GRACE` (5 s), matching on start time so a reused pid is
+  never signalled. A delayed close of the last session reaps from a detached
+  helper, because the tmux server exits with its run-shell job. (plan 074)
 - `session ls` no longer reports `unsent-draft` for an empty composer. The
   draft detector reads the pane with escapes (`capture-pane -e`), ignores
   Claude Code's dimmed ghost suggestion (SGR 2) and the reverse-video cursor,

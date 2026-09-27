@@ -8318,6 +8318,7 @@ cmd_session() {
         kill|k|rm) _session_kill "$@" ;;
         mark-closed) _session_mark_closed "$@" ;;
         record-terminated) _session_record_terminated_cmd "$@" ;;
+        reap) _session_reap_cmd "$@" ;;
         stop-exact) _session_stop_exact "$@" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
@@ -12158,8 +12159,9 @@ _session_stop_exact() {
     # the same tmux command queue entry that kills by immutable $N id. A server
     # restart between the inspection above and this command takes the false
     # branch, so a replacement session cannot be killed.
-    local guard rc=0 stop_anchors
+    local guard rc=0 stop_anchors stop_procs
     stop_anchors="$(_session_pane_anchors "$tmux_session_id")"
+    stop_procs="$(_session_pane_process_snapshot "$tmux_session_id")"
     guard="#{&&:#{==:#{@cctrl_server_instance_id},$expected_server_id},#{&&:#{==:#{pid},$expected_server_pid},#{&&:#{==:#{start_time},$expected_server_started},#{==:#{session_id},$tmux_session_id}}}}"
     tmux if-shell -F -t "$tmux_session_id" "$guard" \
         "kill-session -t '$tmux_session_id'" "run-shell 'exit 75'" \
@@ -12170,12 +12172,114 @@ _session_stop_exact() {
         return $?
     fi
     _session_record_terminated "$name" "$stop_anchors" "session stopped by cctrl session stop-exact"
+    # Reports go to stderr; stdout stays the stop-exact contract.
+    _session_reap_processes "$stop_procs" "$name" || true
 
     if $json; then
         _session_stop_exact_json true stopped "$name" "$execution_id" ""
     else
         echo -e "${GREEN}Stopped exact session: $name${RESET}"
     fi
+}
+
+# ── Pane process reaping (plan 074) ──────────────────────────────────
+# tmux kill-session only hangs up the pty. The wrapper must then stop the
+# agent, and an agent that ignores SIGTERM (or a wrapper stuck waiting on it)
+# kept both alive as orphans. Every cctrl kill path records the pane's process
+# tree first and afterwards makes sure it is gone.
+
+_session_pane_process_snapshot() {
+    # Print "pid@start" tokens (comma-joined) for every process in the panes of
+    # exact tmux target $1 and all their descendants. `start` is ps lstart with
+    # spaces as underscores, so a reused pid is never mistaken for the original.
+    local target="$1" pane_pids
+    pane_pids="$(tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)"
+    [[ -n "${pane_pids// /}" ]] || return 0
+    ps -axo pid=,ppid=,lstart= 2>/dev/null | python3 -c '
+import sys
+roots = {int(p) for p in sys.argv[1].split() if p.isdigit()}
+children, start = {}, {}
+for line in sys.stdin:
+    f = line.split(None, 2)
+    if len(f) < 3 or not f[0].isdigit() or not f[1].isdigit():
+        continue
+    pid, ppid = int(f[0]), int(f[1])
+    start[pid] = "_".join(f[2].split())
+    children.setdefault(ppid, []).append(pid)
+seen, todo = set(), [r for r in roots if r in start]
+while todo:
+    pid = todo.pop()
+    if pid in seen:
+        continue
+    seen.add(pid)
+    todo.extend(children.get(pid, []))
+print(",".join(f"{pid}@{start[pid]}" for pid in sorted(seen)))
+' "$pane_pids"
+}
+
+_session_reap_processes() {
+    # After a kill: SIGTERM every snapshot process that is still the same
+    # process (pid and start time), wait up to CCTRL_CLOSE_REAP_GRACE seconds,
+    # then SIGKILL what is left. Reports escalations and survivors on stderr.
+    local snapshot="$1" label="${2:-session}" grace="${CCTRL_CLOSE_REAP_GRACE:-5}"
+    [[ -n "$snapshot" ]] || return 0
+    [[ "$grace" =~ ^[0-9]+$ ]] || grace=5
+    local token pid start now alive=() ticks=0 killed=0 survivors=()
+    _reap_alive() {
+        alive=()
+        local t p s cur
+        for t in ${snapshot//,/ }; do
+            p="${t%%@*}"; s="${t#*@}"
+            [[ "$p" =~ ^[0-9]+$ ]] || continue
+            # ps fails for an exited pid; under pipefail + set -e that must not abort.
+            cur="$(ps -o lstart= -p "$p" 2>/dev/null | awk '{$1=$1; gsub(/ /, "_"); print}' || true)"
+            if [[ -n "$cur" && "$cur" == "$s" ]]; then alive+=("$p"); fi
+        done
+        return 0  # cctrl runs under set -e: a dead last pid must not abort the reap
+    }
+    _reap_alive
+    (( ${#alive[@]} > 0 )) || return 0
+    for pid in "${alive[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
+    while (( ticks < grace * 10 )); do
+        _reap_alive
+        (( ${#alive[@]} > 0 )) || return 0
+        sleep 0.1; ticks=$((ticks + 1))
+    done
+    for pid in "${alive[@]}"; do
+        if kill -KILL "$pid" 2>/dev/null; then killed=$((killed + 1)); fi
+    done
+    sleep 0.2
+    _reap_alive
+    survivors=("${alive[@]+"${alive[@]}"}")
+    if (( ${#survivors[@]} > 0 )); then
+        echo -e "${RED}⚠  $label: ${#survivors[@]} pane process(es) survived SIGKILL: ${survivors[*]}${RESET}" >&2
+        return 1
+    fi
+    echo -e "${YELLOW}⚠  $label: $killed pane process(es) ignored SIGTERM and were killed.${RESET}" >&2
+    return 0
+}
+
+_session_reap_cmd() {
+    # Internal: `session reap <label> --snapshot TOKENS --after-session ID --wait S`.
+    # Used by the tmux-server job of a delayed close: waits for the session to
+    # be gone, then reaps what it left behind.
+    local label="" snapshot="" session_id="" max_wait=60 waited=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --snapshot) snapshot="$2"; shift 2 ;;
+            --after-session) session_id="$2"; shift 2 ;;
+            --wait) max_wait="$2"; shift 2 ;;
+            *) label="$1"; shift ;;
+        esac
+    done
+    [[ "$max_wait" =~ ^[0-9]+$ ]] || return 64
+    if [[ "$session_id" == \$* ]]; then
+        while tmux has-session -t "$session_id" 2>/dev/null; do
+            (( waited >= max_wait )) && return 75
+            sleep 1; waited=$((waited + 1))
+        done
+    fi
+    _session_reap_processes "$snapshot" "${label:-session}"
 }
 
 # ── Intentional termination (plan 070 S3) ────────────────────────────
@@ -12265,6 +12369,18 @@ _session_record_terminated_shell() {
     done
     printf '%s%q session record-terminated %q --session-id %q --anchors %q --reason %q --wait 30' \
         "$env_q" "$SCRIPT_DIR/cctrl" "$name" "$session_id" "$(printf '%s' "$anchors" | tr '\n' ',')" "$reason"
+}
+
+_session_reap_shell() {
+    # Print a shell command for a tmux-server job: once session id $2 is gone,
+    # reap the pane processes recorded in snapshot $3 (plan 074).
+    local name="$1" session_id="$2" procs="$3" env_q="" var
+    [[ "$session_id" == \$* && -n "$procs" ]] || return 1
+    for var in PATH CCTRL_CLOSE_REAP_GRACE; do
+        [[ -n "${!var:-}" ]] && env_q+="$var=$(printf '%q' "${!var}") "
+    done
+    printf '%s%q session reap %q --snapshot %q --after-session %q --wait 30' \
+        "$env_q" "$SCRIPT_DIR/cctrl" "$name" "$procs" "$session_id"
 }
 
 _session_record_terminated_cmd() {
@@ -12374,13 +12490,16 @@ _session_kill() {
         resolved="$(tmux display-message -p -t "$kill_target" '#{session_id} #{session_name}' 2>/dev/null || true)"
         session_id="${resolved%% *}"; session_name="${resolved#* }"
         [[ "$session_id" == \$* ]] || { session_id="$kill_target"; session_name="$kill_target"; }
+        local procs
         anchors="$(_session_pane_anchors "$session_id")"
+        procs="$(_session_pane_process_snapshot "$session_id")"
         if ! tmux kill-session -t "$session_id"; then
             echo -e "${RED}Could not kill session '$session_name'; its task records are unchanged.${RESET}" >&2
             return 1
         fi
         $keep_restorable || _session_record_terminated "$session_name" "$anchors" "session killed by cctrl session kill"
         echo -e "${GREEN}Killed session: $session_name${RESET}"
+        _session_reap_processes "$procs" "$session_name" || return 1
     else
         echo -e "${RED}No session named '$kill_target'.${RESET}" >&2
         return 1
@@ -12618,6 +12737,8 @@ _session_close() {
     local archive_result="" archive_status="" close_anchors close_session_id
     close_anchors="$(_session_pane_anchors "=$target")"
     close_session_id="$(tmux display-message -p -t "=$target:" '#{session_id}' 2>/dev/null || true)"
+    local close_procs
+    close_procs="$(_session_pane_process_snapshot "=$target")"
     archive_result="$(_session_archive_codex_task "$target" --json 2>/dev/null || true)"
     archive_status="$(jq -r '.status // empty' <<< "$archive_result" 2>/dev/null || true)"
 
@@ -12634,13 +12755,24 @@ _session_close() {
             echo -e "${YELLOW}⚠  Could not resolve the tmux session id for $target; its end will not be recorded. Afterwards run: cctrl session mark-closed $target --apply${RESET}" >&2
             record_cmd=""
         }
-        if ! tmux run-shell -b "sleep $grace; tmux kill-session -t $target_q${record_cmd:+; $record_cmd}" 2>/dev/null; then
+        local reap_cmd=""
+        reap_cmd="$(_session_reap_shell "$target" "$close_session_id" "$close_procs")" || reap_cmd=""
+        # Killing the last session ends the tmux server, and the server takes
+        # its run-shell job with it. So the job first starts a detached helper
+        # (ignoring TERM/HUP) that waits for the session to be gone, then
+        # records the end and reaps the pane processes; only then does it kill.
+        local after_kill=""
+        if [[ -n "$record_cmd" || -n "$reap_cmd" ]]; then
+            after_kill="nohup sh -c $(printf '%q' "trap '' TERM HUP; ${record_cmd:-:}; ${reap_cmd:-:}") >>$(printf '%q' "${CCTRL_CLOSE_JOB_LOG:-/dev/null}") 2>&1 & "
+        fi
+        if ! tmux run-shell -b "sleep $grace; ${after_kill}tmux kill-session -t $target_q" 2>/dev/null; then
             if ! tmux kill-session -t "$target"; then
                 echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
                 return 1
             fi
             _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
             echo -e "${GREEN}Closed session: $target${RESET}"
+            _session_reap_processes "$close_procs" "$target" || return 1
             return 0
         fi
         if [[ "$target" == "$current" ]]; then
@@ -12655,6 +12787,7 @@ _session_close() {
         fi
         _session_record_terminated "$target" "$close_anchors" "session closed by cctrl session close"
         echo -e "${GREEN}Closed session: $target${RESET}"
+        _session_reap_processes "$close_procs" "$target" || return 1
     fi
     case "$archive_status" in
         skipped-no-stable-provider-identity|skipped-metadata-promotion-failed)

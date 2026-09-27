@@ -47,10 +47,20 @@ _rc=0
 _early_window="${CCTRL_EARLY_EXIT_WINDOW_SECONDS:-15}"
 _early_hold="${CCTRL_EARLY_EXIT_HOLD_SECONDS:-10}"
 _started_at="$(date +%s)"
+# On SIGHUP (tmux kill-session / respawn-pane -k closes the pty), SIGTERM or
+# SIGINT, stop the agent. An agent that does not exit on SIGTERM (Claude Code's
+# graceful shutdown can stall once its tty is gone) is killed after a bounded
+# grace. An unbounded wait here kept the wrapper and agent alive as orphans
+# after the tmux session was gone (plan 074).
 _cleanup() {
     _killed=true
     if [[ -n "$_child_pid" ]]; then
         kill -TERM "$_child_pid" 2>/dev/null || true
+        local _ticks=0 _limit=$(( ${CCTRL_WRAPPER_TERM_GRACE:-10} * 10 ))
+        while kill -0 "$_child_pid" 2>/dev/null && (( _ticks < _limit )); do
+            sleep 0.1; _ticks=$((_ticks + 1))
+        done
+        kill -0 "$_child_pid" 2>/dev/null && kill -KILL "$_child_pid" 2>/dev/null
         wait "$_child_pid" 2>/dev/null || true
         _child_pid=""
     fi

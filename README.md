@@ -471,6 +471,14 @@ It is dry-run by default. `--apply` collects evidence again, writes only the
 actions that still hold, and rejects any write whose record changed since the
 decision (exit `75`).
 
+Closing also makes sure the pane's processes exit. `tmux kill-session` only
+hangs up the pty, and an agent that ignores SIGTERM used to keep the wrapper
+and agent running after the session was gone. kill, close and stop-exact
+record the pane's process tree first. They then send SIGTERM, and SIGKILL
+after `CCTRL_CLOSE_REAP_GRACE` seconds (default 5), to processes whose start
+time still matches. The wrapper itself escalates to SIGKILL after
+`CCTRL_WRAPPER_TERM_GRACE` seconds (default 10).
+
 For sessions that ended before this existed, or were killed outside cctrl, run
 `session mark-closed`. It is dry-run by default and refuses a name that is
 still live. A closed task also gives up its old tmux name, so a new session
