@@ -116,12 +116,12 @@ class Evidence:
         return any(task_id in str(p.get("command", "")) for p in self.proc.values())
 
     def codex_app(self, task_id: str) -> str:
-        """live | not-live | unavailable for the App Server as a writer of the task.
+        """App Server evidence for the task: claimed | confirmed-absence | ambiguous | unavailable.
 
-        Mirrors reconcile-codex: `claimed` is an explicit live app owner;
-        `confirmed-absence` and `ambiguous` (the inventory answered but holds no
-        live app-owner fact) mean the app is not writing the task. A failed or
-        missing read is unavailable.
+        `claimed` is an explicit live app owner. `confirmed-absence` proves the
+        app is not running the task. `ambiguous` means the inventory answered
+        but holds no live app-owner fact: enough to hand a live pane back to
+        cctrl (reconcile-codex does the same), never enough to close a record.
         """
         if not self.codex_ok:
             return "unavailable"
@@ -129,12 +129,7 @@ class Evidence:
         sources = row.get("sources") if isinstance(row, dict) and isinstance(row.get("sources"), dict) else {}
         app = sources.get("app_server") if isinstance(sources.get("app_server"), dict) else {}
         status = app.get("status")
-        if status == "claimed":
-            return "live"
-        if status in ("confirmed-absence", "ambiguous"):
-            return "not-live"
-        return "unavailable"
-
+        return status if status in ("claimed", "confirmed-absence", "ambiguous") else "unavailable"
 
 def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None]:
     provider = record.get("provider")
@@ -152,21 +147,25 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
         # Handed off to the app: the provider owns persistence. A leftover
         # tmux name on such a record is not a terminal claim to settle here.
         return "skip", "owned by the app; provider-managed", None
-    app = ev.codex_app(task_id) if provider == "codex" else "not-live"
+    # Closing needs proof the app is not running the task; handing a live
+    # pane back to cctrl only needs the app not to be a live owner.
+    app = ev.codex_app(task_id) if provider == "codex" else "confirmed-absence"
     pane = ev.pane(record)
     if pane is None:
         if ev.argv_mentions(task_id):
             return "skip", "a process still references the task", None
-        if app != "not-live":
-            return "skip", f"Codex App Server evidence {app}", None
+        if app != "confirmed-absence":
+            return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence", None
         return "close", "stale-anchor", None
     running = ev.running_task(pane, provider)
     if running is None:
         return "skip", "cannot prove which task the pane runs", None
-    if app != "not-live":
-        return "skip", f"Codex App Server evidence {app}", running
     if running != task_id:
+        if app != "confirmed-absence":
+            return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence", running
         return "close", f"superseded-by {running}", running
+    if app not in ("confirmed-absence", "ambiguous"):
+        return "skip", f"Codex App Server evidence {app}", running
     owner = (record.get("control_owner"), record.get("execution_runtime"), record.get("lifecycle_state"))
     if owner == ("cctrl", "tmux", "active"):
         return "none", "already the live cctrl tmux owner", running

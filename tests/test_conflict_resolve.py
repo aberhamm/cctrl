@@ -97,6 +97,15 @@ class ConflictResolveTests(unittest.TestCase):
             self.assertEqual(row['action'], 'skip', status)
             self.assertIn('App Server', row['reason'])
 
+    def test_codex_close_needs_confirmed_absence(self):
+        rec = record('01a0bde5-95ce-0000-0000-000000000000', 'TMUX--scraper', '%47', '700', provider='codex',
+                     owner=('conflict', 'conflict', 'active'))
+        for status, action in (('confirmed-absence', 'close'), ('ambiguous', 'skip'), ('unavailable', 'skip')):
+            evidence = {'records': [{'provider_task_id': rec['provider_task_id'], 'host_id': HOST,
+                                     'sources': {'app_server': {'status': status}}}]}
+            rows = self.plan([rec], [self.pane('TMUX--scraper', '%1', 100)], [self.proc(100, 1, 'bash')], codex=evidence)
+            self.assertEqual(rows[rec['provider_task_id']]['action'], action, status)
+
     def test_app_owned_records_are_never_touched(self):
         rec = record('01a0bde6-dfca-0000-0000-000000000000', 'TMUX--comet', '%47', '700', provider='codex',
                      owner=('app', 'app-server', 'active'))

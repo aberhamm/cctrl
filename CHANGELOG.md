@@ -48,6 +48,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `task resolve-conflicts` closes a Codex record only when the App Server
+  confirms the app is not running that task (`confirmed-absence`). An
+  `ambiguous` answer is still enough to hand a live pane back to cctrl, the
+  same rule as `reconcile-codex`, but never enough to close. (plan 070 D6)
 - The first `session snapshot` after a reboot no longer replaces the last good
   `latest.json`. With no tmux session live, the capture still holds surviving
   registry rows, so it slipped past the empty-fleet guard. `session restore`
