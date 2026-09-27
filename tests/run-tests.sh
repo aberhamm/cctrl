@@ -4482,6 +4482,29 @@ test_session_close_reaps_pane_processes() (
     # The last session: its kill ends the tmux server, which must not take the
     # record/reap step down with it.
     assert_gone "delayed session close" "$pids" 150
+    # Safety property: a pid whose start time no longer matches the snapshot
+    # (the pid was reused) is never signalled.
+    local victim good_start
+    bash -c 'exec sleep 30' & victim=$!
+    sleep 0.2
+    good_start="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$victim" | awk '{$1=$1; gsub(/ /, "_"); print}')"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_CLOSE_REAP_GRACE=0 cctrl_source_eval '_session_reap_processes "$1" reuse-test' "$victim@Mon_Jan__1_00:00:00_2001" 2>/dev/null
+    kill -0 "$victim" 2>/dev/null || fail "the reaper signalled a pid whose start time did not match"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_CLOSE_REAP_GRACE=0 cctrl_source_eval '_session_reap_processes "$1" reuse-test' "$victim@$good_start" 2>/dev/null
+    sleep 0.3
+    ! kill -0 "$victim" 2>/dev/null || { kill -KILL "$victim" 2>/dev/null; fail "the reaper did not stop a matching pid"; }
+
+    # A failed process snapshot never blocks the kill itself.
+    local brokebin="$root/brokepy"
+    mkdir -p "$brokebin"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$brokebin/python3"; chmod +x "$brokebin/python3"
+    launch r-snapfail 1; pids="$(pane_tree r-snapfail)"
+    out="$(PATH="$brokebin:$bin:$PATH" "$ROOT/cctrl" session kill r-snapfail 2>&1)" || fail "kill aborted when the process snapshot failed: $out"
+    ! "$real_tmux" -L "$socket" has-session -t '=r-snapfail' 2>/dev/null || fail "a failed snapshot left the session alive"
+    assert_contains "$out" "Could not record r-snapfail's pane processes"
+    assert_gone "kill with a failed snapshot (wrapper escalation)" "$pids" 40
     echo "ok: kill, close, close --now, stop-exact, and delayed close leave no pane processes behind"
 )
 

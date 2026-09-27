@@ -48,6 +48,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Review fixes for plan 074:
+  - A failed process snapshot no longer aborts `session kill`, `close` or
+    `stop-exact`. The kill proceeds and a warning is printed.
+  - Processes that survive the reap are reported as a warning, not an error,
+    so `session prune --yes` no longer stops at the first such session.
+  - The reap grace defaults to 12 s, longer than the wrapper's 10 s, so an
+    agent's shutdown isn't cut short.
+  - Start times are read with `LC_ALL=C TZ=UTC0`, so the tmux-server job
+    matches them regardless of locale.
 - The unsent-draft detector recognises placeholder text only at the start of
   the composer, so a typed draft containing words like "lib/ for" or "for
   commands" is no longer missed. That miss could have let autoheal's `C-u`
@@ -56,12 +65,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   skips the session as `unverifiable-input` instead of treating the composer
   as empty. (plan 073 review)
 - Closing a session no longer leaves its wrapper and agent running. On tmux
-  hangup, `lib/session-wrapper.sh` stops the agent with SIGTERM and then
+  hangup, `lib/session-wrapper.sh` stops a Claude agent with SIGTERM and then
   SIGKILL after `CCTRL_WRAPPER_TERM_GRACE` (10 s); before, it waited forever
-  on an agent that didn't exit. `session kill`, `session close` (immediate and
-  delayed) and `session stop-exact` record the pane's process tree before the
-  kill and make sure it exits: SIGTERM, then SIGKILL after
-  `CCTRL_CLOSE_REAP_GRACE` (5 s), matching on start time so a reused pid is
+  on an agent that didn't exit. Codex runs in the foreground and isn't covered
+  by the wrapper (follow-up plan 076). `session kill`, `session close`
+  (immediate and delayed) and `session stop-exact` record the pane's process
+  tree before the kill and make sure it exits: SIGTERM, then SIGKILL after
+  `CCTRL_CLOSE_REAP_GRACE` (12 s), matching on start time so a reused pid is
   never signalled. A delayed close of the last session reaps from a detached
   helper, because the tmux server exits with its run-shell job. (plan 074)
 - `session ls` no longer reports `unsent-draft` for an empty composer. The

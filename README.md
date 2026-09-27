@@ -475,9 +475,12 @@ Closing also makes sure the pane's processes exit. `tmux kill-session` only
 hangs up the pty, and an agent that ignores SIGTERM used to keep the wrapper
 and agent running after the session was gone. kill, close and stop-exact
 record the pane's process tree first. They then send SIGTERM, and SIGKILL
-after `CCTRL_CLOSE_REAP_GRACE` seconds (default 5), to processes whose start
-time still matches. The wrapper itself escalates to SIGKILL after
-`CCTRL_WRAPPER_TERM_GRACE` seconds (default 10).
+after `CCTRL_CLOSE_REAP_GRACE` seconds (default 12), to processes whose start
+time still matches. For Claude panes the wrapper also escalates to SIGKILL
+after `CCTRL_WRAPPER_TERM_GRACE` seconds (default 10), which covers a plain
+`tmux kill-session` too. Codex runs in the wrapper's foreground, so for Codex
+panes only the cctrl paths above clean up. A bare `tmux kill-session` or
+`respawn-pane -k` can still leave Codex processes behind (follow-up plan 076).
 
 For sessions that ended before this existed, or were killed outside cctrl, run
 `session mark-closed`. It is dry-run by default and refuses a name that is
