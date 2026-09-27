@@ -6377,9 +6377,12 @@ JSON
  $(row old-a TMUX--mismatch false), $(row old-b TMUX--noid false), $(row old-c TMUX--noid false),
  $(row gone-1 TMUX--gone false),
  $(row ended-1 TMUX--dead1 false | jq -c '.lifecycle_state="closed" | .control_owner="unknown" | .execution_runtime="unknown"'), $(row active-1 TMUX--dead1 false),
- $(row open-a TMUX--dead2 false), $(row open-b TMUX--dead2 false)
+ $(row open-a TMUX--dead2 false), $(row open-b TMUX--dead2 false),
+ $(row app-x TMUX--dead3 false | jq -c '.control_owner="app" | .execution_runtime="app-server" | .restore_strategy="provider-managed"'), $(row cctrl-x TMUX--dead3 false)
 ]}
 JSON
+    mkdir -p "$root/meta"
+    printf '{"tmux_session":"TMUX--dead1","launch_command":"cd /tmp && cctrl start --foreground --name TMUX--dead1 --model opus --profile work"}\n' > "$root/meta/legacy-dead1.json"
     cat > "$root/sessions.json" <<'JSON'
 [{"name":"TMUX--pick","agent":"claude","session_id":"live-1","dir":"/tmp/x"},
  {"name":"TMUX--mismatch","agent":"claude","session_id":"brand-new","dir":"/tmp/x","control_owner":"cctrl","execution_runtime":"tmux","lifecycle_state":"active","registered_by_cctrl":true,"launched_by_cctrl":true},
@@ -6388,6 +6391,7 @@ JSON
     local out
     out="$(CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
       CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+      CCTRL_SESSION_METADATA_DIR="$root/meta" \
       CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$root/snapshots" --json)" \
       || fail "snapshot with shared tmux names failed: $out"
     jq -e '[.tasks[] | select(.tmux_session=="TMUX--pick")] | length==1 and .[0].provider_task_id=="live-1"
@@ -6416,6 +6420,13 @@ JSON
            and .[0].control_owner=="unknown" and (.[0].recovery_reason|startswith("ambiguous-tmux-claim"))
            and .[0].shadowed_task_ids==["open-b"]' <<< "$out" >/dev/null \
       || fail "several open claims on a dead tmux name were not ambiguous: $out"
+    # Rows that are not live still carry their launch flags for replay.
+    jq -e '[.tasks[] | select(.provider_task_id=="active-1")][0].launch_flags == {"model":"opus","profile":"work"}' <<< "$out" >/dev/null \
+      || fail "a row that is not live lost its launch flags: $(jq -c '[.tasks[] | select(.provider_task_id=="active-1")][0].launch_flags' <<< "$out")"
+    # An app-owned record does not claim a terminal, so it never makes the cctrl
+    # record on the same dead name ambiguous.
+    jq -e '[.tasks[] | select(.provider_task_id=="cctrl-x")][0] | .control_owner=="cctrl" and (.recovery_reason|startswith("ambiguous")|not)' <<< "$out" >/dev/null \
+      || fail "an app-owned record made a cctrl record ambiguous: $out"
     echo "ok: snapshot picks the live row per tmux name, never lets catalogue order decide a dead name, and only labels live rows already-live"
 }
 

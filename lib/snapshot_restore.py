@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import json
 import os
@@ -149,22 +150,33 @@ def select_tmux_source(candidates: list[dict[str, Any]], session: dict[str, Any]
     return {}, [], None
 
 
-def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]:
-    if not tmux_name:
-        return {}
+@functools.lru_cache(maxsize=4)
+def launch_commands(metadata_dir: str) -> dict[str, str]:
+    """tmux name -> launch_command, first record by sorted path wins (read once per capture)."""
     root = Path(metadata_dir)
+    commands: dict[str, str] = {}
     if not root.is_dir():
-        return {}
-    command = None
+        return commands
     for path in sorted(root.glob("*.json")):
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if isinstance(value, dict) and (value.get("tmux_session") == tmux_name or value.get("name") == tmux_name):
-            command = text(value.get("launch_command"))
-            if command:
-                break
+        if not isinstance(value, dict):
+            continue
+        command = text(value.get("launch_command"))
+        if not command:
+            continue
+        for name in {value.get("tmux_session"), value.get("name")}:
+            if isinstance(name, str) and name and name not in commands:
+                commands[name] = command
+    return commands
+
+
+def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]:
+    if not tmux_name:
+        return {}
+    command = launch_commands(metadata_dir).get(tmux_name)
     if not command:
         return {}
     try:
@@ -283,7 +295,10 @@ def capture(args: argparse.Namespace) -> int:
     live_names = {t.get("tmux_session") for t in tasks if t.get("tmux_session")}
     open_claims: dict[str, list[dict[str, Any]]] = {}
     for source in rows:
+        # App-owned records no longer claim a terminal, so they never make a
+        # cctrl record on the same dead name ambiguous.
         if isinstance(source, dict) and text(source.get("tmux_session")) and source.get("lifecycle_state") not in ENDED_STATES \
+                and source.get("control_owner") != "app" and source.get("execution_runtime") != "app-server" \
                 and source["tmux_session"] not in live_names:
             open_claims.setdefault(source["tmux_session"], []).append(source)
     for source in rows:
@@ -324,7 +339,10 @@ def capture(args: argparse.Namespace) -> int:
             "purpose": None,
             "display_label": text(source.get("display_title")),
             "agent": provider if provider in ("claude", "codex") else None,
-            "launch_flags": {},
+            # Replay flags for rows that are not live too (the fleet after a
+            # reboot, or while restore is only partly done), so a capture taken
+            # then still carries what restore needs.
+            "launch_flags": launch_flags_for(args.metadata_dir, tmux_name),
             "transcript_path": None,
             "transcript_bytes": None,
             "last_active": text(source.get("recency")),

@@ -48,6 +48,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Snapshot rows for tmux sessions that are not live now carry their
+  `launch_flags` too, so a capture taken while restore is only partly done
+  still has what restore replays. The metadata index is read once per
+  capture. A record owned by the Codex app no longer makes a cctrl record on
+  the same dead tmux name ambiguous. (plan 070 re-review P3)
 - Snapshot retention never prunes the newest history file by age. Because
   history is now written only on change, the newest file can be old and still
   be the last known state. (plan 070 review P3)
