@@ -124,7 +124,7 @@ Operational steps, 2026-09-25 (Matthew approved in chat):
   - Killed sessions are no longer offered.
   - homelab and scraper are `[already-live]`.
   - 3 `[conflict]` rows remain, all live Codex tasks: cctrl, homelab--2, rentkompass.
-- **Timer:** loaded at StartInterval 900. A kickstarted run exited 0 and wrote about 110 KB.
+- **Timer:** loaded at StartInterval 900, then moved to 300 on 2026-09-25 at Matthew's request. By 2026-09-27 it had run 626 times, the last exit was 0, and each capture was about 120–160 KB.
 
 Still open:
 - The 3 live Codex conflicts, plus 95ce and the other Codex rows, need the Codex App Server: its control socket is missing. Open the Codex desktop app, then run `cctrl task resolve-conflicts` (dry run) and `--apply`.

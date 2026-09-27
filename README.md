@@ -651,7 +651,7 @@ app tasks and tasks released to the app are retained as provider-managed
 references; snapshotting never starts, resumes, opens, or archives them. A
 launchd timer can run the capture every 5 minutes.
 
-Snapshots stay small (about 100 KB for ~3,000 known tasks):
+Snapshots stay small (about 100–160 KB for ~3,000 known tasks):
 
 - Labels and purposes are capped at 200 characters. A cut label carries
   `display_label_sha256` of the full text.

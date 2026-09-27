@@ -40,6 +40,9 @@ These are the P3 findings from the 2026-09-27 eng reviews of plans 073 (draft de
 - [ ] A test running a Codex-agent pane through `session close`.
 - [ ] A test of the survivors report, for a process that survives SIGKILL.
 
+### Test hygiene
+- [ ] `tests/run-tests.sh`: the `tree_digest` helper inside the Codex hook test is now unused, because its callers use `live_tree_digest`. Remove it.
+
 ## Rules
 
 Edit a copy of `cctrl` or `lib/*` and syntax-check it (`bash -n` / `perl -c`), then `mv` it into place. The live tree runs every session's hooks.
