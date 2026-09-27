@@ -48,6 +48,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- A delayed `session close` (`--in N`, or a session closing itself) records
+  the end from the tmux-server job that performs the kill, not from a
+  background process started by the closing pane. The recorder can no longer
+  die with the pane it is closing. If the session id can't be resolved, close
+  warns and points to `session mark-closed` instead of skipping silently.
+  (plan 070 re-review P3)
 - `task resolve-conflicts` fails closed when a live Claude process has no
   readable session file: that process might be running the task, so nothing
   is closed. Claude Code launched through `node` (npm installs) is recognised

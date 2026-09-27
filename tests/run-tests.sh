@@ -4297,6 +4297,15 @@ test_session_terminate_records_closed() (
     ! "$real_tmux" -L "$socket" has-session -t '=s-grace' 2>/dev/null || fail "delayed close did not kill the session"
     [[ "$(state_of "$f_grace")" == closed ]] || fail "a delayed close never recorded the end after the kill"
 
+    # A session closing itself: the pane (and anything it started) dies with
+    # the kill, so the end must be recorded by the tmux-server job.
+    local f_self
+    "$real_tmux" -L "$socket" new-session -d -s s-self "sleep 1; PATH=$(printf '%q' "$bin:$PATH") CCTRL_SESSION_METADATA_DIR=$(printf '%q' "$meta") CCTRL_DATA_DIR=$(printf '%q' "$data") CCTRL_HOST_ID_FILE=$(printf '%q' "$data/host-id") $(printf '%q' "$ROOT/cctrl") session close s-self --in 1 >/dev/null 2>&1; sleep 60"
+    anchor="$(anchor_of s-self)"; f_self="$(record_for s-self id-self $anchor)"
+    for i in $(seq 1 30); do [[ "$(state_of "$f_self")" == closed ]] && break; sleep 0.5; done
+    ! "$real_tmux" -L "$socket" has-session -t '=s-self' 2>/dev/null || fail "self-close did not kill the session"
+    [[ "$(state_of "$f_self")" == closed ]] || fail "a self-closing session's end was not recorded after its pane died"
+
     # A session whose records carry no pane anchor gets a hint instead of silence.
     record_for s-noanchor id-noanchor >/dev/null
     out="$(PATH="$bin:$PATH" "$ROOT/cctrl" session kill s-noanchor 2>&1)" || fail "kill of an unanchored session failed"

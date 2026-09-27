@@ -12246,15 +12246,18 @@ _session_record_terminated() {
     return 0
 }
 
-_session_record_terminated_after_exit() {
-    # Record the end once tmux session id $2 is gone (a deferred close). The
-    # waiter is detached and ignores SIGHUP so a self-closing pane can't take
-    # it down; if the session is still alive after $5 seconds nothing is written.
-    local name="$1" session_id="$2" anchors="$3" reason="$4" max_wait="$5"
-    [[ "$session_id" == \$* ]] || return 0
-    nohup "$SCRIPT_DIR/cctrl" session record-terminated "$name" --session-id "$session_id" \
-        --anchors "$anchors" --reason "$reason" --wait "$max_wait" >/dev/null 2>&1 &
-    disown 2>/dev/null || true
+_session_record_terminated_shell() {
+    # Print a shell command that records the end of tmux session id $2 once it
+    # is gone, for a tmux-server job (run-shell -b) to run after the kill.
+    # The job runs with the server's environment, so cctrl's paths and PATH are
+    # passed explicitly. Anchors travel comma-joined (no newlines in the job).
+    local name="$1" session_id="$2" anchors="$3" reason="$4" env_q="" var
+    [[ "$session_id" == \$* ]] || return 1
+    for var in PATH CCTRL_DATA_DIR CCTRL_SESSION_METADATA_DIR CCTRL_HOST_ID_FILE; do
+        [[ -n "${!var:-}" ]] && env_q+="$var=$(printf '%q' "${!var}") "
+    done
+    printf '%s%q session record-terminated %q --session-id %q --anchors %q --reason %q --wait 30' \
+        "$env_q" "$SCRIPT_DIR/cctrl" "$name" "$session_id" "$(printf '%s' "$anchors" | tr '\n' ',')" "$reason"
 }
 
 _session_record_terminated_cmd() {
@@ -12263,7 +12266,7 @@ _session_record_terminated_cmd() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --session-id) session_id="$2"; shift 2 ;;
-            --anchors) anchors="$2"; shift 2 ;;
+            --anchors) anchors="$(printf '%s' "$2" | tr ',' '\n')"; shift 2 ;;
             --reason) reason="$2"; shift 2 ;;
             --wait) max_wait="$2"; shift 2 ;;
             *) name="$1"; shift ;;
@@ -12616,7 +12619,15 @@ _session_close() {
         target_q="$(printf '%q' "$target")"
         # run-shell -b runs on the tmux server, so the delayed kill survives
         # the death of the calling pane/client.
-        if ! tmux run-shell -b "sleep $grace; tmux kill-session -t $target_q" 2>/dev/null; then
+        # The end is recorded by the same tmux-server job, after the kill, so
+        # it survives this pane dying (a self-close) and never runs early.
+        local record_cmd=""
+        record_cmd="$(_session_record_terminated_shell "$target" "$close_session_id" "$close_anchors" \
+            "session closed by cctrl session close")" || {
+            echo -e "${YELLOW}⚠  Could not resolve the tmux session id for $target; its end will not be recorded. Afterwards run: cctrl session mark-closed $target --apply${RESET}" >&2
+            record_cmd=""
+        }
+        if ! tmux run-shell -b "sleep $grace; tmux kill-session -t $target_q${record_cmd:+; $record_cmd}" 2>/dev/null; then
             if ! tmux kill-session -t "$target"; then
                 echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
                 return 1
@@ -12625,10 +12636,6 @@ _session_close() {
             echo -e "${GREEN}Closed session: $target${RESET}"
             return 0
         fi
-        # The kill runs later on the tmux server. Record the end only once that
-        # exact session is gone; a detached waiter survives this pane's death.
-        _session_record_terminated_after_exit "$target" "$close_session_id" "$close_anchors" \
-            "session closed by cctrl session close" "$((grace + 30))"
         if [[ "$target" == "$current" ]]; then
             echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s — wrap up now."
         else
