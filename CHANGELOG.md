@@ -48,6 +48,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `session ls` no longer reports `unsent-draft` for an empty composer. The
+  draft detector reads the pane with escapes (`capture-pane -e`), ignores
+  Claude Code's dimmed ghost suggestion (SGR 2) and the reverse-video cursor,
+  and judges only the last prompt line (the composer), not submitted messages
+  in the transcript above it. Autoheal's draft gate uses the same detector.
+  (plan 073)
 - A delayed `session close` (`--in N`, or a session closing itself) records
   the end from the tmux-server job that performs the kill, not from a
   background process started by the closing pane. The recorder can no longer

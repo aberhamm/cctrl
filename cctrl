@@ -9484,16 +9484,21 @@ _session_pane_has_draft() {
     # True (exit 0) when the captured pane shows a non-empty Claude Code input
     # line — a prompt glyph ('>' or Claude Code's '❯' U+276F) followed by typed,
     # unsubmitted text. Anchored to the start of the line (optionally inside the
-    # input box border) so it doesn't match a stray glyph elsewhere. Both glyphs
-    # are accepted because the real Claude Code input line begins with '❯', not
-    # ASCII '>' (plan 030). Known placeholder / hint text (the dimmed "Try ..."
-    # prompt, shortcut hints) is excluded so an EMPTY input box never reads as a
-    # draft. Fragile pane detector (eng-flagged); read-only.
+    # input box border) so it doesn't match a stray glyph elsewhere. Known
+    # placeholder / hint text ("Try ...", shortcut hints) is excluded.
+    #
+    # Pass an escaped capture (`capture-pane -e`): Claude Code draws its
+    # predicted next prompt as dimmed ghost text (SGR 2) in an EMPTY composer,
+    # and only the attributes tell it apart from typed text. Dim and
+    # reverse-video (cursor) characters never count (plan 073). A plain capture
+    # still works, with every character counting as typed. Read-only.
     local capture="$1"
-    printf '%s\n' "$capture" \
-        | grep -E '^[[:space:]│|]*[>❯][[:space:]]+[^[:space:]]' \
-        | grep -Eiv 'Try "|for shortcuts|for commands|for newline|esc to (interrupt|cancel)|/ for' \
-        >/dev/null 2>&1
+    printf '%s\n' "$capture" | perl "$SCRIPT_DIR/lib/pane_draft.pl"
+}
+
+_strip_sgr() {
+    # Remove terminal escape sequences from an escaped pane capture.
+    printf '%s\n' "$1" | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\e\][^\a]*\a//g; s/\e.//g'
 }
 
 _session_rich_state() {
@@ -9547,9 +9552,11 @@ _session_rich_state() {
         local copy_mode capture
         copy_mode="$(tmux display -p -t "$sess" '#{pane_in_mode}' 2>/dev/null || true)"
         if [[ "${copy_mode:-0}" != "1" ]]; then
-            capture="$(tmux capture-pane -p -S -40 -t "$sess" 2>/dev/null || true)"
+            # Escaped capture: the draft detector needs SGR attributes to tell
+            # dimmed ghost text from typed text; the dialog detector gets it plain.
+            capture="$(tmux capture-pane -e -p -S -40 -t "$sess" 2>/dev/null || true)"
             if [[ -n "$capture" ]]; then
-                if [[ "$en_blocked" == "1" ]] && _session_pane_has_dialog "$capture" "$agent"; then
+                if [[ "$en_blocked" == "1" ]] && _session_pane_has_dialog "$(_strip_sgr "$capture")" "$agent"; then
                     printf '%s' 'blocked-dialog'; return 0
                 fi
                 if [[ "$en_draft" == "1" && "$base" == "idle" ]] && _session_pane_has_draft "$capture"; then
@@ -11868,7 +11875,7 @@ _session_autoheal() {
             if [[ "${copy_mode:-0}" == "1" ]]; then
                 action="skipped"; reason="copy-mode"
             else
-                capture="$(tmux capture-pane -p -S -40 -t "$name" 2>/dev/null || true)"
+                capture="$(tmux capture-pane -e -p -S -40 -t "$name" 2>/dev/null || true)"
                 if [[ -z "$capture" ]]; then
                     # Can't confirm the input line is empty — fail safe, never heal.
                     action="skipped"; reason="unverifiable-input"

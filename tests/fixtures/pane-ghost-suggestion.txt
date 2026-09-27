@@ -1,0 +1,6 @@
+  ⏺ Done. The scaffold is in place.
+
+────────
+❯ [2myeah clean up the scaffolded project[0m
+────────
+  [2m? for shortcuts[0m

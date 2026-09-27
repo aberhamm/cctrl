@@ -1,7 +1,7 @@
 ---
 id: 073
 title: Dimmed prompt suggestions are not unsent drafts
-status: pending
+status: in-progress
 blocked-by: []
 priority: 73
 allows-migrations: false
@@ -23,11 +23,13 @@ Claude Code draws a predicted next prompt as dimmed "ghost text" in an empty com
 
 ## Requirements
 
-- [ ] The draft detector reads the pane with escapes (`capture-pane -e`). It counts composer text as a draft only if at least one non-space character is drawn outside dim (SGR 2). A reverse-video character is the cursor and is ignored.
-- [ ] U+00A0 after `❯` is treated as a space.
-- [ ] A real draft is still detected: typed text after the ghost text, or plain text with no dim at all.
-- [ ] Both callers use the escaped capture: rich state (`session ls` STATE) and the autoheal draft gate.
-- [ ] Tests use the exact byte sequence `❯ \e[2myeah clean up the scaffolded project\e[0m`, plus a real draft and a draft with a reverse-video cursor.
+- [x] The draft detector reads the pane with escapes (`capture-pane -e`). It counts composer text as a draft only if at least one non-space character is drawn outside dim (SGR 2). A reverse-video character is the cursor and is ignored.
+- [x] U+00A0 after `❯` is treated as a space.
+- [x] A real draft is still detected: typed text after the ghost text, or plain text with no dim at all.
+- [x] Both callers use the escaped capture: rich state (`session ls` STATE) and the autoheal draft gate.
+- [x] Tests use the exact byte sequence `❯ \e[2myeah clean up the scaffolded project\e[0m`, plus a real draft and a draft with a reverse-video cursor.
+
+- [x] Only the last prompt line on screen, the composer, is judged. Found live on 2026-09-27: submitted messages in the transcript above (`❯ yes` on a grey background) made two sessions with empty composers read as drafts.
 
 ## Tasks
 

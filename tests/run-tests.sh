@@ -2303,7 +2303,7 @@ test_session_pane_has_draft_glyph_fixtures() {
     # committed real-pane fixtures. A draft line beginning with '❯' (and the
     # legacy ASCII '>') must be detected; an empty box showing only placeholder /
     # hint text must NOT be — the glyph-independent exclusion filter still holds.
-    local fn="$TMPDIR/pane-draft-fn.sh"
+    local fn="$TMPDIR/pane-draft-fn.sh" SCRIPT_DIR="$ROOT"
     awk '/^_session_pane_has_draft\(\) \{/,/^}/' "$ROOT/cctrl" > "$fn"
     # shellcheck source=/dev/null
     source "$fn"
@@ -2321,7 +2321,21 @@ test_session_pane_has_draft_glyph_fixtures() {
     # A bare placeholder line under the ❯ glyph is excluded too.
     ! _session_pane_has_draft '❯ Try "write a test for the parser"' \
         || fail "expected ❯ placeholder 'Try ...' line to be excluded"
-    echo "ok: _session_pane_has_draft fires on ❯ and > drafts, ignores hint text"
+    # Plan 073: Claude Code's predicted next prompt is dimmed ghost text in an
+    # EMPTY composer (the exact bytes it draws: ❯, U+00A0, SGR 2 … SGR 0).
+    ! _session_pane_has_draft "$(cat "$fx/pane-ghost-suggestion.txt")" \
+        || fail "dimmed ghost suggestion was read as an unsent draft"
+    ! _session_pane_has_draft $'\xe2\x9d\xaf\xc2\xa0\e[7my\e[27m\e[2meah clean up the scaffolded project\e[0m' \
+        || fail "ghost suggestion under a reverse-video cursor was read as a draft"
+    _session_pane_has_draft $'\xe2\x9d\xaf\xc2\xa0fix the tests\e[7m \e[27m' \
+        || fail "typed text in an escaped capture was not detected as a draft"
+    _session_pane_has_draft $'\xe2\x9d\xaf\xc2\xa0\e[2myeah\e[0m\e[38;5;231m and more\e[39m' \
+        || fail "typed text after ghost text was not detected as a draft"
+    # Only the last prompt line is the composer: a submitted "❯ yes" in the
+    # transcript above an empty composer is not a draft (seen live 2026-09-27).
+    ! _session_pane_has_draft $'\e[38;5;239m\e[48;5;237m\xe2\x9d\xaf \e[38;5;231myes\e[39m\n  answer text\n\e[39m\xe2\x9d\xaf\xc2\xa0' \
+        || fail "a submitted transcript line above an empty composer was read as a draft"
+    echo "ok: _session_pane_has_draft fires on ❯ and > drafts, ignores hint text and dimmed ghost suggestions"
 }
 
 test_session_rich_state_detects_glyph_draft() {
@@ -2372,7 +2386,13 @@ JSON
     state="$(printf '%s' "$out" | jq -r '.[0].state')"
     [[ "$state" == "unsent-draft" ]] \
         || fail "expected ❯ draft pane to surface as unsent-draft; got: $state"
-    echo "ok: rich-state surfaces a ❯ (U+276F) input line as unsent-draft"
+    # An empty composer showing only the dimmed ghost suggestion is not a draft.
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        DRAFT_FIXTURE="$ROOT/tests/fixtures/pane-ghost-suggestion.txt" \
+        TMUX_FAKE_SESSIONS="TMUX--glyphdraft" "$ROOT/cctrl" session ls --json)"
+    state="$(printf '%s' "$out" | jq -r '.[0].state')"
+    [[ "$state" != "unsent-draft" ]] || fail "dimmed ghost suggestion surfaced as unsent-draft in session ls"
+    echo "ok: rich-state surfaces a ❯ (U+276F) input line as unsent-draft, but not a dimmed ghost suggestion"
 }
 
 test_session_autoheal_skips_glyph_draft() {
@@ -9321,6 +9341,13 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             exit 0
             ;;
         health-check) ;;
+        pane-draft)
+            test_session_pane_has_draft_glyph_fixtures
+            test_session_rich_state_detects_glyph_draft
+            test_session_autoheal_skips_glyph_draft
+            echo "ok"
+            exit 0
+            ;;
         snapshot-ownership)
             test_snapshot_ownership_policy
             test_snapshot_tmux_row_selection
