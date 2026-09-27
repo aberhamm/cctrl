@@ -2331,6 +2331,20 @@ test_session_pane_has_draft_glyph_fixtures() {
         || fail "typed text in an escaped capture was not detected as a draft"
     _session_pane_has_draft $'\xe2\x9d\xaf\xc2\xa0\e[2myeah\e[0m\e[38;5;231m and more\e[39m' \
         || fail "typed text after ghost text was not detected as a draft"
+    # Review P2: hint words inside a typed draft don't make it a placeholder.
+    _session_pane_has_draft '❯ check lib/ for the retry bug' \
+        || fail "a draft containing 'lib/ for' was read as a placeholder"
+    _session_pane_has_draft '❯ list the for commands we support' \
+        || fail "a draft containing 'for commands' was read as a placeholder"
+    # Review P3: colon SGR sub-parameters and OSC 8 links ended by ST.
+    ! _session_pane_has_draft $'\xe2\x9d\xaf\xc2\xa0\e[2;4:3myeah clean up\e[0m' \
+        || fail "ghost text with a colon SGR code was read as a draft"
+    ! _session_pane_has_draft $'\e]8;;https://example.com\e\\link\e]8;;\e\\\n\xe2\x9d\xaf\xc2\xa0\e[2mghost\e[0m' \
+        || fail "an OSC 8 link ended by ST broke ghost-text parsing"
+    # A failing detector is neither "draft" (0) nor "no draft" (1).
+    local rc=0
+    SCRIPT_DIR="$TMPDIR/no-such-cctrl" _session_pane_has_draft '❯ hi' || rc=$?
+    (( rc > 1 )) || fail "a failing draft detector returned $rc instead of an unverifiable status"
     # Only the last prompt line is the composer: a submitted "❯ yes" in the
     # transcript above an empty composer is not a draft (seen live 2026-09-27).
     ! _session_pane_has_draft $'\e[38;5;239m\e[48;5;237m\xe2\x9d\xaf \e[38;5;231myes\e[39m\n  answer text\n\e[39m\xe2\x9d\xaf\xc2\xa0' \
@@ -2415,7 +2429,23 @@ test_session_autoheal_skips_glyph_draft() {
     assert_contains "$out" '"reason": "unsent-draft"'
     [[ -s "$rlog" ]] && fail "❯ draft session must NOT be repaired (repair log non-empty)"
     assert_contains "$(cat "$hlog")" "skipped TMUX--ms--portal (unsent-draft)"
-    echo "ok: autoheal safety gate skips a ❯ (U+276F) real-pane draft"
+
+    # Plan 073: if the draft detector itself fails, the gate fails closed —
+    # it can't confirm the input line is empty, so it never sends C-u.
+    local brokebin="$TMPDIR/ah-glyph-brokeperl"
+    mkdir -p "$brokebin"
+    printf '#!/usr/bin/env bash
+exit 2
+' > "$brokebin/perl"; chmod +x "$brokebin/perl"
+    : > "$rlog"
+    out="$(PATH="$brokebin:$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE="$(cat "$ROOT/tests/fixtures/pane-empty-hint.txt")" \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"reason": "unverifiable-input"'
+    [[ -s "$rlog" ]] && fail "autoheal repaired a session although the draft detector failed"
+    echo "ok: autoheal safety gate skips a ❯ (U+276F) real-pane draft and fails closed when the detector fails"
 }
 
 test_needs_me_digest() {

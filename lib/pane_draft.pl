@@ -11,7 +11,9 @@ use warnings;
 use utf8;
 binmode STDIN, ':encoding(UTF-8)';
 
-my $hint = qr/Try "|for shortcuts|for commands|for newline|esc to (?:interrupt|cancel)|\/ for/i;
+# Placeholder/hint text only when it IS the composer text, i.e. at its start:
+# a typed draft may well contain "for commands" or "lib/ for" (review P2).
+my $hint = qr/^[\s\x{00A0}│|]*[>❯][\s\x{00A0}]*(?:Try "|\? for shortcuts|esc to (?:interrupt|cancel))/i;
 my $found = 0;
 while (my $line = <STDIN>) {
     chomp $line;
@@ -19,10 +21,11 @@ while (my $line = <STDIN>) {
     my ($visible, $typed) = ('', '');
     my $pos = 0;
     while ($pos < length $line) {
-        if (substr($line, $pos) =~ /^\e\[([0-9;]*)m/) {
+        if (substr($line, $pos) =~ /^\e\[([0-9;:]*)m/) {
             my @codes = length $1 ? split(/;/, $1) : (0);
             for (my $i = 0; $i < @codes; $i++) {
                 my $c = $codes[$i];
+                $c =~ s/:.*//;    # colon sub-parameters, e.g. 4:3 curly underline
                 if ($c eq '' || $c == 0) { ($dim, $rev) = (0, 0) }
                 elsif ($c == 2) { $dim = 1 }
                 elsif ($c == 22) { $dim = 0 }
@@ -36,7 +39,7 @@ while (my $line = <STDIN>) {
             $pos += length $&;
             next;
         }
-        if (substr($line, $pos) =~ /^\e(?:\[[0-9;?]*[A-Za-z]|\][^\a]*\a|.)/) {
+        if (substr($line, $pos) =~ /^\e(?:\[[0-9;:?<>=]*[ -\/]*[\@-~]|\].*?(?:\a|\e\\)|.)/) {
             $pos += length $&;    # other escape sequences carry no text
             next;
         }

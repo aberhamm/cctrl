@@ -9493,8 +9493,10 @@ _session_pane_has_draft() {
     # and only the attributes tell it apart from typed text. Dim and
     # reverse-video (cursor) characters never count (plan 073). A plain capture
     # still works, with every character counting as typed. Read-only.
+    # Exit 0 draft, 1 no draft; anything else (perl missing or failing) is
+    # unverifiable and callers that act on "no draft" must fail closed.
     local capture="$1"
-    printf '%s\n' "$capture" | perl "$SCRIPT_DIR/lib/pane_draft.pl"
+    printf '%s\n' "$capture" | perl "$SCRIPT_DIR/lib/pane_draft.pl" 2>/dev/null
 }
 
 _strip_sgr() {
@@ -11854,7 +11856,7 @@ _session_autoheal() {
     while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
         < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
-    local name cmd rc pid st copy_mode capture action reason
+    local name cmd rc pid st copy_mode capture action reason draft_rc
     local scanned=0 healed=0 skipped=0 would=0 failed=0
     $json || printf '%-22s %-14s %s\n' "SESSION" "ACTION" "DETAIL"
     for name in "${names[@]}"; do
@@ -11880,10 +11882,17 @@ _session_autoheal() {
                 if [[ -z "$capture" ]]; then
                     # Can't confirm the input line is empty — fail safe, never heal.
                     action="skipped"; reason="unverifiable-input"
-                elif _session_pane_has_draft "$capture"; then
-                    action="skipped"; reason="unsent-draft"
                 else
-                    action="eligible"
+                    draft_rc=0
+                    _session_pane_has_draft "$capture" || draft_rc=$?
+                    if (( draft_rc == 0 )); then
+                        action="skipped"; reason="unsent-draft"
+                    elif (( draft_rc != 1 )); then
+                        # Detector failed: can't confirm the input is empty (C-u would erase it).
+                        action="skipped"; reason="unverifiable-input"
+                    else
+                        action="eligible"
+                    fi
                 fi
             fi
         fi

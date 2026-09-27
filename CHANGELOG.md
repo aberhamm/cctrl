@@ -48,6 +48,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- The unsent-draft detector recognises placeholder text only at the start of
+  the composer, so a typed draft containing words like "lib/ for" or "for
+  commands" is no longer missed. That miss could have let autoheal's `C-u`
+  erase the draft. The detector also parses colon SGR sub-parameters
+  (`\e[4:3m`) and OSC 8 links ended by ST. If the detector fails, autoheal
+  skips the session as `unverifiable-input` instead of treating the composer
+  as empty. (plan 073 review)
 - Closing a session no longer leaves its wrapper and agent running. On tmux
   hangup, `lib/session-wrapper.sh` stops the agent with SIGTERM and then
   SIGKILL after `CCTRL_WRAPPER_TERM_GRACE` (10 s); before, it waited forever
