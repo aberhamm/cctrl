@@ -201,12 +201,23 @@ failing open:
   just silently allow-through anymore, it actively blocks or denies
   something, which is a real behavior change from before this plan.
 
-No hook deliberately exits 2 today, so none of this fires yet, but the
-fail-open guarantee this whole design exists to provide is now narrower
-than "any non-0/1 code from the dispatch path is safe" — it's "any
-non-0/1/2 code is safe; a 2 is trusted as deliberate." Matthew approved
-this trade-off (C-17) with the awareness that it's a deliberate
-narrowing, not a no-op.
+No hook dispatched through `cctrl hooks run` deliberately exits 2 today
+(`pre-tool-use` → `block-git-commit.py`, `stop` → `notify.sh` +
+`session-log.py`, `notify` → `notify.sh`, `codex-observe` →
+`codex-session-observer.py` — none of them do), so none of the above
+fires yet through the launcher. `hooks/peer-doorbell.sh` *does*
+deliberately exit 2 already (README: "Stop/Notification hook: exit 2 on
+queued peer mail"), but it's registered as its own direct hook command
+(its absolute path, checked by `_peer_doorbell_registered`) — Claude
+Code/Codex invoke it directly, not through `cctrl hooks run`, so it never
+passes through the launcher and this plan doesn't touch its behavior.
+It's useful proof the exit-2 convention already works correctly
+end-to-end for a real hook, just not (yet) for one dispatched via `hooks
+run`. The fail-open guarantee this whole design exists to provide is now
+narrower than "any non-0/1 code from the `hooks run` dispatch path is
+safe" — it's "any non-0/1/2 code is safe; a 2 is trusted as deliberate."
+Matthew approved this trade-off (C-17) with the awareness that it's a
+deliberate narrowing, not a no-op.
 
 ## Design
 
