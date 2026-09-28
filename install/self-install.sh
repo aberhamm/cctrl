@@ -26,16 +26,38 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "cctrl self-install: building release from $ROOT" >&2
+# Refuse a dirty tree: installing anything other than exactly what HEAD
+# says is committed reopens the 2026-09-27 hazard this plan exists to
+# close (a half-finished edit to a tracked file ending up live). Ignores
+# untracked files (data/, costs/, profiles/, .active-profile are gitignored
+# and irrelevant to this check) -- only tracked-file modifications count.
+if [[ -n "$(cd "$ROOT" && git status --porcelain --untracked-files=no)" ]]; then
+    echo "cctrl self-install: refusing to install -- $ROOT has uncommitted changes to tracked files. Commit or stash them first." >&2
+    cd "$ROOT" && git status --short --untracked-files=no >&2
+    exit 1
+fi
 
+SHA="$(cd "$ROOT" && git rev-parse HEAD)"
+SHORT_SHA="${SHA:0:12}"
+
+echo "cctrl self-install: building release from $ROOT at $SHORT_SHA" >&2
+
+# Build the release from exactly what's committed at HEAD, not a hand-kept
+# list of paths: `git archive` extracts every tracked file and nothing
+# else, so a new lib/hooks/test/doc file is shipped automatically and
+# nothing untracked (data/, costs/, profiles/, .active-profile, scratch
+# files) sneaks in. Three hand-kept-list gaps found and fixed across the
+# first four live installs (install.sh, install/, AGENTS.md/CLAUDE.md/
+# README.md/skills/, .githooks/) are exactly the failure mode this closes.
 mkdir -p "$SCRATCH"
-for item in cctrl install.sh install lib hooks completions plugins tests \
-            AGENTS.md CLAUDE.md README.md skills .githooks; do
-    if [[ -e "$ROOT/$item" ]]; then
-        cp -a "$ROOT/$item" "$SCRATCH/$item"
-    fi
-done
-find "$SCRATCH" -name '__pycache__' -type d -exec rm -rf {} + 2>/dev/null || true
+git -C "$ROOT" archive --format=tar "$SHA" | tar -x -C "$SCRATCH"
+printf '%s\n' "$SHA" > "$SCRATCH/VERSION"
+
+# data/config.json is tracked despite data/ being gitignored (it ships a
+# default config for fresh installs), so the archive leaves a real
+# data/config.json behind. Clear it before symlinking -- the repo's own
+# data/config.json is the same file; the symlink is authoritative.
+rm -rf "$SCRATCH/data" "$SCRATCH/costs" "$SCRATCH/profiles" "$SCRATCH/.active-profile"
 
 # Mutable state lives in the repo, never duplicated into a release.
 for link in data costs profiles; do
@@ -64,9 +86,8 @@ done
 echo "cctrl self-install: running full test suite (LANG=en_US.UTF-8)" >&2
 LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"
 
-SHA="$(cd "$ROOT" && git rev-parse --short HEAD 2>/dev/null || echo nogit)"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-RELEASE_NAME="${SHA}-${TS}"
+RELEASE_NAME="${SHORT_SHA}-${TS}"
 RELEASE_DIR="$RELEASES_DIR/$RELEASE_NAME"
 
 mv "$SCRATCH" "$RELEASE_DIR"

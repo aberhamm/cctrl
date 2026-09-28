@@ -499,6 +499,30 @@ test_cctrl_current_swap_is_atomic_on_bsd_mv() {
         || fail "swap regressed to the BSD mv bug: current.next ended up inside the old release"
 }
 
+# install/self-install.sh refuses to build a release from a dirty tree
+# (uncommitted changes to tracked files) using `git status --porcelain
+# --untracked-files=no`. This exercises that exact check against a real
+# git fixture rather than the full self-install.sh (which also runs the
+# entire suite internally and would make this test recursive).
+test_git_dirty_check_matches_self_install_semantics() {
+    local repo="$TMPDIR/dirty-check-repo"
+    mkdir -p "$repo"
+    (cd "$repo" && git init -q && git config user.email t@t.co && git config user.name t \
+        && echo hi > f.txt && git add f.txt && git commit -q -m init)
+
+    [[ -z "$(cd "$repo" && git status --porcelain --untracked-files=no)" ]] \
+        || fail "expected a freshly committed repo to report clean"
+
+    (cd "$repo" && echo changed > f.txt)
+    [[ -n "$(cd "$repo" && git status --porcelain --untracked-files=no)" ]] \
+        || fail "expected a modified tracked file to be detected as dirty"
+    (cd "$repo" && git checkout -q -- f.txt)
+
+    (cd "$repo" && echo untracked > new.txt)
+    [[ -z "$(cd "$repo" && git status --porcelain --untracked-files=no)" ]] \
+        || fail "expected an untracked file alone not to count as dirty (data/costs/profiles/.active-profile are gitignored and must not block install)"
+}
+
 test_launch_args() {
     make_fake_agent "$TMPDIR/codex" codex
     make_fake_agent "$TMPDIR/claude" claude
@@ -9658,6 +9682,7 @@ test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit
 test_cctrl_launcher_non_hooks_run_commands_fail_loudly
 test_cctrl_launcher_hooks_run_fails_open_when_release_missing
 test_cctrl_current_swap_is_atomic_on_bsd_mv
+test_git_dirty_check_matches_self_install_semantics
 test_launch_args
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default

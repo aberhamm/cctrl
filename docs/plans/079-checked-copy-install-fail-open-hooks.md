@@ -252,54 +252,69 @@ another session's edit landing between "tests passed" and "copy made").
 A `trap` removes the scratch dir on any failure or interrupt.
 
 1. `trap 'rm -rf "$SCRATCH"' EXIT` before creating anything.
-2. Build the release in a scratch dir first:
+2. **Superseded design note:** the first four live attempts built the
+   release with a hand-kept `cp -a` list (`cctrl`, `lib/`, `hooks/`,
+   `completions/`, `plugins/`, `tests/`, ...), and it missed a path on
+   three of the four attempts — `install.sh`/`install/`
+   (`test_syntax()`'s unconditional `$ROOT/install.sh` check),
+   `AGENTS.md`/`CLAUDE.md`/`README.md`/`skills/`
+   (`test_peer_contract_docs`, `test_codex_ownership_matrix_contract`),
+   and `.githooks/` (`tests/test_secret_hook.py` runs
+   `.githooks/pre-commit` directly). Each miss failed the gate loudly
+   before touching anything installed — the fail-safe design worked
+   exactly as intended every time — but a list that has to be
+   hand-extended every time a test references a new top-level path
+   isn't a sound long-term shape. Per fleet-manager direction
+   (gitarchive-fm0928, 2026-09-28), replaced with:
+   **`git archive` from a required-clean `HEAD`.**
+3. Refuse to build if the tree is dirty:
+   `git -C "$ROOT" status --porcelain --untracked-files=no` — non-empty
+   output aborts before creating anything. `--untracked-files=no` is
+   deliberate: `data/`, `costs/`, `profiles/`, `.active-profile` are
+   gitignored and must not block an install just for existing; only
+   *modifications to tracked files* count as dirty, which is exactly
+   the 2026-09-27 hazard shape (a half-finished edit to a tracked file).
+   This makes "only committed code ships" an explicit property of the
+   installer, not an accident of what a `cp -a` list happened to catch.
+4. Build the release in a scratch dir first:
    `~/.local/lib/cctrl/releases/.tmp-$$` (created on the same filesystem
-   as `releases/` so the later `mv` is a same-fs rename). `cp -a` of
-   `cctrl`, `install.sh`, `install/`, `lib/`, `hooks/`, `completions/`,
-   `plugins/`, `tests/`, `AGENTS.md`, `CLAUDE.md`, `README.md`,
-   `skills/`, and `.githooks/` (excluding `__pycache__`) into it, then
-   create the four
-   symlinks (`data`, `costs`, `profiles`, `.active-profile`) back to
-   this repo's copies. The list is wider than the original draft's
-   `cctrl`/`lib`/`hooks`/`completions`/`plugins`/`tests`: because the
-   scratch copy runs its **own** `tests/run-tests.sh` (step 6), every
-   top-level path that suite references via `$ROOT/...` has to exist
-   inside the scratch copy too — not just cctrl's runtime dependencies.
-   `install.sh`/`install/` (`test_syntax()`'s `$ROOT/install.sh` and
-   `$ROOT/install/*.sh` glob) and `AGENTS.md`/`CLAUDE.md`/`README.md`/
-   `skills/` (`test_peer_contract_docs`, `test_codex_ownership_matrix_contract`)
-   were both missed on the first two live attempts, and `.githooks/`
-   (`tests/test_secret_hook.py` runs `.githooks/pre-commit` directly)
-   was missed on the third — each caused the gate to fail loudly before
-   touching anything installed, exactly the fail-safe behavior working
-   as designed, just tripped by an incomplete copy list rather than a
-   real defect.
-3. `bash -n` on the **scratch copy's** `cctrl`, `install.sh` (if
+   as `releases/` so the later `mv` is a same-fs rename).
+   `git -C "$ROOT" archive --format=tar "$SHA" | tar -x -C "$SCRATCH"`
+   extracts every tracked file at `HEAD` and nothing else — no hand-kept
+   list to fall out of sync with what the bundled test suite references.
+   Write `$SHA` (the full commit hash) to `$SCRATCH/VERSION`. `data/config.json`
+   is tracked despite `data/` being gitignored (it ships a default config
+   for fresh installs), so the archive leaves a real `data/config.json`
+   behind — `rm -rf` the archived `data/`, `costs/`, `profiles/`,
+   `.active-profile` (only the last three are ever non-empty from the
+   archive) before creating the four symlinks back to this repo's real
+   copies, same as before.
+5. `bash -n` on the **scratch copy's** `cctrl`, `install.sh` (if
    present), `install/self-install.sh`, `install/cctrl-launcher.sh`,
    every `lib/*.sh` and `hooks/*.sh` (glob, not a hand list).
-4. `python3 -m py_compile` on the scratch copy's every `lib/*.py`,
+6. `python3 -m py_compile` on the scratch copy's every `lib/*.py`,
    `hooks/*.py`, and `plugins/cctrl-*` (glob).
-5. `perl -c` on the scratch copy's `lib/pane_draft.pl`.
-6. `LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"` — full suite,
+7. `perl -c` on the scratch copy's `lib/pane_draft.pl`.
+8. `LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"` — full suite,
    run from inside the scratch copy so it exercises exactly what's about
    to ship, must exit 0.
-7. Any failure in 3–6 aborts with a clear message; the `EXIT` trap cleans
+9. Any failure in 3–8 aborts with a clear message; the `EXIT` trap cleans
    up the scratch dir; nothing under `~/.local/bin` or `~/.local/lib`
    changes.
-8. `mv` the scratch dir to its final name `releases/<git-sha>-<UTC
-   timestamp>` (atomic rename, same filesystem, disarm the cleanup trap
-   for this path once the mv succeeds).
-9. Atomic symlink swap: `ln -s "releases/<new>" current.next && mv -fh
-   current.next current`. **`-h`/`-n` is required**: plain `mv -f
-   current.next current` on macOS/BSD `mv` follows `current` (a symlink
-   to a directory) and moves `current.next` *inside* the old release
-   instead of replacing the `current` symlink itself — verified by
-   reproduction in a scratch dir during review. `mv -fh` (or `-n`)
-   replaces the symlink instead of following it, which is what makes this
-   step atomic. Verify immediately after: `[[ "$(readlink current)" ==
-   "releases/<new>" ]]` — abort loudly (this is now a real bug, not a
-   "couldn't run" case) if it doesn't match.
-10. Install the launcher: copy `install/cctrl-launcher.sh` to
+10. `mv` the scratch dir to its final name `releases/<short-sha>-<UTC
+    timestamp>` (atomic rename, same filesystem, disarm the cleanup trap
+    for this path once the mv succeeds).
+11. Atomic symlink swap: `ln -s "releases/<new>" current.next && mv -fh
+    current.next current`. **`-h`/`-n` is required**: plain `mv -f
+    current.next current` on macOS/BSD `mv` follows `current` (a symlink
+    to a directory) and moves `current.next` *inside* the old release
+    instead of replacing the `current` symlink itself — verified by
+    reproduction in a scratch dir during review. `mv -fh` (or `-n`)
+    replaces the symlink instead of following it, which is what makes this
+    step atomic. Verify immediately after: `[[ "$(readlink current)" ==
+    "releases/<new>" ]]` — abort loudly (this is now a real bug, not a
+    "couldn't run" case) if it doesn't match.
+12. Install the launcher: copy `install/cctrl-launcher.sh` to
     `~/.local/bin/cctrl.new`, `bash -n` it, `chmod +x`, `mv` it onto
     `~/.local/bin/cctrl` (atomic rename, replaces the existing symlink or
     file at that exact path in one syscall — this one has no
@@ -308,7 +323,7 @@ A `trap` removes the scratch dir on any failure or interrupt.
     install `mv` onto an existing symlink replaces the symlink itself,
     not its target, because the destination has no trailing slash and
     `current`-style directory-following doesn't apply to a file `mv`).
-11. **No automatic pruning of old releases.** Sessions started through
+13. **No automatic pruning of old releases.** Sessions started through
     `~/.local/bin/cctrl` resolve `SCRIPT_DIR` to their release directory
     (not `current`) at startup and bake that literal path into their MCP
     runtime/peer config and argv for the session's entire life
@@ -321,7 +336,7 @@ A `trap` removes the scratch dir on any failure or interrupt.
     work, tracked as a follow-up, not blocking this plan. A release
     directory is small (a few MB); unbounded growth over months is an
     acceptable trade for not breaking long-lived sessions.
-12. Print what changed and the rollback command.
+14. Print what changed and the rollback command.
 
 ### Rollback
 
@@ -353,16 +368,23 @@ itself.
 - [ ] `install/cctrl-launcher.sh` added: no `set -e`; `hooks run` gate
       exactly as designed above; `bash -n` clean; covered by
       `tests/run-tests.sh`.
-- [ ] `install/self-install.sh` added: builds the scratch release
-      **first**, runs every gate (syntax + full suite) against the
-      scratch copy, cleans up on any failure via `trap`, then does the
-      atomic `releases/` rename, the `mv -fh current.next current` swap
-      (with a post-swap `readlink` assertion), and the atomic launcher
-      install; does **not** auto-prune old releases; prints the rollback
-      command on success.
+- [ ] `install/self-install.sh` added: refuses to build from a dirty
+      tree (`git status --porcelain --untracked-files=no` non-empty);
+      builds the scratch release from `git archive --format=tar HEAD`
+      (not a hand-kept file list — see "Superseded design note" above),
+      writes the full commit SHA to `VERSION` inside the release, runs
+      every gate (syntax + full suite) against the scratch copy, cleans
+      up on any failure via `trap`, then does the atomic `releases/`
+      rename, the `mv -fh current.next current` swap (with a post-swap
+      `readlink` assertion), and the atomic launcher install; does
+      **not** auto-prune old releases; prints the rollback command on
+      success.
 - [ ] `data/`, `costs/`, `profiles/`, `.active-profile` are never
-      copied — each is always a symlink from the release back to this
-      repo. `plugins/` **is** copied (it's code, not mutable state).
+      shipped from the archive — each is always a symlink from the
+      release back to this repo (the archive's own `data/config.json`,
+      tracked despite `data/` being gitignored, is deleted before the
+      symlink is created). `plugins/` **is** shipped as real files via
+      the archive (it's code, not mutable state).
 - [ ] `tests/run-tests.sh`'s `test_syntax()` extended by **glob**
       (`lib/*.sh`, `lib/*.py`, `lib/*.pl`, `hooks/*.sh`, `hooks/*.py`,
       `plugins/cctrl-*`, `install/*.sh`) so new files are covered
@@ -379,6 +401,14 @@ itself.
       releases, run the swap step twice, assert `readlink current`
       matches the second release each time (regression test for the
       macOS `mv -f` vs `mv -fh` bug found in review).
+- [ ] New test for the dirty-tree check: `git status --porcelain
+      --untracked-files=no` against a real git fixture reports clean on
+      a fresh commit, dirty after modifying a tracked file, and clean
+      again with only an untracked file present (proves gitignored
+      `data`/`costs`/`profiles`/`.active-profile` never block an
+      install). Tests the exact mechanism, not a full
+      `install/self-install.sh` run — the latter also runs the entire
+      suite internally and would make the test recursive.
 - [ ] `~/.claude/settings.json` requires **no changes** (hooks already
       call bare `cctrl` via `$PATH`) — verify this stays true, don't
       "fix" it if it doesn't need touching.
@@ -396,6 +426,7 @@ itself.
 - [cmd] `LANG=en_US.UTF-8 bash tests/run-tests.sh` — full suite green
 - [cmd] `bash install/self-install.sh` — succeeds, prints new release path
 - [assert] `file ~/.local/bin/cctrl` reports a regular file, not a symlink
+- [assert] `cat ~/.local/lib/cctrl/current/VERSION` equals `git rev-parse HEAD` at install time
 - [assert] `readlink ~/.local/lib/cctrl/current` **equals the just-installed
   release path exactly** (not merely "points at some `releases/...` dir" —
   the macOS `mv -f` bug in review left `current` pointing at the *old*
