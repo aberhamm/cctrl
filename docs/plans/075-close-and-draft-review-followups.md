@@ -1,7 +1,7 @@
 ---
 id: 075
 title: Deferred review items from plans 073 and 074
-status: pending
+status: split
 blocked-by: []
 priority: 75
 allows-migrations: false
@@ -9,12 +9,21 @@ needs-review: none
 review-required: eng
 created: 2026-09-27
 tui-fixture: n/a
-approved-by: none  # filed by the fleet manager's scope call (scope-fm0927); implement on approval
+approved-by: matthew (C-15, via cctrl-fleet-manager); split into 084-089, not implemented directly
 ---
 
 ## Plain-English Summary
 
-These are the P3 findings from the 2026-09-27 eng reviews of plans 073 (draft detector) and 074 (close reaps pane processes). They were deferred so the P2 fixes could ship first.
+These are the P3 findings from the 2026-09-27 eng reviews of plans 073 (draft detector) and 074 (close reaps pane processes), plus later re-review follow-ups from plans 080/081/083. They were deferred so the P2 fixes could ship first, and this plan grew into a catch-all. Split 2026-09-28 into separately shippable plans; this file is kept for history only — implement via the split-outs below, not this file.
+
+## Split into
+
+- [084 — prune classifier + provisional-close fixes](./084-prune-classifier-and-provisional-close-fixes.md) (from the 081 re-review)
+- [085 — tmux exact-target hardening](./085-tmux-exact-target-hardening-followups.md) (from the 080 re-review)
+- [086 — draft detector follow-ups](./086-draft-detector-followups.md) (from the 073 re-review)
+- [087 — close reaper follow-ups](./087-close-reaper-followups.md) (from the 074 re-review, plus test hygiene)
+- [088 — hook exit-2 honesty follow-ups](./088-hook-exit-code-honesty-followups.md) (from the 083 re-review)
+- [089 — release pruning design question](./089-release-pruning-design-question.md) (not approved, blocked on Matthew's decision)
 
 ## Requirements
 
