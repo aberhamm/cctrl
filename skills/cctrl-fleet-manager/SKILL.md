@@ -173,10 +173,11 @@ only when actively watching a live task complete. Use ScheduleWakeup to self-pac
 - **A stale or reused name misroutes mail.** tmux session names get recycled
   (the lowest free `--N` suffix is handed back out once a session closes), so
   a recipient name you last saw in a brief may now belong to someone else.
-  cctrl does not yet refuse this automatically (an early check that tried to
-  proved too eager — it flagged any recipient newer than your own session,
-  which is also true of every normal freshly spawned worker); re-resolve the
-  name via `cctrl peer ls` before trusting one from an old brief.
+  cctrl does not yet refuse this automatically (an earlier version of this
+  check proved too eager — it flagged any recipient newer than your own
+  session, which is also true of every normal freshly spawned worker);
+  re-resolve the name via `cctrl peer ls` before trusting one from an old
+  brief.
 
 ## Resource gating
 
