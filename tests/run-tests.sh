@@ -368,12 +368,26 @@ SH
 test_syntax() {
     bash -n "$ROOT/cctrl"
     bash -n "$ROOT/tests/run-tests.sh"
-    bash -n "$ROOT/hooks/notify.sh"
-    bash -n "$ROOT/hooks/peer-doorbell.sh"
-    bash -n "$ROOT/hooks/statusline.sh"
     bash -n "$ROOT/install.sh"
     zsh -n "$ROOT/completions/_cctrl"
-    python3 -m py_compile "$ROOT/lib/usage_costs.py" "$ROOT/lib/peer_mcp.py" "$ROOT/lib/runtime_mcp.py" "$ROOT/hooks/session-log.py" "$ROOT/hooks/block-git-commit.py"
+
+    # Glob rather than a hand-kept list, so a new lib/hooks/install file is
+    # checked automatically instead of silently exempted from the gate that
+    # install/self-install.sh relies on to decide "safe to ship".
+    local f
+    for f in "$ROOT"/lib/*.sh "$ROOT"/hooks/*.sh "$ROOT"/install/*.sh; do
+        [[ -f "$f" ]] || continue
+        bash -n "$f"
+    done
+    for f in "$ROOT"/lib/*.py "$ROOT"/hooks/*.py; do
+        [[ -f "$f" ]] || continue
+        python3 -m py_compile "$f"
+    done
+    for f in "$ROOT"/lib/*.pl; do
+        [[ -f "$f" ]] || continue
+        perl -c "$f" 2>/dev/null
+    done
+
     # Plugin entry scripts are dispatched by `cctrl <cmd>` exactly like a core
     # command, so a syntax error in one is a user-visible break. Both are
     # python3 (#!/usr/bin/env python3), same as lib/*.py above. py_compile needs
@@ -386,6 +400,103 @@ test_syntax() {
         cp "$plugin" "$dest"
         python3 -m py_compile "$dest"
     done
+}
+
+# install/cctrl-launcher.sh is the tiny tracked file that becomes
+# ~/.local/bin/cctrl (see docs/plans/079). These tests exercise it directly
+# via `bash install/cctrl-launcher.sh`, pointing CCTRL_HOME at a scratch
+# directory -- never the real ~/.local/lib/cctrl.
+
+test_cctrl_launcher_hooks_run_fails_open_on_broken_release() {
+    local home="$TMPDIR/launcher-broken" out rc=0
+    mkdir -p "$home/current"
+    cat > "$home/current/cctrl" <<'SH'
+#!/usr/bin/env bash
+this is not valid bash (((
+SH
+    chmod +x "$home/current/cctrl"
+
+    out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "expected launcher to fail open (exit 0) on a broken release, got $rc: $out"
+    assert_contains "$out" "failing open"
+}
+
+test_cctrl_launcher_hooks_run_passes_deliberate_exit_through() {
+    local home="$TMPDIR/launcher-exit1" rc=0
+    mkdir -p "$home/current"
+    cat > "$home/current/cctrl" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+    chmod +x "$home/current/cctrl"
+
+    CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 1 ]] || fail "expected a deliberate exit 1 to pass through unchanged, got $rc"
+}
+
+test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit() {
+    local home="$TMPDIR/launcher-exit137" out rc=0
+    mkdir -p "$home/current"
+    cat > "$home/current/cctrl" <<'SH'
+#!/usr/bin/env bash
+exit 137
+SH
+    chmod +x "$home/current/cctrl"
+
+    out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "expected an unexpected exit code to fail open (exit 0), got $rc: $out"
+    assert_contains "$out" "failing open"
+}
+
+test_cctrl_launcher_non_hooks_run_commands_fail_loudly() {
+    local home="$TMPDIR/launcher-passthrough" out rc=0
+    mkdir -p "$home/current"
+    cat > "$home/current/cctrl" <<'SH'
+#!/usr/bin/env bash
+echo "real cctrl invoked with: $*"
+exit 3
+SH
+    chmod +x "$home/current/cctrl"
+
+    out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" session ls 2>&1)" || rc=$?
+    [[ $rc -eq 3 ]] || fail "expected non-'hooks run' commands to fail loudly with the real exit code, got $rc: $out"
+    assert_contains "$out" "real cctrl invoked with: session ls"
+}
+
+test_cctrl_launcher_hooks_run_fails_open_when_release_missing() {
+    local home="$TMPDIR/launcher-missing" out rc=0
+    mkdir -p "$home"
+
+    out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run stop 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "expected a missing release to fail open (exit 0), got $rc: $out"
+    assert_contains "$out" "failing open"
+}
+
+# install/self-install.sh's atomic `current` swap: on macOS/BSD, a plain
+# `mv -f x current` follows `current` (a symlink to a directory) instead of
+# replacing it, silently leaving `current` on the old release. This
+# regression-tests the exact swap sequence self-install.sh uses.
+test_cctrl_current_swap_is_atomic_on_bsd_mv() {
+    local home="$TMPDIR/swap-home"
+    mkdir -p "$home/releases/rel-a" "$home/releases/rel-b"
+
+    local swap
+    swap() {
+        local target="$1"
+        rm -f "$home/current.next"
+        ln -s "releases/$target" "$home/current.next"
+        mv -fh "$home/current.next" "$home/current"
+    }
+
+    swap rel-a
+    [[ "$(readlink "$home/current")" == "releases/rel-a" ]] \
+        || fail "first swap: expected current -> releases/rel-a, got $(readlink "$home/current")"
+
+    swap rel-b
+    [[ "$(readlink "$home/current")" == "releases/rel-b" ]] \
+        || fail "second swap: expected current -> releases/rel-b, got $(readlink "$home/current")"
+    [[ ! -e "$home/releases/rel-a/current.next" ]] \
+        || fail "swap regressed to the BSD mv bug: current.next ended up inside the old release"
 }
 
 test_launch_args() {
@@ -9541,6 +9652,12 @@ fi
 
 if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
+test_cctrl_launcher_hooks_run_fails_open_on_broken_release
+test_cctrl_launcher_hooks_run_passes_deliberate_exit_through
+test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit
+test_cctrl_launcher_non_hooks_run_commands_fail_loudly
+test_cctrl_launcher_hooks_run_fails_open_when_release_missing
+test_cctrl_current_swap_is_atomic_on_bsd_mv
 test_launch_args
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
