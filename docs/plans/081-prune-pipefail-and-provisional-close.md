@@ -1,7 +1,8 @@
 ---
 id: 081
 title: prune pipefail false-positive, unbounded --yes, and provisional rows that never close
-status: pending
+status: done
+completed: 2026-09-28
 blocked-by: []
 priority: 81
 allows-migrations: false
@@ -9,7 +10,9 @@ needs-review: eng
 review-required: eng
 created: 2026-09-28
 tui-fixture: n/a
-approved-by: matthew (P1, via cctrl-fleet-manager) — PLAN ONLY, not implemented
+approved-by: matthew (P1, via cctrl-fleet-manager); implementation approved matthew (C-15, via cctrl-fleet-manager)
+reviews:
+  - type=eng verdict=approved date=2026-09-28 by=opus-subagent
 ---
 
 ## Plain-English Summary

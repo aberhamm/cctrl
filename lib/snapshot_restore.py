@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import functools
 import hashlib
 import json
@@ -25,6 +26,15 @@ VALID_DISPOSITIONS = {
 RESUME_KINDS = {"claude-session-id", "codex-thread-id"}
 RESUMABLE_STATES = {"active", "inactive", "provisional", "resumable"}
 ENDED_STATES = {"closed", "archived", "released"}
+# plan 081, P2 impact: how long a provisional record may go with no live tmux
+# session before capture() stops offering it as a tmux-resume restore
+# candidate. _session_write_metadata writes the launch-*.json receipt before
+# `tmux new-session` runs, so a session that is genuinely still starting up
+# can briefly have a provisional record with no matching live tmux session;
+# 5 minutes comfortably covers that race (and a slow health-check retry)
+# without keeping a record that's actually stuck (P2's bug: it never reached
+# `closed`) looking like a live in-progress launch indefinitely.
+PROVISIONAL_STALE_GRACE_SECONDS = 300
 # Codex provider titles are the whole first prompt (pastes included, up to
 # hundreds of KB). A snapshot only needs a readable label plus a hash that
 # identifies the full text.
@@ -82,6 +92,30 @@ def action_for(row: dict[str, Any]) -> tuple[str, str]:
     if owner == "unknown" or runtime == "unknown" or state == "unknown":
         return "unknown", "snapshot ownership is unknown"
     return "insufficient-evidence", "snapshot is informational until current ownership evidence is joined"
+
+
+def _parse_rfc3339_utc(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def provisional_is_stale(observed_at: Any, generated_at: Any) -> bool:
+    """True when a provisional record has had no live tmux session for longer
+    than PROVISIONAL_STALE_GRACE_SECONDS (plan 081, P2 impact).
+
+    Age is unknown -> fail closed (treated as stale), since an unparseable or
+    missing timestamp is not evidence that this is a fresh, still-starting
+    launch.
+    """
+    observed = _parse_rfc3339_utc(observed_at)
+    generated = _parse_rfc3339_utc(generated_at)
+    if observed is None or generated is None:
+        return True
+    return (generated - observed).total_seconds() > PROVISIONAL_STALE_GRACE_SECONDS
 
 
 def bounded(value: Any) -> tuple[str | None, str | None]:
@@ -315,6 +349,15 @@ def capture(args: argparse.Namespace) -> int:
         strategy = source.get("restore_strategy")
         if strategy == "tmux":
             strategy = "tmux-resume"
+        # plan 081, P2 impact: this loop only ever sees rows whose tmux name
+        # has no live session right now, so a provisional record here is
+        # either a launch that is still (briefly) starting up, or one stuck
+        # by the P2 bug (never promoted, never closed). Age is the only
+        # signal that tells them apart; a stale one must not be offered as a
+        # tmux-resume restore candidate.
+        if strategy == "tmux-resume" and source.get("lifecycle_state") == "provisional" \
+                and provisional_is_stale(source.get("recency"), args.generated_at):
+            strategy = None
         resume_kind = "claude-session-id" if provider == "claude" else "codex-thread-id" if provider == "codex" else None
         row = {
             "provider": provider,

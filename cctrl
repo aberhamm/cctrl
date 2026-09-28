@@ -2728,6 +2728,71 @@ _task_record_transition() {
     _task_record_transition_file "$file" "$@"
 }
 
+# Close a still-provisional launch-*.json record directly (plan 081, P2). A
+# provisional record has provider_task_id == null, but the stable-identity
+# event reducer (_task_registry_reduce_files) requires provider_task_id to be
+# a non-empty string on EVERY event (jq -r would also silently stringify a
+# JSON null to the 4-character string "null", corrupting the identity check
+# rather than merely being rejected). So a provisional record can never be
+# closed through the generic register/reconcile event pipeline that
+# _task_record_transition_file uses for canonical (stable-id) records; this
+# closes it in place instead, serialized under the same launch lock
+# _session_update_provisional_field already uses for every other mutation of
+# a provisional record, and mirrors the same resulting shape a canonical
+# record gets from a cctrl-terminate reconcile (control_owner/
+# execution_runtime -> unknown, lifecycle_state -> closed, restore_strategy
+# -> null, an authoritative ownership_evidence entry) so restore/candidate
+# logic treats it identically either way.
+_task_record_close_provisional_file() (
+    # Subshell (not a plain function): the EXIT trap below must be scoped to
+    # this call, not leak into the caller's remaining lifetime (matching
+    # _session_update_provisional_field's own subshell wrapper) -- otherwise
+    # it fires once at the whole script's exit and dereferences a $tmp that
+    # went out of scope when this function returned.
+    local file="$1" session_name="$2" reason="$3" key tmp="" now
+    [[ "$file" == "$SESSION_METADATA_DIR"/launch-*.json ]] || return 1
+    key="${file##*/}"; key="${key%.json}"
+    _task_registry_lock_acquire "$key" || return $?
+    trap '[[ -z "$tmp" ]] || rm -f "$tmp"; _task_registry_lock_release "$TASK_REGISTRY_LOCK_FILE" "$TASK_REGISTRY_LOCK_TOKEN"' EXIT
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    _task_record_normalize_json "$file" >/dev/null 2>&1 || return 1
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    tmp="$(mktemp "$SESSION_METADATA_DIR/.launch-close.XXXXXX")" || return 1
+    python3 - "$file" "$session_name" "$reason" "$now" "$key" "$TASK_RECORD_MAX_EVIDENCE" > "$tmp" <<'PYCLOSE'
+import json, sys
+path, session, reason, now, key, max_evidence = sys.argv[1:]
+max_evidence = int(max_evidence)
+with open(path, encoding="utf-8") as handle:
+    record = json.load(handle)
+if not (record.get("schema_version") == 2 and record.get("provider_task_id") is None
+        and record.get("conversation_id") is None and record.get("origin") == "cctrl"
+        and record.get("launched_by_cctrl") is True and record.get("control_owner") == "cctrl"
+        and record.get("execution_runtime") == "tmux" and record.get("name") == session
+        and key == "launch-" + str(record.get("provisional_launch_id"))):
+    raise SystemExit("Not a matching provisional cctrl launch receipt")
+if record.get("lifecycle_state") != "closed":
+    evidence = list(record.get("ownership_evidence") or [])
+    evidence.append({
+        "source": "cctrl-terminate", "source_instance": session, "source_cursor": None,
+        "authority_class": "authoritative", "observed_owner": "unknown",
+        "observed_runtime": "unknown", "observed_state": "closed",
+        "observed_at": now, "reason": reason,
+    })
+    record["ownership_evidence"] = evidence[-max_evidence:]
+    record["control_owner"] = "unknown"
+    record["execution_runtime"] = "unknown"
+    record["lifecycle_state"] = "closed"
+    record["restore_strategy"] = None
+    record["last_observed_at"] = max(str(record.get("last_observed_at") or ""), now)
+print(json.dumps(record, indent=2, sort_keys=True))
+PYCLOSE
+    local rc=$?
+    (( rc == 0 )) || return "$rc"
+    _task_record_normalize_json "$tmp" >/dev/null 2>&1 || return 1
+    chmod 600 "$tmp" || return 1
+    mv "$tmp" "$file"
+)
+
 # Apply one digest-guarded ownership/lifecycle transition to an exact record
 # file. $2.. are the same as _task_record_transition: the session name is used
 # as the event source instance. An optional ${10} is the record digest the
@@ -2737,6 +2802,14 @@ _task_record_transition_file() {
     local decided_digest="${10:-}"
     local stable_id promoted now record_key event_file event_id expected sequence result
     [[ -f "$file" ]] || return 1
+    # A still-provisional launch-*.json record (no stable id yet) can only be
+    # closed via the direct in-place path above; see its comment for why the
+    # generic event pipeline below cannot express this transition.
+    if [[ "$file" == "$SESSION_METADATA_DIR"/launch-*.json && "$state" == "closed" \
+            && "$(jq -r 'if .provider_task_id == null then "1" else "" end' "$file" 2>/dev/null)" == "1" ]]; then
+        _task_record_close_provisional_file "$file" "$session_name" "$reason"
+        return $?
+    fi
     stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
     if [[ "$(jq -r '.schema_version // empty' "$file" 2>/dev/null || true)" != "$TASK_RECORD_SCHEMA_VERSION" ]]; then
         [[ -n "$stable_id" ]] || return 1
@@ -8338,11 +8411,15 @@ _session_agent_cmd() {
     # Echo the foreground command of a session's pane. cctrl detaches with
     # `exec <agent>`, so the pane root usually is the agent; fall back to first child.
     local sess="$1" pid cmd child ccmd
-    pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    # `|| true` on each `| head -1`: a multi-pane session can make the upstream
+    # command write more than head reads, so it can get SIGPIPE (exit 141) once
+    # head closes the pipe; under pipefail that would otherwise abort this
+    # function (plan 081, P1a pipefail audit).
+    pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)" || true
     [[ -n "$pid" ]] || return 0
     cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
     if [[ -z "$(_agent_from_cmd "$cmd")" ]]; then
-        child="$(pgrep -P "$pid" 2>/dev/null | head -1)"
+        child="$(pgrep -P "$pid" 2>/dev/null | head -1)" || true
         if [[ -n "$child" ]]; then
             ccmd="$(ps -o command= -p "$child" 2>/dev/null)"
             [[ -n "$(_agent_from_cmd "$ccmd")" ]] && cmd="$ccmd"
@@ -8442,7 +8519,9 @@ _session_capture_tmux_attestation_anchor() {
     # Publish the complete receipt in one transaction; never expose half an
     # anchor if a process probe or metadata publication fails.
     local session="$1" line pane_id pane_pid pane_started receipt
-    line="$(tmux list-panes -t "=$session:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)"
+    # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit) — a
+    # multi-pane session can SIGPIPE tmux when `head -1` closes the pipe early.
+    line="$(tmux list-panes -t "=$session:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)" || true
     IFS=: read -r pane_id pane_pid <<< "$line"
     [[ "$pane_id" =~ ^%[0-9]+$ && "$pane_pid" =~ ^[0-9]+$ ]] || return 1
     pane_started="$(_session_tmux_host_process_started "$session" "$pane_pid")"
@@ -8846,7 +8925,8 @@ _session_claude_pid() {
     # `exec claude`, so the pane pid usually IS the claude process; otherwise
     # fall back to the first descendant that owns a Claude session file.
     local sess="$1" pid child
-    pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit).
+    pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)" || true
     [[ -n "$pid" ]] || return 0
     [[ -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]] && { printf '%s' "$pid"; return 0; }
     for child in $(pgrep -P "$pid" 2>/dev/null); do
@@ -8959,10 +9039,15 @@ _codex_state_db() {
 _codex_rollout_thread_id() {
     local rollout="$1"
     [[ -f "$rollout" ]] || return 0
+    # `|| true` on the trailing `| head -1`: a session_meta line elsewhere in
+    # the first 20 lines can make jq emit more than one line, so `head -1`
+    # closing the pipe early can SIGPIPE jq/head upstream; under pipefail that
+    # would otherwise abort this function before it reaches `return 0` (plan
+    # 081, P1a pipefail audit).
     head -20 "$rollout" 2>/dev/null | jq -r '
         select(.type == "session_meta")
         | (.payload.id // .payload.session_id // empty)
-    ' 2>/dev/null | head -1
+    ' 2>/dev/null | head -1 || true
     return 0
 }
 
@@ -9682,7 +9767,8 @@ _session_list() {
     for i in "${!names[@]}"; do
         name="${names[i]}"
         execution_id="${execution_ids[i]}"
-        dir="$(tmux list-panes -t "=$name:" -F '#{pane_current_path}' 2>/dev/null | head -1)"
+        # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit).
+        dir="$(tmux list-panes -t "=$name:" -F '#{pane_current_path}' 2>/dev/null | head -1)" || true
         attached="$(tmux display-message -p -t "=$name:" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
         # Read all needed metadata fields in one jq call (was six separate calls).
@@ -12318,11 +12404,26 @@ _session_task_records_for_name() {
     # tmux session $1. With $2 set to "<pane_id> <pane_pid>" lines, only records
     # anchored to one of those panes; with $2 = "cctrl-tmux", only records
     # owned by a cctrl tmux terminal.
+    #
+    # Also considers launch-*.json provisional records (plan 081, P2): a
+    # session that never progressed past the provisional launch receipt (no
+    # task-*.json ever written) was previously invisible to every consumer of
+    # this lookup — mark-closed, _session_close's record-terminated path, and
+    # prune — so it could never be marked closed through any normal path. A
+    # launch record is only considered once its exact-match tmux session (plan
+    # 080's convention: exact, not prefix) is confirmed gone here, so a
+    # session that is genuinely still starting up is never offered as
+    # closeable — that liveness check is done once, in this shared helper,
+    # rather than trusted to every current and future caller.
     [[ -d "$SESSION_METADATA_DIR" ]] || return 0
-    python3 - "$SESSION_METADATA_DIR" "$1" "${2:-}" <<'PY'
+    local tmux_live=false
+    if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$1" 2>/dev/null; then
+        tmux_live=true
+    fi
+    python3 - "$SESSION_METADATA_DIR" "$1" "${2:-}" "$tmux_live" <<'PY'
 import json, sys
 from pathlib import Path
-root, name, selector = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+root, name, selector, tmux_live = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "true"
 anchors = set()
 if selector != "cctrl-tmux":
     for line in selector.splitlines():
@@ -12331,7 +12432,10 @@ if selector != "cctrl-tmux":
             anchors.add((parts[0], parts[1]))
     if not anchors:
         raise SystemExit(0)
-for path in sorted(root.glob("task-*.json")):
+paths = sorted(root.glob("task-*.json"))
+if not tmux_live:
+    paths += sorted(root.glob("launch-*.json"))
+for path in paths:
     if path.is_symlink():
         continue
     try:
@@ -13080,7 +13184,8 @@ _session_codex_rollout_path() {
     [[ -d "$CODEX_SESSIONS_DIR" ]] || return 0
     metadata="$(_session_metadata_file "$sess")"
     [[ -f "$metadata" ]] || return 0
-    cwd="$(tmux list-panes -t "=$sess:" -F '#{pane_current_path}' 2>/dev/null | head -1)"
+    # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit).
+    cwd="$(tmux list-panes -t "=$sess:" -F '#{pane_current_path}' 2>/dev/null | head -1)" || true
     db="$(_codex_state_db)"
     python3 "$SCRIPT_DIR/lib/codex_rollout.py" "$CODEX_SESSIONS_DIR" "$metadata" "$db" "$cwd" 2>/dev/null || true
     return 0
@@ -13274,7 +13379,15 @@ _session_never_prompted() {
             [[ -n "$tpath" && -e "$tpath" ]] || return 1   # absent -> not flagged
             # Bounded head scan: the first genuine user turn sits at the very top
             # of a transcript, so any user entry within the window means prompted.
-            head -n 500 "$tpath" 2>/dev/null | grep -qE '"(type|role)":"user"' && return 1
+            # Captured into a variable before grepping it (not piped straight into
+            # `grep -q`): under `set -o pipefail`, `grep -q` exits as soon as it
+            # sees a match, `head` can get SIGPIPE writing the rest of its 500
+            # lines, and pipefail then reports that as a pipeline failure even
+            # though the match was found — silently flipping "prompted" to
+            # "never-prompted" (plan 081, P1a).
+            local hl
+            hl="$(head -n 500 "$tpath" 2>/dev/null)"
+            grep -qE '"(type|role)":"user"' <<< "$hl" && return 1
             return 0
             ;;
         codex)
@@ -13382,15 +13495,30 @@ _session_prune() {
     # default: it lists candidates + reason and closes NOTHING. --yes/--close
     # routes each candidate through the graceful _session_close path. Self and
     # (by default) attached sessions are never proposed.
+    #
+    # Safety cap (plan 081, P1b): --yes/--close refuses to act when the
+    # candidate count exceeds max(PRUNE_CAP_K, PRUNE_CAP_PCT% of live tmux
+    # sessions), unless --allow-large-batch is also given. K=5 and N=25% were
+    # picked so a handful of genuinely stale/never-prompted sessions in a
+    # small fleet never trips the cap (K=5 covers that), while a fleet-wide
+    # false-positive sweep — the actual incident this plan is fixing, where a
+    # classifier bug proposed 24-29 of ~30-40 live sessions at once — is
+    # always caught, since that is far more than a quarter of the fleet. The
+    # cap is deliberately a distinct flag from --force: --force only widens
+    # which sessions are *considered* (attached ones); it must not also mean
+    # "skip the safety cap," which would silently defeat this fix for anyone
+    # already in the habit of passing --force.
+    local -r PRUNE_CAP_K=5 PRUNE_CAP_PCT=25
     _session_require_tmux || return 1
 
-    local json=false do_close=false force=false older_than="72h" a threshold_ms
+    local json=false do_close=false force=false allow_large_batch=false older_than="72h" a threshold_ms
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --json) json=true; shift ;;
             --yes|--close) do_close=true; shift ;;
             --dry-run) do_close=false; shift ;;
             --force|-f) force=true; shift ;;
+            --allow-large-batch) allow_large_batch=true; shift ;;
             --older-than)
                 if [[ $# -lt 2 ]]; then
                     echo -e "${RED}--older-than needs a duration (e.g. 72h, 7d)${RESET}" >&2
@@ -13398,7 +13526,7 @@ _session_prune() {
                 fi
                 older_than="$2"; shift 2 ;;
             -h|--help)
-                echo "Usage: cctrl session prune [--older-than DURATION] [--yes] [--force] [--json]"
+                echo "Usage: cctrl session prune [--older-than DURATION] [--yes] [--force] [--allow-large-batch] [--json]"
                 echo ""
                 echo "  Proposes sessions to close: those idle longer than the staleness"
                 echo "  threshold, and 'never-prompted' ones (launched but never given a"
@@ -13407,12 +13535,20 @@ _session_prune() {
                 echo "  --older-than DURATION   Staleness threshold (default 72h; Nd/Nh/Nm/Ns)"
                 echo "  --yes, --close          Close the proposed candidates"
                 echo "  --force                 Also consider attached sessions"
+                echo "  --allow-large-batch     Skip the safety cap on how many candidates --yes"
+                echo "                          may close in one run (see below)"
                 echo "  --json                  Machine-readable candidate list"
+                echo ""
+                echo "  --yes refuses to close more than max($PRUNE_CAP_K, ${PRUNE_CAP_PCT}% of live"
+                echo "  sessions) candidates in one run unless --allow-large-batch is also given —"
+                echo "  a large batch usually means the candidate classifier is wrong, not that"
+                echo "  this many sessions are really stale/never-prompted (plan 081). --force is"
+                echo "  unrelated: it only widens which sessions are considered (attached ones)."
                 return 0
                 ;;
             -*)
                 echo -e "${RED}Unknown flag: $1${RESET}" >&2
-                echo -e "${DIM}Usage: cctrl session prune [--older-than DURATION] [--yes] [--force] [--json]${RESET}" >&2
+                echo -e "${DIM}Usage: cctrl session prune [--older-than DURATION] [--yes] [--force] [--allow-large-batch] [--json]${RESET}" >&2
                 return 1
                 ;;
             *)
@@ -13500,6 +13636,19 @@ _session_prune() {
 
     local i
     if $do_close; then
+        # Safety cap (plan 081, P1b): refuse an oversized batch unless
+        # explicitly overridden. See the comment at the top of this function
+        # for why K/N were chosen and why this is a separate flag from --force.
+        local live_count=${#names[@]} cap_by_pct cap
+        cap_by_pct=$(( (PRUNE_CAP_PCT * live_count + 99) / 100 ))
+        cap=$PRUNE_CAP_K
+        (( cap_by_pct > cap )) && cap=$cap_by_pct
+        if (( ${#cand_names[@]} > cap )) && ! $allow_large_batch; then
+            echo -e "${RED}Refusing to close ${#cand_names[@]} candidate(s): exceeds the safety cap of $cap (max($PRUNE_CAP_K, ${PRUNE_CAP_PCT}% of $live_count live session(s))).${RESET}" >&2
+            echo -e "${DIM}This usually means the candidate classifier is wrong, not that this many sessions are really stale/never-prompted. Review with: cctrl session prune --older-than $older_than${RESET}" >&2
+            echo -e "${DIM}To proceed anyway: cctrl session prune --older-than $older_than --yes --allow-large-batch${RESET}" >&2
+            return 75
+        fi
         echo -e "${BOLD}Closing ${#cand_names[@]} prune candidate(s)${RESET}"
         for i in "${!cand_names[@]}"; do
             echo -e "  ${DIM}${cand_reasons[i]}${RESET}"

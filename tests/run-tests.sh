@@ -5782,6 +5782,223 @@ JSON
     echo "ok: prune excludes self and (by default) attached sessions"
 }
 
+test_session_prune_claude_long_transcript_user_turn_not_flagged() {
+    # Plan 081, P1a regression: a transcript over 500 lines whose user turn
+    # sits within the first few lines must not be misclassified as
+    # never-prompted. Before the fix, _session_never_prompted's Claude branch
+    # did `head -n 500 "$tpath" | grep -qE '"(type|role)":"user"' && return 1`
+    # under `set -euo pipefail`: grep -q can exit as soon as it sees the
+    # match, head can then get SIGPIPE writing the rest of its 500 lines, and
+    # pipefail reports that as pipeline failure -- so the check silently fell
+    # through to "never-prompted" even though the transcript plainly had a
+    # user turn. The fix captures head's output into a variable before
+    # grepping it, so there is no pipe left for pipefail to misread.
+    local bin="$TMPDIR/lt-bin" sdir="$TMPDIR/lt-sess" pdir="$TMPDIR/lt-proj"
+    mkdir -p "$bin" "$sdir" "$pdir/p"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4646* ]]; then echo "claude"; exit 0; fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    local now_ms; now_ms=$(( $(date +%s) * 1000 ))
+    cat > "$sdir/4646.json" <<JSON
+{"pid":4646,"sessionId":"lt-uuid","updatedAt":$now_ms}
+JSON
+    # Pad each line so the first 500 lines exceed a pipe buffer (64KB on
+    # macOS/Linux): head must still be writing when grep -q's early match on
+    # line 1 closes its read end, so head reliably gets SIGPIPE and the
+    # pipefail bug actually reproduces. A handful of short lines fits in one
+    # buffer's worth and never races.
+    local pad; pad="$(printf 'x%.0s' $(seq 1 2000))"
+    {
+        printf '{"type":"user","message":{"role":"user","content":"do the thing"}}\n'
+        local i
+        for i in $(seq 1 600); do
+            printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"line %d %s"}]}}\n' "$i" "$pad"
+        done
+    } > "$pdir/p/lt-uuid.jsonl"
+    [[ "$(wc -l < "$pdir/p/lt-uuid.jsonl")" -gt 500 ]] || fail "fixture transcript must exceed 500 lines"
+    [[ "$(head -n 500 "$pdir/p/lt-uuid.jsonl" | wc -c)" -gt 65536 ]] || fail "fixture's first 500 lines must exceed a pipe buffer to actually race SIGPIPE"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        TMUX_FAKE_SESSIONS="TMUX--lt" TMUX_FAKE_PANE_PID=4646 "$ROOT/cctrl" session prune --json)"
+    [[ "$out" == "[]" ]] || fail "a >500-line transcript with an early user turn must not be pruned; got: $out"
+    echo "ok: long transcript with an early user turn is not misclassified as never-prompted"
+}
+
+test_session_prune_yes_caps_large_batch() {
+    # Plan 081, P1b: --yes refuses to close an oversized batch of candidates
+    # (the exact shape of the incident this plan fixes: a classifier bug
+    # proposing a large fraction of the fleet in one call) unless
+    # --allow-large-batch is also given. --force already means something else
+    # in this codebase (include attached sessions) and must not also bypass
+    # the cap.
+    local bin="$TMPDIR/cap-bin" meta="$TMPDIR/cap-meta"
+    mkdir -p "$bin" "$meta"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+echo "-zsh"; exit 0
+SH
+    chmod +x "$bin/ps"
+
+    # Six old, staleness-only candidates (default --older-than 72h; no
+    # transcript fixtures needed since staleness alone is the reason). With
+    # PRUNE_CAP_K=5 and PRUNE_CAP_PCT=25, max(5, ceil(25% of 6)=2) = 5 < 6.
+    local names="" i
+    for i in $(seq 1 6); do
+        names="$names TMUX--cap$i"
+        cat > "$meta/TMUX--cap$i.json" <<'JSON'
+{"created_at":"2020-01-01T00:00:00Z"}
+JSON
+    done
+    names="${names# }"
+
+    local log="$TMPDIR/prune-cap-refuse.log"; : > "$log"
+    local out rc=0
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/cap-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/cap-nope" \
+        TMUX_FAKE_SESSIONS="$names" "$ROOT/cctrl" session prune --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "expected an oversized --yes batch to refuse with 75 (rc=$rc): $out"
+    assert_contains "$out" "Refusing to close 6 candidate(s)"
+    assert_contains "$out" "--allow-large-batch"
+    assert_not_contains "$(cat "$log")" "kill-session"
+
+    # --force alone (widens which sessions are considered) must not bypass
+    # the cap -- it means something different in this codebase.
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/cap-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/cap-nope" \
+        TMUX_FAKE_SESSIONS="$names" "$ROOT/cctrl" session prune --yes --force 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "expected --force to leave the safety cap in place (rc=$rc): $out"
+
+    local log2="$TMPDIR/prune-cap-allow.log"; : > "$log2"
+    out="$(PATH="$bin:$PATH" TMUX_LOG="$log2" TMUX_FAKE_HAS_SESSION=1 CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/cap-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/cap-nope" \
+        TMUX_FAKE_SESSIONS="$names" "$ROOT/cctrl" session prune --yes --allow-large-batch)" \
+        || fail "expected --allow-large-batch to proceed: $out"
+    assert_contains "$out" "Closing 6 prune candidate(s)"
+    local kills; kills="$(grep -c 'kill-session' "$log2" || true)"
+    [[ "$kills" -eq 6 ]] || fail "expected 6 kill-session calls under --allow-large-batch, got $kills: $(cat "$log2")"
+    echo "ok: prune --yes refuses an oversized batch unless --allow-large-batch overrides it"
+}
+
+test_session_mark_closed_provisional_launch_record() (
+    # Plan 081, P2: a session that never got a stable provider id only has a
+    # launch-*.json provisional record (no task-*.json). Before the fix,
+    # _session_task_records_for_name globbed only task-*.json, so mark-closed
+    # (and _session_close/prune, which share the same lookup) could never
+    # close it through any normal path. A name whose tmux session is gone
+    # now closes; a name whose tmux session is still live is refused, same as
+    # today's live-name protection for canonical records.
+    local meta="$TMPDIR/p2-meta" bin="$TMPDIR/p2-bin" file file2 out rc=0
+    mkdir -p "$meta" "$bin"
+    make_fake_tmux "$bin/tmux"
+    export CCTRL_SESSION_METADATA_DIR="$meta"
+
+    # conversation_id (the 11th positional) empty -> _session_write_metadata
+    # writes launch-<uuid>.json with lifecycle_state=provisional and no
+    # task-*.json ever exists for this name.
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-gone-prov >/dev/null
+    file="$(session_record_path s-gone-prov "$meta")" || fail "no provisional record was written for s-gone-prov"
+    [[ "$(basename "$file")" == launch-*.json ]] || fail "expected a launch-*.json record, got $(basename "$file")"
+    [[ "$(jq -r '.lifecycle_state' "$file")" == provisional ]] || fail "fixture record is not provisional: $(jq -c . "$file")"
+
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--other" \
+        "$ROOT/cctrl" session mark-closed s-gone-prov --apply 2>&1)" \
+        || fail "mark-closed --apply on a gone provisional-only record failed: $out"
+    [[ "$(jq -r '.lifecycle_state' "$file")" == closed ]] || fail "mark-closed --apply did not close the provisional record: $(jq -c . "$file")"
+
+    # A live tmux session with the same provisional-only shape is refused,
+    # exactly like mark-closed already refuses a live name backed by a
+    # canonical task-*.json record.
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-live-prov >/dev/null
+    file2="$(session_record_path s-live-prov "$meta")" || fail "no provisional record was written for s-live-prov"
+    rc=0
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="s-live-prov" \
+        "$ROOT/cctrl" session mark-closed s-live-prov --apply 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "mark-closed on a live provisional-only session did not refuse with 75 (rc=$rc): $out"
+    [[ "$(jq -r '.lifecycle_state' "$file2")" == provisional ]] || fail "mark-closed closed a record for a still-live session: $(jq -c . "$file2")"
+    echo "ok: mark-closed closes a provisional-only (launch-*.json) record once its tmux session is gone; refuses while live"
+)
+
+test_session_task_records_for_name_launch_liveness_gate() (
+    # Plan 081, P2 (direct unit coverage): mark-closed's own live-name check
+    # already refuses a live session before ever reaching
+    # _session_task_records_for_name, so the end-to-end test above never
+    # actually exercises that helper's own `tmux has-session -t "=$1"` gate
+    # around launch-*.json (cctrl:12420). Call the helper directly, with the
+    # fake tmux's has-session answering both ways, so a regression in the
+    # gate itself (not just in mark-closed's outer guard) is caught.
+    local meta="$TMPDIR/p2-gate-meta" bin="$TMPDIR/p2-gate-bin" file
+    mkdir -p "$meta" "$bin"
+    make_fake_tmux "$bin/tmux"
+    export CCTRL_SESSION_METADATA_DIR="$meta"
+
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-gate-prov >/dev/null
+    file="$(session_record_path s-gate-prov "$meta")" || fail "no provisional record was written for s-gate-prov"
+    [[ "$(basename "$file")" == launch-*.json ]] || fail "expected a launch-*.json record, got $(basename "$file")"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_HAS_SESSION="" \
+        cctrl_source_eval '_session_task_records_for_name "$1" cctrl-tmux' s-gate-prov)"
+    [[ "$out" == "$file" ]] || fail "gone session: expected the launch record listed, got: $out"
+
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_HAS_SESSION="s-gate-prov" \
+        cctrl_source_eval '_session_task_records_for_name "$1" cctrl-tmux' s-gate-prov)"
+    [[ -z "$out" ]] || fail "live session: expected no launch record offered, got: $out"
+    echo "ok: _session_task_records_for_name's own liveness gate includes launch-*.json only once its tmux session is confirmed gone"
+)
+
+test_snapshot_excludes_stale_provisional_restore_candidates() {
+    # Plan 081, P2 impact: because of the P2 bug, a provisional record whose
+    # tmux session died stuck forever at lifecycle_state=provisional (it
+    # never reached "closed"), so it kept surviving into latest.json as a
+    # restore_strategy:tmux-resume candidate -- a reboot-time restore could
+    # then try to resurrect a session that was supposed to stay gone. The fix
+    # is at the capture layer: a provisional record with no live tmux session
+    # is only still a tmux-resume candidate within a short grace window
+    # (covering the real race where cctrl writes the launch receipt before
+    # `tmux new-session` runs); past that window it is stale and excluded.
+    # This must filter on staleness, not on "provisional" itself -- a
+    # genuinely fresh, still-starting-up provisional row must still appear.
+    local root="$TMPDIR/snapshot-stale-prov" host="0123456789abcdef0123456789abcdef"
+    mkdir -p "$root/data" "$root/snapshots"
+    printf '%s\n' "$host" > "$root/data/host-id"
+    cat > "$root/process.json" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-24T10:00:00Z","source_cursor":"p","processes":[],"error":null}
+JSON
+    local stale_ts now_ts
+    stale_ts="$(date -u -v-1H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "1 hour ago" +"%Y-%m-%dT%H:%M:%SZ")"
+    now_ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    row() { # id tmux recency
+        printf '{"provider":"claude","provider_task_id":null,"host_id":"%s","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"provisional","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"%s","tmux_session":"%s","recency":"%s","action_capabilities":{"tmux_attach":{"supported":false}}}' \
+            "$host" "$1" "$2" "$3"
+    }
+    cat > "$root/catalogue.json" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
+ $(row stale-prov TMUX--stale-prov "$stale_ts"), $(row fresh-prov TMUX--fresh-prov "$now_ts")
+]}
+JSON
+    printf '[]\n' > "$root/sessions.json"   # neither name has a live tmux session
+    local out
+    out="$(CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+      CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$root/snapshots" --json)" \
+      || fail "snapshot with a stale provisional row failed: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--stale-prov")] | length==1 and .[0].restore_strategy==null' <<< "$out" >/dev/null \
+        || fail "a stale provisional row still carries restore_strategy tmux-resume: $(jq -c '[.tasks[]|select(.tmux_session=="TMUX--stale-prov")]' <<< "$out")"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--fresh-prov")] | length==1 and .[0].restore_strategy=="tmux-resume"' <<< "$out" >/dev/null \
+        || fail "a genuinely fresh provisional row lost its tmux-resume candidacy: $(jq -c '[.tasks[]|select(.tmux_session=="TMUX--fresh-prov")]' <<< "$out")"
+    jq -e '[.tasks[] | select(.restore_strategy=="tmux-resume") | .tmux_session] == ["TMUX--fresh-prov"]' <<< "$out" >/dev/null \
+        || fail "restore-candidate rows are not exactly the fresh provisional one: $(jq -c '[.tasks[] | select(.restore_strategy=="tmux-resume") | .tmux_session]' <<< "$out")"
+    [[ "$(jq -r '.restore_candidate_count' <<< "$out")" == 1 ]] || fail "restore_candidate_count did not exclude the stale provisional row: $(jq -r '.restore_candidate_count' <<< "$out")"
+    echo "ok: a stale provisional record is excluded from tmux-resume restore candidates; a fresh one still appears"
+}
+
 _snapshot_fixture() {
     # args: bindir sessdir projdir metadir [launch_command]
     local bin="$1" sdir="$2" pdir="$3" meta="$4" launch_cmd="${5:-}"
@@ -9840,6 +10057,8 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_prune_codex_no_claude_transcript_bug_guard
             test_session_prune_codex_never_prompted
             test_session_prune_dry_run_closes_nothing
+            test_session_prune_claude_long_transcript_user_turn_not_flagged
+            test_session_prune_yes_caps_large_batch
             echo "ok"
             exit 0
             ;;
@@ -9888,6 +10107,8 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_stop_exact_identity
             test_session_terminate_records_closed
             test_session_close_reaps_pane_processes
+            test_session_mark_closed_provisional_launch_record
+            test_session_task_records_for_name_launch_liveness_gate
             echo "ok"
             exit 0
             ;;
@@ -9994,6 +10215,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_snapshot_reboot_keeps_live_latest
             test_restore_no_force_structural
             test_restore_no_pane_inference_structural
+            test_snapshot_excludes_stale_provisional_restore_candidates
             echo "ok"
             exit 0
             ;;
@@ -10152,6 +10374,11 @@ test_codex_close_archives_and_resolves_rollout_identity
 test_session_release_to_app_quarantines_stale_codex_lock
 test_session_prune_dry_run_closes_nothing
 test_session_prune_excludes_self_and_attached
+test_session_prune_claude_long_transcript_user_turn_not_flagged
+test_session_prune_yes_caps_large_batch
+test_session_mark_closed_provisional_launch_record
+test_session_task_records_for_name_launch_liveness_gate
+test_snapshot_excludes_stale_provisional_restore_candidates
 test_usage_cost_fixtures
 test_project_name_derives_home_at_runtime
 test_peer_contract_docs
