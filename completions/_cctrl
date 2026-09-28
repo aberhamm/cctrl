@@ -97,6 +97,7 @@ _cctrl() {
         'edit:Open a profile in \$EDITOR'
         'start:Launch selected agent (foreground, or -d for a detached session)'
         's:Launch selected agent (foreground, or -d for a detached session)'
+        'launch-to-app:Bootstrap an exact Codex terminal task and safely release it to the app'
         'session:Manage detached sessions (ls/attach/close/kill)'
         'close:Gracefully close a tmux session (default: the one you are inside)'
         'peer:Manage addressable agent peers'
@@ -227,6 +228,30 @@ _cctrl() {
                 '--no-bridge[Disable the phone-control bridge]'
             # Allow @shortcut or a directory as the target
             if (( CURRENT == 3 )); then
+                _cctrl_shortcuts
+                _directories
+            fi
+            ;;
+        launch-to-app)
+            _arguments \
+                '--keep-terminal-owned[Verify exact identity but retain the tmux writer]' \
+                '--identity-timeout[Wait for exact identity proof]:seconds:' \
+                '--release-wait[Wait for anchored terminal-owner exit]:seconds:' \
+                '--json[Machine-readable compound workflow result]' \
+                '--profile[Use an agent profile]:profile:_cctrl_profiles' \
+                '--model[Codex model]:model:' \
+                '--reasoning-effort[Codex reasoning effort]:effort:(none minimal low medium high xhigh max ultra)' \
+                {--name,-n}'[Session display name]:name:' \
+                '--purpose[Session purpose metadata]:purpose:' \
+                '--yolo[Full bypass mode]' \
+                {-m,--message,--prompt}'[Initial prompt]:message:' \
+                {--sandbox,-s}'[Codex sandbox mode]:mode:(read-only workspace-write danger-full-access)' \
+                {--ask-for-approval,-a}'[Codex approval policy]:policy:(untrusted on-request never)' \
+                '--remote[Codex TUI transport during bootstrap only]:addr:(unix://)' \
+                '--remote-auth-token-env[Env var containing remote auth token]:envvar:' \
+                '--no-bridge[Disable the phone-control bridge]' \
+                '*:target:->launch_to_app_target'
+            if [[ "$state" == launch_to_app_target ]]; then
                 _cctrl_shortcuts
                 _directories
             fi

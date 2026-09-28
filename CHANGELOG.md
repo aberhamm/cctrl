@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] - 2026-09-21
 
 ### Added
+- `launch-to-app` is a new opt-in Codex compound workflow: create the normal
+  detached cctrl/tmux owner, prove the exact provider identity (including
+  guarded launch-ID recovery), attest it, and delegate the single-writer
+  transition to `release-to-app`. `--keep-terminal-owned` verifies the same
+  identity while deliberately retaining tmux ownership. Existing `start` and
+  `session attach` behavior is unchanged. (plan 082)
 - `task resolve-conflicts [--apply] [--json]` settles stale ownership
   conflicts from live evidence. A record whose pane is gone while another
   execution holds its tmux name is closed (`stale-anchor`). A record whose pane

@@ -239,6 +239,28 @@ CLI help, completions, and bundled skills mirror these same invariants.
 `--remote unix://` is only a transport option for a terminal TUI. It is not a
 fourth ownership path and never enables simultaneous app and tmux access.
 
+For an opt-in terminal-bootstrap workflow that ends in the app, use:
+
+```bash
+cctrl launch-to-app @myapp -n "Investigate the login flow"
+cctrl --host studio launch-to-app @myapp --json
+cctrl launch-to-app @myapp --keep-terminal-owned
+```
+
+`launch-to-app` is not a fourth ownership path and does not change `start` or
+`session attach`. It creates the normal detached cctrl/Codex terminal owner,
+waits for boot, binds only through that launch's exact provisional launch ID,
+repairs the receipt through `recover-terminal-identity` when necessary, and
+requires a matching `session attest`. It then delegates to the same
+`release-to-app` state machine described below. Cwd, title, prompt, and recency
+are never identity proof. `--keep-terminal-owned` performs the exact identity
+verification but deliberately skips the handoff.
+
+If any identity, attestation, provider preflight, anchored owner exit, or
+postflight check fails, the command does not create a replacement task or claim
+app ownership. Its result gives the exact session/launch identity and the safe
+recovery action; attach to the retained terminal owner when it is still live.
+
 An intentional app-owned launch can include settings and one first turn:
 
 ```bash

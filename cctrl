@@ -2514,23 +2514,32 @@ if not (record.get("lifecycle_state") == "provisional" and record.get("provider_
         and record.get("execution_runtime") == "tmux"):
     raise SystemExit("Recovery requires a provisional cctrl terminal launch")
 for field, value in receipt.items():
-    if not isinstance(value, str) or not value or record.get(field) not in (None, "", value):
-        raise SystemExit("Recovery cannot replace an existing terminal anchor")
+    if value is not None and (not isinstance(value, str) or not value or record.get(field) not in (None, "", value)):
+        raise SystemExit("Identity proof cannot replace an existing terminal anchor")
 if receipt["control_surface"] != "tmux" or receipt["tmux_session"] != record.get("name"):
-    raise SystemExit("Recovery receipt session mismatch")
-if not all(receipt[f].isdecimal() for f in ("pane_pid", "wrapper_pid")):
-    raise SystemExit("Recovery receipt PID must be numeric")
-if not (receipt["pane_id"].startswith("%") and receipt["pane_id"][1:].isdecimal()):
-    raise SystemExit("Recovery receipt pane must be a tmux pane ID")
+    raise SystemExit("Identity proof receipt session mismatch")
 with open(sys.argv[2], encoding="utf-8") as handle:
     proof = json.load(handle)
 if not (isinstance(proof, dict) and proof.get("verified") is True
         and proof.get("provider_task_id") == sys.argv[3]
         and proof.get("expected_source_digest") == sys.argv[4]
         and proof.get("receipt") == receipt
-        and proof.get("evidence_kind") == "live-native-codex-writable-root-rollout"):
-    raise SystemExit("Recovery proof does not match the source, identity, and receipt")
-record.update(receipt)
+        and proof.get("evidence_kind") in {
+            "live-native-codex-writable-root-rollout",
+            "codex-lifecycle-hook-launch-binding",
+        }):
+    raise SystemExit("Identity proof does not match the source, identity, and receipt")
+if proof.get("evidence_kind") == "live-native-codex-writable-root-rollout":
+    if not all(isinstance(receipt[f], str) and receipt[f].isdecimal() for f in ("pane_pid", "wrapper_pid")):
+        raise SystemExit("Recovery receipt PID must be numeric")
+    if not (isinstance(receipt["pane_id"], str) and receipt["pane_id"].startswith("%") and receipt["pane_id"][1:].isdecimal()):
+        raise SystemExit("Recovery receipt pane must be a tmux pane ID")
+else:
+    if not (proof.get("lifecycle_event_id")
+            and proof.get("provisional_launch_id") == record.get("provisional_launch_id")
+            and proof.get("tmux_session") == record.get("name")):
+        raise SystemExit("Lifecycle proof is not bound to the exact launch receipt")
+record.update({field: value for field, value in receipt.items() if value is not None})
 record["terminal_identity_proof"] = proof
 print(json.dumps(record))
 PYRECEIPT
@@ -2931,8 +2940,12 @@ _session_write_metadata() {
         output_file="$(_task_record_file "$provider" "$host_id" "$provider_task_id")" || { rm -f "$tmp"; return 1; }
     else
         lifecycle_state="provisional"
-        launch_id="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
-        [[ "$launch_id" =~ ^[0-9a-f-]{36}$ ]] || launch_id="$(openssl rand -hex 16 2>/dev/null || true)"
+        launch_id="${CCTRL_PENDING_LAUNCH_ID:-}"
+        if [[ -z "$launch_id" ]]; then
+            launch_id="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+            [[ "$launch_id" =~ ^[0-9a-f-]{36}$ ]] || launch_id="$(openssl rand -hex 16 2>/dev/null || true)"
+        fi
+        [[ "$launch_id" =~ ^[0-9a-f-]{16,64}$ ]] || { rm -f "$tmp"; return 1; }
         [[ -n "$launch_id" ]] || { rm -f "$tmp"; return 1; }
         output_file="$SESSION_METADATA_DIR/launch-$launch_id.json"
     fi
@@ -3018,6 +3031,8 @@ _session_write_metadata() {
     else
         mv "$tmp" "$output_file"
     fi
+    CCTRL_LAST_LAUNCH_ID="$launch_id"
+    CCTRL_LAST_LAUNCH_RECORD="$output_file"
     _session_record_index_update "$session_name" "$output_file" 2>/dev/null || true
 }
 
@@ -3598,7 +3613,16 @@ _launch_detached() {
         final_purpose="$(_prompt_session_purpose "$default_purpose")"
     fi
 
+    local CCTRL_PENDING_LAUNCH_ID=""
+    if [[ -z "$resume_id" ]]; then
+        CCTRL_PENDING_LAUNCH_ID="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+        [[ "$CCTRL_PENDING_LAUNCH_ID" =~ ^[0-9a-f-]{36}$ ]] \
+            || CCTRL_PENDING_LAUNCH_ID="$(openssl rand -hex 16 2>/dev/null || true)"
+        [[ "$CCTRL_PENDING_LAUNCH_ID" =~ ^[0-9a-f-]{16,64}$ ]] || return 74
+    fi
     env_q="$base_env_q CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=$(_launch_quote "$session_name")"
+    [[ -n "$CCTRL_PENDING_LAUNCH_ID" ]] \
+        && env_q+=" CCTRL_SESSION_LAUNCH_ID=$(_launch_quote "$CCTRL_PENDING_LAUNCH_ID")"
     [[ -n "$metadata_target" ]] && env_q+=" CCTRL_SESSION_TARGET=$(_launch_quote "$metadata_target")"
     [[ -n "$final_purpose" ]] && env_q+=" CCTRL_SESSION_PURPOSE=$(_launch_quote "$final_purpose")"
     env_q="${env_q# } "
@@ -3634,6 +3658,18 @@ _launch_detached() {
     # attestation rejects a recycled session name or a replaced pane.
     if ! _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null; then
         echo -e "${YELLOW}⚠  Could not persist the launch pane receipt; session remains running. Attestation/release will require identity recovery.${RESET}" >&2
+    fi
+    if [[ -n "${CCTRL_LAUNCH_RECEIPT_FILE:-}" ]]; then
+        local _launch_receipt_tmp
+        _launch_receipt_tmp="$(mktemp "${CCTRL_LAUNCH_RECEIPT_FILE}.XXXXXX")" || return 1
+        chmod 600 "$_launch_receipt_tmp" 2>/dev/null || true
+        if ! jq -n --arg session "$session_name" --arg launch_id "${CCTRL_LAST_LAUNCH_ID:-}" \
+            --arg record "${CCTRL_LAST_LAUNCH_RECORD:-}" \
+            '{schema_version:1,session:$session,launch_id:$launch_id,record:$record}' > "$_launch_receipt_tmp"; then
+            rm -f "$_launch_receipt_tmp"
+            return 1
+        fi
+        mv "$_launch_receipt_tmp" "$CCTRL_LAUNCH_RECEIPT_FILE" || return 1
     fi
 
     # Post-spawn health check (plan 056): poll the pane for known blocking
@@ -7948,9 +7984,48 @@ PY
                 rm -rf "$scratch"
                 return 65
             fi
-            if ! _task_record_promote_legacy "$provisional_record" "$task_id" >/dev/null; then
-                rm -rf "$scratch"
-                return 74
+            if [[ -n "${CCTRL_SESSION_LAUNCH_ID:-}" ]] && \
+                [[ "$(jq -r '.provisional_launch_id // empty' "$provisional_record")" != "$CCTRL_SESSION_LAUNCH_ID" ]]; then
+                provisional_record=""
+            fi
+        fi
+        if [[ "$provisional_record" == "$SESSION_METADATA_DIR"/launch-*.json ]]; then
+            if [[ -z "${CCTRL_SESSION_LAUNCH_ID:-}" ]]; then
+                # Compatibility for sessions launched before exact launch tokens
+                # were inherited. This promotion intentionally carries no exact
+                # proof, so launch-to-app will never trust it for release.
+                if ! _task_record_promote_legacy "$provisional_record" "$task_id" >/dev/null; then
+                    rm -rf "$scratch"
+                    return 74
+                fi
+            else
+                local launch_digest lifecycle_receipt lifecycle_proof lifecycle_event_id
+                launch_digest="$(_task_registry_record_digest "$provisional_record")" || { rm -rf "$scratch"; return 74; }
+                lifecycle_receipt="$scratch/lifecycle-receipt.json"
+                lifecycle_proof="$scratch/lifecycle-proof.json"
+                lifecycle_event_id="$(jq -r '.event_id // empty' "$registry_event_file")"
+                if ! jq '{control_surface,tmux_session,pane_id,pane_pid,wrapper_pid,pane_started}' \
+                    "$provisional_record" > "$lifecycle_receipt" \
+                    || ! jq -e '.control_surface=="tmux" and (.tmux_session|type=="string" and length>0)' \
+                        "$lifecycle_receipt" >/dev/null; then
+                    rm -rf "$scratch"
+                    return 74
+                fi
+                jq -n --arg task "$task_id" --arg digest "$launch_digest" \
+                    --arg event_id "$lifecycle_event_id" \
+                    --arg launch "$CCTRL_SESSION_LAUNCH_ID" \
+                    --arg session "$CCTRL_SESSION_NAME" --slurpfile receipt "$lifecycle_receipt" '
+                  {verified:true,provider_task_id:$task,expected_source_digest:$digest,
+                   receipt:$receipt[0],evidence_kind:"codex-lifecycle-hook-launch-binding",
+                   lifecycle_event_id:$event_id,
+                   provisional_launch_id:$launch,tmux_session:$session}
+                ' > "$lifecycle_proof" \
+                  || { rm -rf "$scratch"; return 74; }
+                if ! _task_record_promote_legacy "$provisional_record" "$task_id" "$launch_digest" \
+                    "$lifecycle_receipt" "$lifecycle_proof" >/dev/null; then
+                    rm -rf "$scratch"
+                    return 74
+                fi
             fi
         fi
     fi
@@ -10891,6 +10966,7 @@ _codex_handoff_result() {
 
 _session_release_to_app_one() {
     local name="$1" dry_run="$2" assume_yes="$3" wait_s="$4"
+    local expected_guard="${5:-}"
     local attempt_id scratch record_file baseline_file current_file event_file pre_file post_file
     local normalized provider_task_id host_id origin owner runtime record_digest current_digest reconcile reconcile_row post_reconcile post_reconcile_row
     local attest tmux_id pane_pid pane_started owner_exit=false status="incomplete" required_action="" error="" ok=false
@@ -10915,6 +10991,16 @@ _session_release_to_app_one() {
     runtime="$(jq -r '.execution_runtime // "unknown"' <<< "$normalized")"
     previous="$(jq -c '{control_owner,execution_runtime,lifecycle_state,restore_strategy}' <<< "$normalized")"
     resulting="$previous"
+
+    if [[ -n "$expected_guard" ]]; then
+        local observed_guard
+        observed_guard="$(jq -c '{provider_task_id,provisional_launch_id,tmux_session:(.tmux_session // .name),pane_id,pane_pid,pane_started}' <<< "$normalized")"
+        if [[ "$observed_guard" != "$expected_guard" ]]; then
+            error="expected-owner-identity-mismatch"; required_action="The compound launch owner changed after verification; no release input was sent. Inspect the exact task and session before retrying."
+            _codex_handoff_result "$attempt_id" "$name" "$provider_task_id" "$previous" "$status" false '{}' "$resulting" "$required_action" "$error" false
+            rm -rf "$scratch"; return 75
+        fi
+    fi
 
     if [[ "$owner" == app && "$runtime" == app-server && "$origin" == cctrl ]]; then
         if _codex_handoff_app_snapshot postflight "$post_file" 2>/dev/null \
@@ -13819,10 +13905,18 @@ cmd_help() {
     echo "                              Extra flags are appended to the selected agent"
     echo "  cctrl start -d <dir|@name>  Detached session; reattach after SSH disconnect"
     echo "  cctrl start --agent codex --app-owned [dir|@name] [-m TEXT] [--json]"
+    echo "  cctrl launch-to-app <dir|@name> [start options]"
+    echo "                              Bootstrap in an exact cctrl/Codex terminal owner,"
+    echo "                              then verify and release the same provider task to app"
+    echo "    --keep-terminal-owned     Verify exact identity but retain the tmux writer"
+    echo "    --identity-timeout SEC    Wait for exact identity proof (default 30)"
+    echo "    --release-wait SEC        Wait for anchored owner exit (default 10)"
+    echo "    --json                    Machine-readable compound workflow result"
     echo "  Codex ownership paths:"
     echo "    app +, then first prompt  App controls; cctrl keeps ownership unknown until authoritative evidence"
     echo "    start --app-owned         cctrl creates once; app owns; zero tmux writers"
     echo "    start -d --agent codex    cctrl/tmux owns until verified release-to-app"
+    echo "    launch-to-app             Same terminal path plus verified handoff; not a fourth path"
     echo "    Host reboot stops tmux. Provider tasks remain resumable; snapshot restore"
     echo "    starts only authorized terminal workers, never app-owned/observed tasks."
     echo "  cctrl start --profile NAME  Launch with that profile's model + env (this launch only;"
@@ -16159,6 +16253,10 @@ _dispatch() {
         diff)    cmd_diff "$@" ;;
         edit)    cmd_edit "$@" ;;
         start|s) cmd_start "$@" ;;
+        launch-to-app)
+            source "$SCRIPT_DIR/lib/codex-launch-to-app.sh"
+            _codex_launch_to_app "$@"
+            ;;
         session|sess) cmd_session "$@" ;;
         task|tasks) cmd_task "$@" ;;
         fleet) cmd_fleet "$@" ;;

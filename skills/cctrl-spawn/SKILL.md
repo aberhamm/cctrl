@@ -58,6 +58,12 @@ memory and attention. One session = one purpose.
      app-open capability unknown until current authoritative app evidence proves
      them. cctrl cannot intercept creation or override app-selected
      model/permissions; SQLite discovery alone never grants an action.
+   - Use `cctrl launch-to-app <dir> ...` when the user specifically wants the
+     terminal-bootstrap path followed by safe viewing/continuation in the app.
+     This opt-in compound workflow defaults to verified release of the exact
+     provider task. Pass `--keep-terminal-owned` only when the user explicitly
+     wants the verified task to remain a tmux worker. Existing `start` and
+     `session attach` keep their normal behavior.
 
    Never use `--remote unix://` to imply simultaneous app access. It selects the
    transport for a terminal TUI; that terminal remains the single writer until
@@ -90,6 +96,12 @@ memory and attention. One session = one purpose.
    For the app-owned choice from step 1, do not add `-d`, `--remote`, `--peer`,
    or `-n`; run `cctrl start --agent codex --app-owned <dir> [-m "<brief>"]`
    and verify the returned provider task id instead of looking for a tmux pane.
+
+   For the terminal-bootstrap-then-app choice, run
+   `cctrl launch-to-app <dir> [-m "<brief>"]`. Do not manually guess the new
+   session's provider task from app inventory: the compound command uses its
+   exact launch ID, recovery proof, attestation, and the normal handoff
+   preflight/postflight. On failure, follow its retained-terminal recovery hint.
 
    - `-d` **requires** an explicit dir/shortcut — it refuses to default to
      `$HOME` (guardrail against dropping a full-access agent into `~/.ssh` etc.).

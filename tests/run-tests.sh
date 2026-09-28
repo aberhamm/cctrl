@@ -1792,6 +1792,10 @@ PY
 _doctor_realign_fixture() {
     # args: bindir sessdir prefix status
     local bin="$1" sdir="$2" prefix="$3" status="$4"
+    # Earlier launch tests intentionally reuse TMUX--ms--portal. Keep doctor
+    # fixtures in their own registry so a newer canonical task record cannot
+    # shadow the legacy metadata this fixture is explicitly exercising.
+    export CCTRL_SESSION_METADATA_DIR="$TMPDIR/doctor-realign-metadata"
     mkdir -p "$bin" "$sdir" "$CCTRL_SESSION_METADATA_DIR" "$TMPDIR/rl-proj"
     make_fake_tmux "$bin/tmux"
     cat > "$bin/ps" <<SH
@@ -10244,6 +10248,9 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
         codex-handoff)
             # Defined after the Codex App Server fixtures; dispatched there.
             ;;
+        codex-launch-to-app)
+            # Defined after the Codex App Server fixtures; dispatched there.
+            ;;
         codex-ownership-matrix)
             # Defined after all Codex ownership-path fixtures; dispatched there.
             ;;
@@ -10378,7 +10385,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     esac
 fi
 
-if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
+if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-launch-to-app" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
 test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release
@@ -11164,12 +11171,12 @@ test_codex_lifecycle_ingestion() {
     }
     lifecycle_event() {
         local name="$1" meta="$2" data="$3" payload="$4" source_kind="${5:-}" confidence="${6:-}"
-        local source_task_id="${7:-}" session_name="${8:-}"
+        local source_task_id="${7:-}" session_name="${8:-}" launch_id="${9:-}"
         printf '%s' "$payload" | CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
             CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_BIN="$ROOT/cctrl" \
             CCTRL_CODEX_SOURCE_KIND="$source_kind" CCTRL_CODEX_SOURCE_CONFIDENCE="$confidence" \
             CCTRL_CODEX_SOURCE_TASK_ID="$source_task_id" CCTRL_SESSION_KIND="${session_name:+tmux}" \
-            CCTRL_SESSION_NAME="$session_name" python3 "$observer" \
+            CCTRL_SESSION_NAME="$session_name" CCTRL_SESSION_LAUNCH_ID="$launch_id" python3 "$observer" \
             || fail "lifecycle observer failed open for $name"
     }
     fixture_event() {
@@ -11258,6 +11265,31 @@ test_codex_lifecycle_ingestion() {
         "$provisional_record" >/dev/null || fail "lifecycle race lost provisional cctrl launch provenance"
     [[ -z "$(find "$provisional_meta" -maxdepth 1 -name 'launch-*.json' -print -quit)" ]] \
         || fail "lifecycle promotion left a split provisional record"
+
+    # New launches carry an independently inherited launch token. Only that
+    # exact generation may receive a lifecycle-bound identity proof; a delayed
+    # hook from a reused tmux name cannot bind itself to the replacement.
+    local token_meta="$root/token-meta" token_data="$root/token-data" token_launch token_record
+    mkdir -p "$token_meta" "$token_data"
+    CCTRL_SESSION_METADATA_DIR="$token_meta" CCTRL_DATA_DIR="$token_data" CCTRL_HOST_ID_FILE="$token_data/host-id" \
+        CCTRL_PENDING_LAUNCH_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+        cctrl_source_eval '_session_write_metadata "TMUX--token" /tmp directory /tmp label purpose prompt cmd "" codex "" ""'
+    lifecycle_event token "$token_meta" "$token_data" \
+        "$(fixture_event startup | jq -c '.session_id="token-task"')" "" "" "" "TMUX--token" aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    token_record="$(lifecycle_record_path "$token_meta" "$token_data" token-task)"
+    jq -e '.terminal_identity_proof.evidence_kind=="codex-lifecycle-hook-launch-binding" and
+      .terminal_identity_proof.provisional_launch_id=="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$token_record" >/dev/null \
+      || fail "exact lifecycle launch token was not persisted"
+
+    CCTRL_SESSION_METADATA_DIR="$token_meta" CCTRL_DATA_DIR="$token_data" CCTRL_HOST_ID_FILE="$token_data/host-id" \
+        CCTRL_PENDING_LAUNCH_ID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+        cctrl_source_eval '_session_write_metadata "TMUX--reused" /tmp directory /tmp label purpose prompt cmd "" codex "" ""'
+    lifecycle_event delayed-old "$token_meta" "$token_data" \
+        "$(fixture_event startup | jq -c '.session_id="old-task"')" "" "" "" "TMUX--reused" cccccccccccccccccccccccccccccccc
+    token_launch="$token_meta/launch-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.json"
+    [[ -f "$token_launch" ]] || fail "wrong-generation lifecycle hook consumed the replacement launch receipt"
+    jq -e '.provider_task_id==null and .provisional_launch_id=="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' "$token_launch" >/dev/null \
+      || fail "wrong-generation lifecycle hook mutated the replacement launch"
 
     # Delivery order converges because lifecycle state is reduced by observed_at.
     local order_a="$root/order-a" order_b="$root/order-b" order_data_a="$root/order-data-a" order_data_b="$root/order-data-b"
@@ -12422,6 +12454,191 @@ test_codex_ownership_matrix_contract() {
     echo "ok: canonical three-path ownership contract is aligned across operator surfaces"
 }
 
+test_codex_launch_to_app_workflow() {
+    local root="$TMPDIR/launch-to-app" out rc=0 release_log recovery_log env_log
+    rm -rf "$root"; mkdir -p "$root"
+    release_log="$root/release.log"; recovery_log="$root/recovery.log"; env_log="$root/env.log"
+
+    # Exercise the real detached-launch seam with only fake tmux/agent/process
+    # tools. The compound workflow receives the exact launch ID from an atomic
+    # private receipt, without parsing human output or searching by cwd/title.
+    local seam_bin="$root/seam-bin" seam_meta="$root/seam-meta" seam_data="$root/seam-data"
+    local seam_project="$root/seam-project" seam_receipt="$root/seam-receipt.json"
+    mkdir -p "$seam_bin" "$seam_meta" "$seam_data" "$seam_project"
+    make_fake_tmux "$seam_bin/tmux"
+    make_fake_agent "$seam_bin/codex" codex
+    make_fake_ps "$seam_bin/ps"
+    : > "$root/seam-tmux.log"
+    PATH="$seam_bin:$PATH" TMUX_LOG="$root/seam-tmux.log" CCTRL_DATA_DIR="$seam_data" CCTRL_HOST_ID_FILE="$seam_data/host-id" \
+      CCTRL_SESSION_METADATA_DIR="$seam_meta" CCTRL_LAUNCH_RECEIPT_FILE="$seam_receipt" \
+      CCTRL_ATTACH_PROMPT=never CCTRL_PURPOSE_PROMPT=never CCTRL_NO_HEALTH_CHECK=1 \
+      "$ROOT/cctrl" start -d --agent codex "$seam_project" >/dev/null
+    jq -e '.schema_version==1 and (.session|test("^TMUX--.*seam-project$")) and
+      (.launch_id|test("^[0-9a-f-]{16,64}$")) and (.record|endswith(".json"))' "$seam_receipt" >/dev/null \
+      || fail "detached launch did not emit its exact private receipt: $(cat "$seam_receipt" 2>/dev/null)"
+    [[ -f "$(jq -r '.record' "$seam_receipt")" ]] || fail "launch receipt points at a missing provisional record"
+
+    run_workflow_fixture() (
+        local mode="$1"; shift
+        export CCTRL_SESSION_METADATA_DIR="$root/meta-$mode"
+        mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+        source "$ROOT/lib/codex-launch-to-app.sh"
+        local fixture_launch_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" fixture_session="TMUX--fixture" fixture_task="exact-task-082"
+        local provisional="$CCTRL_SESSION_METADATA_DIR/launch-$fixture_launch_id.json"
+        local canonical="$CCTRL_SESSION_METADATA_DIR/task-fixture.json"
+
+        _write_canonical() {
+            cat > "$canonical" <<JSON
+{"schema_version":2,"provider":"codex","provider_task_id":"$fixture_task","origin":"cctrl","host_id":"11111111111111111111111111111111","registered_by_cctrl":true,"launched_by_cctrl":true,"execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","last_observed_at":"2026-09-28T20:15:00Z","lineage":{"forked_from_id":null,"parent_thread_id":null,"derived_root_id":null,"derived_root_basis":null},"ownership_evidence":[],"lifecycle_observations":[],"terminal_identity_proof":{"verified":true,"provider_task_id":"$fixture_task","evidence_kind":"live-native-codex-writable-root-rollout","receipt":{"control_surface":"tmux","tmux_session":"$fixture_session","pane_id":"%82","pane_pid":"8200","wrapper_pid":"8200","pane_started":"Sun Sep 28 20:15:00 2026"}},"provisional_launch_id":"$fixture_launch_id","name":"$fixture_session","tmux_session":"$fixture_session","agent":"codex","control_surface":"tmux","pane_id":"%82","pane_pid":"8200","wrapper_pid":"8200","pane_started":"Sun Sep 28 20:15:00 2026","health_status":"ready","cctrl_managed":true}
+JSON
+            if [[ "$mode" == already-promoted ]]; then
+                jq '.terminal_identity_proof.evidence_kind="codex-lifecycle-hook-launch-binding" |
+                    .terminal_identity_proof.lifecycle_event_id="event-082" |
+                    .terminal_identity_proof.provisional_launch_id="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" |
+                    .terminal_identity_proof.tmux_session="TMUX--fixture" |
+                    .terminal_identity_proof.expected_source_digest="digest-082" |
+                    .lifecycle_observations=[{"source":"lifecycle-hook","event_id":"event-082"}]' "$canonical" > "$canonical.tmp"
+                mv "$canonical.tmp" "$canonical"
+            elif [[ "$mode" == heuristic-promoted ]]; then
+                jq 'del(.terminal_identity_proof) |
+                    .lifecycle_observations=[{"source":"lifecycle-hook","event_id":"unbound-event"}]' "$canonical" > "$canonical.tmp"
+                mv "$canonical.tmp" "$canonical"
+            fi
+        }
+        _launch_detached() {
+            printf '%s|%s|%s\n' "${CCTRL_ATTACH_PROMPT:-}" "${CCTRL_RESUME_POLL_TIMEOUT:-}" "${CCTRL_CODEX_TITLE_POLL_TIMEOUT:-}" >> "$env_log"
+            [[ "$mode" != launch-fail ]] || return 1
+            CCTRL_LAST_LAUNCH_ID="$fixture_launch_id"
+            CCTRL_LAST_LAUNCH_RECORD="$provisional"
+            if [[ "$mode" == boot-timeout ]]; then
+                printf '{"provisional_launch_id":"%s","name":"%s","health_status":"timeout"}\n' "$fixture_launch_id" "$fixture_session" > "$provisional"
+            else
+                printf '{"provisional_launch_id":"%s","name":"%s","health_status":"ready"}\n' "$fixture_launch_id" "$fixture_session" > "$provisional"
+            fi
+            jq -n --arg session "$fixture_session" --arg launch_id "$fixture_launch_id" --arg record "$provisional" \
+              '{schema_version:1,session:$session,launch_id:$launch_id,record:$record}' > "$CCTRL_LAUNCH_RECEIPT_FILE"
+            [[ "$mode" != startup-exit ]] || return 1
+            if [[ "$mode" == already-promoted || "$mode" == heuristic-promoted ]]; then
+                _write_canonical
+                rm -f "$provisional"
+            fi
+        }
+        _session_metadata_file() {
+            [[ -f "$canonical" ]] && printf '%s' "$canonical" || printf '%s' "$provisional"
+        }
+        _session_recover_terminal_identity() {
+            printf '%s\n' "$*" >> "$recovery_log"
+            if [[ "$mode" == heuristic-promoted ]]; then
+                printf '{"verified":false,"applied":false}\n'
+                return 65
+            fi
+            if [[ "$*" == *--apply* ]]; then
+                [[ "$mode" != recovery-fail ]] || { printf '{"verified":true,"applied":false,"provider_task_id":"%s"}\n' "$fixture_task"; return 75; }
+                _write_canonical; rm -f "$provisional"
+                printf '{"verified":true,"applied":true,"provider_task_id":"%s"}\n' "$fixture_task"
+            else
+                printf '{"verified":true,"applied":false,"provider_task_id":"%s"}\n' "$fixture_task"
+            fi
+        }
+        _session_attest() {
+            if [[ "$mode" == attest-mismatch ]]; then
+                printf '{"verified":true,"thread_id":"other-task"}\n'
+            else
+                printf '{"verified":true,"thread_id":"%s","pane_id":"%%82","pane_pid":8200}\n' "$fixture_task"
+            fi
+        }
+        _session_release_to_app_one() {
+            printf '%s\n' "$*" >> "$release_log"
+            [[ "$5" == *'"provider_task_id":"exact-task-082"'* && "$5" == *'"provisional_launch_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'* ]] \
+              || { printf '{"ok":false,"error":"missing-expected-guard"}\n'; return 75; }
+            if [[ "$mode" == release-fail ]]; then
+                printf '{"ok":false,"status":"incomplete","provider_task_id":"%s","owner_exit":false,"resulting_state":{"control_owner":"cctrl","execution_runtime":"tmux"},"error":"owner-exit-timeout","required_action":"Attach and resolve blocking input."}\n' "$fixture_task"
+                return 75
+            fi
+            if [[ "$mode" == release-race ]]; then
+                printf '{"ok":true,"status":"handed-off","provider_task_id":"replacement-task","owner_exit":true,"resulting_state":{"control_owner":"app","execution_runtime":"app-server"}}\n'
+                return 0
+            fi
+            printf '{"ok":true,"status":"handed-off","provider_task_id":"%s","owner_exit":true,"provider_postcondition":{"verified":true},"resulting_state":{"control_owner":"app","execution_runtime":"app-server"}}\n' "$fixture_task"
+        }
+        _codex_launch_to_app --identity-timeout 0 --release-wait 0 --json /tmp/fixture "$@"
+    )
+
+    : > "$release_log"; : > "$recovery_log"; : > "$env_log"
+    out="$(run_workflow_fixture success)" || fail "launch-to-app success failed: $out"
+    jq -e '.ok and .status=="released-to-app" and .provider_task_id=="exact-task-082" and
+      .identity.verified and .identity.recovery_applied and
+      .resulting_state=={"control_owner":"app","execution_runtime":"app-server"} and
+      .release.status=="handed-off"' <<< "$out" >/dev/null || fail "launch-to-app success contract is wrong: $out"
+    [[ "$(wc -l < "$release_log" | tr -d ' ')" == 1 ]] || fail "compound workflow did not release exactly once"
+    [[ "$(wc -l < "$recovery_log" | tr -d ' ')" == 2 ]] || fail "compound workflow did not dry-run then apply exact recovery"
+    grep -qx 'never|0|0' "$env_log" || fail "compound launch did not suppress attach and heuristic identity pollers"
+
+    : > "$release_log"; : > "$recovery_log"
+    out="$(run_workflow_fixture success --keep-terminal-owned)" || fail "terminal-owned opt-out failed: $out"
+    jq -e '.ok and .status=="terminal-owned" and .requested_finalization=="keep-terminal-owned" and
+      .resulting_state=={"control_owner":"cctrl","execution_runtime":"tmux"}' <<< "$out" >/dev/null \
+      || fail "terminal-owned opt-out contract is wrong: $out"
+    [[ ! -s "$release_log" ]] || fail "--keep-terminal-owned invoked release-to-app"
+
+    : > "$release_log"; : > "$recovery_log"; rc=0
+    out="$(run_workflow_fixture attest-mismatch 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "mismatched attested provider identity unexpectedly succeeded"
+    jq -e '.status=="attestation-failed" and .error=="owner-attestation-failed"' <<< "$out" >/dev/null \
+      || fail "attestation mismatch result is wrong: $out"
+    [[ ! -s "$release_log" ]] || fail "identity mismatch invoked release-to-app"
+
+    : > "$release_log"; : > "$recovery_log"; rc=0
+    out="$(run_workflow_fixture boot-timeout 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "non-ready boot unexpectedly proceeded"
+    jq -e '.status=="boot-not-ready" and .error=="boot-not-ready" and .provider_task_id==null' <<< "$out" >/dev/null \
+      || fail "boot readiness failure result is wrong: $out"
+    [[ ! -s "$recovery_log" && ! -s "$release_log" ]] || fail "non-ready boot attempted identity recovery or release"
+
+    : > "$release_log"; : > "$recovery_log"; rc=0
+    out="$(run_workflow_fixture release-fail 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "release failure returned $rc instead of 75"
+    jq -e '.status=="release-failed" and .error=="owner-exit-timeout" and
+      .resulting_state=={"control_owner":"cctrl","execution_runtime":"tmux"} and .release.owner_exit==false' <<< "$out" >/dev/null \
+      || fail "release failure did not preserve fail-closed result: $out"
+
+    : > "$release_log"; : > "$recovery_log"; rc=0
+    out="$(run_workflow_fixture release-race 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "release identity race returned $rc instead of 75"
+    jq -e '.status=="identity-conflict" and .error=="release-identity-mismatch" and
+      .provider_task_id=="exact-task-082" and .release.provider_task_id=="replacement-task"' <<< "$out" >/dev/null \
+      || fail "release identity race was not rejected: $out"
+
+    : > "$release_log"; : > "$recovery_log"
+    out="$(run_workflow_fixture already-promoted)" || fail "authoritative pre-promotion path failed: $out"
+    jq -e '.ok and .identity.verified and (.identity.recovery_applied|not)' <<< "$out" >/dev/null \
+      || fail "already-promoted identity result is wrong: $out"
+    [[ ! -s "$recovery_log" ]] || fail "already-promoted exact launch record was unnecessarily recovered"
+
+    : > "$release_log"; : > "$recovery_log"; rc=0
+    out="$(run_workflow_fixture heuristic-promoted 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "heuristically promoted identity unexpectedly succeeded"
+    jq -e '.status=="identity-unverified" and .error=="exact-provider-identity-unavailable"' <<< "$out" >/dev/null \
+      || fail "heuristic promotion was not rejected: $out"
+    [[ ! -s "$release_log" ]] || fail "heuristic promotion invoked release-to-app"
+
+    rc=0
+    out="$(run_workflow_fixture launch-fail 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "failed launch unexpectedly succeeded"
+    jq -e '.status=="launch-failed" and .session==null and .release==null' <<< "$out" >/dev/null \
+      || fail "launch failure result is wrong: $out"
+
+    rc=0
+    out="$(CCTRL_HOST_PREFIX=studio run_workflow_fixture startup-exit 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "post-create startup failure unexpectedly succeeded"
+    jq -e '.status=="launch-failed" and .session=="TMUX--fixture" and
+      .launch_id=="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" and .resulting_state=={"control_owner":"cctrl","execution_runtime":"tmux"} and
+      (.required_action|contains("cctrl --host studio session attach TMUX--fixture"))' <<< "$out" >/dev/null \
+      || fail "post-create startup failure lost its exact receipt or remote hint: $out"
+
+    echo "ok: launch-to-app composes exact recovery, attestation, opt-out, and safe handoff"
+}
+
 run_codex_ownership_matrix_paths() {
     local fixture="$ROOT/tests/fixtures/codex-ownership-matrix.json" path
     while IFS= read -r path; do
@@ -12465,6 +12682,12 @@ fi
 
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-handoff" ]]; then
     test_codex_handoff_state_machine
+    echo "ok"
+    exit 0
+fi
+
+if [[ "${CCTRL_TEST_ONLY:-}" == "codex-launch-to-app" ]]; then
+    test_codex_launch_to_app_workflow
     echo "ok"
     exit 0
 fi
@@ -12520,6 +12743,7 @@ test_codex_lifecycle_ingestion
 test_codex_app_server_adapter
 test_app_owned_launch
 test_codex_handoff_state_machine
+test_codex_launch_to_app_workflow
 test_codex_hook_installation_is_additive_and_observer_is_bounded
 
 echo "ok"
