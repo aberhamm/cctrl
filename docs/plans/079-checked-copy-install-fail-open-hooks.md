@@ -162,6 +162,52 @@ deliberately denied" apart from "cctrl's shell wrapper hit a real syntax
 error and also exits 2" stops being free. Flagging this as a forward
 note on plan 038, not a blocker here.
 
+**Update (2026-09-28, plan 083):** issue #1 above (the launcher swallowing
+a deliberate exit 2 into "fail open") is now fixed. The passthrough set
+in `install/cctrl-launcher.sh` is `0|1|2` (was `0|1`), so a hook that
+deliberately exits 2 is no longer downgraded to "allow"; every other
+unexpected code (126, 127, signal-derived 128+N, anything not 0/1/2)
+still fails open exactly as designed here. Plan 083 also made
+`hooks/block-git-commit.py`'s stderr message honest about being
+advisory-only (issue #2 below); the hook still exits 1, not 2, so it
+still doesn't actually block anything — making it exit 2 to actually
+block remains plan 038's separate, not-yet-made call.
+
+This makes the ambiguity flagged above live, and it's broader than just
+the release's `current/cctrl` crashing with a bash syntax error (exit 2)
+— that specific case is covered (the fail-open test
+suite's `test_cctrl_launcher_hooks_run_fails_open_on_broken_release`
+fixture was changed to a bad-interpreter shebang, exit 127, instead of a
+bash syntax error, exit 2, specifically to keep testing the "unrunnable
+release fails open" case without colliding with the new deliberate-block
+code — and a release only ships after passing `bash -n`, per
+`install/self-install.sh`, so a syntax-error release shouldn't happen in
+practice). The wider, still-open risk (2026-09-28 eng review of plan
+083) is any *accidental* exit 2 from the real hook dispatch path, which
+would now be indistinguishable from a deliberate block rather than
+failing open:
+- `cctrl`'s `hooks run` dispatch execs the target hook script directly
+  (e.g. `exec python3 "$SCRIPT_DIR/hooks/block-git-commit.py"`); if that
+  file is missing or unreadable in a given release, the shell's own exec
+  failure can itself exit 2.
+- `cctrl` runs under `set -euo pipefail`; any command inside the `hooks
+  run` codepath that itself happens to exit 2 (a `grep` usage error, an
+  argparse usage error from a Python hook, etc.) propagates straight out
+  as `cctrl`'s own exit code, with no way to distinguish "the hook
+  deliberately denied" from "something in the dispatch path broke."
+- The launcher only wraps `hooks run`, but Claude Code's own meaning of
+  exit 2 differs by hook type — for `Stop` it means "don't stop", for
+  `PermissionRequest` it means "deny" — so an accidental exit 2 doesn't
+  just silently allow-through anymore, it actively blocks or denies
+  something, which is a real behavior change from before this plan.
+
+No hook deliberately exits 2 today, so none of this fires yet, but the
+fail-open guarantee this whole design exists to provide is now narrower
+than "any non-0/1 code from the dispatch path is safe" — it's "any
+non-0/1/2 code is safe; a 2 is trusted as deliberate." Matthew approved
+this trade-off (C-17) with the awareness that it's a deliberate
+narrowing, not a no-op.
+
 ## Design
 
 ### Layout
@@ -209,12 +255,15 @@ if [[ "${1:-}" == "hooks" && "${2:-}" == "run" ]]; then
         "$CCTRL_REAL" "$@"
         rc=$?
         case $rc in
-            0|1) exit "$rc" ;;      # 0 = allow. 1 passes through unchanged;
-                                     # nothing dispatched via `hooks run`
-                                     # today deliberately exits 2 (Claude
-                                     # Code's actual "block" code), so this
-                                     # is not itself a block guarantee — see
-                                     # "Hook exit-code convention" above.
+            0|1|2) exit "$rc" ;;    # 0 = allow. 1 = non-blocking warning,
+                                     # passes through unchanged. 2 = Claude
+                                     # Code's real "block" code; passed
+                                     # through unchanged too (plan 083) so a
+                                     # hook that deliberately exits 2 is
+                                     # never silently downgraded to
+                                     # "allow" — see "Hook exit-code
+                                     # convention" above and its plan 083
+                                     # update note.
             *)
                 echo "cctrl: hooks entrypoint exited $rc unexpectedly — failing open" >&2
                 exit 0

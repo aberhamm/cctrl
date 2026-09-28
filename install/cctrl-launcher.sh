@@ -13,12 +13,13 @@ if [[ "${1:-}" == "hooks" && "${2:-}" == "run" ]]; then
         "$CCTRL_REAL" "$@"
         rc=$?
         case $rc in
-            0|1)
-                # 0 = allow. 1 passes through unchanged; nothing dispatched
-                # via `hooks run` today deliberately exits 2 (Claude Code's
-                # actual "block" code), so this is not itself a block
-                # guarantee -- see docs/plans/079's "Hook exit-code
-                # convention" note.
+            0|1|2)
+                # 0 = allow. 1 = non-blocking warning, passes through
+                # unchanged. 2 = Claude Code's real "block" code; passed
+                # through unchanged so a hook that deliberately exits 2 is
+                # never silently downgraded to "allow" -- see
+                # docs/plans/079's "Hook exit-code convention" note and
+                # docs/plans/083.
                 exit "$rc"
                 ;;
             *)

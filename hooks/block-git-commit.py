@@ -29,5 +29,5 @@ cmd = data.get("tool_input", {}).get("command", "")
 
 for pattern in PATTERNS:
     if re.search(pattern, cmd, re.DOTALL):
-        print("Blocked: automatic git commits are not allowed. Ask the user first.", file=sys.stderr)
+        print("Warning: this command looks like a git commit action (commit/revert/cherry-pick/am). This is advisory only -- the command is NOT blocked and will still run. Ask the user first if that wasn't intended.", file=sys.stderr)
         sys.exit(1)

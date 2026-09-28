@@ -58,6 +58,11 @@ These are the P3 findings from the 2026-09-27 eng reviews of plans 073 (draft de
 - [ ] `test_snapshot_excludes_stale_provisional_restore_candidates` (plan 081) only compares a 0s-old row against a 1h-old one; add a near-boundary case (e.g. ~60s vs ~301s against the 300s grace) to actually pin the threshold. Also add coverage of the real-world anchored close path (`_session_close` → `_session_record_terminated`) for a provisional-only record — today only `mark-closed --apply` is tested directly.
 - [ ] `_task_record_find_by_session`'s fallback when the index file is missing: closing a provisional record rewrites the launch file, so it can become the newest record for a reused session name. Minor, but worth a look alongside the above.
 
+### From the 2026-09-28 eng review of plan 083 (honest git-commit warning + hook exit-2 passthrough)
+- [ ] `hooks/block-git-commit.py:3`: the module docstring still says "blocks Bash commands that would create git commits" — update it to match the honest-advisory wording plan 083 gave the actual stderr message.
+- [ ] `cctrl:14067` (`hooks run` help text): `"pre-tool-use   Block disallowed tool calls (stdin passthrough)"` overclaims the same way the old `block-git-commit.py` message did — no hook wired through `hooks run` today deliberately exits 2, so nothing is actually blocked yet. Update the wording, or revisit once a hook is exiting 2 on purpose.
+- [ ] Add a test pinning the known, currently-undertested accidental-exit-2 risk plan 083's review surfaced: a release whose target hook script is missing (e.g. `hooks/block-git-commit.py` absent) makes `cctrl`'s `exec python3 "..."` itself exit 2, which the launcher now passes through as if it were a deliberate block. Record this behavior in a test rather than only in `docs/plans/079-checked-copy-install-fail-open-hooks.md`'s prose, or reconsider having plan 038's hook dispatch signal "deliberate block" some way other than the bare process exit code (e.g. a distinguishing marker) so an accidental 2 can't be confused with an intentional one.
+
 ## Rules
 
 Edit a copy of `cctrl` or `lib/*` and syntax-check it (`bash -n` / `perl -c`), then `mv` it into place. The live tree runs every session's hooks.

@@ -580,9 +580,13 @@ $out"
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release() {
     local home="$TMPDIR/launcher-broken" out rc=0
     mkdir -p "$home/current"
+    # A bad shebang (bad interpreter, exit 127) rather than a bash syntax
+    # error (bash itself exits 2 on those, which would collide with the
+    # deliberate exit-2 passthrough added by docs/plans/083 and make this
+    # "broken/unrunnable release" case indistinguishable from a real block).
     cat > "$home/current/cctrl" <<'SH'
-#!/usr/bin/env bash
-this is not valid bash (((
+#!/nonexistent/interpreter-xyz
+echo hi
 SH
     chmod +x "$home/current/cctrl"
 
@@ -639,6 +643,37 @@ test_cctrl_launcher_hooks_run_fails_open_when_release_missing() {
 
     out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run stop 2>&1)" || rc=$?
     [[ $rc -eq 0 ]] || fail "expected a missing release to fail open (exit 0), got $rc: $out"
+    assert_contains "$out" "failing open"
+}
+
+# docs/plans/083: the launcher must pass a deliberate exit 2 (Claude Code's
+# real "block" code) through unchanged, never downgrading it to "allow".
+test_cctrl_launcher_hooks_run_passes_exit_2_through() {
+    local home="$TMPDIR/launcher-exit2" rc=0
+    mkdir -p "$home/current"
+    cat > "$home/current/cctrl" <<'SH'
+#!/usr/bin/env bash
+exit 2
+SH
+    chmod +x "$home/current/cctrl"
+
+    CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 2 ]] || fail "expected a deliberate exit 2 to pass through unchanged, got $rc"
+}
+
+# docs/plans/083: every other unexpected code (not 0/1/2) must still fail
+# open -- adding 2 to the passthrough set must not widen it further.
+test_cctrl_launcher_hooks_run_fails_open_on_exit_42() {
+    local home="$TMPDIR/launcher-exit42" out rc=0
+    mkdir -p "$home/current"
+    cat > "$home/current/cctrl" <<'SH'
+#!/usr/bin/env bash
+exit 42
+SH
+    chmod +x "$home/current/cctrl"
+
+    out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "expected exit 42 (not in 0/1/2) to fail open (exit 0), got $rc: $out"
     assert_contains "$out" "failing open"
 }
 
@@ -10233,6 +10268,8 @@ test_cctrl_launcher_hooks_run_passes_deliberate_exit_through
 test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit
 test_cctrl_launcher_non_hooks_run_commands_fail_loudly
 test_cctrl_launcher_hooks_run_fails_open_when_release_missing
+test_cctrl_launcher_hooks_run_passes_exit_2_through
+test_cctrl_launcher_hooks_run_fails_open_on_exit_42
 test_cctrl_current_swap_is_atomic_on_bsd_mv
 test_git_dirty_check_matches_self_install_semantics
 test_launch_args
