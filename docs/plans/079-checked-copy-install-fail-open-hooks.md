@@ -255,10 +255,22 @@ A `trap` removes the scratch dir on any failure or interrupt.
 2. Build the release in a scratch dir first:
    `~/.local/lib/cctrl/releases/.tmp-$$` (created on the same filesystem
    as `releases/` so the later `mv` is a same-fs rename). `cp -a` of
-   `cctrl`, `lib/`, `hooks/`, `completions/`, `plugins/`, and `tests/`
-   (excluding `__pycache__`) into it, then create the four symlinks
-   (`data`, `costs`, `profiles`, `.active-profile`) back to this repo's
-   copies.
+   `cctrl`, `install.sh`, `install/`, `lib/`, `hooks/`, `completions/`,
+   `plugins/`, `tests/`, `AGENTS.md`, `CLAUDE.md`, `README.md`, and
+   `skills/` (excluding `__pycache__`) into it, then create the four
+   symlinks (`data`, `costs`, `profiles`, `.active-profile`) back to
+   this repo's copies. The list is wider than the original draft's
+   `cctrl`/`lib`/`hooks`/`completions`/`plugins`/`tests`: because the
+   scratch copy runs its **own** `tests/run-tests.sh` (step 6), every
+   top-level path that suite references via `$ROOT/...` has to exist
+   inside the scratch copy too — not just cctrl's runtime dependencies.
+   `install.sh`/`install/` (`test_syntax()`'s `$ROOT/install.sh` and
+   `$ROOT/install/*.sh` glob) and `AGENTS.md`/`CLAUDE.md`/`README.md`/
+   `skills/` (`test_peer_contract_docs`, `test_codex_ownership_matrix_contract`)
+   were both missed on the first two live attempts and caused the gate
+   to fail loudly before touching anything installed — exactly the
+   fail-safe behavior working as designed, just tripped by an
+   incomplete copy list rather than a real defect.
 3. `bash -n` on the **scratch copy's** `cctrl`, `install.sh` (if
    present), `install/self-install.sh`, `install/cctrl-launcher.sh`,
    every `lib/*.sh` and `hooks/*.sh` (glob, not a hand list).

@@ -29,7 +29,8 @@ trap cleanup EXIT
 echo "cctrl self-install: building release from $ROOT" >&2
 
 mkdir -p "$SCRATCH"
-for item in cctrl install.sh lib hooks completions plugins tests; do
+for item in cctrl install.sh install lib hooks completions plugins tests \
+            AGENTS.md CLAUDE.md README.md skills; do
     if [[ -e "$ROOT/$item" ]]; then
         cp -a "$ROOT/$item" "$SCRATCH/$item"
     fi
