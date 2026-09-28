@@ -34,6 +34,29 @@ ln -s ~/.local/share/cctrl/cctrl ~/.local/bin/cctrl
 `~/.local/bin` does not exist on a fresh machine, so create it before symlinking
 and make sure it is on your `PATH`.
 
+### Installing from an existing checkout
+
+If you already have this repo cloned (e.g. for development), don't symlink
+`~/.local/bin/cctrl` straight into the working tree — an in-progress edit
+would break every hook invocation live. Instead:
+
+```bash
+bash install/self-install.sh
+```
+
+This refuses to run against a dirty tree, builds a release from
+`git archive HEAD` (only committed code, nothing uncommitted or untracked),
+gates it on syntax checks and the full test suite (`tests/run-tests.sh`),
+and only then atomically swaps in `~/.local/lib/cctrl/current` and
+`~/.local/bin/cctrl`. `data/`, `costs/`, `profiles/`, and `.active-profile`
+are always symlinked back to this repo, never copied, so nothing forks.
+Re-run it after pulling or committing changes to update. Rollback to a
+plain symlink into the working tree:
+
+```bash
+ln -sf "$(pwd)/cctrl" ~/.local/bin/cctrl
+```
+
 ## Profiles
 
 Each profile is a **model + env overlay** stored in `profiles/` (e.g. one routed
@@ -1610,6 +1633,9 @@ Drop any executable named `cctrl-<cmd>` in `plugins/` or anywhere in `$PATH`:
 ```
 cctrl/
   cctrl                    # main script
+  install/
+    self-install.sh        # gated build+swap for an existing checkout (see Install)
+    cctrl-launcher.sh       # tiny tracked file installed as ~/.local/bin/cctrl
   profiles/*.json          # named settings configs (gitignored)
   hooks/
     notify.sh              # sound notifications (stop/needs-input/permission)
