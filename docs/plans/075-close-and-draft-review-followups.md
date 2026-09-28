@@ -43,6 +43,11 @@ These are the P3 findings from the 2026-09-27 eng reviews of plans 073 (draft de
 ### Test hygiene
 - [ ] `tests/run-tests.sh`: the `tree_digest` helper inside the Codex hook test is now unused, because its callers use `live_tree_digest`. Remove it.
 
+### From the 2026-09-28 eng review of plan 080 (tmux exact targets)
+- [ ] Remote attach (`ssh -t "$ssh_target" "...tmux attach-session -t $sess_q"`, `cctrl` around 14716-14726): the target string runs inside a remote **zsh login shell**, where a bare `=NAME` triggers zsh's own `=command` filename expansion — `printf '%q'` quoting doesn't prevent this since the whole string is re-parsed by the remote shell. The `=` needs escaping (e.g. `\=`) in the remote command string, not just shell-quoted.
+- [ ] `cctrl:10824`-ish: `pane_id` read from `baseline.json` isn't validated against `^%[0-9]+$` before use in `send-keys -t "$pane_id"`. An empty/malformed value would target the current pane instead of failing closed. Pre-existing, not introduced by plan 080.
+- [ ] `test_session_kill_exact_target_no_prefix_match` (added by plan 080) only covers `session kill`. Extend the same prefix-match-collision coverage to `session close`, both the immediate path and the delayed path (grace > 0).
+
 ## Rules
 
 Edit a copy of `cctrl` or `lib/*` and syntax-check it (`bash -n` / `perl -c`), then `mv` it into place. The live tree runs every session's hooks.

@@ -228,6 +228,65 @@ if [[ "${1:-}" == "new-session" ]]; then
     printf 'SHELL_CMD=%s\n' "${@: -1}" >> "${TMUX_LOG:?}"
 fi
 
+# Extract a "-t VALUE" target argument, if present.
+_fake_tmux_target() {
+    local i j
+    for ((i = 1; i <= $#; i++)); do
+        if [[ "${!i}" == "-t" ]]; then
+            j=$((i + 1))
+            printf '%s' "${!j:-}"
+            return 0
+        fi
+    done
+}
+
+# Resolve a target against TMUX_FAKE_STATE (a file of "id:name" lines, one
+# per live fake session; see plan 080's regression test). A target prefixed
+# with "=" is tmux's real exact-match syntax and is matched ONLY against the
+# exact name; a bare target additionally falls back to a prefix match,
+# reproducing the real tmux behavior a missing "=" is vulnerable to (a bare
+# "-t NAME" can silently resolve to a still-live "NAME--2").
+#
+# $2 is the resolution mode: "session" (default) for has-session/
+# kill-session/attach-session, where real tmux accepts a bare "=NAME" (no
+# trailing ":") as an exact match; or "pane" for every other subcommand
+# (display-message, capture-pane, send-keys, list-panes, ...), where real
+# tmux additionally requires the trailing ":" on "=NAME" — a colon-less
+# "=NAME" fails to resolve there (verified against tmux 3.7c; see plan 080's
+# review). Getting this wrong let a broken implementation pass its own tests.
+_fake_tmux_state_resolve() {
+    local target="$1" mode="${2:-session}" exact=false id lname
+    [[ -n "$target" ]] || return 1
+    if [[ "$target" == "="* ]]; then
+        exact=true
+        target="${target#=}"
+        if [[ "$mode" == "pane" ]]; then
+            [[ "$target" == *:* ]] || return 1
+        fi
+    fi
+    target="${target%%:*}"
+    [[ -f "${TMUX_FAKE_STATE:-/dev/null}" ]] || return 1
+    # A literal tmux session id ($N) is always an exact, non-prefix target —
+    # real tmux never prefix-matches it, so it bypasses the name logic below.
+    if [[ "$target" == '$'* ]]; then
+        while IFS=: read -r id lname; do
+            [[ -n "$id" ]] || continue
+            [[ "$id" == "$target" ]] && { printf '%s:%s\n' "$id" "$lname"; return 0; }
+        done < "$TMUX_FAKE_STATE"
+        return 1
+    fi
+    while IFS=: read -r id lname; do
+        [[ -n "$id" ]] || continue
+        [[ "$lname" == "$target" ]] && { printf '%s:%s\n' "$id" "$lname"; return 0; }
+    done < "$TMUX_FAKE_STATE"
+    $exact && return 1
+    while IFS=: read -r id lname; do
+        [[ -n "$id" ]] || continue
+        [[ "$lname" == "$target"* ]] && { printf '%s:%s\n' "$id" "$lname"; return 0; }
+    done < "$TMUX_FAKE_STATE"
+    return 1
+}
+
 case "${1:-}" in
     capture-pane)
         if [[ "${TMUX_FAKE_CAPTURE_FAIL:-}" == "1" ]]; then
@@ -270,21 +329,26 @@ case "${1:-}" in
         exit 0
         ;;
     has-session)
+        if [[ -n "${TMUX_FAKE_STATE:-}" ]]; then
+            _fake_tmux_state_resolve "$(_fake_tmux_target "$@")" >/dev/null && exit 0 || exit 1
+        fi
         if [[ "${TMUX_FAKE_HAS_SESSION:-}" == "1" ]]; then
             exit 0
         fi
         if [[ -n "${TMUX_FAKE_HAS_SESSION:-}" ]]; then
-            target=""
-            for ((i = 1; i <= $#; i++)); do
-                if [[ "${!i}" == "-t" ]]; then
-                    j=$((i + 1))
-                    target="${!j:-}"
-                    break
-                fi
-            done
+            target="$(_fake_tmux_target "$@")"
+            target="${target#=}"
             [[ " ${TMUX_FAKE_HAS_SESSION} " == *" ${target} "* ]] && exit 0
         fi
         exit 1
+        ;;
+    kill-session)
+        if [[ -n "${TMUX_FAKE_STATE:-}" ]]; then
+            match="$(_fake_tmux_state_resolve "$(_fake_tmux_target "$@")")" || { echo "can't find session" >&2; exit 1; }
+            grep -v -x -F "$match" "$TMUX_FAKE_STATE" > "$TMUX_FAKE_STATE.tmp" 2>/dev/null || true
+            mv "$TMUX_FAKE_STATE.tmp" "$TMUX_FAKE_STATE"
+        fi
+        exit 0
         ;;
     list-sessions)
         if [[ -n "${TMUX_FAKE_SESSIONS:-}" ]]; then
@@ -311,6 +375,19 @@ case "${1:-}" in
         exit 0
         ;;
     display-message)
+        if [[ -n "${TMUX_FAKE_STATE:-}" ]]; then
+            match="$(_fake_tmux_state_resolve "$(_fake_tmux_target "$@")" pane)" || exit 1
+            if [[ "$*" == *'session_id'* && "$*" == *'session_name'* ]]; then
+                printf '%s %s\n' "${match%%:*}" "${match#*:}"
+                exit 0
+            elif [[ "$*" == *session_name* ]]; then
+                printf '%s\n' "${match#*:}"
+                exit 0
+            elif [[ "$*" == *session_id* ]]; then
+                printf '%s\n' "${match%%:*}"
+                exit 0
+            fi
+        fi
         if [[ "$*" == *session_name* ]]; then
             printf '%s\n' "${TMUX_FAKE_SESSION_NAME:-demo}"
         else
@@ -400,6 +477,99 @@ test_syntax() {
         cp "$plugin" "$dest"
         python3 -m py_compile "$dest"
     done
+}
+
+test_tmux_exact_target_lint() {
+    # plan 080 (reworked after an Opus eng review found the first pass wrong):
+    # tmux's `-t NAME` falls back to prefix matching when no session named
+    # exactly NAME exists, so `tmux kill-session -t TMUX--ms--cctrl` can
+    # silently kill a still-live `TMUX--ms--cctrl--2`. Every `tmux ... -t
+    # "$NAME"` call must use tmux's real exact-match syntax instead — and
+    # that syntax differs by subcommand (verified directly against tmux
+    # 3.7c, not guessed):
+    #   - has-session / kill-session / attach-session (session-scoped): the
+    #     bare exact form `-t "=$NAME"` (no trailing ":") is correct.
+    #   - every other subcommand (capture-pane, send-keys, paste-buffer,
+    #     set-option, show-option, display-message, display, list-panes,
+    #     and any other pane/window-target subcommand) additionally
+    #     REQUIRES the trailing ":" — `-t "=$NAME:"` — without it the
+    #     target fails outright or silently resolves to nothing. A prior
+    #     version of this check only verified an "=" was present anywhere,
+    #     which let a broken all-bare-no-colon implementation pass its own
+    #     tests; it now checks the exact form per subcommand.
+    # A handful of sites legitimately target an already-exact value (a
+    # literal tmux "$N" session id, or a pane id) rather than a
+    # session-name string; those are marked inline with
+    # `# tmux-target:exact-id` so this check can tell a real exception from
+    # a reintroduced bug.
+    local out script="$TMPDIR/tmux_exact_target_lint.py"
+    cat > "$script" <<'PY'
+import glob, os, re, sys
+
+root = sys.argv[1]
+files = [os.path.join(root, "cctrl")] + sorted(glob.glob(os.path.join(root, "lib", "*.sh")))
+
+# A tmux invocation clause: "tmux" (or the timeout-wrapped helper) optionally
+# followed by "-u", then the subcommand word, then a run of characters that
+# doesn't cross a pipe/backgrounding boundary, up to a quoted -t target.
+# Capturing the subcommand alongside the target (rather than just scanning
+# for any "-t \"...\"" on the line) means a -t belonging to an unrelated
+# command earlier on the same line — e.g. `ssh -t "$x" "... tmux ... -t
+# \"$y\""` — is never mistaken for a tmux target, and vice versa. Brace
+# expansion (${sessions[0]}) is matched, not just a bare $NAME.
+CLAUSE_RE = re.compile(
+    r'(?:\btmux\b|_tmux_run_with_timeout)\s+(?:-u\s+)?(?P<cmd>[a-z][a-z-]*)\b'
+    r'[^|&\n]*?-t\s+"(?P<tgt>[^"]*)"'
+)
+
+SESSION_SCOPED = {"has-session", "kill-session", "attach-session"}
+
+errors = []
+
+for path in files:
+    if not os.path.isfile(path):
+        continue
+    with open(path) as f:
+        lines = f.readlines()
+    for lineno, line in enumerate(lines, 1):
+        if "# tmux-target:exact-id" in line:
+            continue
+        for m in CLAUSE_RE.finditer(line):
+            cmd = m.group("cmd")
+            tgt = m.group("tgt")
+            is_exact = tgt.startswith("=")
+            body = tgt[1:] if is_exact else tgt
+            # Only variable-shaped targets ($NAME or ${NAME[...]}) are in
+            # scope; a literal constant string is not what this check is for.
+            if not body.startswith("$"):
+                continue
+            if not is_exact:
+                errors.append(
+                    f'{path}:{lineno}: bare (prefix-matchable) tmux {cmd} -t "{tgt}" — '
+                    f'use -t "={tgt}" (session-scoped: has-session/kill-session/'
+                    f'attach-session) or -t "={tgt}:" (every other subcommand), or mark '
+                    f"a genuinely pre-exact id/pane target with '# tmux-target:exact-id'"
+                )
+                continue
+            if cmd in SESSION_SCOPED:
+                continue  # bare "=NAME" (no trailing ":") is correct here
+            if ":" not in body:
+                errors.append(
+                    f'{path}:{lineno}: tmux {cmd} -t "{tgt}" is missing the trailing ":" '
+                    f'required for this pane/window-target subcommand — use -t "{tgt}:" '
+                    f"(or mark a genuinely pre-exact target with '# tmux-target:exact-id')"
+                )
+
+if errors:
+    print("\n".join(errors))
+    sys.exit(1)
+PY
+    out="$(python3 "$script" "$ROOT")" || true
+    if [[ -n "$out" ]]; then
+        fail "tmux -t target(s) using the wrong exact-match form (plan 080 review):
+$out"
+    fi
+    echo "ok: every tmux -t target in cctrl and lib/*.sh uses the exact-match form its subcommand requires"
 }
 
 # install/cctrl-launcher.sh is the tiny tracked file that becomes
@@ -1283,12 +1453,12 @@ test_attach_prompt_after_start() {
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start -d "$project" <<< "y")"
     assert_contains "$out" "Connect to session TMUX--prompt-project now? [y/N]"
-    assert_contains "$(cat "$log")" "attach-session -t TMUX--prompt-project"
+    assert_contains "$(cat "$log")" "attach-session -t =TMUX--prompt-project"
 
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_AGENT=codex CCTRL_ATTACH_PROMPT=always "$ROOT/cctrl" start "$project" <<< "")"
     assert_contains "$out" "Connect to session TMUX--prompt-project now? [Y/n]"
-    assert_contains "$(cat "$log")" "attach-session -t TMUX--prompt-project"
+    assert_contains "$(cat "$log")" "attach-session -t =TMUX--prompt-project"
 }
 
 test_codex_statusline_tui_config() {
@@ -2061,6 +2231,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -2114,6 +2296,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -2185,6 +2379,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -2276,6 +2482,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -2514,6 +2732,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -2613,6 +2843,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -2935,7 +3177,7 @@ assert_modal_detection() {
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="$session" TMUX_FAKE_CAPTURE_PANE="$benign_pane" CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC="2026-06-13T00:00:05Z" "$ROOT/cctrl" peer deliver "$peer" --json)"
     printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].submitted == true' >/dev/null || fail "expected benign $peer output (no modal marker) to nudge, not defer"
     assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-nudge-$peer-"
-    assert_contains "$(cat "$log")" "send-keys -t $session Enter"
+    assert_contains "$(cat "$log")" "send-keys -t =$session: Enter"
 }
 
 mark_message_delivered() {
@@ -3668,7 +3910,7 @@ test_peer_deliver_tmux_nudge_lifecycle() {
     printf '%s\n' "$out" | jq -e '.results[0].status == "nudged" and .results[0].queued == 2 and .results[0].submitted == true' >/dev/null || fail "expected JSON nudged result"
     assert_contains "$(cat "$log")" "load-buffer -b cctrl-nudge-comet-"
     assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-nudge-comet-"
-    assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+    assert_contains "$(cat "$log")" "send-keys -t =TMUX--comet: Enter"
     assert_contains "$(cat "$log")" "delete-buffer -b cctrl-nudge-comet-"
     assert_not_contains "$(cat "$log")" "secret body A"
     assert_not_contains "$(cat "$log")" "secret body B"
@@ -3934,7 +4176,7 @@ test_peer_inline_pastes_into_recipient_pane() {
     PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet TMUX--bsender" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --inline "$id" --json >/dev/null
     buf="$(cat "$log")"
     assert_contains "$buf" "paste-buffer -p -r -b cctrl-inline-comet-"
-    assert_contains "$buf" "-t TMUX--comet"
+    assert_contains "$buf" "-t =TMUX--comet:"
     assert_not_contains "$buf" "cctrl-inline-bsender"
     echo "ok: inline delivery pastes into the recipient's pane, not the sender's"
 }
@@ -4388,7 +4630,7 @@ test_session_close_self_graceful() {
         TMUX_FAKE_PANE_PID="__current__" \
         "$ROOT/cctrl" session close)"
     assert_contains "$out" "will close in 5s"
-    assert_contains "$(cat "$log")" "run-shell -b sleep\\ 5\\;\\ tmux\\ kill-session\\ -t\\ TMUX--demo"
+    assert_contains "$(cat "$log")" "run-shell -b sleep\\ 5\\;\\ tmux\\ kill-session\\ -t\\ =TMUX--demo"
 }
 
 test_session_close_stale_tmux_refuses_current() {
@@ -4962,8 +5204,41 @@ test_session_close_named_immediate() {
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX='' TMUX_FAKE_HAS_SESSION=1 \
         "$ROOT/cctrl" close TMUX--demo)"
     assert_contains "$out" "Closed session: TMUX--demo"
-    assert_contains "$(cat "$log")" "kill-session -t TMUX--demo"
+    assert_contains "$(cat "$log")" "kill-session -t =TMUX--demo"
     assert_not_contains "$(cat "$log")" "run-shell"
+}
+
+test_session_kill_exact_target_no_prefix_match() {
+    # plan 080: tmux's `-t NAME` falls back to prefix matching when no session
+    # named exactly NAME exists — `-t TMUX--x` can silently resolve to a live
+    # `TMUX--x--2`. Two fake sessions "X" and "X--2" (exactly the shape cctrl
+    # creates for a duplicate label): kill X once (must remove only X), then
+    # kill the now-gone name "X" again — a second/stale/racing kill — and
+    # confirm it refuses instead of prefix-matching and killing X--2.
+    make_fake_tmux "$TMPDIR/tmux"
+    local state="$TMPDIR/prefix-match-state"
+    printf '$1:X\n$2:X--2\n' > "$state"
+
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_STATE="$state" "$ROOT/cctrl" session kill X 2>&1)" \
+        || fail "first kill of X failed: $out"
+    assert_contains "$out" "Killed session: X"
+    grep -qx '$2:X--2' "$state" || fail "first kill left an unexpected state: $(cat "$state")"
+    ! grep -q ':X$' "$state" || fail "first kill did not remove X: $(cat "$state")"
+
+    # X is already gone. Killing the bare name "X" again must NOT prefix-match
+    # and kill "X--2" — it must refuse with no session found.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_STATE="$state" "$ROOT/cctrl" session kill X 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "a second kill of an already-gone session reported success: $out"
+    assert_contains "$out" "No session named 'X'"
+    grep -qx '$2:X--2' "$state" || fail "second kill of the gone 'X' touched X--2: $(cat "$state")"
+
+    # X--2 is still live and attachable (an exact match still resolves it).
+    PATH="$TMPDIR:$PATH" TMUX_FAKE_STATE="$state" tmux has-session -t "=X--2" \
+        || fail "X--2 should still be attachable after the second (no-op) kill of X"
+
+    echo "ok: session kill targets tmux exactly, so a stale/repeated kill of a gone name never prefix-matches a live X--2"
 }
 
 test_session_close_outside_requires_name() {
@@ -5430,7 +5705,7 @@ JSON
     out="$(PATH="$bin:$PATH" TMUX_LOG="$log2" TMUX_FAKE_HAS_SESSION=1 \
         CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
         TMUX_FAKE_SESSIONS="TMUX--drname" TMUX_FAKE_PANE_PID=4646 "$ROOT/cctrl" session prune --yes)"
-    assert_contains "$(cat "$log2")" "kill-session -t TMUX--drname"
+    assert_contains "$(cat "$log2")" "kill-session -t =TMUX--drname"
     echo "ok: prune dry-run closes nothing; --yes closes candidates"
 }
 
@@ -5448,6 +5723,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) printf 'TMUX--self\nTMUX--attach\n'; exit 0;;
@@ -5506,6 +5793,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -5553,7 +5852,17 @@ fmt=""; target=""; cmd="$1"; shift
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -F) fmt="$2"; shift 2 ;;
-        -t) target="$2"; shift 2 ;;
+        -t)
+            # list-panes requires the trailing ":" on an exact "=NAME"
+            # target; a colon-less "=NAME" must not resolve (plan 080).
+            if [[ "$2" == *: ]]; then
+                target="${2#=}"; target="${target%:}"
+            elif [[ "$2" == "="* ]]; then
+                target="__cctrl_test_unmatched__"
+            else
+                target="$2"
+            fi
+            shift 2 ;;
         *) shift ;;
     esac
 done
@@ -5812,6 +6121,18 @@ target=""
 for ((i=1;i<=$#;i++)); do
     if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
 done
+# Pane/window-target commands (list-panes, display-message, display,
+# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
+# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
+# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
+# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
+# nothing below will match.
+if [[ "$target" == *: ]]; then
+    target="${target#=}"
+    target="${target%:}"
+elif [[ "$target" == "="* ]]; then
+    target="__cctrl_test_unmatched__"
+fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
     list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
@@ -6157,6 +6478,14 @@ case "${1:-}" in
         for ((i=1;i<=$#;i++)); do
             if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
         done
+        # list-panes requires the trailing ":" on an exact "=NAME" target; a
+        # colon-less "=NAME" must not resolve (see plan 080's review).
+        if [[ "$target" == *: ]]; then
+            target="${target#=}"
+            target="${target%:}"
+        elif [[ "$target" == "="* ]]; then
+            target="__cctrl_test_unmatched__"
+        fi
         case "$target" in
             TMUX--live1) echo 30001 ;; TMUX--live2) echo 30002 ;;
             TMUX--live3) echo 30003 ;; TMUX--live4) echo 30004 ;;
@@ -7579,7 +7908,7 @@ test_session_say_submit_and_no_submit() {
         || fail "expected session say submit ok result"
     assert_contains "$(cat "$log")" "BUFFER hello there"
     assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
-    assert_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
+    assert_contains "$(cat "$log")" "send-keys -t =TMUX--demo: Enter"
     # No mailbox file is created or touched by a direct say.
     [[ ! -e "$TMPDIR/data/messages.jsonl" ]] || fail "session say must not write messages.jsonl"
 
@@ -7637,7 +7966,7 @@ test_session_say_long_body_bracketed_exact() {
         || fail "expected long session say to submit: $out"
     cmp -s "$bf" "$raw" || fail "long say body was not loaded byte-for-byte"
     assert_contains "$(cat "$log")" "paste-buffer -p -r -b cctrl-say-TMUX--demo-"
-    assert_contains "$(cat "$log")" "send-keys -t TMUX--demo Enter"
+    assert_contains "$(cat "$log")" "send-keys -t =TMUX--demo: Enter"
 
     echo "ok: session say delivers a long multi-line body exactly as one bracketed paste"
 }
@@ -7969,7 +8298,7 @@ JSON
     PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" \
         TMUX_FAKE_SESSIONS="demo" TMUX_FAKE_HAS_SESSION="demo" \
         "$ROOT/cctrl" peer attach comet >/dev/null 2>&1 || true
-    assert_contains "$(cat "$log")" "attach-session -t demo"
+    assert_contains "$(cat "$log")" "attach-session -t =demo"
 
     echo "ok: peer attach resolves the peer and attaches to the resolved tmux session"
 }
@@ -7995,7 +8324,7 @@ JSON
     printf '%s\n' "$out" | jq -e '.ok == true and .session == "demo" and .submitted == true and .status == "ok"' >/dev/null \
         || fail "expected peer say to delegate to session say with ok result"
     assert_contains "$(cat "$log")" "BUFFER live chat hi"
-    assert_contains "$(cat "$log")" "send-keys -t demo Enter"
+    assert_contains "$(cat "$log")" "send-keys -t =demo: Enter"
     # No mailbox mutation whatsoever.
     [[ ! -e "$data/messages.jsonl" ]] || fail "peer say must not write messages.jsonl"
 
@@ -8125,7 +8454,7 @@ test_peer_mcp_say_peer() {
     ' >/dev/null || fail "expected say_peer to submit via the live tmux path with an ok result"
     printf 'live line one\nlive line two\n' > "$expected"
     cmp -s "$bytes" "$expected" || fail "expected say_peer to preserve the trailing newline via --body-file -"
-    assert_contains "$(cat "$log")" "send-keys -t TMUX--comet Enter"
+    assert_contains "$(cat "$log")" "send-keys -t =TMUX--comet: Enter"
     # (e) NEVER creates a mailbox message.
     [[ ! -e "$data/messages.jsonl" ]] || fail "say_peer must not create a mailbox message"
 
@@ -9676,6 +10005,7 @@ fi
 
 if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
+test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release
 test_cctrl_launcher_hooks_run_passes_deliberate_exit_through
 test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit
@@ -9807,6 +10137,7 @@ test_peer_direct_non_local_host_hint
 test_peer_attach_remote_forwarding_tty
 test_peer_ls_shows_session_and_status
 test_session_close_named_immediate
+test_session_kill_exact_target_no_prefix_match
 test_session_close_outside_requires_name
 test_session_prune_never_prompted_claude
 test_session_prune_fresh_active_not_candidate

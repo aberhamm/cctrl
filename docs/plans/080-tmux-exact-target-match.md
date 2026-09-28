@@ -1,7 +1,8 @@
 ---
 id: 080
 title: tmux -t targets must use exact-match (=NAME), not prefix fallback
-status: pending
+status: done
+completed: 2026-09-28
 blocked-by: []
 priority: 80
 allows-migrations: false
@@ -9,7 +10,9 @@ needs-review: eng
 review-required: eng
 created: 2026-09-27
 tui-fixture: n/a
-approved-by: matthew (C-14, via cctrl-fleet-manager) — PLAN ONLY, not implemented
+approved-by: matthew (C-14, via cctrl-fleet-manager); implementation approved matthew (C-15, via cctrl-fleet-manager)
+reviews:
+  - type=eng verdict=approved date=2026-09-28 by=opus-subagent
 ---
 
 ## Plain-English Summary

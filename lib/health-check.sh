@@ -62,14 +62,14 @@ _hc_select_option() {
     local session_name="$1" option="$2" tries=0 screen
     local selected="^[[:space:]│|]*[❯›][[:space:]]+${option}"
     while (( tries < 6 )); do
-        if _tmux_run_with_timeout capture-pane -p -t "$session_name" 2>/dev/null; then
+        if _tmux_run_with_timeout capture-pane -p -t "=$session_name:" 2>/dev/null; then
             screen="$TMUX_RUN_OUTPUT"
             if printf '%s\n' "$screen" | grep -E "$selected" >/dev/null 2>&1; then
-                _tmux_run_with_timeout send-keys -t "$session_name" Enter 2>/dev/null || return 1
+                _tmux_run_with_timeout send-keys -t "=$session_name:" Enter 2>/dev/null || return 1
                 return 0
             fi
         fi
-        _tmux_run_with_timeout send-keys -t "$session_name" Down 2>/dev/null || return 1
+        _tmux_run_with_timeout send-keys -t "=$session_name:" Down 2>/dev/null || return 1
         tries=$((tries + 1))
         sleep "${CCTRL_HC_SELECT_DELAY:-0.2}"
     done
@@ -112,12 +112,12 @@ _health_check_run() {
 
     while (( elapsed < timeout_seconds )); do
         # A session that is gone died during startup; nothing will become ready.
-        if ! _tmux_run_with_timeout has-session -t "$session_name" 2>/dev/null; then
+        if ! _tmux_run_with_timeout has-session -t "=$session_name" 2>/dev/null; then
             _hc_report_exit "$session_name" "tmux session ended during startup" "$last_capture"
             return 1
         fi
         # Capture the last 40 lines of pane output
-        if ! _tmux_run_with_timeout capture-pane -p -S -40 -t "$session_name" 2>/dev/null; then
+        if ! _tmux_run_with_timeout capture-pane -p -S -40 -t "=$session_name:" 2>/dev/null; then
             # Pane not ready yet — keep trying
             sleep "$poll_interval"
             elapsed=$((elapsed + elapsed_incr))
@@ -146,7 +146,7 @@ _health_check_run() {
                             # First match — auto-dismiss
                             dismissed="$(_hc_mark_dismissed "$i" "$dismissed")"
                             echo -e "${DIM}  Health check: auto-dismissing ${HC_LABEL[$i]}${RESET}" >&2
-                            _tmux_run_with_timeout send-keys -t "$session_name" "${HC_KEYS[$i]}" 2>/dev/null || true
+                            _tmux_run_with_timeout send-keys -t "=$session_name:" "${HC_KEYS[$i]}" 2>/dev/null || true
                         fi
                         # Already dismissed — wait for prompt to clear
                         ;;
@@ -198,7 +198,7 @@ _health_check_run() {
         done
 
         local screen=""
-        if ! $matched && _tmux_run_with_timeout capture-pane -p -t "$session_name" 2>/dev/null; then
+        if ! $matched && _tmux_run_with_timeout capture-pane -p -t "=$session_name:" 2>/dev/null; then
             screen="$TMUX_RUN_OUTPUT"
         fi
         if ! $matched && ! _hc_prompt_visible "$screen"; then

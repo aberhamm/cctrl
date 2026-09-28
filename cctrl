@@ -2995,13 +2995,13 @@ _pick_safe_session_index() {
     # name and returns 0. Prints nothing and returns 1 if no free slot exists
     # within a sane bound, so the caller can refuse rather than collide.
     local base_name="$1"
-    if ! tmux has-session -t "$base_name" 2>/dev/null; then
+    if ! tmux has-session -t "=$base_name" 2>/dev/null; then
         printf '%s\n' "$base_name"
         return 0
     fi
     local n=2
     while (( n <= 999 )); do
-        if ! tmux has-session -t "${base_name}--${n}" 2>/dev/null; then
+        if ! tmux has-session -t "=${base_name}--${n}" 2>/dev/null; then
             printf '%s\n' "${base_name}--${n}"
             return 0
         fi
@@ -3555,8 +3555,8 @@ _launch_detached() {
         rm -f "$(_session_metadata_file "$session_name")" 2>/dev/null || true
         return 1
     fi
-    tmux set-option -t "$session_name" -q @cctrl_managed 1 2>/dev/null || true
-    tmux set-option -t "$session_name" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
+    tmux set-option -t "=$session_name:" -q @cctrl_managed 1 2>/dev/null || true
+    tmux set-option -t "=$session_name:" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
     # Bind this registry record to the newly-created tmux pane. A later
     # attestation rejects a recycled session name or a replaced pane.
     if ! _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null; then
@@ -3667,7 +3667,7 @@ _prompt_attach_session() {
     IFS= read -r answer || return 0
     answer="$(printf '%s' "${answer:-$default_answer}" | tr '[:upper:]' '[:lower:]')"
     case "$answer" in
-        y|yes) exec tmux attach-session -t "$session_name" ;;
+        y|yes) exec tmux attach-session -t "=$session_name" ;;
         *)
             local hint_prefix="cctrl"
             [[ -n "${CCTRL_HOST_PREFIX:-}" ]] && hint_prefix="cctrl --host $CCTRL_HOST_PREFIX"
@@ -3794,7 +3794,7 @@ _peer_live_identity_conflict_exists() {
     local peer_json="$1" allowed_session="${2:-}" name session
     name="$(jq -r '.name // empty' <<< "$peer_json")"
     session="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
-    if [[ -n "$session" && "$session" != "$allowed_session" ]] && command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "$session"; then
+    if [[ -n "$session" && "$session" != "$allowed_session" ]] && command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "=$session"; then
         return 0
     fi
     if [[ -n "$name" ]] && _peer_derived_identity_conflict_exists "$name" "$allowed_session"; then
@@ -4217,7 +4217,7 @@ _peer_cmd_ls() {
         | @tsv
     ' <<< "$doc" | while IFS=$'\t' read -r name source agent session dir capabilities purpose shadows; do
         local shadow_text="" session_text status_text
-        if [[ -n "$session" ]] && _tmux_run_with_timeout has-session -t "$session" >/dev/null 2>&1; then
+        if [[ -n "$session" ]] && _tmux_run_with_timeout has-session -t "=$session" >/dev/null 2>&1; then
             session_text="$session"
             status_text="${GREEN}live${RESET}"
         elif [[ -n "$session" ]]; then
@@ -4279,7 +4279,7 @@ _peer_direct_resolve() {
         return 66
     fi
 
-    if command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "$PEER_DIRECT_TARGET" >/dev/null 2>&1; then
+    if command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "=$PEER_DIRECT_TARGET" >/dev/null 2>&1; then
         PEER_DIRECT_LIVE=true
         PEER_DIRECT_STATUS="ok"
         return 0
@@ -5609,7 +5609,7 @@ _peer_reachability_class() {
         printf 'unreachable\n'
         return 0
     fi
-    if ! _tmux_run_with_timeout has-session -t "$target"; then
+    if ! _tmux_run_with_timeout has-session -t "=$target"; then
         printf 'unreachable\n'
         return 0
     fi
@@ -5698,7 +5698,7 @@ _peer_pane_ready_for_delivery() {
     # Sets PEER_DELIVER_READY_REASON on non-zero return.
     # Uses the shared pattern table from lib/health-check-patterns.sh.
     local target="$1" agent="${2:-}" force_busy="${3:-false}" capture
-    if ! _tmux_run_with_timeout capture-pane -p -S -15 -t "$target"; then
+    if ! _tmux_run_with_timeout capture-pane -p -S -15 -t "=$target:"; then
         PEER_DELIVER_READY_REASON="${TMUX_RUN_ERROR:-capture-pane failed}"
         [[ -n "$PEER_DELIVER_READY_REASON" ]] || PEER_DELIVER_READY_REASON="capture-pane failed"
         return 2
@@ -5776,14 +5776,14 @@ _peer_tmux_paste() {
         [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux load-buffer failed"
         return 1
     fi
-    if ! _tmux_run_with_timeout paste-buffer -p -r -b "$buffer" -t "$target"; then
+    if ! _tmux_run_with_timeout paste-buffer -p -r -b "$buffer" -t "=$target:"; then
         PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux paste-buffer failed}"
         [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux paste-buffer failed"
         _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
         return 1
     fi
     if [[ "$submit" == "true" ]]; then
-        if ! _tmux_run_with_timeout send-keys -t "$target" Enter; then
+        if ! _tmux_run_with_timeout send-keys -t "=$target:" Enter; then
             PEER_DELIVER_REASON="${TMUX_RUN_ERROR:-tmux send-keys failed}"
             [[ -n "$PEER_DELIVER_REASON" ]] || PEER_DELIVER_REASON="tmux send-keys failed"
             _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
@@ -7444,10 +7444,10 @@ _peer_cmd_doctor() {
             checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
             if _peer_has_capability "$peer_json" "tmux"; then
                 target_session="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
-                if [[ -n "$target_session" ]] && command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "$target_session"; then ok=true; else ok=false; fi
+                if [[ -n "$target_session" ]] && command -v tmux >/dev/null 2>&1 && _tmux_run_with_timeout has-session -t "=$target_session"; then ok=true; else ok=false; fi
                 check="$(jq -n --arg name tmux_session_live --argjson ok "$ok" --arg session "$target_session" '{name:$name,ok:$ok,session:$session}')"
                 checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
-                if [[ "$ok" == "true" ]] && _tmux_run_with_timeout capture-pane -p -S -1 -t "$target_session"; then ok=true; else ok=false; fi
+                if [[ "$ok" == "true" ]] && _tmux_run_with_timeout capture-pane -p -S -1 -t "=$target_session:"; then ok=true; else ok=false; fi
                 check="$(jq -n --arg name pane_reachable --argjson ok "$ok" --arg session "$target_session" '{name:$name,ok:$ok,session:$session}')"
                 checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
             fi
@@ -8338,7 +8338,7 @@ _session_agent_cmd() {
     # Echo the foreground command of a session's pane. cctrl detaches with
     # `exec <agent>`, so the pane root usually is the agent; fall back to first child.
     local sess="$1" pid cmd child ccmd
-    pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)"
     [[ -n "$pid" ]] || return 0
     cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
     if [[ -z "$(_agent_from_cmd "$cmd")" ]]; then
@@ -8442,7 +8442,7 @@ _session_capture_tmux_attestation_anchor() {
     # Publish the complete receipt in one transaction; never expose half an
     # anchor if a process probe or metadata publication fails.
     local session="$1" line pane_id pane_pid pane_started receipt
-    line="$(tmux list-panes -t "$session" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)"
+    line="$(tmux list-panes -t "=$session:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)"
     IFS=: read -r pane_id pane_pid <<< "$line"
     [[ "$pane_id" =~ ^%[0-9]+$ && "$pane_pid" =~ ^[0-9]+$ ]] || return 1
     pane_started="$(_session_tmux_host_process_started "$session" "$pane_pid")"
@@ -8605,12 +8605,12 @@ _session_attest() {
             tmux)
                 if ! command -v tmux >/dev/null 2>&1; then
                     result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "tmux-unavailable" "$thread_id")"
-                elif ! tmux has-session -t "$tmux_session" 2>/dev/null; then
+                elif ! tmux has-session -t "=$tmux_session" 2>/dev/null; then
                     result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" false "tmux-session-missing" "$thread_id")"
                 elif [[ -z "$pane_id" || ! "$expected_pid" =~ ^[0-9]+$ ]]; then
                     result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "unanchored-legacy-session" "$thread_id")"
                 else
-                    current_line="$(tmux list-panes -t "$tmux_session" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | awk -F : -v id="$pane_id" '$1 == id {print; exit}')"
+                    current_line="$(tmux list-panes -t "=$tmux_session:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | awk -F : -v id="$pane_id" '$1 == id {print; exit}')"
                     IFS=: read -r current_id current_pid <<< "$current_line"
                     if [[ "$current_id" != "$pane_id" ]]; then
                         result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" false "tmux-pane-missing" "$thread_id")"
@@ -8694,14 +8694,14 @@ _session_tmux_paste() {
         [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux load-buffer failed"
         return 1
     fi
-    if ! _tmux_run_with_timeout paste-buffer -p -r -b "$buffer" -t "$target"; then
+    if ! _tmux_run_with_timeout paste-buffer -p -r -b "$buffer" -t "=$target:"; then
         SESSION_SAY_REASON="${TMUX_RUN_ERROR:-tmux paste-buffer failed}"
         [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux paste-buffer failed"
         _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
         return 1
     fi
     if [[ "$submit" == "true" ]]; then
-        if ! _tmux_run_with_timeout send-keys -t "$target" Enter; then
+        if ! _tmux_run_with_timeout send-keys -t "=$target:" Enter; then
             SESSION_SAY_REASON="${TMUX_RUN_ERROR:-tmux send-keys failed}"
             [[ -n "$SESSION_SAY_REASON" ]] || SESSION_SAY_REASON="tmux send-keys failed"
             _tmux_run_with_timeout delete-buffer -b "$buffer" >/dev/null 2>&1 || true
@@ -8794,7 +8794,7 @@ _session_say() {
         $json && _session_say_json false "$sess" false no-tmux "tmux unavailable" || echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
         return 69
     fi
-    if ! _tmux_run_with_timeout has-session -t "$sess"; then
+    if ! _tmux_run_with_timeout has-session -t "=$sess"; then
         local hs_reason="${TMUX_RUN_ERROR:-tmux session not found: $sess}"
         [[ -n "$hs_reason" ]] || hs_reason="tmux session not found: $sess"
         $json && _session_say_json false "$sess" false unknown-session "$hs_reason" || echo -e "${RED}Unknown tmux session: $sess${RESET}" >&2
@@ -8846,7 +8846,7 @@ _session_claude_pid() {
     # `exec claude`, so the pane pid usually IS the claude process; otherwise
     # fall back to the first descendant that owns a Claude session file.
     local sess="$1" pid child
-    pid="$(tmux list-panes -t "$sess" -F '#{pane_pid}' 2>/dev/null | head -1)"
+    pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)"
     [[ -n "$pid" ]] || return 0
     [[ -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]] && { printf '%s' "$pid"; return 0; }
     for child in $(pgrep -P "$pid" 2>/dev/null); do
@@ -9553,11 +9553,11 @@ _session_rich_state() {
     # once and share it across both detectors to stay within the cost bound.
     if [[ "$base" != "shell" ]] && { [[ "$en_blocked" == "1" ]] || { [[ "$en_draft" == "1" && "$base" == "idle" ]]; }; }; then
         local copy_mode capture
-        copy_mode="$(tmux display -p -t "$sess" '#{pane_in_mode}' 2>/dev/null || true)"
+        copy_mode="$(tmux display -p -t "=$sess:" '#{pane_in_mode}' 2>/dev/null || true)"
         if [[ "${copy_mode:-0}" != "1" ]]; then
             # Escaped capture: the draft detector needs SGR attributes to tell
             # dimmed ghost text from typed text; the dialog detector gets it plain.
-            capture="$(tmux capture-pane -e -p -S -40 -t "$sess" 2>/dev/null || true)"
+            capture="$(tmux capture-pane -e -p -S -40 -t "=$sess:" 2>/dev/null || true)"
             if [[ -n "$capture" ]]; then
                 if [[ "$en_blocked" == "1" ]] && _session_pane_has_dialog "$(_strip_sgr "$capture")" "$agent"; then
                     printf '%s' 'blocked-dialog'; return 0
@@ -9682,8 +9682,8 @@ _session_list() {
     for i in "${!names[@]}"; do
         name="${names[i]}"
         execution_id="${execution_ids[i]}"
-        dir="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)"
-        attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
+        dir="$(tmux list-panes -t "=$name:" -F '#{pane_current_path}' 2>/dev/null | head -1)"
+        attached="$(tmux display-message -p -t "=$name:" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
         # Read all needed metadata fields in one jq call (was six separate calls).
         local stored_conv_id=""
@@ -9724,14 +9724,14 @@ _session_list() {
             model="$(printf '%s' "$cmd" | python3 "$SCRIPT_DIR/lib/agent_model.py" "$agent")"
             [[ -z "$model" ]] && model="?"
             kind="$agent ($model)"
-            if [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
+            if [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "=$name:" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
                 managed=true
             else
                 managed=false
             fi
         else
             claude_yes=false; model=""; agent=""
-            [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "$name" @cctrl_managed 2>/dev/null)" == "1" ]] && managed=true || managed=false
+            [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "=$name:" @cctrl_managed 2>/dev/null)" == "1" ]] && managed=true || managed=false
             base="${cmd%% *}"; base="${base##*/}"; base="${base#-}"
             kind="shell (${base:-sh})"
         fi
@@ -9873,8 +9873,8 @@ _task_tmux_rows_json_readonly() {
             errors+=("$(jq -nc --arg value "$line" '{error:"invalid-session-identity",value:$value}')")
             continue
         fi
-        cwd="$(tmux list-panes -t "$name" -F '#{pane_current_path}' 2>/dev/null | head -1)" || cwd=""
-        pane_raw="$(tmux list-panes -t "$name" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)" || pane_raw=""
+        cwd="$(tmux list-panes -t "=$name:" -F '#{pane_current_path}' 2>/dev/null | head -1)" || cwd=""
+        pane_raw="$(tmux list-panes -t "=$name:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)" || pane_raw=""
         if [[ -z "$cwd" && -z "$pane_raw" ]]; then
             errors+=("$(jq -nc --arg name "$name" '{error:"session-read-failed",session:$name}')")
         fi
@@ -10738,7 +10738,7 @@ _session_release_to_app_one() {
     attest="$(_session_attest "$name" --json 2>/dev/null || true)"
     pane_pid="$(jq -r '.pane_pid // empty' <<< "$attest" 2>/dev/null || true)"
     pane_started="$(jq -r '.pane_started // empty' "$baseline_file")"
-    tmux_id="$(tmux display-message -p -t "$name" '#{session_id}' 2>/dev/null || true)"
+    tmux_id="$(tmux display-message -p -t "=$name:" '#{session_id}' 2>/dev/null || true)"
     local recovering=false
     if [[ "$(jq -r '.verified // false' <<< "$attest" 2>/dev/null)" != true ]]; then
         if [[ "$(jq -r '.reason // empty' <<< "$attest" 2>/dev/null)" == tmux-session-missing && "$pane_pid" =~ ^[0-9]+$ ]]; then
@@ -10809,7 +10809,7 @@ _session_release_to_app_one() {
         error="baseline-changed-before-exit"; required_action="The task record changed after confirmation; inspect the new ownership evidence and retry."
     elif [[ "$recovering" != true ]]; then
         attest="$(_session_attest "$name" --json 2>/dev/null || true)"
-        current_tmux_id="$(tmux display-message -p -t "$name" '#{session_id}' 2>/dev/null || true)"
+        current_tmux_id="$(tmux display-message -p -t "=$name:" '#{session_id}' 2>/dev/null || true)"
         if [[ "$(jq -r '.verified // false' <<< "$attest" 2>/dev/null)" != true || "$current_tmux_id" != "$tmux_id" || "$(jq -r '.pane_pid // empty' <<< "$attest")" != "$pane_pid" ]]; then
             error="owner-fingerprint-changed"; required_action="The tmux owner changed after confirmation; do not send input to the replacement session."
         fi
@@ -10821,11 +10821,11 @@ _session_release_to_app_one() {
 
     if [[ "$recovering" != true ]]; then
         local pane_id; pane_id="$(jq -r '.pane_id // empty' "$baseline_file")"
-        if ! tmux send-keys -t "$pane_id" C-d 2>/dev/null; then
+        if ! tmux send-keys -t "$pane_id" C-d 2>/dev/null; then  # tmux-target:exact-id (pane id, not a session name)
             error="exit-request-failed"; required_action="Reopen the terminal task and exit Codex normally, then rerun release-to-app."
         else
             while (( seconds <= wait_s )); do
-                current_tmux_id="$(tmux display-message -p -t "$name" '#{session_id}' 2>/dev/null || true)"
+                current_tmux_id="$(tmux display-message -p -t "=$name:" '#{session_id}' 2>/dev/null || true)"
                 current_started="$(_session_process_started "$pane_pid")"
                 if [[ -n "$current_tmux_id" && "$current_tmux_id" != "$tmux_id" ]]; then error="owner-process-mismatch"; break; fi
                 if [[ -n "$current_started" && "$current_started" != "$pane_started" ]]; then error="owner-process-mismatch"; break; fi
@@ -10984,10 +10984,10 @@ _session_repair_bridge() {
     # bridgeSessionId on success, non-zero if it never registers.
     local sess="$1" pid after i
     pid="$(_session_claude_pid "$sess")"
-    tmux send-keys -t "$sess" -X cancel 2>/dev/null || true
-    tmux send-keys -t "$sess" C-u 2>/dev/null || true
-    tmux send-keys -t "$sess" -l "/rc" 2>/dev/null || true
-    tmux send-keys -t "$sess" Enter 2>/dev/null || true
+    tmux send-keys -t "=$sess:" -X cancel 2>/dev/null || true
+    tmux send-keys -t "=$sess:" C-u 2>/dev/null || true
+    tmux send-keys -t "=$sess:" -l "/rc" 2>/dev/null || true
+    tmux send-keys -t "=$sess:" Enter 2>/dev/null || true
     for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         sleep 1
         after="$(_session_bridge_field "$pid" bridgeSessionId)"
@@ -11030,7 +11030,7 @@ _session_realign() {
         printf '\n' >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
         return 0
     fi
-    tmux kill-session -t "$name" 2>/dev/null || true
+    tmux kill-session -t "=$name" 2>/dev/null || true
     local -a rl=("$target" --agent claude --name "$name" --resume "$sid")
     [[ -n "$purpose" ]] && rl+=(--purpose "$purpose")
     _launch_detached "${rl[@]}"
@@ -11098,7 +11098,7 @@ _session_doctor() {
         n_total=$((n_total+1))
         pid="$(_session_claude_pid "$name")"
         st="$(_session_bridge_field "$pid" status)"; [[ -n "$st" ]] || st="?"
-        copy_mode="$(tmux display -p -t "$name" '#{pane_in_mode}' 2>/dev/null || true)"
+        copy_mode="$(tmux display -p -t "=$name:" '#{pane_in_mode}' 2>/dev/null || true)"
         prefix="$(printf '%s' "$cmd" | grep -oE -- '--remote-control-session-name-prefix[= ][^ ]+' | head -1 | sed -E 's/^--remote-control-session-name-prefix[= ]//' || true)"
         expected="${name}-"
         bridge=""; repaired=""; aligned="n/a"
@@ -11874,11 +11874,11 @@ _session_autoheal() {
         if [[ "$st" == "busy" ]]; then
             action="skipped"; reason="busy"
         else
-            copy_mode="$(tmux display -p -t "$name" '#{pane_in_mode}' 2>/dev/null || true)"
+            copy_mode="$(tmux display -p -t "=$name:" '#{pane_in_mode}' 2>/dev/null || true)"
             if [[ "${copy_mode:-0}" == "1" ]]; then
                 action="skipped"; reason="copy-mode"
             else
-                capture="$(tmux capture-pane -e -p -S -40 -t "$name" 2>/dev/null || true)"
+                capture="$(tmux capture-pane -e -p -S -40 -t "=$name:" 2>/dev/null || true)"
                 if [[ -z "$capture" ]]; then
                     # Can't confirm the input line is empty — fail safe, never heal.
                     action="skipped"; reason="unverifiable-input"
@@ -11983,7 +11983,7 @@ _session_attach() {
     # Picker mode (no argument)
     if [[ "$attach_target" == "__picker__" ]]; then
         if [[ ${#sessions[@]} -eq 1 ]]; then
-            exec tmux attach-session -t "${sessions[0]}"
+            exec tmux attach-session -t "=${sessions[0]}"
         fi
         echo -e "${BOLD}Active sessions:${RESET}"
         i=1
@@ -11995,14 +11995,14 @@ _session_attach() {
         echo -n "Attach to: "
         read -r choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#sessions[@]} )); then
-            exec tmux attach-session -t "${sessions[$((choice-1))]}"
+            exec tmux attach-session -t "=${sessions[$((choice-1))]}"
         fi
         return 1
     fi
 
     # Exact match
-    if tmux has-session -t "$attach_target" 2>/dev/null; then
-        exec tmux attach-session -t "$attach_target"
+    if tmux has-session -t "=$attach_target" 2>/dev/null; then
+        exec tmux attach-session -t "=$attach_target"
     fi
 
     # Partial match
@@ -12017,7 +12017,7 @@ _session_attach() {
         for s in "${sessions[@]}"; do echo "  $s"; done
         return 1
     elif [[ ${#matches[@]} -eq 1 ]]; then
-        exec tmux attach-session -t "${matches[0]}"
+        exec tmux attach-session -t "=${matches[0]}"
     else
         echo -e "${BOLD}Multiple sessions matching '$attach_target':${RESET}"
         i=1
@@ -12029,7 +12029,7 @@ _session_attach() {
         echo -n "Attach to: "
         read -r choice
         if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#matches[@]} )); then
-            exec tmux attach-session -t "${matches[$((choice-1))]}"
+            exec tmux attach-session -t "=${matches[$((choice-1))]}"
         fi
         return 1
     fi
@@ -12140,8 +12140,7 @@ _session_stop_exact() {
     local expected_server_id="${BASH_REMATCH[1]}" expected_server_pid="${BASH_REMATCH[2]}"
     local expected_server_started="${BASH_REMATCH[3]}" tmux_session_id="${BASH_REMATCH[4]}"
     local observed observed_session_id observed_name observed_server_id observed_server_pid observed_server_started
-    observed="$(tmux -u display-message -p -t "$tmux_session_id" \
-        '#{session_id}|#{@cctrl_server_instance_id}|#{pid}|#{start_time}|#{session_name}' 2>/dev/null || true)"
+    observed="$(tmux -u display-message -p -t "$tmux_session_id" '#{session_id}|#{@cctrl_server_instance_id}|#{pid}|#{start_time}|#{session_name}' 2>/dev/null || true)"  # tmux-target:exact-id ($tmux_session_id is tmux's own "$N" id, always exact)
     if [[ -z "$observed" ]]; then
         _session_stop_exact_error "$json" stale-identity "$name" "$execution_id" \
             "Execution identity is stale; its tmux session no longer exists." 69
@@ -12172,9 +12171,7 @@ _session_stop_exact() {
     stop_anchors="$(_session_pane_anchors "$tmux_session_id")"
     stop_procs="$(_session_pane_process_snapshot "$tmux_session_id")" || stop_procs=""
     guard="#{&&:#{==:#{@cctrl_server_instance_id},$expected_server_id},#{&&:#{==:#{pid},$expected_server_pid},#{&&:#{==:#{start_time},$expected_server_started},#{==:#{session_id},$tmux_session_id}}}}"
-    tmux if-shell -F -t "$tmux_session_id" "$guard" \
-        "kill-session -t '$tmux_session_id'" "run-shell 'exit 75'" \
-        >/dev/null 2>&1 || rc=$?
+    tmux if-shell -F -t "$tmux_session_id" "$guard" "kill-session -t '$tmux_session_id'" "run-shell 'exit 75'" >/dev/null 2>&1 || rc=$?  # tmux-target:exact-id ($tmux_session_id is tmux's own "$N" id, always exact)
     if (( rc != 0 )); then
         _session_stop_exact_error "$json" stale-identity "$name" "$execution_id" \
             "Execution identity became stale before it could be stopped." 69
@@ -12202,7 +12199,12 @@ _session_pane_process_snapshot() {
     # exact tmux target $1 and all their descendants. `start` is ps lstart with
     # spaces as underscores, so a reused pid is never mistaken for the original.
     local target="$1" pane_pids
-    pane_pids="$(tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)"
+    # Callers pass either a tmux-internal "$N" id (already exact) or an
+    # "=name" session target (with or without the trailing ":"). list-panes
+    # is a pane/window-target command and requires the trailing ":" on an
+    # "=name" target, so normalize once here instead of at every call site.
+    [[ "$target" == =* && "$target" != *: ]] && target="$target:"
+    pane_pids="$(tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)"  # tmux-target:exact-id (normalized above: "$N" id or "=name:")
     [[ -n "${pane_pids// /}" ]] || return 0
     # lstart is locale- and time-zone dependent; the delayed reap runs in the
     # tmux server's environment, so both sides use C / UTC.
@@ -12287,7 +12289,7 @@ _session_reap_cmd() {
     done
     [[ "$max_wait" =~ ^[0-9]+$ ]] || return 64
     if [[ "$session_id" == \$* ]]; then
-        while tmux has-session -t "$session_id" 2>/dev/null; do
+        while tmux has-session -t "$session_id" 2>/dev/null; do  # tmux-target:exact-id (guarded above: $session_id is tmux's own "$N" id)
             (( waited >= max_wait )) && return 75
             sleep 1; waited=$((waited + 1))
         done
@@ -12302,8 +12304,13 @@ _session_reap_cmd() {
 
 _session_pane_anchors() {
     # "<pane_id> <pane_pid>" for every pane of an exact tmux target (a
-    # "$N" session id or "=name"). Empty when the session is gone.
-    tmux list-panes -s -t "$1" -F '#{pane_id} #{pane_pid}' 2>/dev/null || true
+    # "$N" session id or "=name", with or without the trailing ":").
+    # Empty when the session is gone.
+    local target="$1"
+    # list-panes is a pane/window-target command and requires the trailing
+    # ":" on an "=name" target; a "$N" id passes through unchanged.
+    [[ "$target" == =* && "$target" != *: ]] && target="$target:"
+    tmux list-panes -s -t "$target" -F '#{pane_id} #{pane_pid}' 2>/dev/null || true  # tmux-target:exact-id (normalized above: "$N" id or "=name:")
 }
 
 _session_task_records_for_name() {
@@ -12409,7 +12416,7 @@ _session_record_terminated_cmd() {
         esac
     done
     [[ -n "$name" && "$session_id" == \$* && "$max_wait" =~ ^[0-9]+$ ]] || return 64
-    while tmux has-session -t "$session_id" 2>/dev/null; do
+    while tmux has-session -t "$session_id" 2>/dev/null; do  # tmux-target:exact-id (guarded above: $session_id is tmux's own "$N" id)
         (( waited >= max_wait )) && return 75
         sleep 1; waited=$((waited + 1))
     done
@@ -12496,20 +12503,23 @@ _session_kill() {
         echo -e "${DIM}List sessions with: cctrl session ls${RESET}" >&2
         return 1
     fi
-    if tmux has-session -t "$kill_target" 2>/dev/null; then
+    if tmux has-session -t "=$kill_target" 2>/dev/null; then
         # Resolve the exact session tmux picked, so the recorded end names the
         # session that actually died, then kill it by immutable id.
         local resolved session_id session_name anchors
-        resolved="$(tmux display-message -p -t "$kill_target" '#{session_id} #{session_name}' 2>/dev/null || true)"
+        resolved="$(tmux display-message -p -t "=$kill_target:" '#{session_id} #{session_name}' 2>/dev/null || true)"
         session_id="${resolved%% *}"; session_name="${resolved#* }"
-        [[ "$session_id" == \$* ]] || { session_id="$kill_target"; session_name="$kill_target"; }
+        # A rare race (has-session succeeded but display-message then failed)
+        # falls back to the target as given; keep it exact rather than a bare
+        # name that could still prefix-match a differently-named survivor.
+        [[ "$session_id" == \$* ]] || { session_id="=$kill_target"; session_name="$kill_target"; }
         local procs
         anchors="$(_session_pane_anchors "$session_id")"
         procs="$(_session_pane_process_snapshot "$session_id")" || {
             echo -e "${YELLOW}⚠  Could not record $session_name's pane processes; they will not be checked after the kill.${RESET}" >&2
             procs=""
         }
-        if ! tmux kill-session -t "$session_id"; then
+        if ! tmux kill-session -t "$session_id"; then  # tmux-target:exact-id (session_id is tmux's own "$N" id, or "=name" from the fallback above)
             echo -e "${RED}Could not kill session '$session_name'; its task records are unchanged.${RESET}" >&2
             return 1
         fi
@@ -12532,7 +12542,7 @@ _session_process_in_session() {
     local -a pane_pids=()
     while IFS= read -r pane_pid; do
         [[ "$pane_pid" =~ ^[0-9]+$ ]] && pane_pids+=("$pane_pid")
-    done < <(CCTRL_CURRENT_PID="$pid" tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null)
+    done < <(CCTRL_CURRENT_PID="$pid" tmux list-panes -t "=$session:" -F '#{pane_pid}' 2>/dev/null)
     [[ ${#pane_pids[@]} -gt 0 ]] || return 1
 
     while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); do
@@ -12553,7 +12563,7 @@ _session_current_name() {
     # unless this process is also a descendant of one of the session's panes.
     local explicit="${CCTRL_SESSION_NAME:-}" tmux_current
     if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "$explicit" ]]; then
-        tmux has-session -t "$explicit" 2>/dev/null || return 1
+        tmux has-session -t "=$explicit" 2>/dev/null || return 1
         _session_process_in_session "$explicit" || return 1
         printf '%s\n' "$explicit"
         return 0
@@ -12593,7 +12603,7 @@ _session_current() {
     fi
 
     if [[ -n "$current" ]]; then
-        if [[ "$(tmux show-option -qv -t "$current" @cctrl_managed 2>/dev/null)" == "1" \
+        if [[ "$(tmux show-option -qv -t "=$current:" @cctrl_managed 2>/dev/null)" == "1" \
               || -f "$(_session_metadata_file "$current")" ]]; then
             managed=true
             can_close=true
@@ -12717,14 +12727,14 @@ _session_close() {
         target="$current"
     fi
 
-    if ! tmux has-session -t "$target" 2>/dev/null; then
+    if ! tmux has-session -t "=$target" 2>/dev/null; then
         echo -e "${RED}No session named '$target'.${RESET}" >&2
         echo -e "${DIM}List sessions with: cctrl session ls${RESET}" >&2
         return 1
     fi
 
     if ! $force; then
-        if [[ "$(tmux show-option -qv -t "$target" @cctrl_managed 2>/dev/null)" != "1" \
+        if [[ "$(tmux show-option -qv -t "=$target:" @cctrl_managed 2>/dev/null)" != "1" \
               && ! -f "$(_session_metadata_file "$target")" ]]; then
             echo -e "${RED}Session '$target' was not started by cctrl.${RESET}" >&2
             echo -e "${DIM}Close it anyway with: cctrl session close $target --force${RESET}" >&2
@@ -12763,7 +12773,10 @@ _session_close() {
 
     if (( grace > 0 )); then
         local target_q
-        target_q="$(printf '%q' "$target")"
+        # "=$target": the delayed kill-session below is embedded in a shell
+        # string run later by the tmux server, so it must carry its own exact
+        # target the same way every other call site does.
+        target_q="$(printf '%q' "=$target")"
         # run-shell -b runs on the tmux server, so the delayed kill survives
         # the death of the calling pane/client.
         # The end is recorded by the same tmux-server job, after the kill, so
@@ -12785,7 +12798,7 @@ _session_close() {
             after_kill="nohup sh -c $(printf '%q' "trap '' TERM HUP; ${record_cmd:-:}; ${reap_cmd:-:}") >>$(printf '%q' "${CCTRL_CLOSE_JOB_LOG:-/dev/null}") 2>&1 & "
         fi
         if ! tmux run-shell -b "sleep $grace; ${after_kill}tmux kill-session -t $target_q" 2>/dev/null; then
-            if ! tmux kill-session -t "$target"; then
+            if ! tmux kill-session -t "=$target"; then
                 echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
                 return 1
             fi
@@ -12800,7 +12813,7 @@ _session_close() {
             echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s."
         fi
     else
-        if ! tmux kill-session -t "$target"; then
+        if ! tmux kill-session -t "=$target"; then
             echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
             return 1
         fi
@@ -12908,7 +12921,7 @@ cmd_rename() {
 
     local target="$1" new_label="$2"
 
-    if ! tmux has-session -t "$target" 2>/dev/null; then
+    if ! tmux has-session -t "=$target" 2>/dev/null; then
         echo -e "${RED}No session named '$target'.${RESET}" >&2
         return 1
     fi
@@ -12918,7 +12931,7 @@ cmd_rename() {
     # only when a stable provider id exists and is never rewritten itself.
     local meta_file agent stable_id="" metadata_updated=false
     meta_file="$(_session_metadata_file "$target")"
-    agent="$(tmux show-option -qv -t "$target" @cctrl_agent 2>/dev/null || true)"
+    agent="$(tmux show-option -qv -t "=$target:" @cctrl_agent 2>/dev/null || true)"
     if [[ -z "$agent" || "$agent" == "1" ]]; then
         agent="$(_session_metadata_field "$target" agent 2>/dev/null || true)"
     fi
@@ -12939,7 +12952,7 @@ cmd_rename() {
     fi
 
     # 2. Update tmux @cctrl_purpose
-    tmux set-option -t "$target" @cctrl_purpose "$new_label" 2>/dev/null || true
+    tmux set-option -t "=$target:" @cctrl_purpose "$new_label" 2>/dev/null || true
 
     # 3. For Claude Code sessions: append custom-title to transcript
     #    For Codex sessions: update the local Codex app thread title/name.
@@ -12984,7 +12997,7 @@ _session_reconcile_names() {
     for name in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
         [[ "$name" == TMUX--* ]] || continue
         local agent
-        agent="$(tmux show-option -qv -t "$name" @cctrl_agent 2>/dev/null || true)"
+        agent="$(tmux show-option -qv -t "=$name:" @cctrl_agent 2>/dev/null || true)"
         [[ "$agent" == "codex" ]] && continue
 
         local tpath claude_title meta_purpose
@@ -13014,7 +13027,7 @@ print(d.get('purpose', ''))
             if [[ -f "$meta_file" ]]; then
                 _session_update_metadata_field "$name" purpose "$claude_label" 2>/dev/null || continue
             fi
-            tmux set-option -t "$name" @cctrl_purpose "$claude_label" 2>/dev/null || true
+            tmux set-option -t "=$name:" @cctrl_purpose "$claude_label" 2>/dev/null || true
             ((corrections++))
 
             if $json_mode; then
@@ -13067,7 +13080,7 @@ _session_codex_rollout_path() {
     [[ -d "$CODEX_SESSIONS_DIR" ]] || return 0
     metadata="$(_session_metadata_file "$sess")"
     [[ -f "$metadata" ]] || return 0
-    cwd="$(tmux list-panes -t "$sess" -F '#{pane_current_path}' 2>/dev/null | head -1)"
+    cwd="$(tmux list-panes -t "=$sess:" -F '#{pane_current_path}' 2>/dev/null | head -1)"
     db="$(_codex_state_db)"
     python3 "$SCRIPT_DIR/lib/codex_rollout.py" "$CODEX_SESSIONS_DIR" "$metadata" "$db" "$cwd" 2>/dev/null || true
     return 0
@@ -13428,7 +13441,7 @@ _session_prune() {
         # Never propose the session we're running inside.
         [[ -n "$current" && "$name" == "$current" ]] && continue
         # Attached sessions are excluded unless explicitly forced.
-        attached="$(tmux display-message -p -t "$name" '#{session_attached}' 2>/dev/null)"
+        attached="$(tmux display-message -p -t "=$name:" '#{session_attached}' 2>/dev/null)"
         [[ "$attached" == "1" && $force == false ]] && continue
 
         cmd="$(_session_agent_cmd "$name")"
