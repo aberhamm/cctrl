@@ -3734,6 +3734,124 @@ test_peer_send_deliver_outcomes() {
     echo "ok: peer send --deliver classifies all five outcomes with correct exit codes"
 }
 
+test_peer_send_sender_binding_refuses_mismatch() {
+    # plan 077: a tmux-hosted caller can only send AS its own live tmux session
+    # (or a role alias bound to it) — never a literal, possibly-stale/reused
+    # session name — unless --impersonate is given. Closes msg_20260927_175609_8f2f78.
+    # TMUX_FAKE_PANE_PID=__current__ makes the fake tmux report this test
+    # process's own pid as the pane pid, so _session_current_name's pane-
+    # ancestry check (it doesn't trust bare $TMUX alone) resolves trivially.
+    local bin="$TMPDIR/bindbin" data="$TMPDIR/peer-bind-data"
+    mkdir -p "$bin" "$data" "$CCTRL_SESSION_METADATA_DIR"
+    make_fake_tmux "$bin/tmux"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--sender-a.json" <<'JSON'
+{"name":"TMUX--sender-a","agent":"claude","created_at":"2026-09-27T10:00:00Z","cctrl_managed":true}
+JSON
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--sender-b.json" <<'JSON'
+{"name":"TMUX--sender-b","agent":"claude","created_at":"2026-09-27T10:05:00Z","cctrl_managed":true}
+JSON
+    PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register mailbox-only --dir /tmp/mo --agent codex >/dev/null
+
+    local before=0 after=0 out rc=0
+    [[ -f "$data/messages.jsonl" ]] && before="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--sender-a TMUX--sender-b" TMUX_FAKE_SESSION_NAME="TMUX--sender-a" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as TMUX--sender-b --json -- "impersonation attempt" 2>&1)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected exit 66 for a sender that isn't the caller's own tmux session, got $rc"
+    assert_contains "$out" "not your session"
+    [[ -f "$data/messages.jsonl" ]] && after="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    [[ "$before" == "$after" ]] || fail "expected no message written on sender-binding refusal (was $before, now $after)"
+
+    # Sending as yourself still works, and records the plan-077 audit fields.
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--sender-a TMUX--sender-b" TMUX_FAKE_SESSION_NAME="TMUX--sender-a" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as TMUX--sender-a --json -- "as myself")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected send as own session to succeed"
+    printf '%s\n' "$out" | jq -e '.audit.requested_from == "TMUX--sender-a"' >/dev/null || fail "expected requested_from audit field"
+    printf '%s\n' "$out" | jq -e '.audit.requested_to == "mailbox-only"' >/dev/null || fail "expected requested_to audit field"
+    printf '%s\n' "$out" | jq -e '.audit.caller_tmux_session == "TMUX--sender-a"' >/dev/null || fail "expected caller_tmux_session audit field"
+    printf '%s\n' "$out" | jq -e '(.audit | has("impersonated")) | not' >/dev/null || fail "expected no impersonated audit field when --impersonate wasn't used"
+
+    # --impersonate overrides the binding refusal on purpose, and is recorded.
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--sender-a TMUX--sender-b" TMUX_FAKE_SESSION_NAME="TMUX--sender-a" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as TMUX--sender-b --impersonate --json -- "on purpose")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected --impersonate to override the sender-binding refusal"
+    printf '%s\n' "$out" | jq -e '.audit.impersonated == true' >/dev/null || fail "expected impersonated audit field to record the override"
+
+    echo "ok: peer send binds the sender to the caller's own tmux session unless --impersonate"
+}
+
+test_peer_send_recipient_created_at_is_audit_only() {
+    # plan 077 (2026-09-28 eng review): an earlier version of this change
+    # refused sending to any recipient whose derived-peer created_at postdated
+    # the caller's own session start, on the theory that it might have been
+    # reissued. That's also true of every ordinary session spawned after the
+    # caller (a fleet manager messaging a freshly spawned worker, a reply to
+    # it, restore-order-dependent sends), so it refused normal fleet traffic
+    # far more often than it caught an actual reissue. Dropped; the field is
+    # recorded for audit only. See docs/plans/075 for the open design
+    # question on a real, non-false-positive-prone freshness check.
+    local bin="$TMPDIR/reissuebin" data="$TMPDIR/peer-reissue-data"
+    mkdir -p "$bin" "$data" "$CCTRL_SESSION_METADATA_DIR"
+    make_fake_tmux "$bin/tmux"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--recip-a.json" <<'JSON'
+{"name":"TMUX--recip-a","agent":"claude","created_at":"2026-09-20T10:00:00Z","cctrl_managed":true}
+JSON
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--recip-b.json" <<'JSON'
+{"name":"TMUX--recip-b","agent":"claude","created_at":"2026-09-25T10:00:00Z","cctrl_managed":true}
+JSON
+
+    # A recipient session created AFTER the caller's own session started (the
+    # shape that used to be refused) sends fine, and the audit field reflects
+    # the recipient's actual registration time.
+    local out rc=0
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--recip-a TMUX--recip-b" TMUX_FAKE_SESSION_NAME="TMUX--recip-a" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send TMUX--recip-b --from TMUX--recip-a --json -- "newer worker")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected send to a recipient newer than the caller's own session to succeed (got $rc)"
+    printf '%s\n' "$out" | jq -e '.audit.recipient_created_at == "2026-09-25T10:00:00Z"' >/dev/null || fail "expected recipient_created_at audit field to reflect the recipient's own created_at"
+
+    # A recipient older than the caller also sends fine, with its own audit value.
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--recip-a TMUX--recip-b" TMUX_FAKE_SESSION_NAME="TMUX--recip-b" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send TMUX--recip-a --from TMUX--recip-b --json -- "older peer")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected send to a recipient older than the caller's own session to succeed"
+    printf '%s\n' "$out" | jq -e '.audit.recipient_created_at == "2026-09-20T10:00:00Z"' >/dev/null || fail "expected recipient_created_at audit field for the older recipient"
+
+    echo "ok: peer send records recipient_created_at for audit without refusing on recency"
+}
+
+test_peer_send_sender_binding_applies_to_remote_recipients() {
+    # plan 077 (2026-09-28 eng review, finding #2): the sender-binding check
+    # must not be bypassable just by sending to a peer that lives on another
+    # host. `_peer_send_and_deliver`'s cross-machine hop used to SSH straight
+    # out to `_peer_send_and_deliver_remote`, skipping the local
+    # `_peer_cmd_send` path entirely — the only vantage point where
+    # `$TMUX`/pane ancestry are meaningful (the remote host never sees them
+    # over a non-interactive SSH command).
+    make_fake_ssh "$TMPDIR/ssh"
+    local data="$TMPDIR/peer-remote-bind-data" hosts="$TMPDIR/peer-remote-bind-hosts.json"
+    local log="$TMPDIR/peer-remote-bind-ssh.log"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    : > "$log"
+    printf '{"studio":{"hostname":"studio.invalid","user":"tester"}}\n' > "$hosts"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--remotebind-a.json" <<'JSON'
+{"name":"TMUX--remotebind-a","agent":"claude","created_at":"2026-09-27T10:00:00Z","cctrl_managed":true}
+JSON
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--remotebind-b.json" <<'JSON'
+{"name":"TMUX--remotebind-b","agent":"claude","created_at":"2026-09-27T10:05:00Z","cctrl_managed":true}
+JSON
+    CCTRL_DATA_DIR="$data" CCTRL_HOSTS_FILE="$hosts" "$ROOT/cctrl" peer register faraway --host studio --agent codex --session TMUX--faraway >/dev/null
+
+    # Impersonating a different (also live) session while messaging a remote
+    # peer is refused, and SSH is never invoked.
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" SSH_LOG="$log" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--remotebind-a TMUX--remotebind-b" TMUX_FAKE_SESSION_NAME="TMUX--remotebind-a" CCTRL_DATA_DIR="$data" CCTRL_HOSTS_FILE="$hosts" "$ROOT/cctrl" peer send faraway --as TMUX--remotebind-b --deliver --json -- "should not ssh" 2>&1)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected exit 66 for a mismatched sender routed to a remote peer, got $rc"
+    assert_not_contains "$(cat "$log")" "SSH"
+
+    # Sending as yourself still proceeds to the remote hop (SSH gets called).
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" SSH_LOG="$log" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--remotebind-a TMUX--remotebind-b" TMUX_FAKE_SESSION_NAME="TMUX--remotebind-a" CCTRL_DATA_DIR="$data" CCTRL_HOSTS_FILE="$hosts" "$ROOT/cctrl" peer send faraway --as TMUX--remotebind-a --deliver --json -- "should ssh" 2>&1)" || true
+    assert_contains "$(cat "$log")" "SSH"
+
+    echo "ok: peer send's sender-binding check also applies before a cross-machine SSH hop"
+}
+
 test_peer_reply_core() {
     # plan 027: reply-by-message-id (happy, legacy, unauthorized, user, dead sender,
     # delivery failure keeps queued) plus plain `peer send` byte-identical guard.
@@ -10362,6 +10480,9 @@ test_peer_orchestrator_status_nudge_watch
 test_peer_gc_retention_and_doctor
 test_peer_doorbell_hook
 test_peer_send_deliver_outcomes
+test_peer_send_sender_binding_refuses_mismatch
+test_peer_send_recipient_created_at_is_audit_only
+test_peer_send_sender_binding_applies_to_remote_recipients
 test_peer_reply_core
 test_peer_reply_ack_and_refusals
 test_peer_reply_single_enumeration

@@ -5015,12 +5015,36 @@ _mailbox_resolve_identity_for_mode() {
     MAILBOX_RESOLVED_PEER_CREATED="$(jq -r '.created_at // ""' <<< "$peer_json")"
 }
 
+# Plan 077: does a resolved sender peer's tmux_target/session match the
+# caller's own live tmux session? Shared by `_peer_cmd_send`'s local path and
+# `_peer_send_and_deliver`'s cross-machine dispatch (the local check never ran
+# for a remote recipient, since that path SSHes out before reaching it —
+# 2026-09-28 eng review). Fails OPEN (returns 0, sets nothing) whenever
+# there's nothing to verify: --impersonate, from=user, an unresolved/manual
+# peer with no session, or no caller_session (not in tmux, or
+# `_session_current_name` couldn't tell). Returns 1 on an actual mismatch and
+# sets _PEER_BIND_TARGET so the caller can render its own error.
+#   $1 = from name   $2 = resolved peer json for from (or "")
+#   $3 = caller's own tmux session name (or "")   $4 = impersonate (bool)
+_peer_sender_binding_mismatch() {
+    local from_name="$1" from_peer_json="$2" caller_session="$3" impersonate="$4"
+    _PEER_BIND_TARGET=""
+    [[ "$impersonate" == "true" ]] && return 0
+    [[ "$from_name" != "user" && -n "$from_peer_json" && -n "$caller_session" ]] || return 0
+    local bind_target
+    bind_target="$(jq -r '.tmux_target // .session // empty' <<< "$from_peer_json")"
+    [[ -n "$bind_target" && "$bind_target" != "$caller_session" ]] || return 0
+    _PEER_BIND_TARGET="$bind_target"
+    return 1
+}
+
 _peer_cmd_send() {
     local to="${1:-}"
-    [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>${RESET}" >&2; return 64; }
+    [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--impersonate] [--json] -- <body>${RESET}" >&2; return 64; }
     shift
+    local requested_to="$to"
 
-    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false sender_host_override=""
+    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false sender_host_override="" impersonate=false
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -5043,6 +5067,8 @@ _peer_cmd_send() {
                 allow_unknown=true; shift ;;
             --deliver)
                 deliver=true; shift ;;
+            --impersonate)
+                impersonate=true; shift ;;
             --json)
                 json=true; shift ;;
             --)
@@ -5100,6 +5126,7 @@ _peer_cmd_send() {
         [[ -n "$as_identity" ]] && send_flags+=(--as "$as_identity")
         [[ -n "$subject" ]] && send_flags+=(--subject "$subject")
         [[ -n "$sender_host_override" ]] && send_flags+=(--sender-host "$sender_host_override")
+        $impersonate && send_flags+=(--impersonate)
         _peer_all_json_cache_begin >/dev/null 2>&1 || true
         _peer_send_and_deliver "$to" "$body" ${send_flags[@]+"${send_flags[@]}"} || true
         local _sd_rc=$PEER_SD_RC
@@ -5107,6 +5134,14 @@ _peer_cmd_send() {
         _peer_all_json_cache_end
         return "$_sd_rc"
     fi
+
+    # requested_from (plan 077): the identity string the caller literally asked
+    # for, BEFORE any alias/CCTRL_PEER resolution below — kept for the audit
+    # trail so a misroute like msg_20260927_175609_8f2f78 (both `--as` and the
+    # recipient name were stale) is diagnosable from the message itself.
+    local requested_from="$as_identity"
+    [[ -n "$requested_from" ]] || requested_from="$from"
+    [[ -n "$requested_from" ]] || requested_from="${CCTRL_PEER:-}"
 
     if [[ -z "$from" ]]; then
         if [[ -n "$as_identity" || -n "${CCTRL_PEER:-}" ]]; then
@@ -5163,6 +5198,39 @@ _peer_cmd_send() {
         fi
     fi
 
+    # Sender binding (plan 077): a tmux-hosted caller can only send AS its own
+    # live tmux session (or a role alias registered against it), unless
+    # --impersonate is given. Fails OPEN whenever there's nothing to verify
+    # against (no $TMUX, no session metadata, no peer tmux_target) — this is a
+    # misroute guard, not a general identity system, and it must never block a
+    # legitimate send it can't actually evaluate. Closes msg_20260927_175609_8f2f78
+    # (sent `--as` a stale, reused tmux session name). `_session_current_name`
+    # (not the bare `_session_tmux_display_current_name`) because `$TMUX` alone
+    # can be stale in an agent subprocess; it also verifies pane ancestry.
+    local caller_tmux_session=""
+    caller_tmux_session="$(_session_current_name 2>/dev/null)" || true
+    # recipient_created_at is audit-only (see below) — NOT enforced. An earlier
+    # version of this check refused any recipient whose derived-peer created_at
+    # postdated the caller's own session start, but that's true of every normal
+    # session spawned after the caller (a fleet manager messaging a freshly
+    # spawned worker, a reply to that worker, restore-order dependent sends),
+    # so it refused ordinary fleet traffic far more often than it caught an
+    # actual reissue (2026-09-28 eng review). Left as a design question in
+    # docs/plans/075-close-and-draft-review-followups.md rather than re-added
+    # naively.
+    local recipient_created_at=""
+    [[ -n "$to_peer_json" ]] && recipient_created_at="$(jq -r '.created_at // empty' <<< "$to_peer_json")"
+
+    if ! _peer_sender_binding_mismatch "$from" "$from_peer_json" "$caller_tmux_session" "$impersonate"; then
+        if $json; then
+            _json_error "sender-mismatch" "Sender '$from' is not your session ('$caller_tmux_session'); use --impersonate to override."
+        else
+            echo -e "${RED}Sender '$from' is not your session ('$caller_tmux_session').${RESET}" >&2
+            echo -e "${DIM}Pass --impersonate to send as another identity on purpose.${RESET}" >&2
+        fi
+        return 66
+    fi
+
     # Durable sender snapshot (plan 023): capture who sent this at send time so a
     # receiver keeps unambiguous identity even after the sender's ephemeral tmux
     # session closes. Purely additive — `from` above is untouched. Field presence
@@ -5211,6 +5279,11 @@ _peer_cmd_send() {
             --arg now "$now" \
             --argjson unknown "$unknown_peer" \
             --argjson sender "$sender_json" \
+            --arg requested_to "$requested_to" \
+            --arg requested_from "$requested_from" \
+            --arg caller_tmux_session "$caller_tmux_session" \
+            --arg recipient_created_at "$recipient_created_at" \
+            --argjson impersonated "$impersonate" \
             '{
               id: $id,
               from: $from,
@@ -5226,6 +5299,13 @@ _peer_cmd_send() {
               nudge_count: 0,
               last_nudge_at: null,
               last_nudge_error: null,
+              audit: ({
+                requested_to: $requested_to,
+                requested_from: (if $requested_from == "" then null else $requested_from end),
+                caller_tmux_session: (if $caller_tmux_session == "" then null else $caller_tmux_session end),
+                recipient_created_at: (if $recipient_created_at == "" then null else $recipient_created_at end),
+                impersonated: (if $impersonated then true else null end)
+              } | with_entries(select(.key == "requested_to" or .value != null))),
               history: [{at: $now, status: "queued", by: $from}]
             } + (if $unknown then {unknown_peer: true} else {} end)')"
         printf '%s\n' "$message" >> "$MESSAGES_FILE"
@@ -6402,6 +6482,43 @@ _peer_send_and_deliver_remote() {
 #   $1 = recipient (name or alias)
 #   $2 = body
 #   remaining args = extra `peer send` flags (--from NAME / --as NAME / --subject)
+
+# Plan 077 (2026-09-28 review finding #2): `_peer_cmd_send`'s sender-binding
+# check never runs for a remote recipient, since `_peer_send_and_deliver`
+# SSHes out to `_peer_send_and_deliver_remote` before ever calling
+# `_peer_cmd_send` locally. Re-run the same check here from the caller's
+# actual vantage point (the only place `$TMUX`/pane ancestry is meaningful —
+# the remote host never sees them over a non-interactive SSH command) so a
+# caller can't bypass sender binding just by messaging a peer on another
+# host. On a mismatch, mimics a local send-failed outcome without ever
+# SSHing out.
+_peer_send_and_deliver_remote_checked() {
+    local to="$1" body="$2" host="$3"; shift 3
+    local -a flags=("$@")
+    local _bind_identity="" _bind_impersonate=false _bind_idx=0
+    while (( _bind_idx < ${#flags[@]} )); do
+        case "${flags[$_bind_idx]}" in
+            --as|--from) _bind_identity="${flags[$((_bind_idx+1))]}" ;;
+            --impersonate) _bind_impersonate=true ;;
+        esac
+        ((_bind_idx++))
+    done
+    [[ -z "$_bind_identity" ]] && _bind_identity="${CCTRL_PEER:-}"
+    if [[ -n "$_bind_identity" && "$_bind_identity" != "user" ]]; then
+        local _bind_peer_json _bind_caller
+        _bind_peer_json="$(_peer_resolve_json "$_bind_identity" 2>/dev/null || true)"
+        _bind_caller="$(_session_current_name 2>/dev/null)" || true
+        if ! _peer_sender_binding_mismatch "$_bind_identity" "$_bind_peer_json" "$_bind_caller" "$_bind_impersonate"; then
+            PEER_SD_OUTCOME="send-failed"
+            PEER_SD_RC=66
+            PEER_SD_SEND_JSON="$(jq -cn --arg name "$_bind_identity" --arg caller "$_bind_caller" \
+                '{ok:false,error:{code:"sender-mismatch",message:("Sender \($name) is not your session (\($caller)); use --impersonate to override.")}}')"
+            return 66
+        fi
+    fi
+    _peer_send_and_deliver_remote "$to" "$body" "$host" ${flags[@]+"${flags[@]}"}
+}
+
 _peer_send_and_deliver() {
     local to="$1" body="$2"; shift 2
     local -a send_flags=("$@")
@@ -6425,7 +6542,7 @@ _peer_send_and_deliver() {
     if _route_peer_json="$(_peer_resolve_json "$to" 2>/dev/null)"; then
         _route_host="$(jq -r '.host // "local"' <<< "$_route_peer_json")"
         if [[ "$_route_host" != "$_route_local" && "$_route_host" != "local" ]]; then
-            _peer_send_and_deliver_remote "$to" "$body" "$_route_host" ${send_flags[@]+"${send_flags[@]}"}
+            _peer_send_and_deliver_remote_checked "$to" "$body" "$_route_host" ${send_flags[@]+"${send_flags[@]}"}
             return $?
         fi
     elif [[ -f "$HOSTS_FILE" ]]; then
@@ -6435,7 +6552,7 @@ _peer_send_and_deliver() {
             _fleet_match="$(jq -c --arg n "$to" '[.[] | select(.name == $n or ((.aliases // []) | index($n)))] | first // empty' <<< "$_fleet_peers" 2>/dev/null)"
             if [[ -n "$_fleet_match" ]]; then
                 _fleet_host="$(jq -r '.host' <<< "$_fleet_match")"
-                _peer_send_and_deliver_remote "$to" "$body" "$_fleet_host" ${send_flags[@]+"${send_flags[@]}"}
+                _peer_send_and_deliver_remote_checked "$to" "$body" "$_fleet_host" ${send_flags[@]+"${send_flags[@]}"}
                 return $?
             fi
         fi
@@ -6579,12 +6696,12 @@ _peer_send_deliver_emit() {
 _peer_cmd_reply() {
     local id="${1:-}"
     if [[ -z "$id" || "$id" == -* ]]; then
-        echo -e "${RED}Usage: cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--json] -- <body>${RESET}" >&2
+        echo -e "${RED}Usage: cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--impersonate] [--json] -- <body>${RESET}" >&2
         return 64
     fi
     shift
 
-    local as_identity="" subject="" body="" body_file="" json=false no_ack=false saw_body=false
+    local as_identity="" subject="" body="" body_file="" json=false no_ack=false saw_body=false impersonate=false
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -6599,6 +6716,8 @@ _peer_cmd_reply() {
                 body_file="$2"; shift 2 ;;
             --no-ack)
                 no_ack=true; shift ;;
+            --impersonate)
+                impersonate=true; shift ;;
             --json)
                 json=true; shift ;;
             --)
@@ -6703,6 +6822,7 @@ _peer_cmd_reply() {
 
     local -a extra=(--from "$identity")
     [[ -n "$subject" ]] && extra+=(--subject "$subject")
+    $impersonate && extra+=(--impersonate)
     _peer_send_and_deliver "$recipient" "$body" ${extra[@]+"${extra[@]}"} || true
     local sd_rc=$PEER_SD_RC
 
@@ -7614,8 +7734,8 @@ cmd_peer() {
             echo "  cctrl peer help-agent [--as NAME] [--json]"
             echo "                                     Agent contract: peer say (live) vs peer send (async); not auto-injected"
             echo "  cctrl peer overview [--as NAME] [--json]"
-            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--json] -- <body>"
-            echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--json] -- <body>"
+            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--impersonate] [--json] -- <body>"
+            echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--impersonate] [--json] -- <body>"
             echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"
             echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"
             echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]"

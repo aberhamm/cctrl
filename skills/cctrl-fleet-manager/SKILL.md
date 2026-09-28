@@ -163,6 +163,21 @@ only when actively watching a live task complete. Use ScheduleWakeup to self-pac
 - **Never pipe a session-spawn command through `head`/`tail`** — SIGPIPE aborts the
   spawn.
 
+## Peer messaging identity
+
+- **Send as yourself, never a literal session name.** Use `--as
+  "$(tmux display -p '#S')"` (your own live tmux session) or a registered role
+  alias — never hand-type another session's name from memory or an old brief.
+  `cctrl peer send`/`reply` bind the sender to your actual tmux session and
+  refuse (exit 66) on a mismatch; `--impersonate` overrides that on purpose.
+- **A stale or reused name misroutes mail.** tmux session names get recycled
+  (the lowest free `--N` suffix is handed back out once a session closes), so
+  a recipient name you last saw in a brief may now belong to someone else.
+  cctrl does not yet refuse this automatically (an early check that tried to
+  proved too eager — it flagged any recipient newer than your own session,
+  which is also true of every normal freshly spawned worker); re-resolve the
+  name via `cctrl peer ls` before trusting one from an old brief.
+
 ## Resource gating
 
 The fleet runs on real hardware. Watching prod while ignoring the local machine is

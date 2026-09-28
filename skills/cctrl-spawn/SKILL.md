@@ -132,6 +132,11 @@ memory and attention. One session = one purpose.
 - **Long briefs / apostrophes:** pass via a quoted heredoc into a shell var, or
   write to a file and load it — inline quoting breaks on apostrophes.
 - **tmux ops may need the right socket** sourced first (env brief has the how).
+- **Peer identity is derived from the tmux session name, and it's brittle.**
+  Once the new session is up, its own `cctrl peer send`/`reply` must run
+  `--as "$(tmux display -p '#S')"` (or a registered role alias), never a
+  literal name copied from this spawn or a brief — session names get recycled,
+  and a stale one is refused (exit 66) unless `--impersonate` is passed.
 
 ## Discipline (make "properly" mean disciplined)
 
