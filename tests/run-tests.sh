@@ -681,6 +681,29 @@ SH
     assert_contains "$out" "failing open"
 }
 
+# docs/plans/079's "Hook exit-code convention" note and docs/plans/088: if a
+# release's target hook script is missing, `_hooks_run pre-tool-use`'s `exec
+# python3 "$SCRIPT_DIR/hooks/block-git-commit.py"` itself exits 2 (python3's
+# own file-not-found code) with no marker distinguishing it from a
+# deliberate block. Pins the real mechanism, not just the launcher's generic
+# exit-2 passthrough (already covered by
+# test_cctrl_launcher_hooks_run_passes_exit_2_through with a fabricated stub).
+test_cctrl_hooks_run_exits_2_when_target_hook_script_missing() {
+    local home="$TMPDIR/hooks-missing-script" out rc=0
+    mkdir -p "$home/current"
+    cp "$ROOT/cctrl" "$home/current/cctrl"
+    chmod +x "$home/current/cctrl"
+    # Deliberately no hooks/ dir under $home/current/.
+
+    out="$("$home/current/cctrl" hooks run pre-tool-use 2>&1)" || rc=$?
+    [[ $rc -eq 2 ]] || fail "expected a missing target hook script to make cctrl exit 2 (python3's own file-not-found code), got $rc: $out"
+    assert_contains "$out" "block-git-commit.py"
+
+    rc=0
+    CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 2 ]] || fail "expected the launcher to pass the missing-script exit 2 through unchanged (indistinguishable from a deliberate block), got $rc"
+}
+
 # install/self-install.sh's atomic `current` swap: on macOS/BSD, a plain
 # `mv -f x current` follows `current` (a symlink to a directory) instead of
 # replacing it, silently leaving `current` on the old release. This
@@ -10822,6 +10845,7 @@ test_cctrl_launcher_non_hooks_run_commands_fail_loudly
 test_cctrl_launcher_hooks_run_fails_open_when_release_missing
 test_cctrl_launcher_hooks_run_passes_exit_2_through
 test_cctrl_launcher_hooks_run_fails_open_on_exit_42
+test_cctrl_hooks_run_exits_2_when_target_hook_script_missing
 test_cctrl_current_swap_is_atomic_on_bsd_mv
 test_git_dirty_check_matches_self_install_semantics
 test_launch_args

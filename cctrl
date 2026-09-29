@@ -14477,7 +14477,7 @@ _hooks_run() {
     if [[ -z "$name" || "$name" == "-h" || "$name" == "--help" ]]; then
         echo "Usage: cctrl hooks run <name>"
         echo ""
-        echo "  pre-tool-use   Block disallowed tool calls (stdin passthrough)"
+        echo "  pre-tool-use   Advisory checks on tool calls (stdin passthrough; none block yet)"
         echo "  stop           Post-turn logging and notifications"
         echo "  notify         Push notification on agent events"
         echo "  codex-observe  Observe bounded Codex lifecycle payloads (fail-open registry write)"

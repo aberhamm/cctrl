@@ -1556,9 +1556,9 @@ Distinguishes "done" from "needs input" by parsing the session transcript and ch
 }
 ```
 
-### block-git-commit.py — commit guardrail
+### block-git-commit.py — commit warning
 
-A `PreToolUse` hook that blocks Claude from creating git commits without explicit user approval. Catches `git commit`, `git revert`, `git cherry-pick`, and variants through `eval`/subshell.
+A `PreToolUse` hook that warns when Claude is about to run a git commit-like command — advisory only, it does not block (exits 1, not 2, so the command always still runs). Catches `git commit`, `git revert`, `git cherry-pick`, and variants through `eval`/subshell.
 
 ```json
 {

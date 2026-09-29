@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-PreToolUse hook: blocks Bash commands that would create git commits.
+PreToolUse hook: advisory-only warning for Bash commands that look like git
+commits. Does not block -- the command always still runs.
 Reads tool input JSON from stdin (Claude Code hook protocol).
 
 JSON structure received from Claude Code:
