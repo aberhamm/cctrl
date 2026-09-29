@@ -2758,13 +2758,17 @@ _task_record_close_provisional_file() (
     # _session_update_provisional_field's own subshell wrapper) -- otherwise
     # it fires once at the whole script's exit and dereferences a $tmp that
     # went out of scope when this function returned.
-    local file="$1" session_name="$2" reason="$3" key tmp="" now
+    local file="$1" session_name="$2" reason="$3" decided_digest="${4:-}" key tmp="" now expected
     [[ "$file" == "$SESSION_METADATA_DIR"/launch-*.json ]] || return 1
     key="${file##*/}"; key="${key%.json}"
     _task_registry_lock_acquire "$key" || return $?
     trap '[[ -z "$tmp" ]] || rm -f "$tmp"; _task_registry_lock_release "$TASK_REGISTRY_LOCK_FILE" "$TASK_REGISTRY_LOCK_TOKEN"' EXIT
     [[ -f "$file" && ! -L "$file" ]] || return 1
     _task_record_normalize_json "$file" >/dev/null 2>&1 || return 1
+    if [[ -n "$decided_digest" ]]; then
+        expected="$(_task_registry_record_digest "$file")" || return 1
+        [[ "$expected" == "$decided_digest" ]] || return 75
+    fi
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     tmp="$(mktemp "$SESSION_METADATA_DIR/.launch-close.XXXXXX")" || return 1
     python3 - "$file" "$session_name" "$reason" "$now" "$key" "$TASK_RECORD_MAX_EVIDENCE" > "$tmp" <<'PYCLOSE'
@@ -2816,7 +2820,7 @@ _task_record_transition_file() {
     # generic event pipeline below cannot express this transition.
     if [[ "$file" == "$SESSION_METADATA_DIR"/launch-*.json && "$state" == "closed" \
             && "$(jq -r 'if .provider_task_id == null then "1" else "" end' "$file" 2>/dev/null)" == "1" ]]; then
-        _task_record_close_provisional_file "$file" "$session_name" "$reason"
+        _task_record_close_provisional_file "$file" "$session_name" "$reason" "$decided_digest"
         return $?
     fi
     stable_id="$(jq -r '.provider_task_id // .conversation_id // empty' "$file" 2>/dev/null || true)"
@@ -8884,7 +8888,11 @@ _session_attest() {
                 elif [[ -z "$pane_id" || ! "$expected_pid" =~ ^[0-9]+$ ]]; then
                     result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" null "unanchored-legacy-session" "$thread_id")"
                 else
-                    current_line="$(tmux list-panes -t "=$tmux_session:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | awk -F : -v id="$pane_id" '$1 == id {print; exit}')"
+                    # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail
+                    # audit) — awk exiting on its first match can SIGPIPE tmux
+                    # mid-write; under pipefail that would otherwise abort this
+                    # attest check (plan 084 re-review of 081).
+                    current_line="$(tmux list-panes -t "=$tmux_session:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | awk -F : -v id="$pane_id" '$1 == id {print; exit}')" || true
                     IFS=: read -r current_id current_pid <<< "$current_line"
                     if [[ "$current_id" != "$pane_id" ]]; then
                         result="$(_session_attest_json false "$control_surface" "$session" "$tmux_session" "$pane_id" "$expected_pid" "$agent" "" false "tmux-pane-missing" "$thread_id")"
@@ -12621,15 +12629,49 @@ _session_task_records_for_name() {
     # session that is genuinely still starting up is never offered as
     # closeable — that liveness check is done once, in this shared helper,
     # rather than trusted to every current and future caller.
+    #
+    # `tmux has-session` alone is not enough for the name-only "cctrl-tmux"
+    # selector (mark-closed's own gate, and prune's unanchored fallback):
+    # _session_write_metadata writes the launch-*.json receipt before `tmux
+    # new-session` runs (plan 084 re-review of 081), so a session in that
+    # narrow startup window has no live tmux session yet even though it is
+    # not dead. Apply the same 300s grace lib/snapshot_restore.py's
+    # PROVISIONAL_STALE_GRACE_SECONDS uses for the identical race: a
+    # launch-*.json record younger than the grace is never offered as
+    # closeable by that selector, and an unparseable/missing created_at
+    # fails closed (excluded) rather than being offered. This grace does
+    # NOT apply to the pane-anchored selector (the "<pane_id> <pane_pid>"
+    # lines form used by _session_record_terminated for kill/close/
+    # stop-exact): an exact pane-anchor match is authoritative identity
+    # evidence cctrl captured itself before tearing the pane down, with no
+    # "still starting up" ambiguity to guard against, and gating it on age
+    # would leave a session closed by the user within its first 5 minutes
+    # wrongly stuck at lifecycle_state=provisional (eng review of plan 084).
     [[ -d "$SESSION_METADATA_DIR" ]] || return 0
     local tmux_live=false
     if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$1" 2>/dev/null; then
         tmux_live=true
     fi
-    python3 - "$SESSION_METADATA_DIR" "$1" "${2:-}" "$tmux_live" <<'PY'
+    local now
+    now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    python3 - "$SESSION_METADATA_DIR" "$1" "${2:-}" "$tmux_live" "$now" <<'PY'
+import datetime as dt
 import json, sys
 from pathlib import Path
-root, name, selector, tmux_live = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "true"
+root, name, selector, tmux_live, now_s = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4] == "true", sys.argv[5]
+PROVISIONAL_STALE_GRACE_SECONDS = 300
+
+
+def parse_rfc3339_utc(value):
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+now = parse_rfc3339_utc(now_s)
 anchors = set()
 if selector != "cctrl-tmux":
     for line in selector.splitlines():
@@ -12653,6 +12695,10 @@ for path in paths:
     if record.get("lifecycle_state") in ("closed", "archived", "released"):
         continue
     if selector == "cctrl-tmux":
+        if path.name.startswith("launch-"):
+            created = parse_rfc3339_utc(record.get("created_at"))
+            if created is None or now is None or (now - created).total_seconds() <= PROVISIONAL_STALE_GRACE_SECONDS:
+                continue
         if record.get("control_owner") != "cctrl" or record.get("execution_runtime") != "tmux":
             continue
     elif (str(record.get("pane_id") or ""), str(record.get("pane_pid") or "")) not in anchors:
@@ -13206,8 +13252,13 @@ cmd_restart() {
         local _pane_pid _agent_pid
         _pane_pid="$(tmux display-message -p '#{pane_pid}' 2>/dev/null || true)"
         if [[ -n "$_pane_pid" ]]; then
+            # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit) —
+            # awk exiting on its first match can SIGPIPE ps mid-write; under
+            # pipefail + set -e that would otherwise abort this background
+            # subshell before it reaches the kill it exists to run (plan 084
+            # re-review of 081).
             _agent_pid="$(ps -ax -o pid=,ppid= 2>/dev/null \
-                | awk -v pp="$_pane_pid" '$2==pp {print $1; exit}')"
+                | awk -v pp="$_pane_pid" '$2==pp {print $1; exit}')" || true
             if [[ -n "$_agent_pid" ]]; then
                 kill -TERM "$_agent_pid" 2>/dev/null || true
             fi
@@ -13578,28 +13629,44 @@ _session_never_prompted() {
     # session, and prevents a busy codex session's lack of a *Claude* transcript
     # from being read as never-prompted — the false-positive bug).
     #   $1 session name, $2 agent (claude|codex|''), $3 (codex) rollout path
-    local sess="$1" agent="$2" rollout="${3:-}" tpath
+    local sess="$1" agent="$2" rollout="${3:-}" tpath rc
     case "$agent" in
         claude)
             tpath="$(_session_transcript_path "$sess")"
             [[ -n "$tpath" && -e "$tpath" ]] || return 1   # absent -> not flagged
-            # Bounded head scan: the first genuine user turn sits at the very top
-            # of a transcript, so any user entry within the window means prompted.
-            # Captured into a variable before grepping it (not piped straight into
-            # `grep -q`): under `set -o pipefail`, `grep -q` exits as soon as it
-            # sees a match, `head` can get SIGPIPE writing the rest of its 500
-            # lines, and pipefail then reports that as a pipeline failure even
-            # though the match was found — silently flipping "prompted" to
-            # "never-prompted" (plan 081, P1a).
-            local hl
-            hl="$(head -n 500 "$tpath" 2>/dev/null)"
-            grep -qE '"(type|role)":"user"' <<< "$hl" && return 1
-            return 0
+            # Bounded single-pass scan: the first genuine user turn sits at the
+            # very top of a transcript, so any user entry within the window
+            # means prompted. A single `awk` process (no pipe, no shell
+            # variable) avoids both the pipefail-under-SIGPIPE hazard a piped
+            # `head | grep -q` had (plan 081, P1a) and loading up to 500 lines
+            # of a transcript — which can carry multi-MB base64 image content
+            # — into memory (plan 084 re-review of 081). Exit code distinguishes
+            # a real read failure (2, "can't open"/similar) from a clean scan
+            # that found no match (1): only the latter means never-prompted.
+            awk '
+                { if ($0 ~ /"(type|role)":"user"/) { found=1; exit }
+                  if (NR > 500) exit }
+                END { exit (found ? 0 : 1) }
+            ' "$tpath" 2>/dev/null
+            rc=$?
+            case "$rc" in
+                0) return 1 ;;  # a user turn found -> prompted
+                1) return 0 ;;  # scanned the bounded window, no user turn -> never-prompted
+                *) return 1 ;;  # read error -> not flagged (fail open on the destructive side)
+            esac
             ;;
         codex)
             [[ -n "$rollout" && -e "$rollout" ]] || return 1  # absent -> not flagged
-            grep -q '"type":"user_message"' "$rollout" 2>/dev/null && return 1
-            return 0
+            # grep run directly against a file (no pipe) so its exit code is
+            # unambiguous: 0 = match, 1 = no match, 2+ = a real read error that
+            # must not be read as "no match" (plan 084 re-review of 081, P1a).
+            grep -q '"type":"user_message"' "$rollout" 2>/dev/null
+            rc=$?
+            case "$rc" in
+                0) return 1 ;;  # a user turn found -> prompted
+                1) return 0 ;;  # no match -> never-prompted
+                *) return 1 ;;  # read error -> not flagged (fail open on the destructive side)
+            esac
             ;;
         *)
             return 1

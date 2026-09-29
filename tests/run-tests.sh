@@ -6055,7 +6055,7 @@ test_session_mark_closed_provisional_launch_record() (
     # close it through any normal path. A name whose tmux session is gone
     # now closes; a name whose tmux session is still live is refused, same as
     # today's live-name protection for canonical records.
-    local meta="$TMPDIR/p2-meta" bin="$TMPDIR/p2-bin" file file2 out rc=0
+    local meta="$TMPDIR/p2-meta" bin="$TMPDIR/p2-bin" file file2 file3 out rc=0 old_created
     mkdir -p "$meta" "$bin"
     make_fake_tmux "$bin/tmux"
     export CCTRL_SESSION_METADATA_DIR="$meta"
@@ -6067,11 +6067,30 @@ test_session_mark_closed_provisional_launch_record() (
     file="$(session_record_path s-gone-prov "$meta")" || fail "no provisional record was written for s-gone-prov"
     [[ "$(basename "$file")" == launch-*.json ]] || fail "expected a launch-*.json record, got $(basename "$file")"
     [[ "$(jq -r '.lifecycle_state' "$file")" == provisional ]] || fail "fixture record is not provisional: $(jq -c . "$file")"
+    # Backdate past the 300s startup grace (plan 084 re-review of 081): this
+    # scenario means "genuinely gone", not "still in its launch window", and
+    # the grace test below covers the fresh-and-gone case directly.
+    old_created="$(date -u -v-400S +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "400 seconds ago" +"%Y-%m-%dT%H:%M:%SZ")"
+    jq --arg t "$old_created" '.created_at=$t' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 
     out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--other" \
         "$ROOT/cctrl" session mark-closed s-gone-prov --apply 2>&1)" \
         || fail "mark-closed --apply on a gone provisional-only record failed: $out"
     [[ "$(jq -r '.lifecycle_state' "$file")" == closed ]] || fail "mark-closed --apply did not close the provisional record: $(jq -c . "$file")"
+
+    # A freshly-launched provisional record with no live tmux session yet is
+    # NOT offered, within the startup grace (plan 084 re-review of 081):
+    # _session_write_metadata writes the launch receipt before `tmux
+    # new-session` runs, so a mark-closed landing in that window must not
+    # close a session that is only still starting up.
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-starting-prov >/dev/null
+    file3="$(session_record_path s-starting-prov "$meta")" || fail "no provisional record was written for s-starting-prov"
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--other" \
+        "$ROOT/cctrl" session mark-closed s-starting-prov --apply 2>&1)" \
+        || fail "mark-closed --apply on a fresh starting-up provisional record failed: $out"
+    assert_contains "$out" "No open cctrl/tmux records claim"
+    [[ "$(jq -r '.lifecycle_state' "$file3")" == provisional ]] \
+        || fail "mark-closed closed a fresh provisional record still inside its startup grace: $(jq -c . "$file3")"
 
     # A live tmux session with the same provisional-only shape is refused,
     # exactly like mark-closed already refuses a live name backed by a
@@ -6083,7 +6102,7 @@ test_session_mark_closed_provisional_launch_record() (
         "$ROOT/cctrl" session mark-closed s-live-prov --apply 2>&1)" || rc=$?
     [[ "$rc" -eq 75 ]] || fail "mark-closed on a live provisional-only session did not refuse with 75 (rc=$rc): $out"
     [[ "$(jq -r '.lifecycle_state' "$file2")" == provisional ]] || fail "mark-closed closed a record for a still-live session: $(jq -c . "$file2")"
-    echo "ok: mark-closed closes a provisional-only (launch-*.json) record once its tmux session is gone; refuses while live"
+    echo "ok: mark-closed closes a provisional-only (launch-*.json) record once its tmux session is genuinely gone; withholds it during its startup grace; refuses while live"
 )
 
 test_session_task_records_for_name_launch_liveness_gate() (
@@ -6094,7 +6113,7 @@ test_session_task_records_for_name_launch_liveness_gate() (
     # around launch-*.json (cctrl:12420). Call the helper directly, with the
     # fake tmux's has-session answering both ways, so a regression in the
     # gate itself (not just in mark-closed's outer guard) is caught.
-    local meta="$TMPDIR/p2-gate-meta" bin="$TMPDIR/p2-gate-bin" file
+    local meta="$TMPDIR/p2-gate-meta" bin="$TMPDIR/p2-gate-bin" file old_created
     mkdir -p "$meta" "$bin"
     make_fake_tmux "$bin/tmux"
     export CCTRL_SESSION_METADATA_DIR="$meta"
@@ -6102,6 +6121,11 @@ test_session_task_records_for_name_launch_liveness_gate() (
     cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-gate-prov >/dev/null
     file="$(session_record_path s-gate-prov "$meta")" || fail "no provisional record was written for s-gate-prov"
     [[ "$(basename "$file")" == launch-*.json ]] || fail "expected a launch-*.json record, got $(basename "$file")"
+    # Backdate past the 300s startup grace (plan 084 re-review of 081) so this
+    # exercises "genuinely gone", not "still starting up"; the fresh case is
+    # covered separately below.
+    old_created="$(date -u -v-400S +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "400 seconds ago" +"%Y-%m-%dT%H:%M:%SZ")"
+    jq --arg t "$old_created" '.created_at=$t' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
 
     local out
     out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_HAS_SESSION="" \
@@ -6111,7 +6135,77 @@ test_session_task_records_for_name_launch_liveness_gate() (
     out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_HAS_SESSION="s-gate-prov" \
         cctrl_source_eval '_session_task_records_for_name "$1" cctrl-tmux' s-gate-prov)"
     [[ -z "$out" ]] || fail "live session: expected no launch record offered, got: $out"
-    echo "ok: _session_task_records_for_name's own liveness gate includes launch-*.json only once its tmux session is confirmed gone"
+
+    # Fresh (not backdated) + no live tmux session: still inside the startup
+    # grace, so the record must not be offered as closeable (plan 084
+    # re-review of 081's missing-grace finding).
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-gate-fresh-prov >/dev/null
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_HAS_SESSION="" \
+        cctrl_source_eval '_session_task_records_for_name "$1" cctrl-tmux' s-gate-fresh-prov)"
+    [[ -z "$out" ]] || fail "fresh + gone session: expected no launch record offered inside the startup grace, got: $out"
+    echo "ok: _session_task_records_for_name's own liveness gate includes launch-*.json only once its tmux session is confirmed gone and past its startup grace"
+)
+
+test_task_record_close_provisional_honors_digest_guard() (
+    # Plan 084 re-review of 081: _task_record_transition_file's generic path
+    # refuses (75) when the caller's digest guard no longer matches the
+    # record on disk, but its special-case launch-*.json close path used to
+    # call _task_record_close_provisional_file without forwarding that guard
+    # at all -- silently ignoring a caller's stale-read protection instead of
+    # refusing. Nothing in cctrl reaches this with a real digest yet (only
+    # lib/conflict_resolve.py's "close" rows do, and those only read
+    # task-*.json), so this is direct unit coverage of the guard itself.
+    local meta="$TMPDIR/digest-guard-meta" file digest rc=0
+    mkdir -p "$meta"
+    export CCTRL_SESSION_METADATA_DIR="$meta"
+
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-digest-prov >/dev/null
+    file="$(session_record_path s-digest-prov "$meta")" || fail "no provisional record was written for s-digest-prov"
+    digest="$(cctrl_source_eval '_task_registry_record_digest "$1"' "$file")" || fail "could not compute the fixture record's digest"
+
+    rc=0
+    cctrl_source_eval '_task_record_transition_file "$1" s-digest-prov unknown unknown closed "" cctrl-test authoritative "stale guard" wrong-digest' "$file" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a stale digest guard on a provisional close did not refuse with 75 (rc=$rc)"
+    [[ "$(jq -r '.lifecycle_state' "$file")" == provisional ]] \
+        || fail "a stale digest guard closed the provisional record anyway: $(jq -c . "$file")"
+
+    cctrl_source_eval '_task_record_transition_file "$1" s-digest-prov unknown unknown closed "" cctrl-test authoritative "matching guard" "$2"' "$file" "$digest" >/dev/null \
+        || fail "a matching digest guard was refused on a provisional close"
+    [[ "$(jq -r '.lifecycle_state' "$file")" == closed ]] \
+        || fail "a matching digest guard did not close the provisional record: $(jq -c . "$file")"
+    echo "ok: a provisional launch-*.json close honors its caller's digest guard (refuses when stale, applies when matching)"
+)
+
+test_session_record_terminated_closes_fresh_anchored_provisional() (
+    # Plan 084 re-review of 081 (required fix from eng review): the 300s
+    # startup grace added to _session_task_records_for_name's name-only
+    # "cctrl-tmux" selector must NOT gate the pane-anchored selector that
+    # _session_record_terminated (kill/close/stop-exact) uses. An exact
+    # pane_id+pane_pid anchor match is identity evidence cctrl captured
+    # itself before tearing the pane down -- there is no "still starting
+    # up" ambiguity to guard against, and age-gating it would leave a
+    # session the user explicitly closed within its first 5 minutes wrongly
+    # stuck at lifecycle_state=provisional (and so still offered as a
+    # tmux-resume restore candidate).
+    local meta="$TMPDIR/anchor-terminated-meta" bin="$TMPDIR/anchor-terminated-bin" file receipt out
+    mkdir -p "$meta" "$bin"
+    make_fake_tmux "$bin/tmux"
+    export CCTRL_SESSION_METADATA_DIR="$meta"
+
+    cctrl_source_eval '_session_write_metadata "$1" /tmp directory /tmp label purpose prompt cmd "" claude "" ""' s-anchor-fresh-prov >/dev/null
+    file="$(session_record_path s-anchor-fresh-prov "$meta")" || fail "no provisional record was written for s-anchor-fresh-prov"
+    [[ "$(jq -r '.lifecycle_state' "$file")" == provisional ]] || fail "fixture record is not provisional: $(jq -c . "$file")"
+
+    receipt='{"control_surface":"tmux","tmux_session":"s-anchor-fresh-prov","pane_id":"%1","pane_pid":"12345","wrapper_pid":"12345","pane_started":"Mon Sep 29 00:00:00 2026"}'
+    cctrl_source_eval '_session_update_metadata_field "$1" _terminal_anchor_receipt "$2"' s-anchor-fresh-prov "$receipt" >/dev/null \
+        || fail "could not attach a pane anchor to the fresh provisional fixture"
+    [[ "$(jq -r '.pane_id' "$file")" == "%1" ]] || fail "anchor was not persisted onto the provisional record: $(jq -c . "$file")"
+
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_HAS_SESSION="" \
+        cctrl_source_eval '_session_record_terminated "$1" "%1 12345" "test: anchored close"' s-anchor-fresh-prov 2>&1)"
+    [[ "$(jq -r '.lifecycle_state' "$file")" == closed ]] \
+        || fail "an anchored close did not close a fresh (0s-old) provisional record: $(jq -c . "$file"); output: $out"
+    echo "ok: _session_record_terminated's pane-anchored close is not gated by the launch-*.json startup grace"
 )
 
 test_snapshot_excludes_stale_provisional_restore_candidates() {
@@ -6132,16 +6226,24 @@ test_snapshot_excludes_stale_provisional_restore_candidates() {
     cat > "$root/process.json" <<'JSON'
 {"schema_version":1,"status":"available","observed_at":"2026-09-24T10:00:00Z","source_cursor":"p","processes":[],"error":null}
 JSON
-    local stale_ts now_ts
+    local stale_ts now_ts near_fresh_ts near_stale_ts
     stale_ts="$(date -u -v-1H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "1 hour ago" +"%Y-%m-%dT%H:%M:%SZ")"
     now_ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    # Near-boundary rows (plan 084 re-review of 081): the 1h-vs-0s pair above
+    # only proves the filter exists, not that it actually sits at
+    # PROVISIONAL_STALE_GRACE_SECONDS (300s). 60s (well inside the grace) and
+    # 310s (just past it) pin the threshold without racing exactly 300s
+    # against wall-clock drift while the snapshot command itself runs.
+    near_fresh_ts="$(date -u -v-60S +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "60 seconds ago" +"%Y-%m-%dT%H:%M:%SZ")"
+    near_stale_ts="$(date -u -v-310S +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "310 seconds ago" +"%Y-%m-%dT%H:%M:%SZ")"
     row() { # id tmux recency
         printf '{"provider":"claude","provider_task_id":null,"host_id":"%s","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"provisional","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"%s","tmux_session":"%s","recency":"%s","action_capabilities":{"tmux_attach":{"supported":false}}}' \
             "$host" "$1" "$2" "$3"
     }
     cat > "$root/catalogue.json" <<JSON
 {"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[
- $(row stale-prov TMUX--stale-prov "$stale_ts"), $(row fresh-prov TMUX--fresh-prov "$now_ts")
+ $(row stale-prov TMUX--stale-prov "$stale_ts"), $(row fresh-prov TMUX--fresh-prov "$now_ts"),
+ $(row near-fresh-prov TMUX--near-fresh-prov "$near_fresh_ts"), $(row near-stale-prov TMUX--near-stale-prov "$near_stale_ts")
 ]}
 JSON
     printf '[]\n' > "$root/sessions.json"   # neither name has a live tmux session
@@ -6154,10 +6256,14 @@ JSON
         || fail "a stale provisional row still carries restore_strategy tmux-resume: $(jq -c '[.tasks[]|select(.tmux_session=="TMUX--stale-prov")]' <<< "$out")"
     jq -e '[.tasks[] | select(.tmux_session=="TMUX--fresh-prov")] | length==1 and .[0].restore_strategy=="tmux-resume"' <<< "$out" >/dev/null \
         || fail "a genuinely fresh provisional row lost its tmux-resume candidacy: $(jq -c '[.tasks[]|select(.tmux_session=="TMUX--fresh-prov")]' <<< "$out")"
-    jq -e '[.tasks[] | select(.restore_strategy=="tmux-resume") | .tmux_session] == ["TMUX--fresh-prov"]' <<< "$out" >/dev/null \
-        || fail "restore-candidate rows are not exactly the fresh provisional one: $(jq -c '[.tasks[] | select(.restore_strategy=="tmux-resume") | .tmux_session]' <<< "$out")"
-    [[ "$(jq -r '.restore_candidate_count' <<< "$out")" == 1 ]] || fail "restore_candidate_count did not exclude the stale provisional row: $(jq -r '.restore_candidate_count' <<< "$out")"
-    echo "ok: a stale provisional record is excluded from tmux-resume restore candidates; a fresh one still appears"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--near-fresh-prov")] | length==1 and .[0].restore_strategy=="tmux-resume"' <<< "$out" >/dev/null \
+        || fail "a 60s-old provisional row (inside the 300s grace) lost its tmux-resume candidacy: $(jq -c '[.tasks[]|select(.tmux_session=="TMUX--near-fresh-prov")]' <<< "$out")"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--near-stale-prov")] | length==1 and .[0].restore_strategy==null' <<< "$out" >/dev/null \
+        || fail "a 310s-old provisional row (past the 300s grace) still carries restore_strategy tmux-resume: $(jq -c '[.tasks[]|select(.tmux_session=="TMUX--near-stale-prov")]' <<< "$out")"
+    jq -e '[.tasks[] | select(.restore_strategy=="tmux-resume") | .tmux_session] | sort == ["TMUX--fresh-prov","TMUX--near-fresh-prov"]' <<< "$out" >/dev/null \
+        || fail "restore-candidate rows are not exactly the two fresh provisional ones: $(jq -c '[.tasks[] | select(.restore_strategy=="tmux-resume") | .tmux_session]' <<< "$out")"
+    [[ "$(jq -r '.restore_candidate_count' <<< "$out")" == 2 ]] || fail "restore_candidate_count did not exclude both stale provisional rows: $(jq -r '.restore_candidate_count' <<< "$out")"
+    echo "ok: a stale provisional record is excluded from tmux-resume restore candidates (including a near-boundary 310s row); a fresh one still appears (including a near-boundary 60s row)"
 }
 
 _snapshot_fixture() {
@@ -10316,6 +10422,8 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_close_reaps_pane_processes
             test_session_mark_closed_provisional_launch_record
             test_session_task_records_for_name_launch_liveness_gate
+            test_task_record_close_provisional_honors_digest_guard
+            test_session_record_terminated_closes_fresh_anchored_provisional
             echo "ok"
             exit 0
             ;;
@@ -10590,6 +10698,8 @@ test_session_prune_claude_long_transcript_user_turn_not_flagged
 test_session_prune_yes_caps_large_batch
 test_session_mark_closed_provisional_launch_record
 test_session_task_records_for_name_launch_liveness_gate
+test_task_record_close_provisional_honors_digest_guard
+test_session_record_terminated_closes_fresh_anchored_provisional
 test_snapshot_excludes_stale_provisional_restore_candidates
 test_usage_cost_fixtures
 test_project_name_derives_home_at_runtime
