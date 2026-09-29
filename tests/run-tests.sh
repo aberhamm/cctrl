@@ -1476,6 +1476,43 @@ test_remote_shortcut_injects_purpose() {
     assert_not_contains "$ssh_log" "--purpose\\ comet"
 }
 
+test_remote_detach_attach_escapes_exact_target() {
+    # plan 085: the remote detach-and-attach path's second ssh call re-parses
+    # its command string inside a remote zsh login shell (it sources
+    # ~/.zprofile), where a bare `-t =NAME` would trigger zsh's own
+    # equals-expansion. That second (attach) call never fires in
+    # test_remote_shortcut_injects_purpose above, because the generic
+    # make_fake_ssh emits no CCTRL_SESSION marker for the launch call, so
+    # _remote_exec gives up before reaching it. Make the fake ssh emit that
+    # marker so the attach call actually runs, and confirm its logged
+    # command carries the backslash-escaped "\=" target.
+    local bin="$TMPDIR/remote-attach-bin" hosts="$TMPDIR/remote-attach-hosts.json" log="$TMPDIR/remote-attach-ssh.log"
+    mkdir -p "$bin"
+    cat > "$bin/ssh" <<'SH'
+#!/usr/bin/env bash
+{
+    printf 'SSH'
+    for arg in "$@"; do printf ' %q' "$arg"; done
+    printf '\n'
+} >> "${SSH_LOG:?}"
+[[ "${1:-}" == "-t" ]] && exit 0
+printf 'CCTRL_SESSION=TMUX--fake-remote\n'
+exit 0
+SH
+    chmod +x "$bin/ssh"
+    printf '{"remote":{"hostname":"example.invalid","user":"tester"}}\n' > "$hosts"
+    : > "$log"
+
+    # shellcheck disable=SC2016 # positional parameter belongs to the sourced shell
+    PATH="$bin:/usr/bin:/bin" SSH_LOG="$log" cctrl_source_eval \
+        'HOSTS_FILE="$1"; _remote_exec remote start -d' "$hosts" >/dev/null 2>&1 || true
+
+    local ssh_log; ssh_log="$(cat "$log")"
+    assert_contains "$ssh_log" "SSH -t tester@example.invalid"
+    assert_contains "$ssh_log" 'tmux\ attach-session\ -t\ \\=TMUX--fake-remote'
+    echo "ok: remote detach-and-attach escapes tmux's exact-match \"=\" so a remote zsh login shell won't equals-expand it"
+}
+
 test_attach_prompt_after_start() {
     make_fake_tmux "$TMPDIR/tmux"
     local project="$TMPDIR/prompt-project"
@@ -5400,6 +5437,49 @@ test_session_kill_exact_target_no_prefix_match() {
         || fail "X--2 should still be attachable after the second (no-op) kill of X"
 
     echo "ok: session kill targets tmux exactly, so a stale/repeated kill of a gone name never prefix-matches a live X--2"
+}
+
+test_session_close_exact_target_no_prefix_match() {
+    # plan 085 (080 re-review): the same prefix-match-collision coverage as
+    # test_session_kill_exact_target_no_prefix_match, extended to `session
+    # close` — both the immediate (--now) path and the delayed (--in) path.
+    make_fake_tmux "$TMPDIR/tmux"
+    local state="$TMPDIR/close-prefix-match-state"
+    printf '$1:X\n$2:X--2\n' > "$state"
+
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_STATE="$state" "$ROOT/cctrl" session close X --now 2>&1)" \
+        || fail "immediate close of X failed: $out"
+    assert_contains "$out" "Closed session: X"
+    grep -qx '$2:X--2' "$state" || fail "immediate close left an unexpected state: $(cat "$state")"
+    ! grep -q ':X$' "$state" || fail "immediate close did not remove X: $(cat "$state")"
+
+    # X is already gone. Closing the bare name "X" again must NOT prefix-match
+    # and close "X--2" — it must refuse with no session found.
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_STATE="$state" "$ROOT/cctrl" session close X --now 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "a second close of an already-gone session reported success: $out"
+    assert_contains "$out" "No session named 'X'"
+    grep -qx '$2:X--2' "$state" || fail "second close of the gone 'X' touched X--2: $(cat "$state")"
+
+    PATH="$TMPDIR:$PATH" TMUX_FAKE_STATE="$state" tmux has-session -t "=X--2" \
+        || fail "X--2 should still be attachable after the second (no-op) close of X"
+
+    # Delayed close (--in): the scheduled kill-session is embedded in a shell
+    # string run later by the tmux server (cctrl:~13156), outside the reach of
+    # test_tmux_exact_target_lint (it's a nested command string, not a literal
+    # `-t "$VAR"` clause) — confirm it still carries the exact "=X" target,
+    # not a bare, prefix-matchable "X".
+    printf '$1:X\n$2:X--2\n' > "$state"
+    local log="$TMPDIR/close-prefix-match.log"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_STATE="$state" "$ROOT/cctrl" session close X --in 5 2>&1)" \
+        || fail "delayed close of X failed: $out"
+    assert_contains "$out" "will close in 5s"
+    assert_contains "$(cat "$log")" "kill-session\\ -t\\ =X"
+    grep -qx '$1:X' "$state" || fail "delayed close must not kill before its grace elapses: $(cat "$state")"
+
+    echo "ok: session close targets tmux exactly (immediate and delayed), so a stale/repeated close of a gone name never prefix-matches a live X--2"
 }
 
 test_session_close_outside_requires_name() {
@@ -10566,6 +10646,7 @@ test_start_peer_env_and_metadata
 test_shortcut_no_args_defaults_to_tmux
 test_purpose_prompt_uses_controlling_tty
 test_remote_shortcut_injects_purpose
+test_remote_detach_attach_escapes_exact_target
 test_attach_prompt_after_start
 test_codex_statusline_tui_config
 test_context_names
@@ -10680,6 +10761,7 @@ test_peer_attach_remote_forwarding_tty
 test_peer_ls_shows_session_and_status
 test_session_close_named_immediate
 test_session_kill_exact_target_no_prefix_match
+test_session_close_exact_target_no_prefix_match
 test_session_close_outside_requires_name
 test_session_prune_never_prompted_claude
 test_session_prune_fresh_active_not_candidate
@@ -12343,7 +12425,7 @@ if [[ "${1:-}" == "-u" ]]; then shift; fi
 case "${1:-}" in
   has-session) [[ -e "$state" ]] ;;
   display-message) [[ -e "$state" ]] && cat "$state" ;;
-  list-panes) printf '%%1:4100\n' ;;
+  list-panes) printf '%s:%s\n' "${FAKE_HANDOFF_PANE_ID:-%1}" "${FAKE_HANDOFF_PANE_PID:-4100}" ;;
   list-sessions) [[ -e "$state" ]] && printf 'TMUX--handoff\n' ;;
   run-shell)
     command="$2"; output="${command#*> }"; output="${output% 2>/dev/null}"
@@ -12505,6 +12587,25 @@ PY
     [[ "$rc" -ne 0 ]] || fail "reused tmux identity unexpectedly committed"
     jq -e '.[0].error=="owner-process-mismatch" and .[0].owner_exit==false' <<< "$out" >/dev/null || fail "tmux reuse result is wrong: $out"
     jq -e '.control_owner=="cctrl"' "$record" >/dev/null || fail "tmux reuse falsely committed app ownership"
+
+    # plan 085: a malformed pane_id must fail closed instead of falling
+    # through to tmux's "current pane" default for the exit send-keys.
+    # Attest only checks the record's pane_id against tmux's live pane_id by
+    # plain string equality, not by format, so a fake (or corrupted) tmux
+    # that happens to echo the same malformed value back would otherwise
+    # sail through attestation; make that happen here (FAKE_HANDOFF_PANE_ID
+    # matching the record) to prove the dedicated format check is what
+    # actually stops it, not attest.
+    make_record cctrl cctrl tmux
+    jq '.pane_id="%abc"' "$record" > "$record.tmp" && mv "$record.tmp" "$record"
+    local tmux_snapshot_bad_pane="$root/tmux-bad-pane.json"
+    jq '.panes[0].pane_id="%abc"' "$tmux_snapshot" > "$tmux_snapshot_bad_pane"
+    printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0
+    out="$(FAKE_HANDOFF_PANE_ID='%abc' HANDOFF_RECONCILE_TMUX_FILE="$tmux_snapshot_bad_pane" run_release 2>/dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "malformed pane_id unexpectedly committed"
+    jq -e '.[0].error=="pane-id-invalid" and .[0].owner_exit==false' <<< "$out" >/dev/null || fail "malformed pane_id result is wrong: $out"
+    [[ -e "$state" && -e "$proc" ]] || fail "malformed pane_id must not send exit input to any pane"
+    jq -e '.control_owner=="cctrl"' "$record" >/dev/null || fail "malformed pane_id falsely committed app ownership"
 
     # A fresh postflight writer snapshot vetoes the handoff after old-owner exit.
     make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; rc=0

@@ -11121,7 +11121,11 @@ _session_release_to_app_one() {
 
     if [[ "$recovering" != true ]]; then
         local pane_id; pane_id="$(jq -r '.pane_id // empty' "$baseline_file")"
-        if ! tmux send-keys -t "$pane_id" C-d 2>/dev/null; then  # tmux-target:exact-id (pane id, not a session name)
+        if [[ ! "$pane_id" =~ ^%[0-9]+$ ]]; then
+            # A malformed/empty pane_id would otherwise fall through to tmux's
+            # "current pane" default instead of failing closed (plan 085).
+            error="pane-id-invalid"; required_action="The task record's pane id is missing or malformed; run 'cctrl session reconcile-codex --json' before retrying release-to-app."
+        elif ! tmux send-keys -t "$pane_id" C-d 2>/dev/null; then  # tmux-target:exact-id (pane id, not a session name)
             error="exit-request-failed"; required_action="Reopen the terminal task and exit Codex normally, then rerun release-to-app."
         else
             while (( seconds <= wait_s )); do
@@ -15153,7 +15157,16 @@ _remote_exec() {
         echo -e "${DIM}Attaching to remote session: $remote_session${RESET}" >&2
         local sess_q
         sess_q="$(printf '%q' "$remote_session")"
-        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t $sess_q"
+        # "=$sess_q" gives tmux's exact-match target (see tmux-target-prefix-match
+        # memory), but this whole string is re-parsed by the remote login shell
+        # (zsh), where a word starting with an unquoted "=" triggers zsh's own
+        # command-path filename generation. printf '%q' quotes for the LOCAL
+        # bash re-parse, not the remote one, so the "=" needs its own backslash
+        # here rather than relying on that quoting (plan 085). This line is
+        # outside test_tmux_exact_target_lint's reach (its target isn't a
+        # literal `-t "$VAR"` clause the static check can anchor on); its
+        # regression coverage is test_remote_detach_attach_escapes_exact_target.
+        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t \\=$sess_q"
     fi
 
     echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
