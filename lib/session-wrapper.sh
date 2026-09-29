@@ -99,9 +99,15 @@ while true; do
             _child_pid=$!
             wait $_child_pid 2>/dev/null; _rc=$?
         else
-            # Codex: options must precede SESSION_ID.
+            # Codex: options must precede SESSION_ID. Run as a waited
+            # background child (explicit stdin: bash gives a plain
+            # background job /dev/null otherwise) so the SIGHUP/TERM trap
+            # can preempt `wait` and escalate, instead of only running
+            # after Codex exits on its own.
             echo -e "\033[2mRestarting: codex resume ${_flags[*]} $_resume_flag\033[0m"
-            codex resume "${_flags[@]}" "$_resume_flag"; _rc=$?
+            codex resume "${_flags[@]}" "$_resume_flag" <&0 &
+            _child_pid=$!
+            wait $_child_pid 2>/dev/null; _rc=$?
         fi
     else
         if [[ "$_agent" == "claude" ]]; then
@@ -111,10 +117,14 @@ while true; do
             wait $_child_pid 2>/dev/null; _rc=$?
         elif [[ ${#_initial[@]} -gt 0 && "${_initial[0]}" == "resume" ]]; then
             echo -e "\033[2mcodex resume ${_flags[*]} ${_initial[*]:1}\033[0m"
-            codex resume "${_flags[@]}" "${_initial[@]:1}"; _rc=$?
+            codex resume "${_flags[@]}" "${_initial[@]:1}" <&0 &
+            _child_pid=$!
+            wait $_child_pid 2>/dev/null; _rc=$?
         else
             echo -e "\033[2mcodex ${_flags[*]} ${_initial[*]:-}\033[0m"
-            codex "${_flags[@]}" ${_initial[@]+"${_initial[@]}"}; _rc=$?
+            codex "${_flags[@]}" ${_initial[@]+"${_initial[@]}"} <&0 &
+            _child_pid=$!
+            wait $_child_pid 2>/dev/null; _rc=$?
         fi
     fi
 

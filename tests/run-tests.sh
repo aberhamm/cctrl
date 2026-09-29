@@ -5526,6 +5526,22 @@ test_session_close_reaps_pane_processes() (
     "$real_tmux" -L "$socket" kill-session -t '=w-plain'
     assert_gone "plain tmux kill-session" "$pids" 40
 
+    # Plan 076: Codex used to run synchronously in the wrapper's foreground,
+    # so the SIGHUP trap only fired once Codex exited on its own — the
+    # escalation above never applied to it. Same bare kill-session, codex
+    # agent instead of claude's default.
+    launch w-plain-codex 1 codex; pids="$(pane_tree w-plain-codex)"
+    "$real_tmux" -L "$socket" kill-session -t '=w-plain-codex'
+    assert_gone "plain tmux kill-session (codex)" "$pids" 40
+
+    # Plan 076: respawn-pane -k hangs up the pane the same way kill-session
+    # does, without tearing down the session — a second path onto the same
+    # trap.
+    launch w-respawn-codex 1 codex; pids="$(pane_tree w-respawn-codex)"
+    "$real_tmux" -L "$socket" respawn-pane -k -t '=w-respawn-codex:'
+    assert_gone "respawn-pane -k (codex)" "$pids" 40
+    "$real_tmux" -L "$socket" kill-session -t '=w-respawn-codex:' 2>/dev/null || true
+
     # 2-5. cctrl paths, with the wrapper's own escalation pushed out of reach
     #      so cctrl's reaper is what must end them.
     for name in r-kill r-close r-now r-stop r-grace; do launch "$name" 600; done
