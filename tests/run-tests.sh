@@ -15,7 +15,21 @@ export CCTRL_HOST_ID_FILE="$CCTRL_DATA_DIR/host-id"
 # persistence tests override these roots with their own fixtures.
 export CODEX_HOME="$TMPDIR/no-codex-home"
 export CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-config"
-trap 'rm -rf "$TMPDIR"' EXIT
+# Name the aborting test on any non-zero exit. A bare statement such as
+# `cmd >/dev/null 2>&1` that fails under `set -e` otherwise kills the suite
+# with no FAIL line at all -- that hid a real bash-5 regression for two
+# install-gate runs (the output looked like a flake). `fail` still prints
+# its own FAIL line first; this adds where the suite stopped.
+_suite_exit() {
+    local rc=$? cmd="$BASH_COMMAND"
+    if [[ "$rc" -ne 0 ]]; then
+        local frames="${FUNCNAME[*]:1}" lines="${BASH_LINENO[*]}"
+        echo "FAIL: test suite aborted (exit $rc) in [${frames:-main}] (call lines: $lines) at: $cmd" >&2
+    fi
+    [[ -n "$TMPDIR" && -d "$TMPDIR" ]] && rm -rf -- "$TMPDIR"
+    return "$rc"
+}
+trap _suite_exit EXIT
 
 cat > "$TMPDIR/hostname" <<'SH'
 #!/usr/bin/env bash
@@ -219,13 +233,15 @@ make_fake_tmux() {
     cat > "$path" <<'SH'
 #!/usr/bin/env bash
 if [[ -n "${TMUX_LOG:-}" ]]; then
-    {
-        printf 'TMUX'
-        for arg in "$@"; do
-            printf ' %q' "$arg"
-        done
-        printf '\n'
-    } >> "$TMUX_LOG"
+    # One write per line: a detached start leaves a background
+    # conversation-id poller calling this fake with the same TMUX_LOG, and
+    # per-arg printf appends let its line splice into ours mid-line.
+    _log_line="TMUX"
+    for arg in "$@"; do
+        printf -v _q ' %q' "$arg"
+        _log_line+="$_q"
+    done
+    printf '%s\n' "$_log_line" >> "$TMUX_LOG"
 fi
 if [[ "${1:-}" == "-u" ]]; then shift; fi
 if [[ "${1:-}" == "new-session" ]]; then
@@ -481,6 +497,19 @@ test_syntax() {
         cp "$plugin" "$dest"
         python3 -m py_compile "$dest"
     done
+}
+
+test_no_errexit_unsafe_post_increment() {
+    # Under bash >= 4.1 with `set -e`, a standalone `((x++))` whose old value
+    # is 0 evaluates to 0, returns status 1, and exits the script. bash 3.2
+    # (macOS /bin/bash) never tripped on it, so it went unnoticed until a
+    # Homebrew bash 5 landed first on PATH and `cctrl --host H @shortcut`
+    # started exiting 1 silently. Use `x=$((x + 1))` instead.
+    local hits
+    hits="$(cd "$ROOT" && grep -nE '\(\( *[A-Za-z_][A-Za-z_0-9]*(\+\+|--) *\)\)' cctrl lib/*.sh hooks/*.sh install/*.sh 2>/dev/null || true)"
+    [[ -z "$hits" ]] || fail "errexit-unsafe ((x++))/((x--)) (use x=\$((x + 1))):
+$hits"
+    echo "ok: no errexit-unsafe ((x++)) post-increments in shipped bash"
 }
 
 test_tmux_exact_target_lint() {
@@ -10904,6 +10933,7 @@ fi
 
 if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-launch-to-app" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
+test_no_errexit_unsafe_post_increment
 test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release
 test_cctrl_launcher_hooks_run_passes_deliberate_exit_through

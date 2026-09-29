@@ -380,7 +380,7 @@ _prompt_agent_choice() {
         i=1
         for agent in "${agents[@]}"; do
             printf '  %d) %s\n' "$i" "$agent" > /dev/tty
-            ((i++))
+            i=$((i + 1))
         done
         printf '> ' > /dev/tty
         IFS= read -r answer < /dev/tty || answer=""
@@ -568,7 +568,7 @@ _launch_apply_profile_args() {
             --yolo|--dangerously-bypass-approvals-and-sandbox)
                 LAUNCH_FULL_BYPASS=true
                 LAUNCH_ACCESS_EXPLICIT=true
-                ((i++))
+                i=$((i + 1))
                 ;;
             --permission-mode)
                 if (( i + 1 >= ${#LAUNCH_PROFILE_ARGS[@]} )); then
@@ -601,7 +601,7 @@ _launch_apply_profile_args() {
                 ;;
             *)
                 LAUNCH_FLAGS+=("$parg")
-                ((i++))
+                i=$((i + 1))
                 ;;
         esac
     done
@@ -1394,7 +1394,7 @@ _launch_app_owned_codex() {
             case "${pargs[$i]}" in
                 --sandbox|-s) (( i + 1 < ${#pargs[@]} )) || { echo "Profile sandbox needs a value" >&2; return 64; }; profile_sandbox="${pargs[$((i+1))]}"; ((i+=2)) ;;
                 --ask-for-approval|-a) (( i + 1 < ${#pargs[@]} )) || { echo "Profile approval needs a value" >&2; return 64; }; profile_approval="${pargs[$((i+1))]}"; ((i+=2)) ;;
-                --yolo|--dangerously-bypass-approvals-and-sandbox) [[ "$yolo" == true || -n "$cli_sandbox$cli_approval" ]] || yolo=true; ((i++)) ;;
+                --yolo|--dangerously-bypass-approvals-and-sandbox) [[ "$yolo" == true || -n "$cli_sandbox$cli_approval" ]] || yolo=true; i=$((i + 1)) ;;
                 *) echo -e "${RED}Profile argument '${pargs[$i]}' is unsupported with --app-owned.${RESET}" >&2; return 64 ;;
             esac
         done
@@ -3097,7 +3097,7 @@ _pick_safe_session_index() {
             printf '%s\n' "${base_name}--${n}"
             return 0
         fi
-        ((n++))
+        n=$((n + 1))
     done
     return 1
 }
@@ -6496,7 +6496,7 @@ _peer_send_and_deliver_remote() {
         case "${extra_flags[$i]}" in
             --as|--from) sender_as="${extra_flags[$((i+1))]}"; break ;;
         esac
-        ((i++))
+        i=$((i + 1))
     done
     [[ -z "$sender_as" ]] && sender_as="${CCTRL_PEER:-user}"
     sender_host="${CCTRL_HOST_PREFIX:-local}"
@@ -6511,7 +6511,7 @@ _peer_send_and_deliver_remote() {
         case "${extra_flags[$j]}" in
             --subject) quoted_args+=" --subject $(printf '%q' "${extra_flags[$((j+1))]}")"; ((j+=2)); continue ;;
         esac
-        ((j++))
+        j=$((j + 1))
     done
 
     result="$(printf '%s' "$body" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
@@ -6578,7 +6578,7 @@ _peer_send_and_deliver_remote_checked() {
             --as|--from) _bind_identity="${flags[$((_bind_idx+1))]}" ;;
             --impersonate) _bind_impersonate=true ;;
         esac
-        ((_bind_idx++))
+        _bind_idx=$((_bind_idx + 1))
     done
     [[ -z "$_bind_identity" ]] && _bind_identity="${CCTRL_PEER:-}"
     if [[ -n "$_bind_identity" && "$_bind_identity" != "user" ]]; then
@@ -12352,7 +12352,7 @@ _session_attach() {
         i=1
         for s in "${sessions[@]}"; do
             echo -e "  ${GREEN}[$i]${RESET} $s"
-            ((i++))
+            i=$((i + 1))
         done
         echo
         echo -n "Attach to: "
@@ -12386,7 +12386,7 @@ _session_attach() {
         i=1
         for s in "${matches[@]}"; do
             echo -e "  ${GREEN}[$i]${RESET} $s"
-            ((i++))
+            i=$((i + 1))
         done
         echo
         echo -n "Attach to: "
@@ -13566,7 +13566,7 @@ print(d.get('purpose', ''))
                 _session_update_metadata_field "$name" purpose "$claude_label" 2>/dev/null || continue
             fi
             tmux set-option -t "=$name:" @cctrl_purpose "$claude_label" 2>/dev/null || true
-            ((corrections++))
+            corrections=$((corrections + 1))
 
             if $json_mode; then
                 json_entries+=("$(printf '{"session":"%s","old":"%s","new":"%s"}' "$name" "$meta_purpose" "$claude_label")")
@@ -15014,7 +15014,7 @@ cmd_chrome() {
         local waited=0
         while pgrep -q "Google Chrome" && [[ $waited -lt 5 ]]; do
             sleep 1
-            ((waited++))
+            waited=$((waited + 1))
         done
         if pgrep -q "Google Chrome"; then
             echo -e "${RED}Chrome didn't stop cleanly. Run: killall -9 'Google Chrome'${RESET}"
@@ -15037,7 +15037,7 @@ cmd_chrome() {
     local attempts=0
     while ! _chrome_cdp_ready "$port" && [[ $attempts -lt 10 ]]; do
         sleep 1
-        ((attempts++))
+        attempts=$((attempts + 1))
     done
 
     if _chrome_cdp_ready "$port"; then
@@ -15280,7 +15280,7 @@ _remote_exec() {
                     fi
                     ;;
             esac
-            ((i++))
+            i=$((i + 1))
         done
     fi
     if $remote_tmux_launch && ! $remote_has_purpose; then
@@ -16176,7 +16176,7 @@ _shortcut_jump() {
             local i=1
             for c in "${candidates[@]}"; do
                 echo -e "  ${GREEN}[$i]${RESET} $c"
-                ((i++))
+                i=$((i + 1))
             done
             echo
             echo -n "Add as shortcut? Enter number (or n to skip): "
@@ -16223,7 +16223,7 @@ _shortcut_jump() {
             local i=1
             for c in "${candidates[@]}"; do
                 echo -e "  ${GREEN}[$i]${RESET} $c"
-                ((i++))
+                i=$((i + 1))
             done
             echo
             echo -n "Update @$key to new path? Enter number (or n to skip): "
