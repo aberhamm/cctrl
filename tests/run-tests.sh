@@ -2865,6 +2865,27 @@ JSON
         TMUX_FAKE_SESSIONS="TMUX--glyphdraft" "$ROOT/cctrl" session ls --json)"
     state="$(printf '%s' "$out" | jq -r '.[0].state')"
     [[ "$state" != "unsent-draft" ]] || fail "dimmed ghost suggestion surfaced as unsent-draft in session ls"
+
+    # Plan 086: a wrapped/multi-line draft whose first composer line is empty
+    # still surfaces as unsent-draft through the full rich-state path.
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        DRAFT_FIXTURE="$ROOT/tests/fixtures/pane-draft-multiline.txt" \
+        TMUX_FAKE_SESSIONS="TMUX--glyphdraft" "$ROOT/cctrl" session ls --json)"
+    state="$(printf '%s' "$out" | jq -r '.[0].state')"
+    [[ "$state" == "unsent-draft" ]] \
+        || fail "expected a multi-line draft with an empty first composer line to surface as unsent-draft; got: $state"
+
+    # Plan 086: a bash-mode "!" prompt with an older submitted "❯ ..." line
+    # still visible in scrollback must NOT surface as unsent-draft — the
+    # detector's "no composer found" (rc=2) falls through to the base state,
+    # same as any other rc it doesn't recognize as a draft.
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        DRAFT_FIXTURE="$ROOT/tests/fixtures/pane-bashmode-with-history.txt" \
+        TMUX_FAKE_SESSIONS="TMUX--glyphdraft" "$ROOT/cctrl" session ls --json)"
+    state="$(printf '%s' "$out" | jq -r '.[0].state')"
+    [[ "$state" == "idle" ]] \
+        || fail "expected a glyph-less bash-mode composer with older scrollback to keep the base 'idle' state; got: $state"
+
     echo "ok: rich-state surfaces a ❯ (U+276F) input line as unsent-draft, but not a dimmed ghost suggestion"
 }
 
@@ -2904,7 +2925,109 @@ exit 2
         "$ROOT/cctrl" session autoheal --json)"
     assert_contains "$out" '"reason": "unverifiable-input"'
     [[ -s "$rlog" ]] && fail "autoheal repaired a session although the draft detector failed"
-    echo "ok: autoheal safety gate skips a ❯ (U+276F) real-pane draft and fails closed when the detector fails"
+
+    # Plan 086: a real "no composer found" pane (bash-mode "!" prompt, an
+    # older submitted "❯ ..." line still in scrollback) must fail closed the
+    # same way, via rc=2 rather than a broken detector.
+    : > "$rlog"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE="$(cat "$ROOT/tests/fixtures/pane-bashmode-with-history.txt")" \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"action": "skipped"'
+    assert_contains "$out" '"reason": "unverifiable-input"'
+    [[ -s "$rlog" ]] && fail "autoheal repaired a session with no composer found (bash-mode prompt)"
+
+    echo "ok: autoheal safety gate skips a ❯ (U+276F) real-pane draft and fails closed when the detector fails or finds no composer"
+}
+
+# --- plan 086: draft detector follow-ups from the 073 re-review ---
+# Fixtures below are real `tmux capture-pane -e` output harvested from a live
+# Claude Code v2.1.281 pane (see docs/plans/086), not hand-crafted: the plain
+# dash-divider composer style, a wrapped long line, a newline-then-type
+# multi-line draft whose first composer line is empty, and a bash-mode "!"
+# prompt with a real submitted "❯ ..." line still visible higher in
+# scrollback (the exact shape that used to misreport as a draft).
+test_pane_draft_plan086_followups() {
+    local fn="$TMPDIR/pane-draft-fn086.sh" SCRIPT_DIR="$ROOT"
+    awk '/^_session_pane_has_draft\(\) \{/,/^}/' "$ROOT/cctrl" > "$fn"
+    # shellcheck source=/dev/null
+    source "$fn"
+    local fx="$ROOT/tests/fixtures"
+
+    # Wrapped/multi-line drafts (requirement 1): every composer line up to the
+    # bottom border is judged, not just the first.
+    _session_pane_has_draft "$(cat "$fx/pane-draft-wrapped.txt")" \
+        || fail "a long wrapped composer line was not detected as a draft"
+    # Eng-review regression (border-pair scoping): when the capture window
+    # cuts off the composer's TOP border (only the bottom border and footer
+    # remain in view), the single-border fallback must still find the draft
+    # on the side that actually holds a glyph line, not blindly assume
+    # "after the border" (that used to mean the footer here, losing the draft).
+    _session_pane_has_draft "$(cat "$fx/pane-draft-wrapped-truncated-top.txt")" \
+        || fail "a draft was missed when its composer's top border scrolled out of the capture window"
+    _session_pane_has_draft "$(cat "$fx/pane-draft-multiline.txt")" \
+        || fail "a draft whose first composer line is empty but a wrapped continuation line holds real text was not detected"
+
+    # "no composer found" gets its own exit code (requirement 2), distinct
+    # from both draft (0) and empty composer (1): a bash-mode "!" prompt with
+    # an older submitted "❯ ..." line still in scrollback above it must not
+    # be misread as a live draft just because it's the last glyph line seen.
+    local rc=0
+    _session_pane_has_draft "$(cat "$fx/pane-bashmode-with-history.txt")" || rc=$?
+    (( rc == 2 )) || fail "expected 'no composer found' (rc=2) for a bash-mode prompt with older scrollback; got rc=$rc"
+
+    # A draft whose entire typed content is the single character '>' or '|'
+    # must still be detected — neither is border/whitespace filler once it is
+    # the composer's own typed text, not the box's own drawing.
+    _session_pane_has_draft $'\xe2\x9d\xaf >' \
+        || fail "a draft consisting only of '>' was not detected"
+    _session_pane_has_draft $'\xe2\x9d\xaf |' \
+        || fail "a draft consisting only of '|' was not detected"
+
+    # requirement 5: the hint-word fallback only fires on a composer line with
+    # NO escape sequences at all. An escaped capture already excludes a real
+    # dimmed placeholder by dimness, so real typed text starting with "Try "
+    # must not be excluded just because some (non-dim) SGR appears on the
+    # line.
+    _session_pane_has_draft $'\xe2\x9d\xaf \e[38;5;231mTry "foo" as the new name\e[39m' \
+        || fail "escaped typed text starting with 'Try ' was misread as the placeholder"
+    # Plain capture (no SGR at all): the hint-word fallback still applies and
+    # this remains a known, accepted limitation (073 review) — not exercised
+    # by either production caller, which always pass an escaped capture.
+    ! _session_pane_has_draft '❯ Try "foo" as the new name' \
+        || fail "plain-capture 'Try ' hint fallback regressed (should still exclude, by design)"
+
+    # requirement 3: verified live against a real Claude Code v2.1.281 pane
+    # (docs/plans/086) that the "[Pasted text #N +M lines]" placeholder is
+    # drawn in the default foreground, not dim — so it already reads as a
+    # draft with no detector change needed. Pinned here against the real
+    # captured bytes so a future rendering change would be caught.
+    _session_pane_has_draft "$(cat "$fx/pane-pasted-text.txt")" \
+        || fail "the '[Pasted text ...]' placeholder was not detected as a draft"
+
+    echo "ok: plan 086 draft-detector follow-ups (multi-line, >/| content, no-composer exit code, hint/SGR gating, pasted-text placeholder)"
+}
+
+test_strip_sgr_shared_regex() {
+    # requirement 4: _strip_sgr and lib/pane_draft.pl share one escape regex
+    # (lib/ansi_escape.pl, plan 086). Probe _strip_sgr with the same
+    # colon-SGR-subparameter and ST-terminated-OSC shapes plan 073 hardened
+    # pane_draft.pl against, so the two can't silently drift apart again.
+    local fn="$TMPDIR/strip-sgr-fn086.sh" SCRIPT_DIR="$ROOT"
+    awk '/^_strip_sgr\(\) \{/,/^}/' "$ROOT/cctrl" > "$fn"
+    # shellcheck source=/dev/null
+    source "$fn"
+
+    local out
+    out="$(_strip_sgr $'\e[2;4:3myeah\e[0m plain text')"
+    [[ "$out" == "yeah plain text" ]] \
+        || fail "_strip_sgr did not strip a colon-SGR-subparameter sequence; got: $out"
+    out="$(_strip_sgr $'\e]8;;https://example.com\e\\link\e]8;;\e\\ trailing')"
+    [[ "$out" == "link trailing" ]] \
+        || fail "_strip_sgr did not strip an ST-terminated OSC 8 link; got: $out"
+    echo "ok: _strip_sgr shares lib/pane_draft.pl's escape regex (colon SGR sub-params, ST-terminated OSC)"
 }
 
 test_needs_me_digest() {
@@ -10599,6 +10722,8 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_pane_has_draft_glyph_fixtures
             test_session_rich_state_detects_glyph_draft
             test_session_autoheal_skips_glyph_draft
+            test_pane_draft_plan086_followups
+            test_strip_sgr_shared_regex
             echo "ok"
             exit 0
             ;;
@@ -10683,6 +10808,8 @@ test_session_list_recap
 test_session_list_rich_state
 test_session_pane_has_draft_glyph_fixtures
 test_session_rich_state_detects_glyph_draft
+test_pane_draft_plan086_followups
+test_strip_sgr_shared_regex
 test_needs_me_digest
 test_host_registry_crud
 test_fleet_merges_multiple_hosts

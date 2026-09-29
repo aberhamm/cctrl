@@ -9772,24 +9772,37 @@ _session_pane_has_dialog() {
 _session_pane_has_draft() {
     # True (exit 0) when the captured pane shows a non-empty Claude Code input
     # line — a prompt glyph ('>' or Claude Code's '❯' U+276F) followed by typed,
-    # unsubmitted text. Anchored to the start of the line (optionally inside the
-    # input box border) so it doesn't match a stray glyph elsewhere. Known
-    # placeholder / hint text ("Try ...", shortcut hints) is excluded.
+    # unsubmitted text. Scoped to the CURRENT composer block only (between the
+    # last two border/divider lines in the capture, plan 086), so a stale
+    # submitted line higher up in scrollback can't be mistaken for it. Every
+    # line in that block is judged, not just the first, so a wrapped or
+    # multi-line draft (including one whose first line is empty) is still
+    # found. Known placeholder / hint text ("Try ...", shortcut hints) is
+    # excluded on the first line, but only when that line carries no escape
+    # sequences at all (plan 086) — an escaped capture already excludes a real
+    # placeholder via dimness, so the string match is only a plain-capture
+    # fallback and must not misread real typed text that happens to start
+    # with "Try ".
     #
     # Pass an escaped capture (`capture-pane -e`): Claude Code draws its
     # predicted next prompt as dimmed ghost text (SGR 2) in an EMPTY composer,
     # and only the attributes tell it apart from typed text. Dim and
     # reverse-video (cursor) characters never count (plan 073). A plain capture
     # still works, with every character counting as typed. Read-only.
-    # Exit 0 draft, 1 no draft; anything else (perl missing or failing) is
-    # unverifiable and callers that act on "no draft" must fail closed.
+    # Exit 0 draft, 1 no draft, 2 no composer found at all (bash-mode '!'
+    # prompt, a pager, or a shell left after a crash — plan 086); anything
+    # else (perl missing or failing) is also unverifiable. Callers that act on
+    # "no draft" must treat any non-zero, non-one exit as unverifiable and
+    # fail closed.
     local capture="$1"
     printf '%s\n' "$capture" | perl "$SCRIPT_DIR/lib/pane_draft.pl" 2>/dev/null
 }
 
 _strip_sgr() {
-    # Remove terminal escape sequences from an escaped pane capture.
-    printf '%s\n' "$1" | perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\e\][^\a]*\a//g; s/\e.//g'
+    # Remove terminal escape sequences from an escaped pane capture. Shares
+    # its escape regex with lib/pane_draft.pl via lib/ansi_escape.pl (plan
+    # 086) so the two can't drift on what counts as an escape sequence.
+    printf '%s\n' "$1" | perl "$SCRIPT_DIR/lib/strip_ansi.pl" 2>/dev/null
 }
 
 _session_rich_state() {
