@@ -8591,6 +8591,7 @@ cmd_session() {
         mark-closed) _session_mark_closed "$@" ;;
         record-terminated) _session_record_terminated_cmd "$@" ;;
         reap) _session_reap_cmd "$@" ;;
+        pane-snapshot) _session_pane_snapshot_cmd "$@" ;;
         stop-exact) _session_stop_exact "$@" ;;
         *)
             echo -e "${RED}Unknown session command: $action${RESET}" >&2
@@ -12486,7 +12487,10 @@ _session_stop_exact() {
     # branch, so a replacement session cannot be killed.
     local guard rc=0 stop_anchors stop_procs
     stop_anchors="$(_session_pane_anchors "$tmux_session_id")"
-    stop_procs="$(_session_pane_process_snapshot "$tmux_session_id")" || stop_procs=""
+    stop_procs="$(_session_pane_process_snapshot "$tmux_session_id")" || {
+        echo -e "${YELLOW}⚠  Could not record $name's pane processes; they will not be checked after the stop.${RESET}" >&2
+        stop_procs=""
+    }
     guard="#{&&:#{==:#{@cctrl_server_instance_id},$expected_server_id},#{&&:#{==:#{pid},$expected_server_pid},#{&&:#{==:#{start_time},$expected_server_started},#{==:#{session_id},$tmux_session_id}}}}"
     tmux if-shell -F -t "$tmux_session_id" "$guard" "kill-session -t '$tmux_session_id'" "run-shell 'exit 75'" >/dev/null 2>&1 || rc=$?  # tmux-target:exact-id ($tmux_session_id is tmux's own "$N" id, always exact)
     if (( rc != 0 )); then
@@ -12523,11 +12527,24 @@ _session_pane_process_snapshot() {
     [[ "$target" == =* && "$target" != *: ]] && target="$target:"
     pane_pids="$(tmux list-panes -s -t "$target" -F '#{pane_pid}' 2>/dev/null | tr '\n' ' ' || true)"  # tmux-target:exact-id (normalized above: "$N" id or "=name:")
     [[ -n "${pane_pids// /}" ]] || return 0
+    # Exclude the calling cctrl process and its ancestor chain up to pid 1: a
+    # `close --now` or `kill` invoked from inside the pane it targets would
+    # otherwise capture (and later signal) the very process performing the
+    # reap, since it descends from the pane's own leader.
+    local exclude_pid="${BASHPID:-$$}" exclude="" ppid
+    while [[ "$exclude_pid" =~ ^[0-9]+$ ]] && (( exclude_pid > 0 )); do
+        exclude+="$exclude_pid "
+        (( exclude_pid == 1 )) && break
+        ppid="$(ps -o ppid= -p "$exclude_pid" 2>/dev/null | tr -d '[:space:]')"
+        [[ -n "$ppid" && "$ppid" != "$exclude_pid" ]] || break
+        exclude_pid="$ppid"
+    done
     # lstart is locale- and time-zone dependent; the delayed reap runs in the
     # tmux server's environment, so both sides use C / UTC.
     LC_ALL=C TZ=UTC0 ps -axo pid=,ppid=,lstart= 2>/dev/null | python3 -c '
 import sys
 roots = {int(p) for p in sys.argv[1].split() if p.isdigit()}
+exclude = {int(p) for p in sys.argv[2].split() if p.isdigit()}
 children, start = {}, {}
 for line in sys.stdin:
     f = line.split(None, 2)
@@ -12543,48 +12560,100 @@ while todo:
         continue
     seen.add(pid)
     todo.extend(children.get(pid, []))
+seen -= exclude
 print(",".join(f"{pid}@{start[pid]}" for pid in sorted(seen)))
-' "$pane_pids"
+' "$pane_pids" "$exclude"
 }
 
 _session_reap_processes() {
     # After a kill: SIGTERM every snapshot process that is still the same
-    # process (pid and start time), wait up to CCTRL_CLOSE_REAP_GRACE seconds,
-    # then SIGKILL what is left. Reports escalations and survivors on stderr.
+    # process (pid and start time), SIGCONT it in case it was stopped (a
+    # stopped process cannot act on SIGTERM until resumed), wait up to
+    # CCTRL_CLOSE_REAP_GRACE seconds of wall clock, then SIGKILL what is
+    # left. Reports escalations and survivors on stderr.
     # Default grace outlasts the wrapper's own SIGTERM->SIGKILL window (10 s),
     # so an agent's shutdown (SessionEnd hooks, transcript flush) isn't cut short.
     local snapshot="$1" label="${2:-session}" grace="${CCTRL_CLOSE_REAP_GRACE:-12}"
     [[ -n "$snapshot" ]] || return 0
+    # A leading zero (e.g. "08") passes this regex but isn't valid octal,
+    # which would blow up the arithmetic below just the same — force base 10.
     [[ "$grace" =~ ^[0-9]+$ ]] || grace=12
-    local token pid start now alive=() ticks=0 killed=0 survivors=()
-    _reap_alive() {
-        alive=()
-        local t p s cur
-        for t in ${snapshot//,/ }; do
-            p="${t%%@*}"; s="${t#*@}"
-            [[ "$p" =~ ^[0-9]+$ ]] || continue
-            # ps fails for an exited pid; under pipefail + set -e that must not abort.
-            cur="$(LC_ALL=C TZ=UTC0 ps -o lstart= -p "$p" 2>/dev/null | awk '{$1=$1; gsub(/ /, "_"); print}' || true)"
-            if [[ -n "$cur" && "$cur" == "$s" ]]; then alive+=("$p"); fi
-        done
-        return 0  # cctrl runs under set -e: a dead last pid must not abort the reap
+    grace=$((10#$grace))
+    local -a alive=() stopped=()
+    local pid killed=0 deadline
+    # One batched `ps -axo pid=,stat=,lstart=` per check instead of a `ps`
+    # (plus awk) per candidate pid: a per-pid loop measured 4.4s to settle a
+    # 2s grace over 30 processes, almost all of it fork/exec overhead.
+    # `stat`'s leading letter also tells a zombie (already gone, its
+    # resources reclaimed once its parent reaps it) from a stopped process
+    # (alive, but needs SIGCONT before it can act on SIGTERM).
+    _reap_scan() {
+        alive=(); stopped=()
+        local scan
+        # ps fails for an all-exited snapshot; under pipefail + set -e that
+        # must not abort the reap.
+        scan="$(LC_ALL=C TZ=UTC0 ps -axo pid=,stat=,lstart= 2>/dev/null | python3 -c '
+import sys
+want = {}
+for tok in sys.argv[1].split(","):
+    if "@" not in tok:
+        continue
+    pid_s, start = tok.split("@", 1)
+    if pid_s.isdigit():
+        want[int(pid_s)] = start
+alive, stopped = [], []
+for line in sys.stdin:
+    f = line.split(None, 2)
+    if len(f) < 3 or not f[0].isdigit():
+        continue
+    pid = int(f[0])
+    if pid not in want:
+        continue
+    stat = f[1]
+    if stat.startswith("Z"):
+        continue  # zombie: already gone as far as the reaper is concerned
+    if "_".join(f[2].split()) != want[pid]:
+        continue
+    alive.append(pid)
+    if "T" in stat:
+        stopped.append(pid)
+print(" ".join(map(str, alive)))
+print(" ".join(map(str, stopped)))
+' "$snapshot" || true)"
+        # Split on the one embedded newline without touching IFS (a `local
+        # IFS=$'\n'` here would still be in effect for the `read -a` calls
+        # below, since a `local` lasts for the rest of the function, not just
+        # its enclosing block — that silently stopped `read -a` from
+        # splitting on spaces at all, folding every pid into one element).
+        # Command substitution also strips ALL trailing newlines, so an empty
+        # second (stopped) line leaves no embedded newline at all to split on.
+        local first="$scan" second=""
+        if [[ "$scan" == *$'\n'* ]]; then
+            first="${scan%%$'\n'*}"
+            second="${scan#*$'\n'}"
+        fi
+        [[ -n "$first" ]] && read -r -a alive <<< "$first"
+        [[ -n "$second" ]] && read -r -a stopped <<< "$second"
+        return 0  # cctrl runs under set -e: a scan that finds nothing must not abort the reap
     }
-    _reap_alive
+    _reap_scan
     (( ${#alive[@]} > 0 )) || return 0
-    for pid in "${alive[@]}"; do kill -TERM "$pid" 2>/dev/null || true; done
-    while (( ticks < grace * 10 )); do
-        _reap_alive
+    for pid in "${alive[@]+"${alive[@]}"}"; do kill -TERM "$pid" 2>/dev/null || true; done
+    for pid in "${stopped[@]+"${stopped[@]}"}"; do kill -CONT "$pid" 2>/dev/null || true; done
+    deadline=$(( $(date +%s) + grace ))
+    while (( $(date +%s) < deadline )); do
+        _reap_scan
         (( ${#alive[@]} > 0 )) || return 0
-        sleep 0.1; ticks=$((ticks + 1))
+        for pid in "${stopped[@]+"${stopped[@]}"}"; do kill -CONT "$pid" 2>/dev/null || true; done
+        sleep 0.2
     done
-    for pid in "${alive[@]}"; do
+    for pid in "${alive[@]+"${alive[@]}"}"; do
         if kill -KILL "$pid" 2>/dev/null; then killed=$((killed + 1)); fi
     done
     sleep 0.2
-    _reap_alive
-    survivors=("${alive[@]+"${alive[@]}"}")
-    if (( ${#survivors[@]} > 0 )); then
-        echo -e "${RED}⚠  $label: ${#survivors[@]} pane process(es) survived SIGKILL: ${survivors[*]}${RESET}" >&2
+    _reap_scan
+    if (( ${#alive[@]} > 0 )); then
+        echo -e "${RED}⚠  $label: ${#alive[@]} pane process(es) survived SIGKILL: ${alive[*]}${RESET}" >&2
         return 1
     fi
     echo -e "${YELLOW}⚠  $label: $killed pane process(es) ignored SIGTERM and were killed.${RESET}" >&2
@@ -12764,16 +12833,35 @@ _session_record_terminated_shell() {
         "$env_q" "$SCRIPT_DIR/cctrl" "$name" "$session_id" "$(printf '%s' "$anchors" | tr '\n' ',')" "$reason"
 }
 
-_session_reap_shell() {
+_session_reap_shell_template() {
     # Print a shell command for a tmux-server job: once session id $2 is gone,
-    # reap the pane processes recorded in snapshot $3 (plan 074).
-    local name="$1" session_id="$2" procs="$3" env_q="" var
-    [[ "$session_id" == \$* && -n "$procs" ]] || return 1
+    # reap the pane processes named by "$1" of the ENCLOSING `sh -c` (plan 087
+    # follow-up: the snapshot is taken live, right before the kill, by the
+    # caller — see _session_pane_snapshot_cmd — so children started during the
+    # grace period are included, instead of a snapshot frozen at the moment
+    # `cctrl session close --in N` was invoked), unioned with the up-front
+    # snapshot $3 taken at command-issue time. The union means a failure of
+    # the live snapshot (a transient PATH/tmux hiccup in the tmux server's
+    # environment) doesn't silently skip reaping altogether — it just falls
+    # back to the same coverage this had before the live snapshot existed. A
+    # stale/dead token from either side is harmless: matching is by pid AND
+    # start time, so a token that no longer matches anything alive is a
+    # no-op. $3 is comma-joined "pid@start" text (digits/@/_/:/, only, no
+    # shell metacharacters), safe to embed as literal text here.
+    local name="$1" session_id="$2" fallback="$3" env_q="" var
+    [[ "$session_id" == \$* ]] || return 1
     for var in PATH CCTRL_CLOSE_REAP_GRACE; do
         [[ -n "${!var:-}" ]] && env_q+="$var=$(printf '%q' "${!var}") "
     done
-    printf '%s%q session reap %q --snapshot %q --after-session %q --wait 30' \
-        "$env_q" "$SCRIPT_DIR/cctrl" "$name" "$procs" "$session_id"
+    printf '%s%q session reap %q --snapshot "$1,%s" --after-session %q --wait 30' \
+        "$env_q" "$SCRIPT_DIR/cctrl" "$name" "$fallback" "$session_id"
+}
+
+_session_pane_snapshot_cmd() {
+    # Internal: `session pane-snapshot <exact-target>`. Prints the live pane
+    # process snapshot for a tmux target (plan 087 follow-up). Used by the
+    # delayed-close tmux-server job to snapshot right before the kill.
+    _session_pane_process_snapshot "$1"
 }
 
 _session_record_terminated_cmd() {
@@ -13133,11 +13221,23 @@ _session_close() {
     # both complete. Keep archival here, rather than in session-wrapper.sh:
     # release-to-app also ends the wrapper with EOF but deliberately preserves
     # the app task for continued use.
-    local archive_result="" archive_status="" close_anchors close_session_id
-    close_anchors="$(_session_pane_anchors "=$target")"
+    local archive_result="" archive_status="" close_anchors close_session_id close_kill_target
     close_session_id="$(tmux display-message -p -t "=$target:" '#{session_id}' 2>/dev/null || true)"
+    # Kill by the resolved immutable "$N" id when available, not by name: a
+    # name target reused by an unrelated replacement session during the grace
+    # period would otherwise let a delayed kill land on the wrong session.
+    # Resolved once, at the top, and used for every lookup below (anchors,
+    # snapshot, kill) — not just the kill — so a same-name replacement
+    # created in the gap between resolving the id and taking the snapshot
+    # can't have ITS anchors/processes captured under the old target's name.
+    if [[ "$close_session_id" == \$* ]]; then
+        close_kill_target="$close_session_id"
+    else
+        close_kill_target="=$target"
+    fi
+    close_anchors="$(_session_pane_anchors "$close_kill_target")"
     local close_procs
-    close_procs="$(_session_pane_process_snapshot "=$target")" || {
+    close_procs="$(_session_pane_process_snapshot "$close_kill_target")" || {
         echo -e "${YELLOW}⚠  Could not record $target's pane processes; they will not be checked after the close.${RESET}" >&2
         close_procs=""
     }
@@ -13145,11 +13245,12 @@ _session_close() {
     archive_status="$(jq -r '.status // empty' <<< "$archive_result" 2>/dev/null || true)"
 
     if (( grace > 0 )); then
-        local target_q
-        # "=$target": the delayed kill-session below is embedded in a shell
-        # string run later by the tmux server, so it must carry its own exact
-        # target the same way every other call site does.
-        target_q="$(printf '%q' "=$target")"
+        local target_q snapshot_q
+        # The delayed kill-session below is embedded in a shell string run
+        # later by the tmux server, so it must carry its own exact target the
+        # same way every other call site does.
+        target_q="$(printf '%q' "$close_kill_target")"
+        snapshot_q="$(printf '%q' "$close_kill_target")"
         # run-shell -b runs on the tmux server, so the delayed kill survives
         # the death of the calling pane/client.
         # The end is recorded by the same tmux-server job, after the kill, so
@@ -13160,18 +13261,32 @@ _session_close() {
             echo -e "${YELLOW}⚠  Could not resolve the tmux session id for $target; its end will not be recorded. Afterwards run: cctrl session mark-closed $target --apply${RESET}" >&2
             record_cmd=""
         }
-        local reap_cmd=""
-        reap_cmd="$(_session_reap_shell "$target" "$close_session_id" "$close_procs")" || reap_cmd=""
+        local reap_tmpl=""
+        reap_tmpl="$(_session_reap_shell_template "$target" "$close_session_id" "$close_procs")" || {
+            echo -e "${YELLOW}⚠  Could not resolve the tmux session id for $target; its pane processes will not be reaped after the grace period. Check for orphans manually afterwards.${RESET}" >&2
+            reap_tmpl=""
+        }
         # Killing the last session ends the tmux server, and the server takes
         # its run-shell job with it. So the job first starts a detached helper
         # (ignoring TERM/HUP) that waits for the session to be gone, then
         # records the end and reaps the pane processes; only then does it kill.
         local after_kill=""
-        if [[ -n "$record_cmd" || -n "$reap_cmd" ]]; then
-            after_kill="nohup sh -c $(printf '%q' "trap '' TERM HUP; ${record_cmd:-:}; ${reap_cmd:-:}") >>$(printf '%q' "${CCTRL_CLOSE_JOB_LOG:-/dev/null}") 2>&1 & "
+        if [[ -n "$record_cmd" || -n "$reap_tmpl" ]]; then
+            after_kill="nohup sh -c $(printf '%q' "trap '' TERM HUP; ${record_cmd:-:}; ${reap_tmpl:-:}") cctrl-reap-helper \"\$__cctrl_procs\" >>$(printf '%q' "${CCTRL_CLOSE_JOB_LOG:-/dev/null}") 2>&1 & "
         fi
-        if ! tmux run-shell -b "sleep $grace; ${after_kill}tmux kill-session -t $target_q" 2>/dev/null; then
-            if ! tmux kill-session -t "=$target"; then
+        # The pane-process snapshot is taken live here, right before the kill
+        # (not up front at command-issue time), so processes spawned during
+        # the grace period are still included in what gets reaped. PATH is
+        # forwarded explicitly: this runs in the tmux server's own
+        # environment, which may not resolve `env bash` (cctrl's shebang) or
+        # `python3` the way the calling shell's PATH does.
+        local snapshot_prefix="" snapshot_env=""
+        [[ -n "${PATH:-}" ]] && snapshot_env="PATH=$(printf '%q' "$PATH") "
+        if [[ -n "$after_kill" ]]; then
+            snapshot_prefix="__cctrl_procs=\$(${snapshot_env}$(printf '%q' "$SCRIPT_DIR/cctrl") session pane-snapshot $snapshot_q 2>/dev/null); "
+        fi
+        if ! tmux run-shell -b "sleep $grace; ${snapshot_prefix}${after_kill}tmux kill-session -t $target_q" 2>/dev/null; then
+            if ! tmux kill-session -t "$close_kill_target"; then  # tmux-target:exact-id ($close_kill_target is already "=$target" or an exact "$N" id)
                 echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
                 return 1
             fi
@@ -13186,7 +13301,7 @@ _session_close() {
             echo -e "${GREEN}✓${RESET} Session ${BOLD}$target${RESET} will close in ${grace}s."
         fi
     else
-        if ! tmux kill-session -t "=$target"; then
+        if ! tmux kill-session -t "$close_kill_target"; then  # tmux-target:exact-id ($close_kill_target is already "=$target" or an exact "$N" id)
             echo -e "${RED}Could not close session '$target'; its task records are unchanged.${RESET}" >&2
             return 1
         fi

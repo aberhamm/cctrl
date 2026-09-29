@@ -56,11 +56,34 @@ _cleanup() {
     _killed=true
     if [[ -n "$_child_pid" ]]; then
         kill -TERM "$_child_pid" 2>/dev/null || true
-        local _ticks=0 _limit=$(( ${CCTRL_WRAPPER_TERM_GRACE:-10} * 10 ))
+        # A malformed grace (e.g. "5s") must not blow up the arithmetic
+        # expansion below: that's a fatal error in bash even without -e, and
+        # would abort this trap before the escalation loop ever ran.
+        local _grace="${CCTRL_WRAPPER_TERM_GRACE:-10}"
+        # A leading zero (e.g. "08") passes the regex but is invalid octal,
+        # which blows up the arithmetic below just the same — force base 10.
+        [[ "$_grace" =~ ^[0-9]+$ ]] || _grace=10
+        _grace=$((10#$_grace))
+        local _ticks=0 _limit=$(( _grace * 10 ))
         while kill -0 "$_child_pid" 2>/dev/null && (( _ticks < _limit )); do
             sleep 0.1; _ticks=$((_ticks + 1))
         done
-        kill -0 "$_child_pid" 2>/dev/null && kill -KILL "$_child_pid" 2>/dev/null
+        if kill -0 "$_child_pid" 2>/dev/null; then
+            # SIGKILL only the direct child would strand any descendants it
+            # spawned (MCP servers, tool subprocesses) as orphans once the
+            # pane is gone; kill its whole process tree. (No arrays with
+            # negative indices — this script also runs under macOS's bash 3.2.)
+            local _pid _kid
+            local -a _todo=("$_child_pid") _tree=()
+            while [[ ${#_todo[@]} -gt 0 ]]; do
+                _pid="${_todo[0]}"; _todo=("${_todo[@]:1}")
+                _tree+=("$_pid")
+                while IFS= read -r _kid; do
+                    [[ -n "$_kid" ]] && _todo+=("$_kid")
+                done < <(pgrep -P "$_pid" 2>/dev/null)
+            done
+            kill -KILL "${_tree[@]}" 2>/dev/null
+        fi
         wait "$_child_pid" 2>/dev/null || true
         _child_pid=""
     fi

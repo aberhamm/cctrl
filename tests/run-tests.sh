@@ -5141,7 +5141,11 @@ test_session_close_reaps_pane_processes() (
     # Stays a bash process running this script (not an exec'd sleep), so its
     # argv names the test root and cleanup can always find it.
     printf '#!/usr/bin/env bash\ntrap "" TERM HUP\nwhile :; do sleep 1; done\n' > "$agents/claude"
-    chmod +x "$bin/tmux" "$agents/claude"
+    # Same shape, so a Codex-flavored pane exercises the identical reaper
+    # path (plan 087): the reap kills by snapshot pid, independent of which
+    # agent the wrapper launched.
+    cp "$agents/claude" "$agents/codex"
+    chmod +x "$bin/tmux" "$agents/claude" "$agents/codex"
     # shellcheck disable=SC2329 # invoked by the EXIT trap
     cleanup_reap() {
         "$real_tmux" -L "$socket" kill-server 2>/dev/null || true
@@ -5150,9 +5154,11 @@ test_session_close_reaps_pane_processes() (
     trap cleanup_reap EXIT
     export CCTRL_SESSION_METADATA_DIR="$root/meta" CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id"
 
-    launch() { # name wrapper-grace
+    launch() { # name wrapper-grace [agent]
+        local agent="${3:-claude}" agent_args=(--probe "$root")
+        [[ "$agent" == "codex" ]] && agent_args=(--probe "$root" --cctrl-initial)
         "$real_tmux" -L "$socket" new-session -d -s "$1" \
-            "CCTRL_WRAPPER_TERM_GRACE=$2 PATH=$(printf '%q' "$agents:$PATH") bash $(printf '%q' "$ROOT/lib/session-wrapper.sh") claude $(printf '%q' "$root/marker-$1") --probe $(printf '%q' "$root")"
+            "CCTRL_WRAPPER_TERM_GRACE=$2 PATH=$(printf '%q' "$agents:$PATH") bash $(printf '%q' "$ROOT/lib/session-wrapper.sh") $agent $(printf '%q' "$root/marker-$1") $(printf '%q ' "${agent_args[@]}")"
         for i in $(seq 1 30); do
             pids="$(pane_tree "$1")"
             [[ "$(wc -w <<< "$pids")" -ge 2 ]] && return 0
@@ -5218,6 +5224,13 @@ test_session_close_reaps_pane_processes() (
     # The last session: its kill ends the tmux server, which must not take the
     # record/reap step down with it.
     assert_gone "delayed session close" "$pids" 150
+    # A Codex-flavored pane (not just claude) through `session close`: the
+    # reaper kills by pid/start-time snapshot, independent of which agent the
+    # wrapper launched.
+    launch r-codex 600 codex; pids="$(pane_tree r-codex)"
+    CCTRL_CLOSE_REAP_GRACE=1 PATH="$bin:$PATH" "$ROOT/cctrl" session close r-codex --force >/dev/null 2>&1 || fail "codex pane close failed"
+    assert_gone "session close of a codex pane" "$pids" 10
+
     # Safety property: a pid whose start time no longer matches the snapshot
     # (the pid was reused) is never signalled.
     local victim good_start
@@ -5231,6 +5244,32 @@ test_session_close_reaps_pane_processes() (
     CCTRL_CLOSE_REAP_GRACE=0 cctrl_source_eval '_session_reap_processes "$1" reuse-test' "$victim@$good_start" 2>/dev/null
     sleep 0.3
     ! kill -0 "$victim" 2>/dev/null || { kill -KILL "$victim" 2>/dev/null; fail "the reaper did not stop a matching pid"; }
+
+    # Survivors report: nothing can actually survive a real SIGKILL, so this
+    # simulates it with a stubbed `ps` that always reports the pid alive
+    # (matching pid/stat/lstart), regardless of reality — confirming the
+    # reaper's own accounting (not the OS's) drives the survivor message and
+    # exit code. Uses a real, self-spawned (and actually-killed) pid rather
+    # than a hardcoded number, so there's no chance of the stub's lie ever
+    # pointing at an unrelated live process.
+    local survivor_bin="$root/survivor-ps" survivor_pid survivor_start="Mon_Jan__1_00:00:00_2001"
+    bash -c 'exec sleep 30' & survivor_pid=$!
+    mkdir -p "$survivor_bin"
+    cat > "$survivor_bin/ps" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "-axo" ]]; then
+    printf '%s R %s\n' "$survivor_pid" "$survivor_start"
+else
+    exec /bin/ps "\$@"
+fi
+EOF
+    chmod +x "$survivor_bin/ps"
+    local survivor_out survivor_rc=0
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    survivor_out="$(CCTRL_CLOSE_REAP_GRACE=0 PATH="$survivor_bin:$PATH" cctrl_source_eval '_session_reap_processes "$1" survivor-test' "$survivor_pid@$survivor_start" 2>&1)" || survivor_rc=$?
+    [[ "$survivor_rc" -eq 1 ]] || fail "a process that survives SIGKILL should report failure, got rc=$survivor_rc: $survivor_out"
+    assert_contains "$survivor_out" "survivor-test: 1 pane process(es) survived SIGKILL: $survivor_pid"
+    kill -KILL "$survivor_pid" 2>/dev/null || true
 
     # A failed process snapshot never blocks the kill itself.
     local brokebin="$root/brokepy"
@@ -5615,15 +5654,18 @@ test_session_close_exact_target_no_prefix_match() {
     # Delayed close (--in): the scheduled kill-session is embedded in a shell
     # string run later by the tmux server (cctrl:~13156), outside the reach of
     # test_tmux_exact_target_lint (it's a nested command string, not a literal
-    # `-t "$VAR"` clause) — confirm it still carries the exact "=X" target,
-    # not a bare, prefix-matchable "X".
+    # `-t "$VAR"` clause) — confirm it carries the resolved immutable tmux
+    # session id ($1, from TMUX_FAKE_STATE) rather than a bare, prefix-
+    # matchable "X" or even a re-usable "=X" name (plan 087: the id, once
+    # resolved, is used for the kill everywhere in `session close`, not just
+    # for the record/reap steps).
     printf '$1:X\n$2:X--2\n' > "$state"
     local log="$TMPDIR/close-prefix-match.log"
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_STATE="$state" "$ROOT/cctrl" session close X --in 5 2>&1)" \
         || fail "delayed close of X failed: $out"
     assert_contains "$out" "will close in 5s"
-    assert_contains "$(cat "$log")" "kill-session\\ -t\\ =X"
+    assert_contains "$(cat "$log")" 'kill-session\ -t\ \\\$1'
     grep -qx '$1:X' "$state" || fail "delayed close must not kill before its grace elapses: $(cat "$state")"
 
     echo "ok: session close targets tmux exactly (immediate and delayed), so a stale/repeated close of a gone name never prefix-matches a live X--2"
@@ -12095,31 +12137,6 @@ test_codex_hook_installation_is_additive_and_observer_is_bounded() {
 
     file_digest() {
         if [[ -f "$1" ]]; then shasum -a 256 "$1" | awk '{print $1}'; else printf 'absent'; fi
-    }
-    tree_digest() {
-        python3 - "$1" <<'PY'
-import hashlib
-import os
-import sys
-
-root = sys.argv[1]
-digest = hashlib.sha256()
-if os.path.isdir(root):
-    for base, dirs, files in os.walk(root):
-        dirs.sort()
-        for name in sorted(files):
-            path = os.path.join(base, name)
-            rel = os.path.relpath(path, root).encode()
-            digest.update(len(rel).to_bytes(8, "big"))
-            digest.update(rel)
-            if os.path.islink(path):
-                digest.update(b"L" + os.readlink(path).encode())
-            else:
-                with open(path, "rb") as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                        digest.update(chunk)
-print(digest.hexdigest())
-PY
     }
 
     real_hooks_before="$(file_digest "$HOME/.codex/hooks.json")"
