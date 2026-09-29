@@ -52,10 +52,14 @@ fail() {
 #   rate-limits*.json(l)  statusline hook of every live Claude session
 #   messages.jsonl        live peer mailbox (other sessions sending messages)
 #   snapshots/latest.json, snapshots/<UTC>Z.json, snapshots/.snapshot-*
-#                         the launchd snapshot timer (every 5 minutes). Only
-#                         these names: `session snapshot` without --dir writes
-#                         the real directory, so every test must pass --dir
-#                         (enforced by test_snapshot_calls_pass_dir).
+#                         the launchd snapshot timer (every 5 minutes), which
+#                         runs independently of this suite and does not set
+#                         CCTRL_DATA_DIR. Since plan 078, `session snapshot`/
+#                         `session restore --from latest`/doctor's staleness
+#                         check all default to CCTRL_DATA_DIR (which this file
+#                         exports globally above), so a test omitting --dir no
+#                         longer risks writing the real directory; only these
+#                         names remain exempt.
 live_tree_digest() {
     find "$1" -type f ! -name 'rate-limits.json' ! -name 'rate-limits-history.jsonl' \
         ! -name 'messages.jsonl' \
@@ -7599,17 +7603,6 @@ JSON
     echo "ok: a capture with no live sessions never replaces a latest.json that had them"
 }
 
-test_snapshot_calls_pass_dir() {
-    # `session snapshot` without --dir writes the REAL data/snapshots (it does
-    # not follow CCTRL_DATA_DIR; plan 078), and the live-store guards ignore the
-    # timer's file names there. So every snapshot call in this file must pass
-    # --dir. The pattern is split so this check does not match itself.
-    local pattern="session ""snapshot" offenders
-    offenders="$(grep -n "$pattern" "$ROOT/tests/run-tests.sh" | grep -v -- '--dir' || true)"
-    [[ -z "$offenders" ]] || fail "session snapshot calls without --dir would write the real store: $offenders"
-    echo "ok: every session snapshot call in the tests passes --dir"
-}
-
 test_snapshot_ownership_policy() {
     local root="$TMPDIR/snapshot-ownership" data="$TMPDIR/snapshot-ownership/data"
     local snapshots="$TMPDIR/snapshot-ownership/snapshots" host="0123456789abcdef0123456789abcdef"
@@ -7825,6 +7818,60 @@ JSON
     after="$(live_data_digest)"
     [[ "$before" == "$after" ]] || fail "snapshot ownership tests changed the real cctrl data store"
     echo "ok: snapshot/restore is schema-v2, ownership-aware, exact-id, source-gated, and non-destructive"
+}
+
+test_snapshot_restore_default_honors_data_dir() {
+    # Plan 078: `session snapshot` (and `session restore --from latest`)
+    # without --dir must follow CCTRL_DATA_DIR, not the real data/snapshots.
+    # live_data_digest() deliberately EXEMPTS snapshots/latest.json and its
+    # siblings (the live launchd timer legitimately rewrites them every 5
+    # minutes), so a before/after digest comparison can't catch a regression
+    # here — it would pass even if this wrote straight into the real store.
+    # Assert the real thing instead: a distinct fake host id that can only
+    # have come from THIS test never appears in the real latest.json, and the
+    # restore default's "not found" error reports the CCTRL_DATA_DIR path,
+    # not the real one.
+    local root="$TMPDIR/snapshot-default-datadir" data host="0123456789abcdef0123456789abcdef"
+    data="$root/data"
+    mkdir -p "$root" "$data"
+    printf '%s\n' "$host" > "$data/host-id"
+    local catalogue="$root/catalogue.json" process="$root/process.json"
+    cat > "$process" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-09-17T10:00:00Z","source_cursor":"process-1","processes":[],"error":null}
+JSON
+    cat > "$catalogue" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[]}
+JSON
+
+    local real_latest="$ROOT/data/snapshots/latest.json" out rc=0
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$catalogue" \
+      CCTRL_SNAPSHOT_PROCESS_FILE="$process" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 \
+      "$ROOT/cctrl" session snapshot --allow-empty --json)" || fail "default-dir snapshot failed: $out"
+    [[ -f "$data/snapshots/latest.json" ]] || fail "snapshot without --dir did not honor CCTRL_DATA_DIR"
+    jq -e --arg host "$host" '.host_id==$host' "$data/snapshots/latest.json" >/dev/null \
+      || fail "test snapshot did not land the fake host id (isolation check invalid)"
+    if [[ -f "$real_latest" ]]; then
+        [[ "$(jq -r '.host_id // empty' "$real_latest" 2>/dev/null)" != "$host" ]] \
+            || fail "session snapshot without --dir wrote the real cctrl data store"
+    fi
+
+    # A fresh, empty CCTRL_DATA_DIR (no snapshots/ at all yet) makes restore's
+    # default resolution deterministic: it must report ITS OWN missing path,
+    # never fall through to the real store's (possibly-present) latest.json.
+    local empty_root="$TMPDIR/snapshot-default-datadir-empty/data"
+    mkdir -p "$empty_root"
+    rc=0; out="$(CCTRL_DATA_DIR="$empty_root" CCTRL_HOST_ID_FILE="$empty_root/host-id" \
+      "$ROOT/cctrl" session restore --from latest --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "restore --from latest against an empty CCTRL_DATA_DIR should exit 64 (rc=$rc): $out"
+    jq -e --arg path "$empty_root/snapshots/latest.json" '.path==$path' <<< "$out" >/dev/null \
+      || fail "restore --from latest without --dir did not resolve against CCTRL_DATA_DIR: $out"
+
+    rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$catalogue" \
+      CCTRL_RESTORE_PROCESS_FILE="$process" \
+      "$ROOT/cctrl" session restore --from latest --dry-run --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "default-dir restore --from latest failed (rc=$rc): $out"
+
+    echo "ok: session snapshot/restore without --dir honor CCTRL_DATA_DIR, not the real store"
 }
 
 test_usage_cost_fixtures() {
@@ -10368,8 +10415,8 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             exit 0
             ;;
         snapshot-ownership)
-            test_snapshot_calls_pass_dir
             test_snapshot_ownership_policy
+            test_snapshot_restore_default_honors_data_dir
             test_snapshot_tmux_row_selection
             test_snapshot_size_controls
             test_snapshot_reboot_keeps_live_latest
@@ -10578,8 +10625,8 @@ test_task_registry_replay_order_and_guards
 test_task_registry_lock_stale_timeout_and_release_token
 test_task_registry_structural_boundary
 test_codex_reconcile_ownership_evidence
-test_snapshot_calls_pass_dir
 test_snapshot_ownership_policy
+test_snapshot_restore_default_honors_data_dir
 test_snapshot_tmux_row_selection
 test_snapshot_size_controls
 test_snapshot_reboot_keeps_live_latest

@@ -54,6 +54,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `session snapshot` (and `session restore --from latest`, and the doctor's
+  timer staleness check) now default to `${CCTRL_DATA_DIR:-data}/snapshots`
+  instead of always writing the real `data/snapshots`, so a test or script
+  that sets `CCTRL_DATA_DIR` but forgets `--dir` can no longer touch the live
+  store. The now-redundant static lint enforcing `--dir` on every test call
+  is removed. (plan 078)
 - Review fixes for plan 074:
   - A failed process snapshot no longer aborts `session kill`, `close` or
     `stop-exact`. The kill proceeds and a warning is printed.

@@ -11562,7 +11562,7 @@ _session_doctor() {
     # or latest.json is stale (>3 intervals = 15 minutes).
     local _snap_plist _snap_dir _snap_latest
     _snap_plist="${CCTRL_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}/com.cctrl.session-snapshot.plist"
-    _snap_dir="$SCRIPT_DIR/data/snapshots"
+    _snap_dir="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}/snapshots"
     _snap_latest="$_snap_dir/latest.json"
     if [[ ! -f "$_snap_plist" ]]; then
         echo -e "${DIM}Snapshot timer not installed. Install with:${RESET}"
@@ -11742,7 +11742,7 @@ _session_snapshot() {
             *) echo -e "${RED}Unknown snapshot flag: $1${RESET}" >&2; return 64 ;;
         esac
     done
-    [[ -n "$snapshot_dir" ]] || snapshot_dir="$SCRIPT_DIR/data/snapshots"
+    [[ -n "$snapshot_dir" ]] || snapshot_dir="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}/snapshots"
     mkdir -p "$snapshot_dir" || return 1
 
     local scratch catalogue_file sessions_file process_file resources_file snapshot_file
@@ -11874,7 +11874,7 @@ _session_restore() {
             *) echo -e "${RED}Unknown restore flag: $1${RESET}" >&2; return 64 ;;
         esac
     done
-    [[ -n "$snapshot_path" ]] || snapshot_path="$SCRIPT_DIR/data/snapshots/latest.json"
+    [[ -n "$snapshot_path" ]] || snapshot_path="${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}/snapshots/latest.json"
     [[ -f "$snapshot_path" ]] || { $json && jq -n --arg path "$snapshot_path" '{ok:false,error:"snapshot not found",path:$path}'; return 64; }
 
     local schema generated_at snap_hostname local_hostname host_id snap_epoch now_epoch age
