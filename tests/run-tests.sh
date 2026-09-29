@@ -3010,6 +3010,30 @@ test_pane_draft_plan086_followups() {
     echo "ok: plan 086 draft-detector follow-ups (multi-line, >/| content, no-composer exit code, hint/SGR gating, pasted-text placeholder)"
 }
 
+# --- plan 086 hotfix: single-border fallback misread an empty composer as a
+# draft when its top edge is a plain-dash divider carrying a title (tmux's
+# own pane-border-status line, e.g. "── portal: resume from handoff ... ──"),
+# because that line isn't ALL border-drawing characters so only the bottom
+# divider registered as a border. The single-border fallback then scoped the
+# composer from index 0 (the FIRST glyph line anywhere in the whole captured
+# scrollback) through the border, instead of the LAST glyph line immediately
+# above it, so real conversation text in between read as "typed" content.
+# Found live 2026-09-29: 3 idle fleet sessions showed as unsent-draft.
+test_pane_draft_plan086_hotfix_titled_divider() {
+    local fn="$TMPDIR/pane-draft-fn086hotfix.sh" SCRIPT_DIR="$ROOT"
+    awk '/^_session_pane_has_draft\(\) \{/,/^}/' "$ROOT/cctrl" > "$fn"
+    # shellcheck source=/dev/null
+    source "$fn"
+    local fx="$ROOT/tests/fixtures"
+
+    ! _session_pane_has_draft "$(cat "$fx/pane-draft-titled-divider-empty.txt")" \
+        || fail "an empty composer (❯ + NBSP only) under a titled top divider was read as a draft"
+    ! _session_pane_has_draft "$(cat "$fx/pane-draft-titled-divider-ghost.txt")" \
+        || fail "a dimmed ghost suggestion under a titled top divider was read as a draft"
+
+    echo "ok: plan 086 hotfix — single-border fallback uses the last glyph line, not the first, so a titled top divider doesn't misread scrollback as a draft"
+}
+
 test_strip_sgr_shared_regex() {
     # requirement 4: _strip_sgr and lib/pane_draft.pl share one escape regex
     # (lib/ansi_escape.pl, plan 086). Probe _strip_sgr with the same
@@ -10723,6 +10747,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_rich_state_detects_glyph_draft
             test_session_autoheal_skips_glyph_draft
             test_pane_draft_plan086_followups
+            test_pane_draft_plan086_hotfix_titled_divider
             test_strip_sgr_shared_regex
             echo "ok"
             exit 0
@@ -10809,6 +10834,7 @@ test_session_list_rich_state
 test_session_pane_has_draft_glyph_fixtures
 test_session_rich_state_detects_glyph_draft
 test_pane_draft_plan086_followups
+test_pane_draft_plan086_hotfix_titled_divider
 test_strip_sgr_shared_regex
 test_needs_me_digest
 test_host_registry_crud

@@ -129,10 +129,17 @@ if (@border_idx >= 2) {
     my ($bef_s, $bef_e) = (0, $b - 1);
     my $aft_ok = $aft_s <= $aft_e;
     my $bef_ok = $bef_s <= $bef_e;
-    my $aft_glyph = $aft_ok && grep { $is_glyph[$_] } $aft_s .. $aft_e;
-    my $bef_glyph = $bef_ok && grep { $is_glyph[$_] } $bef_s .. $bef_e;
-    if ($aft_glyph) { ($start, $end) = ($aft_s, $aft_e) }
-    elsif ($bef_glyph) { ($start, $end) = ($bef_s, $bef_e) }
+    # Tighten to the LAST glyph line within the chosen side, same as the
+    # zero-border fallback below, not the side's whole boundary: a "before"
+    # side in particular can span the entire scrollback above a composer
+    # that never draws a top rule, and scanning from index 0 for the FIRST
+    # glyph line picks up an unrelated earlier "❯ ..." line from history,
+    # then judges everything after it as composer content (regression found
+    # 2026-09-29, plan 086 hotfix).
+    my @aft_glyph_idx = $aft_ok ? (grep { $is_glyph[$_] } $aft_s .. $aft_e) : ();
+    my @bef_glyph_idx = $bef_ok ? (grep { $is_glyph[$_] } $bef_s .. $bef_e) : ();
+    if (@aft_glyph_idx) { ($start, $end) = ($aft_glyph_idx[-1], $aft_e) }
+    elsif (@bef_glyph_idx) { ($start, $end) = ($bef_glyph_idx[-1], $bef_e) }
     elsif ($aft_ok) { ($start, $end) = ($aft_s, $aft_e) }
     elsif ($bef_ok) { ($start, $end) = ($bef_s, $bef_e) }
     else { ($start, $end) = (1, 0) }
