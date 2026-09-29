@@ -59,8 +59,9 @@ _autoheal_refresh_paths() {
 _autoheal_refresh_paths
 _needs_me_refresh_paths() {
     # State file backing the `needs-me` digest (plan 022). Overridable so tests
-    # point it at a scratch path instead of the real data dir.
-    NEEDS_ME_SNAPSHOT="${CCTRL_NEEDS_ME_SNAPSHOT:-$SCRIPT_DIR/data/needs-me-snapshot.json}"
+    # point it at a scratch path instead of the real data dir; follows
+    # CCTRL_DATA_DIR like the other data-dir state (plan 090).
+    NEEDS_ME_SNAPSHOT="${CCTRL_NEEDS_ME_SNAPSHOT:-${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}/needs-me-snapshot.json}"
 }
 _needs_me_refresh_paths
 

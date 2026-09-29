@@ -1,7 +1,8 @@
 ---
 id: 090
 title: Live-store guard flakes — make them diagnosable, then narrow the exclusion list
-status: pending
+status: done
+completed: 2026-09-29
 blocked-by: []
 priority: 90
 allows-migrations: false
@@ -9,7 +10,9 @@ needs-review: none
 review-required: eng
 created: 2026-09-28
 tui-fixture: n/a
-approved-by: none  # filed by the fleet manager (guardflake-fm0928); implement on approval
+approved-by: matthew (via cctrl-fleet-manager), 2026-09-29
+reviews:
+  - type=eng verdict=approved date=2026-09-29 by=opus-level-subagent
 ---
 
 ## Plain-English Summary
@@ -53,7 +56,7 @@ this is the most likely source of the flake, and directly evidenced by the
 
 ## Requirements
 
-- [ ] **(a) Diagnosability.** When `live_tree_digest`/`live_data_digest` (or
+- [x] **(a) Diagnosability.** When `live_tree_digest`/`live_data_digest` (or
       `ownership_live_store_digest`) detects a mismatch, print which path(s)
       changed and how (added/removed/modified), not just "before != after".
       The simplest version: instead of (or in addition to) a single rolled-up
@@ -61,7 +64,7 @@ this is the most likely source of the flake, and directly evidenced by the
       `after` snapshots and diff them; print the diff on failure. This must
       not change what counts as a failure today — it only makes an existing
       failure explain itself.
-- [ ] **(b) Narrow the exclusion, don't broaden it into a blind spot.**
+- [x] **(b) Narrow the exclusion, don't broaden it into a blind spot.**
       Extend the existing per-name/per-path exclusion approach (`tests/run-tests.sh:59-65`,
       `68-109`) to also recognize live-fleet writers under `data/sessions/`
       the same way `messages.jsonl` is already handled: exclude a record
@@ -75,7 +78,7 @@ this is the most likely source of the flake, and directly evidenced by the
       to catch (see `fleet-prune-safety` and `cctrl-multi-machine-git`
       memories). Also evaluate `data/needs-me-snapshot.json`, which the
       `find -newer` evidence above also flagged.
-- [ ] **(c) Consider scoping the guard to the suspicious group, not the whole
+- [x] **(c) Consider scoping the guard to the suspicious group, not the whole
       run.** Investigate taking the "before" snapshot immediately before each
       test group that asserts store-isolation (e.g. right before
       `test_fleet_v2_provider_neutral_federation`), rather than once at
@@ -84,7 +87,7 @@ this is the most likely source of the flake, and directly evidenced by the
       positive, without weakening what the guard actually checks. Only do
       this if it doesn't require duplicating the exclusion logic per call
       site; prefer a single parameterized snapshot/diff pair over N copies.
-- [ ] Add a test (or extend an existing one) that pins the new exclusion
+- [x] Add a test (or extend an existing one) that pins the new exclusion
       behavior: a live-looking `data/sessions/some-other-session.json` write
       that occurs *during* a test group is correctly ignored, while a write
       to a session/task name the test group itself is responsible for is
@@ -103,3 +106,37 @@ place, per repo convention. Do not weaken what counts as a live-store leak
 in the process of reducing false positives — when in doubt, keep the
 exclusion narrower and file a further follow-up rather than broadening it
 speculatively.
+
+## Outcome (2026-09-29)
+
+- **(a)** One Python helper (`$TMPDIR/live_store_guard.py`) builds a
+  per-file manifest (`kind<TAB>path`, sha256 per file, rows for dirs and
+  links) and diffs two manifests. Every guard site now calls
+  `assert_live_store_unchanged BEFORE AFTER MESSAGE [owned-name...]`, which
+  on failure lists each `added:`/`removed:`/`modified:` path.
+- **Found while doing (a):** the install gate runs the suite from a release
+  whose `data/` is a symlink to the live store, and `find DIR` without `-H`
+  does not follow a symlinked root. The old guard hashed nothing there and
+  always passed. The ownership digest only recorded the link target. The
+  manifest now follows a symlinked root.
+- **(b)** Registry entries directly under `data/sessions/` that were added
+  or modified are tolerated as live-fleet churn only when the file stem is
+  not an owned name and the content mentions neither this run's `$TMPDIR`
+  nor an owned name. Removed records always fail. Registry lock files and
+  mktemp'd `.task-event.*` files are tolerated. Tolerated churn is printed
+  as a `note:` line. `needs-me-snapshot.json` is excluded by name, and
+  `cctrl`'s `NEEDS_ME_SNAPSHOT` now follows `CCTRL_DATA_DIR`, so the suite
+  cannot write the real file without an explicit override. It was the one
+  data-dir state file that ignored `CCTRL_DATA_DIR`.
+- **(c)** No change. Every guard already snapshots immediately around its
+  own test. The fleet-v2 guard that flaked wraps a single `cctrl fleet`
+  call. Only the ownership-matrix group guard is wide, and it now shares the
+  same helper.
+- Test: `test_live_store_guard_diagnostics_and_churn` covers the symlinked
+  root, tolerated churn, an owned-name write, a `$TMPDIR`-bearing write, a
+  removed record, and the failure message.
+
+Follow-ups (not done): `.session-index-*.ref` holds only a task filename,
+so it can't be matched by content. The ownership-matrix outer guard passes
+no owned names and relies on `$TMPDIR` matching. The manifest splits on the
+first tab, so a link target containing a tab would mis-parse.

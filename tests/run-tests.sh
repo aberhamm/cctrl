@@ -61,10 +61,19 @@ fail() {
     exit 1
 }
 
-# Files the live fleet rewrites while the suite runs; no code under test writes
-# them, so the "tests did not touch the real live store" guards ignore them:
+# "Tests did not touch the real live store" guards (plan 090). Each guarded
+# test takes a per-file manifest of the live store before and after, then
+# asserts it is unchanged. On a mismatch the failure lists every changed
+# path (added/removed/modified) instead of just "the digest moved".
+#
+# Files the live fleet rewrites while the suite runs; no code under test
+# writes them, so they are left out of the manifest entirely:
 #   rate-limits*.json(l)  statusline hook of every live Claude session
 #   messages.jsonl        live peer mailbox (other sessions sending messages)
+#   needs-me-snapshot.json  rewritten by every fleet-manager `cctrl needs-me`
+#                         poll. Since plan 090 it follows CCTRL_DATA_DIR (which
+#                         this file exports globally), so a test can't reach
+#                         the real one without an explicit override.
 #   snapshots/latest.json, snapshots/<UTC>Z.json, snapshots/.snapshot-*
 #                         the launchd snapshot timer (every 5 minutes), which
 #                         runs independently of this suite and does not set
@@ -74,56 +83,192 @@ fail() {
 #                         exports globally above), so a test omitting --dir no
 #                         longer risks writing the real directory; only these
 #                         names remain exempt.
-live_tree_digest() {
-    find "$1" -type f ! -name 'rate-limits.json' ! -name 'rate-limits-history.jsonl' \
-        ! -name 'messages.jsonl' \
-        ! -path '*/snapshots/latest.json' ! -path '*/snapshots/.snapshot-*' \
-        ! -path '*/snapshots/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z.json' \
-        -exec shasum -a 256 {} + 2>/dev/null | sort | shasum -a 256 | awk '{print $1}'
-}
-live_data_digest() { live_tree_digest "$ROOT/data"; }
-
-ownership_live_store_digest() {
-    python3 - "$ROOT/data" "$ROOT/.active-profile" \
-        "$CCTRL_TEST_REAL_HOME/.config/cctrl" \
-        "$CCTRL_TEST_REAL_HOME/.codex/hooks.json" \
-        "$CCTRL_TEST_REAL_HOME/.codex/config.toml" \
-        "$CCTRL_TEST_REAL_HOME/.claude/settings.json" <<'PY'
+#
+# data/sessions/ (the live session/task registry: heartbeats, spawns, closes
+# of every live session) stays IN the manifest. An added or modified record
+# there is tolerated as live-fleet churn only when it can't be the guarded
+# test's own write: its file stem isn't one the test passed as its own, and
+# its content mentions neither this run's $TMPDIR nor any of those names.
+# Live records are mostly task-<hash>.json / launch-<uuid>.json, so in
+# practice the content check (cwd, tmux_session, name) does the work, not the
+# filename. A REMOVED record always fails: the live fleet adds and rewrites
+# records but almost never deletes them, and a leaked close/prune is exactly
+# what this guard exists to catch. Registry lock files
+# (sessions/.task-registry-locks/*) and mktemp'd .task-event.* files come and
+# go around every live write and are tolerated. Tolerated churn is reported as
+# a `note:` line so it stays visible.
+#
+# The manifest follows a symlinked root: the install gate runs this suite from
+# a release whose data/ is a symlink to the live store, and a bare `find` on
+# that symlink used to hash nothing.
+LIVE_GUARD_PY="$TMPDIR/live_store_guard.py"
+cat > "$LIVE_GUARD_PY" <<'PY'
 import hashlib
 import os
 import re
 import sys
-from pathlib import Path
 
-digest = hashlib.sha256()
-for root_arg in sys.argv[1:]:
-    root = Path(root_arg)
-    digest.update(root_arg.encode() + b"\0")
-    if root.is_symlink():
-        digest.update(b"symlink\0" + os.readlink(root).encode() + b"\0")
-        continue
-    if root.is_file():
-        digest.update(b"file\0" + root.read_bytes() + b"\0")
-        continue
-    if not root.exists():
-        digest.update(b"absent\0")
-        continue
-    digest.update(b"dir\0")
-    for path in sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root))):
-        if path.name in {"rate-limits.json", "rate-limits-history.jsonl", "messages.jsonl"} or (
-                path.parent.name == "snapshots"
-                and (path.name == "latest.json" or path.name.startswith(".snapshot-")
-                     or re.fullmatch(r"\d{8}T\d{6}Z\.json", path.name))):
-            continue  # written by the live fleet, not by tests; see live_tree_digest
-        relative = str(path.relative_to(root)).encode()
-        if path.is_symlink():
-            digest.update(b"link\0" + relative + b"\0" + os.readlink(path).encode() + b"\0")
-        elif path.is_dir():
-            digest.update(b"dir\0" + relative + b"\0")
-        elif path.is_file():
-            digest.update(b"file\0" + relative + b"\0" + path.read_bytes() + b"\0")
-print(digest.hexdigest())
+EXCLUDED_NAMES = {"rate-limits.json", "rate-limits-history.jsonl",
+                  "messages.jsonl", "needs-me-snapshot.json"}
+SNAPSHOT_TS = re.compile(r"\d{8}T\d{6}Z\.json")
+
+
+def excluded(rel):
+    parts = rel.split(os.sep)
+    name = parts[-1]
+    if name in EXCLUDED_NAMES:
+        return True
+    if len(parts) >= 2 and parts[-2] == "snapshots":
+        return (name == "latest.json" or name.startswith(".snapshot-")
+                or SNAPSHOT_TS.fullmatch(name) is not None)
+    return False
+
+
+def file_row(path):
+    try:
+        with open(path, "rb") as fh:
+            return "sha256:" + hashlib.sha256(fh.read()).hexdigest()
+    except FileNotFoundError:
+        return None  # removed mid-walk; the after-manifest decides
+    except OSError as exc:
+        return "unreadable:" + exc.__class__.__name__
+
+
+def manifest(roots):
+    rows = []
+    for root in roots:
+        if os.path.islink(root):
+            rows.append(("link:" + os.readlink(root), root))
+        if os.path.isdir(root):
+            for dirpath, dirnames, filenames in os.walk(root):
+                for name in sorted(dirnames + filenames):
+                    path = os.path.join(dirpath, name)
+                    rel = os.path.relpath(path, root)
+                    if excluded(rel):
+                        continue
+                    if os.path.islink(path):
+                        rows.append(("link:" + os.readlink(path), path))
+                    elif os.path.isdir(path):
+                        rows.append(("dir", path))
+                    else:
+                        row = file_row(path)
+                        if row is not None:
+                            rows.append((row, path))
+        elif os.path.isfile(root):
+            row = file_row(root)
+            rows.append((row or "absent", root))
+        elif not os.path.lexists(root):
+            rows.append(("absent", root))
+    for kind, path in sorted(rows, key=lambda r: r[1]):
+        print(f"{kind}\t{path}")
+
+
+def load(path):
+    out = {}
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if "\t" in line:
+                kind, p = line.split("\t", 1)
+                out[p] = kind
+    return out
+
+
+def tolerated_churn(how, path, tmpdir, owned):
+    parent, name = os.path.split(path)
+    if (os.path.basename(parent) == ".task-registry-locks"
+            and os.path.basename(os.path.dirname(parent)) == "sessions"):
+        return True  # pid/time/token lock around a live registry write
+    if os.path.basename(parent) != "sessions":
+        return False
+    if name == ".task-registry-locks" or name.startswith(".task-event."):
+        return True  # mktemp'd event file, caught mid-write
+    if how == "removed":
+        return False
+    stem = name[:-5] if name.endswith(".json") else name
+    if stem in owned:
+        return False
+    try:
+        with open(path, "rb") as fh:
+            body = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return False  # changed and now unreadable: don't guess
+    needles = [tmpdir] + list(owned)
+    return not any(n and n in body for n in needles)
+
+
+def diff(before_file, after_file, tmpdir, owned):
+    before, after = load(before_file), load(after_file)
+    changes = []
+    for p in sorted(set(before) | set(after)):
+        if p not in before:
+            changes.append(("added", p))
+        elif p not in after:
+            changes.append(("removed", p))
+        elif before[p] != after[p]:
+            changes.append(("modified", p))
+    bad = [c for c in changes if not tolerated_churn(c[0], c[1], tmpdir, owned)]
+    churn = [c for c in changes if c not in bad]
+    if bad:
+        for how, p in bad:
+            print(f"  {how}: {p}")
+        if churn:
+            print(f"  (also {len(churn)} tolerated live-fleet registry change(s): "
+                  + ", ".join(f"{h} {os.path.basename(p)}" for h, p in churn) + ")")
+        return 1
+    if churn:
+        print(f"ignored {len(churn)} live-fleet registry change(s): "
+              + ", ".join(f"{h} {os.path.basename(p)}" for h, p in churn))
+    return 0
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "manifest":
+        manifest(sys.argv[2:])
+    elif sys.argv[1] == "diff":
+        sys.exit(diff(sys.argv[2], sys.argv[3], sys.argv[4], set(sys.argv[5:])))
+    else:
+        sys.exit(f"unknown mode {sys.argv[1]}")
 PY
+
+live_tree_manifest() { python3 "$LIVE_GUARD_PY" manifest "$@"; }
+live_data_manifest() { live_tree_manifest "$ROOT/data"; }
+ownership_live_store_manifest() {
+    live_tree_manifest "$ROOT/data" "$ROOT/.active-profile" \
+        "$CCTRL_TEST_REAL_HOME/.config/cctrl" \
+        "$CCTRL_TEST_REAL_HOME/.codex/hooks.json" \
+        "$CCTRL_TEST_REAL_HOME/.codex/config.toml" \
+        "$CCTRL_TEST_REAL_HOME/.claude/settings.json"
+}
+
+# live_store_changes BEFORE AFTER [owned-name...]: prints the changed paths and
+# returns 1 if any change could be the test's own write; prints a churn note
+# (or nothing) and returns 0 otherwise.
+live_store_changes() {
+    local before="$1" after="$2"; shift 2
+    [[ "$before" == "$after" ]] && return 0
+    local bf af
+    bf="$(mktemp "$TMPDIR/live-guard-before.XXXXXX")"
+    af="$(mktemp "$TMPDIR/live-guard-after.XXXXXX")"
+    printf '%s\n' "$before" > "$bf"
+    printf '%s\n' "$after" > "$af"
+    local rc=0
+    python3 "$LIVE_GUARD_PY" diff "$bf" "$af" "$TMPDIR" "$@" || rc=$?
+    rm -f -- "$bf" "$af"
+    return "$rc"
+}
+
+# assert_live_store_unchanged BEFORE AFTER MESSAGE [owned-name...]
+assert_live_store_unchanged() {
+    local before="$1" after="$2" message="$3"; shift 3
+    local report rc=0
+    report="$(live_store_changes "$before" "$after" "$@")" || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        fail "$message; changed paths:
+$report"
+    fi
+    [[ -z "$report" ]] || echo "note: live-store guard: $report" >&2
+    return 0
 }
 
 assert_contains() {
@@ -510,6 +655,72 @@ test_no_errexit_unsafe_post_increment() {
     [[ -z "$hits" ]] || fail "errexit-unsafe ((x++))/((x--)) (use x=\$((x + 1))):
 $hits"
     echo "ok: no errexit-unsafe ((x++)) post-increments in shipped bash"
+}
+
+test_live_store_guard_diagnostics_and_churn() {
+    # plan 090: the live-store guard names what changed, tolerates live-fleet
+    # registry churn it can't have caused, and still catches the test's own
+    # writes -- including through a symlinked root, as in the install gate.
+    local root="$TMPDIR/live-guard-fixture" link="$TMPDIR/live-guard-link" before after out rc
+    mkdir -p "$root/sessions" "$root/snapshots"
+    printf '{"k":1}\n' > "$root/config.json"
+    printf '{"purpose":"live"}\n' > "$root/sessions/TMUX--ms--other.json"
+    ln -s "$root" "$link"
+
+    before="$(live_tree_manifest "$link")"
+    assert_contains "$before" "link:$root"
+    assert_contains "$before" "$link/sessions/TMUX--ms--other.json" # walked through the link
+
+    # Live-fleet churn only: another session's record, the needs-me poll, the
+    # snapshot timer. Tolerated, and reported as such.
+    printf '{"purpose":"live","heartbeat":2}\n' > "$root/sessions/TMUX--ms--other.json"
+    printf 'task-abc.json\n' > "$root/sessions/.session-index-abc.ref"
+    printf '{}\n' > "$root/needs-me-snapshot.json"
+    printf '{}\n' > "$root/snapshots/latest.json"
+    mkdir -p "$root/sessions/.task-registry-locks"
+    printf '1 2 tok\n' > "$root/sessions/.task-registry-locks/k.lock"
+    printf '{}\n' > "$root/sessions/.task-event.x1"
+    after="$(live_tree_manifest "$link")"
+    out="$(live_store_changes "$before" "$after" TMUX--owned 2>&1)" || fail "guard flagged pure live-fleet churn: $out"
+    assert_contains "$out" "ignored 5 live-fleet registry change(s)"
+
+    # A record named after the test's own session is caught.
+    before="$after"
+    printf '{"purpose":"x"}\n' > "$root/sessions/TMUX--owned.json"
+    after="$(live_tree_manifest "$link")"
+    rc=0; out="$(live_store_changes "$before" "$after" TMUX--owned)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "guard missed a write to the test's own session record"
+    assert_contains "$out" "added: $link/sessions/TMUX--owned.json"
+
+    # A record carrying this run's TMPDIR is caught whatever its name.
+    before="$after"
+    printf '{"dir":"%s/project"}\n' "$TMPDIR" > "$root/sessions/TMUX--leaked.json"
+    after="$(live_tree_manifest "$link")"
+    rc=0; out="$(live_store_changes "$before" "$after")" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "guard missed a registry record that references the test TMPDIR"
+    assert_contains "$out" "added: $link/sessions/TMUX--leaked.json"
+
+    # Deleting a live registry record is never churn (a leaked close/prune).
+    before="$after"
+    rm -f -- "$root/sessions/TMUX--ms--other.json"
+    after="$(live_tree_manifest "$link")"
+    rc=0; out="$(live_store_changes "$before" "$after")" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "guard tolerated a removed live registry record"
+    assert_contains "$out" "removed: $link/sessions/TMUX--ms--other.json"
+
+    # Anything outside data/sessions/ is never churn; the report says how it changed.
+    before="$after"
+    printf '{"k":2}\n' > "$root/config.json"
+    after="$(live_tree_manifest "$link")"
+    rc=0; out="$(live_store_changes "$before" "$after")" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "guard missed a modified config.json"
+    assert_contains "$out" "modified: $link/config.json"
+
+    rc=0; out="$( (assert_live_store_unchanged "$before" "$after" "fixture changed the store") 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "assert_live_store_unchanged passed a real change"
+    assert_contains "$out" "FAIL: fixture changed the store; changed paths:"
+    assert_contains "$out" "modified: $link/config.json"
+    echo "ok: live-store guard lists changed paths, tolerates registry churn, catches own writes"
 }
 
 test_tmux_exact_target_lint() {
@@ -8123,7 +8334,7 @@ JSON
 {"schema_version":1,"kind":"codex_reconcile_result_v1","records":[],"errors":[]}
 JSON
 
-    before="$(live_data_digest)"
+    before="$(live_data_manifest)"
     out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$catalogue" \
       CCTRL_SNAPSHOT_SESSIONS_FILE="$sessions" CCTRL_SNAPSHOT_PROCESS_FILE="$process" \
       CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$snapshots" --json)"
@@ -8309,17 +8520,18 @@ JSON
     jq -e '.plan[0].disposition=="insufficient-evidence" and (.plan[0].reason|contains("host id mismatch"))' <<< "$out" >/dev/null \
       || fail "--force-host upgraded a foreign durable host id"
 
-    after="$(live_data_digest)"
-    [[ "$before" == "$after" ]] || fail "snapshot ownership tests changed the real cctrl data store"
+    after="$(live_data_manifest)"
+    assert_live_store_unchanged "$before" "$after" "snapshot ownership tests changed the real cctrl data store" \
+        TMUX--claude TMUX--live TMUX--old-claude TMUX--old-codex
     echo "ok: snapshot/restore is schema-v2, ownership-aware, exact-id, source-gated, and non-destructive"
 }
 
 test_snapshot_restore_default_honors_data_dir() {
     # Plan 078: `session snapshot` (and `session restore --from latest`)
     # without --dir must follow CCTRL_DATA_DIR, not the real data/snapshots.
-    # live_data_digest() deliberately EXEMPTS snapshots/latest.json and its
+    # live_data_manifest() deliberately EXEMPTS snapshots/latest.json and its
     # siblings (the live launchd timer legitimately rewrites them every 5
-    # minutes), so a before/after digest comparison can't catch a regression
+    # minutes), so a before/after manifest comparison can't catch a regression
     # here — it would pass even if this wrote straight into the real store.
     # Assert the real thing instead: a distinct fake host id that can only
     # have come from THIS test never appears in the real latest.json, and the
@@ -8710,12 +8922,12 @@ JSON
     printf '[{"name":"must-not-fallback-either"}]\n' > "$fix/wrong.invalid.json"
 
     local before after out legacy human
-    before="$(live_data_digest)"
+    before="$(live_data_manifest)"
     out="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
         CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet --json-v2)" || fail "fleet v2 failed"
-    after="$(live_data_digest)"
-    [[ "$before" == "$after" ]] || fail "fleet v2 tests changed the real cctrl live store"
+    after="$(live_data_manifest)"
+    assert_live_store_unchanged "$before" "$after" "fleet v2 tests changed the real cctrl live store" TMUX--managed
     jq -e '
       (keys == ["capabilities","error","rows","schema_version","status"]) and
       .schema_version == 2 and .status == "partial" and
@@ -10934,6 +11146,7 @@ fi
 if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-launch-to-app" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
 test_no_errexit_unsafe_post_increment
+test_live_store_guard_diagnostics_and_churn
 test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release
 test_cctrl_launcher_hooks_run_passes_deliberate_exit_through
@@ -12460,7 +12673,7 @@ PY
     assert_contains "$out" "trust/hash: untrusted"
     assert_contains "$out" "trust/hash: unknown — cctrl hooks run notify"
 
-    live_before="$(live_tree_digest "$ROOT/data")"
+    live_before="$(live_data_manifest)"
     local observer="$ROOT/hooks/codex-session-observer.py" payload="$TMPDIR/hooks-061-oversized"
     for body in '' 'null' '[]' '{bad' '{"hook_event_name":"Unknown","session_id":"id"}' \
         '{"hook_event_name":"SessionStart"}' '{"hook_event_name":"SessionStart","session_id":"fixture-id"}'; do
@@ -12479,8 +12692,8 @@ rc=p.wait(timeout=4)
 assert rc == 0
 assert time.monotonic()-started < 3.5
 PY
-    live_after="$(live_tree_digest "$ROOT/data")"
-    [[ "$live_before" == "$live_after" ]] || fail "isolated observer test changed the real cctrl live store"
+    live_after="$(live_data_manifest)"
+    assert_live_store_unchanged "$live_before" "$live_after" "isolated observer test changed the real cctrl live store" fixture-id
 
     real_hooks_after="$(file_digest "$HOME/.codex/hooks.json")"
     real_trust_after="$(file_digest "$HOME/.codex/config.toml")"
@@ -12549,7 +12762,7 @@ SH
     chmod +x "$bin/tmux"
     : > "$trace"; : > "$tmux_log"
     local before after out rc=0 record
-    before="$(live_data_digest)"
+    before="$(live_data_manifest)"
     out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" start --agent codex --app-owned "$root" --model gpt-6-astra --reasoning-effort high \
@@ -12693,8 +12906,8 @@ SH
     PATH="$bin:/usr/bin:/bin" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
       'HOSTS_FILE="$1"; _remote_exec remote start --message --app-owned --purpose fixed' "$hosts" >/dev/null
     assert_contains "$(cat "$ssh_log")" "-t tester@example.invalid"
-    after="$(live_data_digest)"
-    [[ "$before" == "$after" ]] || fail "app-owned tests changed the real cctrl live store"
+    after="$(live_data_manifest)"
+    assert_live_store_unchanged "$before" "$after" "app-owned tests changed the real cctrl live store"
     echo "ok: app-owned launch is at-most-once, writer-free, recoverable, and settings-safe"
 }
 
@@ -12707,7 +12920,6 @@ test_codex_handoff_state_machine() {
     local proc_snapshot="$TMPDIR/codex-handoff/process.json" tmux_absent="$TMPDIR/codex-handoff/tmux-absent.json"
     local proc_absent="$TMPDIR/codex-handoff/process-absent.json" state="$TMPDIR/codex-handoff/tmux-live" proc="$TMPDIR/codex-handoff/process-live"
     local host="77777777777777777777777777777777" started="Wed Sep 17 10:00:00 2026" out rc=0 record before after
-    handoff_tree_digest() { live_tree_digest "$1"; }
     rm -rf "$root"; mkdir -p "$bin" "$data" "$meta" "$codex_home/thread-writer-locks" "$backup"
     printf '%s\n' "$host" > "$data/host-id"
     cat > "$bin/tmux" <<'SH'
@@ -12813,7 +13025,7 @@ PY
           CCTRL_CODEX_HANDOFF_ATTEMPT_ID="handoff-attempt-0001" "${release_cmd[@]}"
     }
 
-    before="$(handoff_tree_digest "$ROOT/data")"
+    before="$(live_data_manifest)"
     make_record cctrl cctrl tmux; printf '$%s\n' 42 > "$state"; : > "$proc"; : > "$codex_home/thread-writer-locks/handoff-task.lock"
     out="$(run_release)" || fail "verified handoff failed: $out"
     jq -e 'length==1 and .[0].kind=="codex_handoff_result_v1" and .[0].status=="handed-off" and
@@ -12936,8 +13148,8 @@ PY
     [[ "$rc" -ne 0 ]] || fail "app-owned no-op ignored missing provider task"
     jq -e '.[0].error=="app-owned-provider-unverified"' <<< "$out" >/dev/null || fail "app-owned provider verification failure is wrong: $out"
 
-    after="$(handoff_tree_digest "$ROOT/data")"
-    [[ "$before" == "$after" ]] || fail "handoff tests changed the real cctrl live store"
+    after="$(live_data_manifest)"
+    assert_live_store_unchanged "$before" "$after" "handoff tests changed the real cctrl live store" TMUX--handoff handoff-task
     echo "ok: Codex handoff is exact-task, two-checkpoint, owner-exit-gated, idempotent, and attach-safe"
 }
 
@@ -13213,15 +13425,15 @@ run_codex_ownership_matrix_paths() {
 }
 
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-ownership-matrix" ]]; then
-    ownership_live_before="$(ownership_live_store_digest)"
+    ownership_live_before="$(ownership_live_store_manifest)"
     test_codex_ownership_matrix_contract
     test_codex_lifecycle_fixture_contract
     run_codex_ownership_matrix_paths
     test_fleet_v2_provider_neutral_federation
     test_snapshot_ownership_policy
-    ownership_live_after="$(ownership_live_store_digest)"
-    [[ "$ownership_live_before" == "$ownership_live_after" ]] \
-        || fail "three-path ownership matrix changed the real cctrl live store"
+    ownership_live_after="$(ownership_live_store_manifest)"
+    assert_live_store_unchanged "$ownership_live_before" "$ownership_live_after" \
+        "three-path ownership matrix changed the real cctrl live store"
     echo "ok: three ownership paths are isolated, single-writer, exact-id, federated, and restore-safe"
     echo "ok"
     exit 0
