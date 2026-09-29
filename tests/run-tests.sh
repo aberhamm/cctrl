@@ -12519,6 +12519,7 @@ test_codex_launch_to_app_workflow() {
     PATH="$seam_bin:$PATH" TMUX_LOG="$root/seam-tmux.log" CCTRL_DATA_DIR="$seam_data" CCTRL_HOST_ID_FILE="$seam_data/host-id" \
       CCTRL_SESSION_METADATA_DIR="$seam_meta" CCTRL_LAUNCH_RECEIPT_FILE="$seam_receipt" \
       CCTRL_ATTACH_PROMPT=never CCTRL_PURPOSE_PROMPT=never CCTRL_NO_HEALTH_CHECK=1 \
+      CCTRL_RESUME_POLL_TIMEOUT=0 CCTRL_CODEX_TITLE_POLL_TIMEOUT=0 \
       "$ROOT/cctrl" start -d --agent codex "$seam_project" >/dev/null
     jq -e '.schema_version==1 and (.session|test("^TMUX--.*seam-project$")) and
       (.launch_id|test("^[0-9a-f-]{16,64}$")) and (.record|endswith(".json"))' "$seam_receipt" >/dev/null \
