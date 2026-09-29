@@ -5060,20 +5060,35 @@ _mailbox_resolve_identity_for_mode() {
 # `_peer_send_and_deliver`'s cross-machine dispatch (the local check never ran
 # for a remote recipient, since that path SSHes out before reaching it —
 # 2026-09-28 eng review). Fails OPEN (returns 0, sets nothing) whenever
-# there's nothing to verify: --impersonate, from=user, an unresolved/manual
-# peer with no session, or no caller_session (not in tmux, or
-# `_session_current_name` couldn't tell). Returns 1 on an actual mismatch and
-# sets _PEER_BIND_TARGET so the caller can render its own error.
+# there's genuinely nothing to verify: --impersonate, from=user, a
+# mailbox-only/manual "from" peer with no tmux_target to bind against, or the
+# caller isn't in tmux at all. Plan 091: a caller_unresolved=true caller (in
+# tmux, per $TMUX, but `_session_current_name` couldn't verify which session)
+# is NOT treated as "nothing to verify" when "from" DOES have a real
+# bind_target — it's refused like a mismatch, because it's the same shape of
+# stale/inherited-identity gap 077 was built to catch. Checked only after
+# confirming a bind_target exists (2026-09-29 eng review): an unresolved
+# caller sending as a mailbox-only peer has nothing to impersonate, so it
+# must stay exempt exactly like a resolved caller sending as one already is.
+# Returns 1 on an actual mismatch OR an unresolved caller with a real
+# bind_target, and sets _PEER_BIND_TARGET so the caller can render its own
+# error ("(unresolved)" for the latter).
 #   $1 = from name   $2 = resolved peer json for from (or "")
 #   $3 = caller's own tmux session name (or "")   $4 = impersonate (bool)
+#   $5 = caller_unresolved (bool, default false)
 _peer_sender_binding_mismatch() {
-    local from_name="$1" from_peer_json="$2" caller_session="$3" impersonate="$4"
+    local from_name="$1" from_peer_json="$2" caller_session="$3" impersonate="$4" caller_unresolved="${5:-false}"
     _PEER_BIND_TARGET=""
     [[ "$impersonate" == "true" ]] && return 0
-    [[ "$from_name" != "user" && -n "$from_peer_json" && -n "$caller_session" ]] || return 0
+    [[ "$from_name" != "user" && -n "$from_peer_json" ]] || return 0
     local bind_target
     bind_target="$(jq -r '.tmux_target // .session // empty' <<< "$from_peer_json")"
-    [[ -n "$bind_target" && "$bind_target" != "$caller_session" ]] || return 0
+    [[ -n "$bind_target" ]] || return 0
+    if [[ "$caller_unresolved" == "true" ]]; then
+        _PEER_BIND_TARGET="(unresolved)"
+        return 1
+    fi
+    [[ -n "$caller_session" && "$bind_target" != "$caller_session" ]] || return 0
     _PEER_BIND_TARGET="$bind_target"
     return 1
 }
@@ -5247,8 +5262,19 @@ _peer_cmd_send() {
     # (sent `--as` a stale, reused tmux session name). `_session_current_name`
     # (not the bare `_session_tmux_display_current_name`) because `$TMUX` alone
     # can be stale in an agent subprocess; it also verifies pane ancestry.
-    local caller_tmux_session=""
-    caller_tmux_session="$(_session_current_name 2>/dev/null)" || true
+    #
+    # Plan 091: distinguish "no $TMUX at all" (legitimate — nothing to check)
+    # from "$TMUX is set but _session_current_name couldn't resolve it" (an
+    # inherited/stale CCTRL_SESSION_NAME, or the process isn't actually a
+    # descendant of any pane in the session tmux thinks is current) — the
+    # latter used to fall through `|| true` into the same empty-string
+    # fail-open path as the former, silently allowing a `--as` send from a
+    # caller whose own identity couldn't be verified.
+    local caller_tmux_session="" caller_unresolved=false
+    if [[ -n "${TMUX:-}" ]]; then
+        caller_tmux_session="$(_session_current_name 2>/dev/null)" || true
+        [[ -z "$caller_tmux_session" ]] && caller_unresolved=true
+    fi
     # recipient_created_at is audit-only (see below) — NOT enforced. An earlier
     # version of this check refused any recipient whose derived-peer created_at
     # postdated the caller's own session start, but that's true of every normal
@@ -5261,12 +5287,21 @@ _peer_cmd_send() {
     local recipient_created_at=""
     [[ -n "$to_peer_json" ]] && recipient_created_at="$(jq -r '.created_at // empty' <<< "$to_peer_json")"
 
-    if ! _peer_sender_binding_mismatch "$from" "$from_peer_json" "$caller_tmux_session" "$impersonate"; then
-        if $json; then
-            _json_error "sender-mismatch" "Sender '$from' is not your session ('$caller_tmux_session'); use --impersonate to override."
+    if ! _peer_sender_binding_mismatch "$from" "$from_peer_json" "$caller_tmux_session" "$impersonate" "$caller_unresolved"; then
+        if [[ "$caller_unresolved" == "true" ]]; then
+            if $json; then
+                _json_error "sender-unresolved" "Cannot verify your tmux session to send as '$from'; run 'cctrl session current' to diagnose, or pass --impersonate."
+            else
+                echo -e "${RED}Cannot verify your tmux session to send as '$from'.${RESET}" >&2
+                echo -e "${DIM}Run 'cctrl session current' to diagnose, or pass --impersonate to send as another identity on purpose.${RESET}" >&2
+            fi
         else
-            echo -e "${RED}Sender '$from' is not your session ('$caller_tmux_session').${RESET}" >&2
-            echo -e "${DIM}Pass --impersonate to send as another identity on purpose.${RESET}" >&2
+            if $json; then
+                _json_error "sender-mismatch" "Sender '$from' is not your session ('$caller_tmux_session'); use --impersonate to override."
+            else
+                echo -e "${RED}Sender '$from' is not your session ('$caller_tmux_session').${RESET}" >&2
+                echo -e "${DIM}Pass --impersonate to send as another identity on purpose.${RESET}" >&2
+            fi
         fi
         return 66
     fi
@@ -5324,6 +5359,7 @@ _peer_cmd_send() {
             --arg caller_tmux_session "$caller_tmux_session" \
             --arg recipient_created_at "$recipient_created_at" \
             --argjson impersonated "$impersonate" \
+            --argjson caller_unresolved "$caller_unresolved" \
             '{
               id: $id,
               from: $from,
@@ -5344,7 +5380,8 @@ _peer_cmd_send() {
                 requested_from: (if $requested_from == "" then null else $requested_from end),
                 caller_tmux_session: (if $caller_tmux_session == "" then null else $caller_tmux_session end),
                 recipient_created_at: (if $recipient_created_at == "" then null else $recipient_created_at end),
-                impersonated: (if $impersonated then true else null end)
+                impersonated: (if $impersonated then true else null end),
+                caller_unresolved: (if $caller_unresolved then true else null end)
               } | with_entries(select(.key == "requested_to" or .value != null))),
               history: [{at: $now, status: "queued", by: $from}]
             } + (if $unknown then {unknown_peer: true} else {} end)')"
@@ -6545,14 +6582,22 @@ _peer_send_and_deliver_remote_checked() {
     done
     [[ -z "$_bind_identity" ]] && _bind_identity="${CCTRL_PEER:-}"
     if [[ -n "$_bind_identity" && "$_bind_identity" != "user" ]]; then
-        local _bind_peer_json _bind_caller
+        local _bind_peer_json _bind_caller="" _bind_unresolved=false
         _bind_peer_json="$(_peer_resolve_json "$_bind_identity" 2>/dev/null || true)"
-        _bind_caller="$(_session_current_name 2>/dev/null)" || true
-        if ! _peer_sender_binding_mismatch "$_bind_identity" "$_bind_peer_json" "$_bind_caller" "$_bind_impersonate"; then
+        if [[ -n "${TMUX:-}" ]]; then
+            _bind_caller="$(_session_current_name 2>/dev/null)" || true
+            [[ -z "$_bind_caller" ]] && _bind_unresolved=true
+        fi
+        if ! _peer_sender_binding_mismatch "$_bind_identity" "$_bind_peer_json" "$_bind_caller" "$_bind_impersonate" "$_bind_unresolved"; then
             PEER_SD_OUTCOME="send-failed"
             PEER_SD_RC=66
-            PEER_SD_SEND_JSON="$(jq -cn --arg name "$_bind_identity" --arg caller "$_bind_caller" \
-                '{ok:false,error:{code:"sender-mismatch",message:("Sender \($name) is not your session (\($caller)); use --impersonate to override.")}}')"
+            if $_bind_unresolved; then
+                PEER_SD_SEND_JSON="$(jq -cn --arg name "$_bind_identity" \
+                    '{ok:false,error:{code:"sender-unresolved",message:("Cannot verify your tmux session to send as \($name); run \"cctrl session current\" to diagnose, or pass --impersonate.")}}')"
+            else
+                PEER_SD_SEND_JSON="$(jq -cn --arg name "$_bind_identity" --arg caller "$_bind_caller" \
+                    '{ok:false,error:{code:"sender-mismatch",message:("Sender \($name) is not your session (\($caller)); use --impersonate to override.")}}')"
+            fi
             return 66
         fi
     fi

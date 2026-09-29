@@ -68,3 +68,9 @@ itself. This is the operating contract; commands take real flags as shown.
 - **Limitation:** derived peer names are tmux session names, so an address can
   dangle once that session closes. Treat a `sender` snapshot as historical and
   verify liveness with `cctrl peer ls` before relying on it.
+
+## Safety
+
+- **Deletes:** keep the `mktemp` dir in its own variable, check it's
+  non-empty and under `$TMPDIR`, then `rm -rf -- "$tmp"` on that exact
+  path. Never `rm` a `dirname`- or glob-derived path.

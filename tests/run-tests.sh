@@ -3993,6 +3993,62 @@ JSON
     echo "ok: peer send binds the sender to the caller's own tmux session unless --impersonate"
 }
 
+test_peer_send_refuses_when_caller_tmux_session_unresolved() {
+    # plan 091: `_peer_cmd_send` used to swallow `_session_current_name`'s
+    # failure (`|| true`) into the SAME empty-string fail-open path used for
+    # the legitimate "not in tmux at all" case -- so a caller whose own
+    # identity couldn't be verified (a stale/inherited session state) could
+    # still `--as` any peer, exactly the misroute shape plan 077 was meant to
+    # close. Reproduces the validator's sandbox scenario: $TMUX is set
+    # (genuinely in a tmux pane) but the process isn't a descendant of any
+    # pane in the session tmux reports as current (no
+    # TMUX_FAKE_PANE_PID=__current__, so the fake pane pid never matches this
+    # test's own pid) -- the same shape `_session_process_in_session` is
+    # meant to catch for a stale/inherited CCTRL_SESSION_NAME.
+    local bin="$TMPDIR/unresolvedbin" data="$TMPDIR/peer-unresolved-data"
+    mkdir -p "$bin" "$data" "$CCTRL_SESSION_METADATA_DIR"
+    make_fake_tmux "$bin/tmux"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--sender-b.json" <<'JSON'
+{"name":"TMUX--sender-b","agent":"claude","created_at":"2026-09-27T10:05:00Z","cctrl_managed":true}
+JSON
+    PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register mailbox-only --dir /tmp/mo --agent codex >/dev/null
+    PATH="$bin:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register mailbox-sender --dir /tmp/ms --agent codex >/dev/null
+
+    local before=0 after=0 out rc=0
+    [[ -f "$data/messages.jsonl" ]] && before="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_SESSION_NAME="TMUX--stale-inherited" TMUX_FAKE_SESSIONS="TMUX--sender-b" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as TMUX--sender-b --json -- "unresolved caller attempt" 2>&1)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected exit 66 when the caller's own tmux session can't be resolved, got $rc"
+    assert_contains "$out" "Cannot verify"
+    [[ -f "$data/messages.jsonl" ]] && after="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    [[ "$before" == "$after" ]] || fail "expected no message written when the caller is unresolved (was $before, now $after)"
+
+    # --impersonate still overrides it, on purpose, and the anomaly is audited.
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_SESSION_NAME="TMUX--stale-inherited" TMUX_FAKE_SESSIONS="TMUX--sender-b" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as TMUX--sender-b --impersonate --json -- "on purpose")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected --impersonate to override the unresolved-caller refusal"
+    printf '%s\n' "$out" | jq -e '.audit.caller_unresolved == true' >/dev/null || fail "expected caller_unresolved audit field to record the anomaly even when overridden"
+    printf '%s\n' "$out" | jq -e '(.audit | has("caller_tmux_session")) | not' >/dev/null || fail "expected no caller_tmux_session audit field when it couldn't be resolved"
+
+    # Genuinely not in tmux at all (no $TMUX) is completely unaffected --
+    # still the pre-091 fail-open behavior, per plan 091's "not in scope".
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX_FAKE_SESSIONS="TMUX--sender-b" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as TMUX--sender-b --json -- "not in tmux at all")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected a send with no \$TMUX at all to still fail open, got $rc"
+    printf '%s\n' "$out" | jq -e '(.audit | has("caller_unresolved")) | not' >/dev/null || fail "expected no caller_unresolved audit field for the legitimate not-in-tmux case"
+
+    # An unresolved caller sending AS a peer with no tmux binding at all
+    # (mailbox-only, no --session at registration) has nothing to
+    # impersonate, so it must stay exempt exactly like a resolved caller
+    # sending as one already is (2026-09-29 eng review: an earlier version of
+    # this fix refused this case too, which was stricter than the known-
+    # caller case and outside plan 091's scope).
+    rc=0
+    out="$(PATH="$bin:$PATH" TMUX="fake,1,0" TMUX_FAKE_SESSION_NAME="TMUX--stale-inherited" TMUX_FAKE_SESSIONS="TMUX--sender-b" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send mailbox-only --as mailbox-sender --json -- "unresolved caller, mailbox-only sender" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "expected an unresolved caller sending as a peer with no tmux binding to still succeed, got $rc: $out"
+
+    echo "ok: peer send refuses rather than silently fail-opening when the caller's own tmux session can't be resolved"
+}
+
 test_peer_send_recipient_created_at_is_audit_only() {
     # plan 077 (2026-09-28 eng review): an earlier version of this change
     # refused sending to any recipient whose derived-peer created_at postdated
@@ -4063,6 +4119,17 @@ JSON
     : > "$log"
     out="$(PATH="$TMPDIR:$PATH" SSH_LOG="$log" TMUX="fake,1,0" TMUX_FAKE_PANE_PID=__current__ TMUX_FAKE_SESSIONS="TMUX--remotebind-a TMUX--remotebind-b" TMUX_FAKE_SESSION_NAME="TMUX--remotebind-a" CCTRL_DATA_DIR="$data" CCTRL_HOSTS_FILE="$hosts" "$ROOT/cctrl" peer send faraway --as TMUX--remotebind-a --deliver --json -- "should ssh" 2>&1)" || true
     assert_contains "$(cat "$log")" "SSH"
+
+    # Plan 091: an unresolved caller (here, no TMUX_FAKE_PANE_PID=__current__,
+    # so pane ancestry can't confirm this process belongs to
+    # TMUX--remotebind-a even though $TMUX/TMUX_FAKE_SESSION_NAME claim it)
+    # is refused before the remote hop too, not just a real mismatch.
+    : > "$log"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" SSH_LOG="$log" TMUX="fake,1,0" TMUX_FAKE_SESSIONS="TMUX--remotebind-a TMUX--remotebind-b" TMUX_FAKE_SESSION_NAME="TMUX--remotebind-a" CCTRL_DATA_DIR="$data" CCTRL_HOSTS_FILE="$hosts" "$ROOT/cctrl" peer send faraway --as TMUX--remotebind-a --deliver --json -- "unresolved, should not ssh" 2>&1)" || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "expected exit 66 for an unresolved caller routed to a remote peer, got $rc"
+    assert_contains "$out" "sender-unresolved"
+    assert_not_contains "$(cat "$log")" "SSH"
 
     echo "ok: peer send's sender-binding check also applies before a cross-machine SSH hop"
 }
@@ -10943,6 +11010,7 @@ test_peer_gc_retention_and_doctor
 test_peer_doorbell_hook
 test_peer_send_deliver_outcomes
 test_peer_send_sender_binding_refuses_mismatch
+test_peer_send_refuses_when_caller_tmux_session_unresolved
 test_peer_send_recipient_created_at_is_audit_only
 test_peer_send_sender_binding_applies_to_remote_recipients
 test_peer_reply_core

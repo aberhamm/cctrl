@@ -1,7 +1,8 @@
 ---
 id: 091
 title: Peer send sender-binding check fails open when the caller's own tmux session can't be resolved
-status: pending
+status: done
+completed: 2026-09-29
 blocked-by: [077]
 priority: 91
 allows-migrations: false
@@ -9,7 +10,9 @@ needs-review: none
 review-required: eng
 created: 2026-09-29
 tui-fixture: n/a
-approved-by: none  # filed by the fleet manager (plan091-fm0928); implement on approval
+approved-by: matthew (C-15, via cctrl-fleet-manager), 2026-09-29
+reviews:
+  - type=eng verdict=approved date=2026-09-29 by=opus-level-subagent
 ---
 
 ## Plain-English Summary
@@ -99,3 +102,52 @@ way to tell them apart after the fact either.
   design question about the *recipient's* identity, not the caller's.
 - Any change to `--impersonate`'s behavior.
 - Any change to the non-tmux (`user`) send path.
+
+## Implementation
+
+Distinguished "no `$TMUX` at all" (unaffected — `caller_unresolved` stays
+false, exactly the old fail-open path) from "`$TMUX` set but
+`_session_current_name` couldn't resolve it" (`caller_unresolved=true`) in
+both `_peer_cmd_send` and its cross-machine twin
+`_peer_send_and_deliver_remote_checked`. `_peer_sender_binding_mismatch`
+takes the new flag and refuses (rc 66, new `sender-unresolved` error code)
+when the caller is unresolved AND the `--as`/`--from` identity actually has
+a real `tmux_target`/`session` to bind against — chose refuse over
+warn-and-audit (the plan's other offered option) because an unresolved
+caller is the same shape of gap 077 was built to close, not a softer case.
+`--impersonate` and `from=user` remain fully exempt; `audit.caller_unresolved`
+records the anomaly on any message that does get written (i.e. only via
+`--impersonate`, since the plain refused case writes nothing).
+
+## Eng review
+
+Opus-level subagent review, 2026-09-29: verdict "changes requested". One
+REQUIRED finding, fixed: the unresolved-caller refusal in
+`_peer_sender_binding_mismatch` fired before checking whether the `from`
+peer even had a `bind_target` — so an unresolved caller sending `--as` a
+mailbox-only peer (no tmux identity at all, nothing to impersonate) was
+wrongly refused, stricter than the already-allowed case of a *resolved*
+caller doing the same send. Fixed: the unresolved check now runs only after
+confirming `bind_target` is non-empty. Added a test pinning this exact case
+(`test_peer_send_refuses_when_caller_tmux_session_unresolved`'s final
+block, using a second registered peer with no `--session`).
+
+Two OPTIONAL findings folded in anyway: reworded the "sender-unresolved"
+error message to name the sender and point at `cctrl session current`
+instead of guessing "stale/inherited" as the cause (tmux being briefly
+unreachable produces the identical symptom); added a matching unresolved-
+caller sub-case to `test_peer_send_sender_binding_applies_to_remote_recipients`
+covering the cross-machine path (was previously only covered by an ad-hoc,
+uncommitted repro during review).
+
+Not addressed (explicitly optional, left for a future pass if anyone hits
+it): a second test variant that reproduces the *explicit*
+`CCTRL_SESSION_KIND=tmux` + stale `CCTRL_SESSION_NAME` branch of
+`_session_current_name` (the current test only exercises the generic
+pane-ancestry branch — both branches return the same `caller_unresolved`
+signal, so this is redundant coverage, not a gap in behavior). The
+reviewer's suggestion to empirically verify from inside a live Codex-hosted
+fleet session before landing was not run — no live session was touched, per
+the standing hard rule against interacting with other sessions; flagging
+here as a good manual sanity check for whoever next has reason to touch
+this path.
