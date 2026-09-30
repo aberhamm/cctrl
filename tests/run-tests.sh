@@ -4,6 +4,15 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
 CCTRL_TEST_REAL_HOME="${HOME:?HOME must be set}"
+# tmux's socket dir is fixed at /tmp/tmux-<uid> (not $TMPDIR, this suite's own
+# scratch root) unless TMUX_TMPDIR overrides it. Private-socket tests
+# (test_session_terminate_records_closed, test_session_close_reaps_pane_processes,
+# test_session_stop_exact_identity) clean up into this dir; the guard test
+# below (plan 095) checks nothing cctrl-*-$$-* is left there afterward. The
+# guard matches on this run's own pid ($$, unaffected by subshells) rather
+# than diffing a startup snapshot, so a concurrent suite run or worktree
+# doing the same thing at the same time is never blamed on this run.
+CCTRL_TEST_TMUX_SOCKET_DIR="${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)"
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-ownership-matrix" ]]; then
     mkdir -p "$TMPDIR/home"
     export HOME="$TMPDIR/home"
@@ -59,6 +68,33 @@ export CCTRL_CONFIG_LOCAL="$TMPDIR/no-local-config.json"
 fail() {
     echo "FAIL: $*" >&2
     exit 1
+}
+
+# `tmux kill-server` does not reliably unlink its own socket file (confirmed
+# on the macOS tmux this suite runs against: the file survives kill-server
+# and only a matching pid's exit races it) -- private-socket test cleanup
+# traps must rm -f the path themselves. Plan 095.
+_test_tmux_socket_rm() { # socket-name
+    rm -f -- "$CCTRL_TEST_TMUX_SOCKET_DIR/$1" 2>/dev/null || true
+}
+
+test_tmux_sockets_left_behind() {
+    # Backstop for the cleanup traps above: fails if any socket this run
+    # created (name contains this script's own $$, unaffected by subshells)
+    # still exists in the tmux socket dir. Matching on our own pid rather
+    # than diffing a startup snapshot means a concurrent suite run or
+    # worktree doing the same private-socket tests at the same time is never
+    # blamed on this run. Must run after every test that opens a private
+    # cctrl-* socket (session-stop-exact group and the main run).
+    local leftover=() f
+    shopt -s nullglob
+    for f in "$CCTRL_TEST_TMUX_SOCKET_DIR"/cctrl-*-"$$"-*; do
+        leftover+=("$(basename "$f")")
+    done
+    shopt -u nullglob
+    [[ "${#leftover[@]}" -eq 0 ]] \
+        || fail "test suite left tmux sockets behind in $CCTRL_TEST_TMUX_SOCKET_DIR: ${leftover[*]}"
+    echo "ok: no leftover cctrl-* tmux sockets"
 }
 
 # "Tests did not touch the real live store" guards (plan 090). Each guarded
@@ -5355,7 +5391,7 @@ test_session_terminate_records_closed() (
     printf '#!/usr/bin/env bash\n[[ "${1:-}" == kill-session && -n "${CCTRL_TEST_FAIL_KILL:-}" ]] && exit 1\nexec %q -L %q "$@"\n' "$real_tmux" "$socket" > "$bin/tmux"
     chmod +x "$bin/tmux"
     # shellcheck disable=SC2329 # invoked by the EXIT trap
-    cleanup_terminate() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; }
+    cleanup_terminate() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; _test_tmux_socket_rm "$socket"; }
     trap cleanup_terminate EXIT
     export CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id"
 
@@ -5479,6 +5515,7 @@ test_session_close_reaps_pane_processes() (
     # shellcheck disable=SC2329 # invoked by the EXIT trap
     cleanup_reap() {
         "$real_tmux" -L "$socket" kill-server 2>/dev/null || true
+        _test_tmux_socket_rm "$socket"
         pkill -KILL -f "$root" 2>/dev/null || true
     }
     trap cleanup_reap EXIT
@@ -5682,7 +5719,7 @@ SH
     chmod +x "$bin/tmux"
     export CCTRL_TEST_REAL_TMUX="$real_tmux" CCTRL_TEST_TMUX_SOCKET="$socket"
     # shellcheck disable=SC2329 # invoked by the EXIT trap
-    cleanup_exact_stop() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; }
+    cleanup_exact_stop() { "$real_tmux" -L "$socket" kill-server 2>/dev/null || true; _test_tmux_socket_rm "$socket"; }
     trap cleanup_exact_stop EXIT
 
     "$real_tmux" -L "$socket" new-session -d -s reused 'sleep 120'
@@ -11036,6 +11073,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_session_stop_exact_identity
             test_session_terminate_records_closed
             test_session_close_reaps_pane_processes
+            test_tmux_sockets_left_behind
             test_session_mark_closed_provisional_launch_record
             test_session_task_records_for_name_launch_liveness_gate
             test_task_record_close_provisional_honors_digest_guard
@@ -11282,6 +11320,7 @@ test_session_current_identity_json
 test_session_stop_exact_identity
 test_session_terminate_records_closed
 test_session_close_reaps_pane_processes
+test_tmux_sockets_left_behind
 test_session_attest_live_tmux_process_matches
 test_session_attest_direct_metadata
 test_session_attest_stale_tmux_session_missing
