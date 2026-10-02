@@ -13035,7 +13035,7 @@ SH
     # shellcheck disable=SC2016
     out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval \
-        'PROFILES_DIR="$1"; shift; _launch_app_owned_codex "$@"' "$profiles" --app-owned "$root" --profile app \
+        'CCTRL_PROFILES_DIR="$1"; shift; _launch_app_owned_codex "$@"' "$profiles" --app-owned "$root" --profile app \
         --model cli-model --reasoning-effort high --sandbox read-only --json)" || fail "profile-normalized app launch failed"
     jq -e '.task_creation_outcome=="created" and .registry_persisted==true' <<< "$out" >/dev/null || fail "profile launch result is wrong"
     jq -s -e '[.[]|select(.method=="thread/start")][-1].params |
