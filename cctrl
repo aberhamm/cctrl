@@ -16,7 +16,21 @@ set -euo pipefail
 
 # Resolve real path (works through symlinks)
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0")")" && pwd)"
-PROFILES_DIR="$SCRIPT_DIR/profiles"
+
+# XDG Base Directory Specification: https://specifications.freedesktop.org/basedir-spec/latest/
+# Per spec, a relative XDG_CONFIG_HOME is invalid and must be ignored (fall
+# back to the default), so only an absolute value is honored here.
+_config_home() {
+    local xdg="${XDG_CONFIG_HOME:-}"
+    if [[ -n "$xdg" && "$xdg" == /* ]]; then
+        printf '%s/cctrl' "$xdg"
+    else
+        printf '%s/.config/cctrl' "$HOME"
+    fi
+}
+
+PROFILES_REPO_DIR="$SCRIPT_DIR/profiles"
+PROFILES_USER_DIR="$(_config_home)/profiles"
 PLUGINS_DIR="$SCRIPT_DIR/plugins"
 COSTS_DIR="$SCRIPT_DIR/costs"
 SPENDING_LOG="$COSTS_DIR/spending.jsonl"
@@ -25,7 +39,7 @@ HOSTS_FILE="${CCTRL_HOSTS_FILE:-$SCRIPT_DIR/data/hosts.json}"
 CONFIG_FILE="$SCRIPT_DIR/data/config.json"
 CONFIG_USER_FILE="${CCTRL_USER_CONFIG:-}"
 if [[ -z "$CONFIG_USER_FILE" && -n "${HOME:-}" ]]; then
-    CONFIG_USER_FILE="$HOME/.config/cctrl/config.json"
+    CONFIG_USER_FILE="$(_config_home)/config.json"
 fi
 CONFIG_LOCAL_FILE="${CCTRL_CONFIG_LOCAL:-$SCRIPT_DIR/data/config.local.json}"
 _peer_refresh_paths() {
@@ -100,12 +114,86 @@ _active_profile() {
     fi
 }
 
-_profile_path() {
-    echo "$PROFILES_DIR/${1}.json"
+# Name grammar guards path traversal: a name is always a bare filename
+# component under PROFILES_USER_DIR/PROFILES_REPO_DIR, never a path. "none"
+# is reserved as the resolver's explicit "no overlay" sentinel (save/rename
+# refuse it).
+_profile_name_valid() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]]
+}
+
+# Read lookup: CCTRL_PROFILES_DIR, if set, is the SOLE dir searched (tests
+# want determinism, no repo/XDG fallback). Otherwise XDG first, then the
+# repo dir as a legacy fallback. Empty output means missing.
+_profile_find() {
+    local name="$1"
+    _profile_name_valid "$name" || return 0
+    if [[ -n "${CCTRL_PROFILES_DIR:-}" ]]; then
+        local only="$CCTRL_PROFILES_DIR/${name}.json"
+        [[ -f "$only" ]] && printf '%s' "$only"
+        return 0
+    fi
+    local userf="$PROFILES_USER_DIR/${name}.json" repof="$PROFILES_REPO_DIR/${name}.json"
+    if [[ -f "$userf" ]]; then
+        printf '%s' "$userf"
+    elif [[ -f "$repof" ]]; then
+        printf '%s' "$repof"
+    fi
+}
+
+# Write target: always XDG (D9). Creates the dir 0700 if missing. Callers
+# still run _profile_secure_perms on the file after writing it.
+_profile_write_path() {
+    local name="$1"
+    if ! _profile_name_valid "$name" || [[ "$name" == "none" ]]; then
+        echo -e "${RED}Invalid profile name: '$name'${RESET}" >&2
+        return 1
+    fi
+    if [[ -n "${CCTRL_PROFILES_DIR:-}" ]]; then
+        printf '%s/%s.json' "$CCTRL_PROFILES_DIR" "$name"
+        return 0
+    fi
+    if [[ ! -d "$PROFILES_USER_DIR" ]]; then
+        ( umask 077 && mkdir -p "$PROFILES_USER_DIR" )
+    fi
+    chmod 700 "$PROFILES_USER_DIR" 2>/dev/null || true
+    printf '%s/%s.json' "$PROFILES_USER_DIR" "$name"
 }
 
 _profile_exists() {
-    [[ -f "$(_profile_path "$1")" ]]
+    [[ -n "$(_profile_find "$1")" ]]
+}
+
+# Union of both profile dirs, XDG first (shadows a same-named repo profile).
+# Prints one name per line, each name exactly once; a name present in both
+# gets " shadowed" appended so callers can warn without a second pass.
+_profile_list() {
+    if [[ -n "${CCTRL_PROFILES_DIR:-}" ]]; then
+        local f base
+        for f in "$CCTRL_PROFILES_DIR"/*.json; do
+            [[ -f "$f" ]] || continue
+            base="$(basename "$f" .json)"
+            printf '%s\n' "$base"
+        done
+        return 0
+    fi
+    local f base
+    for f in "$PROFILES_USER_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        base="$(basename "$f" .json)"
+        if [[ -f "$PROFILES_REPO_DIR/$base.json" ]]; then
+            printf '%s shadowed\n' "$base"
+        else
+            printf '%s\n' "$base"
+        fi
+    done
+    for f in "$PROFILES_REPO_DIR"/*.json; do
+        [[ -f "$f" ]] || continue
+        base="$(basename "$f" .json)"
+        # Already yielded above (plain or "shadowed") if an XDG copy exists.
+        [[ -f "$PROFILES_USER_DIR/$base.json" ]] && continue
+        printf '%s\n' "$base"
+    done
 }
 
 # Profiles hold credentials (PORTKEY_API_KEY, ANTHROPIC_CUSTOM_HEADERS, …), so
@@ -338,7 +426,7 @@ _profile_agent_preference() {
     _profile_exists "$profile" || return 1
     command -v jq >/dev/null 2>&1 || return 1
 
-    pf="$(_profile_path "$profile")"
+    pf="$(_profile_find "$profile")"
     value="$(jq -r '
         if has("defaultAgent") then
             if .defaultAgent == null then "__cctrl_prompt__" else (.defaultAgent | tostring) end
@@ -962,7 +1050,7 @@ cmd_use() {
     # Note: env is merged, so switching profiles cannot UNSET a key a prior
     # profile added. For clean per-session auth, prefer `cctrl start --profile`.
     local pf tmp
-    pf="$(_profile_path "$name")"
+    pf="$(_profile_find "$name")"
     tmp="$(mktemp)"
     if [[ -f "$SETTINGS" ]]; then
         jq -s '.[0] as $g | .[1] as $p
@@ -992,15 +1080,20 @@ cmd_ls() {
     local active
     active="$(_detect_active)"
 
-    if [[ ! -d "$PROFILES_DIR" ]] || [[ -z "$(ls "$PROFILES_DIR"/*.json 2>/dev/null)" ]]; then
+    local entries
+    entries="$(_profile_list)"
+    if [[ -z "$entries" ]]; then
         echo -e "${DIM}No profiles found. Use 'cctrl save <name>' to create one.${RESET}"
         return
     fi
 
-    for f in "$PROFILES_DIR"/*.json; do
-        local name
-        name="$(basename "$f" .json)"
-        local summary
+    local line name flag f summary
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        name="${line%% shadowed}"
+        flag=""
+        [[ "$line" == *" shadowed" ]] && flag=" shadowed"
+        f="$(_profile_find "$name")"
         summary="$(_profile_summary "$f")"
 
         if [[ "$name" == "$active" ]]; then
@@ -1008,7 +1101,10 @@ cmd_ls() {
         else
             echo -e "    $name  ${DIM}$summary${RESET}"
         fi
-    done
+        if [[ -n "$flag" ]]; then
+            echo -e "    ${YELLOW}WARN: $name exists in both; using $(_display_path "$PROFILES_USER_DIR")/$name.json${RESET}"
+        fi
+    done <<< "$entries"
 }
 
 cmd_current() {
@@ -1018,9 +1114,13 @@ cmd_current() {
 
     if _profile_exists "$active"; then
         local pf summary
-        pf="$(_profile_path "$active")"
+        pf="$(_profile_find "$active")"
         summary="$(_profile_summary "$pf")"
         echo -e "${DIM}$summary${RESET}"
+
+        if [[ -z "${CCTRL_PROFILES_DIR:-}" && -f "$PROFILES_USER_DIR/$active.json" && -f "$PROFILES_REPO_DIR/$active.json" ]]; then
+            echo -e "${YELLOW}WARN: $active exists in both; using $(_display_path "$PROFILES_USER_DIR")/$active.json${RESET}"
+        fi
 
         if [[ -f "$SETTINGS" ]]; then
             local sub='{model: (.model // null), env: (.env // {})}'
@@ -1051,8 +1151,10 @@ cmd_save() {
 
     # Capture only the overlay-relevant Claude keys, not the whole
     # settings.json — profiles are auth/model overlays, not full snapshots.
-    jq '{agents: {claude: {model: (.model // null), env: (.env // {})}}}' "$SETTINGS" > "$(_profile_path "$name")"
-    _profile_secure_perms "$(_profile_path "$name")"
+    local write_pf
+    write_pf="$(_profile_write_path "$name")" || return 1
+    jq '{agents: {claude: {model: (.model // null), env: (.env // {})}}}' "$SETTINGS" > "$write_pf"
+    _profile_secure_perms "$write_pf"
     echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved current Claude model + env as profile: ${BOLD}$name${RESET}"
 }
@@ -1073,9 +1175,9 @@ cmd_diff() {
     # carries hooks/permissions/mcpServers a profile intentionally does not.
     local sub='{model: (.model // null), env: (.env // {})}'
     if command -v delta &>/dev/null; then
-        delta <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_path "$name")" | jq -S "$sub" 2>/dev/null) || true
+        delta <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_find "$name")" | jq -S "$sub" 2>/dev/null) || true
     else
-        diff --color=auto <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_path "$name")" | jq -S "$sub" 2>/dev/null) || true
+        diff --color=auto <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_find "$name")" | jq -S "$sub" 2>/dev/null) || true
     fi
 }
 
@@ -1091,8 +1193,167 @@ cmd_edit() {
         return 1
     fi
 
-    "${EDITOR:-vim}" "$(_profile_path "$name")"
-    _profile_secure_perms "$(_profile_path "$name")"
+    # Edits always land on the XDG copy. A repo-only profile is copied there
+    # first (0600) so editing it never writes into the tracked repo tree; the
+    # repo original is now shadowed (`ls`/`current` report it).
+    local existing edit_pf
+    existing="$(_profile_find "$name")"
+    edit_pf="$(_profile_write_path "$name")" || return 1
+    if [[ "$existing" != "$edit_pf" ]]; then
+        cp "$existing" "$edit_pf"
+        _profile_secure_perms "$edit_pf"
+        echo -e "${DIM}Copied repo profile '$name' to $(_display_path "$edit_pf") for editing.${RESET}"
+    fi
+    "${EDITOR:-vim}" "$edit_pf"
+    _profile_secure_perms "$edit_pf"
+}
+
+# Atomic jq write of defaultProfile into the user config file. Writes through
+# realpath so a dotfiles symlink at CONFIG_USER_FILE survives (a temp file +
+# mv lands on the link's target, never replacing the link itself). The ONLY
+# writer of this field — shared by `cctrl profile migrate` and (phase 3)
+# `cctrl use`.
+_config_user_set_default_profile() {
+    local name="$1" target dir tmp
+    target="$CONFIG_USER_FILE"
+    if [[ -L "$target" ]]; then
+        target="$(realpath "$target" 2>/dev/null || readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
+    fi
+    dir="$(dirname "$target")"
+    ( umask 077 && mkdir -p "$dir" )
+    tmp="$(mktemp "$dir/.cctrl-config.XXXXXX")"
+    if [[ -f "$target" ]]; then
+        jq --arg p "$name" '.defaultProfile = $p' "$target" > "$tmp"
+    else
+        jq -n --arg p "$name" '{defaultProfile: $p}' > "$tmp"
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$target"
+}
+
+# Legacy data/.active-profile -> defaultProfile in the user config, exactly
+# once. The ONLY implementation; called by both `cctrl profile migrate` and
+# (phase 3) the first `cctrl use`. A defaultProfile already present wins (the
+# legacy file still gets removed — "run cctrl use NAME to migrate" has
+# nothing left to offer once that key exists). Idempotent either way.
+_legacy_active_profile_migrate() {
+    [[ -f "$ACTIVE_FILE" ]] || return 0
+    local legacy current
+    legacy="$(cat "$ACTIVE_FILE" 2>/dev/null || true)"
+    if [[ -n "$legacy" ]] && _profile_name_valid "$legacy" && command -v jq >/dev/null 2>&1; then
+        current="$(jq -r '.defaultProfile // empty' "$CONFIG_USER_FILE" 2>/dev/null || true)"
+        if [[ -z "$current" ]]; then
+            _config_user_set_default_profile "$legacy"
+            echo -e "${DIM}Migrated legacy active profile '$legacy' to defaultProfile in $(_display_path "$CONFIG_USER_FILE").${RESET}" >&2
+        fi
+    fi
+    rm -f "$ACTIVE_FILE"
+}
+
+cmd_profile_migrate() {
+    local dry_run=false remove_old=false yes=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) dry_run=true ;;
+            --remove-old) remove_old=true ;;
+            --yes) yes=true ;;
+            -h|--help)
+                echo "Usage: cctrl profile migrate [--dry-run] [--remove-old] [--yes]"
+                return 0
+                ;;
+            *) echo -e "${RED}Unknown option: $1${RESET}" >&2; return 1 ;;
+        esac
+        shift
+    done
+
+    local any_fail=false f name dst tmp
+    if [[ -d "$PROFILES_REPO_DIR" ]]; then
+        for f in "$PROFILES_REPO_DIR"/*.json; do
+            [[ -f "$f" ]] || continue
+            name="$(basename "$f" .json)"
+            if ! _profile_name_valid "$name" || [[ "$name" == "none" ]]; then
+                echo -e "${YELLOW}skipped (invalid name): $name${RESET}" >&2
+                continue
+            fi
+            dst="$PROFILES_USER_DIR/$name.json"
+            if [[ -f "$dst" ]]; then
+                if cmp -s "$f" "$dst"; then
+                    echo "exists identical: $name"
+                else
+                    echo "exists differs: $name"
+                fi
+                continue
+            fi
+            if [[ "$dry_run" == true ]]; then
+                echo "would copy: $name"
+                continue
+            fi
+            ( umask 077 && mkdir -p "$PROFILES_USER_DIR" )
+            chmod 700 "$PROFILES_USER_DIR" 2>/dev/null || true
+            tmp="$(mktemp "$PROFILES_USER_DIR/.${name}.XXXXXX")"
+            cp "$f" "$tmp"
+            chmod 600 "$tmp"
+            mv "$tmp" "$dst"
+            if cmp -s "$f" "$dst"; then
+                echo "copied: $name"
+            else
+                echo -e "${RED}verify failed: $name${RESET}" >&2
+                any_fail=true
+            fi
+        done
+    fi
+
+    if [[ "$remove_old" == true && "$dry_run" != true ]]; then
+        echo -e "${YELLOW}Warning: repo profiles/ is livesynced across machines; removing originals here removes them everywhere. Run 'cctrl profile migrate' on every machine before --remove-old on any of them.${RESET}" >&2
+        if [[ "$yes" != true ]]; then
+            if [[ -t 0 ]]; then
+                echo -en "${YELLOW}Remove identical repo originals now? [y/N] ${RESET}"
+                local confirm
+                read -r confirm
+                [[ "$confirm" =~ ^[yY]$ ]] || return 1
+            else
+                echo -e "${RED}--remove-old needs --yes when not run interactively.${RESET}" >&2
+                return 1
+            fi
+        fi
+        for f in "$PROFILES_REPO_DIR"/*.json; do
+            [[ -f "$f" ]] || continue
+            name="$(basename "$f" .json)"
+            dst="$PROFILES_USER_DIR/$name.json"
+            if [[ -f "$dst" ]] && cmp -s "$f" "$dst"; then
+                rm -f "$f"
+                echo "removed repo original: $name"
+            fi
+        done
+    fi
+
+    [[ "$dry_run" == true ]] || _legacy_active_profile_migrate
+
+    [[ "$any_fail" == true ]] && return 1
+    return 0
+}
+
+cmd_profile() {
+    local sub="${1:-}"
+    shift 2>/dev/null || true
+    case "$sub" in
+        migrate) cmd_profile_migrate "$@" ;;
+        ls|list) cmd_ls "$@" ;;
+        use|switch) cmd_use "$@" ;;
+        current) cmd_current "$@" ;;
+        diff) cmd_diff "$@" ;;
+        save) cmd_save "$@" ;;
+        edit) cmd_edit "$@" ;;
+        ""|-h|--help)
+            echo "Usage: cctrl profile <migrate|ls|use|current|diff|save|edit> [args]"
+            [[ "$sub" == "-h" || "$sub" == "--help" ]] && return 0
+            return 1
+            ;;
+        *)
+            echo -e "${RED}Unknown profile subcommand: $sub${RESET}" >&2
+            return 1
+            ;;
+    esac
 }
 
 cmd_costs() {
@@ -1165,8 +1426,8 @@ cmd_rename() {
             echo -e "${RED}Profile '$new' already exists.${RESET}"
             return 1
         fi
-        mv "$(_profile_path "$old")" "$(_profile_path "$new")"
-        _profile_secure_perms "$(_profile_path "$new")"
+        mv "$(_profile_find "$old")" "$(_profile_write_path "$new")"
+        _profile_secure_perms "$(_profile_write_path "$new")"
         # Update active profile tracking if needed
         if [[ "$(_active_profile)" == "$old" ]]; then
             echo "$new" > "$ACTIVE_FILE"
@@ -1385,7 +1646,7 @@ _launch_app_owned_codex() {
         return 64
     fi
     if [[ -n "$profile" ]] && _profile_exists "$profile"; then
-        pf="$(_profile_path "$profile")"
+        pf="$(_profile_find "$profile")"
         profile_model="$(_profile_model_for_agent codex "$pf")"
         profile_effort="$(jq -r '.agents.codex.reasoningEffort // .agents.codex.reasoning_effort // empty' "$pf" 2>/dev/null)"
         local -a pargs=()
@@ -1617,7 +1878,7 @@ cmd_start() {
     local pf=""
     if [[ -n "$profile" ]]; then
         if _profile_exists "$profile"; then
-            pf="$(_profile_path "$profile")"
+            pf="$(_profile_find "$profile")"
         else
             echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
         fi
@@ -3477,7 +3738,7 @@ _launch_detached() {
         [[ -n "$effective_profile" ]] || effective_profile="$(_active_profile)"
         if [[ -n "$effective_profile" ]] && _profile_exists "$effective_profile"; then
             profile_agent="$(_normalize_agent "$detach_agent")" || return 1
-            pf="$(_profile_path "$effective_profile")"
+            pf="$(_profile_find "$effective_profile")"
             _apply_profile_overlay "$profile_agent" "$pf"
             _peer_refresh_paths
             _session_refresh_paths
@@ -16334,7 +16595,7 @@ _shortcut_jump() {
     local pf=""
     if [[ -n "$profile" ]]; then
         if _profile_exists "$profile"; then
-            pf="$(_profile_path "$profile")"
+            pf="$(_profile_find "$profile")"
         else
             echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
         fi
@@ -16506,6 +16767,7 @@ _dispatch() {
         rename)  cmd_rename "$@" ;;
         diff)    cmd_diff "$@" ;;
         edit)    cmd_edit "$@" ;;
+        profile|profiles) cmd_profile "$@" ;;
         start|s) cmd_start "$@" ;;
         launch-to-app)
             source "$SCRIPT_DIR/lib/codex-launch-to-app.sh"

@@ -7,6 +7,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] - 2026-10-02
 
 ### Added
+- `cctrl profile migrate [--dry-run] [--remove-old]` copies repo-tracked
+  `profiles/*.json` into the new XDG profiles dir (`~/.config/cctrl/profiles/`,
+  override with `XDG_CONFIG_HOME`), byte-verified and 0600, and migrates a
+  legacy `data/.active-profile` into `defaultProfile` in
+  `~/.config/cctrl/config.json`. It never overwrites a differing XDG copy;
+  `--remove-old` deletes only byte-identical repo originals and needs `--yes`
+  off a tty, since the repo `profiles/` dir may be livesynced across
+  machines — migrate on every machine before removing originals on any one
+  of them. `cctrl profile <ls|use|current|diff|save|edit|migrate>` now also
+  works as an alias namespace alongside the existing top-level verbs. (plan
+  071 phase 1)
+
+### Changed
+- Profiles and the user config move to XDG: `~/.config/cctrl/profiles/*.json`
+  and `~/.config/cctrl/config.json` (both overridable — `CCTRL_USER_CONFIG`,
+  `CCTRL_PROFILES_DIR`, or `XDG_CONFIG_HOME`). The repo's `profiles/` dir is
+  now a legacy read fallback only: a same-named profile in the XDG dir always
+  wins, and `cctrl ls`/`cctrl current` warn when a name exists in both.
+  `cctrl save` and `cctrl edit` (copy-on-write for a repo-only profile) write
+  only to the XDG dir, at 0600 in a 0700 directory. (plan 071 phase 1)
+
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including
   guarded launch-ID recovery), attest it, and delegate the single-writer

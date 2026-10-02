@@ -39,6 +39,8 @@ See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
 
 ## Safety
 
+- Profiles and user config live in `~/.config/cctrl/` (XDG). Never write
+  secrets into the repo's `profiles/` or `data/`.
 - **Deletes:** keep the `mktemp` dir in its own variable, check it's
   non-empty and under `$TMPDIR`, then `rm -rf -- "$tmp"` on that exact
   path. Never `rm` a `dirname`- or glob-derived path.

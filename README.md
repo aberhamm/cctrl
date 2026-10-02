@@ -59,10 +59,20 @@ ln -sf "$(pwd)/cctrl" ~/.local/bin/cctrl
 
 ## Profiles
 
-Each profile is a **model + env overlay** stored in `profiles/` (e.g. one routed
-through an API gateway, one on your subscription). Shared Claude settings —
-hooks, permissions, MCP servers, statusline — live once in `~/.claude/settings.json`;
+Each profile is a **model + env overlay** (e.g. one routed through an API
+gateway, one on your subscription). Shared Claude settings — hooks,
+permissions, MCP servers, statusline — live once in `~/.claude/settings.json`;
 profiles only carry what differs.
+
+Profiles and your default-profile choice live at `~/.config/cctrl/profiles/`
+and `~/.config/cctrl/config.json` (XDG Base Directory spec — override the
+root with `XDG_CONFIG_HOME`). This directory is machine-local, not synced
+between machines. The repo's `profiles/` dir is a legacy fallback: a name
+found in `~/.config/cctrl/profiles/` always wins over a same-named repo
+profile. Run `cctrl profile migrate` once per machine to copy repo profiles
+into `~/.config/cctrl/profiles/` (`--dry-run` to preview, `--remove-old` to
+delete the repo originals afterward — do this on every machine before
+`--remove-old` on any one of them, since the repo dir may be livesynced).
 
 The concurrency-safe way to use a profile is to pick it at launch:
 

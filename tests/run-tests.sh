@@ -58,6 +58,13 @@ chmod +x "$TMPDIR/hostname"
 unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
 unset CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
+# Sandbox XDG_CONFIG_HOME globally so a test's default profile/config lookup
+# (no CCTRL_PROFILES_DIR override) never falls through to the real
+# ~/.config/cctrl, which could hold real secrets and would shadow fixture
+# profile names (work, personal, home, team). CCTRL_PROFILES_DIR is unset so
+# individual fallback/clash tests control it explicitly.
+unset CCTRL_PROFILES_DIR
+export XDG_CONFIG_HOME="$TMPDIR/xdg"
 # Skip post-spawn health check by default in tests — it would sleep through
 # poll loops with the fake tmux. Individual health check tests override this.
 export CCTRL_NO_HEALTH_CHECK=1
@@ -1266,6 +1273,169 @@ test_profile_use_current_diff() {
     [[ "$(cat "$rootcopy/.active-profile")" == "work" ]] || fail "a failed 'use' changed the active profile"
 
     echo "ok: profile use/current/diff resolve, merge additively, and reject unknown names"
+}
+
+test_profile_xdg_config_home() {
+    # plan 071 phase 1: profiles and user config move to XDG. A custom
+    # XDG_CONFIG_HOME relocates both; a relative one is invalid per spec and
+    # falls back to $HOME/.config.
+    local rootcopy="$TMPDIR/cctrl-xdg-copy"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$rootcopy/xdg-home" "$rootcopy/home"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"model":"x","env":{}}\n' > "$rootcopy/profiles/myprof.json"
+
+    HOME="$rootcopy/home" XDG_CONFIG_HOME="$rootcopy/xdg-home" "$rootcopy/cctrl" profile migrate >/dev/null
+    [[ -f "$rootcopy/xdg-home/cctrl/profiles/myprof.json" ]] || fail "XDG_CONFIG_HOME was not honoured for the cctrl profiles dir"
+
+    # Relative XDG_CONFIG_HOME is ignored -> falls back to $HOME/.config.
+    rm -rf "$rootcopy/xdg-home"
+    HOME="$rootcopy/home2" XDG_CONFIG_HOME="relative/path" "$rootcopy/cctrl" profile migrate >/dev/null 2>&1 || true
+    [[ -f "$rootcopy/home2/.config/cctrl/profiles/myprof.json" ]] || fail "a relative XDG_CONFIG_HOME should fall back to \$HOME/.config"
+
+    echo "ok: XDG_CONFIG_HOME honoured, relative value falls back to \$HOME/.config"
+}
+
+test_profile_repo_fallback_and_clash() {
+    # A profile only in the repo dir still resolves (legacy fallback); one
+    # present in both resolves to the XDG copy and ls/current warn about it.
+    local rootcopy="$TMPDIR/cctrl-clash-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl/profiles" "$fakehome/.claude"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"repo-only","env":{}}\n' > "$rootcopy/profiles/reponly.json"
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" ls)"
+    assert_contains "$out" "reponly"
+
+    printf '{"model":"repo-version","env":{}}\n' > "$rootcopy/profiles/dupe.json"
+    printf '{"model":"xdg-version","env":{}}\n' > "$fakehome/.config/cctrl/profiles/dupe.json"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" ls)"
+    assert_contains "$out" "xdg-version"
+    assert_contains "$out" "WARN"
+    if echo "$out" | grep -q "repo-version"; then
+        fail "ls should show the XDG copy's summary, not the shadowed repo one"
+    fi
+    [[ "$(echo "$out" | grep -c '^\s*\*\? *dupe ')" == "1" ]] \
+        || fail "a name in both dirs should produce exactly one row in ls, not a duplicate"
+
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "none"   # nothing set as default yet; current must not crash either way
+
+    echo "ok: repo-only profile resolves; a name in both dirs resolves to XDG, warns once, no duplicate row"
+}
+
+test_profile_find_sole_dir_override() {
+    # CCTRL_PROFILES_DIR, when set, is the ONLY dir searched -- no XDG or
+    # repo fallback, even when the name exists in both of those.
+    local rootcopy="$TMPDIR/cctrl-sole-copy"
+    local fakehome="$rootcopy/home"
+    local sole="$TMPDIR/cctrl-sole-profiles"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl/profiles" "$sole"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"sole","env":{}}\n' > "$sole/onlyhere.json"
+    # "elsewhere" exists in BOTH the repo and XDG fallback dirs, but NOT in
+    # the sole override dir -- proves the override excludes them, not just
+    # that a genuinely absent name reports missing.
+    printf '{"model":"repo","env":{}}\n' > "$rootcopy/profiles/elsewhere.json"
+    printf '{"model":"xdg","env":{}}\n' > "$fakehome/.config/cctrl/profiles/elsewhere.json"
+
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_PROFILES_DIR="$sole" \
+        CCTRL_NO_MAIN=1 bash -c 'source "$0"; _profile_exists onlyhere && echo FOUND; _profile_find onlyhere' "$rootcopy/cctrl")"
+    assert_contains "$out" "FOUND"
+    assert_contains "$out" "$sole/onlyhere.json"
+
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_PROFILES_DIR="$sole" \
+        CCTRL_NO_MAIN=1 bash -c 'source "$0"; _profile_exists elsewhere && echo FOUND || echo MISSING' "$rootcopy/cctrl")"
+    assert_contains "$out" "MISSING"
+
+    echo "ok: CCTRL_PROFILES_DIR is the sole dir searched, excluding XDG/repo even for a name present in both"
+}
+
+test_profile_writes_and_edit_copy_on_write_use_xdg() {
+    # save and the edit copy-on-write path write only to XDG, 0600 in a 0700 dir.
+    local rootcopy="$TMPDIR/cctrl-xdg-write-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.claude"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"model":"claude-opus-5","env":{"K":"v"}}\n' > "$fakehome/.claude/settings.json"
+
+    ( umask 022; HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" save newprof >/dev/null )
+    local pf="$fakehome/.config/cctrl/profiles/newprof.json"
+    [[ -f "$pf" ]] || fail "save should write the profile under XDG"
+    [[ ! -f "$rootcopy/profiles/newprof.json" ]] || fail "save must not write into the repo profiles dir"
+    local mode dmode
+    mode="$(stat -f '%Lp' "$pf" 2>/dev/null || stat -c '%a' "$pf")"
+    dmode="$(stat -f '%Lp' "$fakehome/.config/cctrl/profiles" 2>/dev/null || stat -c '%a' "$fakehome/.config/cctrl/profiles")"
+    [[ "$mode" == "600" ]] || fail "XDG profile write is mode $mode, expected 600"
+    [[ "$dmode" == "700" ]] || fail "XDG profiles dir is mode $dmode, expected 700"
+
+    # edit copy-on-write: a repo-only profile gets copied to XDG on first edit.
+    printf '{"model":"repo-edit","env":{}}\n' > "$rootcopy/profiles/repoedit.json"
+    EDITOR=true HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" edit repoedit >/dev/null
+    [[ -f "$fakehome/.config/cctrl/profiles/repoedit.json" ]] || fail "edit should copy a repo-only profile to XDG"
+    mode="$(stat -f '%Lp' "$fakehome/.config/cctrl/profiles/repoedit.json" 2>/dev/null || stat -c '%a' "$fakehome/.config/cctrl/profiles/repoedit.json")"
+    [[ "$mode" == "600" ]] || fail "edit copy-on-write landed at mode $mode, expected 600"
+
+    echo "ok: save and edit copy-on-write land only in XDG, at 0600/0700"
+}
+
+test_profile_migrate() {
+    local rootcopy="$TMPDIR/cctrl-migrate-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"a","env":{}}\n' > "$rootcopy/profiles/alpha.json"
+    printf '{"model":"b","env":{}}\n' > "$rootcopy/profiles/beta.json"
+    printf 'alpha\n' > "$rootcopy/.active-profile"
+
+    local userdir="$fakehome/.config/cctrl/profiles"
+
+    # --dry-run writes nothing.
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" "$rootcopy/cctrl" profile migrate --dry-run >/dev/null
+    [[ ! -d "$fakehome/.config" ]] || fail "--dry-run must not create any XDG state"
+
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" "$rootcopy/cctrl" profile migrate)"
+    assert_contains "$out" "copied: alpha"
+    assert_contains "$out" "copied: beta"
+    cmp -s "$rootcopy/profiles/alpha.json" "$userdir/alpha.json" || fail "migrated alpha.json is not byte-identical"
+    local mode
+    mode="$(stat -f '%Lp' "$userdir/alpha.json" 2>/dev/null || stat -c '%a' "$userdir/alpha.json")"
+    [[ "$mode" == "600" ]] || fail "migrated profile is mode $mode, expected 600"
+    [[ -f "$rootcopy/.active-profile" ]] && fail "legacy .active-profile should be removed after migrate"
+    jq -e '.defaultProfile == "alpha"' "$fakehome/.config/cctrl/config.json" >/dev/null \
+        || fail "migrate should write defaultProfile from the legacy .active-profile"
+
+    # Second run: idempotent, no changes, repo originals untouched.
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" "$rootcopy/cctrl" profile migrate)"
+    assert_contains "$out" "exists identical: alpha"
+    assert_contains "$out" "exists identical: beta"
+    [[ -f "$rootcopy/profiles/alpha.json" ]] || fail "migrate without --remove-old must keep the repo original"
+
+    # A differing XDG copy is never overwritten.
+    printf '{"model":"DIFFERENT","env":{}}\n' > "$userdir/alpha.json"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" "$rootcopy/cctrl" profile migrate)"
+    assert_contains "$out" "exists differs: alpha"
+    jq -e '.model == "DIFFERENT"' "$userdir/alpha.json" >/dev/null \
+        || fail "migrate must never overwrite a differing XDG profile"
+    printf '{"model":"a","env":{}}\n' > "$userdir/alpha.json"   # restore identical for the next step
+
+    # --remove-old removes only identical originals.
+    printf '{"model":"DIFFERENT2","env":{}}\n' > "$userdir/beta.json"
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" "$rootcopy/cctrl" profile migrate --remove-old --yes >/dev/null
+    [[ -f "$rootcopy/profiles/alpha.json" ]] && fail "--remove-old should have removed the identical alpha original"
+    [[ -f "$rootcopy/profiles/beta.json" ]] || fail "--remove-old must not remove a differing beta original"
+
+    echo "ok: profile migrate copies/verifies, is idempotent, never overwrites a differing XDG file, --remove-old is identical-only, --dry-run writes nothing, and migrates .active-profile"
 }
 
 test_profile_prompt_overrides_global_default() {
@@ -11218,6 +11388,11 @@ test_profile_prompt_overrides_global_default
 test_local_config_overrides_shared_defaults
 test_profile_writes_are_owner_only
 test_profile_use_current_diff
+test_profile_xdg_config_home
+test_profile_repo_fallback_and_clash
+test_profile_find_sole_dir_override
+test_profile_writes_and_edit_copy_on_write_use_xdg
+test_profile_migrate
 test_detached_agent_prompt_exports_selection
 test_detached_arg_parsing
 test_live_aware_index_picker
