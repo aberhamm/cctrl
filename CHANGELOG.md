@@ -27,6 +27,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   wins, and `cctrl ls`/`cctrl current` warn when a name exists in both.
   `cctrl save` and `cctrl edit` (copy-on-write for a repo-only profile) write
   only to the XDG dir, at 0600 in a 0700 directory. (plan 071 phase 1)
+- Launch-time profile resolution now follows one explicit precedence —
+  explicit `--profile` > a matched shortcut's `.profile` > the configured
+  `defaultProfile` > the legacy `.active-profile` (read-only, warns to
+  migrate) > none — used consistently by `cctrl start`, `cctrl @<shortcut>`,
+  and `start --app-owned`. An unknown explicit or shortcut profile now fails
+  closed (exit 64) instead of silently launching without it; an unknown
+  configured default warns and falls through to none. Fixes a regression
+  where `cctrl @<shortcut> --profile <name> --foreground` fell into the
+  argument parser's catch-all and leaked `--profile <name>` straight into
+  the agent's own argv while still applying the shortcut's own profile
+  instead of the requested one. A detached `cctrl start -d <dir>` whose
+  directory matches a configured shortcut now also adopts that shortcut's
+  profile (previously only its session name/alias was adopted). (plan 071
+  phase 2)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including

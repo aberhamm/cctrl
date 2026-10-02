@@ -1470,6 +1470,160 @@ test_profile_prompt_overrides_global_default() {
     assert_contains "$out" "ARG[3]=profile picked claude"
 }
 
+test_resolve_profile_precedence() {
+    # plan 071 phase 2: _resolve_profile implements the 5-step precedence
+    # (explicit > shortcut > default > legacy > none). Exercised directly
+    # (not through a full launch) since it's a pure function of its two
+    # arguments plus config/ACTIVE_FILE state. CCTRL_PROFILES_DIR makes the
+    # profile lookup deterministic (sole dir, no XDG/repo fallback).
+    local rootcopy="$TMPDIR/cctrl-resolve-profile-copy"
+    local profiles="$TMPDIR/cctrl-resolve-profile-dir"
+    mkdir -p "$rootcopy/data" "$profiles"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"model":"w"}\n' > "$profiles/work.json"
+    printf '{"model":"p"}\n' > "$profiles/personal.json"
+
+    local out rc
+
+    # explicit wins over shortcut/default/legacy.
+    printf '{"defaultProfile":"personal"}\n' > "$rootcopy/data/config.json"
+    printf 'personal\n' > "$rootcopy/.active-profile"
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile work personal' "$rootcopy/cctrl")"
+    [[ "$out" == $'work\texplicit' ]] || fail "explicit should win over shortcut/default/legacy, got: $out"
+
+    # explicit "none" is a no-overlay sentinel, not a profile lookup.
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile none personal' "$rootcopy/cctrl")"
+    [[ "$out" == $'none\texplicit' ]] || fail "explicit none should short-circuit to none/explicit, got: $out"
+
+    # a missing explicit profile fails closed (exit 64), even with a valid
+    # shortcut underneath it.
+    rc=0
+    CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile bogus personal >/dev/null 2>&1' "$rootcopy/cctrl" || rc=$?
+    [[ "$rc" == 64 ]] || fail "a missing explicit profile should exit 64, got rc=$rc"
+
+    # name grammar rejects a path-like name (exit 64, same fail-closed path).
+    rc=0
+    CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "../x" "" >/dev/null 2>&1' "$rootcopy/cctrl" || rc=$?
+    [[ "$rc" == 64 ]] || fail "a path-like explicit profile name should be rejected (exit 64), got rc=$rc"
+
+    # shortcut wins over default and legacy.
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" work' "$rootcopy/cctrl")"
+    [[ "$out" == $'work\tshortcut' ]] || fail "shortcut should win over default/legacy, got: $out"
+
+    # a missing shortcut profile fails closed too.
+    rc=0
+    CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" bogus >/dev/null 2>&1' "$rootcopy/cctrl" || rc=$?
+    [[ "$rc" == 64 ]] || fail "a missing shortcut profile should exit 64, got rc=$rc"
+
+    # configured default wins over legacy .active-profile.
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" ""' "$rootcopy/cctrl")"
+    [[ "$out" == $'personal\tdefault' ]] || fail "configured default should win over legacy, got: $out"
+
+    # a default pointing at a missing profile warns and falls straight to
+    # none (not to legacy underneath it).
+    printf '{"defaultProfile":"ghost"}\n' > "$rootcopy/data/config.json"
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" ""' "$rootcopy/cctrl" 2>/dev/null)"
+    [[ "$out" == $'none\tnone' ]] || fail "a missing default should fall to none (not legacy), got: $out"
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" "" 2>&1 1>/dev/null' "$rootcopy/cctrl")"
+    assert_contains "$out" "WARN"
+
+    # with no default configured, legacy .active-profile applies.
+    rm -f "$rootcopy/data/config.json"
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" ""' "$rootcopy/cctrl" 2>/dev/null)"
+    [[ "$out" == $'personal\tlegacy' ]] || fail "legacy .active-profile should apply when no default is configured, got: $out"
+
+    # with nothing configured at all, none.
+    rm -f "$rootcopy/.active-profile"
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_NO_MAIN=1 bash -c \
+        'source "$0"; _resolve_profile "" ""' "$rootcopy/cctrl")"
+    [[ "$out" == $'none\tnone' ]] || fail "with nothing configured, resolution should be none/none, got: $out"
+
+    echo "ok: _resolve_profile precedence (explicit > shortcut > default > legacy > none), fail-closed on explicit/shortcut, soft-fail on default, name grammar enforced"
+}
+
+test_shortcut_foreground_profile_flag_not_leaked_and_overlay_applied() {
+    # plan 071 phase 2 REGRESSION: `cctrl @x --profile work --foreground` must
+    # not pass --profile through to the agent's argv, and the named
+    # profile's overlay (its model, here) must actually apply. Before this
+    # fix, _shortcut_jump's foreground arg loop had no --profile case, so
+    # --profile/work fell into the catch-all passthrough (reaching the
+    # agent's own argv) while the overlay silently stayed on the shortcut's
+    # OWN .profile.
+    make_fake_agent "$TMPDIR/claude" claude
+
+    local rootcopy="$TMPDIR/cctrl-shortcut-profile-flag-copy"
+    local project="$TMPDIR/shortcut-profile-flag-project"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"x":{"dir":"%s","profile":"personal"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"model":"personal-model"}\n' > "$rootcopy/profiles/personal.json"
+    printf '{"model":"work-model"}\n' > "$rootcopy/profiles/work.json"
+
+    local out
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_TMUX_CONTEXT=1 \
+        "$rootcopy/cctrl" @x --agent claude --profile work --foreground --no-bridge -m hi 2>&1)"
+    assert_contains "$out" "CMD=claude"
+    if echo "$out" | grep -qE '^ARG\[[0-9]+\]=--profile$'; then
+        fail "--profile must not reach the agent's argv: $out"
+    fi
+    assert_not_contains "$out" "ARG[3]=personal-model"
+    assert_contains "$out" "ARG[2]=--model"
+    assert_contains "$out" "ARG[3]=work-model"
+
+    echo "ok: @shortcut --profile CLI override is not forwarded to the agent, and its overlay (not the shortcut's own profile) applies"
+}
+
+test_detached_dir_adopts_shortcut_profile() {
+    # plan 071 phase 2: `cctrl start -d <dir>` must resolve the SAME profile
+    # as `cctrl start -d @<key>` when <dir> matches a configured shortcut --
+    # not just the same session name (that naming-only adoption predates
+    # this). The parent resolves the shortcut's .profile early and forwards
+    # it into the child's own `cctrl start --foreground` invocation, since a
+    # dir launch's child never sees `@<key>` (it gets `cd <dir> && cctrl
+    # start --foreground`) and so cannot re-derive the profile itself the
+    # way an `@<key>` launch's child does.
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-dir-adopt-copy"
+    local project="$TMPDIR/dir-adopt-project"
+    local log="$TMPDIR/dir-adopt-tmux.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"defaultAgent":"claude"}\n' > "$rootcopy/data/config.json"
+    printf '{"proj":{"dir":"%s","profile":"work"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"model":"work-model"}\n' > "$rootcopy/profiles/work.json"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_NO_HEALTH_CHECK=1 \
+        "$rootcopy/cctrl" start -d "$project" --no-bridge >/dev/null 2>&1
+    local dir_shell_cmd
+    dir_shell_cmd="$(grep '^SHELL_CMD=' "$log" | head -1)"
+    assert_contains "$dir_shell_cmd" "cctrl start --foreground"
+    assert_contains "$dir_shell_cmd" "--profile work"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_NO_HEALTH_CHECK=1 \
+        "$rootcopy/cctrl" start -d @proj --no-bridge >/dev/null 2>&1
+    local shortcut_shell_cmd
+    shortcut_shell_cmd="$(grep '^SHELL_CMD=' "$log" | head -1)"
+    assert_contains "$shortcut_shell_cmd" "@proj --foreground"
+
+    echo "ok: a detached dir launch that adopts a matching shortcut's name also forwards the shortcut's profile into the child"
+}
+
 test_local_config_overrides_shared_defaults() {
     make_fake_tmux "$TMPDIR/tmux"
 
@@ -11385,6 +11539,9 @@ test_git_dirty_check_matches_self_install_semantics
 test_launch_args
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
+test_resolve_profile_precedence
+test_shortcut_foreground_profile_flag_not_leaked_and_overlay_applied
+test_detached_dir_adopts_shortcut_profile
 test_local_config_overrides_shared_defaults
 test_profile_writes_are_owner_only
 test_profile_use_current_diff

@@ -309,6 +309,90 @@ _config_default_agent() {
     esac
 }
 
+_config_default_profile() {
+    _config_jq '.defaultProfile // empty'
+}
+
+# Five-step profile resolution for a launch: explicit --profile wins, then a
+# matched shortcut's .profile, then the configured default, then (read-only)
+# the legacy .active-profile, then no overlay. Steps 1-2 fail closed (exit 64)
+# on an unknown name, since the caller named something specific and it's
+# gone; steps 3-4 are soft -- a misconfigured or stale value warns and falls
+# through rather than blocking every launch on it. Output on success is
+# always "name<TAB>source" on stdout, where name is a real profile or the
+# reserved sentinel "none", and source is one of
+# explicit|shortcut|default|legacy|none. See docs/plans/071-concurrent-profile-sessions.md,
+# "Profile resolution order".
+_resolve_profile() {
+    local explicit="${1:-}" shortcut_profile="${2:-}"
+
+    if [[ -n "$explicit" ]]; then
+        if [[ "$explicit" == "none" ]]; then
+            printf 'none\texplicit\n'
+            return 0
+        fi
+        if ! _profile_exists "$explicit"; then
+            echo -e "${RED}Profile '$explicit' not found.${RESET}" >&2
+            return 64
+        fi
+        printf '%s\texplicit\n' "$explicit"
+        return 0
+    fi
+
+    if [[ -n "$shortcut_profile" ]]; then
+        if ! _profile_exists "$shortcut_profile"; then
+            echo -e "${RED}Shortcut profile '$shortcut_profile' not found.${RESET}" >&2
+            return 64
+        fi
+        printf '%s\tshortcut\n' "$shortcut_profile"
+        return 0
+    fi
+
+    local default
+    default="$(_config_default_profile 2>/dev/null || true)"
+    if [[ -n "$default" ]]; then
+        if _profile_exists "$default"; then
+            printf '%s\tdefault\n' "$default"
+            return 0
+        fi
+        echo -e "${YELLOW}WARN: configured default profile '$default' not found; launching with none.${RESET}" >&2
+        printf 'none\tnone\n'
+        return 0
+    fi
+
+    local legacy
+    legacy="$(_legacy_active_profile)"
+    if [[ -n "$legacy" ]]; then
+        if _profile_exists "$legacy"; then
+            echo -e "${YELLOW}WARN: using legacy active profile '$legacy'; run 'cctrl profile migrate' to migrate it to defaultProfile.${RESET}" >&2
+            printf '%s\tlegacy\n' "$legacy"
+            return 0
+        fi
+        echo -e "${YELLOW}WARN: legacy active profile '$legacy' not found; launching with none.${RESET}" >&2
+    fi
+
+    printf 'none\tnone\n'
+}
+
+# Read-only: the legacy data/.active-profile value, or empty. Never mutates or
+# deletes the file -- _legacy_active_profile_migrate (`profile migrate` / the
+# first `cctrl use`) owns that.
+_legacy_active_profile() {
+    [[ -f "$ACTIVE_FILE" ]] && cat "$ACTIVE_FILE"
+    return 0
+}
+
+# Convenience for display/hint call sites that only want "the profile that
+# would apply with no explicit/shortcut override" (statusline, doctor,
+# _default_agent_label) and don't want launch's fail-closed behavior: both
+# _resolve_profile arguments are empty here, so only the soft-fail steps 3-5
+# are reachable and this never returns non-zero.
+_default_profile_name() {
+    local line
+    line="$(_resolve_profile "" "")"
+    printf '%s' "${line%%$'\t'*}"
+}
+
 _heuristic_title() {
     local prompt="$1" repo_name="$2"
     local short full_wc
@@ -403,7 +487,7 @@ _default_agent() {
 
 _default_agent_label() {
     local agent pref active
-    active="$(_active_profile)"
+    active="$(_default_profile_name)"
     if pref="$(_profile_agent_preference "$active" 2>/dev/null)"; then
         if [[ "$pref" == "prompt" ]]; then
             printf 'prompt (profile %s)' "$active"
@@ -1635,16 +1719,17 @@ _launch_app_owned_codex() {
     agent="$(_normalize_agent "$agent")" || return 64
     [[ "$agent" == codex ]] || { echo -e "${RED}--app-owned is available only for Codex.${RESET}" >&2; return 64; }
 
-    if [[ -z "$profile" && "$profile_explicit" == false && "$target" == @* ]]; then
+    local shortcut_profile=""
+    if [[ "$profile_explicit" == false && "$target" == @* ]]; then
         local shortcut_key
         shortcut_key="$(_shortcut_lookup_key "${target#@}")"
-        [[ -n "$shortcut_key" ]] && profile="$(jq -r --arg k "$shortcut_key" '.[$k].profile // empty' "$SHORTCUTS_FILE")"
+        [[ -n "$shortcut_key" ]] && shortcut_profile="$(jq -r --arg k "$shortcut_key" '.[$k].profile // empty' "$SHORTCUTS_FILE")"
     fi
-    [[ -n "$profile" ]] || profile="$(_active_profile)"
-    if [[ -n "$profile" && "$profile_explicit" == true ]] && ! _profile_exists "$profile"; then
-        echo -e "${RED}Profile '$profile' not found.${RESET}" >&2
-        return 64
-    fi
+    local resolved rc=0
+    resolved="$(_resolve_profile "$profile" "$shortcut_profile")" || rc=$?
+    (( rc == 0 )) || return "$rc"
+    profile="${resolved%%$'\t'*}"
+    [[ "$profile" == "none" ]] && profile=""
     if [[ -n "$profile" ]] && _profile_exists "$profile"; then
         pf="$(_profile_find "$profile")"
         profile_model="$(_profile_model_for_agent codex "$pf")"
@@ -1868,21 +1953,18 @@ cmd_start() {
         esac
     done
 
-    # Resolve profile: explicit --profile wins; else fall back to the last
-    # `cctrl use` profile if recorded. Empty = no overlay (agent's own default).
+    # Resolve profile: explicit --profile > configured default > legacy
+    # .active-profile > none (see _resolve_profile). A missing explicit
+    # profile fails closed; no overlay means the agent's own default.
     # Explicit --profile is concurrency-safe: it never touches global state.
-    if [[ -z "$profile" ]]; then
-        profile="$(_active_profile)"
-    fi
+    local resolved rc=0
+    resolved="$(_resolve_profile "$profile" "")" || rc=$?
+    (( rc == 0 )) || return "$rc"
+    profile="${resolved%%$'\t'*}"
+    [[ "$profile" == "none" ]] && profile=""
     agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$profile")" || return 1
     local pf=""
-    if [[ -n "$profile" ]]; then
-        if _profile_exists "$profile"; then
-            pf="$(_profile_find "$profile")"
-        else
-            echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
-        fi
-    fi
+    [[ -n "$profile" ]] && pf="$(_profile_find "$profile")"
     _apply_profile_overlay "$agent" "$pf"
     _peer_refresh_paths
     _session_refresh_paths
@@ -3713,6 +3795,8 @@ _launch_detached() {
     # --force / CCTRL_FORCE=1 overrides.
     _launch_resource_guardrail "$force" || return 1
 
+    local dir_resolved="" dir_shortcut="" dir_adopted_profile=""
+    local explicit_profile_flag="$profile"
     if [[ "$target_kind" == "shortcut" ]]; then
         shortcut_canonical="$(_shortcut_lookup_key "$target")"
         if [[ -z "$shortcut_canonical" ]]; then
@@ -3728,6 +3812,44 @@ _launch_detached() {
         if [[ "$agent_explicit" != "true" && -n "$shortcut_agent" ]]; then
             detach_agent="$shortcut_agent"
         fi
+    else
+        # Resolve the dir and adopt a matching shortcut's .profile BEFORE
+        # profile/agent resolution below, so `cctrl start -d <dir>` and
+        # `cctrl start -d @<key>` of the same repo resolve the identical
+        # profile, not just the identical session name (the naming adoption
+        # further down reuses $dir_resolved/$dir_shortcut computed here
+        # instead of recomputing them).
+        dir_resolved="${target/#\~/$HOME}"
+        if [[ ! -d "$dir_resolved" ]]; then
+            echo -e "${RED}Directory not found: $dir_resolved${RESET}" >&2
+            return 1
+        fi
+        dir_resolved="$(cd "$dir_resolved" && pwd)"
+        dir_shortcut="$(_shortcut_for_dir "$dir_resolved")"
+        if [[ -n "$dir_shortcut" ]]; then
+            local shortcut_profile=""
+            shortcut_profile="$(jq -r --arg k "$dir_shortcut" '.[$k].profile // empty' "$SHORTCUTS_FILE")"
+            if [[ -z "$profile" && -n "$shortcut_profile" ]]; then
+                profile="$shortcut_profile"
+                dir_adopted_profile="$shortcut_profile"
+            fi
+        fi
+    fi
+    # Validate the resolved profile (explicit --profile, or one adopted from
+    # a shortcut/dir match above) BEFORE spawning tmux. The child's own
+    # resolver would also fail closed on a bad name, but that failure would
+    # happen inside the new detached pane after this function has already
+    # reported success -- CCTRL_ATTACH_AFTER_START (plain `cctrl start`)
+    # skips the post-spawn health check entirely, and even with it on, the
+    # reported reason is only "exited during startup", not the real one.
+    if [[ -n "$profile" ]]; then
+        local _profile_check rc=0
+        if [[ -n "$explicit_profile_flag" ]]; then
+            _profile_check="$(_resolve_profile "$profile" "")" || rc=$?
+        else
+            _profile_check="$(_resolve_profile "" "$profile")" || rc=$?
+        fi
+        (( rc == 0 )) || return "$rc"
     fi
     local agent_profile="$profile"
     [[ -n "$agent_profile" ]] || agent_profile="$(_active_profile)"
@@ -3774,28 +3896,36 @@ _launch_detached() {
         [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(_launch_quote "$env_val")"
     done
     [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(_launch_quote "$peer_name")"
-    if [[ -n "$peer_name" ]]; then
+    # Flags to splice into the child's argv ahead of any "--" literal prompt:
+    # --peer (identity) and, for a dir launch that adopted a matching
+    # shortcut's profile (dir_adopted_profile, resolved above), --profile --
+    # the child's own foreground resolver re-derives from argv, not from this
+    # parent's local $profile, so it needs the flag forwarded explicitly.
+    local -a _inject=()
+    [[ -n "$peer_name" ]] && _inject+=("--peer" "$peer_name")
+    [[ -n "$dir_adopted_profile" ]] && _inject+=("--profile" "$dir_adopted_profile")
+    if [[ ${#_inject[@]} -gt 0 ]]; then
         if [[ "$passthrough_count" -gt 0 ]]; then
-            local inserted_peer=false
+            local inserted_inject=false
             for a in "${passthrough[@]}"; do
-                if [[ "$inserted_peer" == "false" && "$a" == "--" ]]; then
-                    child_args+=("--peer" "$peer_name")
-                    inserted_peer=true
+                if [[ "$inserted_inject" == "false" && "$a" == "--" ]]; then
+                    child_args+=("${_inject[@]}")
+                    inserted_inject=true
                 fi
                 child_args+=("$a")
             done
-            if [[ "$inserted_peer" == "false" ]]; then
-                child_args+=("--peer" "$peer_name")
+            if [[ "$inserted_inject" == "false" ]]; then
+                child_args+=("${_inject[@]}")
             fi
         else
-            child_args+=("--peer" "$peer_name")
+            child_args+=("${_inject[@]}")
         fi
     else
         if [[ "$passthrough_count" -gt 0 ]]; then
             child_args=("${passthrough[@]}")
         fi
     fi
-    if [[ "$peer_name" == "" && "$passthrough_count" -eq 0 ]]; then
+    if [[ "$peer_name" == "" && -z "$dir_adopted_profile" && "$passthrough_count" -eq 0 ]]; then
         :
     else
         for a in "${child_args[@]}"; do
@@ -3815,14 +3945,7 @@ _launch_detached() {
         metadata_cwd="$(jq -r --arg k "$canonical" '.[$k].dir // ""' "$SHORTCUTS_FILE" 2>/dev/null)"
         metadata_cwd="${metadata_cwd/#\~/$HOME}"
     else
-        local dir="$target"
-        dir="${dir/#\~/$HOME}"
-        if [[ ! -d "$dir" ]]; then
-            echo -e "${RED}Directory not found: $dir${RESET}" >&2
-            return 1
-        fi
-        dir="$(cd "$dir" && pwd)"
-        metadata_cwd="$dir"
+        metadata_cwd="$dir_resolved"
         # Naming-only alias adoption: if this directory matches a configured
         # shortcut, name the session from that shortcut's short alias so a dir
         # launch and an `@<key>` launch of the same repo produce the identical
@@ -3831,18 +3954,18 @@ _launch_detached() {
         # The cwd, agent, resume and bridge mechanism are unchanged: this launch
         # still runs `cd <dir> && cctrl start --foreground`. On collision the
         # first shortcut by sorted key wins (see _shortcut_for_dir).
-        local dir_shortcut
-        dir_shortcut="$(_shortcut_for_dir "$dir")"
+        # $dir_resolved/$dir_shortcut were already computed above, before
+        # profile/agent resolution (plan 071 phase 2).
         if [[ -n "$dir_shortcut" ]]; then
             context_name="$(_tmux_session_slug "$dir_shortcut")"
             session_name="$context_name"
             display_label="@$dir_shortcut"
             metadata_target="@$dir_shortcut"
         else
-            context_name="$(_tmux_session_slug "$dir")"
+            context_name="$(_tmux_session_slug "$dir_resolved")"
             session_name="$context_name"
-            display_label="$dir"
-            metadata_target="$dir"
+            display_label="$dir_resolved"
+            metadata_target="$dir_resolved"
         fi
     fi
 
@@ -14591,7 +14714,7 @@ cmd_statusline() {
         install|show|-h|--help|help|"")
             action="${agent:-help}"
             if [[ "$action" != "help" && "$action" != "-h" && "$action" != "--help" ]]; then
-                agent="$(_resolve_agent_or_prompt "" "Choose statusline target" "$(_active_profile)")" || return 1
+                agent="$(_resolve_agent_or_prompt "" "Choose statusline target" "$(_default_profile_name)")" || return 1
             fi
             ;;
         *)
@@ -16009,7 +16132,7 @@ cmd_host() {
                         return 1 ;;
                 esac
             done
-            doctor_agent="$(_resolve_agent_or_prompt "$doctor_agent" "Choose agent runtime to check" "$(_active_profile)")" || return 1
+            doctor_agent="$(_resolve_agent_or_prompt "$doctor_agent" "Choose agent runtime to check" "$(_default_profile_name)")" || return 1
             local lookup
             lookup="$(_host_lookup "$name")"
             if [[ -z "$lookup" ]]; then
@@ -16458,8 +16581,8 @@ _shortcut_jump() {
         return 1
     fi
 
-    local dir profile shortcut_agent resume prompt
-    { IFS= read -r dir; IFS= read -r profile; IFS= read -r shortcut_agent; IFS= read -r resume; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
+    local dir shortcut_profile shortcut_agent resume prompt
+    { IFS= read -r dir; IFS= read -r shortcut_profile; IFS= read -r shortcut_agent; IFS= read -r resume; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
         .[$k] | (.dir // ""), (.profile // ""), (.agent // ""), (.resume // false | tostring), (.prompt // "")
     ' "$SHORTCUTS_FILE")
 
@@ -16525,6 +16648,7 @@ _shortcut_jump() {
     local cli_prompt_set=false
     local no_bridge=false
     local cli_model=""
+    local cli_profile=""
     local agent="${shortcut_agent:-}"
     local launch_name=""
     local peer_identity=""
@@ -16537,6 +16661,9 @@ _shortcut_jump() {
             --agent)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
                 agent="$2"; shift 2 ;;
+            --profile)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
+                cli_profile="$2"; shift 2 ;;
             --resume|-r)
                 cli_resume=true
                 if [[ $# -gt 1 && "$2" != -* ]]; then
@@ -16585,21 +16712,18 @@ _shortcut_jump() {
                 passthrough+=("$1"); shift ;;
         esac
     done
-    local agent_profile="$profile"
-    [[ -n "$agent_profile" ]] || agent_profile="$(_active_profile)"
-    agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$agent_profile")" || return 1
+    local resolved rc=0
+    resolved="$(_resolve_profile "$cli_profile" "$shortcut_profile")" || rc=$?
+    (( rc == 0 )) || return "$rc"
+    local profile="${resolved%%$'\t'*}"
+    [[ "$profile" == "none" ]] && profile=""
+    agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$profile")" || return 1
 
     # Apply the shortcut's profile as a per-process overlay (env + model). No
     # global-settings mutation: concurrent shortcuts with different profiles stay
     # independent and there's no launch race on global agent config.
     local pf=""
-    if [[ -n "$profile" ]]; then
-        if _profile_exists "$profile"; then
-            pf="$(_profile_find "$profile")"
-        else
-            echo -e "${YELLOW}Profile '$profile' not found; launching without it.${RESET}"
-        fi
-    fi
+    [[ -n "$profile" ]] && pf="$(_profile_find "$profile")"
     _apply_profile_overlay "$agent" "$pf"
     _peer_refresh_paths
     _session_refresh_paths
