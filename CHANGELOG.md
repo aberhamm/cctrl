@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [Unreleased] - 2026-09-21
+## [Unreleased] - 2026-10-02
 
 ### Added
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
@@ -40,6 +40,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Lossy historical commands additionally require a verified original launch event.
 
 ### Changed
+- The bundled `cctrl-spawn` and `cctrl-fleet-manager` skills now document the
+  shared fleet approvals contract (`~/.local/state/fleet/approvals.md`), so a
+  worker can verify a scope-widening pasted follow-up against a recorded
+  grant instead of trusting the paste on its own, and every new seed brief
+  carries the contract by default. (plan 096)
 - `cctrl start -d` answers Claude Code's folder-trust dialog with "Yes, I trust
   this folder". The health check moves the selection off the default
   "No, exit" and presses Enter only after the screen shows "Yes" selected. If
@@ -54,6 +59,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `cctrl` no longer aborts silently under bash >= 4.1 (e.g. Homebrew bash 5,
+  now first on `PATH` on some hosts). A bare `((x++))` whose old value is 0
+  evaluates to 0 and returns exit 1 under `set -e`, so several counters and
+  scan loops (the remote-shortcut purpose scan, peer `--as`/`--from` flag
+  scans, `session sync-titles`) could abort the whole command silently. The
+  install gate's own silent-abort failure mode now has a named test too, so a
+  future regression fails loudly instead of looking like host load. (plan 094)
+- Codex panes now stop cleanly on a bare `tmux kill-session` or
+  `respawn-pane -k`, not only through cctrl's own `kill`/`close`/
+  `stop-exact` paths. The session wrapper runs Codex as a waited background
+  child so its SIGHUP trap can escalate SIGTERM -> SIGKILL the same way it
+  already does for Claude, instead of leaving Codex and the wrapper
+  orphaned. (plan 076)
+- `peer send --as` now refuses to send when the caller is inside a tmux
+  session but its own identity can't be resolved (e.g. a stale or inherited
+  `CCTRL_SESSION_NAME`), instead of silently treating "unresolvable" the same
+  as "not in tmux at all" and letting the send through. (plan 091)
+- The advisory-only git-commit hook's docstring and `cctrl hooks run` help
+  text no longer overclaim that it blocks disallowed commands — the wording
+  now matches that it only warns; no hook wired through `hooks run` exits 2
+  today. (plan 088)
+- `session close`/`kill`/`stop-exact` reaper hardening: the process snapshot
+  and the kill now resolve the same session id instead of a prefix match in
+  one path and an exact match in another; SIGCONT now precedes the delayed
+  SIGTERM so a stopped process can act on it; the wrapper's SIGKILL now also
+  kills the agent's descendant processes (MCP servers, tool processes); and a
+  malformed `CCTRL_WRAPPER_TERM_GRACE` no longer skips signalling the agent.
+  (plan 087)
+- Fixed a regression from plan 086: `session ls` could show an idle session
+  as `unsent-draft` (and autoheal would skip it) when its pane's only visible
+  divider was tmux's own titled pane-border-status line. The single-border
+  fallback now scopes the composer from the last glyph-start before that
+  border, not the first. (plan 093)
+- The unsent-draft detector now judges every composer line up to the bottom
+  border, not just the first, so a wrapped or multi-line draft — or one that
+  starts with placeholder-looking text — is still recognized. A composer
+  that can't be found at all (a bash prompt, a pager, a crashed shell) now
+  gets its own exit code so autoheal treats it as unverifiable instead of
+  guessing. (plan 086)
+- Remote `session attach` no longer risks the remote shell re-expanding an
+  exact `=NAME` tmux target as a filename glob; the `=` is now escaped in
+  the remote command string, not just shell-quoted. A malformed `pane_id`
+  read from a launch baseline can no longer target the wrong pane. (plan 085)
+- `session prune`/`mark-closed` and the provisional-close path got several
+  fail-open corrections found in review: a transcript read or `grep` error
+  no longer counts toward "never-prompted" in the destructive-prune
+  classifier, a freshly launched session now gets the same 300s startup
+  grace against a premature `mark-closed` that snapshot/restore already had,
+  and a provisional close now honors the same digest guard a canonical close
+  does. (plan 084)
 - `session snapshot` (and `session restore --from latest`, and the doctor's
   timer staleness check) now default to `${CCTRL_DATA_DIR:-data}/snapshots`
   instead of always writing the real `data/snapshots`, so a test or script
@@ -226,6 +281,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - App Server proxy initialization uses validated WebSocket framing, with explicit
   legacy JSONL selection. Malformed tmux snapshots no longer imply absence, and
   ambiguous terminal evidence cannot authorize an app-only ownership claim.
+
+### Internal
+- Test-only: the three private-socket tests now unlink their own tmux socket
+  file after `kill-server` (which doesn't remove it on this host), and a
+  guard now catches any test that leaves a stray socket behind. (plan 095)
+- Test-only: the "tests didn't touch the real live store" guard now names
+  which paths changed on failure instead of reporting a bare pass/fail, and
+  tolerates only known registry-churn files, so a flake caused by other live
+  fleet sessions on a shared dev machine is distinguishable from a real
+  leak. (plan 090)
+- Test-only: fixed an intermittent full-suite teardown failure (a non-empty
+  `$TMPDIR` at exit) in the `launch-to-app` workflow test; confirmed plan
+  082's shared launch-code edits are safe for plain `cctrl start -d` too, not
+  only the new compound workflow. (plan 092)
 
 ## [Unreleased] - 2026-09-17
 
