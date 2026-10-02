@@ -9,7 +9,7 @@ needs-review: none
 review-required: eng
 created: 2026-09-24
 tui-fixture: n/a  # launch env and metadata tests use the fake agent and fake tmux
-approved-by: none  # plan only; do not implement until Matthew approves (2026-09-24)
+approved-by: Matthew 2026-10-02 (via fm-cctrl)
 reviews:
   - type=eng verdict=approved date=2026-09-24 by=plan-eng-review (subagent, v3 re-check)
 ---
@@ -24,7 +24,7 @@ Run a work session (Bedrock through the Portkey gateway) and a personal session 
 
 Global `~/.claude/settings.json` is never written again. Profiles and user config move to `~/.config/cctrl/`, following the XDG Base Directory spec.
 
-**Status:** plan only. Implementation waits for Matthew's go-ahead.
+**Status:** approved 2026-10-02; implementation in progress, phased per D1.
 
 **Line references** date from commit 3462171 and will drift. Each one is anchored to a function name, so re-grep before editing.
 
