@@ -88,6 +88,12 @@ _cleanup() {
         _child_pid=""
     fi
     rm -f "$_marker"
+    # Plan 071 phase 5 (D5): the per-session --settings overlay file is
+    # uid-scoped runtime-tmp state, not repo/config state -- remove it on
+    # every exit path (signal here, normal exit below) so it doesn't
+    # accumulate. _profile_settings_gc also sweeps orphans from crashes that
+    # skip both paths (e.g. SIGKILL of the whole pane).
+    [[ -n "${CCTRL_PROFILE_SETTINGS_FILE:-}" ]] && rm -f "$CCTRL_PROFILE_SETTINGS_FILE"
 }
 trap _cleanup SIGTERM SIGINT SIGHUP
 
@@ -173,5 +179,6 @@ while true; do
     fi
     break
 done
+[[ -n "${CCTRL_PROFILE_SETTINGS_FILE:-}" ]] && rm -f "$CCTRL_PROFILE_SETTINGS_FILE"
 exit "$_rc"
 }

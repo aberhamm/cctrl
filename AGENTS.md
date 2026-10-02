@@ -44,6 +44,10 @@ See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
 - **Deletes:** keep the `mktemp` dir in its own variable, check it's
   non-empty and under `$TMPDIR`, then `rm -rf -- "$tmp"` on that exact
   path. Never `rm` a `dirname`- or glob-derived path.
+- **tmux targets:** never run an untargeted `tmux` command from a test or
+  shared code path — with `TMUX` unset it hits the default server's
+  *current* session, not nothing. See
+  [docs/findings/tmux-untargeted-default-server.md](./docs/findings/tmux-untargeted-default-server.md).
 
 ## Peer messaging
 

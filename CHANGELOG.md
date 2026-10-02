@@ -74,6 +74,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `.profile: "none"` is now an explicit no-overlay, matching `--profile
   none`, instead of failing closed as an unknown profile name. (plan 071
   phase 4)
+- `cctrl restart` regenerates the session's `--settings` profile overlay
+  file from its current profile before restarting, so a `cctrl profile
+  save`/`use` edit actually takes effect on the restarted agent instead of
+  the stale file the original launch wrote. If that regeneration fails (a
+  refused or unwritable profile-settings dir), it warns and continues with
+  the existing file rather than silently aborting the restart. (plan 071
+  phase 5)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including
@@ -127,6 +134,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `cctrl restart`'s background agent kill no longer uses an untargeted
+  `tmux display-message -p '#{pane_pid}'`. With `TMUX` unset (e.g. a test
+  harness, or any caller outside a pane) that resolved to the default tmux
+  server's *current* session and SIGTERMed an unrelated session's agent — in
+  one incident, the session running the test suite itself. The agent pid is
+  now resolved synchronously, before the marker is written, from this
+  process's own verified ancestry (walking up to the pane process of the
+  session `_session_current_name` confirms we're actually inside, requiring
+  that pane to be `session-wrapper.sh`); if nothing qualifies, it warns and
+  schedules no kill, leaving the marker so the next normal exit still
+  restarts. The delayed kill re-checks the pid's parent before firing, to
+  guard against pid reuse during the 3s window. The profile-settings orphan
+  sweep (`_profile_settings_gc`) now skips entirely when `tmux list-sessions`
+  fails (tmux missing, timed out, or a different socket — all of which look
+  identical to "session absent" otherwise) and only removes a
+  confirmed-absent session's file once it's at least 10 minutes old. The test
+  harness now runs every `tmux` call against a private, initially empty
+  server (`TMUX_TMPDIR` under a short `/tmp/...` path, since macOS's
+  `AF_UNIX` `sun_path` is 104 bytes) and a new guard test
+  (`test_tmux_default_server_is_private`) statically fails on any other
+  untargeted `tmux display-message` in `cctrl`/`lib/*.sh`. See
+  `docs/findings/tmux-untargeted-default-server.md`. (plan 071 phase 5)
 - `_display_path` (the `~`-for-`$HOME` display helper used by `cctrl current`,
   `ls`, `profile migrate`, etc.) no longer leaks the REAL process's home
   directory when a caller runs cctrl with a different `$HOME` (every test

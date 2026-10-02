@@ -21,7 +21,7 @@ def model_from_command(command, agent):
     values = {
         "--model", "--permission-mode", "--remote-control-session-name-prefix",
         "--sandbox", "--ask-for-approval", "--remote", "--profile",
-        "--reasoning-effort",
+        "--reasoning-effort", "--settings",
     }
     switches = {
         "--yolo", "--dangerously-bypass-approvals-and-sandbox", "--full-auto",

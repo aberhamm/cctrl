@@ -1,11 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Health-check tests match a literal "❯" prompt glyph, which never compares
+# equal under a non-UTF-8 locale. Pin this so the suite doesn't depend on
+# whatever LANG/LC_ALL the caller's shell happens to have (p5 incident
+# follow-up: a bare `LANG=`/`LC_ALL=` environment failed here).
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMPDIR="$(mktemp -d)"
 CCTRL_TEST_REAL_HOME="${HOME:?HOME must be set}"
-# tmux's socket dir is fixed at /tmp/tmux-<uid> (not $TMPDIR, this suite's own
-# scratch root) unless TMUX_TMPDIR overrides it. Private-socket tests
+# Never let a bare `tmux` reach the developer's real default server. Run from
+# inside a tmux pane (or with TMUX unset), an untargeted tmux command resolves
+# to that server's "current" session -- `cctrl restart` once SIGTERMed the
+# agent of the session running this suite that way (plan 071 p5 incident).
+# Every tmux call below therefore sees a private, initially empty socket dir;
+# the guard test test_tmux_default_server_is_private proves it. mktemp under
+# /tmp, not $TMPDIR: macOS $TMPDIR is long enough that a -L socket path
+# beneath it would overflow sun_path (104 bytes).
+unset TMUX TMUX_PANE
+CCTRL_TEST_TMUX_TMPDIR="$(mktemp -d /tmp/cctrl-test-tmux.XXXXXX)" \
+    || { echo "FAIL: could not create a private TMUX_TMPDIR; refusing to run against the real tmux server" >&2; exit 1; }
+export TMUX_TMPDIR="$CCTRL_TEST_TMUX_TMPDIR"
+# Phase-5 --settings overlay files (write + orphan GC) must never touch the
+# real per-user runtime dir: a GC there under a fake tmux would delete live
+# sessions' settings files.
+export CCTRL_RUNTIME_DIR="$TMPDIR/runtime"
+# With TMUX_TMPDIR set above, tmux's socket dir is $TMUX_TMPDIR/tmux-<uid>
+# (not $TMPDIR, this suite's own scratch root). Private-socket tests
 # (test_session_terminate_records_closed, test_session_close_reaps_pane_processes,
 # test_session_stop_exact_identity) clean up into this dir; the guard test
 # below (plan 095) checks nothing cctrl-*-$$-* is left there afterward. The
@@ -36,6 +59,15 @@ _suite_exit() {
         echo "FAIL: test suite aborted (exit $rc) in [${frames:-main}] (call lines: $lines) at: $cmd" >&2
     fi
     [[ -n "$TMPDIR" && -d "$TMPDIR" ]] && rm -rf -- "$TMPDIR"
+    if [[ "${CCTRL_TEST_TMUX_TMPDIR:-}" == /tmp/cctrl-test-tmux.* && -d "$CCTRL_TEST_TMUX_TMPDIR" ]]; then
+        # Every server under the private dir is ours (default or a test's
+        # -L socket); -S pins each one so nothing else is ever addressed.
+        local _sock
+        for _sock in "$CCTRL_TEST_TMUX_TMPDIR"/tmux-*/*; do
+            [[ -S "$_sock" ]] && tmux -S "$_sock" kill-server 2>/dev/null || true
+        done
+        rm -rf -- "$CCTRL_TEST_TMUX_TMPDIR"
+    fi
     return "$rc"
 }
 trap _suite_exit EXIT
@@ -102,6 +134,42 @@ test_tmux_sockets_left_behind() {
     [[ "${#leftover[@]}" -eq 0 ]] \
         || fail "test suite left tmux sockets behind in $CCTRL_TEST_TMUX_SOCKET_DIR: ${leftover[*]}"
     echo "ok: no leftover cctrl-* tmux sockets"
+}
+
+test_tmux_default_server_is_private() {
+    # Plan 071 p5 incident guard: a bare `tmux` anywhere in the suite (a
+    # test, or cctrl/wrapper code under test) must land on this run's own
+    # private server, never the developer's real default one -- an
+    # untargeted command there acts on whichever real session is "current".
+    [[ -z "${TMUX:-}" && -z "${TMUX_PANE:-}" ]] || fail "TMUX/TMUX_PANE leaked into the suite"
+    [[ "${TMUX_TMPDIR:-}" == "$CCTRL_TEST_TMUX_TMPDIR" && "$TMUX_TMPDIR" == /tmp/cctrl-test-tmux.* ]] \
+        || fail "TMUX_TMPDIR is not the suite's private dir: ${TMUX_TMPDIR:-<unset>}"
+    [[ "$CCTRL_TEST_TMUX_SOCKET_DIR" == "$TMUX_TMPDIR/"* ]] \
+        || fail "private-socket tests would use a shared socket dir: $CCTRL_TEST_TMUX_SOCKET_DIR"
+    [[ "${CCTRL_RUNTIME_DIR:-}" == "$TMPDIR/"* ]] || fail "CCTRL_RUNTIME_DIR is not sandboxed"
+
+    local real_tmux sock private
+    real_tmux="$(command -v tmux || true)"
+    if [[ -n "$real_tmux" ]]; then
+        "$real_tmux" -f /dev/null new-session -d -s cctrl-guard 'sleep 60' \
+            || fail "could not start a session on the private default server"
+        sock="$("$real_tmux" display-message -p -t '=cctrl-guard:' '#{socket_path}' 2>/dev/null || true)"
+        "$real_tmux" kill-server 2>/dev/null || true
+        private="$(cd "$TMUX_TMPDIR" && pwd -P)"
+        [[ "$sock" == "$private/"* || "$sock" == "$TMUX_TMPDIR/"* ]] \
+            || fail "bare tmux resolved outside the private dir: ${sock:-<none>}"
+    fi
+
+    # Static half: an untargeted display-message falls back to the default
+    # server's current pane. Only the TMUX-guarded, ancestry-checked helper
+    # may use one.
+    local hits
+    hits="$(grep -nE 'tmux display-message( -p)? ' "$ROOT/cctrl" "$ROOT"/lib/*.sh \
+        | grep -v -- ' -t ' | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+        | grep -v "display-message -p '#{session_name}' 2>/dev/null$" || true)"
+    [[ -z "$hits" ]] || fail "untargeted tmux display-message (resolves to the real current pane):
+$hits"
+    echo "ok: bare tmux in the suite hits a private server; no untargeted display-message in shipped code"
 }
 
 # "Tests did not touch the real live store" guards (plan 090). Each guarded
@@ -568,7 +636,13 @@ case "${1:-}" in
         exit 0
         ;;
     list-sessions)
-        if [[ -n "${TMUX_FAKE_SESSIONS:-}" ]]; then
+        if [[ "${TMUX_FAKE_LIST_SESSIONS_FAIL:-}" == "1" ]]; then
+            echo "no server running on this socket" >&2
+            exit 1
+        fi
+        if [[ -n "${TMUX_FAKE_STATE:-}" && -f "${TMUX_FAKE_STATE:-/dev/null}" ]]; then
+            cut -d: -f2- "$TMUX_FAKE_STATE"
+        elif [[ -n "${TMUX_FAKE_SESSIONS:-}" ]]; then
             for session in $TMUX_FAKE_SESSIONS; do
                 printf '%s\n' "$session"
             done
@@ -1069,7 +1143,12 @@ test_launch_args() {
     assert_contains "$out" "ARG[2]=--last"
     assert_contains "$out" "ARG[3]=continue bug"
 
-    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --model sonnet --yolo --no-bridge -m "fix bug")"
+    # --profile none: this test isn't exercising profile resolution, and
+    # invoking "$ROOT/cctrl" directly without an explicit --profile falls
+    # through to whatever legacy/default profile this machine happens to
+    # have (see the phase-4 handoff hazard note) -- which, as of phase 5,
+    # would add a --settings flag and shift every ARG index below.
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --profile none --model sonnet --yolo --no-bridge -m "fix bug")"
     assert_contains "$out" "CMD=claude"
     assert_contains "$out" "ARG[0]=--permission-mode"
     assert_contains "$out" "ARG[1]=bypassPermissions"
@@ -1250,6 +1329,209 @@ test_shortcut_profile_none_is_explicit_no_overlay() {
     assert_contains "$out" "CMD=claude"
     assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE=none"
     assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE_SOURCE=shortcut"
+}
+
+test_profile_settings_file_written_scoped_and_not_in_argv() {
+    # plan 071 phase 5 (D5/D8): a resolved profile gets a per-session
+    # --settings overlay file (0600, dir 0700) in addition to the phase-4
+    # process-env overlay. The secret value must land only in that file,
+    # never inline in argv (ps-visible), and every unused provider key is
+    # neutralised to "" so it can't fall through to a contaminated global
+    # settings.json.
+    make_fake_agent "$TMPDIR/claude" claude
+    local profiles="$TMPDIR/settings-write-profiles" runtime="$TMPDIR/settings-write-runtime"
+    mkdir -p "$profiles"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_AUTH_TOKEN":"sekrit-token-value"}}}}\n' \
+        > "$profiles/work.json"
+
+    local out
+    out="$(CCTRL_PROFILES_DIR="$profiles" CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile work -m scrub)"
+
+    assert_not_contains "$out" "sekrit-token-value"
+
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    [[ -d "$dir" ]] || fail "profile-settings dir was not created"
+    local mode
+    mode="$(stat -f '%Lp' "$dir" 2>/dev/null || stat -c '%a' "$dir")"
+    [[ "$mode" == "700" ]] || fail "profile-settings dir should be 0700, got $mode"
+
+    local settings_path
+    settings_path="$(printf '%s\n' "$out" \
+        | awk -F= '/^ARG\[[0-9]+\]=--settings$/{getline; sub(/^ARG\[[0-9]+\]=/, ""); print; exit}')"
+    [[ -n "$settings_path" ]] || fail "no --settings path found in argv: $out"
+    [[ -f "$settings_path" ]] || fail "--settings path does not exist: $settings_path"
+
+    mode="$(stat -f '%Lp' "$settings_path" 2>/dev/null || stat -c '%a' "$settings_path")"
+    [[ "$mode" == "600" ]] || fail "settings file should be 0600, got $mode"
+
+    jq -e '.env.CLAUDE_CODE_USE_BEDROCK == "1"' "$settings_path" >/dev/null \
+        || fail "settings file missing the profile's own set key"
+    jq -e '.env.ANTHROPIC_AUTH_TOKEN == "sekrit-token-value"' "$settings_path" >/dev/null \
+        || fail "settings file missing the profile's secret value"
+    jq -e '.env.CLAUDE_CODE_USE_VERTEX == ""' "$settings_path" >/dev/null \
+        || fail "settings file should neutralise an unused provider key to \"\""
+}
+
+test_profile_settings_none_profile_no_file() {
+    # Profile "none" relies solely on the phase-4 scrub -- no --settings
+    # file or flag.
+    make_fake_agent "$TMPDIR/claude" claude
+    local runtime="$TMPDIR/settings-none-runtime"
+    local out
+    out="$(CCTRL_RUNTIME_DIR="$runtime" FAKE_AGENT_ENV_NAMES="CCTRL_PROFILE_SETTINGS_FILE" \
+        PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --profile none -m scrub)"
+    assert_contains "$out" "ENV_CCTRL_PROFILE_SETTINGS_FILE=<unset>"
+    assert_not_contains "$out" "--settings"
+}
+
+test_profile_settings_gc_removes_dead_keeps_live() {
+    # D5/R3: the orphan sweep removes a dead fg-<pid> file and a dead
+    # tmux-session-named file, but keeps one whose tmux session is live.
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    local runtime="$TMPDIR/settings-gc-runtime"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    mkdir -p "$dir"
+    printf '{"env":{}}\n' > "$dir/fg-999999.json"
+    printf '{"env":{}}\n' > "$dir/TMUX--gc-dead.json"
+    # Old enough to clear the age gate (test_profile_settings_gc_removes_dead_only_after_age_threshold
+    # covers the "too fresh to remove" case on its own).
+    touch -t 202001010000 "$dir/TMUX--gc-dead.json"
+    printf '{"env":{}}\n' > "$dir/TMUX--gc-live.json"
+    local state="$TMPDIR/settings-gc-state"
+    printf '%s\n' '$0:TMUX--gc-live' > "$state"
+
+    CCTRL_RUNTIME_DIR="$runtime" TMUX_FAKE_STATE="$state" PATH="$TMPDIR:$PATH" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile none -m gc >/dev/null
+
+    [[ ! -f "$dir/fg-999999.json" ]] || fail "GC should remove a dead fg-pid settings file"
+    [[ ! -f "$dir/TMUX--gc-dead.json" ]] || fail "GC should remove a settings file for a dead tmux session"
+    [[ -f "$dir/TMUX--gc-live.json" ]] || fail "GC should keep a settings file for a live tmux session"
+}
+
+test_profile_settings_gc_skips_sweep_when_list_sessions_fails() {
+    # Review hardening (p5 incident): `tmux has-session` returning nonzero is
+    # ambiguous -- it also fails when tmux is missing, times out, or this
+    # process is pointed at a different/wrong socket, none of which mean the
+    # session is dead. So the whole sweep must be skipped unless
+    # `tmux list-sessions` first proves this server is actually reachable.
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    local runtime="$TMPDIR/settings-gc-unreachable-runtime"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    mkdir -p "$dir"
+    printf '{"env":{}}\n' > "$dir/TMUX--gc-dead.json"
+    touch -t 202001010000 "$dir/TMUX--gc-dead.json"
+
+    CCTRL_RUNTIME_DIR="$runtime" TMUX_FAKE_LIST_SESSIONS_FAIL=1 PATH="$TMPDIR:$PATH" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile none -m gc >/dev/null
+
+    [[ -f "$dir/TMUX--gc-dead.json" ]] || fail "GC must not sweep when tmux list-sessions fails (server unreachable)"
+}
+
+test_profile_settings_gc_removes_dead_only_after_age_threshold() {
+    # Review hardening (p5 incident): even a confirmed-absent session's file
+    # is only removed once it's at least 10 minutes old, so a transient
+    # has-session blip can't explain away a just-written file.
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    local runtime="$TMPDIR/settings-gc-age-runtime"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    mkdir -p "$dir"
+    printf '{"env":{}}\n' > "$dir/TMUX--gc-fresh-dead.json"
+    printf '{"env":{}}\n' > "$dir/TMUX--gc-old-dead.json"
+    touch -t 202001010000 "$dir/TMUX--gc-old-dead.json"
+
+    CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile none -m gc >/dev/null
+
+    [[ -f "$dir/TMUX--gc-fresh-dead.json" ]] || fail "GC should not remove a dead session's file before the age threshold"
+    [[ ! -f "$dir/TMUX--gc-old-dead.json" ]] || fail "GC should remove a dead session's file once it's old enough"
+}
+
+test_profile_settings_wrapper_removes_file_on_exit() {
+    # D5: both the wrapper's signal trap and its normal exit path remove
+    # the --settings overlay file so it doesn't outlive the session.
+    local bin="$TMPDIR/wrap-settings-bin" settings="$TMPDIR/wrap-settings-file.json"
+    mkdir -p "$bin"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$bin/claude"
+    chmod +x "$bin/claude"
+    printf '{"env":{}}\n' > "$settings"
+
+    CCTRL_EARLY_EXIT_WINDOW_SECONDS=0 CCTRL_PROFILE_SETTINGS_FILE="$settings" \
+        PATH="$bin:$PATH" "$ROOT/lib/session-wrapper.sh" claude "$TMPDIR/wrap-settings-marker" --flag \
+        >/dev/null 2>&1
+
+    [[ ! -f "$settings" ]] || fail "wrapper exit should remove the profile-settings file"
+}
+
+test_profile_settings_restart_regenerates_file() {
+    # cmd_restart writes a fresh settings file from the session's current
+    # profile before the restart marker, so a profile edit (profile
+    # save/use) takes effect on the restarted ("fresh config") agent
+    # instead of the stale file the original launch wrote.
+    local profiles="$TMPDIR/restart-settings-profiles" runtime="$TMPDIR/restart-settings-runtime"
+    mkdir -p "$profiles"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}}}\n' > "$profiles/work.json"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    mkdir -p "$dir"
+    printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":""}}\n' > "$dir/TMUX--restart-settings.json"
+    local marker="$TMPDIR/restart-settings-marker"
+    # cmd_restart stops the agent it runs under; this test runs under no
+    # session at all, so it must go through the fake tmux and find nothing
+    # to stop (the real tmux here once killed the suite's own session).
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/restart-settings-tmux.log" out
+    : > "$log"
+
+    out="$(CLAUDE_CODE_SESSION_ID="sess-restart-settings" CCTRL_RESTART_MARKER="$marker" \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="TMUX--restart-settings" \
+        CCTRL_SESSION_PROFILE=work CCTRL_PROFILES_DIR="$profiles" CCTRL_RUNTIME_DIR="$runtime" \
+        PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1)"
+
+    assert_contains "$out" "Could not locate this session's agent process"
+    assert_not_contains "$out" "Restarting with fresh config in 3s"
+    [[ -f "$marker" ]] || fail "restart marker was not written"
+    [[ "$(cat "$marker")" == "sess-restart-settings" ]] || fail "marker should hold the resolved session id"
+    jq -e '.env.CLAUDE_CODE_USE_BEDROCK == "1"' "$dir/TMUX--restart-settings.json" >/dev/null \
+        || fail "cmd_restart should regenerate the settings file from the current profile"
+}
+
+test_restart_write_failure_warns_but_restarts() {
+    # Review hardening (p5 incident item 2): a refused profile-settings dir
+    # must not silently abort the restart under set -e before the marker is
+    # written. It should warn and let the restart continue.
+    local profiles="$TMPDIR/restart-write-fail-profiles" runtime="$TMPDIR/restart-write-fail-runtime"
+    mkdir -p "$profiles" "$runtime"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}}}\n' > "$profiles/work.json"
+    # A regular file where the profile-settings dir needs to be created makes
+    # `mkdir -p` fail, simulating a refused/unwritable runtime dir.
+    printf 'not a directory\n' > "$runtime/cctrl-$(id -u)"
+    local marker="$TMPDIR/restart-write-fail-marker"
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/restart-write-fail-tmux.log"
+    : > "$log"
+
+    local out
+    out="$(CLAUDE_CODE_SESSION_ID="sess-restart-write-fail" CCTRL_RESTART_MARKER="$marker" \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="TMUX--restart-write-fail" \
+        CCTRL_SESSION_PROFILE=work CCTRL_PROFILES_DIR="$profiles" CCTRL_RUNTIME_DIR="$runtime" \
+        PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1)"
+
+    assert_contains "$out" "WARN"
+    [[ -f "$marker" ]] || fail "restart marker was not written despite the settings-write failure"
+    [[ "$(cat "$marker")" == "sess-restart-write-fail" ]] || fail "marker should hold the resolved session id"
+}
+
+test_agent_model_py_settings_flag() {
+    # lib/agent_model.py: --settings is a value-taking flag so a --settings
+    # <path> ahead of --model never swallows --model as its own value.
+    local out
+    out="$(printf '%s' "claude --settings /tmp/p.json --model opus-5" \
+        | python3 "$ROOT/lib/agent_model.py" claude 2>&1)" \
+        || fail "agent_model.py invocation failed: $out"
+    [[ "$out" == "opus-5" ]] || fail "expected model 'opus-5', got '$out'"
 }
 
 test_agent_prompt_without_default() {
@@ -1857,8 +2139,11 @@ test_profile_prompt_overrides_global_default() {
     assert_contains "$out" "Choose agent runtime:"
     assert_contains "$out" "CMD=claude"
     assert_contains "$out" "ARG[0]=--permission-mode"
-    assert_contains "$out" "ARG[2]=--chrome"
-    assert_contains "$out" "ARG[3]=profile picked claude"
+    # The resolved "personal" profile (even with an empty env) gets a phase-5
+    # --settings overlay file, shifting --chrome/the prompt two slots later.
+    assert_contains "$out" "ARG[2]=--settings"
+    assert_contains "$out" "ARG[4]=--chrome"
+    assert_contains "$out" "ARG[5]=profile picked claude"
 }
 
 test_resolve_profile_precedence() {
@@ -11727,6 +12012,9 @@ SH
     echo "ok: task inventory is provider-neutral, stable-identity fused, capability explicit, partial, and read-only"
 }
 
+# Before any test, focused group or not (plan 071 p5 incident).
+test_tmux_default_server_is_private
+
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
         session-prune)
@@ -11933,6 +12221,15 @@ test_launch_env_scrub_codex
 test_launch_env_scrub_source_label_not_inherited
 test_launch_env_scrub_dir_adopted_profile_source_handoff
 test_shortcut_profile_none_is_explicit_no_overlay
+test_profile_settings_file_written_scoped_and_not_in_argv
+test_profile_settings_none_profile_no_file
+test_profile_settings_gc_removes_dead_keeps_live
+test_profile_settings_gc_skips_sweep_when_list_sessions_fails
+test_profile_settings_gc_removes_dead_only_after_age_threshold
+test_profile_settings_wrapper_removes_file_on_exit
+test_profile_settings_restart_regenerates_file
+test_restart_write_failure_warns_but_restarts
+test_agent_model_py_settings_flag
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
 test_resolve_profile_precedence

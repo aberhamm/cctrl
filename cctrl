@@ -841,6 +841,145 @@ _profile_auth_backend() {
     printf '%s' "${result:-subscription}"
 }
 
+# Plan 071 phase 5 (D5/D8): per-session --settings overlay files. These live
+# outside the repo/XDG config in uid-scoped OS runtime space, since a
+# profile's secrets end up written here in plaintext (0600) for the agent to
+# read via --settings -- never inline in argv (visible via ps) and never in
+# the repo or ~/.config.
+#
+# <runtime_tmp>: getconf DARWIN_USER_TEMP_DIR on macOS (stable across tmux,
+# SSH, launchd, --host -- unlike $TMPDIR, which varies by shell/session), or
+# ${TMPDIR:-/tmp} elsewhere. Resolved once here; every other phase-5 site
+# (write, GC, cmd_restart) goes through this or _profile_settings_dir, never
+# a bare $TMPDIR.
+_cctrl_runtime_dir() {
+    # Test/CI seam: a fixed override takes priority over the real
+    # per-UID OS runtime dir, so tests never write (or GC-sweep) into the
+    # dev box's actual shared temp space -- real launches never set this.
+    if [[ -n "${CCTRL_RUNTIME_DIR:-}" ]]; then
+        printf '%s' "${CCTRL_RUNTIME_DIR%/}"
+        return 0
+    fi
+    local dir=""
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]] && command -v getconf >/dev/null 2>&1; then
+        dir="$(getconf DARWIN_USER_TEMP_DIR 2>/dev/null || true)"
+    fi
+    [[ -n "$dir" ]] || dir="${TMPDIR:-/tmp}"
+    printf '%s' "${dir%/}"
+}
+
+_profile_settings_dir() {
+    printf '%s/cctrl-%s/profile-settings' "$(_cctrl_runtime_dir)" "$(id -u)"
+}
+
+# Create (if needed) and sanity-check the profile-settings dir: 0700, owned
+# by the current user. Refuses rather than writing into shared uid-scoped
+# tmp space it doesn't actually own.
+_profile_settings_ensure_dir() {
+    local dir="$1"
+    ( umask 077 && mkdir -p "$dir" ) || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    local owner
+    owner="$(stat -f '%u' "$dir" 2>/dev/null || stat -c '%u' "$dir" 2>/dev/null || true)"
+    [[ -n "$owner" && "$owner" == "$(id -u)" ]] || return 1
+    return 0
+}
+
+# Write a profile's --settings overlay file for one launch/restart (claude
+# only -- codex has no --settings mechanism here). Built from the same
+# _profile_overlay_json_for_agent used by the process-env overlay, plus an
+# explicit "" for every CCTRL_PROVIDER_ENV_KEYS entry the profile itself
+# doesn't set (so an unset provider key is neutralised rather than falling
+# through to whatever the global settings.json happens to have -- the spike
+# in docs/findings/profile-settings-spike.md confirmed --settings merges its
+# env per-key with the global settings.json, not block-replace, so no other
+# global env keys need copying here).
+#   $1=agent $2=profile_file(may be empty/none) $3=key (tmux session name, or
+#   fg-$$ for a foreground launch -- see _profile_settings_gc for how the key
+#   is later classified as live/dead)
+# Prints the written file's absolute path on success; prints nothing and
+# returns nonzero on any failure (missing jq, dir refusal, etc).
+_profile_settings_write() {
+    local agent="$1" pf="${2:-}" key="$3"
+    [[ "$agent" == "claude" ]] || return 0
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -n "$key" ]] || return 1
+
+    local dir
+    dir="$(_profile_settings_dir)"
+    _profile_settings_ensure_dir "$dir" || return 1
+
+    local overlay provider_keys_json
+    overlay="$(_profile_overlay_json_for_agent "$agent" "$pf")"
+    provider_keys_json="$(printf '%s\n' "${CCTRL_PROVIDER_ENV_KEYS[@]}" | jq -R . | jq -s .)"
+
+    local file="$dir/${key}.json" tmp="$dir/.${key}.json.tmp.$$"
+    jq -n --argjson overlay "$overlay" --argjson keys "$provider_keys_json" '
+        ($keys | map({(.): ""}) | add // {}) as $neutral
+        | {env: ($neutral + $overlay.env)}
+    ' > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    printf '%s' "$file"
+}
+
+# Orphan sweep (D5, R3): a key of the form fg-<pid> is removed once that pid
+# is dead; any other key is a tmux session name and is removed once no live
+# tmux session on this server has it (exact match -- tmux -t falls back to a
+# prefix match otherwise, see tmux-target-prefix-match) AND the file is at
+# least 10 minutes old. Run on every launch (before writing a fresh file) and
+# from _session_prune, so crashed/killed sessions' files don't pile up in
+# shared uid-scoped tmp space.
+#
+# `tmux has-session` returning nonzero is ambiguous: it also fails when tmux
+# is missing, times out, or this process is pointed at a different/wrong
+# socket -- none of which mean the session is dead. A foreground launch
+# outside tmux hit exactly that ambiguity (p5 incident review). So, for any
+# tmux-session-named key: (1) it's only treated as dead once `tmux
+# list-sessions` first proves this server is actually reachable (an
+# unreachable server leaves those files alone; it doesn't make tmux reachable
+# just to check `fg-<pid>` keys below, which never needed tmux at all), and
+# (2) even a confirmed-absent session's file is only removed once it's old
+# enough that a transient blip can't explain it.
+#
+# Live names are listed ONCE (not `has-session` per file, exact-match
+# membership against that one list in-process instead) -- this ran one `tmux`
+# subprocess per accumulated dead file every time GC ran, and the age gate
+# above means dead files now stick around for minutes rather than being swept
+# on first sight, so the backlog (and the per-file subprocess cost) can grow
+# across a long-running caller instead of staying near-empty.
+_profile_settings_gc() {
+    local dir
+    dir="$(_profile_settings_dir)"
+    [[ -d "$dir" ]] || return 0
+    local tmux_reachable=false live=""
+    live="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" && tmux_reachable=true
+    local -A live_set=()
+    if $tmux_reachable; then
+        local _name
+        while IFS= read -r _name; do
+            [[ -n "$_name" ]] && live_set["$_name"]=1
+        done <<< "$live"
+    fi
+
+    local f key pid now mtime age
+    now="$(date +%s)"
+    for f in "$dir"/*.json; do
+        [[ -e "$f" ]] || continue
+        key="$(basename "$f" .json)"
+        if [[ "$key" =~ ^fg-([0-9]+)$ ]]; then
+            pid="${BASH_REMATCH[1]}"
+            kill -0 "$pid" 2>/dev/null || rm -f "$f"
+        else
+            $tmux_reachable || continue
+            [[ -n "${live_set[$key]+x}" ]] && continue
+            mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || continue
+            age=$(( now - mtime ))
+            (( age >= 600 )) && rm -f "$f"
+        fi
+    done
+}
+
 _profile_summary() {
     local pf="$1" claude_model codex_model backend
     local -a parts=()
@@ -965,6 +1104,7 @@ _launch_exec_agent() {
     # provider env, THEN apply the resolved profile's overlay -- before any
     # flag assembly below, so nothing here can observe a leaked host value.
     _launch_prepare_env "$agent" "$pf" "$profile_name" "$profile_source"
+    _profile_settings_gc
 
     export CCTRL_AGENT="$agent"
     if [[ "${CCTRL_SESSION_KIND:-}" != "tmux" ]]; then
@@ -1014,6 +1154,28 @@ _launch_exec_agent() {
             LAUNCH_FLAGS=("--permission-mode" "${LAUNCH_PERMISSION_MODE:-bypassPermissions}")
         fi
         [[ -n "$launch_display_name" ]] && LAUNCH_FLAGS+=("--name" "$launch_display_name")
+
+        # Plan 071 phase 5 (D5/D8): when a profile is set, back it with a
+        # per-session --settings overlay file as well as the process-env
+        # overlay -- belt-and-braces, so a profile's provider choice still
+        # wins even if something downstream of claude's own startup reads
+        # the global settings.json directly. Profile "none" (pf empty) gets
+        # no file; its only protection is the phase-4 scrub.
+        if [[ -n "$pf" ]]; then
+            local _settings_key
+            if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
+                _settings_key="$CCTRL_SESSION_NAME"
+            else
+                _settings_key="fg-$$"
+            fi
+            local _settings_file
+            _settings_file="$(_profile_settings_write "$agent" "$pf" "$_settings_key")"
+            if [[ -n "$_settings_file" ]]; then
+                export CCTRL_PROFILE_SETTINGS_FILE="$_settings_file"
+                LAUNCH_FLAGS+=("--settings" "$_settings_file")
+            fi
+        fi
+
         if [[ "$no_bridge" != "true" ]]; then
             # Bridge name reconciliation: when an explicit session name is set
             # (detached/tmux-managed launches always pass --name), derive the
@@ -14043,10 +14205,40 @@ cmd_restart() {
         return 1
     fi
 
+    # Plan 071 phase 5: regenerate the --settings overlay file from the
+    # session's current profile before restarting, so a profile edit
+    # (cctrl profile save/use) actually takes effect on "fresh config" --
+    # otherwise the restarted agent would keep re-reading the stale file the
+    # original launch wrote. Same key (the tmux session name) as the
+    # original launch, so this overwrites in place rather than littering.
+    local _restart_profile="${CCTRL_SESSION_PROFILE:-none}"
+    if [[ "$_restart_profile" != "none" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
+        local _restart_pf
+        _restart_pf="$(_profile_find "$_restart_profile" 2>/dev/null || true)"
+        if [[ -n "$_restart_pf" ]]; then
+            _profile_settings_write claude "$_restart_pf" "$CCTRL_SESSION_NAME" >/dev/null \
+                || echo -e "${YELLOW}WARN: could not refresh the profile overlay for restart; continuing with the existing file.${RESET}" >&2
+        fi
+    fi
+
+    # Resolve the agent to stop BEFORE writing the marker, from this
+    # process's own ancestry -- never from tmux's "current" pane. An
+    # untargeted `tmux display-message` outside a pane (TMUX unset, e.g.
+    # the test suite) resolves to the default server's most recently active
+    # session and would SIGTERM some unrelated session's agent (p5
+    # incident: it took down the session running the suite).
+    local _agent_pid="" _wrapper_pid="" _found
+    _found="$(_restart_agent_pid 2>/dev/null)" || _found=""
+    read -r _agent_pid _wrapper_pid <<< "$_found" || true
+
     # Write the restart marker. The wrapper reads this after the agent exits.
     printf '%s' "$session_id" > "$marker"
 
     echo -e "${GREEN}✓${RESET} Restart marker written (session: ${DIM}${session_id}${RESET})"
+    if [[ -z "$_agent_pid" ]]; then
+        echo -e "${YELLOW}Could not locate this session's agent process; exit the agent to restart.${RESET}" >&2
+        return 0
+    fi
     echo -e "${DIM}Restarting with fresh config in 3s...${RESET}"
 
     # Schedule the agent process kill in the background so this command
@@ -14055,24 +14247,46 @@ cmd_restart() {
     # with --resume after the agent exits.
     (
         sleep 3
-        # Find the agent process: it's the tmux pane's command's child chain.
-        # The wrapper is the pane command; the agent is its direct child.
-        local _pane_pid _agent_pid
-        _pane_pid="$(tmux display-message -p '#{pane_pid}' 2>/dev/null || true)"
-        if [[ -n "$_pane_pid" ]]; then
-            # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit) —
-            # awk exiting on its first match can SIGPIPE ps mid-write; under
-            # pipefail + set -e that would otherwise abort this background
-            # subshell before it reaches the kill it exists to run (plan 084
-            # re-review of 081).
-            _agent_pid="$(ps -ax -o pid=,ppid= 2>/dev/null \
-                | awk -v pp="$_pane_pid" '$2==pp {print $1; exit}')" || true
-            if [[ -n "$_agent_pid" ]]; then
-                kill -TERM "$_agent_pid" 2>/dev/null || true
-            fi
-        fi
+        # Re-check the pid still belongs under the same wrapper: if the
+        # agent exited meanwhile, the pid may have been reused.
+        local _ppid
+        _ppid="$(ps -o ppid= -p "$_agent_pid" 2>/dev/null | tr -d '[:space:]')" || true
+        [[ "$_ppid" == "$_wrapper_pid" ]] && kill -TERM "$_agent_pid" 2>/dev/null || true
     ) &
     disown
+}
+
+# Print "<agent-pid> <wrapper-pid>" for the agent this process runs under:
+# the ancestor whose parent is a pane process of the cctrl session we are
+# verifiably inside (_session_current_name checks pane ancestry, not just
+# $TMUX), and that pane process must be session-wrapper.sh. Fails -- rather
+# than guessing -- when there is no such session or wrapper.
+_restart_agent_pid() {
+    local sess pane_pid pid ppid self="${BASHPID:-$$}"
+    local -a pane_pids=()
+    sess="$(_session_current_name)" || return 1
+    [[ -n "$sess" ]] || return 1
+    while IFS= read -r pane_pid; do
+        [[ "$pane_pid" =~ ^[0-9]+$ ]] && pane_pids+=("$pane_pid")
+    done < <(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null)
+    [[ ${#pane_pids[@]} -gt 0 ]] || return 1
+
+    pid="$self"
+    while [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 1 )); do
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+        [[ "$ppid" =~ ^[0-9]+$ && "$ppid" != "$pid" ]] || return 1
+        for pane_pid in "${pane_pids[@]}"; do
+            [[ "$ppid" == "$pane_pid" ]] || continue
+            # Never ourselves or cctrl itself (plain shell pane), and only
+            # under the wrapper -- anything else is not a restartable agent.
+            [[ "$pid" != "$self" && "$pid" != "$$" ]] || return 1
+            [[ "$(ps -o command= -p "$ppid" 2>/dev/null)" == *session-wrapper.sh* ]] || return 1
+            printf '%s %s\n' "$pid" "$ppid"
+            return 0
+        done
+        pid="$ppid"
+    done
+    return 1
 }
 
 cmd_rename() {
@@ -14591,6 +14805,10 @@ _session_prune() {
     # already in the habit of passing --force.
     local -r PRUNE_CAP_K=5 PRUNE_CAP_PCT=25
     _session_require_tmux || return 1
+    # Plan 071 phase 5 (D5/R3): piggyback the profile-settings orphan sweep
+    # on the existing stale-session scan, so files from crashed/killed
+    # sessions don't rely solely on launch-time GC to clear out.
+    _profile_settings_gc
 
     local json=false do_close=false force=false allow_large_batch=false older_than="72h" a threshold_ms
     while [[ $# -gt 0 ]]; do
