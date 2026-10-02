@@ -160,18 +160,20 @@ the file across (as with `data/hosts.json`, each machine is its own source of
 truth).
 
 ```bash
-cctrl ls                  # list profiles (* = active default)
-cctrl use <profile>       # set the CCTRL default profile; also merges Claude model+env for compatibility
-cctrl current             # show active default + model/env drift
-cctrl save <name>         # capture current Claude model+env as a new agent-aware profile
-cctrl diff <profile>      # diff current Claude model+env vs a profile
-cctrl rename <old> <new>  # rename a profile
-cctrl edit <profile>      # open in $EDITOR
+cctrl ls                        # list profiles (* = configured default, with auth backend)
+cctrl use <profile>             # set defaultProfile in ~/.config/cctrl/config.json
+cctrl current                   # show the resolved default, its source file, and live sessions by profile
+cctrl save <name>                # capture current Claude model+env as a new agent-aware profile
+cctrl diff <profileA> [profileB]  # diff two profiles, or a profile vs the configured default (secrets redacted)
+cctrl profile rename <old> <new> # rename a profile (plain `cctrl rename` renames a SESSION, not a profile)
+cctrl profile migrate            # one-time: copy repo profiles/ into ~/.config/cctrl/profiles/
+cctrl edit <profile>             # open in $EDITOR
 ```
 
-> `cctrl use` keeps legacy Claude Code compatibility by merging the profile's
-> Claude model/env into `~/.claude/settings.json`. For clean per-session auth
-> switching across Claude and Codex, prefer `cctrl start --profile`.
+> `cctrl use` only sets the configured default for future launches that pick
+> no explicit/shortcut profile. It never touches `~/.claude/settings.json` or
+> any already-running session. For a one-off switch, prefer
+> `cctrl start --profile <name>`.
 
 ## Sessions
 

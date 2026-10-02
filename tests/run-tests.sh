@@ -1219,60 +1219,74 @@ test_host_registry_crud() {
 }
 
 test_profile_use_current_diff() {
-    # `use`, `current`, and `diff` had no direct coverage (only `save`/`rename`
-    # were touched, by the profile-perms test). All three read and WRITE
-    # $HOME/.claude/settings.json — CLAUDE_DIR is derived from HOME with no
-    # override — so HOME is redirected at a fixture dir. Without that, running
-    # this suite would merge a test profile into the developer's real Claude
-    # settings. (CCTRL_SETTINGS is not a variable cctrl reads; HOME is the seam.)
+    # plan 071 phase 3: `use`, `current`, and `diff` moved off
+    # ~/.claude/settings.json. `use` now only writes defaultProfile into the
+    # XDG user config; `current` reports the resolved default plus its
+    # source; `diff` compares two profiles (or a profile vs. the configured
+    # default) instead of a profile vs. settings.json. HOME and
+    # XDG_CONFIG_HOME are both redirected at fixture dirs, and settings.json
+    # is hashed before/after to prove `use` never touches it.
     local rootcopy="$TMPDIR/cctrl-profile-verbs-copy"
     local fakehome="$rootcopy/home"
-    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.claude"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.claude" "$fakehome/.config"
     cp "$ROOT/cctrl" "$rootcopy/cctrl"
     chmod +x "$rootcopy/cctrl"
+    make_fake_tmux "$TMPDIR/tmux"
 
     printf '{"model":"claude-sonnet-5","env":{"KEEP":"yes"}}\n' > "$fakehome/.claude/settings.json"
     printf '{"model":"claude-opus-5","env":{"PROFILE_ONLY":"1"}}\n' > "$rootcopy/profiles/work.json"
     printf '{"model":"claude-sonnet-5","env":{"KEEP":"yes"}}\n' > "$rootcopy/profiles/home.json"
 
-    local out rc
+    local out rc settings_before settings_after
 
     # ls lists both profiles.
-    out="$(HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" ls)"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" ls)"
     assert_contains "$out" "work"
     assert_contains "$out" "home"
 
-    # use sets the active default AND merges the profile's Claude model+env into
-    # settings.json for legacy compatibility. The merge is additive: a key the
-    # profile does not mention survives.
-    HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use work >/dev/null
-    [[ "$(cat "$rootcopy/.active-profile")" == "work" ]] || fail "use did not write .active-profile"
-    jq -e '.model == "claude-opus-5" and .env.PROFILE_ONLY == "1" and .env.KEEP == "yes"' \
-        "$fakehome/.claude/settings.json" >/dev/null \
-        || fail "use should merge the profile's model+env without dropping existing keys"
+    settings_before="$(shasum "$fakehome/.claude/settings.json")"
 
-    # current names the active profile.
-    out="$(HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" current)"
+    # use sets ONLY the configured default; it never touches settings.json or
+    # the legacy .active-profile file.
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use work >/dev/null
+    jq -e '.defaultProfile == "work"' "$fakehome/.config/cctrl/config.json" >/dev/null \
+        || fail "use should write defaultProfile into the XDG user config"
+    settings_after="$(shasum "$fakehome/.claude/settings.json")"
+    [[ "$settings_before" == "$settings_after" ]] || fail "use must never touch ~/.claude/settings.json"
+    [[ ! -f "$rootcopy/.active-profile" ]] || fail "use must not write the legacy .active-profile file"
+
+    # current reports the resolved default (source: default), its model, and
+    # the config file that supplied it.
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" current)"
     assert_contains "$out" "work"
     assert_contains "$out" "claude-opus-5"
+    assert_contains "$out" "source: default"
+    assert_contains "$out" "~/.config/cctrl/config.json"
 
-    # diff reports the delta against another profile; the differing model shows
-    # on both sides and the profile-only env key shows as removed.
-    out="$(HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff home)"
+    # diff compares two named profiles directly.
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff work home)"
     assert_contains "$out" "claude-sonnet-5"
+    assert_contains "$out" "claude-opus-5"
     assert_contains "$out" "PROFILE_ONLY"
+
+    # With no second profile, diff falls back to the configured default.
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff home)"
+    assert_contains "$out" "claude-sonnet-5"
+    assert_contains "$out" "claude-opus-5"
 
     # Unknown profile names fail loudly on both verbs.
     rc=0
-    HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use ghost >/dev/null 2>&1 || rc=$?
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use ghost >/dev/null 2>&1 || rc=$?
     (( rc != 0 )) || fail "expected non-zero exit for 'use' with an unknown profile"
     rc=0
-    HOME="$fakehome" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff ghost >/dev/null 2>&1 || rc=$?
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff ghost >/dev/null 2>&1 || rc=$?
     (( rc != 0 )) || fail "expected non-zero exit for 'diff' with an unknown profile"
-    # The failed switch must not have moved the active default.
-    [[ "$(cat "$rootcopy/.active-profile")" == "work" ]] || fail "a failed 'use' changed the active profile"
+    # The failed 'use' must not have moved the configured default.
+    jq -e '.defaultProfile == "work"' "$fakehome/.config/cctrl/config.json" >/dev/null \
+        || fail "a failed 'use' changed the configured default"
 
-    echo "ok: profile use/current/diff resolve, merge additively, and reject unknown names"
+    echo "ok: profile use/current/diff resolve off XDG config, never touch settings.json, and reject unknown names"
 }
 
 test_profile_xdg_config_home() {
@@ -1436,6 +1450,242 @@ test_profile_migrate() {
     [[ -f "$rootcopy/profiles/beta.json" ]] || fail "--remove-old must not remove a differing beta original"
 
     echo "ok: profile migrate copies/verifies, is idempotent, never overwrites a differing XDG file, --remove-old is identical-only, --dry-run writes nothing, and migrates .active-profile"
+}
+
+test_profile_use_symlinked_user_config() {
+    # N4: the user config may be a dotfiles symlink; `cctrl use` must write
+    # defaultProfile through it (realpath) rather than replacing the link
+    # with a plain file.
+    local rootcopy="$TMPDIR/cctrl-use-symlink-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl" "$rootcopy/dotfiles"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"x","env":{}}\n' > "$rootcopy/profiles/work.json"
+    printf '{}\n' > "$rootcopy/dotfiles/config.json"
+    ln -s "$rootcopy/dotfiles/config.json" "$fakehome/.config/cctrl/config.json"
+
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" use work >/dev/null
+    [[ -L "$fakehome/.config/cctrl/config.json" ]] || fail "use replaced the user config symlink with a plain file"
+    jq -e '.defaultProfile == "work"' "$rootcopy/dotfiles/config.json" >/dev/null \
+        || fail "use should write defaultProfile through the symlink to its target"
+
+    echo "ok: 'cctrl use' writes defaultProfile through a dotfiles symlink without replacing it"
+}
+
+test_profile_current_source_file_and_warnings() {
+    # cmd_current (phase 3) names the config file that supplied defaultProfile,
+    # warns when data/config.local.json overrides the XDG user config, and
+    # warns when the global settings.json env still carries a provider key.
+    local rootcopy="$TMPDIR/cctrl-current-warn-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl" "$fakehome/.claude"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    make_fake_tmux "$TMPDIR/tmux"
+
+    printf '{"model":"x","env":{}}\n' > "$rootcopy/profiles/work.json"
+    printf '{"model":"y","env":{}}\n' > "$rootcopy/profiles/personal.json"
+    printf '{"defaultProfile":"work"}\n' > "$fakehome/.config/cctrl/config.json"
+
+    # CCTRL_USER_CONFIG and CCTRL_CONFIG_LOCAL must both be overridden here:
+    # the harness globally points them at fixed, nonexistent sentinel paths
+    # (shared across the whole suite run) so an unrelated test's CONFIG_FILE
+    # lookups stay inert; this test specifically wants the real XDG user
+    # config and a real data/config.local.json under $rootcopy.
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" \
+        CCTRL_CONFIG_LOCAL="$rootcopy/data/config.local.json" CCTRL_ROOT="$rootcopy" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "~/.config/cctrl/config.json"
+
+    # data/config.local.json (higher precedence) sets a different default:
+    # current should report THAT file and warn about the override.
+    printf '{"defaultProfile":"personal"}\n' > "$rootcopy/data/config.local.json"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" \
+        CCTRL_CONFIG_LOCAL="$rootcopy/data/config.local.json" CCTRL_ROOT="$rootcopy" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "personal"
+    assert_contains "$out" "config.local.json"
+    assert_contains "$out" "WARN"
+    rm -f "$rootcopy/data/config.local.json"
+
+    # A global settings.json leaking a provider key gets its own warning.
+    printf '{"model":"x","env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}\n' > "$fakehome/.claude/settings.json"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" \
+        CCTRL_CONFIG_LOCAL="$rootcopy/data/config.local.json" CCTRL_ROOT="$rootcopy" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "WARN"
+    assert_contains "$out" "settings.json"
+
+    echo "ok: 'cctrl current' names the winning config file and warns on local-override + leaked settings.json provider keys"
+}
+
+test_profile_diff_redaction() {
+    # R4: diff never prints a credential-shaped env value in cleartext, even
+    # though the generated overlay still carries the real secret.
+    local rootcopy="$TMPDIR/cctrl-diff-redact-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"claude-opus-5","env":{"HEALTHCHECKS_API_KEY":"s3cr3t-value","PORTKEY_API_KEY":"another-s3cr3t"}}\n' \
+        > "$rootcopy/profiles/work.json"
+    printf '{"model":"claude-sonnet-5","env":{}}\n' > "$rootcopy/profiles/personal.json"
+
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_ROOT="$rootcopy" "$rootcopy/cctrl" diff work personal)"
+    assert_contains "$out" "<redacted>"
+    if echo "$out" | grep -q 's3cr3t-value\|another-s3cr3t'; then
+        fail "diff must redact credential-shaped env values, not print them"
+    fi
+    assert_contains "$out" "claude-opus-5"
+    assert_contains "$out" "claude-sonnet-5"
+
+    echo "ok: 'cctrl diff' redacts KEY/TOKEN/SECRET/HEADERS/AUTH/PASSWORD-shaped env values"
+}
+
+test_profile_auth_backend_table() {
+    # _profile_auth_backend classifies bedrock / api (key or base URL) /
+    # subscription / codex. Exercised directly via CCTRL_NO_MAIN=1 sourcing.
+    local rootcopy="$TMPDIR/cctrl-auth-backend-copy"
+    local pf="$TMPDIR/cctrl-auth-backend-profiles"
+    mkdir -p "$rootcopy/data" "$pf"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"x","env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}\n' > "$pf/bedrock.json"
+    printf '{"model":"x","env":{"ANTHROPIC_API_KEY":"k"}}\n' > "$pf/apikey.json"
+    printf '{"model":"x","env":{"ANTHROPIC_BASE_URL":"https://gateway.example/v1"}}\n' > "$pf/apibase.json"
+    printf '{"model":"x","env":{}}\n' > "$pf/subscription.json"
+
+    local out
+    out="$(CCTRL_AUTH_BACKEND_FIXTURES="$pf" CCTRL_NO_MAIN=1 bash -c '
+        source "$0"
+        _profile_auth_backend claude "$CCTRL_AUTH_BACKEND_FIXTURES/bedrock.json"
+        echo
+        _profile_auth_backend claude "$CCTRL_AUTH_BACKEND_FIXTURES/apikey.json"
+        echo
+        _profile_auth_backend claude "$CCTRL_AUTH_BACKEND_FIXTURES/apibase.json"
+        echo
+        _profile_auth_backend claude "$CCTRL_AUTH_BACKEND_FIXTURES/subscription.json"
+        echo
+        _profile_auth_backend codex "$CCTRL_AUTH_BACKEND_FIXTURES/subscription.json"
+    ' "$rootcopy/cctrl")"
+
+    local -a lines=()
+    local l
+    while IFS= read -r l; do lines+=("$l"); done <<< "$out"
+    [[ "${#lines[@]}" -eq 5 ]] || fail "expected 5 classification lines, got ${#lines[@]}: $out"
+    [[ "${lines[0]}" == "bedrock" ]] || fail "bedrock profile classified as '${lines[0]}'"
+    [[ "${lines[1]}" == "api" ]] || fail "API-key profile classified as '${lines[1]}'"
+    [[ "${lines[2]}" == "api" ]] || fail "custom-base-URL profile classified as '${lines[2]}'"
+    [[ "${lines[3]}" == "subscription" ]] || fail "no-override profile classified as '${lines[3]}'"
+    [[ "${lines[4]}" == "codex" ]] || fail "codex agent classified as '${lines[4]}'"
+
+    echo "ok: _profile_auth_backend classifies bedrock/api(key)/api(base url)/subscription/codex"
+}
+
+test_profile_use_migrates_legacy_active_profile() {
+    # Plan 071 phase 3: `cctrl use` also runs the shared legacy-migration
+    # helper (previously only `profile migrate` did), removing a
+    # pre-existing .active-profile file as a side effect of its first run.
+    local rootcopy="$TMPDIR/cctrl-use-migrate-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"x","env":{}}\n' > "$rootcopy/profiles/alpha.json"
+    printf 'alpha\n' > "$rootcopy/.active-profile"
+
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" \
+        "$rootcopy/cctrl" use alpha >/dev/null
+    [[ ! -f "$rootcopy/.active-profile" ]] || fail "'cctrl use' should migrate/remove the legacy .active-profile file on its first run"
+    jq -e '.defaultProfile == "alpha"' "$fakehome/.config/cctrl/config.json" >/dev/null \
+        || fail "'cctrl use alpha' should leave defaultProfile set to alpha"
+
+    # profile migrate afterward is a no-op: the legacy file is already gone
+    # and defaultProfile is already set, so nothing changes.
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" \
+        "$rootcopy/cctrl" profile migrate >/dev/null
+    jq -e '.defaultProfile == "alpha"' "$fakehome/.config/cctrl/config.json" >/dev/null \
+        || fail "'profile migrate' after 'use' must not disturb an already-set defaultProfile"
+
+    echo "ok: 'cctrl use' also runs the shared legacy .active-profile migration; a later 'profile migrate' is a no-op"
+}
+
+test_profile_rename_dispatch_and_defaultProfile() {
+    # REGRESSION: plain `cctrl rename` is the SESSION rename, not the profile
+    # one -- `cctrl profile rename` is the only way to rename a profile (plan
+    # 071 phase 3 moved its body into _profile_rename and deleted the
+    # shadowed duplicate `cmd_rename` definition). `_profile_rename` also
+    # follows a renamed profile's defaultProfile pointer.
+    local rootcopy="$TMPDIR/cctrl-rename-dispatch-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    make_fake_tmux "$TMPDIR/tmux"
+
+    printf '{"model":"x","env":{}}\n' > "$rootcopy/profiles/alpha.json"
+    printf '{"defaultProfile":"alpha"}\n' > "$fakehome/.config/cctrl/config.json"
+
+    # Plain `cctrl rename <old> <new>` must NOT rename a profile -- it hits
+    # the session rename, which fails loudly with no matching tmux session,
+    # and must not touch the profile file or defaultProfile. The fake tmux
+    # (empty TMUX_FAKE_SESSIONS/no TMUX_FAKE_STATE) always reports no such
+    # session, so this never depends on the real tmux server.
+    local rc=0
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" rename alpha beta >/dev/null 2>&1 || rc=$?
+    (( rc != 0 )) || fail "plain 'cctrl rename alpha beta' should fail (no session named alpha), not silently rename a profile"
+    [[ -f "$rootcopy/profiles/alpha.json" ]] || fail "plain 'cctrl rename' must not touch the profile file"
+    [[ ! -f "$rootcopy/profiles/beta.json" ]] || fail "plain 'cctrl rename' must not rename a profile"
+
+    # cctrl profile rename does the real work (writing the renamed file to
+    # XDG per D9) and follows defaultProfile.
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="" CCTRL_ROOT="$rootcopy" \
+        "$rootcopy/cctrl" profile rename alpha beta >/dev/null
+    [[ ! -f "$rootcopy/profiles/alpha.json" ]] || fail "profile rename should remove the old profile file"
+    [[ -f "$fakehome/.config/cctrl/profiles/beta.json" ]] || fail "profile rename should create the new profile under XDG"
+    jq -e '.defaultProfile == "beta"' "$fakehome/.config/cctrl/config.json" >/dev/null \
+        || fail "profile rename should update defaultProfile when it pointed at the old name"
+
+    echo "ok: plain 'cctrl rename' hits the session rename; 'cctrl profile rename' renames the file (to XDG) and follows defaultProfile"
+}
+
+test_profile_ls_shows_auth_backend_and_current_lists_sessions() {
+    # cmd_ls (phase 3) adds an auth_backend column; cmd_current lists live
+    # cctrl sessions, all grouped under "unknown" until plan 071 phase 6 adds
+    # per-session profile metadata. A fake tmux makes the session list
+    # deterministic instead of depending on whatever is really running.
+    local rootcopy="$TMPDIR/cctrl-ls-backend-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    make_fake_tmux "$TMPDIR/tmux"
+
+    printf '{"model":"x","env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}\n' > "$rootcopy/profiles/work.json"
+    printf '{"model":"y","env":{}}\n' > "$rootcopy/profiles/personal.json"
+
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_ROOT="$rootcopy" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" ls)"
+    assert_contains "$out" "[bedrock]"
+    assert_contains "$out" "[subscription]"
+
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_ROOT="$rootcopy" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--work TMUX--ms--personal" PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "Live sessions by profile"
+    assert_contains "$out" "unknown"
+    assert_contains "$out" "TMUX--ms--work"
+    assert_contains "$out" "TMUX--ms--personal"
+
+    echo "ok: 'cctrl ls' shows an auth_backend column; 'cctrl current' lists live sessions under 'unknown' pre-phase-6"
 }
 
 test_profile_prompt_overrides_global_default() {
@@ -11550,6 +11800,13 @@ test_profile_repo_fallback_and_clash
 test_profile_find_sole_dir_override
 test_profile_writes_and_edit_copy_on_write_use_xdg
 test_profile_migrate
+test_profile_use_symlinked_user_config
+test_profile_use_migrates_legacy_active_profile
+test_profile_current_source_file_and_warnings
+test_profile_diff_redaction
+test_profile_auth_backend_table
+test_profile_rename_dispatch_and_defaultProfile
+test_profile_ls_shows_auth_backend_and_current_lists_sessions
 test_detached_agent_prompt_exports_selection
 test_detached_arg_parsing
 test_live_aware_index_picker

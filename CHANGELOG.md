@@ -41,6 +41,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   directory matches a configured shortcut now also adopts that shortcut's
   profile (previously only its session name/alias was adopted). (plan 071
   phase 2)
+- `cctrl use` only writes `defaultProfile` into `~/.config/cctrl/config.json`
+  now — it no longer merges a profile's model/env into
+  `~/.claude/settings.json`, and no longer writes the legacy
+  `data/.active-profile` (a pre-existing legacy file is migrated to
+  `defaultProfile` the first time `cctrl use` or `cctrl profile migrate`
+  runs). `cctrl ls`/`cctrl current` mark the configured default from this
+  resolver, not the legacy file, and `cctrl ls` adds an auth-backend column.
+  `cctrl current` names the config file that supplied `defaultProfile`, warns
+  when `data/config.local.json` overrides the user config or when
+  `~/.claude/settings.json`'s `env` sets a provider key, and lists live
+  sessions (grouped under `unknown` until plan 071 phase 6 adds per-session
+  profile metadata). `cctrl diff <profileA> [profileB]` now diffs two
+  profiles (or a profile vs. the configured default) instead of a profile vs.
+  `settings.json`, with credential-shaped env values redacted. `cctrl save`
+  refuses the reserved name `none` and no longer writes `.active-profile`.
+  Profile renames move to `cctrl profile rename <old> <new>` (plain `cctrl
+  rename <name> "label"` was already, and remains, the session rename). (plan
+  071 phase 3)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including
@@ -94,6 +112,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `_display_path` (the `~`-for-`$HOME` display helper used by `cctrl current`,
+  `ls`, `profile migrate`, etc.) no longer leaks the REAL process's home
+  directory when a caller runs cctrl with a different `$HOME` (every test
+  fixture that sandboxes it; also any real invocation where `$HOME` differs
+  from the inherited one). The bug: on bash >= 4.x (Homebrew bash 5, first on
+  `PATH` on this fleet) an unquoted `~` in a parameter-expansion's
+  *replacement* text is itself tilde-expanded against the live `$HOME`,
+  rather than kept as a literal character — bash 3.2 doesn't do this, which
+  is how it went unnoticed. (plan 071 phase 3)
 - `cctrl` no longer aborts silently under bash >= 4.1 (e.g. Homebrew bash 5,
   now first on `PATH` on some hosts). A bare `((x++))` whose old value is 0
   evaluates to 0 and returns exit 1 under `set -e`, so several counters and

@@ -106,14 +106,6 @@ DIM='\033[2m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
-_active_profile() {
-    if [[ -f "$ACTIVE_FILE" ]]; then
-        cat "$ACTIVE_FILE"
-    else
-        echo "personal"
-    fi
-}
-
 # Name grammar guards path traversal: a name is always a bare filename
 # component under PROFILES_USER_DIR/PROFILES_REPO_DIR, never a path. "none"
 # is reserved as the resolver's explicit "no overlay" sentinel (save/rename
@@ -273,9 +265,16 @@ _config_jq() {
 }
 
 _display_path() {
-    local path="$1"
-    if [[ -n "${HOME:-}" ]]; then
-        printf '%s' "${path/#$HOME/~}"
+    local path="$1" tilde='~'
+    # Not `${path/#$HOME/~}`: on bash 5.x (homebrew, first on PATH on this
+    # fleet) an unquoted `~` in a parameter-expansion REPLACEMENT is itself
+    # tilde-expanded against the real process HOME, not kept literal -- so a
+    # caller that reassigns HOME (every test fixture that sandboxes it) got
+    # back the real machine's home dir instead of "~". bash 3.2 doesn't do
+    # this, which is how it went unnoticed. Quoting `~` in a plain assignment
+    # suppresses that expansion on both.
+    if [[ -n "${HOME:-}" && "$path" == "$HOME"* ]]; then
+        printf '%s%s' "$tilde" "${path#$HOME}"
     else
         printf '%s' "$path"
     fi
@@ -311,6 +310,25 @@ _config_default_agent() {
 
 _config_default_profile() {
     _config_jq '.defaultProfile // empty'
+}
+
+# Which config file actually supplied defaultProfile, walking highest
+# precedence first (data/config.local.json > user config > data/config.json
+# -- the same order _config_jq's reduce resolves, just stopped at the first
+# hit instead of merged). Empty/non-zero when no file sets it. Used by
+# `cctrl current` to name the winning file and warn on an override.
+_config_default_profile_source_file() {
+    local file value
+    for file in "$CONFIG_LOCAL_FILE" "$CONFIG_USER_FILE" "$CONFIG_FILE"; do
+        [[ -n "$file" && -f "$file" ]] || continue
+        command -v jq >/dev/null 2>&1 || continue
+        value="$(jq -r '.defaultProfile // empty' "$file" 2>/dev/null || true)"
+        if [[ -n "$value" ]]; then
+            printf '%s' "$file"
+            return 0
+        fi
+    done
+    return 1
 }
 
 # Five-step profile resolution for a launch: explicit --profile wins, then a
@@ -697,31 +715,83 @@ _profile_overlay_json_for_agent() {
     ' "$pf" 2>/dev/null
 }
 
+# Provider/auth env keys that identify which backend a profile's `env` talks
+# to. One array shared by `_profile_auth_backend`, `cmd_current` (global
+# settings.json leak warning), and `cmd_diff` (redaction); later phases reuse
+# it for the launch-env scrub keep-logic and the `--settings` "" neutraliser.
+CCTRL_PROVIDER_ENV_KEYS=(
+    CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+    CLAUDE_CODE_SKIP_BEDROCK_AUTH CLAUDE_CODE_SKIP_VERTEX_AUTH CLAUDE_CODE_SKIP_FOUNDRY_AUTH
+    ANTHROPIC_MODEL ANTHROPIC_BASE_URL ANTHROPIC_BEDROCK_BASE_URL ANTHROPIC_VERTEX_BASE_URL
+    ANTHROPIC_FOUNDRY_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_CUSTOM_HEADERS
+    ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL
+    ANTHROPIC_SMALL_FAST_MODEL
+)
+
+# Classify a profile's auth backend for the given agent: subscription (no
+# provider override -- the default), bedrock, vertex, foundry, api (a direct
+# API key/token, or a non-default ANTHROPIC_BASE_URL), or codex (the Claude
+# provider concept doesn't apply). A profile's values may be JSON booleans or
+# strings ("1"/"true"), so truthiness is checked explicitly rather than via
+# jq's own "truthy" rule, which would treat the string "0" as true.
+_profile_auth_backend() {
+    local agent="$1" pf="$2" result
+    if [[ "$agent" != "claude" ]]; then
+        printf 'codex'
+        return 0
+    fi
+    [[ -n "$pf" && -f "$pf" ]] || { printf 'subscription'; return 0; }
+    command -v jq >/dev/null 2>&1 || { printf 'subscription'; return 0; }
+    # A malformed profile must never abort the whole script under set -e --
+    # fall back to "subscription" (the no-overlay default) rather than
+    # propagating jq's parse-error exit status through this command
+    # substitution.
+    result="$(jq -r '
+        def truthy: . as $v
+            | if ($v | type) == "boolean" then $v
+              elif ($v | type) == "number" then ($v != 0)
+              elif ($v | type) == "string" then
+                (($v | ascii_downcase) as $s | ($s == "1" or $s == "true" or $s == "yes" or $s == "on"))
+              else false end;
+        (if has("agents") then ((.env // {}) + (.agents.claude.env // {})) else (.env // {}) end) as $e
+        | if (($e.CLAUDE_CODE_USE_BEDROCK // false) | truthy) then "bedrock"
+          elif (($e.CLAUDE_CODE_USE_VERTEX // false) | truthy) then "vertex"
+          elif (($e.CLAUDE_CODE_USE_FOUNDRY // false) | truthy) then "foundry"
+          elif (($e.ANTHROPIC_API_KEY // "") != "" or ($e.ANTHROPIC_AUTH_TOKEN // "") != "") then "api"
+          elif (($e.ANTHROPIC_BASE_URL // "") != "" and ($e.ANTHROPIC_BASE_URL // "") != "https://api.anthropic.com") then "api"
+          else "subscription"
+          end
+    ' "$pf" 2>/dev/null)" || true
+    printf '%s' "${result:-subscription}"
+}
+
 _profile_summary() {
-    local pf="$1"
+    local pf="$1" claude_model codex_model backend
+    local -a parts=()
     command -v jq >/dev/null 2>&1 || { printf 'model=unknown'; return; }
-    jq -r '
-        def model_for($a):
-            if has("agents") then
-                (.agents[$a].env.ANTHROPIC_MODEL // .agents[$a].model // empty)
-            elif $a == "claude" then
-                (.env.ANTHROPIC_MODEL // .model // empty)
-            else
-                empty
-            end;
-        def provider_for($a):
-            if has("agents") then
-                if (.agents[$a].env.CLAUDE_CODE_USE_BEDROCK // false) then "bedrock" else "direct" end
-            elif $a == "claude" then
-                if (.env.CLAUDE_CODE_USE_BEDROCK // false) then "bedrock" else "direct" end
-            else
-                "direct"
-            end;
-        [
-            (model_for("claude") as $m | if $m != "" then "claude=\($m) via=\(provider_for("claude"))" else empty end),
-            (model_for("codex") as $m | if $m != "" then "codex=\($m)" else empty end)
-        ] | if length > 0 then join("  ") else "model=default" end
-    ' "$pf" 2>/dev/null
+    claude_model="$(jq -r '
+        if has("agents") then (.agents.claude.env.ANTHROPIC_MODEL // .agents.claude.model // empty)
+        else (.env.ANTHROPIC_MODEL // .model // empty) end
+    ' "$pf" 2>/dev/null)"
+    if [[ -n "$claude_model" ]]; then
+        backend="$(_profile_auth_backend claude "$pf")"
+        parts+=("claude=$claude_model via=$backend")
+    fi
+    codex_model="$(jq -r '
+        if has("agents") then (.agents.codex.env.ANTHROPIC_MODEL // .agents.codex.model // empty)
+        else empty end
+    ' "$pf" 2>/dev/null)"
+    [[ -n "$codex_model" ]] && parts+=("codex=$codex_model")
+
+    if [[ ${#parts[@]} -eq 0 ]]; then
+        printf 'model=default'
+        return
+    fi
+    printf '%s' "${parts[0]}"
+    local p
+    for p in "${parts[@]:1}"; do
+        printf '  %s' "$p"
+    done
 }
 
 _launch_apply_profile_args() {
@@ -1092,17 +1162,6 @@ _remote_prefix() {
     fi
 }
 
-_detect_active() {
-    # Profiles are overlays (model + env), not full settings snapshots, so a
-    # whole-file match against the intentionally-richer global settings.json is
-    # no longer meaningful. The active profile is whatever `cctrl use` recorded.
-    if [[ -f "$ACTIVE_FILE" ]]; then
-        cat "$ACTIVE_FILE"
-    else
-        echo "none"
-    fi
-}
-
 # ── Commands ──────────────────────────────────────────────────────────
 
 cmd_use() {
@@ -1121,48 +1180,30 @@ cmd_use() {
         return 1
     fi
 
+    # Promote any pre-existing legacy .active-profile to defaultProfile before
+    # reading/overwriting it, so a first-ever `use` on a machine that still has
+    # the legacy file doesn't silently discard it. Idempotent (phase 1); a
+    # no-op once the file is gone.
+    _legacy_active_profile_migrate
+
     local prev
-    prev="$(_active_profile)"
+    prev="$(_config_default_profile 2>/dev/null || true)"
 
-    if [[ "$prev" == "$name" ]]; then
-        echo -e "${DIM}Already on profile: ${BOLD}$name${RESET}"
-        return 0
-    fi
+    # D9: this only sets the configured default for FUTURE launches with no
+    # explicit/shortcut profile; it never touches ~/.claude/settings.json or
+    # any already-running session. For a clean one-off switch, prefer
+    # `cctrl start --profile`.
+    _config_user_set_default_profile "$name"
+    _log_switch "${prev:-none}" "$name"
 
-    # Overlay the profile's Claude model + env onto the existing global settings.json
-    # (non-destructive: hooks, permissions, mcpServers, etc. are preserved).
-    # Note: env is merged, so switching profiles cannot UNSET a key a prior
-    # profile added. For clean per-session auth, prefer `cctrl start --profile`.
-    local pf tmp
-    pf="$(_profile_find "$name")"
-    tmp="$(mktemp)"
-    if [[ -f "$SETTINGS" ]]; then
-        jq -s '.[0] as $g | .[1] as $p
-               | $g + {model: ($p.model // $g.model),
-                       env: (($g.env // {}) + ($p.env // {}))}' \
-            "$SETTINGS" <(_profile_overlay_json_for_agent claude "$pf") > "$tmp"
-    else
-        mkdir -p "$(dirname "$SETTINGS")"
-        _profile_overlay_json_for_agent claude "$pf" | jq '{model, env}' > "$tmp"
-    fi
-    if [[ -s "$tmp" ]]; then
-        mv "$tmp" "$SETTINGS"
-    else
-        rm -f "$tmp"
-        echo -e "${RED}Failed to merge profile into settings.${RESET}"; return 1
-    fi
-    echo "$name" > "$ACTIVE_FILE"
-    _log_switch "$prev" "$name"
-
-    echo -e "${GREEN}Switched to profile: ${BOLD}$name${RESET}"
-    echo -e "${DIM}Default CCTRL profile is now '$name'.${RESET}"
-    echo -e "${DIM}Merged Claude model + env into $SETTINGS for Claude Code compatibility.${RESET}"
-    echo -e "${YELLOW}Prefer per-session launches with: cctrl start --profile $name${RESET}"
+    echo -e "${GREEN}Default profile is now: ${BOLD}$name${RESET}"
+    echo -e "${DIM}Written to $(_display_path "$CONFIG_USER_FILE"). Running sessions are unaffected.${RESET}"
+    echo -e "${YELLOW}For a one-off launch on a different profile, use: cctrl start --profile <name>${RESET}"
 }
 
 cmd_ls() {
     local active
-    active="$(_detect_active)"
+    active="$(_default_profile_name)"
 
     local entries
     entries="$(_profile_list)"
@@ -1171,7 +1212,7 @@ cmd_ls() {
         return
     fi
 
-    local line name flag f summary
+    local line name flag f summary backend
     while IFS= read -r line; do
         [[ -n "$line" ]] || continue
         name="${line%% shadowed}"
@@ -1179,11 +1220,12 @@ cmd_ls() {
         [[ "$line" == *" shadowed" ]] && flag=" shadowed"
         f="$(_profile_find "$name")"
         summary="$(_profile_summary "$f")"
+        backend="$(_profile_auth_backend claude "$f")"
 
         if [[ "$name" == "$active" ]]; then
-            echo -e "  ${GREEN}* ${BOLD}$name${RESET}  ${DIM}$summary${RESET}"
+            echo -e "  ${GREEN}* ${BOLD}$name${RESET}  ${DIM}[$backend] $summary${RESET}"
         else
-            echo -e "    $name  ${DIM}$summary${RESET}"
+            echo -e "    $name  ${DIM}[$backend] $summary${RESET}"
         fi
         if [[ -n "$flag" ]]; then
             echo -e "    ${YELLOW}WARN: $name exists in both; using $(_display_path "$PROFILES_USER_DIR")/$name.json${RESET}"
@@ -1191,34 +1233,77 @@ cmd_ls() {
     done <<< "$entries"
 }
 
-cmd_current() {
-    local active
-    active="$(_detect_active)"
-    echo -e "${BOLD}$active${RESET}"
+# Live cctrl-managed sessions, grouped by profile. Pre-phase-6 there is no
+# per-session profile metadata, so every session lands under one "unknown"
+# bucket; phase 6 adds the real grouping once launches record their profile.
+_current_sessions_by_profile() {
+    local names
+    names="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" || return 0
+    [[ -n "$names" ]] || return 0
+    echo ""
+    echo -e "${BOLD}Live sessions by profile:${RESET}"
+    echo -e "  ${DIM}unknown${RESET}"
+    local n
+    while IFS= read -r n; do
+        [[ -n "$n" ]] && echo "    $n"
+    done <<< "$names"
+}
 
-    if _profile_exists "$active"; then
+cmd_current() {
+    local line name source
+    line="$(_resolve_profile "" "")"
+    name="${line%%$'\t'*}"
+    source="${line#*$'\t'}"
+    echo -e "${BOLD}$name${RESET}  ${DIM}(source: $source)${RESET}"
+
+    if [[ "$name" != "none" ]] && _profile_exists "$name"; then
         local pf summary
-        pf="$(_profile_find "$active")"
+        pf="$(_profile_find "$name")"
         summary="$(_profile_summary "$pf")"
         echo -e "${DIM}$summary${RESET}"
 
-        if [[ -z "${CCTRL_PROFILES_DIR:-}" && -f "$PROFILES_USER_DIR/$active.json" && -f "$PROFILES_REPO_DIR/$active.json" ]]; then
-            echo -e "${YELLOW}WARN: $active exists in both; using $(_display_path "$PROFILES_USER_DIR")/$active.json${RESET}"
+        if [[ -z "${CCTRL_PROFILES_DIR:-}" && -f "$PROFILES_USER_DIR/$name.json" && -f "$PROFILES_REPO_DIR/$name.json" ]]; then
+            echo -e "${YELLOW}WARN: $name exists in both; using $(_display_path "$PROFILES_USER_DIR")/$name.json${RESET}"
         fi
+    fi
 
-        if [[ -f "$SETTINGS" ]]; then
-            local sub='{model: (.model // null), env: (.env // {})}'
-            if ! diff -q <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$pf" | jq -S "$sub" 2>/dev/null) &>/dev/null; then
-                echo -e "${YELLOW}Note: live Claude model/env differ from profile '${active}'${RESET}"
+    local source_file
+    if source_file="$(_config_default_profile_source_file)"; then
+        echo -e "${DIM}defaultProfile set in: $(_display_path "$source_file")${RESET}"
+        if [[ "$source_file" == "$CONFIG_LOCAL_FILE" && -n "${CONFIG_USER_FILE:-}" && -f "$CONFIG_USER_FILE" ]]; then
+            local user_default
+            user_default="$(jq -r '.defaultProfile // empty' "$CONFIG_USER_FILE" 2>/dev/null || true)"
+            if [[ -n "$user_default" ]]; then
+                echo -e "${YELLOW}WARN: $(_display_path "$CONFIG_LOCAL_FILE") overrides defaultProfile from $(_display_path "$CONFIG_USER_FILE") ('$user_default').${RESET}"
             fi
         fi
     fi
+
+    if [[ -f "$SETTINGS" ]] && command -v jq >/dev/null 2>&1; then
+        local key leaked=false
+        for key in "${CCTRL_PROVIDER_ENV_KEYS[@]}"; do
+            if jq -e --arg k "$key" '(.env // {}) | has($k)' "$SETTINGS" >/dev/null 2>&1; then
+                leaked=true
+                break
+            fi
+        done
+        if [[ "$leaked" == true ]]; then
+            echo -e "${YELLOW}WARN: $(_display_path "$SETTINGS") env sets provider keys; those apply to every launch until the per-session --settings overlay lands.${RESET}"
+        fi
+    fi
+
+    _current_sessions_by_profile
 }
 
 cmd_save() {
     local name="${1:-}"
     if [[ -z "$name" ]]; then
         echo -e "${RED}Usage: cctrl save <name>${RESET}"
+        return 1
+    fi
+
+    if [[ "$name" == "none" ]]; then
+        echo -e "${RED}'none' is reserved and cannot be used as a profile name.${RESET}"
         return 1
     fi
 
@@ -1239,29 +1324,62 @@ cmd_save() {
     write_pf="$(_profile_write_path "$name")" || return 1
     jq '{agents: {claude: {model: (.model // null), env: (.env // {})}}}' "$SETTINGS" > "$write_pf"
     _profile_secure_perms "$write_pf"
-    echo "$name" > "$ACTIVE_FILE"
     echo -e "${GREEN}Saved current Claude model + env as profile: ${BOLD}$name${RESET}"
 }
 
+# Redact credential-shaped env values so diff output never leaks secrets.
+# Pattern matches the plan's *KEY*|*TOKEN*|*SECRET*|*HEADERS*|*AUTH*|*PASSWORD*
+# (case-insensitive substring), which also covers HEALTHCHECKS_API_KEY.
+_redacted_overlay_json() {
+    local pf="$1" result
+    # Guarded the same way as _profile_auth_backend: under pipefail, a
+    # malformed profile would otherwise make this command substitution
+    # fail and abort the whole script via set -e at the call site.
+    result="$(_profile_overlay_json_for_agent claude "$pf" | jq -S '
+        {model: (.model // null), env: (.env // {})}
+        | .env |= with_entries(
+            if (.key | test("KEY|TOKEN|SECRET|HEADERS|AUTH|PASSWORD"; "i"))
+            then .value = "<redacted>" else . end
+          )
+    ' 2>/dev/null)" || true
+    [[ -n "$result" ]] || result='{"model":null,"env":{}}'
+    printf '%s' "$result"
+}
+
 cmd_diff() {
-    local name="${1:-}"
-    if [[ -z "$name" ]]; then
-        echo -e "${RED}Usage: cctrl diff <profile>${RESET}"
+    local a="${1:-}" b="${2:-}"
+    if [[ -z "$a" ]]; then
+        echo -e "${RED}Usage: cctrl diff <profileA> [profileB]${RESET}"
+        return 1
+    fi
+    if ! _profile_exists "$a"; then
+        echo -e "${RED}Profile '$a' not found.${RESET}"
+        return 1
+    fi
+    if [[ -n "$b" ]] && ! _profile_exists "$b"; then
+        echo -e "${RED}Profile '$b' not found.${RESET}"
         return 1
     fi
 
-    if ! _profile_exists "$name"; then
-        echo -e "${RED}Profile '$name' not found.${RESET}"
-        return 1
+    # With no second profile, compare against the configured default (D9's
+    # resolver, display-only -- never fails closed).
+    local b_name="$b" b_pf=""
+    if [[ -z "$b_name" ]]; then
+        b_name="$(_default_profile_name)"
+        [[ "$b_name" == "none" ]] && echo -e "${DIM}No default profile configured; comparing '$a' against an empty overlay.${RESET}" >&2
     fi
+    [[ "$b_name" != "none" ]] && b_pf="$(_profile_find "$b_name")"
 
     # Compare only the Claude overlay subset (model + env); global settings.json
     # carries hooks/permissions/mcpServers a profile intentionally does not.
-    local sub='{model: (.model // null), env: (.env // {})}'
+    local a_json b_json
+    a_json="$(_redacted_overlay_json "$(_profile_find "$a")")"
+    b_json="$(_redacted_overlay_json "$b_pf")"
+
     if command -v delta &>/dev/null; then
-        delta <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_find "$name")" | jq -S "$sub" 2>/dev/null) || true
+        delta <(printf '%s\n' "$a_json") <(printf '%s\n' "$b_json") || true
     else
-        diff --color=auto <(jq -S "$sub" "$SETTINGS" 2>/dev/null) <(_profile_overlay_json_for_agent claude "$(_profile_find "$name")" | jq -S "$sub" 2>/dev/null) || true
+        diff --color=auto <(printf '%s\n' "$a_json") <(printf '%s\n' "$b_json") || true
     fi
 }
 
@@ -1428,8 +1546,9 @@ cmd_profile() {
         diff) cmd_diff "$@" ;;
         save) cmd_save "$@" ;;
         edit) cmd_edit "$@" ;;
+        rename) _profile_rename "$@" ;;
         ""|-h|--help)
-            echo "Usage: cctrl profile <migrate|ls|use|current|diff|save|edit> [args]"
+            echo "Usage: cctrl profile <migrate|ls|use|current|diff|save|edit|rename> [args]"
             [[ "$sub" == "-h" || "$sub" == "--help" ]] && return 0
             return 1
             ;;
@@ -1498,10 +1617,18 @@ cmd_log() {
     done
 }
 
-cmd_rename() {
+_profile_rename() {
     local old="${1:-}" new="${2:-}"
     if [[ -z "$old" || -z "$new" ]]; then
-        echo -e "${RED}Usage: cctrl rename <old> <new>${RESET}"
+        echo -e "${RED}Usage: cctrl profile rename <old> <new>${RESET}"
+        return 1
+    fi
+    if [[ "$new" == "none" ]]; then
+        echo -e "${RED}'none' is reserved and cannot be used as a profile name.${RESET}"
+        return 1
+    fi
+    if ! _profile_name_valid "$new"; then
+        echo -e "${RED}Invalid profile name: '$new'${RESET}"
         return 1
     fi
 
@@ -1512,9 +1639,12 @@ cmd_rename() {
         fi
         mv "$(_profile_find "$old")" "$(_profile_write_path "$new")"
         _profile_secure_perms "$(_profile_write_path "$new")"
-        # Update active profile tracking if needed
-        if [[ "$(_active_profile)" == "$old" ]]; then
-            echo "$new" > "$ACTIVE_FILE"
+        # Follow the configured default so a rename doesn't leave it pointing
+        # at a name that no longer exists.
+        local configured
+        configured="$(_config_default_profile 2>/dev/null || true)"
+        if [[ "$configured" == "$old" ]]; then
+            _config_user_set_default_profile "$new"
         fi
     else
         echo -e "${YELLOW}Profile '$old' not found on disk; updating log references only.${RESET}"
@@ -3851,13 +3981,25 @@ _launch_detached() {
         fi
         (( rc == 0 )) || return "$rc"
     fi
+    # _active_profile/_detect_active (the legacy .active-profile reader) are
+    # no longer kept current -- phase 3's `cctrl use` only writes
+    # defaultProfile now, never the legacy file -- so an empty $profile here
+    # falls back to the same resolver `cctrl current`/`cctrl ls` use, not the
+    # stale legacy reader. "none" is the resolver's no-overlay sentinel, same
+    # normalization as the explicit --profile case elsewhere in this file.
     local agent_profile="$profile"
-    [[ -n "$agent_profile" ]] || agent_profile="$(_active_profile)"
+    if [[ -z "$agent_profile" ]]; then
+        agent_profile="$(_default_profile_name)"
+        [[ "$agent_profile" == "none" ]] && agent_profile=""
+    fi
     detach_agent="$(_resolve_agent_or_prompt "$detach_agent" "Choose agent runtime" "$agent_profile")" || return 1
     export CCTRL_AGENT="$detach_agent"
     if [[ -n "$peer_identity" ]]; then
         local effective_profile="$profile" profile_agent pf=""
-        [[ -n "$effective_profile" ]] || effective_profile="$(_active_profile)"
+        if [[ -z "$effective_profile" ]]; then
+            effective_profile="$(_default_profile_name)"
+            [[ "$effective_profile" == "none" ]] && effective_profile=""
+        fi
         if [[ -n "$effective_profile" ]] && _profile_exists "$effective_profile"; then
             profile_agent="$(_normalize_agent "$detach_agent")" || return 1
             pf="$(_profile_find "$effective_profile")"
@@ -14504,13 +14646,14 @@ cmd_help() {
     echo -e "${BOLD}cctrl${RESET} — agent session controller"
     echo ""
     echo -e "${BOLD}Profile Management${RESET}"
-    echo "  cctrl use <profile>     Switch to a settings profile (alias: switch)"
-    echo "  cctrl ls                List available profiles"
-    echo "  cctrl current           Show active profile"
+    echo "  cctrl use <profile>     Set the configured default profile (alias: switch)"
+    echo "  cctrl ls                List available profiles (* = configured default)"
+    echo "  cctrl current           Show the resolved default profile, its source, and live sessions"
     echo "  cctrl save <name>       Save current Claude model/env as a profile"
-    echo "  cctrl diff <profile>    Diff current Claude model/env vs a profile"
-    echo "  cctrl rename <old> <new>  Rename a profile"
+    echo "  cctrl diff <profileA> [B]  Diff two profiles, or a profile vs the default"
     echo "  cctrl edit <profile>    Open a profile in \$EDITOR"
+    echo "  cctrl profile rename <old> <new>  Rename a profile (plain 'cctrl rename' is the session rename, below)"
+    echo "  cctrl profile migrate [--dry-run] [--remove-old]  Copy repo profiles/ into ~/.config/cctrl/profiles/"
     echo ""
     echo -e "${BOLD}Session${RESET} ${DIM}(tmux-backed by default; --foreground for one-offs)${RESET}"
     echo "  cctrl start [@name]         Launch selected agent in tmux and attach when interactive"
@@ -14568,6 +14711,7 @@ cmd_help() {
     echo "                              no name = the session you're inside, killed after"
     echo "                              a short grace period (--in N, --now, --force);"
     echo "                              Codex close also archives its app task"
+    echo "  cctrl rename <name> \"label\"  Rename a session's display label (metadata + tmux + app title)"
     echo "  cctrl session kill <name>   Kill by mutable name (legacy/manual)"
     echo "  cctrl session stop-exact <name> --execution-id ID [--json]"
     echo "                              Stop only the execution returned by session ls --json"
@@ -16904,7 +17048,6 @@ _dispatch() {
         close) cmd_session close "$@" ;;
         restart) cmd_restart "$@" ;;
         hooks) cmd_hooks "$@" ;;
-        rename) cmd_rename "$@" ;;
         costs|cost) cmd_costs "$@" ;;
         usage) cmd_usage "$@" ;;
         statusline|status-line) cmd_statusline "$@" ;;
