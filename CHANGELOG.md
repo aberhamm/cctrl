@@ -81,6 +81,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   refused or unwritable profile-settings dir), it warns and continues with
   the existing file rather than silently aborting the restart. (plan 071
   phase 5)
+- A session's resolved profile is now part of its recorded identity, not
+  just its launch argv: metadata gains `profile`, `profile_source`,
+  `auth_backend`, `requested_model`, `claude_config_dir`, and `profile_file`,
+  set for every detached launch (explicit, shortcut, config default, or
+  none) rather than only the dir-adopts-a-shortcut's-profile case. `cctrl
+  session ls`/fleet's `@cctrl_profile`/`@cctrl_auth_backend` tmux options
+  mirror it as a display hint; metadata stays authoritative. A resumed
+  conversation relaunched under a different profile now updates the stored
+  identity instead of keeping the old one. Restore's `launch_flags_for`
+  prefers a session's own recorded `profile` field over re-parsing
+  `launch_command`, falling back to the old argv parse for pre-change
+  records. `session doctor --fix`'s realign now carries the old session's
+  profile/model/peer/no-bridge forward through the same resolver, instead of
+  hand-adding only the corrected `--name`/`--resume` and silently dropping
+  the rest. Known, accepted behavior: a realign or restore replay records
+  the carried-forward profile's `profile_source` as `explicit` (it replays
+  it as a literal `--profile` flag) rather than preserving the original
+  session's shortcut/default/legacy source — the profile name itself is
+  still correct, this is cosmetic. (plan 071 phase 6)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including

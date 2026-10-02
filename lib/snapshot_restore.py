@@ -185,12 +185,12 @@ def select_tmux_source(candidates: list[dict[str, Any]], session: dict[str, Any]
 
 
 @functools.lru_cache(maxsize=4)
-def launch_commands(metadata_dir: str) -> dict[str, str]:
-    """tmux name -> launch_command, first record by sorted path wins (read once per capture)."""
+def launch_records(metadata_dir: str) -> dict[str, dict[str, Any]]:
+    """tmux name -> full metadata record, first record by sorted path wins (read once per capture)."""
     root = Path(metadata_dir)
-    commands: dict[str, str] = {}
+    records: dict[str, dict[str, Any]] = {}
     if not root.is_dir():
-        return commands
+        return records
     for path in sorted(root.glob("*.json")):
         try:
             value = json.loads(path.read_text(encoding="utf-8"))
@@ -198,49 +198,61 @@ def launch_commands(metadata_dir: str) -> dict[str, str]:
             continue
         if not isinstance(value, dict):
             continue
-        command = text(value.get("launch_command"))
-        if not command:
-            continue
         for name in {value.get("tmux_session"), value.get("name")}:
-            if isinstance(name, str) and name and name not in commands:
-                commands[name] = command
-    return commands
+            if isinstance(name, str) and name and name not in records:
+                records[name] = value
+    return records
+
+
+def launch_commands(metadata_dir: str) -> dict[str, str]:
+    """tmux name -> launch_command, derived from launch_records."""
+    return {name: text(record.get("launch_command")) for name, record in launch_records(metadata_dir).items() if text(record.get("launch_command"))}
 
 
 def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]:
     if not tmux_name:
         return {}
-    command = launch_commands(metadata_dir).get(tmux_name)
-    if not command:
-        return {}
-    try:
-        argv = shlex.split(command)
-    except ValueError:
-        return {}
+    record = launch_records(metadata_dir).get(tmux_name, {})
     flags: dict[str, Any] = {}
-    names = {
-        "--model": "model",
-        "--profile": "profile",
-        "--permission-mode": "permission_mode",
-        "--sandbox": "sandbox",
-        "--ask-for-approval": "ask_for_approval",
-        "--peer": "peer",
-        "--agent": "agent",
-    }
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token == "--no-bridge":
-            flags["no_bridge"] = True
-        elif token in names and index + 1 < len(argv):
-            flags[names[token]] = argv[index + 1]
+    command = text(record.get("launch_command"))
+    if command:
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            argv = []
+        names = {
+            "--model": "model",
+            "--profile": "profile",
+            "--permission-mode": "permission_mode",
+            "--sandbox": "sandbox",
+            "--ask-for-approval": "ask_for_approval",
+            "--peer": "peer",
+            "--agent": "agent",
+        }
+        index = 0
+        while index < len(argv):
+            token = argv[index]
+            if token == "--no-bridge":
+                flags["no_bridge"] = True
+            elif token in names and index + 1 < len(argv):
+                flags[names[token]] = argv[index + 1]
+                index += 1
+            else:
+                for option, key in names.items():
+                    if token.startswith(option + "="):
+                        flags[key] = token.split("=", 1)[1]
+                        break
             index += 1
-        else:
-            for option, key in names.items():
-                if token.startswith(option + "="):
-                    flags[key] = token.split("=", 1)[1]
-                    break
-        index += 1
+    # Plan 071 phase 6: the metadata record's own `profile` field (session
+    # identity, set at launch) is more reliable than re-parsing launch_command
+    # -- it is recorded directly rather than reconstructed from argv, and a
+    # pre-change record (no such field) still falls back to the argv parse
+    # above. The caller is still responsible for handling a profile that has
+    # since been renamed or deleted (e.g. the realign path drops it rather
+    # than forwarding a name that would now fail closed).
+    record_profile = record.get("profile")
+    if isinstance(record_profile, str) and record_profile:
+        flags["profile"] = record_profile
     return flags
 
 
@@ -701,6 +713,14 @@ def plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def launch_flags_cmd(args: argparse.Namespace) -> int:
+    # Plan 071 phase 6: shares launch_flags_for with capture() so a bash
+    # caller (doctor's realign) gets the same profile/model/peer/no-bridge
+    # resolution the restore path does, instead of a second hand-rolled copy.
+    print(json.dumps(launch_flags_for(args.metadata_dir, args.name)))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -727,6 +747,10 @@ def main() -> int:
     plan_parser.add_argument("--host-id", required=True)
     plan_parser.add_argument("--hostname", required=True)
     plan_parser.set_defaults(func=plan)
+    flags_parser = sub.add_parser("launch-flags")
+    flags_parser.add_argument("--metadata-dir", required=True)
+    flags_parser.add_argument("--name", required=True)
+    flags_parser.set_defaults(func=launch_flags_cmd)
     args = parser.parse_args()
     try:
         return args.func(args)

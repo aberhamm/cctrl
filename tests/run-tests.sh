@@ -20,6 +20,19 @@ CCTRL_TEST_REAL_HOME="${HOME:?HOME must be set}"
 # /tmp, not $TMPDIR: macOS $TMPDIR is long enough that a -L socket path
 # beneath it would overflow sun_path (104 bytes).
 unset TMUX TMUX_PANE
+# This suite runs FROM a cctrl-managed session as often as not (every
+# worker session is one) -- that session's own launch already exported its
+# profile identity (plan 071 phases 4-6) into this very shell, and a test
+# that spawns a bare subprocess (not through a rootcopy or an explicit env
+# prefix) would otherwise inherit it verbatim, making e.g.
+# test_profile_settings_none_profile_no_file see a stale real
+# CCTRL_PROFILE_SETTINGS_FILE instead of the fresh, unset value its fixture
+# expects. Individual tests still `export` these deliberately for their own
+# fixtures; this only clears what this shell brought in from outside the run.
+unset CCTRL_AGENT CCTRL_PEER CCTRL_TMUX_CONTEXT CCTRL_RESTART_MARKER \
+    CCTRL_PROFILE_SETTINGS_FILE CCTRL_SESSION_KIND CCTRL_SESSION_NAME \
+    CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE CCTRL_SESSION_LAUNCH_ID \
+    CCTRL_SESSION_PROFILE CCTRL_SESSION_PROFILE_SOURCE CCTRL_SESSION_AUTH_BACKEND
 CCTRL_TEST_TMUX_TMPDIR="$(mktemp -d /tmp/cctrl-test-tmux.XXXXXX)" \
     || { echo "FAIL: could not create a private TMUX_TMPDIR; refusing to run against the real tmux server" >&2; exit 1; }
 export TMUX_TMPDIR="$CCTRL_TEST_TMUX_TMPDIR"
@@ -1331,6 +1344,52 @@ test_shortcut_profile_none_is_explicit_no_overlay() {
     assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE_SOURCE=shortcut"
 }
 
+test_detached_launch_writes_profile_identity_fields() {
+    # Plan 071 phase 6: profile becomes part of a detached launch's identity.
+    # Metadata carries profile/profile_source/auth_backend/requested_model/
+    # claude_config_dir/profile_file, and the tmux display options mirror
+    # profile/auth_backend -- for the plain default-profile path (no explicit
+    # --profile, no shortcut), the gap phase 6 closes (previously only a
+    # dir-adopted shortcut profile got this forwarding).
+    mkdir -p "$TMPDIR/p6bin"
+    make_fake_tmux "$TMPDIR/p6bin/tmux"
+    local rootcopy="$TMPDIR/cctrl-p6-copy"
+    local project="$TMPDIR/p6-project"
+    local log="$TMPDIR/p6-tmux.log"
+    local p6meta="$TMPDIR/p6-metadata"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project" "$p6meta"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"model":"sonnet-x","env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}\n' > "$rootcopy/profiles/work.json"
+    printf '{"defaultProfile":"work","defaultAgent":"claude"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    CLAUDE_CONFIG_DIR="$TMPDIR/p6-fake-claude-config" CCTRL_SESSION_METADATA_DIR="$p6meta" \
+        PATH="$TMPDIR/p6bin:$PATH" TMUX_LOG="$log" "$rootcopy/cctrl" start -d "$project" >/dev/null
+
+    local record_file
+    record_file="$(ls "$p6meta"/*.json 2>/dev/null | head -1)"
+    [[ -n "$record_file" ]] || fail "expected a metadata record to be written"
+    local record
+    record="$(cat "$record_file")"
+    assert_contains "$record" '"provider": "claude"'
+    assert_contains "$record" '"profile": "work"'
+    assert_contains "$record" '"profile_source": "default"'
+    assert_contains "$record" '"auth_backend": "bedrock"'
+    assert_contains "$record" '"requested_model": "sonnet-x"'
+    assert_contains "$record" '"claude_config_dir": "'"$TMPDIR"'/p6-fake-claude-config"'
+    # _profile_find resolves SCRIPT_DIR through `cd && pwd` (physical path),
+    # so on macOS this canonicalizes /tmp to /private/tmp -- match the
+    # meaningful suffix rather than the exact (possibly non-canonical) prefix.
+    assert_contains "$record" 'cctrl-p6-copy/profiles/work.json"'
+
+    local tmuxlog
+    tmuxlog="$(cat "$log")"
+    assert_contains "$tmuxlog" "@cctrl_profile work"
+    assert_contains "$tmuxlog" "@cctrl_auth_backend bedrock"
+    echo "ok: detached launch writes profile identity metadata + tmux options"
+}
+
 test_profile_settings_file_written_scoped_and_not_in_argv() {
     # plan 071 phase 5 (D5/D8): a resolved profile gets a per-session
     # --settings overlay file (0600, dir 0700) in addition to the phase-4
@@ -2606,10 +2665,19 @@ JSON
     local prompt_project="$TMPDIR/start-peer-prompt-project"
     mkdir -p "$prompt_project"
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" CCTRL_DEVICE_TAG=peerhost "$ROOT/cctrl" start -d --peer comet --agent codex "$prompt_project" -- "do task")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_EMIT_SESSION=1 CCTRL_DATA_DIR="$data" CCTRL_DEVICE_TAG=peerhost "$ROOT/cctrl" start -d --peer comet --profile none --agent codex "$prompt_project" -- "do task")"
     assert_contains "$out" "CCTRL_SESSION=TMUX--peerhost--start-peer-prompt-project"
     assert_contains "$(cat "$log")" "CCTRL_DEVICE_TAG=peerhost"
+    # Explicit `--profile none` keeps this deterministic regardless of
+    # ambient/legacy profile state (plan 071 phase 6 forwards a resolved
+    # profile into every launch's child argv, so an unpinned profile here
+    # would otherwise depend on test run order -- this call site invokes the
+    # real $ROOT/cctrl directly, so an unpinned profile would fall through to
+    # the live repo's own legacy .active-profile). An explicit --profile
+    # isn't re-injected (only --peer is spliced in, directly before the
+    # first `--`), so the original contiguous assertion still holds.
     assert_contains "$(cat "$log")" "--peer comet -- do\\ task"
+    assert_contains "$(cat "$log")" "--profile none"
 
     local registered_duplicate_project="$TMPDIR/start-peer-registered-duplicate-project"
     rc=0
@@ -3259,6 +3327,31 @@ JSON
     assert_contains "$tmuxlog" "--resume sess_uuid_1"
     # It relaunches as claude (only claude carries the app-name prefix).
     assert_contains "$tmuxlog" "--agent claude"
+}
+
+test_session_doctor_realign_carries_profile_model_peer() {
+    # Plan 071 phase 6: realign must not silently drop the old session's
+    # profile/model/peer -- it reads them back via launch_flags_for instead of
+    # hand-adding only the corrected --name/--resume. profile comes from the
+    # metadata record's own field (preferred over argv); model and peer come
+    # from the argv parse of launch_command (unchanged mechanism).
+    local bin="$TMPDIR/rl6bin" sdir="$TMPDIR/rl6-sessions" relog="$TMPDIR/rl6-relaunch.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+    cat > "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json" <<JSON
+{"name":"TMUX--ms--portal","tmux_session":"TMUX--ms--portal","target":"$TMPDIR/rl-proj","cwd":"$TMPDIR/rl-proj","purpose":"realign me","profile":"work","launch_command":"cctrl start --foreground --model X --peer p"}
+JSON
+    : > "$relog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
+    assert_contains "$out" '"action": "realigned'
+
+    local cmd
+    cmd="$(cat "$relog")"
+    assert_contains "$cmd" '--profile work'
+    assert_contains "$cmd" '--model X'
+    assert_contains "$cmd" '--peer p'
+    echo "ok: realign carries profile/model/peer forward"
 }
 
 # --- plan 021: opt-in autoheal of DEAD remote-control bridges ---------------
@@ -8976,6 +9069,29 @@ JSON
     echo "ok: already-live skipped"
 }
 
+test_launch_flags_for_prefers_metadata_profile() {
+    # Plan 071 phase 6: launch_flags_for prefers the metadata record's own
+    # `profile` field over re-parsing launch_command -- a default-sourced
+    # profile has no `--profile` token in argv at all, so only the metadata
+    # field can recover it for restore/realign. A pre-change record (no such
+    # field) still falls back to the argv parse.
+    local meta="$TMPDIR/p6-launch-flags-meta"
+    mkdir -p "$meta"
+    cat > "$meta/TMUX--default-sourced.json" <<'JSON'
+{"tmux_session":"TMUX--default-sourced","name":"TMUX--default-sourced","launch_command":"cd /tmp && cctrl start --foreground --name TMUX--default-sourced","profile":"work"}
+JSON
+    cat > "$meta/TMUX--pre-change.json" <<'JSON'
+{"tmux_session":"TMUX--pre-change","name":"TMUX--pre-change","launch_command":"cd /tmp && cctrl start --foreground --profile legacy-work --name TMUX--pre-change"}
+JSON
+
+    local out
+    out="$(python3 "$ROOT/lib/snapshot_restore.py" launch-flags --metadata-dir "$meta" --name TMUX--default-sourced)"
+    assert_contains "$out" '"profile": "work"'
+    out="$(python3 "$ROOT/lib/snapshot_restore.py" launch-flags --metadata-dir "$meta" --name TMUX--pre-change)"
+    assert_contains "$out" '"profile": "legacy-work"'
+    echo "ok: launch_flags_for prefers metadata profile, falls back to argv"
+}
+
 test_restore_launch_config_replay() {
     local dir="$TMPDIR/restore-config"
     _restore_fixture "$dir"
@@ -11400,6 +11516,38 @@ test_task_record_relaunch_moves_terminal_anchors() {
     echo "ok: relaunching a task moves its terminal anchors; older receipts cannot roll them back"
 }
 
+test_task_record_relaunch_moves_profile_identity() {
+    # Plan 071 phase 6: resuming a task under a different profile must carry
+    # that profile (and the backend/model/config-dir it implies) forward --
+    # the stored record describes an earlier execution and would otherwise
+    # mislabel the session now actually running under it (same reasoning as
+    # the terminal-anchor move above).
+    local root="$TMPDIR/task-relaunch-profile" meta="$TMPDIR/task-relaunch-profile/meta" data="$TMPDIR/task-relaunch-profile/data"
+    rm -rf "$root"; mkdir -p "$meta" "$data"
+    # shellcheck disable=SC2016 # literal args belong to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_session_write_metadata "TMUX--old" /tmp directory /tmp label purpose prompt cmd "" claude "shared-id-2" "" "profile-a" "explicit" "subscription" "sonnet" "" "/profiles/a.json"'
+    local canonical
+    canonical="$(session_record_path "TMUX--old" "$meta")"
+    jq -e '.profile == "profile-a" and .profile_source == "explicit"' "$canonical" >/dev/null \
+        || fail "expected the initial record to carry profile-a"
+
+    jq '
+        .name="TMUX--new" | .tmux_session="TMUX--new" | .provider_task_id=null | .conversation_id=null |
+        .lifecycle_state="provisional" | .provisional_launch_id="22222222-3333-4444-5555-666666666666" |
+        .created_at="2999-01-01T00:00:00Z" |
+        .profile="profile-b" | .profile_source="default" | .auth_backend="bedrock" |
+        .requested_model="opus" | .claude_config_dir="/custom" | .profile_file="/profiles/b.json" |
+        .ownership_evidence=[]
+    ' "$canonical" > "$meta/launch-22222222-3333-4444-5555-666666666666.json"
+    # shellcheck disable=SC2016 # positional argument belongs to the sourced shell
+    CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
+        cctrl_source_eval '_task_record_promote_legacy "$1" "shared-id-2" >/dev/null' "$meta/launch-22222222-3333-4444-5555-666666666666.json"
+    jq -e '.profile == "profile-b" and .profile_source == "default" and .auth_backend == "bedrock" and .requested_model == "opus" and .claude_config_dir == "/custom" and .profile_file == "/profiles/b.json"' \
+        "$canonical" >/dev/null || fail "resuming under profile-b did not update the stored profile identity"
+    echo "ok: relaunching a task under a new profile updates its stored profile identity"
+}
+
 test_task_record_relaunch_reclaims_and_reopens() {
     # Plan 070 S4: a cctrl terminal relaunch that is newer than the handoff to
     # the app (or than the recorded end) takes ownership back instead of
@@ -12221,6 +12369,7 @@ test_launch_env_scrub_codex
 test_launch_env_scrub_source_label_not_inherited
 test_launch_env_scrub_dir_adopted_profile_source_handoff
 test_shortcut_profile_none_is_explicit_no_overlay
+test_detached_launch_writes_profile_identity_fields
 test_profile_settings_file_written_scoped_and_not_in_argv
 test_profile_settings_none_profile_no_file
 test_profile_settings_gc_removes_dead_keeps_live
@@ -12274,6 +12423,8 @@ test_session_doctor_realign_fix_emits_relaunch
 test_session_doctor_realign_skips_busy
 test_session_doctor_realign_idempotent
 test_session_doctor_realign_real_relaunch
+test_session_doctor_realign_carries_profile_model_peer
+test_launch_flags_for_prefers_metadata_profile
 test_session_autoheal_dry_run_selects_dead_and_no_repair
 test_session_autoheal_skips_unsent_draft
 test_session_autoheal_skips_glyph_draft
@@ -12425,6 +12576,7 @@ test_task_record_schema_v2_and_provisional_promotion
 test_task_record_legacy_validation_and_lazy_promotion
 test_task_record_merge_conflict_preserves_evidence
 test_task_record_relaunch_moves_terminal_anchors
+test_task_record_relaunch_moves_profile_identity
 test_task_record_relaunch_reclaims_and_reopens
 test_task_resolve_conflicts_digest_guarded
 test_tmux_inventory_survives_sanitized_formats

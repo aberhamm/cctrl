@@ -2992,7 +2992,12 @@ else:
         merged["lineage"] = {k: old_lineage.get(k) if old_lineage.get(k) is not None else new_lineage.get(k)
                              for k in ("forked_from_id", "parent_thread_id", "derived_root_id", "derived_root_basis")}
         if terminal_relaunch:
-            for field in ("name", "tmux_session", "control_surface", "pane_id", "pane_pid", "wrapper_pid", "pane_started"):
+            # Plan 071 phase 6: a resumed conversation relaunched under a
+            # different profile carries that profile forward too -- the
+            # stored one describes an earlier execution, same reasoning as
+            # the terminal anchors above.
+            for field in ("name", "tmux_session", "control_surface", "pane_id", "pane_pid", "wrapper_pid", "pane_started",
+                          "profile", "profile_source", "auth_backend", "requested_model", "claude_config_dir", "profile_file"):
                 merged[field] = incoming.get(field)
         combined = list(record.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
         if reclaim:
@@ -3656,6 +3661,10 @@ _session_app_display_name() {
 
 _session_write_metadata() {
     local session_name="$1" cwd="$2" target_kind="$3" target="$4" display_label="$5" purpose="$6" initial_prompt="$7" launch_command="$8" peer="${9:-}" agent="${10:-}" conversation_id="${11:-}" transcript_path="${12:-}"
+    # Plan 071 phase 6: the session's launch-time profile identity. Optional
+    # so every pre-phase-6 positional call site (tests included) still works
+    # unchanged; a pre-change record simply has these fields null.
+    local profile="${13:-}" profile_source="${14:-}" auth_backend="${15:-}" requested_model="${16:-}" claude_config_dir="${17:-}" profile_file="${18:-}"
     mkdir -p "$SESSION_METADATA_DIR" || return 1
     local tmp created_at host_label host_id provider lifecycle_state provider_task_id launch_id output_file
     mkdir -p "$SESSION_METADATA_DIR" || return 1
@@ -3708,6 +3717,12 @@ _session_write_metadata() {
         --arg transcript_path "$transcript_path" \
         --arg lifecycle_state "$lifecycle_state" \
         --arg launch_id "$launch_id" \
+        --arg profile "$profile" \
+        --arg profile_source "$profile_source" \
+        --arg auth_backend "$auth_backend" \
+        --arg requested_model "$requested_model" \
+        --arg claude_config_dir "$claude_config_dir" \
+        --arg profile_file "$profile_file" \
         '{
             schema_version: $schema_version,
             provider: $provider,
@@ -3753,6 +3768,12 @@ _session_write_metadata() {
             host: $host,
             conversation_id: (if $conversation_id == "" then null else $conversation_id end),
             transcript_path: (if $transcript_path == "" then null else $transcript_path end),
+            profile: (if $profile == "" then null else $profile end),
+            profile_source: (if $profile_source == "" then null else $profile_source end),
+            auth_backend: (if $auth_backend == "" then null else $auth_backend end),
+            requested_model: (if $requested_model == "" then null else $requested_model end),
+            claude_config_dir: (if $claude_config_dir == "" then null else $claude_config_dir end),
+            profile_file: (if $profile_file == "" then null else $profile_file end),
             control_surface: "tmux",
             tmux_session: $name,
             pane_id: null,
@@ -4232,38 +4253,54 @@ _launch_detached() {
     # reported success -- CCTRL_ATTACH_AFTER_START (plain `cctrl start`)
     # skips the post-spawn health check entirely, and even with it on, the
     # reported reason is only "exited during startup", not the real one.
-    if [[ -n "$profile" ]]; then
-        local _profile_check rc=0
-        if [[ -n "$explicit_profile_flag" ]]; then
-            _profile_check="$(_resolve_profile "$profile" "")" || rc=$?
-        else
-            _profile_check="$(_resolve_profile "" "$profile")" || rc=$?
-        fi
-        (( rc == 0 )) || return "$rc"
+    # Resolve the profile once, unconditionally -- both the explicit/shortcut
+    # case (previously the only validated case) and the pure-default/legacy/
+    # none case (previously a separate _default_profile_name call that threw
+    # the resolver's own source label away). _resolve_profile is the single
+    # authority for the explicit|shortcut|default|legacy|none vocabulary
+    # (plan 071 phase 6); reusing it here, instead of re-deriving the source
+    # from local state, is what keeps this label correct as new sources are
+    # added. "none" is the resolver's no-overlay sentinel.
+    local resolved_profile="" resolved_profile_source="none" _profile_resolve_out rc=0
+    if [[ -n "$explicit_profile_flag" ]]; then
+        _profile_resolve_out="$(_resolve_profile "$explicit_profile_flag" "")" || rc=$?
+    else
+        _profile_resolve_out="$(_resolve_profile "" "$profile")" || rc=$?
     fi
-    # _active_profile/_detect_active (the legacy .active-profile reader) are
-    # no longer kept current -- phase 3's `cctrl use` only writes
-    # defaultProfile now, never the legacy file -- so an empty $profile here
-    # falls back to the same resolver `cctrl current`/`cctrl ls` use, not the
-    # stale legacy reader. "none" is the resolver's no-overlay sentinel, same
-    # normalization as the explicit --profile case elsewhere in this file.
-    local agent_profile="$profile"
-    if [[ -z "$agent_profile" ]]; then
-        agent_profile="$(_default_profile_name)"
-        [[ "$agent_profile" == "none" ]] && agent_profile=""
-    fi
+    (( rc == 0 )) || return "$rc"
+    resolved_profile="${_profile_resolve_out%%$'\t'*}"
+    resolved_profile_source="${_profile_resolve_out#*$'\t'}"
+    [[ "$resolved_profile" == "none" ]] && resolved_profile=""
+    local agent_profile="$resolved_profile"
     detach_agent="$(_resolve_agent_or_prompt "$detach_agent" "Choose agent runtime" "$agent_profile")" || return 1
     export CCTRL_AGENT="$detach_agent"
-    if [[ -n "$peer_identity" ]]; then
-        local effective_profile="$profile" profile_agent pf=""
-        if [[ -z "$effective_profile" ]]; then
-            effective_profile="$(_default_profile_name)"
-            [[ "$effective_profile" == "none" ]] && effective_profile=""
+    # Phase 6 session identity: resolved profile file, auth backend and
+    # requested model, computed once here (side-effect-free reads of the
+    # profile file) so metadata and the display tmux options below both see
+    # the one value, rather than each re-deriving it from argv later.
+    # Snapshot before the peer-identity overlay below can run: that overlay
+    # may apply a profile's own CLAUDE_CONFIG_DIR, and metadata must record
+    # what this launch genuinely inherited (D7), not a value a profile set.
+    local resolved_claude_config_dir="${CLAUDE_CONFIG_DIR:-}"
+    local resolved_profile_file="" resolved_auth_backend="" resolved_requested_model=""
+    [[ -n "$resolved_profile" ]] && resolved_profile_file="$(_profile_find "$resolved_profile")"
+    resolved_auth_backend="$(_profile_auth_backend "$detach_agent" "$resolved_profile_file")"
+    local cli_model_for_metadata="" _pt_i
+    for (( _pt_i = 0; _pt_i < ${#passthrough[@]}; _pt_i++ )); do
+        # Stop at a literal "--": everything after it is the initial prompt
+        # text, not flags, and must never be scanned for "--model" by value.
+        [[ "${passthrough[$_pt_i]}" == "--" ]] && break
+        if [[ "${passthrough[$_pt_i]}" == "--model" ]]; then
+            cli_model_for_metadata="${passthrough[$((_pt_i + 1))]:-}"
+            break
         fi
-        if [[ -n "$effective_profile" ]] && _profile_exists "$effective_profile"; then
+    done
+    resolved_requested_model="$(_resolve_model "$detach_agent" "$cli_model_for_metadata" "$resolved_profile_file")"
+    if [[ -n "$peer_identity" ]]; then
+        if [[ -n "$resolved_profile" ]]; then
+            local profile_agent
             profile_agent="$(_normalize_agent "$detach_agent")" || return 1
-            pf="$(_profile_find "$effective_profile")"
-            _apply_profile_overlay "$profile_agent" "$pf"
+            _apply_profile_overlay "$profile_agent" "$resolved_profile_file"
             _peer_refresh_paths
             _session_refresh_paths
         fi
@@ -4297,21 +4334,30 @@ _launch_detached() {
         env_val="${!env_name:-}"
         [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(_launch_quote "$env_val")"
     done
+    # Forwarded from the pre-overlay snapshot, not the (possibly now
+    # profile-overlaid) live env var -- so the child's inherited
+    # CLAUDE_CONFIG_DIR, and the claude_config_dir metadata records below,
+    # always match what this launch genuinely started with (D7; plan 071
+    # phase 6).
+    [[ -n "$resolved_claude_config_dir" ]] && base_env_q+=" CLAUDE_CONFIG_DIR=$(_launch_quote "$resolved_claude_config_dir")"
     [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(_launch_quote "$peer_name")"
-    # R1 one-shot source handoff: the child below sees the adopted profile as
-    # an explicit `--profile` flag (injected just below) and would otherwise
-    # correctly-from-its-own-argv, but wrongly, label it source=explicit; this
-    # tells _launch_prepare_env the true source. It's read and unset on first
-    # use, so it can never leak into a later, unrelated launch in that shell.
-    [[ -n "$dir_adopted_profile" ]] && base_env_q+=" CCTRL_LAUNCH_PROFILE_SOURCE=shortcut"
+    # R1 one-shot source handoff: the child below sees the resolved profile as
+    # an explicit `--profile` flag (injected just below, for every source the
+    # user didn't type themselves) and would otherwise correctly-from-its-own-
+    # argv, but wrongly, label it source=explicit; this tells
+    # _launch_prepare_env the true source. It's read and unset on first use,
+    # so it can never leak into a later, unrelated launch in that shell.
+    [[ -z "$explicit_profile_flag" ]] && base_env_q+=" CCTRL_LAUNCH_PROFILE_SOURCE=$(_launch_quote "$resolved_profile_source")"
     # Flags to splice into the child's argv ahead of any "--" literal prompt:
-    # --peer (identity) and, for a dir launch that adopted a matching
-    # shortcut's profile (dir_adopted_profile, resolved above), --profile --
-    # the child's own foreground resolver re-derives from argv, not from this
-    # parent's local $profile, so it needs the flag forwarded explicitly.
+    # --peer (identity) and --profile for every non-explicit source (shortcut,
+    # default, legacy, none) -- the child's own foreground resolver re-derives
+    # from argv, not from this parent's local $profile, so anything this
+    # parent resolved on the child's behalf needs forwarding explicitly
+    # (plan 071 phase 6: pass the resolved profile into every launch's
+    # identity, not just the dir/shortcut-adoption case).
     local -a _inject=()
     [[ -n "$peer_name" ]] && _inject+=("--peer" "$peer_name")
-    [[ -n "$dir_adopted_profile" ]] && _inject+=("--profile" "$dir_adopted_profile")
+    [[ -z "$explicit_profile_flag" ]] && _inject+=("--profile" "${resolved_profile:-none}")
     if [[ ${#_inject[@]} -gt 0 ]]; then
         if [[ "$passthrough_count" -gt 0 ]]; then
             local inserted_inject=false
@@ -4333,9 +4379,7 @@ _launch_detached() {
             child_args=("${passthrough[@]}")
         fi
     fi
-    if [[ "$peer_name" == "" && -z "$dir_adopted_profile" && "$passthrough_count" -eq 0 ]]; then
-        :
-    else
+    if [[ ${#child_args[@]} -gt 0 ]]; then
         for a in "${child_args[@]}"; do
             extras_q+=" $(_launch_quote "$a")"
         done
@@ -4436,7 +4480,8 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
-    if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" 2>/dev/null; then
+    if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
+        "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" 2>/dev/null; then
         echo -e "${YELLOW}⚠  Could not write session metadata.${RESET}" >&2
         echo -e "${DIM}   Path: $(_session_metadata_file "$session_name")${RESET}" >&2
         if [[ -n "$peer_name" ]]; then
@@ -4451,6 +4496,11 @@ _launch_detached() {
     fi
     tmux set-option -t "=$session_name:" -q @cctrl_managed 1 2>/dev/null || true
     tmux set-option -t "=$session_name:" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
+    # Display hints only -- metadata (just written above) stays authoritative;
+    # tmux options are restorable, mutable state a user or another tool could
+    # change (plan 071 phase 6).
+    tmux set-option -t "=$session_name:" -q @cctrl_profile "${resolved_profile:-none}" 2>/dev/null || true
+    tmux set-option -t "=$session_name:" -q @cctrl_auth_backend "$resolved_auth_backend" 2>/dev/null || true
     # Bind this registry record to the newly-created tmux pane. A later
     # attestation rejects a recycled session name or a replaced pane.
     if ! _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null; then
@@ -12152,6 +12202,33 @@ _session_repair_bridge() {
     return 1
 }
 
+_session_realign_flags() {
+    # Plan 071 phase 6: the realign relaunch must not silently drop the old
+    # session's profile/model/peer/no-bridge -- read them back through the
+    # same launch_flags_for the (app-less) restore path uses, rather than
+    # hand-adding just --profile. One flag (value, if any) per line; a
+    # bare flag (--no-bridge) is printed alone. Best-effort: a metadata read
+    # failure here must never block the realign itself.
+    local old_name="$1" out profile
+    out="$(python3 "$SCRIPT_DIR/lib/snapshot_restore.py" launch-flags --metadata-dir "$SESSION_METADATA_DIR" --name "$old_name" 2>/dev/null)" || return 0
+    profile="$(jq -r '.profile // empty' <<< "$out" 2>/dev/null)"
+    # The caller kills the old tmux session before relaunching; a profile
+    # since renamed or deleted must not turn that into a hard failure after
+    # the kill (_launch_detached fails closed on an unknown --profile). Drop
+    # it instead and let the relaunch fall through to the configured default,
+    # same as this session originally would have if it had never had one.
+    if [[ -n "$profile" ]] && ! _profile_exists "$profile"; then
+        out="$(jq 'del(.profile)' <<< "$out" 2>/dev/null)"
+    fi
+    jq -r '
+        (if .profile then ["--profile", .profile] else [] end)
+        + (if .model then ["--model", .model] else [] end)
+        + (if .peer then ["--peer", .peer] else [] end)
+        + (if .no_bridge == true then ["--no-bridge"] else [] end)
+        | .[]
+    ' <<< "$out" 2>/dev/null
+}
+
 _session_realign_cmd() {
     # Build the copy-pasteable relaunch command that realigns a mismatched
     # session: relaunch detached at the same target with the corrected --name
@@ -12163,6 +12240,8 @@ _session_realign_cmd() {
     local name="$1" target="$2" sid="$3" purpose="$4" cmd
     cmd="cctrl start -d $(printf '%q' "$target") --agent claude --name $(printf '%q' "$name") --resume $(printf '%q' "$sid")"
     [[ -n "$purpose" ]] && cmd+=" --purpose $(printf '%q' "$purpose")"
+    local extra
+    while IFS= read -r extra; do cmd+=" $(printf '%q' "$extra")"; done < <(_session_realign_flags "$name")
     printf '%s' "$cmd"
 }
 
@@ -12186,9 +12265,11 @@ _session_realign() {
         printf '\n' >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
         return 0
     fi
-    tmux kill-session -t "=$name" 2>/dev/null || true
     local -a rl=("$target" --agent claude --name "$name" --resume "$sid")
     [[ -n "$purpose" ]] && rl+=(--purpose "$purpose")
+    local extra
+    while IFS= read -r extra; do rl+=("$extra"); done < <(_session_realign_flags "$name")
+    tmux kill-session -t "=$name" 2>/dev/null || true
     _launch_detached "${rl[@]}"
 }
 
