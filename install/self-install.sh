@@ -23,6 +23,9 @@ cleanup() {
     if [[ "$CLEANUP_SCRATCH" == 1 && -e "$SCRATCH" ]]; then
         rm -rf "$SCRATCH"
     fi
+    if [[ "$CLEANUP_SCRATCH" == 1 && -e "$SCRATCH.tar" ]]; then
+        rm -f "$SCRATCH.tar"
+    fi
 }
 trap cleanup EXIT
 
@@ -50,7 +53,15 @@ echo "cctrl self-install: building release from $ROOT at $SHORT_SHA" >&2
 # first four live installs (install.sh, install/, AGENTS.md/CLAUDE.md/
 # README.md/skills/, .githooks/) are exactly the failure mode this closes.
 mkdir -p "$SCRATCH"
-git -C "$ROOT" archive --format=tar "$SHA" | tar -x -C "$SCRATCH"
+# Archive to a file rather than piping straight into `tar -x`: macOS's
+# bsdtar closes its stdin as soon as it has read the end-of-archive
+# markers, before consuming git archive's trailing record padding, so
+# `git archive` gets SIGPIPE and exits 141 even though extraction is
+# complete -- with pipefail that failed this script on every run despite
+# shipping a correct release.
+git -C "$ROOT" archive --format=tar -o "$SCRATCH.tar" "$SHA"
+tar -x -C "$SCRATCH" -f "$SCRATCH.tar"
+rm -f "$SCRATCH.tar"
 printf '%s\n' "$SHA" > "$SCRATCH/VERSION"
 
 # data/config.json is tracked despite data/ being gitignored (it ships a
