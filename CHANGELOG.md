@@ -59,6 +59,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Profile renames move to `cctrl profile rename <old> <new>` (plain `cctrl
   rename <name> "label"` was already, and remains, the session rename). (plan
   071 phase 3)
+- Every launch (`cctrl start`, `cctrl @<shortcut>`, detached, and
+  `--app-owned` Codex) now scrubs every exported `CLAUDE_*`/`ANTHROPIC_*`/
+  `CLAUDECODE` env var inherited from the caller's shell or a leaky tmux
+  server env, then applies the resolved profile's overlay on top — so a
+  profile's own values always win, and an unprofiled launch never silently
+  inherits a stray provider var leaked from elsewhere (e.g. Claude Desktop).
+  `CLAUDE_CONFIG_DIR` is always kept; add more names to keep with
+  `launchEnvKeep` in config (`~/.config/cctrl/config.json` or
+  `data/config.local.json`). `CCTRL_KEEP_HOST_ENV=1` skips the scrub
+  entirely. Every launch also now exports `CCTRL_SESSION_PROFILE`,
+  `CCTRL_SESSION_PROFILE_SOURCE`, and `CCTRL_SESSION_AUTH_BACKEND` as
+  hook/UI labels (they never feed profile resolution). A shortcut's own
+  `.profile: "none"` is now an explicit no-overlay, matching `--profile
+  none`, instead of failing closed as an unknown profile name. (plan 071
+  phase 4)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including

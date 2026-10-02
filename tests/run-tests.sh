@@ -407,6 +407,15 @@ echo "CMD=$name"
 if [[ -n "\${CCTRL_PEER:-}" ]]; then
     printf 'ENV_CCTRL_PEER=%s\n' "\$CCTRL_PEER"
 fi
+if [[ -n "\${FAKE_AGENT_ENV_NAMES:-}" ]]; then
+    for _fake_env_name in \$FAKE_AGENT_ENV_NAMES; do
+        if [[ -n "\${!_fake_env_name+set}" ]]; then
+            printf 'ENV_%s=%s\n' "\$_fake_env_name" "\${!_fake_env_name}"
+        else
+            printf 'ENV_%s=<unset>\n' "\$_fake_env_name"
+        fi
+    done
+fi
 i=0
 for arg in "\$@"; do
     printf 'ARG[%d]=%s\n' "\$i" "\$arg"
@@ -1109,6 +1118,138 @@ test_launch_args() {
     assert_contains "$out" "mcp_servers.cctrl_runtime.command"
     assert_contains "$out" "ARG[7]=remote suppressed"
     assert_not_contains "$out" "--remote"
+}
+
+test_launch_env_scrub_claude() {
+    # plan 071 phase 4: every launch scrubs inherited CLAUDE_*/ANTHROPIC_*/
+    # CLAUDECODE env before applying the resolved profile's overlay, so a
+    # profile's own values always win and an unprofiled launch never
+    # silently inherits a leaked provider var. CLAUDE_CONFIG_DIR is kept by
+    # default (already exported globally by this harness, D7); AWS_PROFILE
+    # is never touched (wrong prefix).
+    make_fake_agent "$TMPDIR/claude" claude
+    local profiles="$TMPDIR/launch-scrub-profiles"
+    mkdir -p "$profiles"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1","ANTHROPIC_MODEL":"bedrock-model"}}}}\n' \
+        > "$profiles/work.json"
+    local names="CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_ENTRYPOINT CLAUDE_EFFORT CLAUDE_CODE_DISABLE_TERMINAL_TITLE CLAUDECODE CLAUDE_CONFIG_DIR AWS_PROFILE CCTRL_SESSION_PROFILE CCTRL_SESSION_PROFILE_SOURCE CCTRL_SESSION_AUTH_BACKEND"
+
+    # No profile: a leaked provider var from the caller's shell must not survive.
+    local out
+    out="$(CLAUDE_CODE_USE_BEDROCK=1 CLAUDE_CODE_ENTRYPOINT=cli CLAUDE_EFFORT=high \
+        CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1 CLAUDECODE=1 AWS_PROFILE=keepme \
+        FAKE_AGENT_ENV_NAMES="$names" PATH="$TMPDIR:$PATH" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile none -m scrub)"
+    assert_contains "$out" "ENV_CLAUDE_CODE_USE_BEDROCK=<unset>"
+    assert_contains "$out" "ENV_CLAUDE_CODE_ENTRYPOINT=<unset>"
+    assert_contains "$out" "ENV_CLAUDE_EFFORT=<unset>"
+    assert_contains "$out" "ENV_CLAUDE_CODE_DISABLE_TERMINAL_TITLE=<unset>"
+    assert_contains "$out" "ENV_CLAUDECODE=<unset>"
+    assert_contains "$out" "ENV_AWS_PROFILE=keepme"
+    assert_contains "$out" "ENV_CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE=none"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE_SOURCE=explicit"
+    assert_contains "$out" "ENV_CCTRL_SESSION_AUTH_BACKEND=subscription"
+
+    # --profile work: the scrub runs first, then the profile overlay -- its
+    # own CLAUDE_CODE_USE_BEDROCK must survive (ordering guard).
+    out="$(CLAUDE_CODE_USE_BEDROCK=0 FAKE_AGENT_ENV_NAMES="$names" PATH="$TMPDIR:$PATH" \
+        CCTRL_PROFILES_DIR="$profiles" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile work -m scrub)"
+    assert_contains "$out" "ENV_CLAUDE_CODE_USE_BEDROCK=1"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE=work"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE_SOURCE=explicit"
+    assert_contains "$out" "ENV_CCTRL_SESSION_AUTH_BACKEND=bedrock"
+
+    # CCTRL_KEEP_HOST_ENV=1 skips the scrub entirely.
+    out="$(CLAUDE_CODE_USE_BEDROCK=1 CCTRL_KEEP_HOST_ENV=1 FAKE_AGENT_ENV_NAMES="$names" \
+        PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --profile none -m scrub)"
+    assert_contains "$out" "ENV_CLAUDE_CODE_USE_BEDROCK=1"
+
+    # A config launchEnvKeep entry is kept even without CCTRL_KEEP_HOST_ENV.
+    local rootcopy="$TMPDIR/cctrl-launch-scrub-keep-copy"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"launchEnvKeep":["ANTHROPIC_LOG"]}\n' > "$rootcopy/data/config.json"
+    out="$(ANTHROPIC_LOG=debug CCTRL_USER_CONFIG="" CCTRL_CONFIG_LOCAL="$rootcopy/data/config.local.json" \
+        FAKE_AGENT_ENV_NAMES="ANTHROPIC_LOG" PATH="$TMPDIR:$PATH" \
+        "$rootcopy/cctrl" start --foreground --agent claude --profile none -m scrub)"
+    assert_contains "$out" "ENV_ANTHROPIC_LOG=debug"
+}
+
+test_launch_env_scrub_codex() {
+    # Same scrub applies to codex (D2); the CLAUDE_*/ANTHROPIC_* prefixes
+    # don't overlap CODEX_*, so CODEX_HOME is untouched.
+    make_fake_agent "$TMPDIR/codex" codex
+    local out
+    out="$(ANTHROPIC_API_KEY=sk-leaked CODEX_HOME="$TMPDIR/codex-home" \
+        FAKE_AGENT_ENV_NAMES="ANTHROPIC_API_KEY CODEX_HOME CCTRL_SESSION_AUTH_BACKEND" \
+        PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent codex --profile none -m scrub)"
+    assert_contains "$out" "ENV_ANTHROPIC_API_KEY=<unset>"
+    assert_contains "$out" "ENV_CODEX_HOME=$TMPDIR/codex-home"
+    assert_contains "$out" "ENV_CCTRL_SESSION_AUTH_BACKEND=codex"
+}
+
+test_launch_env_scrub_source_label_not_inherited() {
+    # R1: labels are always freshly derived at launch, never read back from
+    # an already-exported CCTRL_SESSION_PROFILE_SOURCE -- so a later launch
+    # inside an already-labelled session (e.g. a nested foreground run) can't
+    # inherit a stale source from a previous one in the same process/env.
+    make_fake_agent "$TMPDIR/claude" claude
+    local profiles="$TMPDIR/launch-scrub-nested-profiles"
+    mkdir -p "$profiles"
+    printf '{}\n' > "$profiles/work.json"
+    local out
+    out="$(CCTRL_SESSION_PROFILE_SOURCE=default CCTRL_PROFILES_DIR="$profiles" \
+        FAKE_AGENT_ENV_NAMES="CCTRL_SESSION_PROFILE_SOURCE" PATH="$TMPDIR:$PATH" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile work -m nested)"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE_SOURCE=explicit"
+}
+
+test_launch_env_scrub_dir_adopted_profile_source_handoff() {
+    # R1: a detached dir launch that adopts a matching shortcut's profile
+    # forwards it to its child as an explicit --profile flag, plus a
+    # one-shot CCTRL_LAUNCH_PROFILE_SOURCE=shortcut so the child's label
+    # reads source=shortcut, not source=explicit.
+    make_fake_tmux "$TMPDIR/tmux"
+    local rootcopy="$TMPDIR/cctrl-dir-adopt-copy"
+    local project="$TMPDIR/dir-adopt-project"
+    local log="$TMPDIR/dir-adopt-tmux.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"adopted":{"dir":"%s","profile":"work","agent":"codex"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{}\n' > "$rootcopy/profiles/work.json"
+    # Dir-adoption only adopts the matched shortcut's .profile, not its
+    # .agent (that part of the shortcut's "agent" field above is unused
+    # here) -- supply an agent some other way so resolution doesn't prompt.
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$rootcopy/cctrl" start -d "$project" >/dev/null
+    assert_contains "$(cat "$log")" "CCTRL_LAUNCH_PROFILE_SOURCE=shortcut"
+    assert_contains "$(cat "$log")" "--profile work"
+}
+
+test_shortcut_profile_none_is_explicit_no_overlay() {
+    # fm-cctrl design decision (2026-10-02): a shortcut's own `.profile:
+    # "none"` is an explicit no-overlay, matching `--profile none` -- not an
+    # unknown-profile failure.
+    make_fake_agent "$TMPDIR/claude" claude
+    local rootcopy="$TMPDIR/cctrl-shortcut-none-copy"
+    local project="$TMPDIR/shortcut-none-project"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"noprof":{"dir":"%s","profile":"none","agent":"claude"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+
+    local out
+    out="$(FAKE_AGENT_ENV_NAMES="CCTRL_SESSION_PROFILE CCTRL_SESSION_PROFILE_SOURCE" \
+        PATH="$TMPDIR:$PATH" "$rootcopy/cctrl" @noprof --foreground)"
+    assert_contains "$out" "CMD=claude"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE=none"
+    assert_contains "$out" "ENV_CCTRL_SESSION_PROFILE_SOURCE=shortcut"
 }
 
 test_agent_prompt_without_default() {
@@ -11787,6 +11928,11 @@ test_cctrl_hooks_run_exits_2_when_target_hook_script_missing
 test_cctrl_current_swap_is_atomic_on_bsd_mv
 test_git_dirty_check_matches_self_install_semantics
 test_launch_args
+test_launch_env_scrub_claude
+test_launch_env_scrub_codex
+test_launch_env_scrub_source_label_not_inherited
+test_launch_env_scrub_dir_adopted_profile_source_handoff
+test_shortcut_profile_none_is_explicit_no_overlay
 test_agent_prompt_without_default
 test_profile_prompt_overrides_global_default
 test_resolve_profile_precedence

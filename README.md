@@ -86,6 +86,21 @@ cctrl @myapp                       # a shortcut applies its profile the same way
 model as `--model` (CLI `--model` still wins). It does **not** touch global
 state, so two windows can run different profiles simultaneously without conflict.
 
+Every launch is hermetic: before applying the profile overlay (or launching
+with none), cctrl scrubs every exported `CLAUDE_*`/`ANTHROPIC_*`/`CLAUDECODE`
+env var inherited from your shell or a leaky tmux server env (e.g. a Claude
+Desktop leak), so a stray provider var can never silently survive into a
+launch that didn't ask for it. `CLAUDE_CONFIG_DIR` is always kept. Keep more
+names with a `launchEnvKeep` array in config:
+
+```json
+{
+  "launchEnvKeep": ["ANTHROPIC_LOG"]
+}
+```
+
+Set `CCTRL_KEEP_HOST_ENV=1` to skip the scrub entirely for one launch.
+
 Profiles can be agent-aware. Top-level `env` is shared only when an `agents`
 block exists; `agents.<agent>.env`, `agents.<agent>.model`, and
 `agents.<agent>.args` are selected for the runtime:

@@ -358,6 +358,13 @@ _resolve_profile() {
     fi
 
     if [[ -n "$shortcut_profile" ]]; then
+        # A shortcut's own `.profile: "none"` is an explicit no-overlay, same
+        # as `--profile none` -- not an unknown-name failure (fm-cctrl
+        # 2026-10-02 design decision).
+        if [[ "$shortcut_profile" == "none" ]]; then
+            printf 'none\tshortcut\n'
+            return 0
+        fi
         if ! _profile_exists "$shortcut_profile"; then
             echo -e "${RED}Shortcut profile '$shortcut_profile' not found.${RESET}" >&2
             return 64
@@ -688,6 +695,75 @@ _apply_profile_overlay() {
     done < <(_profile_env_entries_for_agent "$agent" "$pf")
 }
 
+# Hermetic launch env (plan 071 phase 4, D2/D3/D4/D7): scrub every exported
+# CLAUDE_*/ANTHROPIC_*/CLAUDECODE var inherited from the caller's shell or a
+# leaky tmux server env, THEN apply the resolved profile's overlay, so a
+# profile's own values always win over anything that leaked in -- and an
+# unprofiled launch never silently inherits a stray provider var either.
+# Runs once per launch, inside _launch_exec_agent, and never touches the
+# tmux server's own global environment (only this process's). Escape hatch:
+# CCTRL_KEEP_HOST_ENV=1 skips the scrub entirely (debugging a host-env
+# issue, or deliberately wanting Desktop's env to flow through).
+#   $1=agent $2=profile_file(may be empty) $3=profile_name(may be empty,
+#   "none" normalized to empty by callers) $4=source (explicit|shortcut|
+#   default|legacy|none)
+_launch_prepare_env() {
+    local agent="$1" pf="$2" profile="$3" source="${4:-none}"
+
+    # A caller (cmd_start/_shortcut_jump) may have already resolved and
+    # exported the launch's real `--peer` identity into CCTRL_PEER before
+    # calling here -- that resolution is authoritative and must survive the
+    # overlay below even when the profile's own env also sets CCTRL_PEER
+    # (test fixtures deliberately do this to catch exactly this ordering
+    # bug). Snapshot it now, before the overlay can touch it, and restore it
+    # after; if it wasn't set yet, leave whatever the overlay produces alone.
+    local peer_snapshot="${CCTRL_PEER:-}" peer_was_set=false
+    [[ -n "${CCTRL_PEER+x}" ]] && peer_was_set=true
+
+    if [[ "${CCTRL_KEEP_HOST_ENV:-}" != 1 ]]; then
+        # CLAUDE_CONFIG_DIR is kept by default (D7): an inherited one is a
+        # deliberate per-machine/per-shell choice, not Desktop leakage, and
+        # losing it would silently relocate the agent's own config.
+        local -a keep=(CLAUDE_CONFIG_DIR)
+        local extra
+        while IFS= read -r extra; do
+            [[ -n "$extra" ]] && keep+=("$extra")
+        done < <(_config_jq '(.launchEnvKeep // []) | .[] | tostring' 2>/dev/null)
+
+        local name kept k
+        while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            case "$name" in
+                CLAUDE_*|ANTHROPIC_*|CLAUDECODE)
+                    kept=false
+                    for k in "${keep[@]}"; do
+                        [[ "$name" == "$k" ]] && { kept=true; break; }
+                    done
+                    $kept || unset "$name"
+                    ;;
+            esac
+        done < <(compgen -e)
+    fi
+
+    _apply_profile_overlay "$agent" "$pf"
+    $peer_was_set && export CCTRL_PEER="$peer_snapshot"
+
+    # One-shot handoff from _launch_detached (R1): a dir launch that adopted
+    # a matching shortcut's profile forwards it to its child as an explicit
+    # `--profile`, which the child would otherwise (correctly, from its own
+    # argv) label source=explicit -- override that back to the true source
+    # this once, then clear it so it can never leak into a later, unrelated
+    # launch sharing the same process/env.
+    if [[ "$source" == "explicit" && -n "${CCTRL_LAUNCH_PROFILE_SOURCE:-}" ]]; then
+        source="$CCTRL_LAUNCH_PROFILE_SOURCE"
+    fi
+    unset CCTRL_LAUNCH_PROFILE_SOURCE
+
+    export CCTRL_SESSION_PROFILE="${profile:-none}"
+    export CCTRL_SESSION_PROFILE_SOURCE="$source"
+    export CCTRL_SESSION_AUTH_BACKEND="$(_profile_auth_backend "$agent" "$pf")"
+}
+
 # Resolve the launch model. Precedence: explicit CLI --model > profile model >
 # empty (omit --model entirely and let the selected agent use its own default).
 #   $1 = agent, $2 = cli_model (may be empty), $3 = profile_file (may be empty)
@@ -883,6 +959,12 @@ _launch_flags_has_codex_cd() {
 _launch_exec_agent() {
     local agent="$1" pf="$2" cli_model="$3" launch_name="$4" no_bridge="$5"
     local resume="$6" resume_val="$7" final_prompt="$8" bridge_dir="${9:-$PWD}"
+    local profile_name="${10:-}" profile_source="${11:-none}"
+
+    # Hermetic launch env (plan 071 phase 4): scrub inherited Claude/Anthropic
+    # provider env, THEN apply the resolved profile's overlay -- before any
+    # flag assembly below, so nothing here can observe a leaked host value.
+    _launch_prepare_env "$agent" "$pf" "$profile_name" "$profile_source"
 
     export CCTRL_AGENT="$agent"
     if [[ "${CCTRL_SESSION_KIND:-}" != "tmux" ]]; then
@@ -1859,6 +1941,7 @@ _launch_app_owned_codex() {
     resolved="$(_resolve_profile "$profile" "$shortcut_profile")" || rc=$?
     (( rc == 0 )) || return "$rc"
     profile="${resolved%%$'\t'*}"
+    local profile_source="${resolved#*$'\t'}"
     [[ "$profile" == "none" ]] && profile=""
     if [[ -n "$profile" ]] && _profile_exists "$profile"; then
         pf="$(_profile_find "$profile")"
@@ -1876,6 +1959,12 @@ _launch_app_owned_codex() {
             esac
         done
     fi
+    # Same hermetic scrub as every other launch path (D2: every cctrl
+    # launch, claude and codex, profiled or not). Label only -- no
+    # `--settings` file here (phase 5 doesn't apply to --app-owned; model/
+    # sandbox/effort already went through the profile-args extraction above
+    # as explicit adapter flags, not inherited env).
+    _launch_prepare_env "$agent" "$pf" "$profile" "$profile_source"
     local model="${cli_model:-$profile_model}" effort="${cli_effort:-$profile_effort}"
     local sandbox="${cli_sandbox:-$profile_sandbox}" approval="${cli_approval:-$profile_approval}"
     if $yolo_explicit; then
@@ -2091,10 +2180,19 @@ cmd_start() {
     resolved="$(_resolve_profile "$profile" "")" || rc=$?
     (( rc == 0 )) || return "$rc"
     profile="${resolved%%$'\t'*}"
+    local profile_source="${resolved#*$'\t'}"
     [[ "$profile" == "none" ]] && profile=""
     agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$profile")" || return 1
     local pf=""
     [[ -n "$profile" ]] && pf="$(_profile_find "$profile")"
+    # Narrow peer-path overlay (matches the one _launch_detached keeps, per
+    # plan 071 phase 4): a profile may set CCTRL_DATA_DIR/
+    # CCTRL_SESSION_METADATA_DIR to namespace its own peer registry, and the
+    # --peer resolution just below needs that path BEFORE the real launch.
+    # This does not weaken the hermetic scrub-then-overlay guarantee: this
+    # same overlay runs again, after the scrub, inside _launch_exec_agent ->
+    # _launch_prepare_env, so the agent process itself still only ever sees
+    # scrub-then-overlay, never a leaked value surviving unscrubbed.
     _apply_profile_overlay "$agent" "$pf"
     _peer_refresh_paths
     _session_refresh_paths
@@ -2127,7 +2225,7 @@ cmd_start() {
     LAUNCH_PERMISSION_MODE="$permission_mode"
     LAUNCH_PASSTHROUGH=()
     [[ ${#passthrough[@]} -gt 0 ]] && LAUNCH_PASSTHROUGH=("${passthrough[@]}")
-    _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$resume" "$resume_val" "$final_prompt" "$PWD"
+    _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$resume" "$resume_val" "$final_prompt" "$PWD" "$profile" "$profile_source"
 }
 
 _cctrl_host_id_read() {
@@ -4038,6 +4136,12 @@ _launch_detached() {
         [[ -n "$env_val" ]] && base_env_q+=" $env_name=$(_launch_quote "$env_val")"
     done
     [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(_launch_quote "$peer_name")"
+    # R1 one-shot source handoff: the child below sees the adopted profile as
+    # an explicit `--profile` flag (injected just below) and would otherwise
+    # correctly-from-its-own-argv, but wrongly, label it source=explicit; this
+    # tells _launch_prepare_env the true source. It's read and unset on first
+    # use, so it can never leak into a later, unrelated launch in that shell.
+    [[ -n "$dir_adopted_profile" ]] && base_env_q+=" CCTRL_LAUNCH_PROFILE_SOURCE=shortcut"
     # Flags to splice into the child's argv ahead of any "--" literal prompt:
     # --peer (identity) and, for a dir launch that adopted a matching
     # shortcut's profile (dir_adopted_profile, resolved above), --profile --
@@ -16860,12 +16964,17 @@ _shortcut_jump() {
     resolved="$(_resolve_profile "$cli_profile" "$shortcut_profile")" || rc=$?
     (( rc == 0 )) || return "$rc"
     local profile="${resolved%%$'\t'*}"
+    local profile_source="${resolved#*$'\t'}"
     [[ "$profile" == "none" ]] && profile=""
     agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$profile")" || return 1
 
-    # Apply the shortcut's profile as a per-process overlay (env + model). No
-    # global-settings mutation: concurrent shortcuts with different profiles stay
-    # independent and there's no launch race on global agent config.
+    # Narrow peer-path overlay (matches cmd_start and _launch_detached, per
+    # plan 071 phase 4): a profile may set CCTRL_DATA_DIR/
+    # CCTRL_SESSION_METADATA_DIR to namespace its own peer registry, and the
+    # --peer resolution below needs that path BEFORE the real launch. The
+    # same overlay runs again, after the hermetic scrub, inside
+    # _launch_exec_agent -> _launch_prepare_env, so the agent process itself
+    # still only ever sees scrub-then-overlay.
     local pf=""
     [[ -n "$profile" ]] && pf="$(_profile_find "$profile")"
     _apply_profile_overlay "$agent" "$pf"
@@ -16919,7 +17028,7 @@ _shortcut_jump() {
     LAUNCH_PERMISSION_MODE="$permission_mode"
     LAUNCH_PASSTHROUGH=()
     [[ ${#passthrough[@]} -gt 0 ]] && LAUNCH_PASSTHROUGH=("${passthrough[@]}")
-    _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$launch_resume" "$launch_resume_val" "$final_prompt" "$dir"
+    _launch_exec_agent "$agent" "$pf" "$cli_model" "$launch_name" "$no_bridge" "$launch_resume" "$launch_resume_val" "$final_prompt" "$dir" "$profile" "$profile_source"
 }
 
 cmd_shortcut() {
