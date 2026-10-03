@@ -93,6 +93,12 @@ memory and attention. One session = one purpose.
    cctrl start -d <dir> --agent <claude|codex> -n "<label>" [-m "<brief>"]
    ```
 
+   Add `--profile <name>` when the new session should run on a different
+   model/env overlay than the spawner's own (e.g. a Bedrock-routed worker
+   next to a subscription one). Launch is hermetic and per-session, so
+   profiles coexist safely — it never touches global config or other live
+   sessions.
+
    For the app-owned choice from step 1, do not add `-d`, `--remote`, `--peer`,
    or `-n`; run `cctrl start --agent codex --app-owned <dir> [-m "<brief>"]`
    and verify the returned provider task id instead of looking for a tmux pane.

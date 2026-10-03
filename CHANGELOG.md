@@ -131,6 +131,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `session-log.py` (previously the second script always got nothing, since
   the first one being a `cat` already drained the pipe). (plan 071 phase 8)
 
+- README gains a "Where cctrl keeps files" table (XDG config/profiles vs.
+  the per-session `--settings` runtime dir vs. unchanged livesynced repo
+  state) and `cctrl-spawn`/`cctrl-fleet-manager` document spawning a worker
+  on its own `--profile` alongside other live sessions. (plan 071 phase 9,
+  docs only; all 9 phases implemented and installed — live smoke still
+  pending Matthew's go-ahead)
+
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including
   guarded launch-ID recovery), attest it, and delegate the single-writer

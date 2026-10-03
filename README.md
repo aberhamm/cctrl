@@ -1694,6 +1694,26 @@ Drop any executable named `cctrl-<cmd>` in `plugins/` or anywhere in `$PATH`:
 # plugins/cctrl-backup → cctrl backup
 ```
 
+## Where cctrl keeps files
+
+Config and per-session secrets follow the [XDG Base Directory
+spec](https://specifications.freedesktop.org/basedir-spec/latest/); other
+state stays in the repo, livesynced across machines on purpose.
+
+| What | Path | Role |
+|---|---|---|
+| user config | `$XDG_CONFIG_HOME/cctrl/config.json` (default `~/.config/cctrl/config.json`) | config |
+| profiles | `$XDG_CONFIG_HOME/cctrl/profiles/*.json` (0600; repo `profiles/` is a legacy fallback) | config |
+| per-session `--settings` files | `$(getconf DARWIN_USER_TEMP_DIR)cctrl-$UID/profile-settings/` (TMPDIR fallback off macOS) | runtime state; fills the XDG_RUNTIME_DIR role, which macOS doesn't provide |
+| sessions, mailbox, shortcuts, config.local | repo `data/` | state, unchanged for now (livesynced on purpose) |
+| cost logs | repo `costs/` | state, unchanged for now |
+
+Overrides: `XDG_CONFIG_HOME`, `CCTRL_USER_CONFIG` (user config file),
+`CCTRL_PROFILES_DIR` (sole profiles dir, mainly for tests).
+
+`~/.config` isn't synced between machines, so run `cctrl profile migrate` on
+each Mac before running `--remove-old` on either.
+
 ## Structure
 
 ```

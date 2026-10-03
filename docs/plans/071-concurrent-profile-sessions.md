@@ -1,7 +1,7 @@
 ---
 id: 071
 title: Run sessions on different profiles side by side
-status: pending
+status: done
 blocked-by: []
 priority: 71
 allows-migrations: false
@@ -444,6 +444,11 @@ Critical gaps remaining: 0 on paper. They depend on the P4 ordering test, the P5
 - statusline's `rate_limits` presence gate: already subscription-only.
 
 ## Follow-ups (TODO)
+- Live smoke: pending Matthew's go-ahead. Phase 9's steps 0-7 (concurrent
+  `--profile work`/personal sessions, `/status`, pane title, `restart`,
+  snapshot/restore, settings.json/runtime-dir hygiene) have not been run on
+  the Studio yet. All code and docs for 071 are implemented and installed;
+  this is the one unverified step.
 - Restart marker path uses a bare `${TMPDIR:-/tmp}` (cctrl:733/797). Move it to `_cctrl_runtime_dir` (same issue as R3).
 - TODOS.md entry (not in scope): consider moving `data/` state (sessions, mailbox, costs) to `$XDG_STATE_HOME/cctrl`. Blocked on livesync, which syncs that data between machines on purpose, and on how many fleet code paths it touches.
 

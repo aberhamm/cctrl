@@ -85,6 +85,10 @@ loaded doctrine — do not re-invoke the skill.)
 Otherwise use cctrl's environment/profile/config preference resolution; task type
 is not a reason to substitute another provider. Missing telemetry remains unknown,
 and a provider-specific bridge failure applies only to that provider.
+Spawn a worker on a specific profile with `cctrl start --profile <name>` (or a
+shortcut's own `.profile`) when it needs a different model/env overlay than
+other live sessions — launches are hermetic and per-session, so profiles run
+side by side without affecting each other or global config.
 
 **Mode A — Auto-pilot ON (default):** decide reversible, agent-level things
 yourself and just report — drive tmux pickers, choose build/plan options, sequence
