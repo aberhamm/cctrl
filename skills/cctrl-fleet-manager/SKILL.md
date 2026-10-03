@@ -128,7 +128,15 @@ watching. Only agent *decisions* route to the human. The toggle is global for no
    text for a real typed-but-unsent line, and sometimes a real draft *is*
    sitting there. The state carries no signal either way — before acting on it
    (or dismissing it), read the pane or transcript and look at what's actually
-   in the input line.
+   in the input line. `session ls`/`session doctor`'s `rc` column is one
+   classifier: `live`/`dead`/`off` as before, plus `na` (the session's profile
+   uses a non-subscription backend — Bedrock/Vertex/Foundry/API — so the
+   remote-control bridge can't authenticate there), `na-inferred` (same
+   conclusion, inferred from a pre-071 session's process env since it has no
+   recorded profile), and `unknown` (that inference itself couldn't be
+   confirmed). Only `dead` is ever `doctor --fix`/autoheal-repairable — `na`/
+   `na-inferred`/`unknown` are not bugs to chase, they're expected for
+   non-subscription sessions.
 2. **Decide** — per the autonomy mode (auto-pilot → act; manual → surface).
    Respect the always-confirm set regardless of mode.
 3. **Sequence** — order commits/pushes across shared worktrees; relay results;

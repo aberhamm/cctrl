@@ -631,13 +631,30 @@ TMUX--studio--myapp      # detached session launched with --host studio
 explains the two markers, and each row reads left to right as: `✦` (cctrl
 spawned it), session name, agent and model (or `shell (zsh)`), working
 directory, **STATE**, attached/detached, time since last active, `rc` (the
-remote-control bridge: `live` / `dead` / `off`), and the session purpose. Rows
-are sorted by last-active, most recent first. Anything unmeasurable renders `-`
-rather than guessing.
+remote-control bridge), and the session purpose. Rows are sorted by
+last-active, most recent first. Anything unmeasurable renders `-` rather than
+guessing.
+
+`rc` is one shared classifier across `session ls`, `session doctor`, and
+autoheal:
+- `live` / `dead` — bridge established / not (subscription backend, or a
+  session with no recorded profile at all).
+- `off` — launched with `--no-bridge`.
+- `na` — the session's profile uses a non-subscription backend (Bedrock,
+  Vertex, Foundry, a direct API key); the remote-control bridge can't
+  authenticate there, so `cctrl` skips it at launch unless the profile sets
+  `"bridge": true`. Only `dead` bridges are ever repaired — `na` is never
+  touched by `doctor --fix` or autoheal.
+- `na-inferred` — a pre-plan-071 session (no `profile` recorded) with no
+  bridge, where the claude process's own env shows a non-subscription
+  provider var. Inferred, not repaired.
+- `unknown` — a pre-plan-071 session with no bridge, where that env read
+  itself couldn't be confirmed. Skipped, fail-safe.
+- `-` — not a claude session.
 
 ```
 $ cctrl session ls
-✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix
+✦ = cctrl-managed · rc = remote-control bridge (live/dead/off/na/na-inferred/unknown). Repair: cctrl session doctor --fix
 ✦ TMUX--homelab   claude (opus-5)    ~/dev/homelab                  working        detached  4m     live  deploy-poll flake
 ✦ TMUX--api       claude (sonnet-4-6) ~/dev/api                      idle           detached  3h     live  rate-limit middleware
   scratch         shell (zsh)        ~/tmp                          -              attached  -      -

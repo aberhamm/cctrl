@@ -2070,6 +2070,66 @@ test_profile_auth_backend_table() {
     echo "ok: _profile_auth_backend classifies bedrock/api(key)/api(base url)/subscription/codex"
 }
 
+test_profile_bridge_override_table() {
+    # Plan 071 phase 7: _profile_bridge_override is false by default and true
+    # only when a profile explicitly opts back into the remote-control bridge
+    # on a non-subscription backend, via either the top-level "bridge" key or
+    # the agents.claude.bridge fallback (same shape/truthy rule as
+    # _profile_auth_backend).
+    local rootcopy="$TMPDIR/cctrl-bridge-override-copy"
+    local pf="$TMPDIR/cctrl-bridge-override-profiles"
+    mkdir -p "$rootcopy/data" "$pf"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}\n' > "$pf/no-override.json"
+    printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"},"bridge":true}\n' > "$pf/override.json"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"},"bridge":"yes"}}}\n' > "$pf/agents-override.json"
+
+    local out
+    out="$(CCTRL_BRIDGE_FIXTURES="$pf" CCTRL_NO_MAIN=1 bash -c '
+        source "$0"
+        _profile_bridge_override "$CCTRL_BRIDGE_FIXTURES/no-override.json"
+        echo
+        _profile_bridge_override "$CCTRL_BRIDGE_FIXTURES/override.json"
+        echo
+        _profile_bridge_override "$CCTRL_BRIDGE_FIXTURES/agents-override.json"
+    ' "$rootcopy/cctrl")"
+
+    local -a lines=()
+    local l
+    while IFS= read -r l; do lines+=("$l"); done <<< "$out"
+    [[ "${#lines[@]}" -eq 3 ]] || fail "expected 3 classification lines, got ${#lines[@]}: $out"
+    [[ "${lines[0]}" == "false" ]] || fail "no-override profile reported '${lines[0]}'"
+    [[ "${lines[1]}" == "true" ]] || fail "top-level bridge:true profile reported '${lines[1]}'"
+    [[ "${lines[2]}" == "true" ]] || fail "agents.claude.bridge profile reported '${lines[2]}'"
+
+    echo "ok: _profile_bridge_override honors top-level and agents.claude bridge overrides"
+}
+
+test_launch_skips_bridge_for_non_subscription_backend() {
+    # Plan 071 phase 7: a non-subscription backend (Bedrock here) can't
+    # authenticate the remote-control app bridge, so --remote-control is
+    # skipped at launch -- unless the profile sets "bridge": true.
+    make_fake_agent "$TMPDIR/claude" claude
+    local pf="$TMPDIR/launch-bridge-profiles" runtime="$TMPDIR/launch-bridge-runtime"
+    mkdir -p "$pf"
+    printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}\n' > "$pf/work.json"
+    printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"},"bridge":true}\n' > "$pf/work-bridge.json"
+
+    local out
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_PROFILES_DIR="$pf" CCTRL_RUNTIME_DIR="$runtime" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile work -m "bedrock prompt")"
+    assert_contains "$out" "CMD=claude"
+    assert_not_contains "$out" "--remote-control"
+
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_PROFILES_DIR="$pf" CCTRL_RUNTIME_DIR="$runtime" \
+        "$ROOT/cctrl" start --foreground --agent claude --profile work-bridge -m "bedrock prompt 2")"
+    assert_contains "$out" "--remote-control"
+
+    echo "ok: launch skips --remote-control for a non-subscription backend, unless the profile sets bridge:true"
+}
+
 test_profile_use_migrates_legacy_active_profile() {
     # Plan 071 phase 3: `cctrl use` also runs the shared legacy-migration
     # helper (previously only `profile migrate` did), removing a
@@ -3082,8 +3142,8 @@ test_dir_launch_no_shortcut_match_unchanged() {
 test_session_doctor_classifies_bridge() {
     # session doctor reads bridgeSessionId from the Claude session file to decide
     # live vs dead, and flags app/tmux name-prefix mismatches.
-    local bin="$TMPDIR/doctorbin" sdir="$TMPDIR/claude-sessions"
-    mkdir -p "$bin" "$sdir"
+    local bin="$TMPDIR/doctorbin" sdir="$TMPDIR/claude-sessions" meta="$TMPDIR/doctorbin-meta"
+    mkdir -p "$bin" "$sdir" "$meta"
     make_fake_tmux "$bin/tmux"
 
     # live + name-aligned
@@ -3100,8 +3160,14 @@ SH
 {"pid":4242,"name":"TMUX--ms--portal","status":"idle","bridgeSessionId":"session_live123"}
 JSON
 
+    # Plan 071 phase 7: the classifier now reads session metadata too, so this
+    # test needs its own metadata dir -- isolated from any earlier test's
+    # real `cctrl start --name TMUX--ms--portal` launch (a provisional
+    # launch-*.json record keyed by that same session name, found by name
+    # scan regardless of which dir it landed in) -- or it would pick that up
+    # instead of staying metadata-free like a pre-071 session.
     local out
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
     assert_contains "$out" '"session": "TMUX--ms--portal"'
     assert_contains "$out" '"remote_control": "live"'
     assert_contains "$out" '"bridge": "session_live123"'
@@ -3120,7 +3186,7 @@ SH
     cat > "$sdir/4242.json" <<'JSON'
 {"pid":4242,"name":"TMUX--ms--portal","status":"idle"}
 JSON
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
     assert_contains "$out" '"remote_control": "dead"'
     assert_contains "$out" '"name_aligned": false'
 }
@@ -3129,8 +3195,8 @@ test_session_doctor_detects_collision() {
     # Two sessions reporting the same bridgeSessionId = a bridge collision from a
     # shared name prefix. Both read "live" individually; only cross-checking ids
     # reveals it.
-    local bin="$TMPDIR/colbin" sdir="$TMPDIR/col-sessions"
-    mkdir -p "$bin" "$sdir"
+    local bin="$TMPDIR/colbin" sdir="$TMPDIR/col-sessions" meta="$TMPDIR/colbin-meta"
+    mkdir -p "$bin" "$sdir" "$meta"
     make_fake_tmux "$bin/tmux"
     cat > "$bin/ps" <<'SH'
 #!/usr/bin/env bash
@@ -3145,7 +3211,7 @@ SH
 {"pid":4242,"status":"idle","bridgeSessionId":"session_shared"}
 JSON
     local out
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--homelab--3 TMUX--ms--homelab--5" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--ms--homelab--3 TMUX--ms--homelab--5" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
     assert_contains "$out" '"remote_control": "collision"'
 }
 
@@ -3366,6 +3432,14 @@ _autoheal_fixture() {
     local bin="$1" sdir="$2" status="$3"
     mkdir -p "$bin" "$sdir"
     make_fake_tmux "$bin/tmux"
+    # Plan 071 phase 7: the bridge classifier now reads session metadata, so
+    # give every autoheal test its own empty metadata dir -- isolated from
+    # any earlier test's real `cctrl start --name TMUX--ms--portal` launch
+    # (a provisional launch-*.json record found by session-name scan
+    # regardless of which dir it landed in) -- or this fixture's session
+    # would stop looking metadata-free like a pre-071 session.
+    export CCTRL_SESSION_METADATA_DIR="$sdir/.autoheal-meta"
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
     cat > "$bin/ps" <<'SH'
 #!/usr/bin/env bash
 if [[ "$*" == *4242* ]]; then
@@ -3509,6 +3583,206 @@ JSON
     [[ "$out" == "[]" ]] || fail "live bridge must not be selected (got: $out)"
     [[ -s "$rlog" ]] && fail "live bridge must NOT be repaired"
     echo "ok: autoheal never touches a live bridge"
+}
+
+test_session_bridge_state_na_backend() {
+    # Plan 071 phase 7: a session whose profile uses a non-subscription
+    # backend is classified "na" -- the bridge can't authenticate there -- the
+    # same way across ls, doctor, and autoheal. One fixture, three
+    # assertions, per the plan's test list. Never /rc-repaired.
+    local bin="$TMPDIR/na-bin" sdir="$TMPDIR/na-sessions" meta="$TMPDIR/na-meta"
+    local rlog="$TMPDIR/na-repair.log" hlog="$TMPDIR/na-heal.log"
+    mkdir -p "$bin" "$sdir" "$meta"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--bedrock --remote-control --remote-control-session-name-prefix TMUX--ms--bedrock-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--bedrock","status":"idle"}
+JSON
+    cat > "$meta/TMUX--ms--bedrock.json" <<'JSON'
+{"name":"TMUX--ms--bedrock","agent":"claude","profile":"work","auth_backend":"bedrock","cctrl_managed":true}
+JSON
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--bedrock" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"remote_control": "na"'
+
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--bedrock" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"remote_control": "na"'
+
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--bedrock" TMUX_FAKE_PANE_PID=4242 \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    [[ "$out" == "[]" ]] || fail "na session must not be selected for autoheal (got: $out)"
+    [[ -s "$rlog" ]] && fail "na session must NOT have /rc injected"
+    echo "ok: na backend classified consistently across ls, doctor, autoheal; never /rc-repaired"
+}
+
+test_session_bridge_state_subscription_dead_still_heals() {
+    # Regression: a post-071 session (metadata carries a `profile` field) on
+    # the default subscription backend is still a plain live/dead bridge, and
+    # a dead one is still autoheal-repairable -- having a `profile` field at
+    # all must not reclassify it as na/na-inferred/unknown.
+    local bin="$TMPDIR/subdead-bin" sdir="$TMPDIR/subdead-sessions" meta="$TMPDIR/subdead-meta"
+    local rlog="$TMPDIR/subdead-repair.log" hlog="$TMPDIR/subdead-heal.log"
+    mkdir -p "$bin" "$sdir" "$meta"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude --name TMUX--ms--subdead --remote-control --remote-control-session-name-prefix TMUX--ms--subdead-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--subdead","status":"idle"}
+JSON
+    cat > "$meta/TMUX--ms--subdead.json" <<'JSON'
+{"name":"TMUX--ms--subdead","agent":"claude","profile":"personal","auth_backend":"subscription","cctrl_managed":true}
+JSON
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--subdead" TMUX_FAKE_PANE_PID=4242 \
+        TMUX_FAKE_CAPTURE_PANE='⏺ Done.' \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    assert_contains "$out" '"action": "healed"'
+    assert_contains "$(cat "$rlog")" "TMUX--ms--subdead"
+    echo "ok: a post-071 subscription-backend dead bridge still heals normally"
+}
+
+test_session_bridge_state_pre_change_inferred_and_unknown() {
+    # Pre-071 sessions carry no `profile` metadata field at all. With no
+    # bridge, the classifier infers backend from the claude pid's own env via
+    # `ps eww` (grep -q only -- the content itself is never stored/printed,
+    # R2): a provider var present -> na-inferred; ps unreadable -> unknown.
+    # Neither is ever /rc-repaired.
+    local bin="$TMPDIR/inf-bin" sdir="$TMPDIR/inf-sessions"
+    local rlog="$TMPDIR/inf-repair.log" hlog="$TMPDIR/inf-heal.log"
+    mkdir -p "$bin" "$sdir"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    if [[ "$*" == *eww* ]]; then
+        echo "claude --name TMUX--ms--legacy --remote-control --remote-control-session-name-prefix TMUX--ms--legacy- CLAUDE_CODE_USE_BEDROCK=1"
+    else
+        echo "claude --name TMUX--ms--legacy --remote-control --remote-control-session-name-prefix TMUX--ms--legacy-"
+    fi
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--legacy","status":"idle"}
+JSON
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--legacy" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"remote_control": "na-inferred"'
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--legacy" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"remote_control": "na-inferred"'
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--legacy" TMUX_FAKE_PANE_PID=4242 \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    [[ "$out" == "[]" ]] || fail "na-inferred session must not be autohealed (got: $out)"
+    [[ -s "$rlog" ]] && fail "na-inferred session must NOT have /rc injected"
+
+    # ps unreadable for the env probe (but cmd-sniffing still works) -> unknown.
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    if [[ "$*" == *eww* ]]; then
+        exit 1
+    fi
+    echo "claude --name TMUX--ms--legacy --remote-control --remote-control-session-name-prefix TMUX--ms--legacy-"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--legacy" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session ls --json)"
+    assert_contains "$out" '"remote_control": "unknown"'
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--legacy" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json)"
+    assert_contains "$out" '"remote_control": "unknown"'
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--legacy" TMUX_FAKE_PANE_PID=4242 \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json)"
+    [[ "$out" == "[]" ]] || fail "unknown session must not be autohealed (got: $out)"
+    [[ -s "$rlog" ]] && fail "unknown session must NOT have /rc injected"
+    echo "ok: pre-change sessions classify na-inferred/unknown from env inference, never repaired"
+}
+
+test_session_bridge_state_never_prints_ps_env() {
+    # R2: the pre-change inference reads the claude pid's env via `ps eww`
+    # but must never surface that content. Plant a fixture secret in the fake
+    # ps output and prove it never reaches ls, doctor (text + json), or
+    # autoheal output.
+    local bin="$TMPDIR/leak-bin" sdir="$TMPDIR/leak-sessions"
+    local rlog="$TMPDIR/leak-repair.log" hlog="$TMPDIR/leak-heal.log"
+    local secret="FIXTURE_SECRET_sk-test-do-not-leak-9f2a"
+    mkdir -p "$bin" "$sdir"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<SH
+#!/usr/bin/env bash
+if [[ "\$*" == *4242* ]]; then
+    if [[ "\$*" == *eww* ]]; then
+        echo "claude --name TMUX--ms--leak --remote-control --remote-control-session-name-prefix TMUX--ms--leak- CLAUDE_CODE_USE_BEDROCK=1 ANTHROPIC_API_KEY=${secret}"
+    else
+        echo "claude --name TMUX--ms--leak --remote-control --remote-control-session-name-prefix TMUX--ms--leak-"
+    fi
+    exit 0
+fi
+exec /bin/ps "\$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$sdir/4242.json" <<'JSON'
+{"pid":4242,"name":"TMUX--ms--leak","status":"idle"}
+JSON
+    : > "$rlog"
+
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--leak" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session ls 2>&1)"
+    assert_not_contains "$out" "$secret"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--leak" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session ls --json 2>&1)"
+    assert_not_contains "$out" "$secret"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--leak" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor 2>&1)"
+    assert_not_contains "$out" "$secret"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--leak" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --json 2>&1)"
+    assert_not_contains "$out" "$secret"
+    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        TMUX_FAKE_SESSIONS="TMUX--ms--leak" TMUX_FAKE_PANE_PID=4242 \
+        CCTRL_AUTOHEAL_LOG="$hlog" CCTRL_AUTOHEAL_REPAIR_LOG="$rlog" \
+        "$ROOT/cctrl" session autoheal --json 2>&1)"
+    assert_not_contains "$out" "$secret"
+    echo "ok: planted ps env secret never surfaces in ls, doctor, or autoheal output"
 }
 
 test_session_autoheal_install_uninstall_plist() {
@@ -12397,6 +12671,8 @@ test_profile_use_migrates_legacy_active_profile
 test_profile_current_source_file_and_warnings
 test_profile_diff_redaction
 test_profile_auth_backend_table
+test_profile_bridge_override_table
+test_launch_skips_bridge_for_non_subscription_backend
 test_profile_rename_dispatch_and_defaultProfile
 test_profile_ls_shows_auth_backend_and_current_lists_sessions
 test_detached_agent_prompt_exports_selection
@@ -12432,6 +12708,10 @@ test_session_autoheal_skips_busy
 test_session_autoheal_skips_copy_mode
 test_session_autoheal_heals_clean_dead_bridge
 test_session_autoheal_ignores_live_bridge
+test_session_bridge_state_na_backend
+test_session_bridge_state_subscription_dead_still_heals
+test_session_bridge_state_pre_change_inferred_and_unknown
+test_session_bridge_state_never_prints_ps_env
 test_session_autoheal_install_uninstall_plist
 test_session_list_codex_default_model
 test_session_list_agent_not_mislabelled_by_prompt

@@ -100,6 +100,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   it as a literal `--profile` flag) rather than preserving the original
   session's shortcut/default/legacy source — the profile name itself is
   still correct, this is cosmetic. (plan 071 phase 6)
+- `session ls`/`session doctor`/`session autoheal` now share one
+  remote-control bridge classifier (`_session_bridge_state`), adding `na`
+  (the session's profile uses a non-subscription backend — Bedrock, Vertex,
+  Foundry, or a direct API key/token — which can't authenticate the app
+  bridge), `na-inferred` (a pre-071 session with no recorded profile, no
+  bridge, and a non-subscription provider var found in the claude process's
+  own env), and `unknown` (same pre-071 case, but that env read couldn't be
+  confirmed) alongside the existing `live`/`dead`/`off`/`collision`/`-`.
+  Only `dead` is ever repaired by `doctor --fix` or autoheal; the new states
+  are always skipped. Launch itself now skips `--remote-control` for a
+  non-subscription backend unless the profile sets `"bridge": true`
+  (`_profile_bridge_override`), so new sessions on those backends land
+  straight in `na` territory instead of `dead`. (plan 071 phase 7)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including

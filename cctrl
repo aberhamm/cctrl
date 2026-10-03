@@ -841,6 +841,26 @@ _profile_auth_backend() {
     printf '%s' "${result:-subscription}"
 }
 
+# Plan 071 phase 7: does this profile explicitly ask to keep the
+# remote-control bridge even on a non-subscription backend? Mirrors
+# _profile_auth_backend's exact agents.claude.X // .X fallback shape and
+# truthy coercion rather than deriving a second rule.
+_profile_bridge_override() {
+    local pf="$1" result
+    [[ -n "$pf" && -f "$pf" ]] || { printf 'false'; return 0; }
+    command -v jq >/dev/null 2>&1 || { printf 'false'; return 0; }
+    result="$(jq -r '
+        def truthy: . as $v
+            | if ($v | type) == "boolean" then $v
+              elif ($v | type) == "number" then ($v != 0)
+              elif ($v | type) == "string" then
+                (($v | ascii_downcase) as $s | ($s == "1" or $s == "true" or $s == "yes" or $s == "on"))
+              else false end;
+        ((if has("agents") then (.agents.claude.bridge // .bridge) else .bridge end) // false) | truthy
+    ' "$pf" 2>/dev/null)" || true
+    printf '%s' "${result:-false}"
+}
+
 # Plan 071 phase 5 (D5/D8): per-session --settings overlay files. These live
 # outside the repo/XDG config in uid-scoped OS runtime space, since a
 # profile's secrets end up written here in plaintext (0600) for the agent to
@@ -1176,7 +1196,15 @@ _launch_exec_agent() {
             fi
         fi
 
-        if [[ "$no_bridge" != "true" ]]; then
+        # Plan 071 phase 7: a non-subscription backend (Bedrock/Vertex/Foundry/
+        # api) can't authenticate the remote-control app bridge, so skip
+        # --remote-control there unless the profile explicitly opts back in
+        # with "bridge": true.
+        local _bridge_wanted=true
+        if [[ "$no_bridge" != "true" && -n "${CCTRL_SESSION_AUTH_BACKEND:-}" && "$CCTRL_SESSION_AUTH_BACKEND" != "subscription" ]]; then
+            [[ "$(_profile_bridge_override "$pf")" == "true" ]] || _bridge_wanted=false
+        fi
+        if [[ "$no_bridge" != "true" ]] && $_bridge_wanted; then
             # Bridge name reconciliation: when an explicit session name is set
             # (detached/tmux-managed launches always pass --name), derive the
             # remote-control prefix from that exact name so the Claude Code app
@@ -10547,18 +10575,60 @@ _fmt_age_ms() {
     fi
 }
 
-_session_rc_state() {
-    # Classify a session's remote-control bridge: live | dead | off | - .
-    #   off  = launched with --no-bridge (no --remote-control in argv)
-    #   live = --remote-control present AND bridgeSessionId set in session file
-    #   dead = --remote-control present but bridgeSessionId null/missing
-    #   -    = not a claude session
-    local sess="$1" cmd="$2" pid bridge
+_session_bridge_state() {
+    # Plan 071 phase 7: the single remote-control bridge classifier shared by
+    # `session ls`, `session doctor`, and autoheal. Collision detection stays
+    # layered on top by _session_doctor (it needs the full session list to
+    # spot two sessions sharing one bridgeSessionId); this function never
+    # sees that context.
+    #   -          = not a claude session
+    #   off        = no --remote-control in argv
+    #   na         = metadata auth_backend != subscription (bridge won't work)
+    #   live/dead  = --remote-control present, subscription (or no-profile-
+    #                field) backend; bridgeSessionId set or not
+    #   na-inferred = pre-change session (no metadata `profile` field), no
+    #                bridge, and the claude pid's env shows a non-subscription
+    #                provider var
+    #   unknown    = pre-change session, no bridge, and `ps` couldn't be read
+    #                (R2: never store/print the env content itself)
+    local sess="$1" cmd="$2" pid meta_file normalized_record has_profile auth_backend bridge ps_out
     [[ "$cmd" == *claude* ]] || { printf '%s' '-'; return 0; }
-    if [[ "$cmd" != *--remote-control* ]]; then printf '%s' 'off'; return 0; fi
+    [[ "$cmd" == *--remote-control* ]] || { printf '%s' 'off'; return 0; }
     pid="$(_session_claude_pid "$sess")"
+    has_profile=false; auth_backend=""
+    meta_file="$(_session_metadata_file "$sess")"
+    if [[ -f "$meta_file" ]]; then
+        normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
+        if [[ -n "$normalized_record" ]]; then
+            [[ "$(jq -r 'has("profile")' <<< "$normalized_record" 2>/dev/null || true)" == "true" ]] && has_profile=true
+            auth_backend="$(jq -r '.auth_backend // empty' <<< "$normalized_record" 2>/dev/null || true)"
+        fi
+    fi
+    if $has_profile; then
+        if [[ -n "$auth_backend" && "$auth_backend" != "subscription" ]]; then
+            printf '%s' 'na'; return 0
+        fi
+        bridge="$(_session_bridge_field "$pid" bridgeSessionId)"
+        [[ -n "$bridge" ]] && printf '%s' 'live' || printf '%s' 'dead'
+        return 0
+    fi
+    # Pre-change session: no `profile` key was ever written to its metadata.
     bridge="$(_session_bridge_field "$pid" bridgeSessionId)"
-    [[ -n "$bridge" ]] && printf '%s' 'live' || printf '%s' 'dead'
+    if [[ -n "$bridge" ]]; then printf '%s' 'live'; return 0; fi
+    [[ -n "$pid" ]] || { printf '%s' 'unknown'; return 0; }
+    if ! ps_out="$(ps eww -o command= -p "$pid" 2>/dev/null)" || [[ -z "$ps_out" ]]; then
+        printf '%s' 'unknown'; return 0
+    fi
+    # Bash regex match, not `grep <<< "$ps_out"`: a here-string writes its
+    # content (which may carry the env content we must never persist) to a
+    # temp file under some bash/shell builds. Anchored on whitespace/string
+    # edges so it can't fire on an unrelated substring inside the command
+    # line (e.g. a prompt that happens to contain this text).
+    if [[ "$ps_out" =~ (^|[[:space:]])CLAUDE_CODE_USE_(BEDROCK|VERTEX|FOUNDRY)=(1|true)([[:space:]]|$) ]]; then
+        printf '%s' 'na-inferred'
+    else
+        printf '%s' 'dead'
+    fi
 }
 
 _session_base_state() {
@@ -10865,7 +10935,7 @@ _session_list() {
     fi
 
     local -a json_items=() human_lines=() sort_keys=() order=()
-    $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off). Repair: cctrl session doctor --fix${RESET}"
+    $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off/na/na-inferred/unknown). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
     local record_schema provider origin host_id registered_by_cctrl launched_by_cctrl execution_runtime control_owner lifecycle_state restore_strategy last_observed_at lineage_json evidence_json normalized_record
@@ -10929,15 +10999,14 @@ _session_list() {
         [[ "$attached" == "1" ]] && state="attached" || state="detached"
         disp_dir="${dir/#$HOME/~}"
 
-        # Remote-control bridge state (claude only): live | dead | off | - .
+        # Remote-control bridge state (shared classifier, plan 071 phase 7):
+        # live | dead | off | na | na-inferred | unknown | - .
         rc_state="-"; bridge_id=""
         if [[ "$agent" == "claude" && "$(_agent_from_cmd "$cmd")" == "claude" ]]; then
-            if [[ "$cmd" != *--remote-control* ]]; then
-                rc_state="off"
-            else
+            rc_state="$(_session_bridge_state "$name" "$cmd")"
+            if [[ "$rc_state" == "live" ]]; then
                 cpid="$(_session_claude_pid "$name")"
                 bridge_id="$(_session_bridge_field "$cpid" bridgeSessionId)"
-                [[ -n "$bridge_id" ]] && rc_state="live" || rc_state="dead"
             fi
         fi
 
@@ -11008,14 +11077,18 @@ _session_list() {
                 purpose_display="${purpose_display:0:39}..."
             fi
             last_active_disp="$(_fmt_age_ms "$last_active_ms")"
+            # Human display only: na/na-inferred render as the shorter "n/a"
+            # (the --json `rc` field above always keeps the raw verdict word).
+            local rc_display="$rc_state"
+            [[ "$rc_state" == "na" || "$rc_state" == "na-inferred" ]] && rc_display="n/a"
             if $recap; then
                 recap_display="${recap_text:--}"
                 if [[ ${#recap_display} -gt 50 ]]; then
                     recap_display="${recap_display:0:47}..."
                 fi
-                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display" "$recap_display")")
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_display" "$purpose_display" "$recap_display")")
             else
-                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_state" "$purpose_display")")
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_display" "$purpose_display")")
             fi
         fi
     done
@@ -12328,6 +12401,7 @@ _session_doctor() {
     local sid mtarget mpurpose realign_cmd
     local n_total=0 n_live=0 n_dead=0 n_off=0 n_misnamed=0 n_fixed=0 n_realigned=0 n_skipped=0 n_collision=0
     local n_orphan_locks=0 n_locks_quarantined=0 n_locks_skipped=0
+    local n_na=0 n_na_inferred=0 n_unknown=0
     $json || printf '%-22s %-6s %-8s %-9s %s\n' "SESSION" "RC" "STATE" "NAME" "DETAIL"
     for name in "${names[@]}"; do
         cmd="$(_session_agent_cmd "$name")"
@@ -12345,15 +12419,20 @@ _session_doctor() {
             bridge="$(_session_bridge_field "$pid" bridgeSessionId)"
             [[ "$prefix" == "$expected" ]] && aligned="ok" || aligned="MISMATCH"
             [[ "$aligned" == "MISMATCH" ]] && n_misnamed=$((n_misnamed+1))
-            if [[ -n "$bridge" ]]; then
-                if [[ "$(grep -Fxc -- "$bridge" <<< "$all_bridges" || true)" -gt 1 ]]; then
-                    verdict="collision"; n_collision=$((n_collision+1))
-                else
-                    verdict="live"; n_live=$((n_live+1))
-                fi
-            else
-                verdict="dead"; n_dead=$((n_dead+1))
-            fi
+            verdict="$(_session_bridge_state "$name" "$cmd")"
+            case "$verdict" in
+                live)
+                    if [[ "$(grep -Fxc -- "$bridge" <<< "$all_bridges" || true)" -gt 1 ]]; then
+                        verdict="collision"; n_collision=$((n_collision+1))
+                    else
+                        n_live=$((n_live+1))
+                    fi
+                    ;;
+                dead) n_dead=$((n_dead+1)) ;;
+                na) n_na=$((n_na+1)) ;;
+                na-inferred) n_na_inferred=$((n_na_inferred+1)) ;;
+                unknown) n_unknown=$((n_unknown+1)) ;;
+            esac
         fi
 
         # Doctor is audit-only unless --fix is supplied. In particular it does
@@ -12446,13 +12525,30 @@ _session_doctor() {
                 --arg repaired "$repaired" --arg hint "$hint_out" \
                 '{session:$s, pid:$pid, remote_control:$rc, bridge:(if $bridge=="" then null else $bridge end), app_name_prefix:(if $prefix=="" then null else $prefix end), expected_prefix:$expected, name_aligned:($aligned=="ok"), copy_mode:($cm=="1"), status:$st, action:(if $repaired=="" then null else $repaired end), realign_hint:(if $hint=="" then null else $hint end)}')")
         else
+            # Human display only -- JSON above always carries the raw verdict
+            # word for stable automation. na/na-inferred render as "n/a" with
+            # a backend/reason in DETAIL; unknown is reported with its reason.
+            local rc_display="$verdict"
             detail=""
-            [[ "$verdict" == "collision" ]] && detail="shares bridge ${bridge} with another session — relaunch to fix"
+            case "$verdict" in
+                na)
+                    rc_display="n/a"
+                    detail="backend: $(_session_metadata_field "$name" auth_backend)"
+                    ;;
+                na-inferred)
+                    rc_display="n/a"
+                    detail="backend inferred from process env"
+                    ;;
+                unknown)
+                    detail="skipped: could not read process env"
+                    ;;
+            esac
+            [[ "$verdict" == "collision" ]] && detail="${detail:+$detail; }shares bridge ${bridge} with another session — relaunch to fix"
             [[ "$aligned" == "MISMATCH" ]] && detail="${detail:+$detail; }app-name=${prefix:-<none>} (want ${expected})"
             [[ "${copy_mode:-0}" == "1" ]] && detail="${detail:+$detail; }copy-mode"
             [[ -n "$repaired" ]] && detail="${detail:+$detail; }$repaired"
             [[ -n "$hint_out" ]] && detail="${detail:+$detail; }realign: $hint_out"
-            printf '%-22s %-6s %-8s %-9s %s\n' "$name" "$verdict" "$st" "$aligned" "$detail"
+            printf '%-22s %-6s %-8s %-9s %s\n' "$name" "$rc_display" "$st" "$aligned" "$detail"
         fi
     done
 
@@ -12481,6 +12577,9 @@ _session_doctor() {
 
     echo ""
     local summary="${n_total} claude session(s): ${n_live} live, ${n_dead} dead, ${n_off} off"
+    [[ "$n_na" -gt 0 ]] && summary+=", ${n_na} n/a"
+    [[ "$n_na_inferred" -gt 0 ]] && summary+=", ${n_na_inferred} n/a (inferred)"
+    [[ "$n_unknown" -gt 0 ]] && summary+=", ${n_unknown} unknown"
     [[ "$n_collision" -gt 0 ]] && summary+=", ${n_collision} collision"
     [[ "$n_fixed" -gt 0 ]] && summary+=", ${n_fixed} fixed"
     [[ "$n_realigned" -gt 0 ]] && summary+=", ${n_realigned} realigned"
@@ -13099,7 +13198,7 @@ _session_autoheal() {
     for name in "${names[@]}"; do
         cmd="$(_session_agent_cmd "$name")"
         [[ "$cmd" == *claude* ]] || continue
-        rc="$(_session_rc_state "$name" "$cmd")"
+        rc="$(_session_bridge_state "$name" "$cmd")"
         # Only DEAD bridges are /rc-repairable; live/off/collision are left alone.
         [[ "$rc" == "dead" ]] || continue
         scanned=$((scanned+1))
