@@ -1,41 +1,23 @@
 #!/usr/bin/env python3
 """
-Claude Code Stop hook: logs session token usage with the active cctrl profile.
+Claude Code Stop hook: logs session token usage with the launching cctrl
+profile and auth backend.
 
-Fires after every assistant turn. Uses an upsert strategy: if the last entry
-in spending.jsonl is for the same session_id, it replaces that line with
-updated totals. This way, only the final snapshot per session persists.
+Fires after every assistant turn. Reads the hook's own JSON from stdin and
+logs only the transcript it names -- a previous version globbed every
+~/.claude/projects/*.jsonl modified in the last 120s, which misattributed
+usage between concurrent sessions. Uses an upsert strategy: if the last
+entry in spending.jsonl is for the same session_id, it replaces that line
+with updated totals. This way, only the final snapshot per session persists.
 """
 import json
 import os
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 CCTRL_DIR = Path(__file__).resolve().parent.parent
-ACTIVE_FILE = CCTRL_DIR / ".active-profile"
 SPENDING_LOG = CCTRL_DIR / "costs" / "spending.jsonl"
-CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
-
-
-def get_active_profile():
-    if ACTIVE_FILE.exists():
-        return ACTIVE_FILE.read_text().strip()
-    return "unknown"
-
-
-def find_recent_sessions(max_age_seconds=120):
-    """Find all session JSONL files modified within the last max_age_seconds."""
-    now = time.time()
-    candidates = []
-    for p in CLAUDE_PROJECTS.rglob("*.jsonl"):
-        try:
-            if now - p.stat().st_mtime <= max_age_seconds:
-                candidates.append(p)
-        except OSError:
-            continue
-    return candidates
 
 
 def sum_session_tokens(session_path):
@@ -97,11 +79,30 @@ def _flush(assistant_entry, totals, by_model):
 
 
 def main():
-    recent = find_recent_sessions()
-    if not recent:
+    try:
+        hook_input = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        hook_input = {}
+    if not isinstance(hook_input, dict):
+        hook_input = {}
+
+    transcript_path = hook_input.get("transcript_path")
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return
+    session_path = Path(transcript_path)
+    if not session_path.is_file():
         return
 
-    profile = get_active_profile()
+    profile = os.environ.get("CCTRL_SESSION_PROFILE") or "unknown"
+    auth_backend = os.environ.get("CCTRL_SESSION_AUTH_BACKEND") or "unknown"
+
+    session_id, totals, by_model = sum_session_tokens(session_path)
+    hook_session_id = hook_input.get("session_id")
+    if isinstance(hook_session_id, str) and hook_session_id:
+        session_id = hook_session_id
+
+    if totals["input_tokens"] == 0 and totals["output_tokens"] == 0:
+        return
 
     SPENDING_LOG.parent.mkdir(parents=True, exist_ok=True)
     lines = []
@@ -109,40 +110,35 @@ def main():
         with open(SPENDING_LOG) as f:
             lines = f.readlines()
 
-    for session_path in recent:
-        session_id, totals, by_model = sum_session_tokens(session_path)
+    entry_line = json.dumps({
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "event": "session_update",
+        "profile": profile,
+        "auth_backend": auth_backend,
+        "session_id": session_id,
+        "session_file": str(session_path),
+        "input_tokens": totals["input_tokens"],
+        "output_tokens": totals["output_tokens"],
+        "cache_write_tokens": totals["cache_creation_input_tokens"],
+        "cache_read_tokens": totals["cache_read_input_tokens"],
+        "models": by_model,
+    }) + "\n"
 
-        if totals["input_tokens"] == 0 and totals["output_tokens"] == 0:
+    replaced = False
+    search_start = max(0, len(lines) - 100)
+    for i in range(len(lines) - 1, search_start - 1, -1):
+        try:
+            existing = json.loads(lines[i])
+            if (existing.get("event") in ("session_update", "session_end")
+                    and existing.get("session_id") == session_id):
+                lines[i] = entry_line
+                replaced = True
+                break
+        except (json.JSONDecodeError, IndexError):
             continue
 
-        entry_line = json.dumps({
-            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "event": "session_update",
-            "profile": profile,
-            "session_id": session_id,
-            "session_file": str(session_path),
-            "input_tokens": totals["input_tokens"],
-            "output_tokens": totals["output_tokens"],
-            "cache_write_tokens": totals["cache_creation_input_tokens"],
-            "cache_read_tokens": totals["cache_read_input_tokens"],
-            "models": by_model,
-        }) + "\n"
-
-        replaced = False
-        search_start = max(0, len(lines) - 100)
-        for i in range(len(lines) - 1, search_start - 1, -1):
-            try:
-                existing = json.loads(lines[i])
-                if (existing.get("event") in ("session_update", "session_end")
-                        and existing.get("session_id") == session_id):
-                    lines[i] = entry_line
-                    replaced = True
-                    break
-            except (json.JSONDecodeError, IndexError):
-                continue
-
-        if not replaced:
-            lines.append(entry_line)
+    if not replaced:
+        lines.append(entry_line)
 
     with open(SPENDING_LOG, "w") as f:
         f.writelines(lines)

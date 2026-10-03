@@ -10935,9 +10935,10 @@ _session_list() {
     fi
 
     local -a json_items=() human_lines=() sort_keys=() order=()
-    $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off/na/na-inferred/unknown). Repair: cctrl session doctor --fix${RESET}"
+    $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off/na/na-inferred/unknown) · profile = personal/work·bedrock/none/? (? = pre-071 record). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
+    local profile profile_source auth_backend profile_display has_profile_raw has_profile
     local record_schema provider origin host_id registered_by_cctrl launched_by_cctrl execution_runtime control_owner lifecycle_state restore_strategy last_observed_at lineage_json evidence_json normalized_record
     for i in "${!names[@]}"; do
         name="${names[i]}"
@@ -10951,11 +10952,12 @@ _session_list() {
         local meta_file
         meta_file="$(_session_metadata_file "$name")"
         purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""
+        profile=""; profile_source=""; auth_backend=""; has_profile_raw="false"
         record_schema=""; provider=""; origin=""; host_id=""; registered_by_cctrl=false; launched_by_cctrl=false; execution_runtime=unknown; control_owner=unknown; lifecycle_state=unknown; restore_strategy=""; last_observed_at=""; lineage_json='{}'; evidence_json='[]'
         if [[ -f "$meta_file" ]]; then
             normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
             if [[ -n "$normalized_record" ]]; then
-                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // "")' <<< "$normalized_record" 2>/dev/null) || true
+                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r profile; IFS= read -r has_profile_raw; IFS= read -r profile_source; IFS= read -r auth_backend; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.profile // ""), (has("profile")|tostring), (.profile_source // ""), (.auth_backend // "")' <<< "$normalized_record" 2>/dev/null) || true
                 record_schema="$(jq -r '.schema_version // empty' <<< "$normalized_record")"
                 provider="$(jq -r '.provider // empty' <<< "$normalized_record")"
                 origin="$(jq -r '.origin // empty' <<< "$normalized_record")"
@@ -11051,6 +11053,22 @@ _session_list() {
         recap_text=""
         if $recap && [[ "$agent" == "claude" ]]; then recap_text="$(_session_recap "$name")"; fi
 
+        # PROFILE column (plan 071 phase 8): "?" when the metadata record
+        # predates the profile field entirely (has("profile") false --
+        # genuinely unknown, not the same as an explicit --profile none);
+        # "none" for an explicit no-overlay record; otherwise the profile
+        # name, suffixed with the auth backend when it isn't subscription.
+        has_profile=false; [[ "$has_profile_raw" == "true" ]] && has_profile=true
+        if ! $has_profile; then
+            profile_display="?"
+        elif [[ -z "$profile" ]]; then
+            profile_display="none"
+        elif [[ -n "$auth_backend" && "$auth_backend" != "subscription" ]]; then
+            profile_display="${profile}·${auth_backend}"
+        else
+            profile_display="$profile"
+        fi
+
         if $json; then
             json_items+=("$(jq -n \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
@@ -11069,7 +11087,8 @@ _session_list() {
                 --argjson registered_by_cctrl "$registered_by_cctrl" --argjson launched_by_cctrl "$launched_by_cctrl" \
                 --argjson lineage "$lineage_json" --argjson ownership_evidence "$evidence_json" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
+                --arg profile "$profile" --arg profile_source "$profile_source" --arg auth_backend "$auth_backend" \
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence, profile:(if $profile=="" then null else $profile end), profile_source:(if $profile_source=="" then null else $profile_source end), auth_backend:(if $auth_backend=="" then null else $auth_backend end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -11086,9 +11105,9 @@ _session_list() {
                 if [[ ${#recap_display} -gt 50 ]]; then
                     recap_display="${recap_display:0:47}..."
                 fi
-                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_display" "$purpose_display" "$recap_display")")
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %-14s %-42s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_display" "$profile_display" "$purpose_display" "$recap_display")")
             else
-                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_display" "$purpose_display")")
+                human_lines+=("$(printf '%s %-15s %-18s %-30s %-14s %-9s %-6s %-5s %-14s %s' "$marker" "$name" "$kind" "$disp_dir" "$base_state" "$state" "$last_active_disp" "$rc_display" "$profile_display" "$purpose_display")")
             fi
         fi
     done
@@ -11378,6 +11397,7 @@ def base_row(key, provider, task_id=None):
         "lineage": {"forked_from_id": None, "parent_thread_id": None, "derived_root_id": None, "derived_root_basis": None},
         "ownership_evidence": [], "diagnostic_evidence": [], "recency": None,
         "cwd": None, "title": None, "display_title": None, "tmux_session": None,
+        "profile": None, "auth_backend": None,
         "_tmux_live": False, "_provider_seen": False, "_provider_archived": False,
     }
 
@@ -11395,6 +11415,8 @@ def merge_record(row, record, path_hint="registry"):
     if isinstance(evidence, list): row["ownership_evidence"] = evidence[-MAX_EVIDENCE:]
     row["recency"] = record.get("last_observed_at") or record.get("created_at")
     row["cwd"] = record.get("cwd")
+    row["profile"] = record.get("profile")
+    row["auth_backend"] = record.get("auth_backend")
     row["title"] = record.get("display_label") or record.get("purpose") or record.get("name")
     row["display_title"] = row["title"]
     row["tmux_session"] = nullable_string(record.get("tmux_session")) or nullable_string(record.get("name"))
@@ -15565,8 +15587,13 @@ _hooks_run() {
             exec python3 "$SCRIPT_DIR/hooks/block-git-commit.py"
             ;;
         stop)
-            "$SCRIPT_DIR/hooks/notify.sh" stop
-            python3 "$SCRIPT_DIR/hooks/session-log.py"
+            # Capture stdin once and tee it to both: each script used to read
+            # it independently, so the second one ever got nothing once the
+            # first consumed the pipe.
+            local stop_input
+            stop_input="$(cat)"
+            printf '%s' "$stop_input" | "$SCRIPT_DIR/hooks/notify.sh" stop
+            printf '%s' "$stop_input" | python3 "$SCRIPT_DIR/hooks/session-log.py"
             ;;
         notify)
             exec "$SCRIPT_DIR/hooks/notify.sh" notification

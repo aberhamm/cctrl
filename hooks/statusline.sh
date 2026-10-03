@@ -25,14 +25,24 @@ tokens_fmt=$(awk -v t="$tokens" 'BEGIN {
     else printf "%d", t
 }')
 
+# Bridge label (plan 071 phase 8): this session's own CCTRL_SESSION_PROFILE,
+# never the configured default or the legacy single-machine .active-profile
+# file (both would be wrong under concurrent profiles). Shown only when the
+# auth backend isn't the subscription default, so a plain personal session's
+# line stays unchanged.
+bridge_prefix=""
+if [[ -n "${CCTRL_SESSION_AUTH_BACKEND:-}" && "$CCTRL_SESSION_AUTH_BACKEND" != "subscription" ]]; then
+    bridge_prefix="[${CCTRL_SESSION_PROFILE:-unknown}·${CCTRL_SESSION_AUTH_BACKEND}] "
+fi
+
 # Add rate limit hint if available
 five_hr=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
 
 if [[ -n "$five_hr" && -n "$seven_day" ]]; then
-    printf "%s | %s | %s | 5h: %s%% 7d: %s%%" "$model" "$project" "$tokens_fmt" "${five_hr%.*}" "${seven_day%.*}"
+    printf "%s%s | %s | %s | 5h: %s%% 7d: %s%%" "$bridge_prefix" "$model" "$project" "$tokens_fmt" "${five_hr%.*}" "${seven_day%.*}"
 else
-    printf "%s | %s | %s" "$model" "$project" "$tokens_fmt"
+    printf "%s%s | %s | %s" "$bridge_prefix" "$model" "$project" "$tokens_fmt"
 fi
 
 # ── Capture: rate_limits to file (if present) ────────────────────────

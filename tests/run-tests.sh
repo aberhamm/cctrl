@@ -3816,6 +3816,166 @@ SH
     echo "ok: autoheal install writes plist to test dir; uninstall removes it"
 }
 
+test_session_list_profile_column_mixed() {
+    # Plan 071 phase 8: PROFILE column + --json fields, across a bedrock
+    # profile, a plain subscription profile, a genuinely pre-071 record
+    # (metadata exists but was never given a `profile` key at all -- the
+    # real has("profile")==false path, not just "no metadata file"), and an
+    # explicit --profile none no-overlay record (has("profile")==true,
+    # value null). The first two must render "?" and "none" respectively --
+    # the whole point of the has("profile") distinction.
+    local bin="$TMPDIR/profcol-bin" meta="$TMPDIR/profcol-meta"
+    mkdir -p "$bin" "$meta"
+    make_fake_tmux "$bin/tmux"
+    cat > "$bin/ps" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == *4242* ]]; then
+    echo "claude"
+    exit 0
+fi
+exec /bin/ps "$@"
+SH
+    chmod +x "$bin/ps"
+    cat > "$meta/TMUX--ms--work.json" <<'JSON'
+{"name":"TMUX--ms--work","agent":"claude","profile":"work","profile_source":"explicit","auth_backend":"bedrock","cctrl_managed":true}
+JSON
+    cat > "$meta/TMUX--ms--personal.json" <<'JSON'
+{"name":"TMUX--ms--personal","agent":"claude","profile":"personal","profile_source":"default","auth_backend":"subscription","cctrl_managed":true}
+JSON
+    # Metadata exists (this is a real, managed cctrl record) but was written
+    # before phase 6 ever added the `profile` key -- no "profile" field at
+    # all, not even null.
+    cat > "$meta/TMUX--ms--legacy.json" <<'JSON'
+{"name":"TMUX--ms--legacy","agent":"claude","cctrl_managed":true,"purpose":"pre-071 session"}
+JSON
+    cat > "$meta/TMUX--ms--none.json" <<'JSON'
+{"name":"TMUX--ms--none","agent":"claude","profile":null,"profile_source":"explicit","auth_backend":"subscription","cctrl_managed":true}
+JSON
+
+    local sessions="TMUX--ms--work TMUX--ms--personal TMUX--ms--legacy TMUX--ms--none"
+    local out
+    out="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="$sessions" TMUX_FAKE_PANE_PID=4242 \
+        "$ROOT/cctrl" session ls)"
+    echo "$out" | grep "TMUX--ms--work" | grep -q "work·bedrock" || fail "work row must show 'work·bedrock' in its own PROFILE column: $out"
+    echo "$out" | grep "TMUX--ms--personal" | grep -q "·subscription" && fail "subscription (the default backend) must never get a ·backend suffix: $out"
+    # " ? " / " none " (surrounded by the format's own separator+padding
+    # spaces) targets the PROFILE column specifically -- a bare '?' or
+    # 'none' substring would also match inside the KIND column's model
+    # placeholder ("claude (?)") or elsewhere.
+    echo "$out" | grep "TMUX--ms--legacy" | grep -q ' ? ' || fail "pre-071 row (no profile key at all) must show '?' in the PROFILE column: $out"
+    echo "$out" | grep "TMUX--ms--none" | grep -q ' none ' || fail "explicit --profile none row must show 'none' in the PROFILE column: $out"
+
+    local jout
+    jout="$(PATH="$bin:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" \
+        TMUX_FAKE_SESSIONS="$sessions" TMUX_FAKE_PANE_PID=4242 \
+        "$ROOT/cctrl" session ls --json)"
+    printf '%s\n' "$jout" | jq -e '
+        (map(select(.name=="TMUX--ms--work"))[0] | .profile=="work" and .profile_source=="explicit" and .auth_backend=="bedrock")
+        and (map(select(.name=="TMUX--ms--personal"))[0] | .profile=="personal" and .profile_source=="default" and .auth_backend=="subscription")
+        and (map(select(.name=="TMUX--ms--legacy"))[0] | .profile==null and .profile_source==null and .auth_backend==null)
+        and (map(select(.name=="TMUX--ms--none"))[0] | .profile==null and .profile_source=="explicit" and .auth_backend=="subscription")
+    ' >/dev/null || fail "profile/profile_source/auth_backend --json fields wrong: $jout"
+    echo "ok: session ls PROFILE column and --json fields handle bedrock/subscription/pre-071/explicit-none"
+}
+
+test_statusline_bridge_label_and_rate_limit_gate() {
+    # Plan 071 phase 8: the visible label comes from CCTRL_SESSION_PROFILE
+    # (never the configured default or the legacy single-machine
+    # .active-profile file), shown as a "[profile·backend]" prefix only when
+    # the auth backend isn't the subscription default. The rate-limit file
+    # write stays gated on `rate_limits` being present in the hook input --
+    # proven here by never giving that key, so this test cannot touch the
+    # live, shared data/rate-limits.json.
+    local payload rl_file rl_before rl_after out
+    payload='{"model":{"display_name":"Opus"},"cwd":"/tmp/demo","context_window":{"total_input_tokens":500}}'
+    rl_file="$ROOT/data/rate-limits.json"
+    rl_before=""
+    [[ -f "$rl_file" ]] && rl_before="$(cat "$rl_file")"
+
+    out="$("$ROOT/hooks/statusline.sh" <<< "$payload")"
+    assert_contains "$out" "Opus | demo | 500"
+    assert_not_contains "$out" "["
+
+    out="$(CCTRL_SESSION_AUTH_BACKEND=bedrock CCTRL_SESSION_PROFILE=work "$ROOT/hooks/statusline.sh" <<< "$payload")"
+    assert_contains "$out" "[work·bedrock] Opus | demo | 500"
+
+    out="$(CCTRL_SESSION_AUTH_BACKEND=bedrock "$ROOT/hooks/statusline.sh" <<< "$payload")"
+    assert_contains "$out" "[unknown·bedrock] Opus | demo | 500"
+
+    out="$(CCTRL_SESSION_AUTH_BACKEND=subscription CCTRL_SESSION_PROFILE=personal "$ROOT/hooks/statusline.sh" <<< "$payload")"
+    assert_contains "$out" "Opus | demo | 500"
+    assert_not_contains "$out" "["
+
+    rl_after=""
+    [[ -f "$rl_file" ]] && rl_after="$(cat "$rl_file")"
+    [[ "$rl_before" == "$rl_after" ]] || fail "rate-limits.json changed even though the fixture input carried no rate_limits key"
+    echo "ok: statusline bridge-label prefix (bedrock, unset-profile, subscription-no-prefix); rate-limit write still gated"
+}
+
+test_session_log_concurrency_regression() {
+    # Plan 071 phase 8 REGRESSION: the old implementation rglobbed every
+    # ~/.claude/projects/*.jsonl touched in the last 120s, so a concurrent
+    # second session's usage could bleed into the wrong profile's log. It now
+    # processes only the transcript the Stop hook's own stdin names.
+    local root="$TMPDIR/seslog-root" projdir="$TMPDIR/seslog-proj"
+    mkdir -p "$root/hooks" "$projdir"
+    cp "$ROOT/hooks/session-log.py" "$root/hooks/session-log.py"
+    local t_a="$projdir/a.jsonl" t_b="$projdir/b.jsonl"
+    cat > "$t_a" <<'JSONL'
+{"sessionId":"sess-a","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":111,"output_tokens":22}}}
+JSONL
+    cat > "$t_b" <<'JSONL'
+{"sessionId":"sess-b","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":999,"output_tokens":88}}}
+JSONL
+    touch "$t_a" "$t_b"
+
+    local hook_in spend
+    hook_in="$(jq -nc --arg tp "$t_a" '{transcript_path:$tp, session_id:"sess-a"}')"
+    spend="$root/costs/spending.jsonl"
+
+    printf '%s' "$hook_in" | CCTRL_SESSION_PROFILE=work CCTRL_SESSION_AUTH_BACKEND=bedrock \
+        python3 "$root/hooks/session-log.py"
+    [[ -f "$spend" ]] || fail "expected $spend to be written"
+    local body
+    body="$(cat "$spend")"
+    assert_contains "$body" '"session_id": "sess-a"'
+    assert_contains "$body" '"input_tokens": 111'
+    assert_contains "$body" '"profile": "work"'
+    assert_contains "$body" '"auth_backend": "bedrock"'
+    assert_not_contains "$body" "sess-b"
+    assert_not_contains "$body" "999"
+    echo "ok: session-log.py logs only the transcript the hook stdin names, with env profile/auth_backend"
+}
+
+test_hooks_run_stop_tees_stdin_to_notify_and_session_log() {
+    # Plan 071 phase 8: notify.sh and session-log.py each used to read stdin
+    # independently; the first one to run (notify.sh) drained the pipe, so
+    # session-log.py (now that it also reads stdin) got nothing. `hooks run
+    # stop` must capture stdin once and hand the same bytes to both.
+    local scratch="$TMPDIR/stop-tee"
+    mkdir -p "$scratch/hooks"
+    cp "$ROOT/cctrl" "$scratch/cctrl"
+    chmod +x "$scratch/cctrl"
+    cat > "$scratch/hooks/notify.sh" <<SH
+#!/usr/bin/env bash
+cat > "$scratch/notify.in"
+SH
+    chmod +x "$scratch/hooks/notify.sh"
+    cat > "$scratch/hooks/session-log.py" <<PY
+import sys
+with open("$scratch/sessionlog.in", "w") as f:
+    f.write(sys.stdin.read())
+PY
+
+    local payload
+    payload='{"transcript_path":"/tmp/x","session_id":"abc"}'
+    printf '%s' "$payload" | "$scratch/cctrl" hooks run stop
+    [[ "$(cat "$scratch/notify.in" 2>/dev/null)" == "$payload" ]] || fail "notify.sh did not receive the full stop stdin"
+    [[ "$(cat "$scratch/sessionlog.in" 2>/dev/null)" == "$payload" ]] || fail "session-log.py did not receive the full stop stdin"
+    echo "ok: hooks run stop tees one stdin capture to both notify.sh and session-log.py"
+}
+
 test_session_list_codex_default_model() {
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"
@@ -12713,6 +12873,10 @@ test_session_bridge_state_subscription_dead_still_heals
 test_session_bridge_state_pre_change_inferred_and_unknown
 test_session_bridge_state_never_prints_ps_env
 test_session_autoheal_install_uninstall_plist
+test_session_list_profile_column_mixed
+test_statusline_bridge_label_and_rate_limit_gate
+test_session_log_concurrency_regression
+test_hooks_run_stop_tees_stdin_to_notify_and_session_log
 test_session_list_codex_default_model
 test_session_list_agent_not_mislabelled_by_prompt
 test_session_list_agent_prefers_recorded_metadata

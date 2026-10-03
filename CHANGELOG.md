@@ -113,6 +113,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   non-subscription backend unless the profile sets `"bridge": true`
   (`_profile_bridge_override`), so new sessions on those backends land
   straight in `na` territory instead of `dead`. (plan 071 phase 7)
+- `session ls` gets a PROFILE column (`personal`, `work·bedrock`, `none` for
+  an explicit `--profile none` no-overlay record, or `?` for a genuinely
+  pre-071 record that never had a `profile` field at all) and `--json`
+  carries `profile`/`profile_source`/`auth_backend` through; `cctrl task ls
+  --json` and `cctrl fleet` gain the same `profile`/`auth_backend` fields.
+  The statusline now shows a `[profile·backend]` prefix sourced from the
+  launching session's own `CCTRL_SESSION_PROFILE`/`CCTRL_SESSION_AUTH_
+  BACKEND` (never the configured default or the legacy single-machine
+  `.active-profile` file), only when the backend isn't the subscription
+  default. `hooks/session-log.py` now logs only the transcript the Stop
+  hook's own stdin names (with the launching profile/auth_backend from
+  env), instead of rglobbing every `~/.claude/projects/*.jsonl` touched in
+  the last 120s — which could misattribute token usage between two
+  concurrent sessions on different profiles. `cctrl hooks run stop` now
+  captures that stdin once and tees it to both `notify.sh` and
+  `session-log.py` (previously the second script always got nothing, since
+  the first one being a `cat` already drained the pipe). (plan 071 phase 8)
 
 - `launch-to-app` is a new opt-in Codex compound workflow: create the normal
   detached cctrl/tmux owner, prove the exact provider identity (including

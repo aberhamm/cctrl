@@ -28,7 +28,7 @@ LEGACY_FIELDS = (
     "name", "host", "managed", "agent", "claude", "model", "dir",
     "state", "attached", "remote_control", "bridge", "session_id",
     "transcript", "last_active", "purpose", "created_at", "peer",
-    "display_label",
+    "display_label", "profile", "auth_backend",
 )
 
 
@@ -340,6 +340,8 @@ def _legacy_defaults(row: dict[str, Any], alias: str) -> dict[str, Any]:
         "created_at": row.get("created_at"),
         "peer": row.get("peer"),
         "display_label": row.get("display_label") or row.get("display_title") or row.get("title"),
+        "profile": row.get("profile"),
+        "auth_backend": row.get("auth_backend"),
     }
     for field in LEGACY_FIELDS:
         result.setdefault(field, defaults[field])
