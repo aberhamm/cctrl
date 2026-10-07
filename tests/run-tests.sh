@@ -60,6 +60,16 @@ export CCTRL_HOST_ID_FILE="$CCTRL_DATA_DIR/host-id"
 # persistence tests override these roots with their own fixtures.
 export CODEX_HOME="$TMPDIR/no-codex-home"
 export CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-config"
+# Honest bash leg (plan 103): everything cctrl-shaped must run under the SAME
+# bash as this harness. `#!/usr/bin/env bash` shebangs (cctrl, lib/, hooks/) and
+# bare `bash -c` otherwise resolve to whatever bash is first on PATH (Homebrew
+# 5.x on the Studio), so `/bin/bash tests/run-tests.sh` exercised cctrl under
+# bash 5 while only the harness ran under 3.2. The shim lives only in this
+# suite's TMPDIR and PATH; nothing outside is touched.
+mkdir -p "$TMPDIR/bash-shim"
+ln -s "$BASH" "$TMPDIR/bash-shim/bash"
+export PATH="$TMPDIR/bash-shim:$PATH"
+echo "bash: harness=$BASH_VERSION ($BASH) cctrl-under-test=$(printf '%s\n' 'echo "$BASH_VERSION"' | env bash -s) (via env bash shim)"
 # Name the aborting test on any non-zero exit. A bare statement such as
 # `cmd >/dev/null 2>&1` that fails under `set -e` otherwise kills the suite
 # with no FAIL line at all -- that hid a real bash-5 regression for two
@@ -450,7 +460,7 @@ session_record_json() {
 cctrl_source_eval() {
     local code="$1"
     shift
-    CCTRL_NO_MAIN=1 bash -c 'code="$1"; shift; source "$0"; eval "$code"' "$ROOT/cctrl" "$code" "$@"
+    CCTRL_NO_MAIN=1 "$BASH" -c 'code="$1"; shift; source "$0"; eval "$code"' "$ROOT/cctrl" "$code" "$@"
 }
 
 run_with_pty_input() {
@@ -1715,6 +1725,44 @@ test_profile_settings_none_profile_no_file() {
         PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --profile none -m scrub)"
     assert_contains "$out" "ENV_CCTRL_PROFILE_SETTINGS_FILE=<unset>"
     assert_not_contains "$out" "--settings"
+}
+
+test_bash_leg_is_honest() {
+    # Plan 103 guard: cctrl-shaped execution must run under the harness's own
+    # bash, through every path the suite uses (shebang lookup, bash -c, the
+    # eval helper). Fails if the PATH shim is missing or bypassed.
+    local want="$BASH_VERSION" got
+    [[ "$(head -n 1 "$ROOT/cctrl")" == "#!/usr/bin/env bash" ]] \
+        || fail "cctrl shebang is no longer '#!/usr/bin/env bash'; the shim probe no longer models it"
+    local probe="$TMPDIR/bash-probe.sh"
+    printf '#!/usr/bin/env bash\necho "$BASH_VERSION"\n' > "$probe"
+    chmod +x "$probe"
+    got="$("$probe")"
+    [[ "$got" == "$want" ]] || fail "shebang path ran bash $got, harness is $want"
+    got="$(bash -c 'echo "$BASH_VERSION"')"
+    [[ "$got" == "$want" ]] || fail "bare 'bash -c' ran bash $got, harness is $want"
+    got="$(cctrl_source_eval 'echo "$BASH_VERSION"')"
+    [[ "$got" == "$want" ]] || fail "cctrl_source_eval ran bash $got, harness is $want"
+    [[ "$(command -v bash)" == "$TMPDIR/bash-shim/bash" ]] || fail "PATH shim is not first for bash"
+}
+
+test_profile_settings_gc_portable_membership() {
+    # Plan 103: GC liveness must work without associative arrays (bash 3.2).
+    # Calls the function directly under the harness bash.
+    make_fake_tmux "$TMPDIR/tmux"
+    local runtime="$TMPDIR/settings-gc-portable-runtime"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    mkdir -p "$dir"
+    printf '{}\n' > "$dir/TMUX--p-live.json"
+    printf '{}\n' > "$dir/TMUX--p-live-2.json"
+    printf '{}\n' > "$dir/TMUX--p-dead.json"
+    touch -t 202001010000 "$dir/TMUX--p-live.json" "$dir/TMUX--p-live-2.json" "$dir/TMUX--p-dead.json"
+    local state="$TMPDIR/settings-gc-portable-state"
+    printf '%s\n' '$0:TMUX--p-live' '$1:TMUX--p-live-2' > "$state"
+    CCTRL_RUNTIME_DIR="$runtime" TMUX_FAKE_STATE="$state" PATH="$TMPDIR:$PATH" \
+        cctrl_source_eval '_profile_settings_gc'
+    [[ -f "$dir/TMUX--p-live.json" && -f "$dir/TMUX--p-live-2.json" ]] || fail "GC removed a live session's file"
+    [[ ! -f "$dir/TMUX--p-dead.json" ]] || fail "GC kept a dead (old) session's file"
 }
 
 test_profile_settings_gc_removes_dead_keeps_live() {
@@ -6426,12 +6474,12 @@ test_peer_tmux_missing_still_resolves_manual() {
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register offline --agent codex --capability polling)"
     assert_contains "$out" "Registered peer"
 
-    out="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
     assert_contains "$out" '"derived_skipped": true'
     assert_contains "$out" '"derived_skip_reason": "tmux unavailable"'
     assert_contains "$out" '"name": "offline"'
 
-    out="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve offline --json)"
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve offline --json)"
     assert_contains "$out" '"name": "offline"'
     assert_contains "$out" '"polling"'
 }
@@ -6928,7 +6976,7 @@ test_peer_overview() {
     # (3) derived_skipped passthrough: with tmux unavailable the manual identity and
     # mailbox counts still resolve, no derived peers appear, and the skip reason is
     # surfaced instead of failing the whole call.
-    out="$(PATH="/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json)"
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json)"
     printf '%s\n' "$out" | jq -e '
         .derived_skipped == true
         and .derived_skip_reason == "tmux unavailable"
@@ -14459,6 +14507,12 @@ test_session_ls_warns_on_two_fleet_managers_and_unknown_kind() {
 
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
+        bash-leg)
+            test_bash_leg_is_honest
+            test_profile_settings_gc_portable_membership
+            echo "ok"
+            exit 0
+            ;;
         session-prune)
             test_session_prune_never_prompted_claude
             test_session_prune_fresh_active_not_candidate
@@ -14848,6 +14902,8 @@ test_shortcut_profile_none_is_explicit_no_overlay
 test_detached_launch_writes_profile_identity_fields
 test_profile_settings_file_written_scoped_and_not_in_argv
 test_profile_settings_none_profile_no_file
+test_bash_leg_is_honest
+test_profile_settings_gc_portable_membership
 test_profile_settings_gc_removes_dead_keeps_live
 test_profile_settings_gc_skips_sweep_when_list_sessions_fails
 test_profile_settings_gc_removes_dead_only_after_age_threshold
@@ -16157,7 +16213,7 @@ PY
 
     : > "$trace"
     local out rc=0
-    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_PLATFORM_CANDIDATES="$fake" \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_PLATFORM_CANDIDATES="$fake" \
         FAKE_CODEX_TRACE="$trace" FAKE_CODEX_PID="$pid_file" \
         "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "capability discovery failed: $out"
@@ -16173,7 +16229,7 @@ PY
         || fail "capability discovery invoked a non-read-only RPC: $(cat "$trace")"
 
     : > "$trace"
-    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" FAKE_CODEX_SERVER_VERSION=9.9.9 \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_SERVER_VERSION=9.9.9 \
         FAKE_CODEX_TRACE="$trace" "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "version mismatch diagnostics should complete"
     jq -e '[.methods[].status] | all(. == "unknown")' <<< "$out" >/dev/null \
@@ -16182,21 +16238,21 @@ PY
         || fail "version mismatch evidence not recorded"
 
     rc=0
-    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_APP_SERVER_SOCKET=/tmp/fake-codex.sock \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_APP_SERVER_SOCKET=/tmp/fake-codex.sock \
         FAKE_CODEX_DAEMON_FAIL=1 "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "explicit socket discovery incorrectly required the default daemon: $out"
     [[ "$(jq -r '.transport.endpoint' <<< "$out")" == "/tmp/fake-codex.sock" ]] \
         || fail "explicit App Server socket was not reported"
 
     rc=0
-    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" FAKE_CODEX_MODE=schema-malformed \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_MODE=schema-malformed \
         "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "malformed schema diagnostics should complete"
     jq -e '[.methods[].status] | all(. == "unknown")' <<< "$out" >/dev/null \
         || fail "malformed schema must leave method support unknown"
 
     rc=0
-    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_CONNECT_TIMEOUT=invalid \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_CONNECT_TIMEOUT=invalid \
         "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 64 ]] || fail "invalid timeout environment should exit 64, got $rc"
     jq -e '.errors[0].code == 64 and .errors[0].phase == "usage"' <<< "$out" >/dev/null \
@@ -16337,12 +16393,12 @@ assert caught is not None and caught.exit_code == module.EXIT_REQUEST_TIMEOUT
 assert_reaped()
 PY
 
-    out="$(PATH=/usr/bin:/bin "$ROOT/cctrl" codex capabilities --help)" \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" "$ROOT/cctrl" codex capabilities --help)" \
         || fail "Codex capabilities help command failed"
     assert_contains "$out" "capabilities"
 
     rc=0
-    out="$(PATH=/usr/bin:/bin CCTRL_CODEX_BIN="$fake" FAKE_CODEX_THREAD_LIST=1 \
+    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_THREAD_LIST=1 \
         python3 "$ROOT/lib/codex_app_server.py" threads --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "App Server thread snapshot failed: $out"
     jq -e '.schema_version == 1 and .status == "available" and .complete == true and

@@ -1669,6 +1669,23 @@ and is surfaced through `cctrl usage`.
 | Phone bridge | yes | no |
 | Hooks in this repo | Claude hook protocol | additive user-level hooks with explicit trust |
 
+## Requirements and testing
+
+cctrl is a single bash script and must run under both macOS `/bin/bash` 3.2
+(the only bash on a stock Mac) and Homebrew bash 5. Avoid bash-4+ features
+(`declare -A`, `mapfile`, `${v,,}`, negative array indices, `&>>`, `|&`).
+
+Run the suite once per bash, one after the other:
+
+```bash
+/bin/bash tests/run-tests.sh
+/opt/homebrew/bin/bash tests/run-tests.sh
+```
+
+The suite runs cctrl under the *same* bash as the harness (a `bash` shim in
+its private temp dir, first on its PATH) and prints both versions on the first
+line. `CCTRL_TEST_ONLY=bash-leg` runs just the guard tests for this.
+
 ## Hooks
 
 `cctrl hooks install` configures both Claude Code and Codex with portable

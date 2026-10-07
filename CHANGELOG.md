@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased] - 2026-10-02
 
+### Fixed
+- `_profile_settings_gc` no longer uses an associative array (`local -A`), which
+  aborted launches under macOS `/bin/bash` 3.2. (plan 103)
+
+### Changed
+- The test suite now runs cctrl under the same bash as the harness (private
+  PATH shim; `cctrl_source_eval` uses `"$BASH"`), so `/bin/bash
+  tests/run-tests.sh` really exercises cctrl on bash 3.2. New guard test
+  `test_bash_leg_is_honest`. (plan 103)
+
 ### Added
 - `cctrl profile migrate [--dry-run] [--remove-old]` copies repo-tracked
   `profiles/*.json` into the new XDG profiles dir (`~/.config/cctrl/profiles/`,

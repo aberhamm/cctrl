@@ -988,13 +988,9 @@ _profile_settings_gc() {
     [[ -d "$dir" ]] || return 0
     local tmux_reachable=false live=""
     live="$(tmux list-sessions -F '#{session_name}' 2>/dev/null)" && tmux_reachable=true
-    local -A live_set=()
-    if $tmux_reachable; then
-        local _name
-        while IFS= read -r _name; do
-            [[ -n "$_name" ]] && live_set["$_name"]=1
-        done <<< "$live"
-    fi
+    # Newline-delimited membership (no associative array: macOS /bin/bash 3.2
+    # has none, plan 103). Names never contain newlines (tmux session names).
+    local live_nl=$'\n'"$live"$'\n'
 
     local f key pid now mtime age
     now="$(date +%s)"
@@ -1006,7 +1002,7 @@ _profile_settings_gc() {
             kill -0 "$pid" 2>/dev/null || rm -f "$f"
         else
             $tmux_reachable || continue
-            [[ -n "${live_set[$key]+x}" ]] && continue
+            [[ -n "$key" && "$live_nl" == *$'\n'"$key"$'\n'* ]] && continue
             mtime="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || continue
             age=$(( now - mtime ))
             (( age >= 600 )) && rm -f "$f"
