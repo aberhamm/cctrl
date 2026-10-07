@@ -128,7 +128,8 @@ _codex_launch_to_app() {
                 shift
                 launch_args+=("$@")
                 break ;;
-            --peer|--no-health-check|--skip-health-check)
+            --no-input) shift ;;
+            --peer|--no-health-check|--skip-health-check|--role|--orch-kind|--succeeds)
                 echo "$arg is incompatible with launch-to-app." >&2
                 return 64 ;;
             -d|--detach|--foreground|--no-tmux|--tmux|--app-owned|--resume|-r)

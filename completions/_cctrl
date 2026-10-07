@@ -191,6 +191,10 @@ _cctrl() {
                 '--foreground[Launch directly without tmux]' \
                 '--no-tmux[Launch directly without tmux]' \
                 '--no-bridge[Disable the phone-control bridge]' \
+                '--role[Session role]:role:(orchestrator worker)' \
+                '--orch-kind[Orchestrator kind]:kind:(fleet repo)' \
+                '--succeeds[Name of the session this one succeeds]:name:' \
+                '--no-input[Never prompt; ambiguous kinds exit 78]' \
                 '--yolo[Full bypass mode]' \
                 '--permission-mode[Claude permission mode]:mode:' \
                 '--remote[Codex TUI transport only; does not grant simultaneous app control]:addr:(unix://)' \
@@ -269,6 +273,7 @@ _cctrl() {
                     'autoheal:Repair dead bridges unattended'
                     'prune:Propose stale / never-prompted sessions'
                     'close:Gracefully close a session (default: the one you are inside)'
+                    'set-role:Tag a live session worker or orchestrator (fleet|repo)'
                     'kill:Kill a detached session'
                     'stop-exact:Stop only the execution identified by session ls --json'
                 )

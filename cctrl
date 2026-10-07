@@ -1971,10 +1971,10 @@ _start_args_have_explicit_target() {
             --)
                 return 1
                 ;;
-            -d|--detach|--foreground|--no-tmux|--tmux|--yolo|--dangerously-bypass-approvals-and-sandbox|--no-bridge)
+            -d|--detach|--foreground|--no-tmux|--tmux|--yolo|--dangerously-bypass-approvals-and-sandbox|--no-bridge|--no-input)
                 shift
                 ;;
-            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m)
+            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|--role|--orch-kind|--succeeds)
                 [[ $# -ge 2 ]] || return 1
                 shift 2
                 ;;
@@ -2008,7 +2008,7 @@ _start_requests_app_owned() {
         case "$1" in
             --) return 1 ;;
             --app-owned) return 0 ;;
-            --agent|--profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|-c|--config)
+            --agent|--profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|-c|--config|--role|--orch-kind|--succeeds)
                 (( $# >= 2 )) || return 1
                 shift 2
                 ;;
@@ -2114,7 +2114,7 @@ _launch_app_owned_codex() {
     while [[ $# -gt 0 ]]; do
         arg="$1"
         case "$arg" in
-            --app-owned) shift ;;
+            --app-owned|--no-input) shift ;;
             --json) json=true; shift ;;
             --agent) [[ $# -ge 2 ]] || { echo "--agent needs a value" >&2; return 64; }; agent="$(_normalize_agent "$2")" || return 64; shift 2 ;;
             --profile) [[ $# -ge 2 ]] || { echo "--profile needs a value" >&2; return 64; }; profile="$2"; profile_explicit=true; shift 2 ;;
@@ -2124,7 +2124,7 @@ _launch_app_owned_codex() {
             --ask-for-approval|-a) [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }; cli_approval="$2"; shift 2 ;;
             --yolo|--dangerously-bypass-approvals-and-sandbox) yolo=true; yolo_explicit=true; shift ;;
             --message|--prompt|-m) [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }; message="$2"; message_set=true; shift 2 ;;
-            -d|--detach|--foreground|--no-tmux|--tmux|--resume|-r|--remote|--remote-auth-token-env|--peer|--purpose|--name|-n|--permission-mode|--no-bridge|-f|--force|--health-check|--skip-health-check)
+            -d|--detach|--foreground|--no-tmux|--tmux|--resume|-r|--remote|--remote-auth-token-env|--peer|--purpose|--name|-n|--permission-mode|--no-bridge|-f|--force|--health-check|--skip-health-check|--role|--orch-kind|--succeeds)
                 echo -e "${RED}$arg is incompatible with --app-owned.${RESET}" >&2; return 64 ;;
             --|-*) echo -e "${RED}Unsupported --app-owned argument: $arg${RESET}" >&2; return 64 ;;
             *) [[ -z "$target" ]] || { echo -e "${RED}--app-owned accepts only one target.${RESET}" >&2; return 64; }; target="$arg"; shift ;;
@@ -2358,6 +2358,13 @@ cmd_start() {
             --peer)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--peer needs a peer name${RESET}"; return 1; }
                 peer_identity="$2"; shift 2
+                ;;
+            --role|--orch-kind|--succeeds)
+                echo "cctrl: $1 needs a tmux-backed launch: add -d (inside a session, cctrl start <dir> is a foreground launch)" >&2
+                return 64
+                ;;
+            --no-input)
+                shift
                 ;;
             --)
                 shift
@@ -3039,6 +3046,15 @@ else:
             for field in ("name", "tmux_session", "control_surface", "pane_id", "pane_pid", "wrapper_pid", "pane_started",
                           "profile", "profile_source", "auth_backend", "requested_model", "claude_config_dir", "profile_file"):
                 merged[field] = incoming.get(field)
+        # Plan 100: a cctrl terminal launch states its role. terminal_relaunch
+        # above needs a provisional launch id, which a launch that already
+        # knows its conversation (-r <id>, restore) does not have, so the role
+        # fields carry their own, wider condition: any cctrl tmux launch that
+        # wrote a role replaces the recorded one.
+        if (event["source"] == "legacy-promotion" and incoming.get("launched_by_cctrl") is True
+                and incoming.get("control_surface") == "tmux" and incoming.get("role")):
+            for field in ("role", "orch_kind", "succeeds"):
+                merged[field] = incoming.get(field)
         combined = list(record.get("ownership_evidence") or []) + list(incoming.get("ownership_evidence") or [])
         if reclaim:
             combined.append({"source": "cctrl-reclaim", "source_instance": str(incoming.get("tmux_session")),
@@ -3429,7 +3445,7 @@ if not (record.get("schema_version") == 2 and record.get("lifecycle_state") == "
         and key == "launch-" + str(record.get("provisional_launch_id"))):
     raise SystemExit("Not a matching provisional cctrl launch receipt")
 receipt = {"control_surface", "tmux_session", "pane_id", "pane_pid", "wrapper_pid", "pane_started"}
-allowed = receipt | {"health_status", "health_reason", "health_info", "purpose"}
+allowed = receipt | {"health_status", "health_reason", "health_info", "purpose", "role", "orch_kind", "succeeds"}
 updates = json.loads(value) if field == "_terminal_anchor_receipt" else {field: value}
 if not isinstance(updates, dict) or (field == "_terminal_anchor_receipt" and set(updates) != receipt):
     raise SystemExit("Terminal receipt must contain exactly the anchor fields")
@@ -3705,6 +3721,9 @@ _session_write_metadata() {
     # so every pre-phase-6 positional call site (tests included) still works
     # unchanged; a pre-change record simply has these fields null.
     local profile="${13:-}" profile_source="${14:-}" auth_backend="${15:-}" requested_model="${16:-}" claude_config_dir="${17:-}" profile_file="${18:-}"
+    # Plan 100: role (orchestrator|worker), orch_kind (fleet|repo|empty), and
+    # the optional succeeds label. Empty stores null; a pre-plan record has none.
+    local role="${19:-}" orch_kind="${20:-}" succeeds="${21:-}"
     mkdir -p "$SESSION_METADATA_DIR" || return 1
     local tmp created_at host_label host_id provider lifecycle_state provider_task_id launch_id output_file
     mkdir -p "$SESSION_METADATA_DIR" || return 1
@@ -3763,6 +3782,9 @@ _session_write_metadata() {
         --arg requested_model "$requested_model" \
         --arg claude_config_dir "$claude_config_dir" \
         --arg profile_file "$profile_file" \
+        --arg role "$role" \
+        --arg orch_kind "$orch_kind" \
+        --arg succeeds "$succeeds" \
         '{
             schema_version: $schema_version,
             provider: $provider,
@@ -3814,6 +3836,9 @@ _session_write_metadata() {
             requested_model: (if $requested_model == "" then null else $requested_model end),
             claude_config_dir: (if $claude_config_dir == "" then null else $claude_config_dir end),
             profile_file: (if $profile_file == "" then null else $profile_file end),
+            role: (if $role == "" then null else $role end),
+            orch_kind: (if $orch_kind == "" then null else $orch_kind end),
+            succeeds: (if $succeeds == "" then null else $succeeds end),
             control_surface: "tmux",
             tmux_session: $name,
             pane_id: null,
@@ -4056,6 +4081,306 @@ _launch_quote() (
     printf '%q' "$1"
 )
 
+# ── Roles (plan 100, phase 1) ─────────────────────────────────────────
+# role: orchestrator | worker; orch_kind: fleet | repo (orchestrators only;
+# unknown only on legacy or replayed sessions). Resolution returns through the
+# globals below, never stdout, so a caller can run it outside $(...) and the
+# ask can read the terminal. Phase 1 changes no session names and no labels.
+ROLE_RESOLVED=""
+ORCH_KIND_RESOLVED=""
+
+# One jq definition of a shortcut's role (D5). Input object: {key, value}.
+_SHORTCUT_ROLE_JQ='
+  def sc_legacy: (.key | ascii_downcase) as $k | (($k | startswith("fm-")) or ($k | startswith("orch-")));
+  def sc_role: if (.value.role // "") != "" then .value.role
+               elif (.value.orch_kind // "") != "" then "orchestrator"
+               elif sc_legacy then "orchestrator"
+               else "worker" end;
+  def sc_kind: (.value.orch_kind // "");
+  def sc_valid: ((sc_role == "orchestrator") or (sc_role == "worker"))
+                and ((sc_kind == "") or (sc_kind == "fleet") or (sc_kind == "repo"));
+'
+
+_shortcut_role_kind() {
+    # Print "<role>|<kind>" for a shortcut key (kind empty when unknown).
+    # Exit 64 and name the key when the stored values are invalid.
+    local key="$1" out status role kind
+    [[ -f "$SHORTCUTS_FILE" ]] || return 1
+    out="$(jq -r --arg k "$key" "$_SHORTCUT_ROLE_JQ"'
+        {key: $k, value: (.[$k] // {})}
+        | if sc_valid then "ok|\(sc_role)|\(sc_kind)"
+          else "bad|\(.value.role // "")|\(.value.orch_kind // "")" end
+    ' "$SHORTCUTS_FILE" 2>/dev/null)" || return 1
+    status="${out%%|*}"; out="${out#*|}"
+    role="${out%%|*}"; kind="${out#*|}"
+    if [[ "$status" != ok ]]; then
+        if [[ "$role" != "" && "$role" != orchestrator && "$role" != worker ]]; then
+            echo "cctrl: shortcut @$key: invalid role \"$role\"" >&2
+        else
+            echo "cctrl: shortcut @$key: invalid orch_kind \"$kind\"" >&2
+        fi
+        return 64
+    fi
+    printf '%s|%s' "$role" "$kind"
+}
+
+_role_needs_decision() {
+    # The non-interactive answer to an ambiguous kind (D3). The first stderr
+    # line is the machine-readable marker; nothing else may precede it.
+    local reason="$1" where="$2" key="${3:-}"
+    {
+        echo "cctrl: needs-user-decision: orchestrator-kind"
+        echo "Cannot tell which kind of orchestrator this is: $reason."
+        echo "Nothing was launched. Do not guess: ask the user, then re-run with one of"
+        echo "  --orch-kind fleet    the fleet-manager orchestrator (one per runtime on this machine)"
+        echo "  --orch-kind repo     a repo-level orchestrator for $where"
+        echo "  --role worker        not an orchestrator"
+        if [[ -n "$key" ]]; then
+            echo "To settle it for the shortcut: cctrl @add $key $where --orch-kind fleet|repo"
+        fi
+    } >&2
+    return 78
+}
+
+_role_ask_kind() {
+    # Ask a human which kind of orchestrator this is. Returns 0 with
+    # ORCH_KIND_RESOLVED set, or 78 (after the needs-user-decision message).
+    # Order matters (D3): replay never asks; then the decision made once in
+    # main(); then the terminal is re-tested at the read site, because restore
+    # calls the launcher inside `while read ... < <(jq ...)`.
+    local reason="$1" where="$2" key="${3:-}" answer="" tries=0
+    if [[ -n "${_CCTRL_REPLAY:-}" ]] \
+        || [[ "${_CCTRL_CAN_ASK:-0}" != 1 ]] \
+        || ! [[ -t 0 && -t 2 ]]; then
+        _role_needs_decision "$reason" "$where" "$key"
+        return 78
+    fi
+    while (( tries < 3 )); do
+        {
+            printf 'Which kind of orchestrator is this session?  (%s)\n' "$reason"
+            printf '  1) fleet   the fleet-manager orchestrator (one per runtime on this machine)\n'
+            printf '  2) repo    the repo-level orchestrator for %s\n' "$where"
+            printf '  q) abort\n> '
+        } >&2
+        if ! IFS= read -r -t "${CCTRL_ASK_TIMEOUT:-120}" answer; then
+            echo >&2
+            _role_needs_decision "$reason" "$where" "$key"
+            return 78
+        fi
+        case "$answer" in
+            1|fleet) ORCH_KIND_RESOLVED=fleet; break ;;
+            2|repo)  ORCH_KIND_RESOLVED=repo; break ;;
+            q|Q)     _role_needs_decision "$reason" "$where" "$key"; return 78 ;;
+        esac
+        tries=$((tries + 1))
+    done
+    if [[ -z "$ORCH_KIND_RESOLVED" ]]; then
+        _role_needs_decision "$reason" "$where" "$key"
+        return 78
+    fi
+    if [[ -n "$key" ]]; then
+        echo "cctrl: to remember this: cctrl @add $key $where --orch-kind $ORCH_KIND_RESOLVED" >&2
+    fi
+    return 0
+}
+
+_role_resolve() {
+    # _role_resolve <role_flag> <kind_flag> <explicit_key_or_empty> <dir_or_target>
+    # Sets ROLE_RESOLVED and ORCH_KIND_RESOLVED. Returns 0 | 64 | 78.
+    # Call as `_role_resolve ... || return $?`; never inside $(...).
+    local role_flag="$1" kind_flag="$2" key="$3" where="$4"
+    ROLE_RESOLVED=""; ORCH_KIND_RESOLVED=""
+    case "$role_flag" in
+        ""|orchestrator|worker) ;;
+        *) echo "cctrl: invalid --role \"$role_flag\" (use orchestrator or worker)" >&2; return 64 ;;
+    esac
+    case "$kind_flag" in
+        ""|fleet|repo) ;;
+        *) echo "cctrl: invalid --orch-kind \"$kind_flag\" (use fleet or repo)" >&2; return 64 ;;
+    esac
+    if [[ "$role_flag" == worker && -n "$kind_flag" ]]; then
+        echo "cctrl: --role worker cannot be combined with --orch-kind" >&2
+        return 64
+    fi
+    local sc_role="" sc_kind="" sc rc=0
+    if [[ -n "$key" ]]; then
+        sc="$(_shortcut_role_kind "$key")" || rc=$?
+        (( rc == 0 )) || return "$rc"
+        sc_role="${sc%%|*}"; sc_kind="${sc#*|}"
+    fi
+    if [[ -n "$role_flag" ]]; then
+        ROLE_RESOLVED="$role_flag"
+    elif [[ -n "$kind_flag" ]]; then
+        ROLE_RESOLVED=orchestrator
+    elif [[ -n "$key" ]]; then
+        ROLE_RESOLVED="$sc_role"
+    else
+        ROLE_RESOLVED=worker
+    fi
+    if [[ -n "$key" ]] && { [[ "$ROLE_RESOLVED" != "$sc_role" ]] \
+        || { [[ -n "$kind_flag" && -n "$sc_kind" && "$kind_flag" != "$sc_kind" ]]; }; }; then
+        echo "cctrl: note: flags override shortcut @$key (role=$sc_role orch_kind=${sc_kind:--})" >&2
+    fi
+    [[ "$ROLE_RESOLVED" == orchestrator ]] || return 0
+    if [[ -n "$kind_flag" ]]; then
+        ORCH_KIND_RESOLVED="$kind_flag"
+    elif [[ -n "$key" && "$sc_role" == orchestrator && -n "$sc_kind" ]]; then
+        ORCH_KIND_RESOLVED="$sc_kind"
+    elif [[ -n "${_CCTRL_REPLAY:-}" ]]; then
+        ORCH_KIND_RESOLVED=""   # replay: unknown stays unknown, no question
+    else
+        local reason where_dir="$where" shortcut_key=""
+        if [[ -n "$key" ]]; then
+            reason="shortcut @$key is an orchestrator with no orch_kind"
+            where_dir="$(jq -r --arg k "$key" '.[$k].dir // ""' "$SHORTCUTS_FILE" 2>/dev/null)"
+            shortcut_key="$key"
+        else
+            reason="--role orchestrator was given without --orch-kind"
+        fi
+        _role_ask_kind "$reason" "${where_dir:-$where}" "$shortcut_key" || return $?
+    fi
+    return 0
+}
+
+_cmd_role_resolve() {
+    # Hidden read-only verb for the remote preflight (D4): resolve role and
+    # kind exactly as `start -d` would, launch and write nothing.
+    local rc=0
+    _CCTRL_ROLE_RESOLVE_ONLY=1
+    if _start_args_have_explicit_target "$@"; then
+        _launch_detached "$@" || rc=$?
+    else
+        _launch_detached "$PWD" "$@" || rc=$?
+    fi
+    unset _CCTRL_ROLE_RESOLVE_ONLY
+    return "$rc"
+}
+
+_role_infer_from_name() {
+    # Legacy name inference (fallback only): TMUX--<host>--fm-* or orch-* is an
+    # orchestrator of unknown kind. Prints "orchestrator" or nothing.
+    local name="$1" rest slug
+    [[ "$name" == TMUX--* ]] || return 0
+    rest="${name#TMUX--}"
+    [[ "$rest" == *--* ]] || return 0
+    slug="$(printf '%s' "${rest#*--}" | tr '[:upper:]' '[:lower:]')"
+    case "$slug" in
+        fm-*|orch-*) printf 'orchestrator' ;;
+    esac
+}
+
+_session_role_fallback() {
+    # tmux options first, then legacy name inference. Prints
+    # "<role>|<kind>|<source>"; source is option | name | default.
+    local name="$1" role kind
+    role="$(tmux show-options -t "=$name:" -qv @cctrl_role 2>/dev/null || true)"
+    kind="$(tmux show-options -t "=$name:" -qv @cctrl_orch_kind 2>/dev/null || true)"
+    if [[ -n "$role" ]]; then
+        printf '%s|%s|option' "$role" "$kind"
+        return 0
+    fi
+    role="$(_role_infer_from_name "$name")"
+    if [[ -n "$role" ]]; then
+        printf '%s||name' "$role"
+        return 0
+    fi
+    printf 'worker||default'
+}
+
+_session_role_of() {
+    # Print "<role>|<kind>|<source>" for a live session (source: record |
+    # option | name | default). The record wins, so a recorded worker beats
+    # legacy name inference (the live fm-homelab is a worker).
+    local name="$1" role kind
+    role="$(_session_metadata_field "$name" role 2>/dev/null || true)"
+    if [[ -n "$role" ]]; then
+        kind="$(_session_metadata_field "$name" orch_kind 2>/dev/null || true)"
+        printf '%s|%s|record' "$role" "$kind"
+        return 0
+    fi
+    _session_role_fallback "$name"
+}
+
+_session_set_role() {
+    # cctrl session set-role <session> worker
+    # cctrl session set-role <session> orchestrator --orch-kind fleet|repo
+    # cctrl session set-role <session> --clear
+    # Tags a live session. Never renames it, never relabels it, never restarts
+    # it. (The one-fleet-manager guard arrives in phase 2: until then
+    # `--orch-kind fleet` is not checked against other live sessions.)
+    local session="" role="" kind_flag="" clear=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help|help)
+                echo "Usage: cctrl session set-role <session> worker"
+                echo "       cctrl session set-role <session> orchestrator --orch-kind fleet|repo"
+                echo "       cctrl session set-role <session> --clear"
+                echo ""
+                echo "  Tag a live session with a role. Writes the record and the @cctrl_role /"
+                echo "  @cctrl_orch_kind tmux options. Never renames, relabels or restarts it."
+                echo "  The one-fleet-manager guard is not part of this phase: --orch-kind fleet"
+                echo "  is not checked against other live sessions."
+                return 0 ;;
+            --orch-kind)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--orch-kind needs a value${RESET}" >&2; return 64; }
+                kind_flag="$2"; shift 2 ;;
+            --clear) clear=true; shift ;;
+            -*) echo -e "${RED}Unknown set-role flag: $1${RESET}" >&2; return 64 ;;
+            *)
+                if [[ -z "$session" ]]; then session="$1"
+                elif [[ -z "$role" ]]; then role="$1"
+                else echo -e "${RED}Unexpected argument: $1${RESET}" >&2; return 64
+                fi
+                shift ;;
+        esac
+    done
+    if [[ -z "$session" ]]; then
+        echo -e "${RED}Usage: cctrl session set-role <session> worker|orchestrator [--orch-kind fleet|repo] | --clear${RESET}" >&2
+        return 64
+    fi
+    _session_require_tmux || return 1
+    if ! tmux has-session -t "=$session" 2>/dev/null; then
+        echo -e "${RED}No live tmux session named '$session'.${RESET}" >&2
+        return 66
+    fi
+    local new_role="" new_kind=""
+    if $clear; then
+        if [[ -n "$role" || -n "$kind_flag" ]]; then
+            echo -e "${RED}--clear takes no role or --orch-kind.${RESET}" >&2
+            return 64
+        fi
+    else
+        case "$role" in
+            worker|orchestrator) ;;
+            "") echo -e "${RED}set-role needs worker, orchestrator or --clear.${RESET}" >&2; return 64 ;;
+            *) echo -e "${RED}cctrl: invalid role \"$role\" (use orchestrator or worker)${RESET}" >&2; return 64 ;;
+        esac
+        _role_resolve "$role" "$kind_flag" "" "$session" || return $?
+        new_role="$ROLE_RESOLVED"; new_kind="$ORCH_KIND_RESOLVED"
+    fi
+    local via="tmux options only"
+    if [[ -f "$(_session_metadata_file "$session")" ]] \
+        && _session_update_metadata_field "$session" role "$new_role" 2>/dev/null \
+        && _session_update_metadata_field "$session" orch_kind "$new_kind" 2>/dev/null; then
+        via="record + tmux options"
+    fi
+    if [[ -n "$new_role" ]]; then
+        tmux set-option -t "=$session:" -q @cctrl_role "$new_role" 2>/dev/null || true
+    else
+        tmux set-option -t "=$session:" -q -u @cctrl_role 2>/dev/null || true
+    fi
+    if [[ -n "$new_kind" ]]; then
+        tmux set-option -t "=$session:" -q @cctrl_orch_kind "$new_kind" 2>/dev/null || true
+    else
+        tmux set-option -t "=$session:" -q -u @cctrl_orch_kind 2>/dev/null || true
+    fi
+    if $clear; then
+        echo "$session: role cleared ($via)"
+    else
+        echo "$session: role=$new_role${new_kind:+ orch_kind=$new_kind} ($via)"
+    fi
+}
+
 _launch_detached() {
     # Quote each shell argument byte-for-byte in the C locale. Older Bash
     # multibyte %q can mix raw UTF-8 bytes with octal escapes; jq then replaces
@@ -4074,6 +4399,7 @@ _launch_detached() {
     local shortcut_canonical=""
     local force=false
     local resume_id=""
+    local role_flag="" kind_flag="" succeeds_flag="" pinned_name=""
     local no_health_check=false
     local health_check_timeout=30
     local passthrough_count=0
@@ -4154,6 +4480,9 @@ _launch_detached() {
                 if [[ "$2" != TMUX--* && "$purpose_set" != true ]]; then
                     purpose="$2"; purpose_set=true
                 fi
+                # Realign replay keeps the recorded tmux name (plan 100 D7):
+                # it exists to fix the app prefix, so it must not rename.
+                [[ "$2" == TMUX--* && "${_CCTRL_REPLAY:-}" == realign ]] && pinned_name="$2"
                 shift 2
                 ;;
             --model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env)
@@ -4172,6 +4501,25 @@ _launch_detached() {
                 fi
                 peer_identity="$2"
                 shift 2
+                ;;
+            --role|--orch-kind|--succeeds)
+                # Role flags are consumed here and never reach the pane child
+                # (no argv, no env): the child computes no name and writes no
+                # metadata.
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}$1 needs a value${RESET}" >&2
+                    return 64
+                fi
+                case "$1" in
+                    --role) role_flag="$2" ;;
+                    --orch-kind) kind_flag="$2" ;;
+                    --succeeds) succeeds_flag="$2" ;;
+                esac
+                shift 2
+                ;;
+            --no-input)
+                # Decided once in main(); consumed so it never reaches the agent.
+                shift
                 ;;
             --no-health-check)
                 no_health_check=true
@@ -4238,6 +4586,29 @@ _launch_detached() {
         echo -e "${DIM}A detached session needs an explicit dir or shortcut — defaulting${RESET}" >&2
         echo -e "${DIM}to \$HOME would drop a full-access agent into ~/.ssh, ~/.aws, etc.${RESET}" >&2
         return 1
+    fi
+
+    # Role and kind come first (plan 100 D3): an ambiguous kind must answer
+    # 78 with the marker as the first stderr line, before the guardrail,
+    # profile or agent resolution can print anything. A missing shortcut key
+    # is left to the existing "Shortcut not found" error below.
+    local role_key=""
+    if [[ "$target_kind" == "shortcut" ]]; then
+        role_key="$(_shortcut_lookup_key "$target")"
+    fi
+    if [[ -n "${_CCTRL_ROLE_RESOLVE_ONLY:-}" ]]; then
+        if [[ "$target_kind" == "shortcut" && -z "$role_key" ]] \
+            || [[ "$target_kind" != "shortcut" && ! -d "${target/#\~/$HOME}" ]]; then
+            echo "cctrl: target not found: $target" >&2
+            return 66
+        fi
+    fi
+    if [[ "$target_kind" != "shortcut" || -n "$role_key" ]]; then
+        _role_resolve "$role_flag" "$kind_flag" "$role_key" "$target" || return $?
+    fi
+    if [[ -n "${_CCTRL_ROLE_RESOLVE_ONLY:-}" ]]; then
+        printf 'role=%s orch_kind=%s\n' "$ROLE_RESOLVED" "${ORCH_KIND_RESOLVED:--}"
+        return 0
     fi
 
     # Bail out before doing any work if the machine is genuinely low on memory
@@ -4473,6 +4844,9 @@ _launch_detached() {
         return 1
     fi
     session_name="$picked_name"
+    if [[ -n "$pinned_name" ]] && ! tmux has-session -t "=$pinned_name" 2>/dev/null; then
+        session_name="$pinned_name"
+    fi
 
     local default_purpose final_purpose
     if $purpose_set; then
@@ -4521,7 +4895,8 @@ _launch_detached() {
     fi
 
     if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
-        "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" 2>/dev/null; then
+        "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" \
+        "${ROLE_RESOLVED:-worker}" "$ORCH_KIND_RESOLVED" "$succeeds_flag" 2>/dev/null; then
         echo -e "${YELLOW}⚠  Could not write session metadata.${RESET}" >&2
         echo -e "${DIM}   Path: $(_session_metadata_file "$session_name")${RESET}" >&2
         if [[ -n "$peer_name" ]]; then
@@ -4541,6 +4916,9 @@ _launch_detached() {
     # change (plan 071 phase 6).
     tmux set-option -t "=$session_name:" -q @cctrl_profile "${resolved_profile:-none}" 2>/dev/null || true
     tmux set-option -t "=$session_name:" -q @cctrl_auth_backend "$resolved_auth_backend" 2>/dev/null || true
+    tmux set-option -t "=$session_name:" -q @cctrl_role "${ROLE_RESOLVED:-worker}" 2>/dev/null || true
+    [[ -n "$ORCH_KIND_RESOLVED" ]] \
+        && { tmux set-option -t "=$session_name:" -q @cctrl_orch_kind "$ORCH_KIND_RESOLVED" 2>/dev/null || true; }
     # Bind this registry record to the newly-created tmux pane. A later
     # attestation rejects a recycled session name or a replaced pane.
     if ! _session_capture_tmux_attestation_anchor "$session_name" 2>/dev/null; then
@@ -4832,6 +5210,8 @@ _peer_derived_json() {
                 session: .name,
                 purpose: .purpose,
                 display_label: .display_label,
+                role: .role,
+                orch_kind: .orch_kind,
                 capabilities: ["mailbox", "tmux"],
                 source: "derived",
                 tmux_target: .name,
@@ -9418,7 +9798,7 @@ cmd_session() {
     shift 2>/dev/null || true
     case "$action" in
         -h|--help|help)
-            echo "Usage: cctrl session <ls | app-ls | recover-app-owned | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | close | kill | stop-exact>"
+            echo "Usage: cctrl session <ls | app-ls | recover-app-owned | archive | attest | mcp | reconcile-codex | release-to-app | doctor | backfill-ids | current | attach | say | prune | snapshot | restore | set-role | close | kill | stop-exact>"
             echo ""
             echo "  cctrl session ls               List sessions (dir, agent/shell, model, state, rc)"
             echo "    --json                       Machine-readable output"
@@ -9480,6 +9860,8 @@ cmd_session() {
             echo "    --yes, --close               Actually close the proposed candidates"
             echo "    --force                      Also consider attached sessions"
             echo "    --json                       Machine-readable candidate list"
+            echo "  cctrl session set-role <session> worker | orchestrator --orch-kind fleet|repo | --clear"
+            echo "                                 Tag a live session's role (no rename, no relabel, no restart)"
             echo "  cctrl session close [name]     Gracefully close a session; with no name,"
             echo "                                 closes the session you are running inside"
             echo "                                 (delayed kill so the caller can finish output)"
@@ -9515,6 +9897,7 @@ cmd_session() {
         restore)   _session_restore "$@" ;;
         close|stop) _session_close "$@" ;;
         reconcile-names) _session_reconcile_names "$@" ;;
+        set-role) _session_set_role "$@" ;;
         kill|k|rm) _session_kill "$@" ;;
         mark-closed) _session_mark_closed "$@" ;;
         record-terminated) _session_record_terminated_cmd "$@" ;;
@@ -10950,7 +11333,7 @@ _session_list() {
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off/na/na-inferred/unknown) · profile = personal/work·bedrock/none/? (? = pre-071 record). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
-    local profile profile_source auth_backend profile_display has_profile_raw has_profile
+    local profile profile_source auth_backend profile_display has_profile_raw has_profile role orch_kind role_fb
     local record_schema provider origin host_id registered_by_cctrl launched_by_cctrl execution_runtime control_owner lifecycle_state restore_strategy last_observed_at lineage_json evidence_json normalized_record
     for i in "${!names[@]}"; do
         name="${names[i]}"
@@ -10964,12 +11347,12 @@ _session_list() {
         local meta_file
         meta_file="$(_session_metadata_file "$name")"
         purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""
-        profile=""; profile_source=""; auth_backend=""; has_profile_raw="false"
+        profile=""; profile_source=""; auth_backend=""; has_profile_raw="false"; role=""; orch_kind=""
         record_schema=""; provider=""; origin=""; host_id=""; registered_by_cctrl=false; launched_by_cctrl=false; execution_runtime=unknown; control_owner=unknown; lifecycle_state=unknown; restore_strategy=""; last_observed_at=""; lineage_json='{}'; evidence_json='[]'
         if [[ -f "$meta_file" ]]; then
             normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
             if [[ -n "$normalized_record" ]]; then
-                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r profile; IFS= read -r has_profile_raw; IFS= read -r profile_source; IFS= read -r auth_backend; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.profile // ""), (has("profile")|tostring), (.profile_source // ""), (.auth_backend // "")' <<< "$normalized_record" 2>/dev/null) || true
+                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r profile; IFS= read -r has_profile_raw; IFS= read -r profile_source; IFS= read -r auth_backend; IFS= read -r role; IFS= read -r orch_kind; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.profile // ""), (has("profile")|tostring), (.profile_source // ""), (.auth_backend // ""), (.role // ""), (.orch_kind // "")' <<< "$normalized_record" 2>/dev/null) || true
                 record_schema="$(jq -r '.schema_version // empty' <<< "$normalized_record")"
                 provider="$(jq -r '.provider // empty' <<< "$normalized_record")"
                 origin="$(jq -r '.origin // empty' <<< "$normalized_record")"
@@ -11082,7 +11465,13 @@ _session_list() {
         fi
 
         if $json; then
+            if [[ -z "$role" ]]; then
+                role_fb="$(_session_role_fallback "$name")"
+                role="${role_fb%%|*}"; role_fb="${role_fb#*|}"; orch_kind="${role_fb%%|*}"
+                [[ "${role_fb#*|}" == default ]] && { role=""; orch_kind=""; }
+            fi
             json_items+=("$(jq -n \
+                --arg role "$role" --arg orch_kind "$orch_kind" \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" --arg agent "$agent" \
                 --arg purpose "$purpose" --arg created_at "$created_at" \
@@ -11100,7 +11489,7 @@ _session_list() {
                 --argjson lineage "$lineage_json" --argjson ownership_evidence "$evidence_json" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
                 --arg profile "$profile" --arg profile_source "$profile_source" --arg auth_backend "$auth_backend" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence, profile:(if $profile=="" then null else $profile end), profile_source:(if $profile_source=="" then null else $profile_source end), auth_backend:(if $auth_backend=="" then null else $auth_backend end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence, profile:(if $profile=="" then null else $profile end), profile_source:(if $profile_source=="" then null else $profile_source end), auth_backend:(if $auth_backend=="" then null else $auth_backend end), role:(if $role=="" then null else $role end), orch_kind:(if $orch_kind=="" then null else $orch_kind end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -12316,7 +12705,7 @@ _session_realign_flags() {
     # hand-adding just --profile. One flag (value, if any) per line; a
     # bare flag (--no-bridge) is printed alone. Best-effort: a metadata read
     # failure here must never block the realign itself.
-    local old_name="$1" out profile
+    local old_name="$1" out profile role role_info role_kind role_src
     out="$(python3 "$SCRIPT_DIR/lib/snapshot_restore.py" launch-flags --metadata-dir "$SESSION_METADATA_DIR" --name "$old_name" 2>/dev/null)" || return 0
     profile="$(jq -r '.profile // empty' <<< "$out" 2>/dev/null)"
     # The caller kills the old tmux session before relaunching; a profile
@@ -12334,6 +12723,16 @@ _session_realign_flags() {
         + (if .no_bridge == true then ["--no-bridge"] else [] end)
         | .[]
     ' <<< "$out" 2>/dev/null
+    # Role and kind (plan 100 D7). A pure default worker adds nothing; a
+    # recorded worker is kept explicit so name inference cannot upgrade it.
+    role_info="$(_session_role_of "$old_name")"
+    role="${role_info%%|*}"; role_info="${role_info#*|}"
+    role_kind="${role_info%%|*}"; role_src="${role_info#*|}"
+    if [[ "$role_src" != default && "${2:-}" != no-role ]]; then
+        printf '%s\n' --role "$role"
+        [[ -n "$role_kind" ]] && printf '%s\n' --orch-kind "$role_kind"
+    fi
+    return 0
 }
 
 _session_realign_cmd() {
@@ -12348,7 +12747,7 @@ _session_realign_cmd() {
     cmd="cctrl start -d $(printf '%q' "$target") --agent claude --name $(printf '%q' "$name") --resume $(printf '%q' "$sid")"
     [[ -n "$purpose" ]] && cmd+=" --purpose $(printf '%q' "$purpose")"
     local extra
-    while IFS= read -r extra; do cmd+=" $(printf '%q' "$extra")"; done < <(_session_realign_flags "$name")
+    while IFS= read -r extra; do cmd+=" $(printf '%q' "$extra")"; done < <(_session_realign_flags "$name" "${5:-no-role}")
     printf '%s' "$cmd"
 }
 
@@ -12368,7 +12767,7 @@ _session_realign() {
     # the harness can assert on the exact argv without touching a real session.
     local name="$1" target="$2" sid="$3" purpose="$4"
     if [[ -n "${CCTRL_DOCTOR_RELAUNCH_LOG:-}" ]]; then
-        _session_realign_cmd "$name" "$target" "$sid" "$purpose" >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
+        _session_realign_cmd "$name" "$target" "$sid" "$purpose" with-role >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
         printf '\n' >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
         return 0
     fi
@@ -12377,7 +12776,11 @@ _session_realign() {
     local extra
     while IFS= read -r extra; do rl+=("$extra"); done < <(_session_realign_flags "$name")
     tmux kill-session -t "=$name" 2>/dev/null || true
-    _launch_detached "${rl[@]}"
+    local realign_rc=0
+    _CCTRL_REPLAY=realign
+    _launch_detached "${rl[@]}" || realign_rc=$?
+    unset _CCTRL_REPLAY
+    return "$realign_rc"
 }
 
 _session_doctor() {
@@ -13048,6 +13451,7 @@ _session_restore() {
         purpose="$(jq -r '.purpose // "restored task"' <<< "$row_file")"; label="$(jq -r '.display_label // empty' <<< "$row_file")"
         agent="$(jq -r '.agent // .provider // empty' <<< "$row_file")"
         local -a launch_argv=(-d "$cwd" -r "$resume" --purpose "$purpose")
+        local flag_role="" flag_kind=""
         [[ -n "$label" ]] && launch_argv+=(--name "$label")
         case "$agent" in
             claude|codex) launch_argv+=(--agent "$agent") ;;
@@ -13062,8 +13466,33 @@ _session_restore() {
                 ask_for_approval) launch_argv+=(--ask-for-approval "$value") ;;
                 peer) launch_argv+=(--peer "$value") ;;
                 no_bridge) [[ "$value" == true ]] && launch_argv+=(--no-bridge) ;;
+                role) flag_role="$value" ;;
+                orch_kind) flag_kind="$value" ;;
             esac
         done < <(jq -r '.launch_flags // {} | to_entries[] | [.key,(.value|tostring)] | @tsv' <<< "$row_file")
+        # Role and kind (plan 100 D7). Always read the CURRENT record for this
+        # conversation: a record that has a role wins over the snapshot row (a
+        # snapshot older than `set-role` must not erase a newer tag), then the
+        # snapshot's launch flags, then legacy name inference. Replay never
+        # overwrites a recorded kind with "unknown".
+        local rec_file="" rec_role="" rec_kind="" rec_id
+        rec_id="$(jq -r '.provider_task_id // .resume_identity // empty' <<< "$row_file")"
+        [[ -n "$rec_id" ]] && rec_file="$(_task_record_file "$(jq -r '.provider // empty' <<< "$row_file")" "$host_id" "$rec_id" 2>/dev/null || true)"
+        if [[ -n "$rec_file" && -f "$rec_file" ]]; then
+            rec_role="$(jq -r '.role // empty' "$rec_file" 2>/dev/null || true)"
+            rec_kind="$(jq -r '.orch_kind // empty' "$rec_file" 2>/dev/null || true)"
+        fi
+        if [[ -n "$rec_role" ]]; then
+            if [[ "$rec_role" != "$flag_role" ]]; then flag_kind=""; fi
+            flag_role="$rec_role"
+            [[ "$rec_role" == orchestrator && -n "$rec_kind" ]] && flag_kind="$rec_kind"
+        elif [[ -z "$flag_role" ]]; then
+            flag_role="$(_role_infer_from_name "$(jq -r '.tmux_session // empty' <<< "$row_file")")"
+        fi
+        if [[ -n "$flag_role" ]]; then
+            launch_argv+=(--role "$flag_role")
+            [[ "$flag_role" == orchestrator && -n "$flag_kind" ]] && launch_argv+=(--orch-kind "$flag_kind")
+        fi
         if [[ "$agent" == codex ]]; then
             # Confirmation and wave pauses can outlive an ownership snapshot.
             # Repeat the existing closed restore predicate immediately before
@@ -13092,7 +13521,14 @@ _session_restore() {
         if [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then
             printf 'cctrl start' >> "$CCTRL_RESTORE_LAUNCH_LOG"; printf ' %q' "${launch_argv[@]}" >> "$CCTRL_RESTORE_LAUNCH_LOG"; printf '\n' >> "$CCTRL_RESTORE_LAUNCH_LOG"
         else
-            CCTRL_ATTACH_PROMPT=never _launch_detached "${launch_argv[@]}" >/dev/null 2>&1 || spawn_rc=$?
+            local launch_err="$scratch/launch-err"
+            : > "$launch_err"
+            _CCTRL_REPLAY=restore
+            CCTRL_ATTACH_PROMPT=never _launch_detached "${launch_argv[@]}" >/dev/null 2>"$launch_err" || spawn_rc=$?
+            unset _CCTRL_REPLAY
+            if (( spawn_rc != 0 )); then
+                echo "$(jq -r '.tmux_session // .provider_task_id // "unnamed"' <<< "$row_file"): $(head -n 1 "$launch_err" 2>/dev/null)" >&2
+            fi
         fi
         if (( spawn_rc == 0 )); then restored=$((restored+1)); else failed=$((failed+1)); fi
         index=$((index+1))
@@ -15211,6 +15647,9 @@ cmd_help() {
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
+    echo "    --role orchestrator|worker  Session role (default worker); needs -d"
+    echo "    --orch-kind fleet|repo    Orchestrator kind (implies orchestrator); unknown kind asks, or exits 78"
+    echo "    --no-input                Never prompt (same as CCTRL_NO_INPUT=1)"
     echo "    -f, --force               Skip the low-memory launch guardrail"
     echo "    --yolo                    Full bypass alias (Codex) / bypassPermissions (Claude)"
     echo "    --no-bridge               Disable the phone-control bridge (on by default)"
@@ -15294,7 +15733,7 @@ cmd_help() {
     echo "  cctrl @<name> --peer NAME  Export CCTRL_PEER for peer mailbox identity"
     echo "  cctrl @<name> -- TEXT   Same, but takes everything after -- as the prompt"
     echo "  cctrl @                 List shortcuts (also: cctrl @ ls)"
-    echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
+    echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT] [--role R] [--orch-kind K]"
     echo "  cctrl @rm <name>        Remove a shortcut"
     echo "  cctrl @ edit            Open shortcuts file in \$EDITOR"
     echo "  Extra flags after the name are passed through to the selected agent, e.g. cctrl @HomeLab --resume"
@@ -16309,6 +16748,19 @@ _remote_exec() {
             ;;
     esac
     if $remote_tmux_launch; then
+        # The remote side never asks (plan 100 D4): it gets CCTRL_NO_INPUT=1
+        # and the role flags are resolved locally below. --no-input itself is
+        # dropped so an older remote cctrl never sees an unknown flag.
+        env_prefix="CCTRL_NO_INPUT=1 $env_prefix"
+        local -a _ni_kept=()
+        local _ni_a _ni_done=false
+        for _ni_a in "${remote_args[@]}"; do
+            if [[ "$_ni_done" == false && "$_ni_a" == "--" ]]; then _ni_done=true; fi
+            if [[ "$_ni_done" == false && "$_ni_a" == "--no-input" ]]; then continue; fi
+            _ni_kept+=("$_ni_a")
+        done
+        remote_args=("${_ni_kept[@]}")
+        set -- "${remote_args[@]}"
         local i j a
         i=0
         while (( i < ${#remote_args[@]} )); do
@@ -16338,7 +16790,7 @@ _remote_exec() {
                     ((i+=2))
                     continue
                     ;;
-                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer)
+                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--role|--orch-kind|--succeeds)
                     ((i+=2))
                     continue
                     ;;
@@ -16377,6 +16829,86 @@ _remote_exec() {
         fi
         remote_args=("${updated_args[@]}")
         set -- "${remote_args[@]}"
+    fi
+
+    # Plan 100 D4 preflight: only for a remote tmux launch with an @key target or
+    # a role flag. The remote runs the hidden read-only `_role-resolve` verb
+    # (the same parser as `start -d`, stopped after the role block); this side
+    # asks if it can and forwards explicit --role/--orch-kind.
+    if $remote_tmux_launch; then
+        local -a rp_launch=()
+        case "${remote_args[0]:-}" in
+            @*) rp_launch=("${remote_args[@]}") ;;
+            start|s) rp_launch=("${remote_args[@]:1}") ;;
+        esac
+        local rp_needs=false rp_role_typed=false rp_i=0 rp_a
+        while (( rp_i < ${#rp_launch[@]} )); do
+            rp_a="${rp_launch[$rp_i]}"
+            case "$rp_a" in
+                --) break ;;
+                --role|--orch-kind|--succeeds) rp_needs=true; rp_role_typed=true; rp_i=$((rp_i + 2)); continue ;;
+                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m)
+                    rp_i=$((rp_i + 2)); continue ;;
+                @*) rp_needs=true ;;
+            esac
+            rp_i=$((rp_i + 1))
+        done
+        if $rp_needs && (( ${#rp_launch[@]} > 0 )); then
+            local pre_q="" pre_out="" pre_rc=0 pre_err pre_a
+            for pre_a in "${rp_launch[@]}"; do pre_q+=" $(printf '%q' "$pre_a")"; done
+            pre_err="$(mktemp "${TMPDIR:-/tmp}/cctrl-preflight.XXXXXX")" || return 1
+            pre_out="$(ssh -n "$ssh_target" "source ~/.zprofile 2>/dev/null; CCTRL_NO_INPUT=1 $env_prefix cctrl _role-resolve$pre_q" 2>"$pre_err")" || pre_rc=$?
+            local pre_role="" pre_kind="" pre_line="" add_role=false
+            case "$pre_rc" in
+                0)
+                    pre_line="$(printf '%s\n' "$pre_out" | grep '^role=' | tail -n 1 || true)"
+                    if [[ -n "$pre_line" ]]; then
+                        pre_role="${pre_line#role=}"; pre_role="${pre_role%% *}"
+                        pre_kind="${pre_line##*orch_kind=}"; [[ "$pre_kind" == "-" ]] && pre_kind=""
+                        [[ "$pre_role" == orchestrator || "$pre_role" == worker ]] && add_role=true
+                    fi
+                    ;;
+                78)
+                    if [[ "${_CCTRL_CAN_ASK:-0}" == 1 ]]; then
+                        local pre_reason
+                        pre_reason="$(sed -n '2s/^Cannot tell which kind of orchestrator this is: //;2s/\.$//p' "$pre_err")"
+                        ORCH_KIND_RESOLVED=""
+                        _role_ask_kind "${pre_reason:-the kind is not set}" "$host_alias" "" || { pre_rc=$?; rm -f "$pre_err"; return "$pre_rc"; }
+                        pre_role=orchestrator; pre_kind="$ORCH_KIND_RESOLVED"; add_role=true
+                    else
+                        cat "$pre_err" >&2; rm -f "$pre_err"; return 78
+                    fi
+                    ;;
+                64) cat "$pre_err" >&2; rm -f "$pre_err"; return 64 ;;
+                66) ;;
+                1)
+                    if $rp_role_typed; then
+                        rm -f "$pre_err"
+                        echo "cctrl: cctrl on $host_alias does not support role flags; update it" >&2
+                        return 69
+                    fi
+                    ;;
+                255) cat "$pre_err" >&2; rm -f "$pre_err"; return 255 ;;
+                *) cat "$pre_err" >&2; rm -f "$pre_err"; return "$pre_rc" ;;
+            esac
+            rm -f "$pre_err"
+            if $add_role; then
+                local -a rp_flags=(--role "$pre_role")
+                [[ -n "$pre_kind" ]] && rp_flags+=(--orch-kind "$pre_kind")
+                local -a rp_new=()
+                local rp_ins=false
+                for a in "${remote_args[@]}"; do
+                    if [[ "$a" == "--" && "$rp_ins" == false ]]; then
+                        rp_new+=("${rp_flags[@]}")
+                        rp_ins=true
+                    fi
+                    rp_new+=("$a")
+                done
+                [[ "$rp_ins" == false ]] && rp_new+=("${rp_flags[@]}")
+                remote_args=("${rp_new[@]}")
+                set -- "${remote_args[@]}"
+            fi
+        fi
     fi
 
     # Quote each argument for safe SSH transport after any local-only remote
@@ -17089,11 +17621,11 @@ _shortcut_for_dir() {
     # Collision rule: when multiple keys point at the same directory, the first
     # match by sorted key wins — a deterministic, documented choice.
     #
-    # fm-* keys (manager shortcuts) are never adopted here (plan 098): only an
-    # explicit `cctrl @fm-<x>` launch should get the fm- name. Excluding them
-    # by key prefix, rather than requiring a new "role" field on every
-    # shortcut, needs no data migration and matches the one convention that
-    # already marks a manager shortcut today. Before this fix, fm-* keys won
+    # Orchestrator shortcuts are never adopted here (plan 098, plan 100): only
+    # an explicit `cctrl @<key>` launch gets the orchestrator treatment. The
+    # test is the shortcut's ROLE (_SHORTCUT_ROLE_JQ); a key starting with fm-
+    # or orch- with no role/orch_kind is the legacy fallback and counts as an
+    # orchestrator. An entry with an invalid role or kind is skipped. Before this fix, fm-* keys won
     # the sorted-key collision against a plain key for the same dir (e.g.
     # fm-homelab < homelab, fm-personal < obsidian), so a plain `-d <dir>`
     # launch was silently named and profiled as if it were the manager.
@@ -17114,11 +17646,11 @@ _shortcut_for_dir() {
             printf '%s' "$key"
             return 0
         fi
-    done < <(jq -r '
+    done < <(jq -r "$_SHORTCUT_ROLE_JQ"'
         to_entries
         | sort_by(.key)[]
         | select(.value.dir != null and .value.dir != "")
-        | select(.key | ascii_downcase | startswith("fm-") | not)
+        | select(sc_valid and sc_role == "worker")
         | "\(.key)\t\(.value.dir)"
     ' "$SHORTCUTS_FILE" 2>/dev/null)
     return 0
@@ -17135,7 +17667,7 @@ _shortcut_help() {
     echo "  cctrl @<name> --resume [id]       Resume picker, or a specific session"
     echo "  cctrl @<name> --no-bridge         Disable the phone-control bridge for this launch"
     echo "  cctrl @<name> --remote unix://    Codex TUI transport only; no shared app control"
-    echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]"
+    echo "  cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT] [--role R] [--orch-kind K]"
     echo "  cctrl @rm <name>                  Remove a shortcut"
     echo "  cctrl @ ls                        List shortcuts (no helper)"
     echo "  cctrl @ edit                      Open ${SHORTCUTS_FILE/#$HOME/~} in \$EDITOR"
@@ -17183,8 +17715,15 @@ _shortcut_add() {
     local agent=""
     local resume="false"
     local prompt=""
+    local role_flag="" kind_flag=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --role)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--role needs a value${RESET}"; return 64; }
+                role_flag="$2"; shift 2 ;;
+            --orch-kind)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--orch-kind needs a value${RESET}"; return 64; }
+                kind_flag="$2"; shift 2 ;;
             --profile|-p)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
                 profile="$2"; shift 2 ;;
@@ -17218,10 +17757,38 @@ _shortcut_add() {
         echo -e "${YELLOW}A shortcut '$existing' already exists with different casing. Overwriting under new name '$name'.${RESET}"
     fi
 
+    # Role fields (plan 100 D5): an existing entry's role and orch_kind are
+    # kept unless --role/--orch-kind say otherwise; --role worker drops the
+    # kind; an orchestrator with no kind is case A5 (ask, or exit 78).
+    case "$role_flag" in ""|orchestrator|worker) ;; *) echo -e "${RED}cctrl: invalid --role \"$role_flag\" (use orchestrator or worker)${RESET}"; return 64 ;; esac
+    case "$kind_flag" in ""|fleet|repo) ;; *) echo -e "${RED}cctrl: invalid --orch-kind \"$kind_flag\" (use fleet or repo)${RESET}"; return 64 ;; esac
+    if [[ "$role_flag" == worker && -n "$kind_flag" ]]; then
+        echo -e "${RED}cctrl: --role worker cannot be combined with --orch-kind${RESET}"
+        return 64
+    fi
+    local final_role="" final_kind=""
+    if [[ -n "$existing" ]]; then
+        final_role="$(jq -r --arg k "$existing" '.[$k].role // empty' "$SHORTCUTS_FILE" 2>/dev/null || true)"
+        final_kind="$(jq -r --arg k "$existing" '.[$k].orch_kind // empty' "$SHORTCUTS_FILE" 2>/dev/null || true)"
+    fi
+    if [[ "$role_flag" == worker ]]; then
+        final_role=worker; final_kind=""
+    elif [[ "$role_flag" == orchestrator || -n "$kind_flag" ]]; then
+        final_role=orchestrator
+        [[ -n "$kind_flag" ]] && final_kind="$kind_flag"
+        if [[ -z "$final_kind" ]]; then
+            ORCH_KIND_RESOLVED=""
+            _role_ask_kind "--role orchestrator was given without --orch-kind" "$dir" "$name" || return $?
+            final_kind="$ORCH_KIND_RESOLVED"
+        fi
+    fi
+
     local tmp
     tmp=$(mktemp)
     jq --arg name "$name" \
        --arg dir "$dir" \
+       --arg role "$final_role" \
+       --arg orch_kind "$final_kind" \
        --arg profile "$profile" \
        --arg agent "$agent" \
        --arg resume "$resume" \
@@ -17237,6 +17804,8 @@ _shortcut_add() {
                    elif $resume == "false" then {}
                    else {resume: $resume} end)
                 + (if $prompt != "" then {prompt: $prompt} else {} end)
+                + (if $role != "" then {role: $role} else {} end)
+                + (if $orch_kind != "" then {orch_kind: $orch_kind} else {} end)
             )
         }
     ' "$SHORTCUTS_FILE" > "$tmp" && mv "$tmp" "$SHORTCUTS_FILE"
@@ -17246,6 +17815,7 @@ _shortcut_add() {
     [[ -n "$agent" ]] && echo -e "${DIM}  agent=$agent${RESET}"
     [[ "$resume" != "false" ]] && echo -e "${DIM}  resume=$resume${RESET}"
     [[ -n "$prompt" ]] && echo -e "${DIM}  prompt=\"$prompt\"${RESET}"
+    [[ -n "$final_role" ]] && echo -e "${DIM}  role=$final_role${final_kind:+ orch_kind=$final_kind}${RESET}"
     return 0
 }
 
@@ -17436,6 +18006,11 @@ _shortcut_jump() {
             --peer)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--peer needs a peer name${RESET}"; return 1; }
                 peer_identity="$2"; shift 2 ;;
+            --role|--orch-kind|--succeeds)
+                echo "cctrl: $1 needs a tmux-backed launch: add -d (inside a session, cctrl @key is a foreground launch)" >&2
+                return 64 ;;
+            --no-input)
+                shift ;;
             --model)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--model needs a value${RESET}"; return 1; }
                 cli_model="$2"; shift 2 ;;
@@ -17556,6 +18131,22 @@ _try_plugin() {
 # ── Main dispatch ─────────────────────────────────────────────────────
 
 main() {
+    # Plan 100: interactivity is decided once, here, on the script's own file
+    # descriptors (stdin and stderr, never stdout, never /dev/tty), before any
+    # command substitution. Agent markers force non-interactive even on a pty.
+    # The replay and resolve-only markers are plain shell variables: clear
+    # them so nothing inherited can switch them on.
+    unset _CCTRL_REPLAY _CCTRL_ROLE_RESOLVE_ONLY
+    _CCTRL_CAN_ASK=0
+    if [[ -t 0 && -t 2 && "${CCTRL_NO_INPUT:-}" != "1" && "${CCTRL_TMUX_CONTEXT:-}" != "1" \
+          && -z "${CCTRL_SESSION_KIND:-}" && -z "${CLAUDECODE:-}" ]]; then
+        _CCTRL_CAN_ASK=1
+    fi
+    local _ni_arg
+    for _ni_arg in "$@"; do
+        [[ "$_ni_arg" == "--" ]] && break
+        [[ "$_ni_arg" == "--no-input" ]] && _CCTRL_CAN_ASK=0
+    done
     # Parse global flags before subcommand routing. Subcommands may also accept
     # --agent locally; this form is useful when combined with --host.
     local _host_alias="" _agent=""
@@ -17637,6 +18228,7 @@ _dispatch() {
         edit)    cmd_edit "$@" ;;
         profile|profiles) cmd_profile "$@" ;;
         start|s) cmd_start "$@" ;;
+        _role-resolve) _cmd_role_resolve "$@" ;;
         launch-to-app)
             source "$SCRIPT_DIR/lib/codex-launch-to-app.sh"
             _codex_launch_to_app "$@"

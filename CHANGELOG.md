@@ -19,6 +19,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   works as an alias namespace alongside the existing top-level verbs. (plan
   071 phase 1)
 
+### Added (plan 100, phase 1: roles)
+- Sessions and shortcuts have a `role` (`orchestrator | worker`) and, for
+  orchestrators, an `orch_kind` (`fleet | repo`): `cctrl start -d ... --role X
+  --orch-kind Y [--succeeds NAME] [--no-input]`, `cctrl @add ... --role/--orch-kind`
+  (an existing entry's role fields are kept on re-add), `cctrl session set-role
+  <session> worker | orchestrator --orch-kind K | --clear`. Recorded in the session
+  record and the `@cctrl_role` / `@cctrl_orch_kind` tmux options, shown in
+  `session ls --json` and `peer ls --json`, carried in snapshot `launch_flags` and
+  replayed by `session restore` and `session doctor --fix` (replay never asks).
+- When the orchestrator kind is ambiguous cctrl prompts at a terminal and
+  otherwise exits 78 with `cctrl: needs-user-decision: orchestrator-kind` as the
+  first stderr line, nothing launched. Remote launches resolve the role with a
+  read-only `_role-resolve` preflight and forward explicit flags; the remote side
+  runs with `CCTRL_NO_INPUT=1`.
+- `cctrl session restore` now prints `<session>: <first stderr line>` for a row
+  whose launch failed.
+
+### Changed (plan 100, phase 1)
+- A plain `cctrl start -d <dir>` no longer adopts an `orch-*` shortcut (or any
+  orchestrator shortcut: by role, with `fm-*` / `orch-*` keys as the legacy
+  fallback). Visible effect today: `-d ~/dev/rentkompass` is named
+  `TMUX--<host>--rentkompass` instead of `TMUX--<host>--orch-rentkompass`; a
+  restore of that live session before the later naming phase also comes back under
+  the worker name. No other session name or label changes in this phase.
+- `session doctor --fix` (realign) now keeps the session's recorded tmux name.
+- A cctrl tmux launch that states a role replaces the recorded role on the
+  conversation's record (including `-r <id>` launches).
+- `--role` / `--orch-kind` / `--succeeds` are rejected with exit 64 on foreground,
+  `--app-owned` and `launch-to-app` launches. `session set-role --orch-kind
+  fleet` has no one-fleet-manager guard until the next phase.
+
 ### Added (plan 089)
 - `cctrl release prune [--keep N] [--apply] [--json]`: manual, dry-run-by-default
   pruning of old releases under `~/.local/lib/cctrl/releases` (default keep 5,

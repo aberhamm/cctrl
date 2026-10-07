@@ -103,6 +103,9 @@ chmod +x "$TMPDIR/hostname"
 unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
 unset CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
+# Plan 100: an agent running the suite sets these; any of them would force
+# the non-interactive answer in the tty-ask tests or change an ask's outcome.
+unset CLAUDECODE CCTRL_NO_INPUT CCTRL_ASK_TIMEOUT CCTRL_ALLOW_SECOND_FLEET_MANAGER
 # Sandbox XDG_CONFIG_HOME globally so a test's default profile/config lookup
 # (no CCTRL_PROFILES_DIR override) never falls through to the real
 # ~/.config/cctrl, which could hold real secrets and would shadow fixture
@@ -3409,30 +3412,852 @@ test_dir_launch_only_manager_shortcut_uses_dir_basename() {
     echo "ok: dir launch with only an fm- key for that dir falls back to the dir basename"
 }
 
-test_at_fm_shortcut_launch_keeps_fm_name() {
-    # Plan 098 regression guard: an explicit `cctrl @fm-<x>` launch is
-    # unaffected by _shortcut_for_dir's fm- exclusion (that function is only
-    # the *reverse* dir->key lookup; an explicit @key launch never calls it).
+# ── Plan 100 phase 1: roles, kinds, the ask, remote preflight, replay ──────
+# Every launch here uses a rootcopy of cctrl (its own data/shortcuts.json), the
+# fake tmux on PATH and stdin from /dev/null, so nothing prompts, hangs, or
+# reaches the real tmux server, registry or shortcuts file.
+
+_rf_setup() {
+    # args: tag shortcuts-json (@P@ is replaced with the project dir)
+    RF_COPY="$TMPDIR/rf-$1-copy"; RF_PROJ="$TMPDIR/rf-$1-proj"; RF_LOG="$TMPDIR/rf-$1.log"
+    mkdir -p "$RF_COPY/data" "$RF_COPY/profiles" "$RF_PROJ"
+    cp "$ROOT/cctrl" "$RF_COPY/cctrl"
+    chmod +x "$RF_COPY/cctrl"
+    local json="${2//@P@/$RF_PROJ}"
+    printf '%s\n' "$json" > "$RF_COPY/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$RF_COPY/data/config.json"
     make_fake_tmux "$TMPDIR/tmux"
+    : > "$RF_LOG"
+}
 
-    local rootcopy="$TMPDIR/cctrl-atfm-copy"
-    local project="$TMPDIR/at-fm-project"
-    local log="$TMPDIR/atfm.log"
-    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
-    cp "$ROOT/cctrl" "$rootcopy/cctrl"
-    chmod +x "$rootcopy/cctrl"
-    printf '{"fm-atfm":{"dir":"%s"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
-    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+_rf() {
+    # Run the rootcopy. stdin is /dev/null and stderr is merged, so the first
+    # line of the output is the first line of stderr when nothing precedes it.
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never \
+        "$RF_COPY/cctrl" "$@" </dev/null 2>&1
+}
 
+_rf_session() { sed -n 's/^CCTRL_SESSION=//p' <<< "$1" | tail -n 1; }
+
+_rf_field() {
+    # args: output field -> that field of the record for the launched session
+    local sess
+    sess="$(_rf_session "$1")"
+    [[ -n "$sess" ]] || fail "no CCTRL_SESSION in output: $1"
+    session_record_json "$sess" | jq -r --arg f "$2" '.[$f] // empty'
+}
+
+_rf_records() { ls "$CCTRL_SESSION_METADATA_DIR" 2>/dev/null | wc -l | tr -d ' '; }
+
+_assert_ask_78() {
+    # args: output rc
+    [[ "$2" -eq 78 ]] || fail "expected exit 78, got $2: $1"
+    [[ "$(head -n 1 <<< "$1")" == "cctrl: needs-user-decision: orchestrator-kind" ]] \
+        || fail "first stderr line must be the needs-user-decision marker, got: $(head -n 1 <<< "$1")"
+    assert_contains "$1" "--orch-kind fleet"
+    assert_contains "$1" "--orch-kind repo"
+    assert_contains "$1" "--role worker"
+    assert_not_contains "$(cat "$RF_LOG")" "new-session"
+}
+
+test_role_flags_before_dir_target_with_detach() {
+    _rf_setup rp1 '{}'
+    local out rc=0
+    out="$(_rf start -d --orch-kind repo --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "launch with --orch-kind before the dir failed: $out"
+    assert_contains "$(grep '^SHELL_CMD=' "$RF_LOG" | head -n 1)" "$RF_PROJ"
+    [[ "$(_rf_field "$out" role)" == orchestrator ]] || fail "role not recorded: $out"
+    [[ "$(_rf_field "$out" orch_kind)" == repo ]] || fail "kind not recorded: $out"
+    echo "ok: role flags before the dir target are consumed, not taken as the target"
+}
+
+test_role_flags_before_at_target_without_detach() {
+    cctrl_source_eval '_start_args_have_explicit_target --role worker @x' || fail "--role worker @x has an explicit target"
+    cctrl_source_eval '_start_args_have_explicit_target --orch-kind repo --succeeds old --no-input @x' || fail "value flags and --no-input must be skipped"
+    if cctrl_source_eval "_start_args_have_explicit_target --role $TMPDIR"; then
+        fail "the value of --role must not be taken as a target dir"
+    fi
+    if cctrl_source_eval '_start_requests_app_owned --role --app-owned'; then
+        fail "the value of --role must not be taken as --app-owned"
+    fi
+    echo "ok: role flags are skipped by the target and app-owned scanners"
+}
+
+test_role_flags_never_reach_child_command() {
+    _rf_setup rp3 '{}'
+    local out shell_cmd
+    out="$(_rf start -d --role orchestrator --orch-kind repo --succeeds old-one --no-input --purpose p "$RF_PROJ")"
+    shell_cmd="$(grep '^SHELL_CMD=' "$RF_LOG" | head -n 1)"
+    [[ -n "$shell_cmd" ]] || fail "no tmux new-session command logged: $out"
+    local needle
+    for needle in "--role" "--orch-kind" "--succeeds" "--no-input" "CCTRL_ROLE" "CCTRL_ORCH" "CCTRL_NO_INPUT"; do
+        assert_not_contains "$shell_cmd" "$needle"
+    done
+    echo "ok: role flags and role env never reach the pane child"
+}
+
+test_role_flags_with_foreground_exit_64() {
+    _rf_setup rp4 '{"k":{"dir":"@P@"}}'
+    local out rc=0
+    out="$(_rf start --foreground --role worker "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "start --foreground --role must exit 64, got $rc: $out"
+    assert_contains "$out" "add -d"
+    rc=0
+    out="$(_rf @k --foreground --orch-kind repo)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "@key --foreground --orch-kind must exit 64, got $rc: $out"
+    echo "ok: role flags on a foreground launch exit 64"
+}
+
+test_role_flags_with_app_owned_and_launch_to_app_exit_64() {
+    _rf_setup rp5 '{}'
+    local out rc=0
+    out="$(_rf start --app-owned --role worker "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--app-owned with --role must exit 64, got $rc: $out"
+    rc=0
+    [[ -e "$RF_COPY/lib" ]] || ln -s "$ROOT/lib" "$RF_COPY/lib"
+    out="$(PATH="$TMPDIR:$PATH" "$RF_COPY/cctrl" launch-to-app --orch-kind repo "$RF_PROJ" </dev/null 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "launch-to-app with --orch-kind must exit 64, got $rc: $out"
+    echo "ok: role flags are rejected by app-owned and launch-to-app"
+}
+
+test_remote_role_value_not_taken_as_purpose() {
+    make_fake_ssh "$TMPDIR/ssh"
+    local rootcopy="$TMPDIR/rp6-copy" log="$TMPDIR/rp6-ssh.log" proj="$TMPDIR/rp6-proj"
+    mkdir -p "$rootcopy/data" "$proj"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"; chmod +x "$rootcopy/cctrl"
+    printf '{"ms":{"hostname":"example.invalid","user":"tester"}}\n' > "$rootcopy/data/hosts.json"
     : > "$log"
-    local out
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
-        "$rootcopy/cctrl" start -d --purpose p @fm-atfm)"
-    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fm-atfm"
-    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--fm-atfm"
-    assert_contains "$(cat "$log")" "--name TMUX--ms--fm-atfm"
+    PATH="$TMPDIR:$PATH" SSH_LOG="$log" CCTRL_PURPOSE_PROMPT=never \
+        "$rootcopy/cctrl" --host ms start -d --role orchestrator --orch-kind repo "$proj" >/dev/null 2>&1 </dev/null || true
+    local ssh_log
+    ssh_log="$(cat "$log")"
+    assert_not_contains "$ssh_log" "--purpose\\ orchestrator"
+    assert_not_contains "$ssh_log" "--purpose\\ repo"
+    assert_contains "$ssh_log" "--purpose\\ rp6-proj"
+    echo "ok: remote default purpose skips role flag values"
+}
 
+test_role_flag_recorded_in_metadata_and_tmux_option() {
+    _rf_setup rp7 '{}'
+    local out sess
+    out="$(_rf start -d --role worker --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(_rf_field "$out" role)" == worker ]] || fail "worker role not recorded: $out"
+    assert_contains "$(cat "$RF_LOG")" "@cctrl_role worker"
+    out="$(_rf start -d --orch-kind fleet --purpose p "$RF_PROJ")"
+    assert_contains "$(cat "$RF_LOG")" "@cctrl_role orchestrator"
+    assert_contains "$(cat "$RF_LOG")" "@cctrl_orch_kind fleet"
+    [[ "$(_rf_field "$out" orch_kind)" == fleet ]] || fail "fleet kind not recorded"
+    echo "ok: role and kind are recorded and set as tmux options"
+}
+
+test_role_and_orch_kind_invalid_values_exit_64() {
+    _rf_setup rp8 '{}'
+    local out rc=0
+    out="$(_rf start -d --role boss --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--role boss must exit 64, got $rc: $out"
+    rc=0
+    out="$(_rf start -d --orch-kind king --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--orch-kind king must exit 64, got $rc: $out"
+    rc=0
+    out="$(_rf start -d --role --purpose p "$RF_PROJ")" || rc=$?
+    assert_not_contains "$(cat "$RF_LOG")" "new-session"
+    echo "ok: invalid role and kind values exit 64 and launch nothing"
+}
+
+test_orch_kind_flag_implies_orchestrator_role() {
+    _rf_setup rp9 '{}'
+    local out
+    out="$(_rf start -d --orch-kind fleet --purpose p "$RF_PROJ")"
+    [[ "$(_rf_field "$out" role)" == orchestrator ]] || fail "--orch-kind alone must imply orchestrator: $out"
+    echo "ok: --orch-kind implies the orchestrator role"
+}
+
+test_role_worker_with_orch_kind_exits_64() {
+    _rf_setup rp10 '{}'
+    local out rc=0
+    out="$(_rf start -d --role worker --orch-kind repo --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "worker with --orch-kind must exit 64, got $rc: $out"
+    echo "ok: --role worker with --orch-kind exits 64"
+}
+
+test_shortcut_role_and_kind_resolve_on_at_launch() {
+    _rf_setup rp11 '{"mgr":{"dir":"@P@","role":"orchestrator","orch_kind":"fleet"},"wk":{"dir":"@P@","role":"worker"}}'
+    local out
+    out="$(_rf start -d --purpose p @mgr)"
+    [[ "$(_rf_field "$out" role)" == orchestrator && "$(_rf_field "$out" orch_kind)" == fleet ]] || fail "@mgr role/kind: $out"
+    out="$(_rf start -d --purpose p @wk)"
+    [[ "$(_rf_field "$out" role)" == worker ]] || fail "@wk role: $out"
+    echo "ok: an explicit @key launch takes the shortcut's role and kind"
+}
+
+test_shortcut_orch_kind_without_role_is_orchestrator() {
+    _rf_setup rp12 '{"k":{"dir":"@P@","orch_kind":"repo"}}'
+    local out
+    out="$(_rf start -d --purpose p @k)"
+    [[ "$(_rf_field "$out" role)" == orchestrator && "$(_rf_field "$out" orch_kind)" == repo ]] || fail "orch_kind alone: $out"
+    echo "ok: orch_kind without role is a known orchestrator"
+}
+
+test_shortcut_invalid_role_exits_64_naming_key() {
+    _rf_setup rp13 '{"bad":{"dir":"@P@","role":"boss"},"bad2":{"dir":"@P@","orch_kind":"king"}}'
+    local out rc=0
+    out="$(_rf start -d --purpose p @bad)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "invalid role must exit 64, got $rc: $out"
+    assert_contains "$out" 'shortcut @bad: invalid role "boss"'
+    rc=0
+    out="$(_rf start -d --purpose p @bad2)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "invalid orch_kind must exit 64, got $rc: $out"
+    assert_contains "$out" 'shortcut @bad2: invalid orch_kind "king"'
+    assert_not_contains "$(cat "$RF_LOG")" "new-session"
+    echo "ok: an invalid shortcut role or kind exits 64 naming the key"
+}
+
+test_orch_kind_flag_overrides_shortcut_kind() {
+    _rf_setup rp14 '{"k":{"dir":"@P@","role":"orchestrator","orch_kind":"repo"}}'
+    local out
+    out="$(_rf start -d --orch-kind fleet --purpose p @k)"
+    [[ "$(_rf_field "$out" orch_kind)" == fleet ]] || fail "flag must win over the shortcut kind: $out"
+    assert_contains "$out" "flags override shortcut @k"
+    echo "ok: --orch-kind wins over the shortcut and says so"
+}
+
+test_dir_launch_never_inherits_shortcut_role() {
+    _rf_setup rp15 '{"plain":{"dir":"@P@","role":"orchestrator","orch_kind":"fleet"}}'
+    local out
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    [[ "$(_rf_field "$out" role)" == worker ]] || fail "a dir launch is a worker: $out"
+    assert_not_contains "$out" "CCTRL_SESSION=TMUX--ms--plain"
+    echo "ok: a dir launch never inherits a shortcut's role"
+}
+
+test_dir_launch_with_orch_key_and_plain_key_uses_plain_key() {
+    _rf_setup rp16 '{"orch-x":{"dir":"@P@"},"plainkey":{"dir":"@P@"}}'
+    local out
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--plainkey"
+    echo "ok: a dir with an orch-* key and a plain key is named from the plain key"
+}
+
+test_dir_launch_with_only_orch_key_uses_basename() {
+    _rf_setup rp17 '{"ORCH-x":{"dir":"@P@"}}'
+    local out
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--rf-rp17-proj"
+    echo "ok: a dir with only an orch-* key falls back to the dir basename"
+}
+
+test_dir_launch_matches_stored_dir_with_trailing_slash() {
+    _rf_setup rp18 '{"slashy":{"dir":"@P@/"}}'
+    local out
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--slashy"
+    echo "ok: a stored dir with a trailing slash still matches"
+}
+
+test_dir_launch_skips_role_shortcut_without_legacy_prefix() {
+    _rf_setup rp19 '{"boss":{"dir":"@P@","role":"orchestrator"},"kinded":{"dir":"@P@","orch_kind":"repo"}}'
+    local out
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--rf-rp19-proj"
+    echo "ok: an orchestrator shortcut is skipped by role, not only by prefix"
+}
+
+test_legacy_prefixed_key_with_worker_role_is_adopted() {
+    _rf_setup rp20 '{"fm-w":{"dir":"@P@","role":"worker"}}'
+    local out
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fm-w"
+    [[ "$(_rf_field "$out" role)" == worker ]] || fail "adopted key must stay a worker: $out"
+    echo "ok: a legacy-prefixed key with role worker is adopted by a dir launch"
+}
+
+test_no_env_var_supplies_role_or_kind() {
+    _rf_setup rp21 '{}'
+    local out
+    out="$(CCTRL_ROLE=orchestrator CCTRL_ORCH_KIND=fleet CCTRL_SESSION_ROLE=orchestrator CCTRL_SESSION_ORCH_KIND=fleet \
+        _rf start -d --purpose p "$RF_PROJ")"
+    [[ "$(_rf_field "$out" role)" == worker ]] || fail "no env var may supply a role: $out"
+    echo "ok: no environment variable supplies a role or kind"
+}
+
+test_shortcut_add_preserves_role_fields() {
+    _rf_setup rp22 '{"k":{"dir":"/old","role":"orchestrator","orch_kind":"repo"}}'
+    _rf @add k /new --profile personal >/dev/null
+    local got
+    got="$(jq -c '.k | [.dir,.role,.orch_kind]' "$RF_COPY/data/shortcuts.json")"
+    [[ "$got" == '["/new","orchestrator","repo"]' ]] || fail "@add must keep role fields, got $got"
+    echo "ok: @add keeps an existing entry's role and orch_kind"
+}
+
+test_shortcut_add_role_flags_set_and_clear() {
+    _rf_setup rp23 '{}'
+    _rf @add k /d --role orchestrator --orch-kind fleet >/dev/null
+    [[ "$(jq -c '.k | [.role,.orch_kind]' "$RF_COPY/data/shortcuts.json")" == '["orchestrator","fleet"]' ]] || fail "set failed"
+    _rf @add k /d --role worker >/dev/null
+    [[ "$(jq -c '.k | [.role,.orch_kind]' "$RF_COPY/data/shortcuts.json")" == '["worker",null]' ]] || fail "--role worker must drop the kind"
+    local out rc=0
+    out="$(_rf @add k /d --role worker --orch-kind repo)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "worker + kind must exit 64, got $rc: $out"
+    rc=0
+    out="$(_rf @add k /d --role boss)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "invalid role must exit 64, got $rc: $out"
+    echo "ok: @add --role/--orch-kind set, clear and validate"
+}
+
+test_at_fm_shortcut_launch_keeps_fm_name() {
+    # Plan 098 regression guard, rewritten by plan 100: an explicit
+    # `cctrl @fm-<x>` launch still names from the fm- key. The fixture now says
+    # what the key is (role + kind); the role-less fixture is case A3 below.
+    _rf_setup atfm '{"fm-atfm":{"dir":"@P@","role":"orchestrator","orch_kind":"repo"}}'
+    local out
+    out="$(_rf start -d --purpose p @fm-atfm)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fm-atfm"
+    assert_contains "$(cat "$RF_LOG")" "new-session -d -s TMUX--ms--fm-atfm"
+    assert_contains "$(cat "$RF_LOG")" "--name TMUX--ms--fm-atfm"
     echo "ok: an explicit @fm-<x> launch still names from the fm- key"
+}
+
+test_ask_a1_role_orchestrator_without_kind_exits_78() {
+    _rf_setup a1 '{}'
+    local before out rc=0
+    before="$(_rf_records)"
+    out="$(_rf start -d --role orchestrator --purpose p "$RF_PROJ")" || rc=$?
+    _assert_ask_78 "$out" "$rc"
+    [[ "$(_rf_records)" == "$before" ]] || fail "a refused launch must write no record"
+    echo "ok: A1 --role orchestrator without a kind exits 78"
+}
+
+test_ask_a2_shortcut_role_without_kind_exits_78() {
+    _rf_setup a2 '{"k":{"dir":"@P@","role":"orchestrator"}}'
+    local out rc=0
+    out="$(_rf start -d --purpose p @k)" || rc=$?
+    _assert_ask_78 "$out" "$rc"
+    assert_contains "$out" "cctrl @add k"
+    echo "ok: A2 a shortcut with role orchestrator and no kind exits 78"
+}
+
+test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78() {
+    _rf_setup a3 '{"fm-k":{"dir":"@P@"},"orch-k":{"dir":"@P@"},"FM-Upper":{"dir":"@P@"}}'
+    local out rc key
+    for key in fm-k orch-k FM-Upper; do
+        rc=0
+        out="$(_rf start -d --purpose p "@$key")" || rc=$?
+        _assert_ask_78 "$out" "$rc"
+    done
+    echo "ok: A3 role-less fm-* and orch-* keys (any case) exit 78"
+}
+
+test_ask_a4_set_role_orchestrator_without_kind_exits_78() {
+    _rf_setup a4 '{}'
+    local out rc=0
+    out="$(TMUX_FAKE_HAS_SESSION=TMUX--ms--x _rf session set-role TMUX--ms--x orchestrator)" || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "set-role orchestrator without a kind must exit 78, got $rc: $out"
+    [[ "$(head -n 1 <<< "$out")" == "cctrl: needs-user-decision: orchestrator-kind" ]] || fail "marker line: $out"
+    assert_not_contains "$(cat "$RF_LOG")" "@cctrl_role"
+    echo "ok: A4 set-role orchestrator without a kind exits 78"
+}
+
+test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78() {
+    _rf_setup a5 '{}'
+    local out rc=0
+    out="$(_rf @add k /d --role orchestrator)" || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "@add --role orchestrator without a kind must exit 78, got $rc: $out"
+    [[ "$(head -n 1 <<< "$out")" == "cctrl: needs-user-decision: orchestrator-kind" ]] || fail "marker line: $out"
+    [[ "$(jq 'length' "$RF_COPY/data/shortcuts.json")" == 0 ]] || fail "nothing may be written"
+    echo "ok: A5 @add --role orchestrator without a kind exits 78"
+}
+
+test_non_interactive_never_reads_stdin() {
+    _rf_setup nostdin '{}'
+    local out
+    out="$(printf '1\n' | { PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" 2>&1; echo "RC=$?"; echo "LEFT=$(cat)"; })"
+    assert_contains "$out" "RC=78"
+    assert_contains "$out" "LEFT=1"
+    echo "ok: the non-interactive refusal leaves stdin unread"
+}
+
+test_no_input_flag_and_env_force_78_on_pty() {
+    _rf_setup noinput '{}'
+    local rc=0 out_file="$TMPDIR/noinput.out"
+    run_with_pty_input $'1\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_NO_INPUT=1 \
+        "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "CCTRL_NO_INPUT=1 must refuse on a pty, got $rc: $(cat "$out_file")"
+    rc=0
+    run_with_pty_input $'1\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms \
+        "$RF_COPY/cctrl" start -d --role orchestrator --no-input --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "--no-input must refuse on a pty, got $rc: $(cat "$out_file")"
+    assert_not_contains "$(cat "$out_file")" "Which kind of orchestrator"
+    echo "ok: --no-input and CCTRL_NO_INPUT force the non-interactive answer on a pty"
+}
+
+test_agent_env_markers_force_78_on_pty() {
+    _rf_setup markers '{}'
+    local rc out_file="$TMPDIR/markers.out" marker
+    for marker in CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_KIND=tmux CCTRL_SESSION_KIND=foreground CLAUDECODE=1; do
+        rc=0
+        run_with_pty_input $'1\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms "$marker" \
+            "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+        [[ "$rc" -eq 78 ]] || fail "$marker must force the non-interactive answer, got $rc: $(cat "$out_file")"
+        assert_not_contains "$(cat "$out_file")" "Which kind of orchestrator"
+    done
+    echo "ok: agent environment markers force exit 78 even on a pty"
+}
+
+test_ask_tty_accepts_fleet() {
+    _rf_setup ttyfleet '{}'
+    local rc=0 out_file="$TMPDIR/ttyfleet.out"
+    run_with_pty_input $'1\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never \
+        "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "answering 1 must launch, got $rc: $(cat "$out_file")"
+    assert_contains "$(cat "$out_file")" "Which kind of orchestrator"
+    local out
+    out="$(tr -d '\r' < "$out_file")"
+    [[ "$(_rf_field "$out" orch_kind)" == fleet ]] || fail "answer 1 must record fleet: $out"
+    echo "ok: the tty ask accepts 1 = fleet"
+}
+
+test_ask_tty_accepts_repo() {
+    _rf_setup ttyrepo '{}'
+    local rc=0 out_file="$TMPDIR/ttyrepo.out"
+    run_with_pty_input $'repo\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never \
+        "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "answering repo must launch, got $rc: $(cat "$out_file")"
+    local out
+    out="$(tr -d '\r' < "$out_file")"
+    [[ "$(_rf_field "$out" orch_kind)" == repo ]] || fail "answer repo must record repo: $out"
+    echo "ok: the tty ask accepts repo"
+}
+
+test_ask_tty_prompts_when_stdout_is_captured() {
+    _rf_setup ttycap '{}'
+    local rc=0 out_file="$TMPDIR/ttycap.out"
+    run_with_pty_input $'2\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 CCTRL_PURPOSE_PROMPT=never CCTRL_ATTACH_PROMPT=never \
+        bash -c 'out="$("$1" start -d --role orchestrator --purpose p "$2")"; echo "CAPTURED=$out"' _ "$RF_COPY/cctrl" "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a captured stdout must still prompt on the tty, got $rc: $(cat "$out_file")"
+    assert_contains "$(cat "$out_file")" "Which kind of orchestrator"
+    assert_contains "$(cat "$out_file")" "CCTRL_SESSION=TMUX--ms--rf-ttycap-proj"
+    echo "ok: the tty ask works when stdout is captured"
+}
+
+test_ask_tty_three_invalid_answers_exit_78() {
+    _rf_setup ttybad '{}'
+    local rc=0 out_file="$TMPDIR/ttybad.out"
+    run_with_pty_input $'x\ny\nz\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_ASK_TIMEOUT=5 \
+        "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "three invalid answers must exit 78, got $rc: $(cat "$out_file")"
+    assert_not_contains "$(cat "$RF_LOG")" "new-session"
+    echo "ok: three invalid tty answers exit 78"
+}
+
+test_ask_tty_read_timeout_exits_78() {
+    _rf_setup ttyto '{}'
+    local rc=0 out_file="$TMPDIR/ttyto.out"
+    run_with_pty_input "" env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms CCTRL_ASK_TIMEOUT=1 \
+        "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "an ask timeout must exit 78, got $rc: $(cat "$out_file")"
+    echo "ok: the tty ask times out to exit 78"
+}
+
+test_ask_tty_abort_exits_78_nothing_launched() {
+    _rf_setup ttyq '{}'
+    local rc=0 out_file="$TMPDIR/ttyq.out" before
+    before="$(_rf_records)"
+    run_with_pty_input $'q\n' env PATH="$TMPDIR:$PATH" TMUX_LOG="$RF_LOG" CCTRL_HOST_PREFIX=ms \
+        "$RF_COPY/cctrl" start -d --role orchestrator --purpose p "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "q must exit 78, got $rc: $(cat "$out_file")"
+    assert_not_contains "$(cat "$RF_LOG")" "new-session"
+    [[ "$(_rf_records)" == "$before" ]] || fail "an aborted ask must write no record"
+    echo "ok: q aborts with exit 78 and launches nothing"
+}
+
+# Remote preflight. The fake ssh answers the hidden `_role-resolve` call from
+# SSH_PRE_RC / SSH_PRE_OUT / SSH_PRE_ERR and exits 0 for everything else.
+_make_fake_ssh_role() {
+    cat > "$1" <<'SH'
+#!/usr/bin/env bash
+{
+    printf 'SSH'
+    for arg in "$@"; do printf ' %q' "$arg"; done
+    printf '\n'
+} >> "${SSH_LOG:?}"
+if [[ "$*" == *_role-resolve* ]]; then
+    [[ -n "${SSH_PRE_OUT:-}" ]] && printf '%s\n' "$SSH_PRE_OUT"
+    [[ -n "${SSH_PRE_ERR:-}" ]] && printf '%s\n' "$SSH_PRE_ERR" >&2
+    exit "${SSH_PRE_RC:-0}"
+fi
+exit 0
+SH
+    chmod +x "$1"
+}
+
+_remote_role_fixture() {
+    _make_fake_ssh_role "$TMPDIR/ssh"
+    RR_COPY="$TMPDIR/rr-$1-copy"; RR_LOG="$TMPDIR/rr-$1-ssh.log"; RR_PROJ="$TMPDIR/rr-$1-proj"
+    mkdir -p "$RR_COPY/data" "$RR_PROJ"
+    cp "$ROOT/cctrl" "$RR_COPY/cctrl"; chmod +x "$RR_COPY/cctrl"
+    printf '{"ms":{"hostname":"example.invalid","user":"tester"}}\n' > "$RR_COPY/data/hosts.json"
+    printf '{"k":{"dir":"%s","role":"orchestrator"}}\n' "$RR_PROJ" > "$RR_COPY/data/shortcuts.json"
+    : > "$RR_LOG"
+}
+
+_remote_role() {
+    # stdin /dev/null, stderr merged; run through a `--host ms` alias
+    PATH="$TMPDIR:$PATH" SSH_LOG="$RR_LOG" CCTRL_PURPOSE_PROMPT=never "$RR_COPY/cctrl" --host ms "$@" </dev/null 2>&1
+}
+
+test_remote_preflight_forwards_resolved_role_and_kind() {
+    _remote_role_fixture fwd
+    local out rc=0 last
+    out="$(SSH_PRE_OUT='role=orchestrator orch_kind=repo' _remote_role @k)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "remote launch failed: $out"
+    [[ "$(grep -c '_role-resolve' "$RR_LOG")" -eq 1 ]] || fail "expected one preflight call: $(cat "$RR_LOG")"
+    last="$(tail -n 1 "$RR_LOG")"
+    assert_contains "$last" "--role\\ orchestrator\\ --orch-kind\\ repo"
+    assert_not_contains "$last" "_role-resolve"
+    echo "ok: the remote preflight result is forwarded as explicit flags"
+}
+
+test_remote_ambiguous_prompts_locally_and_forwards_kind() {
+    _remote_role_fixture ask
+    local rc=0 out_file="$TMPDIR/rr-ask.out"
+    run_with_pty_input $'2\n' env PATH="$TMPDIR:$PATH" SSH_LOG="$RR_LOG" CCTRL_PURPOSE_PROMPT=never \
+        SSH_PRE_RC=78 SSH_PRE_ERR='Cannot tell which kind of orchestrator this is: shortcut @k is an orchestrator with no orch_kind.' \
+        "$RR_COPY/cctrl" --host ms @k > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a local answer must launch, got $rc: $(cat "$out_file")"
+    assert_contains "$(cat "$out_file")" "Which kind of orchestrator"
+    assert_contains "$(tail -n 1 "$RR_LOG")" "--role\\ orchestrator\\ --orch-kind\\ repo"
+    echo "ok: an ambiguous remote kind is asked locally and forwarded"
+}
+
+test_remote_ambiguous_non_interactive_returns_78_with_message() {
+    _remote_role_fixture noni
+    local out rc=0
+    out="$(SSH_PRE_RC=78 SSH_PRE_ERR=$'cctrl: needs-user-decision: orchestrator-kind\nCannot tell which kind of orchestrator this is: x.' _remote_role @k)" || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "expected 78, got $rc: $out"
+    [[ "$(head -n 1 <<< "$out")" == "cctrl: needs-user-decision: orchestrator-kind" ]] || fail "remote stderr must be relayed first: $out"
+    [[ "$(grep -vc '_role-resolve' "$RR_LOG")" -eq 0 ]] || fail "nothing may be launched: $(cat "$RR_LOG")"
+    echo "ok: a non-interactive remote ambiguity returns 78 with the remote message"
+}
+
+test_remote_sets_no_input_on_remote_side() {
+    _remote_role_fixture noin
+    SSH_PRE_OUT='role=worker orch_kind=-' _remote_role @k >/dev/null || true
+    assert_contains "$(tail -n 1 "$RR_LOG")" "CCTRL_NO_INPUT=1"
+    assert_contains "$(head -n 1 "$RR_LOG")" "CCTRL_NO_INPUT=1"
+    echo "ok: remote tmux launches run with CCTRL_NO_INPUT=1"
+}
+
+test_remote_old_cctrl_with_role_flags_exits_69() {
+    _remote_role_fixture old
+    local out rc=0
+    out="$(SSH_PRE_RC=1 _remote_role start -d --orch-kind repo "$RR_PROJ")" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "an old remote with role flags must exit 69, got $rc: $out"
+    rc=0
+    : > "$RR_LOG"
+    out="$(SSH_PRE_RC=1 _remote_role @k)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "an old remote without role flags launches unchanged, got $rc: $out"
+    assert_not_contains "$(tail -n 1 "$RR_LOG")" "--role"
+    echo "ok: an old remote cctrl with role flags exits 69"
+}
+
+test_remote_dir_launch_without_role_flags_skips_preflight() {
+    _remote_role_fixture skip
+    _remote_role start -d "$RR_PROJ" >/dev/null || true
+    assert_not_contains "$(cat "$RR_LOG")" "_role-resolve"
+    echo "ok: a remote dir launch without role flags skips the preflight"
+}
+
+test_remote_preflight_exit_0_without_role_line_launches_unchanged() {
+    _remote_role_fixture noline
+    _remote_role @k >/dev/null || true
+    assert_not_contains "$(tail -n 1 "$RR_LOG")" "--role"
+    echo "ok: a preflight with no role= line launches unchanged"
+}
+
+test_remote_preflight_66_falls_through_to_launch() {
+    _remote_role_fixture f66
+    local rc=0
+    SSH_PRE_RC=66 _remote_role @k >/dev/null || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "66 must fall through to the launch, got $rc"
+    assert_not_contains "$(tail -n 1 "$RR_LOG")" "_role-resolve"
+    echo "ok: preflight 66 falls through to the real launch"
+}
+
+test_remote_foreground_skips_preflight_and_role_flags() {
+    _remote_role_fixture fg
+    local out rc=0
+    out="$(SSH_PRE_OUT='role=orchestrator orch_kind=repo' _remote_role start --foreground @k)" || rc=$?
+    [[ "$(grep -c '_role-resolve' "$RR_LOG")" -eq 0 ]] || fail "foreground must not preflight: $(cat "$RR_LOG")"
+    assert_not_contains "$(cat "$RR_LOG")" "--role"
+    : > "$RR_LOG"
+    out="$(SSH_PRE_OUT='role=orchestrator orch_kind=repo' _remote_role start --no-tmux @k)" || rc=$?
+    [[ "$(grep -c '_role-resolve' "$RR_LOG")" -eq 0 ]] || fail "--no-tmux must not preflight: $(cat "$RR_LOG")"
+    assert_not_contains "$(cat "$RR_LOG")" "--role"
+    echo "ok: remote --foreground/--no-tmux skips the preflight and forwards no role flags"
+}
+
+test_remote_preflight_other_exit_code_is_relayed() {
+    _remote_role_fixture other
+    local out rc=0
+    out="$(SSH_PRE_RC=127 SSH_PRE_ERR='cctrl: command not found' _remote_role @k)" || rc=$?
+    [[ "$rc" -eq 127 ]] || fail "127 must be relayed, got $rc: $out"
+    assert_contains "$out" "command not found"
+    echo "ok: any other preflight exit code is relayed"
+}
+
+test_set_role_updates_live_session_and_keeps_label() {
+    _rf_setup sr1 '{}'
+    local out sess before after rc=0
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    before="$(session_record_json "$sess" | jq -c '[.display_label,.purpose,.name]')"
+    out="$(TMUX_FAKE_HAS_SESSION="$sess" _rf session set-role "$sess" orchestrator --orch-kind fleet)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "set-role failed: $out"
+    assert_contains "$out" "role=orchestrator orch_kind=fleet"
+    after="$(session_record_json "$sess" | jq -c '[.display_label,.purpose,.name]')"
+    [[ "$before" == "$after" ]] || fail "set-role must not touch label, purpose or name: $before -> $after"
+    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/fleet ]] || fail "record not updated"
+    assert_contains "$(cat "$RF_LOG")" "@cctrl_role orchestrator"
+    assert_not_contains "$(cat "$RF_LOG")" "rename-session"
+    echo "ok: set-role tags a live session without touching its label"
+}
+
+test_set_role_on_provisional_record() {
+    _rf_setup sr2 '{}'
+    local out sess
+    out="$(_rf start -d --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(session_record_json "$sess" | jq -r '.lifecycle_state')" == provisional ]] || fail "fixture must be a provisional record"
+    out="$(TMUX_FAKE_HAS_SESSION="$sess" _rf session set-role "$sess" worker)"
+    assert_contains "$out" "record + tmux options"
+    [[ "$(session_record_json "$sess" | jq -r '.role')" == worker ]] || fail "provisional record not updated: $out"
+    echo "ok: set-role updates a provisional launch record"
+}
+
+test_set_role_clear_removes_fields() {
+    _rf_setup sr3 '{}'
+    local out sess
+    out="$(_rf start -d --orch-kind repo --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    out="$(TMUX_FAKE_HAS_SESSION="$sess" _rf session set-role "$sess" --clear)"
+    assert_contains "$out" "role cleared"
+    [[ -z "$(session_record_json "$sess" | jq -r '.role // empty')" ]] || fail "role must be cleared"
+    [[ -z "$(session_record_json "$sess" | jq -r '.orch_kind // empty')" ]] || fail "kind must be cleared"
+    assert_contains "$(cat "$RF_LOG")" "-u @cctrl_role"
+    echo "ok: set-role --clear removes role, kind and tmux options"
+}
+
+test_relaunch_with_new_role_replaces_recorded_role() {
+    _rf_setup relaunch '{}'
+    local out sess
+    out="$(_rf start -d --role worker -r conv-relaunch-1 --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(session_record_json "$sess" | jq -r '.role')" == worker ]] || fail "first launch: $out"
+    out="$(_rf start -d --orch-kind repo -r conv-relaunch-1 --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] \
+        || fail "a relaunch with a new role must replace the recorded one: $(session_record_json "$sess")"
+    echo "ok: a relaunch with a new role replaces the recorded role"
+}
+
+test_snapshot_launch_flags_carry_role_and_kind() {
+    _rf_setup snapflags '{}'
+    local out sess flags
+    out="$(_rf start -d --orch-kind repo --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    flags="$(python3 "$ROOT/lib/snapshot_restore.py" launch-flags --metadata-dir "$CCTRL_SESSION_METADATA_DIR" --name "$sess")"
+    [[ "$(jq -r '.role + "/" + .orch_kind' <<< "$flags")" == orchestrator/repo ]] || fail "launch_flags missing role: $flags"
+    echo "ok: launch_flags carry role and orch_kind"
+}
+
+_restore_role_fixture() {
+    # args: dir. A restore fixture whose cctrl row points at a real temp cwd so a
+    # real _launch_detached (fake tmux) can run.
+    local dir="$1"
+    _restore_fixture "$dir"
+    make_fake_tmux "$dir/bin/tmux"   # has-session says "not live", so the real launcher can pick a name
+    mkdir -p "$dir/work"
+    jq --arg w "$dir/work" '.tasks[].cwd = $w' "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    jq --arg w "$dir/work" '.rows[].cwd = $w' "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+}
+
+_restore_run_real() {
+    # Like _restore_run but WITHOUT the launch-log seam: the real
+    # _launch_detached runs against the fixture's fake tmux, in this
+    # fixture's private metadata dir.
+    local dir="$1"
+    shift
+    PATH="$dir/bin:$PATH" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
+        CCTRL_RESTORE_CATALOGUE_FILE="$dir/catalogue.json" CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
+        CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 \
+        CCTRL_RESTORE_MAX_ACTIVE=10 CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=0 CCTRL_NO_HEALTH_CHECK=1 \
+        CCTRL_PURPOSE_PROMPT=never \
+        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" "$@"
+}
+
+test_restore_replays_role_and_kind() {
+    local dir="$TMPDIR/restore-role"
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {role:"orchestrator",orch_kind:"repo"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    assert_contains "$(grep -- '--resume\|-r conv-aaa-111' "$dir/launch.log" | head -n 1)" "--role orchestrator --orch-kind repo"
+    echo "ok: restore replays role and orch_kind from launch_flags"
+}
+
+test_restore_legacy_row_infers_orchestrator_from_tmux_name() {
+    local dir="$TMPDIR/restore-role-legacy"
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--homelab") | .tmux_session) = "TMUX--ms--fm-homelab"' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    local line
+    line="$(grep 'conv-bbb-222' "$dir/launch.log" | head -n 1)"
+    assert_contains "$line" "--role orchestrator"
+    assert_not_contains "$line" "--orch-kind"
+    echo "ok: a legacy fm-* row is replayed as an orchestrator of unknown kind"
+}
+
+test_restore_unknown_kind_row_never_asks() {
+    local dir="$TMPDIR/restore-role-noask" out_file="$TMPDIR/restore-role-noask.out" rc=0
+    _restore_role_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {role:"orchestrator"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    run_with_pty_input $'1\n' env PATH="$dir/bin:$PATH" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
+        CCTRL_RESTORE_CATALOGUE_FILE="$dir/catalogue.json" CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
+        CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 \
+        CCTRL_RESTORE_MAX_ACTIVE=10 CCTRL_RESTORE_WAVE_PAUSE=0 CCTRL_NO_HEALTH_CHECK=1 CCTRL_PURPOSE_PROMPT=never TMUX_LOG="$dir/tmux.log" \
+        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" --only cctrl --yes > "$out_file" 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "restore of an unknown-kind orchestrator failed ($rc): $(cat "$out_file")"
+    assert_not_contains "$(cat "$out_file")" "Which kind of orchestrator"
+    local rec
+    rec="$(grep -l 'conv-aaa-111\|TMUX--ms--cctrl' "$dir/session-metadata"/*.json 2>/dev/null | head -n 1)"
+    [[ -n "$rec" ]] || fail "no record written by the restore: $(ls "$dir/session-metadata")"
+    [[ "$(jq -r '.role' "$rec")" == orchestrator && -z "$(jq -r '.orch_kind // empty' "$rec")" ]] \
+        || fail "expected orchestrator with an unknown kind: $(cat "$rec")"
+    echo "ok: restore never asks about an unknown kind"
+}
+
+test_restore_old_snapshot_does_not_erase_recorded_kind() {
+    local dir="$TMPDIR/restore-role-old"
+    _restore_fixture "$dir"
+    # The current registry record already carries role + kind; the snapshot row
+    # has none (it predates `set-role`).
+    CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_HOST_PREFIX=ms \
+        cctrl_source_eval '_session_write_metadata TMUX--ms--cctrl /tmp @cctrl @cctrl @cctrl p "" "cmd" "" claude conv-aaa-111 "" "" "" "" "" "" "" orchestrator repo' \
+        || fail "fixture record could not be written"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    assert_contains "$(grep 'conv-aaa-111' "$dir/launch.log" | head -n 1)" "--role orchestrator --orch-kind repo"
+    echo "ok: an old snapshot cannot erase the recorded kind"
+}
+
+test_restore_current_record_beats_snapshot_row_role() {
+    local dir="$TMPDIR/restore-role-rec-wins"
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {role:"worker"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_HOST_PREFIX=ms \
+        cctrl_source_eval '_session_write_metadata TMUX--ms--cctrl /tmp @cctrl @cctrl @cctrl p "" "cmd" "" claude conv-aaa-111 "" "" "" "" "" "" "" orchestrator fleet' \
+        || fail "fixture record could not be written"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    assert_contains "$(grep 'conv-aaa-111' "$dir/launch.log" | head -n 1)" "--role orchestrator --orch-kind fleet"
+    assert_not_contains "$(grep 'conv-aaa-111' "$dir/launch.log" | head -n 1)" "--role worker"
+    echo "ok: the current record beats a snapshot row's role"
+}
+
+test_recorded_worker_beats_legacy_name_inference() {
+    local dir="$TMPDIR/restore-role-worker"
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--homelab") | .tmux_session) = "TMUX--ms--fm-homelab"
+        | (.tasks[] | select(.tmux_session=="TMUX--ms--fm-homelab") | .launch_flags) += {role:"worker"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    local line
+    line="$(grep 'conv-bbb-222' "$dir/launch.log" | head -n 1)"
+    assert_contains "$line" "--role worker"
+    assert_not_contains "$line" "--role orchestrator"
+    echo "ok: a recorded worker beats legacy name inference"
+}
+
+test_ask_rechecks_tty_at_read_site() {
+    # _CCTRL_CAN_ASK=1 was decided in main(), but fd 0 here is a pipe (as it is
+    # inside restore's `while read ... < <(jq ...)`): the ask must refuse and
+    # must not read the pipe.
+    local out rc=0
+    out="$(printf '1\n' | cctrl_source_eval '_CCTRL_CAN_ASK=1; ORCH_KIND_RESOLVED=""; _role_ask_kind "reason" "dir" "" || echo "RC=$?"; echo "KIND=$ORCH_KIND_RESOLVED"' 2>&1)" || rc=$?
+    assert_contains "$out" "needs-user-decision: orchestrator-kind"
+    assert_contains "$out" "RC=78"
+    assert_not_contains "$out" "KIND=fleet"
+    echo "ok: the ask re-tests the terminal at the read site"
+}
+
+test_restore_prints_reason_for_failed_row() {
+    local dir="$TMPDIR/restore-role-fail" out rc=0
+    _restore_role_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {profile:"no-such-profile"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_run_real "$dir" --only cctrl --yes 2>&1 </dev/null)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "a failed row must make restore exit non-zero: $out"
+    assert_contains "$out" "TMUX--cctrl: "
+    assert_contains "$out" "failed=1"
+    echo "ok: restore prints the first stderr line of a failed row"
+}
+
+test_realign_flags_carry_role_and_kind() {
+    local bin="$TMPDIR/rl-role-bin" sdir="$TMPDIR/rl-role-sessions" relog="$TMPDIR/rl-role-relaunch.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+    jq '. + {role:"orchestrator",orch_kind:"repo"}' "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json" > "$TMPDIR/rl-role.tmp" \
+        && mv "$TMPDIR/rl-role.tmp" "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json"
+    : > "$relog"
+    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        "$ROOT/cctrl" session doctor --fix --yes --json >/dev/null </dev/null
+    assert_contains "$(cat "$relog")" "--role orchestrator --orch-kind repo"
+    local hint
+    hint="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        "$ROOT/cctrl" session doctor --json </dev/null 2>/dev/null)" || true
+    assert_contains "$hint" "realign_hint"
+    assert_not_contains "$hint" "--role"
+    echo "ok: realign carries role and orch_kind (the printed hint carries neither)"
+}
+
+test_realign_keeps_recorded_tmux_name() {
+    local bin="$TMPDIR/rl-name-bin" sdir="$TMPDIR/rl-name-sessions" log="$TMPDIR/rl-name-tmux.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+    : > "$log"
+    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        CCTRL_NO_HEALTH_CHECK=1 CCTRL_HOST_PREFIX=ms CCTRL_PURPOSE_PROMPT=never \
+        "$ROOT/cctrl" session doctor --fix --yes --json >/dev/null 2>&1 </dev/null || true
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--portal"
+    echo "ok: realign relaunches under the recorded tmux name"
+}
+
+test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind() {
+    local out
+    out="$(PATH="$TMPDIR:$PATH" cctrl_source_eval 'make() { :; }; _session_role_of TMUX--ms--fm-legacy-x')"
+    [[ "$out" == "orchestrator||name" ]] || fail "expected orchestrator, unknown kind, from the name; got: $out"
+    out="$(PATH="$TMPDIR:$PATH" cctrl_source_eval '_session_role_of TMUX--ms--plainone')"
+    [[ "$out" == "worker||default" ]] || fail "expected a default worker; got: $out"
+    echo "ok: a legacy fm-* session reads as an orchestrator of unknown kind"
+}
+
+test_recorded_worker_beats_legacy_name_inference_live() {
+    local meta="$TMPDIR/role-live-meta"
+    mkdir -p "$meta"
+    printf '{"target":"/tmp","cwd":"/tmp","role":"worker"}\n' > "$meta/TMUX--ms--fm-homelab.json"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" cctrl_source_eval '_session_role_of TMUX--ms--fm-homelab')"
+    [[ "$out" == "worker||record" ]] || fail "a recorded worker must beat name inference; got: $out"
+    echo "ok: a recorded worker beats name inference for a live session"
+}
+
+test_session_ls_json_exposes_role_and_kind() {
+    local meta="$TMPDIR/role-ls-meta" out
+    mkdir -p "$meta"
+    printf '{"target":"/tmp","cwd":"/tmp","role":"orchestrator","orch_kind":"repo","purpose":"p"}\n' > "$meta/TMUX--ms--ls-role.json"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--ms--ls-role" "$ROOT/cctrl" session ls --json </dev/null)"
+    [[ "$(jq -r '.[0].role + "/" + .[0].orch_kind' <<< "$out")" == orchestrator/repo ]] || fail "session ls --json role/orch_kind: $out"
+    echo "ok: session ls --json exposes role and orch_kind"
 }
 
 test_dir_launch_no_shortcut_match_unchanged() {
@@ -12756,6 +13581,76 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        role-phase1)
+            test_at_fm_shortcut_launch_keeps_fm_name
+            test_role_flags_before_dir_target_with_detach
+            test_role_flags_before_at_target_without_detach
+            test_role_flags_never_reach_child_command
+            test_role_flags_with_foreground_exit_64
+            test_role_flags_with_app_owned_and_launch_to_app_exit_64
+            test_remote_role_value_not_taken_as_purpose
+            test_role_flag_recorded_in_metadata_and_tmux_option
+            test_role_and_orch_kind_invalid_values_exit_64
+            test_orch_kind_flag_implies_orchestrator_role
+            test_role_worker_with_orch_kind_exits_64
+            test_shortcut_role_and_kind_resolve_on_at_launch
+            test_shortcut_orch_kind_without_role_is_orchestrator
+            test_shortcut_invalid_role_exits_64_naming_key
+            test_orch_kind_flag_overrides_shortcut_kind
+            test_dir_launch_never_inherits_shortcut_role
+            test_dir_launch_with_orch_key_and_plain_key_uses_plain_key
+            test_dir_launch_with_only_orch_key_uses_basename
+            test_dir_launch_matches_stored_dir_with_trailing_slash
+            test_dir_launch_skips_role_shortcut_without_legacy_prefix
+            test_legacy_prefixed_key_with_worker_role_is_adopted
+            test_no_env_var_supplies_role_or_kind
+            test_shortcut_add_preserves_role_fields
+            test_shortcut_add_role_flags_set_and_clear
+            test_ask_a1_role_orchestrator_without_kind_exits_78
+            test_ask_a2_shortcut_role_without_kind_exits_78
+            test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78
+            test_ask_a4_set_role_orchestrator_without_kind_exits_78
+            test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78
+            test_non_interactive_never_reads_stdin
+            test_no_input_flag_and_env_force_78_on_pty
+            test_agent_env_markers_force_78_on_pty
+            test_ask_tty_accepts_fleet
+            test_ask_tty_accepts_repo
+            test_ask_tty_prompts_when_stdout_is_captured
+            test_ask_tty_three_invalid_answers_exit_78
+            test_ask_tty_read_timeout_exits_78
+            test_ask_tty_abort_exits_78_nothing_launched
+            test_remote_preflight_forwards_resolved_role_and_kind
+            test_remote_ambiguous_prompts_locally_and_forwards_kind
+            test_remote_ambiguous_non_interactive_returns_78_with_message
+            test_remote_sets_no_input_on_remote_side
+            test_remote_old_cctrl_with_role_flags_exits_69
+            test_remote_dir_launch_without_role_flags_skips_preflight
+            test_remote_preflight_exit_0_without_role_line_launches_unchanged
+            test_remote_preflight_66_falls_through_to_launch
+            test_remote_foreground_skips_preflight_and_role_flags
+            test_remote_preflight_other_exit_code_is_relayed
+            test_set_role_updates_live_session_and_keeps_label
+            test_set_role_on_provisional_record
+            test_set_role_clear_removes_fields
+            test_relaunch_with_new_role_replaces_recorded_role
+            test_snapshot_launch_flags_carry_role_and_kind
+            test_restore_replays_role_and_kind
+            test_restore_legacy_row_infers_orchestrator_from_tmux_name
+            test_restore_unknown_kind_row_never_asks
+            test_restore_old_snapshot_does_not_erase_recorded_kind
+            test_restore_current_record_beats_snapshot_row_role
+            test_recorded_worker_beats_legacy_name_inference
+            test_ask_rechecks_tty_at_read_site
+            test_restore_prints_reason_for_failed_row
+            test_realign_flags_carry_role_and_kind
+            test_realign_keeps_recorded_tmux_name
+            test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind
+            test_recorded_worker_beats_legacy_name_inference_live
+            test_session_ls_json_exposes_role_and_kind
+            echo "ok"
+            exit 0
+            ;;
         release-prune)
             test_release_prune
             echo "ok"
@@ -12854,6 +13749,71 @@ test_dir_launch_shortcut_collision_deterministic
 test_dir_launch_skips_manager_shortcut_for_plain_key
 test_dir_launch_only_manager_shortcut_uses_dir_basename
 test_at_fm_shortcut_launch_keeps_fm_name
+test_role_flags_before_dir_target_with_detach
+test_role_flags_before_at_target_without_detach
+test_role_flags_never_reach_child_command
+test_role_flags_with_foreground_exit_64
+test_role_flags_with_app_owned_and_launch_to_app_exit_64
+test_remote_role_value_not_taken_as_purpose
+test_role_flag_recorded_in_metadata_and_tmux_option
+test_role_and_orch_kind_invalid_values_exit_64
+test_orch_kind_flag_implies_orchestrator_role
+test_role_worker_with_orch_kind_exits_64
+test_shortcut_role_and_kind_resolve_on_at_launch
+test_shortcut_orch_kind_without_role_is_orchestrator
+test_shortcut_invalid_role_exits_64_naming_key
+test_orch_kind_flag_overrides_shortcut_kind
+test_dir_launch_never_inherits_shortcut_role
+test_dir_launch_with_orch_key_and_plain_key_uses_plain_key
+test_dir_launch_with_only_orch_key_uses_basename
+test_dir_launch_matches_stored_dir_with_trailing_slash
+test_dir_launch_skips_role_shortcut_without_legacy_prefix
+test_legacy_prefixed_key_with_worker_role_is_adopted
+test_no_env_var_supplies_role_or_kind
+test_shortcut_add_preserves_role_fields
+test_shortcut_add_role_flags_set_and_clear
+test_ask_a1_role_orchestrator_without_kind_exits_78
+test_ask_a2_shortcut_role_without_kind_exits_78
+test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78
+test_ask_a4_set_role_orchestrator_without_kind_exits_78
+test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78
+test_non_interactive_never_reads_stdin
+test_no_input_flag_and_env_force_78_on_pty
+test_agent_env_markers_force_78_on_pty
+test_ask_tty_accepts_fleet
+test_ask_tty_accepts_repo
+test_ask_tty_prompts_when_stdout_is_captured
+test_ask_tty_three_invalid_answers_exit_78
+test_ask_tty_read_timeout_exits_78
+test_ask_tty_abort_exits_78_nothing_launched
+test_remote_preflight_forwards_resolved_role_and_kind
+test_remote_ambiguous_prompts_locally_and_forwards_kind
+test_remote_ambiguous_non_interactive_returns_78_with_message
+test_remote_sets_no_input_on_remote_side
+test_remote_old_cctrl_with_role_flags_exits_69
+test_remote_dir_launch_without_role_flags_skips_preflight
+test_remote_preflight_exit_0_without_role_line_launches_unchanged
+test_remote_preflight_66_falls_through_to_launch
+test_remote_foreground_skips_preflight_and_role_flags
+test_remote_preflight_other_exit_code_is_relayed
+test_set_role_updates_live_session_and_keeps_label
+test_set_role_on_provisional_record
+test_set_role_clear_removes_fields
+test_relaunch_with_new_role_replaces_recorded_role
+test_snapshot_launch_flags_carry_role_and_kind
+test_restore_replays_role_and_kind
+test_restore_legacy_row_infers_orchestrator_from_tmux_name
+test_restore_unknown_kind_row_never_asks
+test_restore_old_snapshot_does_not_erase_recorded_kind
+test_restore_current_record_beats_snapshot_row_role
+test_recorded_worker_beats_legacy_name_inference
+test_ask_rechecks_tty_at_read_site
+test_restore_prints_reason_for_failed_row
+test_realign_flags_carry_role_and_kind
+test_realign_keeps_recorded_tmux_name
+test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind
+test_recorded_worker_beats_legacy_name_inference_live
+test_session_ls_json_exposes_role_and_kind
 test_dir_launch_no_shortcut_match_unchanged
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision

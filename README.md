@@ -1001,6 +1001,47 @@ cctrl @add cctrl ~/dev/cctrl --agent codex
 cctrl @rm myapp
 ```
 
+#### Roles: orchestrators and workers
+
+Every session has a role. A **worker** does the work. An **orchestrator**
+manages other sessions, and comes in two kinds: `fleet` (the fleet-manager
+orchestrator, at most one per runtime per machine) and `repo` (a repo-level
+orchestrator). A shortcut or a launch declares it; cctrl records it on the
+session (`role`, `orch_kind`, shown in `cctrl session ls --json`) and replays it
+on `restore` and `session doctor --fix`. This release changes no existing session label; the two name effects are that `-d ~/dev/rentkompass` now launches as the `rentkompass` worker name (no longer adopting the orchestrator shortcut) and that `session doctor --fix` realign pins the recorded tmux name.
+
+```bash
+cctrl start -d ~/dev/myapp --orch-kind repo       # an orchestrator of kind repo
+cctrl start -d ~/dev/myapp --role worker          # the default
+cctrl @add mgr ~/dev/ops --role orchestrator --orch-kind fleet
+cctrl session set-role TMUX--host--mgr orchestrator --orch-kind repo   # tag a live session
+cctrl session set-role TMUX--host--mgr --clear
+```
+
+A plain `cctrl start -d <dir>` is always a worker: roles are never inherited
+from a shortcut that happens to share the directory, and a shortcut whose role
+is `orchestrator` (or whose key starts with `fm-` / `orch-` and has no role,
+the legacy fallback) is never adopted for the session name. `--role`,
+`--orch-kind` and `--succeeds` need a tmux-backed launch (`-d`), are consumed by
+cctrl and never reach the agent.
+
+**When the kind is ambiguous cctrl asks and never guesses.** That is: an
+orchestrator with no kind from the flags or the shortcut. At a terminal it
+prompts (`1` fleet, `2` repo, `q` abort). Anywhere else (an agent, a pipe, `--no-input`
+or `CCTRL_NO_INPUT=1`) it exits **78** with nothing launched and, as the first
+stderr line, `cctrl: needs-user-decision: orchestrator-kind`, followed by the
+flags to re-run with. A caller that gets 78 must ask the human, then re-run
+with `--orch-kind fleet|repo` or `--role worker`. `restore`, `doctor --fix` and
+other replays never ask: an unknown kind stays unknown. Remote launches
+(`cctrl --host <alias> ...`) resolve the role first with a read-only preflight on the
+remote, ask on the local terminal and forward explicit flags; the remote side
+never asks. `CCTRL_ASK_TIMEOUT` (default 120 s) bounds the prompt.
+
+`session set-role` writes the record and the `@cctrl_role` / `@cctrl_orch_kind`
+tmux options. It never renames, relabels or restarts a session. There is no
+one-fleet-manager guard yet, so `--orch-kind fleet` is not checked against
+other live sessions.
+
 ### Peers
 
 Peers are named coding agents that other cctrl workflows can address. The peer

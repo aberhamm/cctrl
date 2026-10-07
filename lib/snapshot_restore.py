@@ -253,6 +253,12 @@ def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]
     record_profile = record.get("profile")
     if isinstance(record_profile, str) and record_profile:
         flags["profile"] = record_profile
+    # Plan 100: the record's role and orchestrator kind travel with the
+    # launch flags so a restore or realign replays them.
+    for field in ("role", "orch_kind"):
+        value = record.get(field)
+        if isinstance(value, str) and value:
+            flags[field] = value
     return flags
 
 
