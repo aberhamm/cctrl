@@ -228,7 +228,7 @@ disconnects. Use `--foreground` or `--no-tmux` for quick direct one-offs.
 
 Add `-d` to start the tmux session and return without attaching. No GUI required — just tmux. An explicit detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop a full-access agent into `~/.ssh`, `~/.aws`, etc.
 
-When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic). A directory with no matching shortcut keeps its repo-folder slug (unchanged).
+When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic), excluding any `fm-*` (fleet-manager) key — only an explicit `cctrl @fm-<x>` launch gets an `fm-` name. A directory with no matching non-`fm-` shortcut keeps its repo-folder slug (unchanged).
 
 For tmux-backed Codex sessions, `cctrl close` treats the terminal owner as
 complete and archives the matching Codex app task automatically. Restarts stay

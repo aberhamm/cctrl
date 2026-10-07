@@ -190,6 +190,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- Only fleet-manager shortcuts get an `fm-` session name now. `cctrl start
+  -d <dir>`'s reverse shortcut lookup (`_shortcut_for_dir`) picked the
+  alphabetically-first key on a dir collision, and `fm-*` sorts before
+  most plain names (`fm-homelab` < `homelab`), so a plain directory launch
+  sharing a dir with a manager's own shortcut was silently named — and
+  profiled — as that manager. The lookup now excludes `fm-*` keys
+  entirely: a dir launch names from the first non-`fm-` match, or the dir
+  basename if only `fm-` key(s) match. An explicit `cctrl @fm-<x>` launch
+  is unaffected (plan 098).
 - `cctrl restart`'s background agent kill no longer uses an untargeted
   `tmux display-message -p '#{pane_pid}'`. With `TMUX` unset (e.g. a test
   harness, or any caller outside a pane) that resolved to the default tmux

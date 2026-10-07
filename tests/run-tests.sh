@@ -3112,6 +3112,89 @@ test_dir_launch_shortcut_collision_deterministic() {
     echo "ok: dir-launch shortcut collision resolves to first sorted key"
 }
 
+test_dir_launch_skips_manager_shortcut_for_plain_key() {
+    # Plan 098: only fm- (manager) shortcuts should ever produce an fm- name.
+    # Before the fix, _shortcut_for_dir's sorted-key collision rule let an
+    # fm- key beat a plain key for the same dir (fm-aaa < zzz), so a plain
+    # `-d <dir>` launch was silently named and profiled after the manager.
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-fmcollision-copy"
+    local project="$TMPDIR/fm-collision-project"
+    local log="$TMPDIR/fmcollision.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    # fm-aaa sorts before zzz, so the old first-sorted-key rule would pick it.
+    printf '{"fm-aaa":{"dir":"%s"},"zzz":{"dir":"%s"}}\n' "$project" "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --agent codex --purpose p "$project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--zzz"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--zzz"
+    assert_not_contains "$(cat "$log")" "TMUX--ms--fm-aaa"
+
+    echo "ok: dir launch with a plain and an fm- key for the same dir names from the plain key"
+}
+
+test_dir_launch_only_manager_shortcut_uses_dir_basename() {
+    # Plan 098: a dir with ONLY an fm- key configured for it must NOT adopt
+    # that manager shortcut's name — it falls back to the dir basename, same
+    # as no match at all.
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-fmonly-copy"
+    local project="$TMPDIR/fm-only-project"
+    local log="$TMPDIR/fmonly.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"fm-only":{"dir":"%s"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --agent codex --purpose p "$project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fm-only-project"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--fm-only-project"
+    local got_name
+    got_name="$(grep -oE -- '--name TMUX--[^ ]+' "$log" | head -1)"
+    [[ "$got_name" == "--name TMUX--ms--fm-only-project" ]] || \
+        fail "expected the dir-basename name, got: $got_name"
+
+    echo "ok: dir launch with only an fm- key for that dir falls back to the dir basename"
+}
+
+test_at_fm_shortcut_launch_keeps_fm_name() {
+    # Plan 098 regression guard: an explicit `cctrl @fm-<x>` launch is
+    # unaffected by _shortcut_for_dir's fm- exclusion (that function is only
+    # the *reverse* dir->key lookup; an explicit @key launch never calls it).
+    make_fake_tmux "$TMPDIR/tmux"
+
+    local rootcopy="$TMPDIR/cctrl-atfm-copy"
+    local project="$TMPDIR/at-fm-project"
+    local log="$TMPDIR/atfm.log"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+    printf '{"fm-atfm":{"dir":"%s"}}\n' "$project" > "$rootcopy/data/shortcuts.json"
+    printf '{"defaultAgent":"codex"}\n' > "$rootcopy/data/config.json"
+
+    : > "$log"
+    local out
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_HOST_PREFIX=ms CCTRL_EMIT_SESSION=1 \
+        "$rootcopy/cctrl" start -d --purpose p @fm-atfm)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fm-atfm"
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--fm-atfm"
+    assert_contains "$(cat "$log")" "--name TMUX--ms--fm-atfm"
+
+    echo "ok: an explicit @fm-<x> launch still names from the fm- key"
+}
+
 test_dir_launch_no_shortcut_match_unchanged() {
     # Plan 012: a directory with no matching shortcut keeps the repo-dir slug —
     # behavior is unchanged.
@@ -12850,6 +12933,9 @@ test_context_names
 test_bridge_prefix_matches_explicit_name
 test_dir_launch_adopts_shortcut_alias
 test_dir_launch_shortcut_collision_deterministic
+test_dir_launch_skips_manager_shortcut_for_plain_key
+test_dir_launch_only_manager_shortcut_uses_dir_basename
+test_at_fm_shortcut_launch_keeps_fm_name
 test_dir_launch_no_shortcut_match_unchanged
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision

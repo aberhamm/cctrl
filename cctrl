@@ -17035,6 +17035,17 @@ _shortcut_for_dir() {
     #
     # Collision rule: when multiple keys point at the same directory, the first
     # match by sorted key wins — a deterministic, documented choice.
+    #
+    # fm-* keys (manager shortcuts) are never adopted here (plan 098): only an
+    # explicit `cctrl @fm-<x>` launch should get the fm- name. Excluding them
+    # by key prefix, rather than requiring a new "role" field on every
+    # shortcut, needs no data migration and matches the one convention that
+    # already marks a manager shortcut today. Before this fix, fm-* keys won
+    # the sorted-key collision against a plain key for the same dir (e.g.
+    # fm-homelab < homelab, fm-personal < obsidian), so a plain `-d <dir>`
+    # launch was silently named and profiled as if it were the manager.
+    # Case-insensitive prefix check to match _shortcut_lookup_key's existing
+    # case-insensitive key matching elsewhere.
     local want="$1"
     [[ -n "$want" && -f "$SHORTCUTS_FILE" ]] || return 0
     local key raw resolved
@@ -17054,6 +17065,7 @@ _shortcut_for_dir() {
         to_entries
         | sort_by(.key)[]
         | select(.value.dir != null and .value.dir != "")
+        | select(.key | ascii_downcase | startswith("fm-") | not)
         | "\(.key)\t\(.value.dir)"
     ' "$SHORTCUTS_FILE" 2>/dev/null)
     return 0
