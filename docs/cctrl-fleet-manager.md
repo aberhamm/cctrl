@@ -6,7 +6,9 @@ of truth, no duplicated copy to drift:
 
 ➡️ **[`skills/cctrl-fleet-manager/SKILL.md`](../skills/cctrl-fleet-manager/SKILL.md)**
 
-It covers the core "manage, don't do hands-on work" rule, the two-mode **autonomy
+It opens with the role model (two kinds of orchestrator, the ask rule and exit
+78) and covers the one-fleet-manager guard and `--succeeds` handover, the core
+"manage, don't do hands-on work" rule, the two-mode **autonomy
 model** (auto-pilot / manual) with its always-confirm set and session-close gate,
 the monitor → decide → sequence loop, tmux driving gotchas, resource gating, and the
 handoff / startup-hang lessons.
@@ -15,6 +17,7 @@ The doctrine is deliberately free of environment specifics (cctrl is public).
 Concrete probe endpoints, service inventory, SSH map, and the standing role brief
 live only in the operator's private infra repo.
 
-See also: [`skills/README.md`](../skills/README.md). A companion stack-watcher
+See also: [`skills/README.md`](../skills/README.md) and the per-repo counterpart,
+[`docs/cctrl-repo-orchestrator.md`](./cctrl-repo-orchestrator.md). A companion stack-watcher
 (sentinel) role is environment-specific and kept in the operator's private infra
 repo, not here.

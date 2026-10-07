@@ -1092,6 +1092,16 @@ runs in (`CCTRL_SESSION_KIND=tmux` and `CCTRL_SESSION_NAME` set; otherwise exit
 64). A worker launched with a prompt starting `resume from handoff <slug>` gets
 the label `<repo>: <slug>`.
 
+On a build older than this bookkeeping (before plan 100 phase 3), never run
+`cctrl session reconcile-names` in any form: every invocation, `--dry-run`,
+`--json` and `--help` included, writes. From phase 3 on, run `--dry-run` first;
+a real run on a live fleet is an explicit decision. The doctrine for these roles
+(what a fleet manager, a repo orchestrator and a worker each do, the ask rule
+and exit 78, handover with `--succeeds`) lives in
+[`skills/cctrl-fleet-manager`](./skills/cctrl-fleet-manager/SKILL.md),
+[`skills/cctrl-repo-orchestrator`](./skills/cctrl-repo-orchestrator/SKILL.md) and
+[`skills/cctrl-spawn`](./skills/cctrl-spawn/SKILL.md).
+
 ### Peers
 
 Peers are named coding agents that other cctrl workflows can address. The peer

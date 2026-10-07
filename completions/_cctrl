@@ -93,7 +93,8 @@ _cctrl() {
         'current:Show active profile'
         'save:Save current settings as a profile'
         'diff:Diff current settings vs a profile'
-        'rename:Rename a profile'
+        'rename:Rename a session display label (--self for the current session)'
+        'release:Manage installed cctrl releases (prune)'
         'edit:Open a profile in \$EDITOR'
         'start:Launch selected agent (foreground, or -d for a detached session)'
         's:Launch selected agent (foreground, or -d for a detached session)'
@@ -172,6 +173,8 @@ _cctrl() {
                                     '--profile[Profile to switch to]:profile:_cctrl_profiles' \
                                     '--agent[Agent runtime]:agent:_cctrl_agents' \
                                     '--resume[Resume a session]' \
+                                    '--role[Session role]:role:(orchestrator worker)' \
+                                    '--orch-kind[Orchestrator kind]:kind:(fleet repo)' \
                                     '--message[Initial prompt]:message:'
                                 ;;
                         esac
@@ -206,7 +209,20 @@ _cctrl() {
             (( CURRENT == 3 )) && _cctrl_profiles
             ;;
         rename)
-            (( CURRENT == 3 || CURRENT == 4 )) && _cctrl_profiles
+            if (( CURRENT == 3 )); then
+                _arguments '--self[Rename the session this process runs in]' '*:session:_cctrl_tmux_sessions'
+            fi
+            ;;
+        release)
+            if (( CURRENT == 3 )); then
+                local -a release_cmds=('prune:Prune old releases (dry run by default)')
+                _describe "release commands" release_cmds
+            elif [[ "${words[3]}" == prune ]]; then
+                _arguments \
+                    '--keep[Keep the newest N complete releases]:count:' \
+                    '--apply[Actually delete the listed releases]' \
+                    '--json[Machine-readable report]'
+            fi
             ;;
         save)
             ;; # name is freeform
@@ -218,6 +234,10 @@ _cctrl() {
                 {--resume,-r}'[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
                 '--app-owned[Create one app-owned Codex task and leave zero tmux writers]' \
+                '--role[Session role (needs -d)]:role:(orchestrator worker)' \
+                '--orch-kind[Orchestrator kind; unknown kind asks, or exits 78]:kind:(fleet repo)' \
+                '--succeeds[Fleet-manager handover: the live session this one succeeds]:session:_cctrl_tmux_sessions' \
+                '--no-input[Never prompt; ambiguous kinds exit 78]' \
                 '--reasoning-effort[Codex reasoning effort]:effort:(none minimal low medium high xhigh max ultra)' \
                 {--name,-n}'[Session display name]:name:' \
                 '--peer[Peer mailbox identity]:peer:_cctrl_peers' \
@@ -274,6 +294,9 @@ _cctrl() {
                     'prune:Propose stale / never-prompted sessions'
                     'close:Gracefully close a session (default: the one you are inside)'
                     'set-role:Tag a live session worker or orchestrator (fleet|repo)'
+                    'reconcile-names:Pull names typed inside Claude (use --dry-run first)'
+                    'snapshot:Record the live sessions for a later restore'
+                    'restore:Relaunch recorded sessions (use --dry-run first)'
                     'kill:Kill a detached session'
                     'stop-exact:Stop only the execution identified by session ls --json'
                 )
@@ -290,6 +313,33 @@ _cctrl() {
                     '--dry-run[Read-only identity proof (default)]' \
                     '--apply[Repair local receipt after fresh proof; keeps terminal ownership]' \
                     '--json[Machine-readable proof and result]'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == set-role ]]; then
+                _arguments \
+                    '--orch-kind[Orchestrator kind]:kind:(fleet repo)' \
+                    '--relabel[Also write the canonical star label]' \
+                    '--clear[Remove the role tag]' \
+                    '*:session or role:_cctrl_tmux_sessions'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == reconcile-names ]]; then
+                _arguments \
+                    '--dry-run[Show what would change; write nothing]' \
+                    '--json[Machine-readable output]'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == snapshot ]]; then
+                _arguments \
+                    '--dir[Snapshot directory]:dir:_directories' \
+                    '--allow-empty[Write a snapshot even with no sessions]' \
+                    '--json[Machine-readable output]' \
+                    '--quiet[Suppress informational output]'
+            elif (( CURRENT >= 4 )) && [[ "${words[3]}" == restore ]]; then
+                _arguments \
+                    '--dry-run[Show the plan; spawn nothing]' \
+                    '--limit[Cap spawns in this invocation]:count:' \
+                    '--from[Snapshot file to restore]:file:_files' \
+                    '--only[Restore only the named sessions]:sessions:' \
+                    '--yes[Skip interactive confirmation]' \
+                    '--stale-ok[Accept snapshots older than 24h]' \
+                    '--force-host[Accept snapshots from a different host]' \
+                    '--json[Machine-readable output]' \
+                    '--quiet[Suppress informational output]'
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == say ]]; then
                 _arguments \
                     '--no-submit[Paste without pressing Enter]' \

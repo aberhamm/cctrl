@@ -1,7 +1,9 @@
 ---
 id: 055
 title: Session name reconciliation and cctrl rename
-status: pending
+status: skipped
+skipped: 2026-10-07
+skipped-reason: folded into plan 100 (reconcile rule D11, shipped in phase 3); decision mdec-1007-cctrl-decisions-b
 blocked-by: []
 priority: 55
 allows-migrations: false
@@ -125,4 +127,4 @@ resolution.
 
 NO UNRESOLVED DECISIONS
 
-> Note (2026-10-07): plan 100 (`docs/plans/100-role-aware-session-naming.md`) folds the label-reconcile direction (cctrl label wins for role sessions) into this plan's reconcile-names work.
+> Note (2026-10-07): plan 100 (`docs/plans/100-role-aware-session-naming.md`) took over this plan's reconcile-names work. The rule is now D11 of plan 100 (pull a Claude-side name only if cctrl has never seen it; a record with no known-names set is baselined and pulls nothing), shipped in phase 3. This plan is skipped as folded into plan 100.

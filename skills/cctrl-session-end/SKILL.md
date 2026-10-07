@@ -1,6 +1,6 @@
 ---
 name: cctrl-session-end
-version: 1.0.0
+version: 1.1.0
 description: Gracefully wind down and close a cctrl-managed agent session — save state, check for uncommitted work, optionally hand off, then self-close. Generic doctrine, no environment specifics.
 triggers:
   - end this session
@@ -142,6 +142,13 @@ When running under a fleet manager, the **session-close gate** applies:
   surfaces the session as done and **leaves it open** for human review. The
   human says "close" — the fleet manager then tells you to end, or closes you
   remotely. You do not self-close without the human's word.
+- **Orchestrators** (role `orchestrator`, either kind) are never closed on their
+  own word or on a clean `git status`: before the close, run the wrap-up/harvest
+  step, write a **handoff note of your loose ends to a file** (running workers,
+  open decisions, the exact next step), and report its path. The fleet manager
+  or human closes you; a repo orchestrator's workers are listed in its status
+  file first so none is orphaned. A fleet manager hands over with
+  `--orch-kind fleet --succeeds <old>` before it is closed.
 - **Ephemeral throwaways** (health probes, read-only scouts, validators with no
   work product): close freely — no gate needed.
 
@@ -156,8 +163,10 @@ When context is approaching ~200k and there is follow-on work:
 1. Finish the current atomic unit of work (don't stop mid-task).
 2. Run the pre-close checklist (steps 1–5).
 3. Note that you are handing off due to context length.
-4. `cctrl close` — the fleet manager or user spawns the continuation session
-   with the handoff as its first prompt.
+4. Report the handoff (its file path, or the block) and the fleet manager or
+   user spawns the continuation with it as its first prompt. If you are
+   fleet-managed or an orchestrator, **wait to be closed** (see above). Only a
+   standalone session runs `cctrl close` itself.
 
 ## Gotchas
 

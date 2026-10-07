@@ -773,7 +773,7 @@ Review status: phases 1 and 2 had no blocker in the rev3 review; phase 3's two b
 - `skills/cctrl-spawn/SKILL.md`: `--role`, `--orch-kind`, the `-n` rule, `rename --self`, and "exit 78 = stop, ask the human, re-run with the flag they chose; never retry with a guessed kind".
 - `skills/cctrl-session-end/SKILL.md`, `AGENTS.md`, `skills/README.md`, `docs/cctrl-fleet-manager.md`, `README.md`, `completions/_cctrl`, `CHANGELOG.md`.
 - Plan bookkeeping: plan 055's status, and reword its 2026-10-07 note (it says "cctrl label wins for role sessions"; the rule is now D11). Plan 098's note stays.
-- Skill and runbook text: on a build older than phase 3, never run `cctrl session reconcile-names` in any form; from phase 3, `--dry-run` first. After a power cycle the new fleet manager is `fleet-<runtime>` and restore brings the old one back as `fleet-<runtime>--2`; `--succeeds` needs exactly one live fleet manager, so one of the two is closed before any handover.
+- Skill and runbook text: on a build older than phase 3, never run `cctrl session reconcile-names` in any form; from phase 3, `--dry-run` first. A restore or realign never renames (recorded tmux names are reused, the next free `--N` only when a live session holds the name), so after a power cycle the restored old fleet manager keeps its recorded name beside the new one (the guard does not apply to a restore); `--succeeds` needs exactly one live fleet manager, so one of the two is closed before any handover.
 - Runbook, no code: new repo orchestrators write `orch-<repo>.md`; ask the fleet manager to append the "fleet-primary" record; the new skill's skillshare / `~/.claude/skills` link.
 
 **Tests:** extend the skill-content check (the `rg` block on
@@ -782,6 +782,8 @@ Review status: phases 1 and 2 had no blocker in the rev3 review; phase 3's two b
 cctrl-spawn contain the ask rule and "exit 78".
 
 **Ship step:** create the skill link. No launch smoke. **Rollback:** revert the commit; remove the link.
+
+**Phase 4 completion note (2026-10-07). Code and docs shipped; status stays `pending` until the ship step (skill link) is done and the review gate is clear.** The review gate requires EVERY `eng` entry in `reviews:` to be `approved`; the rev2 and rev3 `changes-requested` entries therefore keep the plan from being marked done even after an independent final eng review of the shipped phases 1-4 returned approved (no REQUIRED items; open RECOMMENDED: add `--succeeds`/`--no-input`/`rename --self`/`reconcile-names` to `cmd_help`, and in realign abort when the pinned name is still live after `kill-session` fails, `cctrl:5181`). Shipped: `skills/cctrl-repo-orchestrator/SKILL.md`; the fleet-manager skill rewritten as the top-level orchestrator doctrine (ask rule, exit 78, guard exit 65, `--succeeds` handover, sole approvals writer); `cctrl-spawn` (`--role`, `--orch-kind`, `-n`, `rename --self`, trust dialog) and `cctrl-session-end`; AGENTS.md, skills/README.md, docs pointers, README, `completions/_cctrl` (+ `release`, role flags, `set-role`, `reconcile-names`, `restore`, `rename --self`), CHANGELOG; plan 055 skipped as folded in; skill-content test extended. Not done here: the ship step (skill link) and a completions-vs-dispatcher test. Plan 101 stays a stub below.
 
 ## Plan 101 (to be filed): push cctrl's label into a running Claude process
 

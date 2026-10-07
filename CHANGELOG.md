@@ -99,6 +99,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   pulls nothing; a set over 32 names fails closed; a resumed launch never seeds
   the set from the purpose alone. cctrl's label wins after `cctrl rename`.
 
+### Added (plan 100, phase 4: docs and skills)
+- New skill `skills/cctrl-repo-orchestrator/SKILL.md` (per-repo orchestrator
+  doctrine) and its pointer `docs/cctrl-repo-orchestrator.md`.
+- `completions/_cctrl`: the `release` command, `start` role flags (`--role`,
+  `--orch-kind`, `--succeeds`, `--no-input`), `@add --role/--orch-kind`,
+  `session set-role`, `session reconcile-names --dry-run`, `rename --self`.
+
+### Changed (plan 100, phase 4)
+- `cctrl-fleet-manager` becomes the top-level (fleet) orchestrator doctrine: the
+  role model, the ask rule (exit 78), the one-fleet-manager guard (exit 65),
+  `--succeeds` handover, sole approvals writer. `cctrl-spawn` documents `--role`,
+  `--orch-kind`, the `-n` rule, `rename --self`, exit 78 and the trust-folder
+  dialog; `cctrl-session-end` adds the orchestrator close rule.
+- Skill-content test requires the new skill and the ask rule / "exit 78" in both
+  orchestrator skills and `cctrl-spawn`.
+- Docs: on a build older than phase 3 never run `reconcile-names` in any form.
+
 ### Fixed (plan 102)
 - `cctrl release prune` hardening, all fail closed (exit 69, nothing deleted,
   dry run and `--apply`): a `current` that is dangling or not a direct child of

@@ -6,7 +6,8 @@ reference are the same file, so there is nothing to keep in sync.
 
 | Skill | Role |
 |---|---|
-| [`cctrl-fleet-manager`](./cctrl-fleet-manager/SKILL.md) | Orchestrate a fleet of concurrent cctrl sessions: monitor → decide → sequence, delegate all hands-on work, a two-mode autonomy model (auto-pilot / manual) with an always-confirm set and session-close gate. |
+| [`cctrl-fleet-manager`](./cctrl-fleet-manager/SKILL.md) | The top-level orchestrator (one per runtime per machine): monitor → decide → sequence, delegate all hands-on work, a two-mode autonomy model (auto-pilot / manual) with an always-confirm set and session-close gate, sole approvals writer, handover with `--succeeds`. |
+| [`cctrl-repo-orchestrator`](./cctrl-repo-orchestrator/SKILL.md) | The per-repo orchestrator: manage and delegate, briefs as the only guardrail, approvals file as a non-writer, quiet status-file reporting, two-worker pattern for large phases, close gate, own handoff. |
 | [`cctrl-session-end`](./cctrl-session-end/SKILL.md) | Gracefully wind down a session from the inside: check for uncommitted work, save context/handoff, report completion, then self-close. Counterpart to `cctrl-spawn`. |
 | [`cctrl-spawn`](./cctrl-spawn/SKILL.md) | Spin up a managed session properly from any repo: pick the runtime, create it detached and then attach (never launch an agent straight into a tab), seed a brief, verify boot, and gate on local resources. Counterpart to `cctrl-session-end`. |
 
@@ -17,6 +18,7 @@ into your skill host — e.g. skillshare:
 
 ```sh
 ln -s <path-to>/cctrl/skills/cctrl-fleet-manager ~/.config/skillshare/skills/cctrl-fleet-manager
+ln -s <path-to>/cctrl/skills/cctrl-repo-orchestrator ~/.config/skillshare/skills/cctrl-repo-orchestrator
 ln -s <path-to>/cctrl/skills/cctrl-session-end   ~/.config/skillshare/skills/cctrl-session-end
 ln -s <path-to>/cctrl/skills/cctrl-spawn         ~/.config/skillshare/skills/cctrl-spawn
 ```
@@ -24,8 +26,10 @@ ln -s <path-to>/cctrl/skills/cctrl-spawn         ~/.config/skillshare/skills/cct
 The symlink is a filesystem artifact; the version-controlled copy lives here. Edit the
 doctrine here and every symlinked host picks it up instantly.
 
-`docs/cctrl-fleet-manager.md` is a thin pointer back to this file, so the `docs/`
-reference path still resolves.
+`docs/cctrl-fleet-manager.md` and `docs/cctrl-repo-orchestrator.md` are thin
+pointers to the skills, so the `docs/` reference paths still resolve. A new skill
+is not live until it is linked into your skill host; linking is a separate,
+deliberate step after the commit.
 
 A companion **stack-watcher** role (a periodic health sentinel that investigates
 failures and dispatches cctrl fixer agents but never self-fixes prod) is

@@ -14505,8 +14505,35 @@ test_session_ls_warns_on_two_fleet_managers_and_unknown_kind() {
 }
 
 
+test_role_skills_ask_rule() {
+    # Plan 100 phase 4: the orchestrator skills and cctrl-spawn state the ask
+    # rule (cctrl asks, never guesses the kind; exit 78 = stop and ask).
+    local skill f
+    [[ -f "$ROOT/skills/cctrl-repo-orchestrator/SKILL.md" ]] \
+        || fail "skills/cctrl-repo-orchestrator/SKILL.md is missing"
+    for skill in cctrl-fleet-manager cctrl-repo-orchestrator cctrl-spawn; do
+        f="$ROOT/skills/$skill/SKILL.md"
+        grep -qF "exit 78" "$f" || grep -qF "exits **78**" "$f" \
+            || fail "$skill skill does not mention exit 78"
+        grep -qF "Never retry with a guessed kind" "$f" \
+            || fail "$skill skill does not state the ask rule"
+        grep -qF "needs-user-decision: orchestrator-kind" "$f" \
+            || fail "$skill skill omits the needs-user-decision marker"
+    done
+    for skill in cctrl-fleet-manager cctrl-repo-orchestrator; do
+        grep -qF "There are two kinds" "$ROOT/skills/$skill/SKILL.md" \
+            || fail "$skill skill does not open with the two-kinds statement"
+    done
+    echo "ok: orchestrator skills and cctrl-spawn state the ask rule and exit 78"
+}
+
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
+        role-skills)
+            test_role_skills_ask_rule
+            echo "ok"
+            exit 0
+            ;;
         bash-leg)
             test_bash_leg_is_honest
             test_profile_settings_gc_portable_membership
@@ -17385,6 +17412,7 @@ fi
 
 if [[ -z "${CCTRL_TEST_ONLY:-}" ]]; then
     test_codex_ownership_matrix_contract
+    test_role_skills_ask_rule
 fi
 
 if [[ "${CCTRL_TEST_ONLY:-}" == "codex-handoff" ]]; then

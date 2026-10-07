@@ -1,6 +1,6 @@
 ---
 name: cctrl-spawn
-version: 1.0.0
+version: 1.1.0
 description: Properly spin up a new cctrl-managed agent session from any repo — pick the runtime, create it detached, seed a brief, verify boot, and (optionally) open it in a terminal tab. Generic doctrine, no environment specifics.
 triggers:
   - spin up a new session
@@ -80,6 +80,10 @@ memory and attention. One session = one purpose.
    belongs to, not `$HOME`. Pick a short, descriptive `-n` label (the *purpose*;
    the tmux id is derived from the dir, not the label).
 
+   Pick the **role** too. A plain `-d <dir>` launch is a **worker**, and that is
+   what you want almost every time. Only an **orchestrator** takes `--role` /
+   `--orch-kind` (below).
+
 2. **Resource gate.** Before spawning, check memory pressure on the host (see the
    private env brief for the exact command). Gate on **free RAM %**, not session
    count — too many heavy sessions thrashed memory before. If pressure is high,
@@ -109,6 +113,28 @@ memory and attention. One session = one purpose.
    exact launch ID, recovery proof, attestation, and the normal handoff
    preflight/postflight. On failure, follow its retained-terminal recovery hint.
 
+   - **`-n` rule:** always pass `-n "<label>"` for a worker. Without it cctrl
+     derives a label from the first prompt, which is vague. An orchestrator with
+     no `-n` gets its canonical label (`★★ fleet manager (<runtime>)` or
+     `★ orchestrator: <repo>`); an explicit label is kept and cctrl prepends the
+     kind's star if it lacks one. Relabel later from inside the session with
+     `cctrl rename --self "<label>"` (cctrl tmux sessions only; exit 64
+     elsewhere) or from outside with `cctrl rename <session> "<label>"`.
+   - **Roles:** `--role orchestrator|worker` and `--orch-kind fleet|repo`
+     (`--orch-kind` alone implies orchestrator; `--role worker` with
+     `--orch-kind` is exit 64). Role flags need `-d` (a tmux-backed launch) and
+     are refused for app-owned and launch-to-app Codex tasks. `--no-input`
+     (or `CCTRL_NO_INPUT=1`) means never prompt.
+   - **Handover:** a successor fleet manager is
+     `--orch-kind fleet --succeeds <old-session>`; a second fleet manager of the
+     same runtime on the machine is refused with exit 65. See
+     `cctrl-fleet-manager`.
+   - **The ask rule — exit 78.** If cctrl cannot tell the orchestrator kind, it
+     asks a human at a terminal; otherwise it launches **nothing**, exits **78**
+     and prints `cctrl: needs-user-decision: orchestrator-kind` as the first
+     stderr line. **Exit 78 = stop, ask the human, re-run with the flag they
+     chose. Never retry with a guessed kind**, never add `--orch-kind fleet`
+     to get past it, and never set `CCTRL_ALLOW_SECOND_FLEET_MANAGER=1`.
    - `-d` **requires** an explicit dir/shortcut — it refuses to default to
      `$HOME` (guardrail against dropping a full-access agent into `~/.ssh` etc.).
    - `-m "<brief>"` **auto-submits on boot**, so the session starts working
@@ -128,6 +154,10 @@ memory and attention. One session = one purpose.
      > On any miss, refuse with `APPROVAL MISS <id>: <reason>` and wait. Never write to approvals.md.
 
 4. **Verify boot.** Confirm it came up: `cctrl session ls` (or capture the pane).
+   A spawn into a directory the agent has not seen before can stall on its
+   "trust this folder" dialog, whose default answer is **No**. Capture the pane
+   about 20 s after the spawn and answer it deliberately (navigate to the
+   trust option and confirm) rather than assuming the session is stuck.
    Available telemetry may show `working`/`idle`/`waiting-input` or a known
    blocking dialog. A model of `?` or state of `-` means unknown for either
    provider; it is not evidence of failure or readiness. Confirm the actual
