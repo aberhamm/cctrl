@@ -15305,6 +15305,7 @@ cmd_help() {
     echo "  cctrl codex capabilities [--json]  Inspect desktop App Server support (read-only)"
     echo "    ranges: --today, --week, --month, --all [project-filter]"
     echo "  cctrl log [count]       Show profile switch history"
+    echo "  cctrl release prune [--keep N] [--apply] [--json]  Prune old releases (dry run by default)"
     echo ""
     echo -e "${BOLD}Statusline${RESET}"
     echo "  cctrl statusline claude install  Configure Claude Code statusLine script"
@@ -16671,6 +16672,40 @@ cmd_whoami() {
     echo -e "${DIM}'cctrl --host <any-of-these> ...' runs locally — no SSH.${RESET}"
 }
 
+cmd_release() {
+    # plan 089: manual, dry-run-by-default pruning of old releases under
+    # $CCTRL_HOME/releases. Never run by install/self-install.sh. The scan and
+    # all deletion guards live in lib/release_prune.py.
+    local sub="${1:-}"; shift 2>/dev/null || true
+    case "$sub" in
+        prune)
+            local keep=5 apply=false json=false
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --keep) [[ $# -ge 2 && "$2" =~ ^[0-9]{1,4}$ ]] || { echo "cctrl release prune: --keep needs a number (0-9999)" >&2; return 64; }
+                            keep=$((10#$2)); shift 2 ;;
+                    --apply) apply=true; shift ;;
+                    --json) json=true; shift ;;
+                    -h|--help)
+                        echo "Usage: cctrl release prune [--keep N] [--apply] [--json]"
+                        echo "Dry run by default. Keeps the newest N (default 5) complete releases, current, the launcher's"
+                        echo "target, and any release still referenced by a live process, live session metadata, a"
+                        echo "--settings overlay, or ~/.local/bin. If a reference scan fails, nothing is deleted (exit 69)."
+                        return 0 ;;
+                    *) echo "cctrl release prune: unknown flag $1" >&2; return 64 ;;
+                esac
+            done
+            local -a argv=(--home "${CCTRL_HOME:-$HOME/.local/lib/cctrl}" --bin "${CCTRL_BIN:-$HOME/.local/bin/cctrl}"
+                --data-dir "$SESSION_METADATA_DIR" --runtime-settings-dir "$(_profile_settings_dir)" --keep "$keep")
+            $apply && argv+=(--apply)
+            $json && argv+=(--json)
+            python3 "$SCRIPT_DIR/lib/release_prune.py" "${argv[@]}"
+            ;;
+        ""|-h|--help|help) echo "Usage: cctrl release prune [--keep N] [--apply] [--json]" ;;
+        *) echo "cctrl release: unknown subcommand '$sub' (try: prune)" >&2; return 64 ;;
+    esac
+}
+
 cmd_host() {
     local action="${1:-list}"
     shift 2>/dev/null || true
@@ -17591,6 +17626,7 @@ _dispatch() {
         codex) cmd_codex "$@" ;;
         shortcuts) cmd_shortcut "$@" ;;
         host) cmd_host "$@" ;;
+        release) cmd_release "$@" ;;
         whoami) cmd_whoami "$@" ;;
         use|switch) cmd_use "$@" ;;
         ls|list) cmd_ls "$@" ;;

@@ -19,6 +19,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   works as an alias namespace alongside the existing top-level verbs. (plan
   071 phase 1)
 
+### Added (plan 089)
+- `cctrl release prune [--keep N] [--apply] [--json]`: manual, dry-run-by-default
+  pruning of old releases under `~/.local/lib/cctrl/releases` (default keep 5,
+  newest by build time). Always keeps `current`, the launcher target and any
+  release still referenced by a live process (argv, open files, cwd), live
+  session registry records, a `--settings` overlay, `~/.local/bin` or the user's Claude/Codex
+  config; fails closed (exit 69, nothing deleted) when a reference scan cannot
+  complete; deletes only exact direct-child release directories and never
+  touches partial or unrecognised entries. Not run by `self-install.sh`.
+
 ### Fixed
 - `cctrl session restore` honours `CCTRL_RESTORE_MAX_ACTIVE` again (default 8):
   restores beyond live + planned tasks reaching the cap are deferred as

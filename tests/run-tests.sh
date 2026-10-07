@@ -806,6 +806,176 @@ $dead"
     echo "ok: every defined test_* function is registered"
 }
 
+test_release_prune() {
+    # plan 089: sandbox releases dir ONLY (CCTRL_HOME), stub ps/lsof/tmux; never
+    # touches ~/.local/lib/cctrl.
+    local dir="$TMPDIR/release-prune"
+    local home="$dir/home" stubs="$dir/stubs" binhome="$dir/binhome" meta="$dir/meta" rt="$dir/rt" uhome="$dir/uhome"
+    mkdir -p "$home/releases" "$stubs" "$binhome" "$meta" "$rt/cctrl-$(id -u)/profile-settings" "$uhome" "$dir/outside"
+    echo keepme > "$dir/outside/precious"
+    local n
+    local -a names=(aaaaaaaaaaa1-20261001T000001Z bbbbbbbbbbb2-20261002T000002Z ccccccccccc3-20261003T000003Z
+        ddddddddddd4-20261004T000004Z eeeeeeeeeee5-20261005T000005Z fffffffffff6-20261006T000006Z 00000000000a-20261007T000007Z)
+    for n in "${names[@]}"; do
+        mkdir -p "$home/releases/$n"; : > "$home/releases/$n/cctrl"; echo "$n" > "$home/releases/$n/VERSION"
+    done
+    mkdir -p "$home/releases/.tmp-999" "$home/releases/abababababa8-20261008T000008Z" "$home/releases/not-a-release"
+    echo x > "$home/releases/.tmp-999/f"; echo x > "$home/releases/abababababa8-20261008T000008Z/cctrl"   # no VERSION: incomplete
+    echo x > "$home/releases/not-a-release/f"
+    ln -s "$dir/outside" "$home/releases/cdcdcdcdcdc9-20261009T000009Z"
+    ln -s "releases/${names[6]}" "$home/current"
+    printf '#!/bin/sh\nexec "%s/current/cctrl" "$@"\n' "$home" > "$binhome/cctrl"
+    cat > "$stubs/ps" <<'SH'
+#!/usr/bin/env bash
+[[ -n "${FAKE_PS_FAIL:-}" ]] && exit 1
+cat "${FAKE_PS_FILE:-/dev/null}"
+echo "1 /sbin/launchd"
+SH
+    cat > "$stubs/lsof" <<'SH'
+#!/usr/bin/env bash
+[[ -n "${FAKE_LSOF_FAIL:-}" ]] && exit 2
+printf 'p1\nn/\n'
+[[ -n "${FAKE_LSOF_FILE:-}" ]] && cat "$FAKE_LSOF_FILE"
+exit 0
+SH
+    cat > "$stubs/tmux" <<'SH'
+#!/usr/bin/env bash
+[[ "$1" == "list-sessions" ]] || exit 0
+if [[ -n "${FAKE_TMUX_FAIL:-}" ]]; then echo "error connecting to /tmp/x (Permission denied)" >&2; exit 1; fi
+for s in ${FAKE_TMUX_SESSIONS:-}; do echo "$s"; done
+SH
+    chmod +x "$stubs/ps" "$stubs/lsof" "$stubs/tmux"
+    : > "$dir/ps.txt"
+    local -a envv=(env HOME="$uhome" CCTRL_HOME="$home" CCTRL_BIN="$binhome/cctrl" CCTRL_SESSION_METADATA_DIR="$meta"
+        CCTRL_RUNTIME_DIR="$rt" PATH="$stubs:$PATH" FAKE_PS_FILE="$dir/ps.txt")
+    local out rc count
+
+    # 1. dry run is the default and deletes nothing; keeps newest 3 + current.
+    out="$("${envv[@]}" "$ROOT/cctrl" release prune --keep 3 --json)" || fail "dry run failed: $out"
+    assert_contains "$(jq -r '.mode' <<< "$out")" "dry-run"
+    [[ "$(jq -r '.kept | map(.name) | sort | join(",")' <<< "$out")" == "$(printf '%s\n' "${names[4]}" "${names[5]}" "${names[6]}" | sort | paste -sd, -)" ]] \
+        || fail "keep 3 should keep the newest three: $(jq -c '.kept' <<< "$out")"
+    [[ "$(jq -r '.would_delete | length' <<< "$out")" -eq 4 ]] || fail "expected 4 would_delete: $(jq -c . <<< "$out")"
+    [[ "$(jq -r '.incomplete | map(.name) | sort | join(",")' <<< "$out")" == "$(printf '%s\n' .tmp-999 abababababa8-20261008T000008Z | sort | paste -sd, -)" ]] \
+        || fail "incomplete dirs not reported: $(jq -c '.incomplete' <<< "$out")"
+    for n in "${names[@]}"; do [[ -d "$home/releases/$n" ]] || fail "dry run removed $n"; done
+
+    # 2. references keep a release regardless of age: process argv, live session
+    #    metadata (dead-session metadata does NOT), settings overlay, bin symlink.
+    printf '4242 /usr/bin/claude --mcp-config {"command":"%s/releases/%s/cctrl"}\n' "$home" "${names[0]}" > "$dir/ps.txt"
+    # real-shaped registry records: task-<hex>.json keyed by `.name`
+    printf '{"name":"TMUX--live","lifecycle_state":"active","launch_command":"%s/releases/%s/cctrl"}\n' "$home" "${names[1]}" > "$meta/task-aa11.json"
+    printf '{"name":"TMUX--dead","lifecycle_state":"active","launch_command":"%s/releases/%s/cctrl"}\n' "$home" "${names[2]}" > "$meta/task-bb22.json"
+    printf '{"name":"TMUX--live","lifecycle_state":"closed","launch_command":"%s/releases/%s/cctrl"}\n' "$home" "${names[4]}" > "$meta/task-cc33.json"
+    printf '{"statusLine":"%s/releases/%s/cctrl"}\n' "$home" "${names[3]}" > "$rt/cctrl-$(id -u)/profile-settings/x.json"
+    out="$(FAKE_TMUX_SESSIONS="TMUX--live" "${envv[@]}" FAKE_TMUX_SESSIONS="TMUX--live" "$ROOT/cctrl" release prune --keep 3 --json)" || fail "referenced dry run failed"
+    [[ "$(jq -r '.would_delete | length' <<< "$out")" -eq 1 ]] || fail "only the dead-session release should remain deletable: $(jq -c '.would_delete,.kept' <<< "$out")"
+    assert_contains "$(jq -r '.would_delete[0]' <<< "$out")" "${names[2]}"
+    assert_contains "$(jq -r '.kept[] | select(.name=="'"${names[0]}"'") | .reasons | join(";")' <<< "$out")" "in use by process 4242 (claude)"
+    assert_contains "$(jq -r '.kept[] | select(.name=="'"${names[1]}"'") | .reasons | join(";")' <<< "$out")" "session record task-aa11.json (TMUX--live)"
+    assert_contains "$(jq -r '.kept[] | select(.name=="'"${names[3]}"'") | .reasons | join(";")' <<< "$out")" "settings overlay x.json"
+    # a closed record of a live name must not pin (names[4] is in the keep-3 set anyway, so check names[4] via keep 2 below)
+    ln -s "$home/releases/${names[2]}" "$dir/binhome/other-tool"
+    out="$(FAKE_TMUX_SESSIONS="TMUX--live" "${envv[@]}" FAKE_TMUX_SESSIONS="TMUX--live" "$ROOT/cctrl" release prune --keep 3 --json)"
+    [[ "$(jq -r '.would_delete | length' <<< "$out")" -eq 0 ]] || fail "bin symlink should keep ${names[2]}: $(jq -c '.would_delete' <<< "$out")"
+    rm -f "$dir/binhome/other-tool"
+
+    # 2b. more reference sources: open-file (lsof), user config; each pins its release.
+    printf 'n%s/releases/%s/lib/x.sh\n' "$home" "${names[2]}" > "$dir/lsof.txt"
+    out="$(FAKE_TMUX_SESSIONS="TMUX--live" "${envv[@]}" FAKE_LSOF_FILE="$dir/lsof.txt" FAKE_TMUX_SESSIONS="TMUX--live" "$ROOT/cctrl" release prune --keep 3 --json)"
+    [[ "$(jq -r '.would_delete | length' <<< "$out")" -eq 0 ]] || fail "lsof open-file reference should keep ${names[2]}: $(jq -c '.would_delete' <<< "$out")"
+    assert_contains "$(jq -r '.kept[] | select(.name=="'"${names[2]}"'") | .reasons | join(";")' <<< "$out")" "open file/cwd"
+    rm -f "$dir/binhome/other-tool"
+    printf '{"mcpServers":{"x":{"command":"%s/releases/%s/cctrl"}}}\n' "$home" "${names[2]}" > "$uhome/.claude.json"
+    out="$(FAKE_TMUX_SESSIONS="TMUX--live" "${envv[@]}" FAKE_TMUX_SESSIONS="TMUX--live" "$ROOT/cctrl" release prune --keep 3 --json)"
+    [[ "$(jq -r '.would_delete | length' <<< "$out")" -eq 0 ]] || fail "~/.claude.json reference should keep ${names[2]}"
+    assert_contains "$(jq -r '.kept[] | select(.name=="'"${names[2]}"'") | .reasons | join(";")' <<< "$out")" "~/.claude.json"
+    rm -f "$uhome/.claude.json"
+    # closed record of a live name does not pin names[4]: keep 2 leaves names[4] deletable
+    out="$(FAKE_TMUX_SESSIONS="TMUX--live" "${envv[@]}" FAKE_TMUX_SESSIONS="TMUX--live" "$ROOT/cctrl" release prune --keep 2 --json)"
+    jq -e '.would_delete | index("'"${names[4]}"'")' <<< "$out" >/dev/null || fail "closed record must not pin ${names[4]}: $(jq -c '.would_delete' <<< "$out")"
+
+    # 3a. tmux failing (not "no server") and unreadable/oversized files fail closed.
+    rc=0; "${envv[@]}" FAKE_TMUX_FAIL=1 "$ROOT/cctrl" release prune --keep 1 --apply >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "tmux error must exit 69, got $rc"
+    printf '{}' > "$rt/cctrl-$(id -u)/profile-settings/locked.json"; chmod 000 "$rt/cctrl-$(id -u)/profile-settings/locked.json"
+    rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 --apply >/dev/null 2>&1 || rc=$?
+    chmod 600 "$rt/cctrl-$(id -u)/profile-settings/locked.json"; rm -f "$rt/cctrl-$(id -u)/profile-settings/locked.json"
+    [[ "$rc" -eq 69 ]] || fail "unreadable overlay must exit 69, got $rc"
+    for n in "${names[@]}"; do [[ -d "$home/releases/$n" ]] || fail "fail-closed run removed $n"; done
+    rm -f "$meta"/*.json
+
+    # 3. fail closed: an incomplete reference scan deletes nothing (exit 69), even with --apply.
+    rc=0; out="$(FAKE_PS_FAIL=1 "${envv[@]}" FAKE_PS_FAIL=1 "$ROOT/cctrl" release prune --keep 1 --apply --json)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "failed ps scan must exit 69, got $rc"
+    [[ "$(jq -r '.scan_complete' <<< "$out")" == false ]] || fail "scan_complete should be false"
+    [[ "$(jq -r '(.deleted|length) + (.would_delete|length)' <<< "$out")" -eq 0 ]] || fail "fail-closed must propose no deletion"
+    rc=0; "${envv[@]}" FAKE_LSOF_FAIL=1 "$ROOT/cctrl" release prune --keep 1 --apply >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "failed lsof scan must exit 69, got $rc"
+    for n in "${names[@]}"; do [[ -d "$home/releases/$n" ]] || fail "fail-closed run removed $n"; done
+
+    # 4. --apply deletes exactly the unreferenced, complete, older releases.
+    : > "$dir/ps.txt"; rm -f "$meta"/*.json "$rt/cctrl-$(id -u)/profile-settings/x.json"
+    out="$("${envv[@]}" "$ROOT/cctrl" release prune --keep 2 --apply --json)" || fail "apply failed: $out"
+    [[ "$(jq -r '.deleted | sort | join(",")' <<< "$out")" == "$(printf '%s\n' "${names[@]:0:5}" | sort | paste -sd, -)" ]] \
+        || fail "apply deleted the wrong set: $(jq -c '.deleted' <<< "$out")"
+    for n in "${names[5]}" "${names[6]}"; do [[ -d "$home/releases/$n" ]] || fail "apply removed kept release $n"; done
+    for n in "${names[0]}" "${names[4]}"; do [[ ! -e "$home/releases/$n" ]] || fail "apply left $n"; done
+    [[ -d "$home/releases/.tmp-999" && -d "$home/releases/abababababa8-20261008T000008Z" && -d "$home/releases/not-a-release" ]] \
+        || fail "apply must not touch incomplete/unrecognized dirs"
+    [[ -L "$home/releases/cdcdcdcdcdc9-20261009T000009Z" && -f "$dir/outside/precious" ]] || fail "apply must not follow or remove a symlink entry"
+    [[ "$(readlink "$home/current")" == "releases/${names[6]}" ]] || fail "current changed"
+
+    # 5. current's target survives even with --keep 0.
+    out="$("${envv[@]}" "$ROOT/cctrl" release prune --keep 0 --apply --json)" || fail "keep 0 apply failed"
+    [[ -d "$home/releases/${names[6]}" ]] || fail "--keep 0 must still keep current's target"
+
+    # 5b. direct guard checks (symlink, outside path, current target, empty dir, bad name) and an
+    #     apply-time failure that must stop with exit 70 and a report, not a traceback.
+    local g="$dir/guards"; mkdir -p "$g/releases/abababababab-20261001T000001Z" "$g/releases/cdcdcdcdcdcd-20261001T000002Z" "$g/elsewhere/ededededeaed-20261001T000003Z"
+    : > "$g/releases/abababababab-20261001T000001Z/f"; : > "$g/elsewhere/ededededeaed-20261001T000003Z/f"
+    ln -s "$g/elsewhere/ededededeaed-20261001T000003Z" "$g/releases/ededededeaed-20261001T000003Z"
+    out="$(python3 -I - "$ROOT/lib" "$g" <<'PY'
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import release_prune as r
+g = sys.argv[2]; rd = g + "/releases"; real = os.path.realpath(rd)
+cur = os.path.realpath(rd + "/abababababab-20261001T000001Z")
+res = {
+ "ok": r.safe_to_delete(rd, real, "cdcdcdcdcdcd-20261001T000002Z", cur)[0],   # empty dir -> refuse
+ "empty": r.safe_to_delete(rd, real, "cdcdcdcdcdcd-20261001T000002Z", None)[0],
+ "cur": r.safe_to_delete(rd, real, "abababababab-20261001T000001Z", cur)[0],
+ "symlink": r.safe_to_delete(rd, real, "ededededeaed-20261001T000003Z", None)[0],
+ "badname": r.safe_to_delete(rd, real, "../elsewhere", None)[0],
+ "good": r.safe_to_delete(rd, real, "abababababab-20261001T000001Z", None)[0],
+}
+print(" ".join("%s=%s" % kv for kv in sorted(res.items())))
+PY
+)"
+    [[ "$out" == "badname=False cur=False empty=False good=True ok=False symlink=False" ]] || fail "safe_to_delete guards wrong: $out"
+    mkdir -p "$home/releases/123456789abc-20260101T000001Z"; : > "$home/releases/123456789abc-20260101T000001Z/cctrl"; echo v > "$home/releases/123456789abc-20260101T000001Z/VERSION"
+    rc=0; out="$(python3 -I - "$ROOT/lib" "$home" "$binhome/cctrl" "$meta" "$rt/cctrl-$(id -u)/profile-settings" "$stubs" <<'PY' 2>&1
+import os, sys
+sys.path.insert(0, sys.argv[1]); os.environ["PATH"] = sys.argv[6] + os.pathsep + os.environ["PATH"]
+os.environ["FAKE_PS_FILE"] = "/dev/null"
+import shutil, release_prune as r
+def boom(path, *a, **k): raise PermissionError("denied")
+shutil.rmtree = boom
+sys.argv = ["x", "--home", sys.argv[2], "--bin", sys.argv[3], "--data-dir", sys.argv[4], "--runtime-settings-dir", sys.argv[5], "--keep", "0", "--apply"]
+sys.exit(r.main())
+PY
+)" || rc=$?
+    [[ "$rc" -eq 70 ]] || fail "apply-time delete failure must exit 70, got $rc: $out"
+    assert_contains "$out" "FAILED deleting"
+    [[ -d "$home/releases/123456789abc-20260101T000001Z" ]] || fail "failed delete should leave the dir (monkeypatched rmtree)"
+
+    # 6. never auto-run from the installer; bad flags refused.
+    ! grep -q "release prune" "$ROOT/install/self-install.sh" || fail "self-install.sh must not run release prune"
+    rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep x >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "bad --keep should exit 64, got $rc"
+    echo "ok: release prune is dry-run by default, fails closed, honors references, and deletes only guarded complete releases"
+}
+
 test_no_errexit_unsafe_post_increment() {
     # Under bash >= 4.1 with `set -e`, a standalone `((x++))` whose old value
     # is 0 evaluates to 0, returns status 1, and exits the script. bash 3.2
@@ -12586,6 +12756,11 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        release-prune)
+            test_release_prune
+            echo "ok"
+            exit 0
+            ;;
         snapshot-ownership)
             test_snapshot_ownership_policy
             test_snapshot_restore_default_honors_data_dir
@@ -12608,6 +12783,7 @@ if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "cod
 test_syntax
 test_no_errexit_unsafe_post_increment
 test_every_defined_test_is_registered
+test_release_prune
 test_live_store_guard_diagnostics_and_churn
 test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release

@@ -57,6 +57,34 @@ plain symlink into the working tree:
 ln -sf "$(pwd)/cctrl" ~/.local/bin/cctrl
 ```
 
+#### Pruning old releases
+
+Releases accumulate under `~/.local/lib/cctrl/releases/` and are never removed
+by `self-install.sh`, because a long-lived session can still point at an old
+release path (its `--mcp-config`, a `--settings` overlay, a running hook).
+Prune them by hand:
+
+```bash
+cctrl release prune                 # dry run (default): what would go, what is kept and why
+cctrl release prune --keep 3        # keep the newest 3 instead of 5
+cctrl release prune --apply         # actually delete the listed releases
+cctrl release prune --json          # machine-readable report
+```
+
+It always keeps the newest N complete releases (default 5, by build time), the
+target of `current`, and whatever the launcher points at, and keeps any
+release still referenced — found read-only from live process command lines and
+open files and cwds (`ps` argv and `lsof` paths only, never environment values), the
+registry records of live tmux sessions (records of closed sessions don't pin), per-session `--settings` overlay files,
+`~/.local/bin`, and `~/.claude.json` / `~/.claude/settings.json` /
+`~/.codex/config.toml` (only release paths are searched for, never printed).
+Referenced releases are listed as `kept (in use by ...)`. If any scan cannot
+complete, every release counts as referenced, nothing is deleted, and the
+command exits 69. Each delete must resolve to a direct child of the releases
+dir and never follows a symlink; partial (`.tmp-*`, missing `cctrl`/`VERSION`)
+and unrecognised entries are reported, not deleted. It is never run
+automatically by the installer.
+
 ## Profiles
 
 Each profile is a **model + env overlay** (e.g. one routed through an API
