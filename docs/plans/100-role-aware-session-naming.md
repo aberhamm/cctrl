@@ -857,3 +857,19 @@ shrunk to "exactly one live predecessor"; no new shortcut keys; phases merged.
 - The MacBook's cctrl version and its copy of `shortcuts.json`.
 - The live-session list is a snapshot from 2026-10-07; the F4 transcript evidence is carried from rev1.
 - No test was run for this revision (read-only limit). Line numbers are approximate.
+
+## Phase 1 review follow-ups
+
+Phase 1 shipped as ffea995 (R1 and R2 fixed) plus the role-less relaunch fix below. Open items from the phase 1 Opus review (`.mstack/handoffs/2026-10-07-plan100-phase1-opus-review.md`) and the confirmation review:
+
+- Remote `CCTRL_NO_INPUT=1` is prefixed before the arg loop finds `--foreground`, so a foreground remote agent inherits it (fails safe). Add the prefix only if `remote_tmux_launch` is still true after the loop. The same applies to a local `CCTRL_NO_INPUT=1 start -d` landing in the tmux server's global env: unset it before `tmux new-session`.
+- `_remote_exec` maps a remote exit 1 to 69 ("update it"); `_role-resolve` also returns 1 for its own errors, so the message can be wrong.
+- `_session_set_role`: a half-updated record if the kind write fails while the output says "tmux options only"; `--clear` stores null or "" (readers handle both).
+- `_role_ask_kind` on a remote 78 passes `$host_alias` as the "for <dir>" text and drops the "To settle it" line (cosmetic).
+- Tests: `_make_fake_ssh_role` overwrites `$TMPDIR/ssh`, which later remote tests may reuse; the third case in `test_role_and_orch_kind_invalid_values_exit_64` asserts no rc; `test_restore_replays_role_and_kind` uses a loose grep; `test_remote_foreground_skips_preflight_and_role_flags` does not cover `@k --foreground` and asserts no rc.
+
+Deviations from the plan (phase 1):
+
+1. Registry merge: `terminal_relaunch` needs a provisional launch id, which a launch of a known conversation (`-r <id>`, restore) lacks, so the role fields use a separate, wider merge condition (legacy-promotion, launched_by_cctrl, tmux control surface, incoming role set). A launch that states no role (no `--role`/`--orch-kind`, no shortcut role) now re-reads the recorded role+kind for that conversation before the write, so `start -d <dir> -r <id>` keeps a recorded orchestrator; an explicit flag or shortcut role still wins (test_roleless_relaunch_keeps_recorded_role_and_kind).
+2. `--succeeds` is parsed and recorded only (no relabel or handover behaviour).
+3. The restore failure reason prints the FIRST stderr line, which can be an unrelated warning (legacy-profile WARN) hiding the real error; consider the last error line.

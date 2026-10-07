@@ -4061,6 +4061,23 @@ test_relaunch_with_new_role_replaces_recorded_role() {
     echo "ok: a relaunch with a new role replaces the recorded role"
 }
 
+test_roleless_relaunch_keeps_recorded_role_and_kind() {
+    _rf_setup keeprole '{}'
+    local out sess
+    out="$(_rf start -d --role orchestrator --orch-kind repo -r conv-keep-1 --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] || fail "first launch: $out"
+    out="$(_rf start -d -r conv-keep-1 --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] \
+        || fail "a role-less relaunch must keep the recorded role: $(session_record_json "$sess")"
+    out="$(_rf start -d --role worker -r conv-keep-1 --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + (.orch_kind // "")')" == worker/ ]] \
+        || fail "an explicit --role worker must win and clear the kind: $(session_record_json "$sess")"
+    echo "ok: a role-less relaunch keeps the recorded role and kind; an explicit flag wins"
+}
+
 test_snapshot_launch_flags_carry_role_and_kind() {
     _rf_setup snapflags '{}'
     local out sess flags
@@ -13634,6 +13651,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_set_role_on_provisional_record
             test_set_role_clear_removes_fields
             test_relaunch_with_new_role_replaces_recorded_role
+            test_roleless_relaunch_keeps_recorded_role_and_kind
             test_snapshot_launch_flags_carry_role_and_kind
             test_restore_replays_role_and_kind
             test_restore_legacy_row_infers_orchestrator_from_tmux_name
@@ -13800,6 +13818,7 @@ test_set_role_updates_live_session_and_keeps_label
 test_set_role_on_provisional_record
 test_set_role_clear_removes_fields
 test_relaunch_with_new_role_replaces_recorded_role
+test_roleless_relaunch_keeps_recorded_role_and_kind
 test_snapshot_launch_flags_carry_role_and_kind
 test_restore_replays_role_and_kind
 test_restore_legacy_row_infers_orchestrator_from_tmux_name

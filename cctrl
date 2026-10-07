@@ -4087,6 +4087,7 @@ _launch_quote() (
 # globals below, never stdout, so a caller can run it outside $(...) and the
 # ask can read the terminal. Phase 1 changes no session names and no labels.
 ROLE_RESOLVED=""
+ROLE_EXPLICIT=0   # 1 when --role/--orch-kind or a shortcut role stated the role
 ORCH_KIND_RESOLVED=""
 
 # One jq definition of a shortcut's role (D5). Input object: {key, value}.
@@ -4189,7 +4190,7 @@ _role_resolve() {
     # Sets ROLE_RESOLVED and ORCH_KIND_RESOLVED. Returns 0 | 64 | 78.
     # Call as `_role_resolve ... || return $?`; never inside $(...).
     local role_flag="$1" kind_flag="$2" key="$3" where="$4"
-    ROLE_RESOLVED=""; ORCH_KIND_RESOLVED=""
+    ROLE_RESOLVED=""; ORCH_KIND_RESOLVED=""; ROLE_EXPLICIT=0
     case "$role_flag" in
         ""|orchestrator|worker) ;;
         *) echo "cctrl: invalid --role \"$role_flag\" (use orchestrator or worker)" >&2; return 64 ;;
@@ -4207,6 +4208,11 @@ _role_resolve() {
         sc="$(_shortcut_role_kind "$key")" || rc=$?
         (( rc == 0 )) || return "$rc"
         sc_role="${sc%%|*}"; sc_kind="${sc#*|}"
+    fi
+    if [[ -n "$role_flag" || -n "$kind_flag" ]]; then
+        ROLE_EXPLICIT=1
+    elif [[ -n "$key" && -f "$SHORTCUTS_FILE" && -n "$(jq -r --arg k "$key" '.[$k].role // empty' "$SHORTCUTS_FILE" 2>/dev/null)" ]]; then
+        ROLE_EXPLICIT=1
     fi
     if [[ -n "$role_flag" ]]; then
         ROLE_RESOLVED="$role_flag"
@@ -4894,6 +4900,22 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
+    # A launch that states no role (no flag, no shortcut role) must not
+    # overwrite the role/kind already recorded for this conversation.
+    if [[ "$ROLE_EXPLICIT" != 1 && -n "$resume_id" ]]; then
+        local keep_file keep_host keep_role
+        keep_host="$(_cctrl_host_id 2>/dev/null || true)"
+        keep_file="$(_task_record_file "$detach_agent" "$keep_host" "$resume_id" 2>/dev/null || true)"
+        if [[ -n "$keep_file" && -f "$keep_file" ]]; then
+            keep_role="$(jq -r '.role // empty' "$keep_file" 2>/dev/null || true)"
+            if [[ "$keep_role" == orchestrator || "$keep_role" == worker ]]; then
+                ROLE_RESOLVED="$keep_role"
+                ORCH_KIND_RESOLVED="$(jq -r '.orch_kind // empty' "$keep_file" 2>/dev/null || true)"
+                [[ "$ORCH_KIND_RESOLVED" == fleet || "$ORCH_KIND_RESOLVED" == repo ]] || ORCH_KIND_RESOLVED=""
+                [[ "$ROLE_RESOLVED" == orchestrator ]] || ORCH_KIND_RESOLVED=""
+            fi
+        fi
+    fi
     if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
         "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" \
         "${ROLE_RESOLVED:-worker}" "$ORCH_KIND_RESOLVED" "$succeeds_flag" 2>/dev/null; then
