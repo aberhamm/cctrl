@@ -78,6 +78,13 @@ open files and cwds (`ps` argv and `lsof` paths only, never environment values),
 registry records of live tmux sessions (records of closed sessions don't pin), per-session `--settings` overlay files,
 `~/.local/bin`, and `~/.claude.json` / `~/.claude/settings.json` /
 `~/.codex/config.toml` (only release paths are searched for, never printed).
+
+The scan is fail closed (plan 102): a missing or dangling `current`, a `current`
+that is not a direct child of `releases/`, `ps`/`lsof` output that does not
+contain the tool's own pid, or a missing data or bin directory counts as a scan
+error: exit 69 and nothing is deleted, in dry run and `--apply`. (The
+`--settings` overlay directory is created on first profile launch, so its
+absence just means no overlays.)
 Referenced releases are listed as `kept (in use by ...)`. If any scan cannot
 complete, every release counts as referenced, nothing is deleted, and the
 command exits 69. Each delete must resolve to a direct child of the releases

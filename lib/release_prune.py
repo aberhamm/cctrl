@@ -68,6 +68,7 @@ class Scan:
 
 
 def scan_processes(scan):
+    own = str(os.getpid())
     try:
         r = run(["ps", "-ww", "-axo", "pid=,command="])
     except Exception as e:  # noqa: BLE001
@@ -75,6 +76,11 @@ def scan_processes(scan):
         return
     if r.returncode != 0 or not r.stdout.strip():
         scan.fail("process scan failed (ps exit %d)" % r.returncode)
+        return
+    # Plan 102: rc 0 with implausible output is not trusted. The tool's own pid
+    # must appear as the exact first field of a line (never a substring match).
+    if not any(ln.split(None, 1)[:1] == [own] for ln in r.stdout.splitlines()):
+        scan.fail("process scan implausible (own pid %s not in ps output)" % own)
         return
     for line in r.stdout.splitlines():
         parts = line.strip().split(None, 1)
@@ -96,6 +102,9 @@ def scan_processes(scan):
     if r.returncode not in (0, 1) or not r.stdout.strip():
         scan.fail("open-file scan failed (lsof exit %d)" % r.returncode)
         return
+    if own not in {ln[1:] for ln in r.stdout.splitlines() if ln.startswith("p")}:
+        scan.fail("open-file scan implausible (own pid %s not in lsof output)" % own)
+        return
     pid = "?"
     for line in r.stdout.splitlines():
         if line.startswith("p"):
@@ -115,8 +124,13 @@ def read_file(path):
 
 
 def scan_dir_files(scan, label, directory):
-    """Every plain file in a short-lived overlay directory."""
+    """Every plain file in a short-lived overlay directory. Plan 102: the
+    overlay dir is created lazily by the first profile launch, so a missing one
+    legitimately means "no overlays" (the only optional scan location)."""
+    if not os.path.lexists(directory):
+        return
     if not os.path.isdir(directory):
+        scan.fail("%s exists but is not a directory" % label)
         return
     try:
         entries = sorted(os.listdir(directory))
@@ -142,7 +156,7 @@ def scan_session_records(scan, directory, live):
     a record pins the releases it mentions when its `name` is a live tmux
     session. Unparseable records fail closed."""
     if not os.path.isdir(directory):
-        return
+        return  # presence is checked by main() (plan 102)
     try:
         entries = sorted(os.listdir(directory))
     except OSError as e:
@@ -192,6 +206,7 @@ def scan_bin_dir(scan, bin_path):
     """Symlinks and small launchers next to the cctrl launcher."""
     bin_dir = os.path.dirname(bin_path) or "."
     if not os.path.isdir(bin_dir):
+        scan.fail("bin dir missing")
         return
     try:
         entries = sorted(os.listdir(bin_dir))
@@ -239,6 +254,25 @@ def link_target_name(path, releases_real):
     return None
 
 
+def current_target(current_link, releases_real, scan=None):
+    """Real path of `current` if it is a direct child directory of the releases
+    dir, else None (recording a scan error when `scan` is given)."""
+    why = None
+    if not os.path.lexists(current_link):
+        why = "current link missing"
+    else:
+        real = os.path.realpath(current_link)
+        if not os.path.isdir(real):
+            why = "current link dangling"
+        elif os.path.dirname(real) != releases_real:
+            why = "current does not resolve to a direct child of the releases dir"
+        else:
+            return real
+    if scan is not None:
+        scan.fail(why)
+    return None
+
+
 def safe_to_delete(releases_dir, releases_real, name, current_real):
     if not NAME_RE.match(name):
         return False, "name does not match the release pattern"
@@ -256,7 +290,7 @@ def safe_to_delete(releases_dir, releases_real, name, current_real):
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(allow_abbrev=False)
     ap.add_argument("--home", required=True)
     ap.add_argument("--bin", required=True)
     ap.add_argument("--data-dir", required=True)
@@ -284,9 +318,12 @@ def main():
     result["unrecognized"] = [{"name": n, "reason": why} for n, why in unrecognized]
 
     scan = Scan()
-    current_real = os.path.realpath(current_link) if os.path.lexists(current_link) else None
-    if current_real is None:
-        scan.fail("current link missing")
+    # Plan 102: `current` must exist, resolve to a real directory, and be a
+    # DIRECT child of the releases dir. Absent, dangling or pointing elsewhere
+    # is a scan error (fail closed, as an absent one already was).
+    current_real = current_target(current_link, releases_real, scan)
+    if not os.path.isdir(a.data_dir):
+        scan.fail("data dir missing")
     scan_processes(scan)
     scan_bin_dir(scan, a.bin)
     # Metadata only for sessions that are live in tmux; settings overlays are
@@ -301,7 +338,7 @@ def main():
     newest = sorted(complete, key=build_time, reverse=True)
     for n in newest[: max(a.keep, 0)]:
         keep_reason[n] = ["newest %d" % a.keep]
-    if current_real and os.path.dirname(current_real) == releases_real:
+    if current_real:
         keep_reason.setdefault(os.path.basename(current_real), []).append("current")
     launcher_name = link_target_name(a.bin, releases_real)
     if launcher_name:
@@ -329,10 +366,12 @@ def main():
         for name in list(result["would_delete"]):
             # Re-resolve current and the launcher right before each delete so a
             # rollback during the scan window cannot be raced.
-            cur = os.path.realpath(current_link) if os.path.lexists(current_link) else None
+            cur = current_target(current_link, releases_real)
             launcher_now = link_target_name(a.bin, releases_real)
             if cur is None:
-                result["refused"].append({"name": name, "reason": "current link vanished"})
+                for rest in result["would_delete"]:
+                    result["refused"].append({"name": rest, "reason": "current link vanished or no longer a direct child"})
+                result["would_delete"] = []
                 rc = 69
                 break
             if launcher_now == name:

@@ -74,6 +74,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   recorded tmux name (next free `--N` if a live session holds it), so the new
   names apply only to fresh launches.
 
+### Fixed (plan 102)
+- `cctrl release prune` hardening, all fail closed (exit 69, nothing deleted,
+  dry run and `--apply`): a `current` that is dangling or not a direct child of
+  `releases/` is a scan error; the `ps` and `lsof` scans must each show the
+  tool's own pid (exact match); a missing data or bin dir is a scan error (the
+  lazily-created settings-overlay dir stays optional); the python module no
+  longer accepts flag abbreviations.
+
 ### Added (plan 089)
 - `cctrl release prune [--keep N] [--apply] [--json]`: manual, dry-run-by-default
   pruning of old releases under `~/.local/lib/cctrl/releases` (default keep 5,

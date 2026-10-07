@@ -846,11 +846,14 @@ test_release_prune() {
 [[ -n "${FAKE_PS_FAIL:-}" ]] && exit 1
 cat "${FAKE_PS_FILE:-/dev/null}"
 echo "1 /sbin/launchd"
+# plan 102: the tool must see its own pid ($PPID = the python module)
+[[ -n "${FAKE_PS_NO_OWN:-}" ]] || echo "${FAKE_PS_OWN:-$PPID} /usr/bin/python3 release_prune.py"
 SH
     cat > "$stubs/lsof" <<'SH'
 #!/usr/bin/env bash
 [[ -n "${FAKE_LSOF_FAIL:-}" ]] && exit 2
 printf 'p1\nn/\n'
+[[ -n "${FAKE_LSOF_NO_OWN:-}" ]] || printf 'p%s\nn/\n' "${FAKE_LSOF_OWN:-$PPID}"
 [[ -n "${FAKE_LSOF_FILE:-}" ]] && cat "$FAKE_LSOF_FILE"
 exit 0
 SH
@@ -929,6 +932,67 @@ SH
     rc=0; "${envv[@]}" FAKE_LSOF_FAIL=1 "$ROOT/cctrl" release prune --keep 1 --apply >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 69 ]] || fail "failed lsof scan must exit 69, got $rc"
     for n in "${names[@]}"; do [[ -d "$home/releases/$n" ]] || fail "fail-closed run removed $n"; done
+
+    # 3b. plan 102 hardening, every case fail closed (exit 69, nothing deleted), dry run AND apply.
+    local mode
+    for mode in "" --apply; do
+        # a. dangling / outside-pointing / absent `current`
+        mv "$home/current" "$dir/current.save"
+        ln -s "releases/zzzzzzzzzzzz-20269999T000000Z" "$home/current"
+        rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 69 ]] || fail "dangling current must exit 69 ($mode), got $rc"
+        rm -f "$home/current"; ln -s "$dir/outside" "$home/current"
+        rc=0; out="$("${envv[@]}" "$ROOT/cctrl" release prune --keep 1 $mode --json 2>&1)" || rc=$?
+        [[ "$rc" -eq 69 ]] || fail "outside-pointing current must exit 69 ($mode), got $rc"
+        assert_contains "$out" "direct child"
+        rm -f "$home/current"; ln -s "releases/${names[6]}/.." "$home/current"   # resolves to home, not a child of releases/
+        rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 69 ]] || fail "non-direct-child current must exit 69 ($mode), got $rc"
+        rm -f "$home/current"
+        rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 69 ]] || fail "absent current must exit 69 ($mode), got $rc"
+        mv "$dir/current.save" "$home/current"
+        # b. own pid must be in the ps and the lsof output (exact match: a pid that merely
+        #    contains ours as a substring does not count)
+        rc=0; "${envv[@]}" FAKE_PS_NO_OWN=1 "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 69 ]] || fail "ps output without own pid must exit 69 ($mode), got $rc"
+        rc=0; "${envv[@]}" FAKE_LSOF_NO_OWN=1 "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 69 ]] || fail "lsof output without own pid must exit 69 ($mode), got $rc"
+        # c. missing bin dir / registry (data) dir are scan errors
+        mv "$binhome" "$dir/binhome.save"
+        rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        mv "$dir/binhome.save" "$binhome"
+        [[ "$rc" -eq 69 ]] || fail "missing bin dir must exit 69 ($mode), got $rc"
+        mv "$meta" "$dir/meta.save"
+        rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 $mode >/dev/null 2>&1 || rc=$?
+        mv "$dir/meta.save" "$meta"
+        [[ "$rc" -eq 69 ]] || fail "missing registry dir must exit 69 ($mode), got $rc"
+        for n in "${names[@]}"; do [[ -d "$home/releases/$n" ]] || fail "plan-102 fail-closed run removed $n ($mode)"; done
+    done
+    # b (positive control, and the substring case run through the module directly with a pid-prefix stub)
+    cat > "$stubs/ps-prefix" <<'SH'
+#!/usr/bin/env bash
+echo "${PPID}9 /usr/bin/python3 other"
+echo "1 /sbin/launchd"
+SH
+    mkdir -p "$dir/prefix-stubs"; cp "$stubs/lsof" "$stubs/tmux" "$dir/prefix-stubs/"; cp "$stubs/ps-prefix" "$dir/prefix-stubs/ps"; chmod +x "$dir/prefix-stubs/"*
+    rc=0; "${envv[@]}" PATH="$dir/prefix-stubs:$PATH" "$ROOT/cctrl" release prune --keep 1 --apply >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "ps line for pid '<own>9' must not satisfy the own-pid check, got $rc"
+    printf '#!/usr/bin/env bash\nprintf "p1\\nn/\\np%%s9\\nn/\\n" "$PPID"\n' > "$dir/prefix-stubs/lsof"; cp "$stubs/ps" "$dir/prefix-stubs/ps"
+    rc=0; "${envv[@]}" PATH="$dir/prefix-stubs:$PATH" "$ROOT/cctrl" release prune --keep 1 --apply >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "lsof pid '<own>9' must not satisfy the own-pid check, got $rc"
+    # d. no flag abbreviations when the module is called directly
+    for n in --app --kee --js; do
+        rc=0; python3 "$ROOT/lib/release_prune.py" --home "$home" --bin "$binhome/cctrl" --data-dir "$meta" \
+            --runtime-settings-dir "$rt" "$n" 1 >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 2 ]] || fail "module must reject abbreviation $n (argparse exit 2), got $rc"
+    done
+    for n in "${names[@]}"; do [[ -d "$home/releases/$n" ]] || fail "abbreviation/prefix run removed $n"; done
+    # the optional overlay dir: absent is fine (plan 102 documents why)
+    mv "$rt/cctrl-$(id -u)/profile-settings" "$dir/ps-overlay.save"
+    rc=0; "${envv[@]}" "$ROOT/cctrl" release prune --keep 1 >/dev/null 2>&1 || rc=$?
+    mv "$dir/ps-overlay.save" "$rt/cctrl-$(id -u)/profile-settings"
+    [[ "$rc" -eq 0 ]] || fail "absent overlay dir is legitimately optional, got $rc"
 
     # 4. --apply deletes exactly the unreferenced, complete, older releases.
     : > "$dir/ps.txt"; rm -f "$meta"/*.json "$rt/cctrl-$(id -u)/profile-settings/x.json"
