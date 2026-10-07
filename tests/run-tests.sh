@@ -13515,6 +13515,12 @@ _p2_restore_row_run() {
     _restore_role_fixture "$dir"
     jq --argjson f "$2" '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += $f' \
         "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    if [[ -n "${P2_ROW_TMUX:-}" ]]; then
+        jq --arg n "$P2_ROW_TMUX" '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .tmux_session) = $n' \
+            "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+        jq --arg n "$P2_ROW_TMUX" '(.rows[] | select(.tmux_session=="TMUX--cctrl") | .tmux_session) = $n' \
+            "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+    fi
     local rrc=0
     P2_RESTORE_OUT="$(TMUX_LOG="$dir/tmux.log" CCTRL_DEVICE_TAG=ms TMUX_FAKE_STATE="${3:-}" \
         _restore_run_real "$dir" --only cctrl --yes 2>&1 </dev/null)" || rrc=$?
@@ -13524,9 +13530,9 @@ _p2_restore_row_run() {
 
 test_unknown_kind_orchestrator_keeps_worker_name() {
     local dir="$TMPDIR/p2-restore-unknown"
-    _p2_restore_row_run "$dir" '{"role":"orchestrator"}'
-    [[ "$P2_RESTORE_NAME" == TMUX--ms--work ]] || fail "unknown kind must keep the worker name, got: $P2_RESTORE_NAME"
-    echo "ok: an orchestrator of unknown kind keeps the worker name"
+    P2_ROW_TMUX=TMUX--ms--work _p2_restore_row_run "$dir" '{"role":"orchestrator"}'
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--work ]] || fail "unknown kind must keep its recorded name, got: $P2_RESTORE_NAME"
+    echo "ok: an orchestrator of unknown kind keeps its recorded name"
 }
 
 test_orchestrator_ignores_prompt_derived_label() {
@@ -13572,14 +13578,14 @@ test_rename_adds_glyph_for_known_kind_only() {
 
 test_replay_keeps_label_verbatim() {
     local dir="$TMPDIR/p2-restore-verbatim"
-    _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}'
+    P2_ROW_TMUX=TMUX--ms--fm-verbatim _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}'
     local rec
     rec="$(grep -l 'conv-aaa-111' "$dir/session-metadata"/*.json 2>/dev/null | head -n 1)"
     [[ -n "$rec" ]] || fail "no record: $(ls "$dir/session-metadata")"
     [[ "$(jq -r .purpose "$rec")" != ★* && "$(jq -r .purpose "$rec")" != ☆* ]] \
         || fail "a replayed label must stay verbatim, got: $(jq -r .purpose "$rec")"
-    [[ "$P2_RESTORE_NAME" == TMUX--ms--orch-* ]] || fail "a restored repo orchestrator is orch-<repo>, got: $P2_RESTORE_NAME"
-    echo "ok: a replayed label is kept verbatim and the name is re-derived"
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fm-verbatim ]] || fail "a restore keeps the recorded name, got: $P2_RESTORE_NAME"
+    echo "ok: a replayed label is kept verbatim and the name is not re-derived"
 }
 
 test_set_role_relabel_writes_canonical_label() {
@@ -13943,10 +13949,69 @@ test_refusal_wording_per_caller() {
     echo "ok: refusal wording names the action and the holder"
 }
 
+test_restore_keeps_recorded_name_for_tagged_fleet_row() {
+    local dir="$TMPDIR/p2-keep-fleet"
+    P2_ROW_TMUX=TMUX--ms--fm-orchestrator _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"fleet"}'
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fm-orchestrator ]] || fail "a restore must keep the recorded fm-orchestrator name, got: $P2_RESTORE_NAME"
+    echo "ok: a restored tagged fleet row keeps its recorded name"
+}
+
+test_restore_keeps_recorded_name_for_tagged_repo_row_with_index() {
+    local dir="$TMPDIR/p2-keep-repo"
+    P2_ROW_TMUX=TMUX--ms--fm-homelab--3 _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}'
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fm-homelab--3 ]] || fail "a restore must keep the recorded --3 name, got: $P2_RESTORE_NAME"
+    echo "ok: a restored tagged repo row keeps its recorded name including the index"
+}
+
+test_restore_beside_live_session_of_same_name_gets_next_index() {
+    local dir="$TMPDIR/p2-keep-live" state="$TMPDIR/p2-keep-live.state"
+    printf '$1:TMUX--ms--fm-comet\n' > "$state"
+    P2_ROW_TMUX=TMUX--ms--fm-comet _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}' "$state"
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fm-comet--2 ]] || fail "a collision must take the next free index, got: $P2_RESTORE_NAME"
+    : > "$state"; printf '$1:TMUX--ms--fm-comet\n$2:TMUX--ms--fm-comet--2\n' > "$state"
+    dir="$TMPDIR/p2-keep-live2"
+    P2_ROW_TMUX=TMUX--ms--fm-comet _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}' "$state"
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fm-comet--3 ]] || fail "next free index after --2, got: $P2_RESTORE_NAME"
+    echo "ok: a restore beside a live session of the same name takes the next free index"
+}
+
+test_restore_keeps_phase2_style_names() {
+    local dir="$TMPDIR/p2-keep-new1"
+    P2_ROW_TMUX=TMUX--ms--orch-rentkompass _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}'
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--orch-rentkompass ]] || fail "orch name changed on restore: $P2_RESTORE_NAME"
+    dir="$TMPDIR/p2-keep-new2"
+    P2_ROW_TMUX=TMUX--ms--fleet-claude _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"fleet"}'
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fleet-claude ]] || fail "fleet name changed on restore: $P2_RESTORE_NAME"
+    echo "ok: a row already named orch-x / fleet-claude keeps that name on restore"
+}
+
+test_realign_of_tagged_orchestrator_keeps_recorded_name() {
+    local bin="$TMPDIR/rl-p2-bin" sdir="$TMPDIR/rl-p2-sessions" log="$TMPDIR/rl-p2-tmux.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+    printf '{"target":"/tmp","cwd":"/tmp","purpose":"p","role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json"
+    : > "$log"
+    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        CCTRL_NO_HEALTH_CHECK=1 CCTRL_HOST_PREFIX=ms CCTRL_PURPOSE_PROMPT=never \
+        "$ROOT/cctrl" session doctor --fix --yes --json >/dev/null 2>&1 </dev/null || true
+    assert_contains "$(cat "$log")" "new-session -d -s TMUX--ms--portal"
+    assert_not_contains "$(cat "$log")" "new-session -d -s TMUX--ms--orch-"
+    echo "ok: a realign of a tagged orchestrator keeps the recorded tmux name"
+}
+
+test_fresh_orchestrator_launch_still_gets_role_name() {
+    _p2_setup fr '{}'
+    local out
+    out="$(_p2 start -d --orch-kind repo --purpose p "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-"
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    echo "ok: a fresh (non-replay) orchestrator launch still gets orch-<repo> / fleet-<runtime>"
+}
+
 test_restore_bypasses_guard_and_reports_predecessor() {
     local dir="$TMPDIR/p2-restore-fleet" state="$TMPDIR/p2-restore-fleet.state"
     printf '$1:TMUX--ms--fleet-claude\n' > "$state"
-    _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"fleet"}' "$state"
+    P2_ROW_TMUX=TMUX--ms--fleet-claude _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"fleet"}' "$state"
     [[ "$P2_RESTORE_NAME" == TMUX--ms--fleet-claude--2 ]] || fail "restored beside a live fleet manager, got: $P2_RESTORE_NAME"
     assert_contains "$P2_RESTORE_OUT" "restored=1"
     assert_contains "$P2_RESTORE_OUT" "beside the live fleet manager TMUX--ms--fleet-claude"
@@ -14277,6 +14342,12 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_set_role_relabel_repo_falls_back_to_pane_path
             test_fleet_lock_registry_dir_failure_has_own_message
             test_refusal_wording_per_caller
+            test_restore_keeps_recorded_name_for_tagged_fleet_row
+            test_restore_keeps_recorded_name_for_tagged_repo_row_with_index
+            test_restore_beside_live_session_of_same_name_gets_next_index
+            test_restore_keeps_phase2_style_names
+            test_realign_of_tagged_orchestrator_keeps_recorded_name
+            test_fresh_orchestrator_launch_still_gets_role_name
             echo "ok"
             exit 0
             ;;
@@ -14480,6 +14551,12 @@ test_set_role_fleet_takes_launch_lock
 test_set_role_relabel_repo_falls_back_to_pane_path
 test_fleet_lock_registry_dir_failure_has_own_message
 test_refusal_wording_per_caller
+test_restore_keeps_recorded_name_for_tagged_fleet_row
+test_restore_keeps_recorded_name_for_tagged_repo_row_with_index
+test_restore_beside_live_session_of_same_name_gets_next_index
+test_restore_keeps_phase2_style_names
+test_realign_of_tagged_orchestrator_keeps_recorded_name
+test_fresh_orchestrator_launch_still_gets_role_name
 test_dir_launch_no_shortcut_match_unchanged
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision

@@ -70,8 +70,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ### Changed (plan 100, phase 2)
 - A repo orchestrator launch is no longer named like a worker: `@fm-cctrl` is now
-  `orch-cctrl`, not `cctrl`. A restored orchestrator or fleet manager is
-  re-named the same way (a restore replaces the session).
+  `orch-cctrl`, not `cctrl`. A restore or realign never renames: it reuses the
+  recorded tmux name (next free `--N` if a live session holds it), so the new
+  names apply only to fresh launches.
 
 ### Added (plan 089)
 - `cctrl release prune [--keep N] [--apply] [--json]`: manual, dry-run-by-default

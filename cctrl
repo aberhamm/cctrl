@@ -5137,6 +5137,17 @@ _launch_detached() {
     # it reuses freed/dead indices (homelab, homelab--2, ...) but skips any
     # live one, and refuses if no safe slot is available.
     local base_name="$session_name" picked_name
+    # A restore never renames (plan 100 D7/D9): the recorded tmux name is
+    # reused when it is free; when it is live, the next free --N of its base.
+    if [[ -n "${_CCTRL_REPLAY:-}" && "${_CCTRL_REPLAY_TMUX:-}" == TMUX--* ]]; then
+        if tmux has-session -t "=$_CCTRL_REPLAY_TMUX" 2>/dev/null; then
+            base_name="$_CCTRL_REPLAY_TMUX"
+            if [[ "$base_name" =~ ^(TMUX--.+)--[0-9]+$ ]]; then base_name="${BASH_REMATCH[1]}"; fi
+        else
+            base_name="$_CCTRL_REPLAY_TMUX"
+            fleet_exact_name=true
+        fi
+    fi
     if [[ "$fleet_exact_name" == true ]]; then
         picked_name="$base_name"
     elif ! picked_name="$(_pick_safe_session_index "$base_name")"; then
@@ -13880,8 +13891,9 @@ _session_restore() {
                 rs_pred="$(_fleet_live_managers "${rs_agent:-claude}" | head -n 1)"
             fi
             _CCTRL_REPLAY=restore
+            _CCTRL_REPLAY_TMUX="$(jq -r '.tmux_session // empty' <<< "$row_file")"
             CCTRL_ATTACH_PROMPT=never _launch_detached "${launch_argv[@]}" >/dev/null 2>"$launch_err" || spawn_rc=$?
-            unset _CCTRL_REPLAY
+            unset _CCTRL_REPLAY _CCTRL_REPLAY_TMUX
             if (( spawn_rc != 0 )); then
                 echo "$(jq -r '.tmux_session // .provider_task_id // "unnamed"' <<< "$row_file"): $(head -n 1 "$launch_err" 2>/dev/null)" >&2
             elif [[ -n "$rs_pred" ]]; then
@@ -18511,7 +18523,7 @@ main() {
     # command substitution. Agent markers force non-interactive even on a pty.
     # The replay and resolve-only markers are plain shell variables: clear
     # them so nothing inherited can switch them on.
-    unset _CCTRL_REPLAY _CCTRL_ROLE_RESOLVE_ONLY
+    unset _CCTRL_REPLAY _CCTRL_REPLAY_TMUX _CCTRL_ROLE_RESOLVE_ONLY
     _CCTRL_CAN_ASK=0
     if [[ -t 0 && -t 2 && "${CCTRL_NO_INPUT:-}" != "1" && "${CCTRL_TMUX_CONTEXT:-}" != "1" \
           && -z "${CCTRL_SESSION_KIND:-}" && -z "${CLAUDECODE:-}" ]]; then

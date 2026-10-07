@@ -362,6 +362,8 @@ cctrl session set-role <session> --clear
 - `orchestrator` with no kind is A4. `--orch-kind fleet` runs the guard (D10), excluding the session itself.
 - `--clear` removes both fields and both options (rollback).
 
+**Replay never renames (decided at phase 2 install).** A restore or realign reuses the recorded tmux name (`_CCTRL_REPLAY_TMUX` from the restore row; realign pins it with `--name`); if a live session holds it, the picker takes the next free `--N` of its base. The new names apply only to fresh launches. This amends D7/D9: a restore no longer re-derives `fleet-<runtime>` / `orch-<repo>`.
+
 ### D9. Names and default labels (phase 2)
 
 Computed in `_launch_detached` where `session_name` is set (4430-4462):

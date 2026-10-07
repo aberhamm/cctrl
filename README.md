@@ -1046,8 +1046,9 @@ orchestrator never takes a prompt-derived label; an explicit `-n` / `--purpose`
 wins and gets the star prepended once (unless it already starts with `★` or
 `☆`). `cctrl rename` does the same for an orchestrator of known kind. Existing
 sessions keep their names and labels, and `restore` / `session doctor --fix`
-keep replaying recorded labels verbatim (a restore re-derives the name, as for
-any restored session; realign keeps the recorded name).
+keep replaying recorded labels verbatim, and a restore or realign never renames:
+it reuses the recorded tmux name (the next free `--N` if a live session holds
+it). The new names apply only to fresh launches.
 
 **One fleet manager per runtime per machine.** Launching a second one
 (`--orch-kind fleet`) exits **65** and names the live one. The tmux name
@@ -1059,7 +1060,7 @@ handing over` and closes nothing. Override, for the rare deliberate case:
 `CCTRL_ALLOW_SECOND_FLEET_MANAGER=1` (environment only; cctrl unsets it before
 it starts tmux, and prints one line naming the live fleet manager). `restore`
 and `doctor --fix` bypass the guard (a restored fleet manager beside a live one
-comes back as `fleet-<runtime>--2` and the restore summary says so). `cctrl
+comes back under its recorded name with the next free `--N` and the restore summary says so). `cctrl
 session ls` prints a footer line for orchestrators of unknown kind and a
 warning when two fleet managers of a runtime are live.
 
