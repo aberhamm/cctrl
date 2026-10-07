@@ -190,6 +190,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   Model labels conservatively report command evidence rather than prompt text.
 
 ### Fixed
+- `cctrl ls`/`cctrl current`'s `WARN: <name> exists in both; using
+  ~/.config/cctrl/profiles/<name>.json` now stays silent once the repo
+  and XDG copies are byte-identical (the normal post-`profile migrate`
+  state) — it still prints when the two copies genuinely differ. No
+  other WARN, precedence, or deletion behavior changed (plan 099).
 - Only fleet-manager shortcuts get an `fm-` session name now. `cctrl start
   -d <dir>`'s reverse shortcut lookup (`_shortcut_for_dir`) picked the
   alphabetically-first key on a dir collision, and `fm-*` sorts before

@@ -1473,6 +1473,18 @@ cmd_use() {
     echo -e "${YELLOW}For a one-off launch on a different profile, use: cctrl start --profile <name>${RESET}"
 }
 
+_profile_shadow_differs() {
+    # True (0) when a profile exists in both the repo and the XDG user dirs
+    # AND the two files differ (compared via cmp, never file contents/env).
+    # A migrated, byte-identical pair has nothing to warn about; a genuine
+    # divergence still must (plan 099).
+    local name="$1" repo_f user_f
+    repo_f="$PROFILES_REPO_DIR/$name.json"
+    user_f="$PROFILES_USER_DIR/$name.json"
+    [[ -f "$repo_f" && -f "$user_f" ]] || return 1
+    ! cmp -s "$repo_f" "$user_f"
+}
+
 cmd_ls() {
     local active
     active="$(_default_profile_name)"
@@ -1499,7 +1511,7 @@ cmd_ls() {
         else
             echo -e "    $name  ${DIM}[$backend] $summary${RESET}"
         fi
-        if [[ -n "$flag" ]]; then
+        if [[ -n "$flag" ]] && _profile_shadow_differs "$name"; then
             echo -e "    ${YELLOW}WARN: $name exists in both; using $(_display_path "$PROFILES_USER_DIR")/$name.json${RESET}"
         fi
     done <<< "$entries"
@@ -1534,7 +1546,7 @@ cmd_current() {
         summary="$(_profile_summary "$pf")"
         echo -e "${DIM}$summary${RESET}"
 
-        if [[ -z "${CCTRL_PROFILES_DIR:-}" && -f "$PROFILES_USER_DIR/$name.json" && -f "$PROFILES_REPO_DIR/$name.json" ]]; then
+        if [[ -z "${CCTRL_PROFILES_DIR:-}" ]] && _profile_shadow_differs "$name"; then
             echo -e "${YELLOW}WARN: $name exists in both; using $(_display_path "$PROFILES_USER_DIR")/$name.json${RESET}"
         fi
     fi

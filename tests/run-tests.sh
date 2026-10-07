@@ -1823,6 +1823,53 @@ test_profile_repo_fallback_and_clash() {
     echo "ok: repo-only profile resolves; a name in both dirs resolves to XDG, warns once, no duplicate row"
 }
 
+test_profile_shadow_identical_warn_quiet() {
+    # Plan 099: once the repo and XDG copies of a profile are byte-identical
+    # (the normal post-`profile migrate` state), ls/current must NOT print
+    # the "exists in both" WARN -- there is nothing to warn about.
+    local rootcopy="$TMPDIR/cctrl-shadowsame-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl/profiles" "$fakehome/.claude"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"same-version","env":{}}\n' > "$rootcopy/profiles/twin.json"
+    printf '{"model":"same-version","env":{}}\n' > "$fakehome/.config/cctrl/profiles/twin.json"
+
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" ls)"
+    assert_contains "$out" "twin"
+    assert_not_contains "$out" "WARN: twin exists in both"
+
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" use twin 2>&1)"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "twin"
+    assert_not_contains "$out" "WARN: twin exists in both"
+
+    echo "ok: byte-identical repo/XDG profile copies stay silent in ls and current"
+}
+
+test_profile_shadow_current_warns_when_differs() {
+    # Plan 099 counterpart: when the two copies genuinely differ, `current`'s
+    # own WARN (not just `ls`'s, covered by test_profile_repo_fallback_and_clash)
+    # must still print.
+    local rootcopy="$TMPDIR/cctrl-shadowdiff-copy"
+    local fakehome="$rootcopy/home"
+    mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl/profiles" "$fakehome/.claude"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"
+    chmod +x "$rootcopy/cctrl"
+
+    printf '{"model":"repo-version","env":{}}\n' > "$rootcopy/profiles/diverged.json"
+    printf '{"model":"xdg-version","env":{}}\n' > "$fakehome/.config/cctrl/profiles/diverged.json"
+
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" use diverged >/dev/null 2>&1
+    local out
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" current)"
+    assert_contains "$out" "WARN: diverged exists in both"
+
+    echo "ok: current still warns when the repo/XDG profile copies genuinely differ"
+}
+
 test_profile_find_sole_dir_override() {
     # CCTRL_PROFILES_DIR, when set, is the ONLY dir searched -- no XDG or
     # repo fallback, even when the name exists in both of those.
@@ -12906,6 +12953,8 @@ test_profile_writes_are_owner_only
 test_profile_use_current_diff
 test_profile_xdg_config_home
 test_profile_repo_fallback_and_clash
+test_profile_shadow_identical_warn_quiet
+test_profile_shadow_current_warns_when_differs
 test_profile_find_sole_dir_override
 test_profile_writes_and_edit_copy_on_write_use_xdg
 test_profile_migrate
