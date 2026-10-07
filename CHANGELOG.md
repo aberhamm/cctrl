@@ -74,6 +74,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   recorded tmux name (next free `--N` if a live session holds it), so the new
   names apply only to fresh launches.
 
+### Added (plan 100, phase 3: label bookkeeping)
+- `cctrl session reconcile-names --dry-run` (real argument loop: `--dry-run`,
+  `--json`, `-h`/`--help`; an unknown flag exits 64; `--help` and `--dry-run`
+  write nothing; the JSON carries `dry_run`, `baselines`, `full`).
+- `cctrl rename --self "<label>"` (needs `CCTRL_SESSION_KIND=tmux` and
+  `CCTRL_SESSION_NAME`, else exit 64).
+- A worker launched with `resume from handoff <slug>` is labelled `<repo>: <slug>`.
+
+### Changed (plan 100, phase 3)
+- `reconcile-names` pulls Claude's name only if cctrl never launched, set or
+  pulled it (record field `label_names_known`, seeded from every transcript
+  title, suffix and star ignored). A record without the set is baselined and
+  pulls nothing; a set over 32 names fails closed; a resumed launch never seeds
+  the set from the purpose alone. cctrl's label wins after `cctrl rename`.
+
 ### Fixed (plan 102)
 - `cctrl release prune` hardening, all fail closed (exit 69, nothing deleted,
   dry run and `--apply`): a `current` that is dangling or not a direct child of

@@ -481,6 +481,20 @@ _llm_generate_title() {
 _generate_auto_purpose() {
     local prompt="$1" repo_name="$2"
 
+    # Plan 100 D12: "resume from handoff <slug>" labels as "<repo>: <slug>".
+    local handoff_re='^[[:space:]]*[Rr]esume[[:space:]]+from[[:space:]]+handoff[[:space:]]+([^[:space:]]+)'
+    if [[ "$prompt" =~ $handoff_re ]]; then
+        local slug="${BASH_REMATCH[1]}"
+        local trail_re='[]).,;:"'"'"']$'
+        while [[ -n "$slug" && "$slug" =~ $trail_re ]]; do slug="${slug%?}"; done
+        local lead_re='^["'"'"'(\[]'
+        while [[ -n "$slug" && "$slug" =~ $lead_re ]]; do slug="${slug#?}"; done
+        if [[ -n "$slug" ]]; then
+            if [[ -n "$repo_name" ]]; then printf '%s: %s' "$repo_name" "$slug"; else printf '%s' "$slug"; fi
+            return 0
+        fi
+    fi
+
     if [[ "${CCTRL_TITLE_MODE:-auto}" != "heuristic" ]]; then
         local endpoint model
         endpoint="$(_config_jq '.titleEndpoint // empty' 2>/dev/null || true)"
@@ -3445,7 +3459,7 @@ if not (record.get("schema_version") == 2 and record.get("lifecycle_state") == "
         and key == "launch-" + str(record.get("provisional_launch_id"))):
     raise SystemExit("Not a matching provisional cctrl launch receipt")
 receipt = {"control_surface", "tmux_session", "pane_id", "pane_pid", "wrapper_pid", "pane_started"}
-allowed = receipt | {"health_status", "health_reason", "health_info", "purpose", "role", "orch_kind", "succeeds"}
+allowed = receipt | {"health_status", "health_reason", "health_info", "purpose", "role", "orch_kind", "succeeds", "label_names_known"}
 updates = json.loads(value) if field == "_terminal_anchor_receipt" else {field: value}
 if not isinstance(updates, dict) or (field == "_terminal_anchor_receipt" and set(updates) != receipt):
     raise SystemExit("Terminal receipt must contain exactly the anchor fields")
@@ -3726,8 +3740,16 @@ _session_write_metadata() {
     local profile="${13:-}" profile_source="${14:-}" auth_backend="${15:-}" requested_model="${16:-}" claude_config_dir="${17:-}" profile_file="${18:-}"
     # Plan 100: role (orchestrator|worker), orch_kind (fleet|repo|empty), and
     # the optional succeeds label. Empty stores null; a pre-plan record has none.
-    local role="${19:-}" orch_kind="${20:-}" succeeds="${21:-}"
+    local role="${19:-}" orch_kind="${20:-}" succeeds="${21:-}" resuming="${22:-}"
     mkdir -p "$SESSION_METADATA_DIR" || return 1
+    # Plan 100 D11: a fresh launch knows the label it launched with. A resumed
+    # launch (conversation id given) never seeds the set from the purpose alone:
+    # an existing record keeps its set, one without gets the baseline later.
+    local names_known=""
+    if [[ -z "$conversation_id" && -z "$resuming" && -n "$purpose" ]]; then
+        names_known="$(_session_names_known_json "[]" "$purpose" 2>/dev/null || true)"
+        [[ "$names_known" == "[]" ]] && names_known=""
+    fi
     local tmp created_at host_label host_id provider lifecycle_state provider_task_id launch_id output_file
     mkdir -p "$SESSION_METADATA_DIR" || return 1
     tmp="$(mktemp "$SESSION_METADATA_DIR/.task-write.XXXXXX")" || return 1
@@ -3788,6 +3810,7 @@ _session_write_metadata() {
         --arg role "$role" \
         --arg orch_kind "$orch_kind" \
         --arg succeeds "$succeeds" \
+        --arg names_known "$names_known" \
         '{
             schema_version: $schema_version,
             provider: $provider,
@@ -3842,6 +3865,7 @@ _session_write_metadata() {
             role: (if $role == "" then null else $role end),
             orch_kind: (if $orch_kind == "" then null else $orch_kind end),
             succeeds: (if $succeeds == "" then null else $succeeds end),
+            label_names_known: (if $names_known == "" then null else $names_known end),
             control_surface: "tmux",
             tmux_session: $name,
             pane_id: null,
@@ -4611,7 +4635,7 @@ _launch_detached() {
     local profile="" detach_agent="" agent_explicit=false
     local shortcut_canonical=""
     local force=false
-    local resume_id=""
+    local resume_id="" resuming=""
     local role_flag="" kind_flag="" succeeds_flag="" pinned_name=""
     local no_health_check=false
     local health_check_timeout=30
@@ -4750,6 +4774,7 @@ _launch_detached() {
                 shift
                 ;;
             --resume|-r)
+                resuming=1
                 passthrough+=("$1")
                 passthrough_count=$((passthrough_count + 1))
                 if [[ $# -gt 1 && "$2" != -* && "$2" != @* ]]; then
@@ -4771,6 +4796,7 @@ _launch_detached() {
                 shift
                 ;;
             -*)
+                case "$1" in -c|--continue|--resume=*|-r=*) resuming=1 ;; esac
                 passthrough+=("$1")
                 passthrough_count=$((passthrough_count + 1))
                 shift
@@ -5214,7 +5240,7 @@ _launch_detached() {
 
     if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
         "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" \
-        "${ROLE_RESOLVED:-worker}" "$ORCH_KIND_RESOLVED" "$succeeds_flag" 2>/dev/null; then
+        "${ROLE_RESOLVED:-worker}" "$ORCH_KIND_RESOLVED" "$succeeds_flag" "$resuming" 2>/dev/null; then
         echo -e "${YELLOW}⚠  Could not write session metadata.${RESET}" >&2
         echo -e "${DIM}   Path: $(_session_metadata_file "$session_name")${RESET}" >&2
         if [[ -n "$peer_name" ]]; then
@@ -15322,8 +15348,18 @@ _restart_agent_pid() {
 cmd_rename() {
     # Rename a session's display label everywhere: cctrl metadata, tmux
     # option, and the backing agent app title when a supported surface exists.
+    if [[ "${1:-}" == "--self" ]]; then
+        # Plan 100 D12: the session this process runs in. Only a cctrl tmux
+        # session exports both variables; anywhere else there is no "self".
+        if [[ "${CCTRL_SESSION_KIND:-}" != tmux || -z "${CCTRL_SESSION_NAME:-}" || $# -ne 2 ]]; then
+            echo "Usage: cctrl rename --self \"new label\"  (inside a cctrl tmux session only)" >&2
+            return 64
+        fi
+        set -- "$CCTRL_SESSION_NAME" "$2"
+    fi
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" || $# -lt 2 ]]; then
         echo "Usage: cctrl rename <session> \"new label\""
+        echo "       cctrl rename --self \"new label\"   (the current cctrl tmux session)"
         echo ""
         echo "  Update the display label for a session."
         echo "  Changes cctrl metadata, tmux @cctrl_purpose, and the app display name"
@@ -15392,6 +15428,7 @@ cmd_rename() {
         tpath="$(_session_transcript_path "$target" 2>/dev/null || true)"
         if [[ -n "$sid" && -n "$tpath" ]]; then
             local display_name="${new_label} (${target})"
+            _session_names_known_note_rename "$target" "$tpath" "$new_label"
             if _claude_set_display_name "$sid" "$display_name" "$tpath"; then
                 echo -e "${GREEN}✓${RESET} Renamed ${BOLD}$target${RESET} → \"$new_label\" (metadata + tmux + Claude transcript)"
             else
@@ -15406,64 +15443,249 @@ cmd_rename() {
     fi
 }
 
-_session_reconcile_names() {
-    # For each live Claude Code session, read the last custom-title from
-    # its transcript and sync into cctrl metadata if different.
-    # Direction: Claude wins — the user's most recent UI rename propagates.
-    local json_mode=false
-    [[ "${1:-}" == "--json" ]] && json_mode=true
+# ── Plan 100 phase 3 (D11): known-names bookkeeping ─────────────────────────
+# `label_names_known` is a JSON array stored as a STRING (both update paths
+# accept strings only), newest last. More than 32 distinct names is stored as
+# 33 entries and means FULL: reconcile then pulls nothing for that session.
+_SESSION_NAMES_CAP=32
 
-    local name corrections=0 json_entries=()
+_session_name_normalise() {
+    # Strip one trailing " (TMUX--...)" suffix, whatever tmux name is inside it,
+    # then trim. A bare tmux name is not a label: it normalises to empty, which
+    # is never stored and never pulled.
+    local n="$1"
+    local re='^(.*)[[:space:]]\(TMUX--[^)]*\)$'
+    n="${n%"${n##*[![:space:]]}"}"
+    if [[ "$n" =~ $re ]]; then
+        n="${BASH_REMATCH[1]}"
+    elif [[ "$n" =~ ^\(TMUX--[^\)]*\)$ ]]; then
+        n=""
+    fi
+    n="${n#"${n%%[![:space:]]*}"}"
+    n="${n%"${n##*[![:space:]]}"}"
+    # The kind's star is cctrl's decoration (D9): compared and stored without it.
+    n="${n#★★ }"; n="${n#★ }"; n="${n#☆ }"
+    [[ "$n" == TMUX--* ]] && n=""
+    printf '%s' "$n"
+}
+
+_session_names_known_sweep() {
+    # One pass over the whole transcript: every custom-title, normalised,
+    # distinct, ordered by LAST occurrence. One name per line.
+    local tpath="$1"
+    [[ -n "$tpath" && -f "$tpath" ]] || return 0
+    python3 - "$tpath" <<'PYSWEEP' 2>/dev/null || true
+import json, re, sys
+last = {}
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    for i, line in enumerate(f):
+        if '"custom-title"' not in line:
+            continue
+        try:
+            d = json.loads(line)
+        except Exception:
+            continue
+        if d.get("type") != "custom-title":
+            continue
+        t = d.get("customTitle")
+        if not isinstance(t, str):
+            continue
+        t = t.strip()
+        m = re.match(r"^(.*)\s\(TMUX--[^)]*\)$", t, re.S)
+        if m:
+            t = m.group(1)
+        elif re.match(r"^\(TMUX--[^)]*\)$", t):
+            t = ""
+        t = t.strip()
+        for g in ("\u2605\u2605 ", "\u2605 ", "\u2606 "):
+            if t.startswith(g):
+                t = t[len(g):]
+        t = t.strip()
+        if not t or t.startswith("TMUX--") or "\n" in t:
+            continue
+        last[t] = i
+for t in sorted(last, key=last.get):
+    print(t)
+PYSWEEP
+}
+
+_session_names_known_get() {
+    # Echo the stored JSON array text; empty when the record has no set.
+    local raw
+    raw="$(_session_metadata_field "$1" label_names_known 2>/dev/null || true)"
+    [[ -n "$raw" ]] && jq -e 'type == "array"' <<< "$raw" >/dev/null 2>&1 && printf '%s' "$raw"
+    return 0
+}
+
+_session_names_known_has() {
+    # args: session name (already normalised). 0 when the set holds it.
+    local raw
+    raw="$(_session_names_known_get "$1")"
+    [[ -n "$raw" ]] || return 1
+    jq -e --arg n "$2" 'index($n) != null' <<< "$raw" >/dev/null 2>&1
+}
+
+_session_names_known_full() {
+    local raw
+    raw="$(_session_names_known_get "$1")"
+    [[ -n "$raw" ]] || return 1
+    jq -e --argjson cap "$_SESSION_NAMES_CAP" 'length > $cap' <<< "$raw" >/dev/null 2>&1
+}
+
+_session_names_known_json() {
+    # args: existing-json-or-empty, then names. Merge (a re-added name moves to
+    # the end), keep the newest cap+1, print the array. Normalised, non-empty only.
+    local cur="${1:-[]}"; shift
+    local names=() n
+    for n in "$@"; do
+        n="$(_session_name_normalise "$n")"
+        [[ -n "$n" ]] && names+=("$n")
+    done
+    local add="[]"
+    (( ${#names[@]} == 0 )) || add="$(printf '%s\n' "${names[@]}" | jq -R . | jq -sc .)"
+    jq -nc --argjson cur "$cur" --argjson add "$add" --argjson cap "$_SESSION_NAMES_CAP" '
+        reduce $add[] as $n ($cur; (map(select(. != $n))) + [$n]) | .[-($cap + 1):]'
+}
+
+_session_names_known_store() {
+    # args: session json. Returns non-zero when the record cannot take it.
+    _session_update_metadata_field "$1" label_names_known "$2" 2>/dev/null
+}
+
+_session_names_known_add() {
+    # args: session names... Adds to the set (creating it). A full set stays as
+    # it is: nothing is evicted silently and reconcile keeps pulling nothing.
+    local sess="$1"; shift
+    local cur json
+    cur="$(_session_names_known_get "$sess")"
+    if [[ -n "$cur" ]] && _session_names_known_full "$sess"; then return 0; fi
+    json="$(_session_names_known_json "$cur" "$@")" || return 1
+    _session_names_known_store "$sess" "$json"
+}
+
+_session_names_known_note_rename() {
+    # cctrl rename: sweep the transcript (every title already in it), then add
+    # the new label. Best effort: a rename never fails because of bookkeeping.
+    local sess="$1" tpath="$2" label="$3" swept=()
+    [[ -f "$(_session_metadata_file "$sess")" ]] || return 0
+    local line
+    while IFS= read -r line; do [[ -n "$line" ]] && swept+=("$line"); done < <(_session_names_known_sweep "$tpath")
+    _session_names_known_add "$sess" ${swept[@]+"${swept[@]}"} "$label" || true
+    return 0
+}
+
+_session_reconcile_usage() {
+    echo "Usage: cctrl session reconcile-names [--dry-run] [--json]"
+    echo ""
+    echo "  Pull a name typed inside Claude into cctrl's label, but only a name cctrl"
+    echo "  has never launched, set or already pulled (the known-names set)."
+    echo "  A record with no set gets a baseline (current label + every transcript"
+    echo "  title) and pulls nothing."
+    echo ""
+    echo "  --dry-run  print what would change; write nothing"
+    echo "  --json     machine-readable output (carries \"dry_run\":true|false)"
+}
+
+_session_reconcile_names() {
+    # For each live Claude Code session: pull Claude's current title into the
+    # label ONLY when cctrl has never seen that name (D11). cctrl's label wins
+    # after `cctrl rename`; Claude wins only on a rename made inside Claude.
+    local json_mode=false dry_run=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --json) json_mode=true ;;
+            --dry-run) dry_run=true ;;
+            -h|--help) _session_reconcile_usage; return 0 ;;
+            *) echo "cctrl: reconcile-names: unknown argument: $arg" >&2
+               _session_reconcile_usage >&2; return 64 ;;
+        esac
+    done
+
+    local name corrections=0 json_entries=() base_entries=() full_entries=() text_lines=()
     for name in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
         [[ "$name" == TMUX--* ]] || continue
         local agent
         agent="$(tmux show-option -qv -t "=$name:" @cctrl_agent 2>/dev/null || true)"
         [[ "$agent" == "codex" ]] && continue
 
-        local tpath claude_title meta_purpose
+        local tpath claude_title meta_purpose meta_file claude_label
         tpath="$(_session_transcript_path "$name" 2>/dev/null || true)"
         [[ -n "$tpath" ]] || continue
 
         claude_title="$(_claude_get_display_name "$tpath")"
         [[ -n "$claude_title" ]] || continue
+        claude_label="$(_session_name_normalise "$claude_title")"
+        [[ -n "$claude_label" ]] || continue
 
-        # Strip the tmux suffix if present: "label (TMUX--ms--cctrl)" → "label"
-        local claude_label="$claude_title"
-        if [[ "$claude_title" == *" ($name)"* ]]; then
-            claude_label="${claude_title% ($name)*}"
-        fi
-
-        local meta_file
         meta_file="$(_session_metadata_file "$name")"
-        meta_purpose=""
-        [[ -f "$meta_file" ]] && meta_purpose="$(python3 -c "
-import json, sys
-with open(sys.argv[1]) as f: d = json.load(f)
-print(d.get('purpose', ''))
-" "$meta_file" 2>/dev/null || true)"
+        [[ -f "$meta_file" ]] || continue
+        meta_purpose="$(_session_metadata_field "$name" purpose 2>/dev/null || true)"
+        local purpose_norm
+        purpose_norm="$(_session_name_normalise "$meta_purpose")"
 
-        if [[ -n "$claude_label" && "$claude_label" != "$meta_purpose" ]]; then
-            # Update metadata
-            if [[ -f "$meta_file" ]]; then
-                _session_update_metadata_field "$name" purpose "$claude_label" 2>/dev/null || continue
+        local known
+        known="$(_session_names_known_get "$name")"
+        if [[ -z "$known" ]]; then
+            # No set (every pre-plan session, or a resumed launch): baseline,
+            # pull nothing.
+            local swept=() line
+            while IFS= read -r line; do [[ -n "$line" ]] && swept+=("$line"); done < <(_session_names_known_sweep "$tpath")
+            local bjson
+            bjson="$(_session_names_known_json "[]" ${swept[@]+"${swept[@]}"} "$meta_purpose" "$claude_label")" || continue
+            if $dry_run || _session_names_known_store "$name" "$bjson"; then
+                base_entries+=("$(jq -nc --arg s "$name" --argjson n "$(jq 'length' <<< "$bjson")" '{session:$s,names:$n}')")
+                text_lines+=("${DIM}$($dry_run && echo 'Would baseline' || echo 'Baseline'): $name (known names: $(jq 'length' <<< "$bjson"))${RESET}")
             fi
-            tmux set-option -t "=$name:" @cctrl_purpose "$claude_label" 2>/dev/null || true
-            corrections=$((corrections + 1))
-
-            if $json_mode; then
-                json_entries+=("$(printf '{"session":"%s","old":"%s","new":"%s"}' "$name" "$meta_purpose" "$claude_label")")
-            else
-                echo -e "${DIM}Synced: $name purpose → '$claude_label'${RESET}"
-            fi
+            continue
         fi
+        if _session_names_known_full "$name"; then
+            full_entries+=("$(jq -nc --arg s "$name" '{session:$s}')")
+            text_lines+=("${YELLOW}Full: $name has more than $_SESSION_NAMES_CAP known names; nothing pulled.${RESET}")
+            continue
+        fi
+        _session_names_known_has "$name" "$claude_label" && continue
+
+        # A name cctrl has never seen: a rename made inside Claude.
+        if [[ "$claude_label" == "$purpose_norm" ]]; then
+            $dry_run || _session_names_known_add "$name" "$claude_label" || true
+            continue
+        fi
+        # A known-kind orchestrator keeps its star on a pulled label (D9).
+        local new_label="$claude_label" rinfo rrole rkind
+        rinfo="$(_session_role_of "$name")"
+        rrole="${rinfo%%|*}"; rinfo="${rinfo#*|}"; rkind="${rinfo%%|*}"
+        [[ "$rrole" == orchestrator ]] && new_label="$(_role_apply_glyph "$rkind" "$claude_label")"
+        if ! $dry_run; then
+            # Order: the known-names set first (if it cannot be recorded, pull
+            # nothing), then the label, then the tmux option. A later failure
+            # leaves the old label, the safe direction.
+            _session_names_known_add "$name" "$claude_label" || continue
+            _session_update_metadata_field "$name" purpose "$new_label" 2>/dev/null || continue
+            tmux set-option -t "=$name:" @cctrl_purpose "$new_label" 2>/dev/null || true
+        fi
+        corrections=$((corrections + 1))
+        json_entries+=("$(jq -nc --arg s "$name" --arg o "$meta_purpose" --arg n "$new_label" '{session:$s,old:$o,new:$n}')")
+        text_lines+=("${DIM}$($dry_run && echo 'Would sync' || echo 'Synced'): $name purpose → '$new_label'${RESET}")
     done
 
     if $json_mode; then
-        printf '{"corrections":%d,"details":[%s]}\n' "$corrections" "$(IFS=,; echo "${json_entries[*]:-}")"
-    elif (( corrections == 0 )); then
-        echo -e "${DIM}All session names in sync.${RESET}"
+        jq -nc --argjson dry "$($dry_run && echo true || echo false)" --argjson c "$corrections" \
+            --argjson d "[$(IFS=,; echo "${json_entries[*]:-}")]" \
+            --argjson b "[$(IFS=,; echo "${base_entries[*]:-}")]" \
+            --argjson f "[$(IFS=,; echo "${full_entries[*]:-}")]" \
+            '{dry_run:$dry,corrections:$c,details:$d,baselines:$b,full:$f}'
     else
-        echo -e "${GREEN}✓${RESET} Reconciled $corrections session name(s)."
+        local l
+        if (( ${#text_lines[@]} > 0 )); then
+            for l in "${text_lines[@]}"; do printf '%b\n' "$l"; done
+        fi
+        if (( corrections == 0 )); then
+            echo -e "${DIM}All session names in sync.${RESET}"
+        elif $dry_run; then
+            echo -e "${GREEN}✓${RESET} Would reconcile $corrections session name(s) (dry run, nothing written)."
+        else
+            echo -e "${GREEN}✓${RESET} Reconciled $corrections session name(s)."
+        fi
     fi
 }
 

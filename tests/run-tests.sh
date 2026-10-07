@@ -13652,6 +13652,364 @@ test_replay_keeps_label_verbatim() {
     echo "ok: a replayed label is kept verbatim and the name is not re-derived"
 }
 
+# ── Plan 100 phase 3: label bookkeeping (D11 known names, D12) ─────────────
+# Reconcile runs from the sourced script against the fake tmux, a sandbox
+# registry (CCTRL_SESSION_METADATA_DIR) and a fixture transcript. Nothing here
+# reaches the real tmux server, registry or ~/.claude.
+
+_p3_setup() {
+    # args: tag
+    _p2_setup "p3$1" '{}'
+    P3_TP="$TMPDIR/p3-$1.jsonl"; : > "$P3_TP"
+}
+
+_p3_cc() {
+    # args: code args... -> code runs in the sourced script with the transcript seam
+    local code="$1"; shift
+    TMUX_FAKE_STATE="$P2_STATE" TMUX_LOG="$RF_LOG" PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms P3_TP="$P3_TP" \
+        cctrl_source_eval '_session_transcript_path() { printf %s "$P3_TP"; }; _session_id() { echo sid-p3; }; '"$code" "$@"
+}
+
+_p3_rec() {
+    # args: session purpose conv(empty = fresh launch with a set) [role kind]
+    CCTRL_HOST_PREFIX=ms cctrl_source_eval '_session_write_metadata "$1" /tmp @x @x @x "$2" "" cmd "" claude "$3" "" "" "" "" "" "" "" "${4:-worker}" "${5:-}"' "$1" "$2" "$3" "${4:-}" "${5:-}" \
+        || fail "fixture record for $1 could not be written"
+    _p2_live "$1"
+}
+
+_p3_title() {
+    # args: session label [raw] -> append a custom-title line like the running process does
+    local t="$2 ($1)"
+    [[ -n "${3:-}" ]] && t="$2"
+    jq -nc --arg t "$t" '{type:"custom-title",customTitle:$t,sessionId:"sid-p3"}' >> "$P3_TP"
+}
+
+_p3_purpose() { session_record_json "$1" | jq -r '.purpose // empty'; }
+_p3_known() { session_record_json "$1" | jq -r '.label_names_known // empty'; }
+_p3_rec_conv() { printf 'conv-p3-%s' "${1//[^a-z0-9]/-}"; }
+_p3_reconcile() { _p3_cc '_session_reconcile_names "$@"' "$@" 2>&1; }
+_p3_rename() { _p3_cc 'cmd_rename "$@"' "$1" "$2" >/dev/null 2>&1 || fail "rename $1 failed"; }
+_p3_state_sum() {
+    { (cd "$CCTRL_SESSION_METADATA_DIR" && find . -type f ! -path './.task-registry-locks/*' | sort | while read -r f; do echo "$f"; cat "$f"; done)
+      cat "$P3_TP"; grep -c 'set-option' "$RF_LOG" || true; } | shasum | awk '{print $1}'
+}
+
+test_reconcile_names_legacy_record_without_known_names_is_not_pulled() {
+    _p3_setup l1
+    local s=TMUX--ms--p3-legacy out
+    _p3_rec "$s" "mine" "$(_p3_rec_conv "$s")"
+    _p3_title "$s" "something else"
+    out="$(_p3_reconcile)"
+    [[ "$(_p3_purpose "$s")" == mine ]] || fail "legacy record was pulled: $(_p3_purpose "$s") / $out"
+    assert_not_contains "$(cat "$RF_LOG")" "set-option -t =$s: @cctrl_purpose"
+    echo "ok: a record with no known-names set is baselined, never pulled"
+}
+
+test_reconcile_names_writes_baseline_once() {
+    _p3_setup b1
+    local s=TMUX--ms--p3-base out
+    _p3_rec "$s" "mine" "$(_p3_rec_conv "$s")"
+    _p3_title "$s" "older name"; _p3_title "$s" "latest name"
+    out="$(_p3_reconcile --json)"
+    [[ "$(jq '.baselines | length' <<< "$out")" == 1 ]] || fail "first run should write one baseline: $out"
+    jq -e 'index("mine") != null and index("older name") != null and index("latest name") != null' <<< "$(_p3_known "$s")" >/dev/null \
+        || fail "baseline must hold purpose and every title: $(_p3_known "$s")"
+    local sum; sum="$(_p3_state_sum)"
+    out="$(_p3_reconcile --json)"
+    [[ "$(jq '.baselines | length' <<< "$out")" == 0 ]] || fail "second run wrote a baseline again: $out"
+    [[ "$(_p3_state_sum)" == "$sum" ]] || fail "second run changed state"
+    echo "ok: the baseline is written once"
+}
+
+test_reconcile_names_does_not_pull_launch_name_restamp() {
+    _p3_setup r1
+    local s=TMUX--ms--p3-restamp
+    _p3_rec "$s" "launch name" ""
+    _p3_title "$s" "launch name"
+    _p3_rename "$s" "cctrl label"
+    _p3_title "$s" "launch name"        # the running process re-stamps its in-memory name
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "cctrl label" ]] || fail "launch-name re-stamp was pulled: $(_p3_purpose "$s")"
+    echo "ok: a re-stamp of the launch name is not pulled"
+}
+
+test_reconcile_names_cctrl_label_stays_after_cctrl_rename() {
+    _p3_setup c1
+    local s=TMUX--ms--p3-stays
+    _p3_rec "$s" "first" ""
+    _p3_title "$s" "first"
+    _p3_rename "$s" "second"
+    _p3_reconcile >/dev/null
+    _p3_title "$s" "first"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == second ]] || fail "cctrl label did not stay: $(_p3_purpose "$s")"
+    echo "ok: cctrl's label wins after cctrl rename"
+}
+
+test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator() {
+    _p3_setup w1
+    local w=TMUX--ms--p3-worker o=TMUX--ms--p3-orch
+    _p3_rec "$w" "worker label" ""
+    _p3_rec "$o" "★ orch label" "" orchestrator repo
+    _p3_title "$w" "worker label"; _p3_title "$o" "★ orch label"
+    _p3_reconcile >/dev/null
+    _p3_title "$w" "typed in claude"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$w")" == "typed in claude" ]] || fail "worker not pulled: $(_p3_purpose "$w")"
+    assert_contains "$(cat "$RF_LOG")" "set-option -t =$w: @cctrl_purpose typed\\ in\\ claude"
+    # the orchestrator session uses its own transcript title
+    : > "$P3_TP"; _p3_title "$o" "★ orch label"; _p3_title "$o" "orch typed in claude"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$o")" == "★ orch typed in claude" ]] || fail "orchestrator not pulled: $(_p3_purpose "$o")"
+    echo "ok: a rename made inside Claude is pulled for a worker and an orchestrator"
+}
+
+test_reconcile_names_cctrl_rename_after_pull_stays() {
+    _p3_setup a1
+    local s=TMUX--ms--p3-afterpull
+    _p3_rec "$s" "start" ""
+    _p3_title "$s" "start"
+    _p3_title "$s" "X from claude"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "X from claude" ]] || fail "pull failed: $(_p3_purpose "$s")"
+    _p3_rename "$s" "Y from cctrl"
+    _p3_title "$s" "X from claude"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "Y from cctrl" ]] || fail "Y was reverted: $(_p3_purpose "$s")"
+    echo "ok: a cctrl rename after a pull stays"
+}
+
+test_reconcile_names_no_pull_when_baseline_cannot_be_written() {
+    _p3_setup n1
+    local s=TMUX--ms--p3-nobase out
+    _p3_rec "$s" "mine" "$(_p3_rec_conv "$s")"
+    _p3_title "$s" "foreign"
+    out="$(_p3_cc '_session_names_known_store() { return 1; }; _session_reconcile_names --json')"
+    [[ "$(_p3_purpose "$s")" == mine ]] || fail "pulled without a baseline: $(_p3_purpose "$s")"
+    [[ "$(jq -r '.corrections' <<< "$out")" == 0 ]] || fail "no correction expected: $out"
+    [[ -z "$(_p3_known "$s")" ]] || fail "a set appeared although the store failed"
+    echo "ok: no pull when the baseline cannot be written"
+}
+
+test_restore_keeps_known_names_and_pulls_nothing() {
+    local dir="$TMPDIR/p3-restore-keep" rec
+    _restore_role_fixture "$dir"
+    # An existing record for the restored conversation, with a known-names set.
+    CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_HOST_PREFIX=ms \
+        cctrl_source_eval '_session_write_metadata TMUX--cctrl /tmp @x @x @x "kept label" "" cmd "" claude conv-aaa-111 "" "" "" "" "" "" "" worker "" \
+            && _session_update_metadata_field TMUX--cctrl label_names_known "[\"keep me\",\"and me\"]"' \
+        || fail "could not seed a record with a set"
+    local rout rrc=0
+    rout="$(TMUX_LOG="$dir/tmux.log" CCTRL_DEVICE_TAG=ms _restore_run_real "$dir" --only cctrl --yes 2>&1 </dev/null)" || rrc=$?
+    [[ "$rrc" -eq 0 ]] || fail "restore failed ($rrc): $(tail -n 6 <<< "$rout")"
+    rec="$(grep -l 'conv-aaa-111' "$dir/session-metadata"/*.json | head -n 1)"
+    [[ -n "$rec" ]] || fail "no record after restore"
+    [[ "$(jq -r '.label_names_known // empty' "$rec")" == '["keep me","and me"]' ]] \
+        || fail "restore changed the set: $(jq -r '.label_names_known' "$rec")"
+    echo "ok: a restore keeps the known names"
+}
+
+test_reconcile_names_full_set_pulls_nothing() {
+    _p3_setup f1
+    local s=TMUX--ms--p3-full out names
+    _p3_rec "$s" "mine" ""
+    names="$(jq -nc '[range(0;33) | "name-\(.)"]')"
+    _p3_cc '_session_update_metadata_field "$1" label_names_known "$2"' "$s" "$names" || fail "seed full set"
+    _p3_title "$s" "brand new typed name"
+    out="$(_p3_reconcile --json)"
+    [[ "$(_p3_purpose "$s")" == mine ]] || fail "full set pulled: $(_p3_purpose "$s")"
+    [[ "$(jq '.full | length' <<< "$out")" == 1 ]] || fail "full session not reported: $out"
+    out="$(_p3_reconcile --dry-run --json)"
+    [[ "$(jq '.full | length' <<< "$out")" == 1 ]] || fail "dry run must report the full session: $out"
+    _p3_rename "$s" "still works"
+    [[ "$(_p3_purpose "$s")" == "still works" ]] || fail "rename must keep working on a full set"
+    echo "ok: a full set fails closed, is reported, and rename still works"
+}
+
+test_restore_of_record_without_known_names_gets_baseline_not_seed() {
+    local dir="$TMPDIR/p3-restore-noset" rec
+    _p2_restore_row_run "$dir" '{}'
+    rec="$(grep -l 'conv-aaa-111' "$dir/session-metadata"/*.json | head -n 1)"
+    [[ -n "$rec" ]] || fail "no record after restore"
+    [[ "$(jq -r '.label_names_known // "none"' "$rec")" == none ]] || fail "a resumed launch must not seed the set: $(jq -r .label_names_known "$rec")"
+    # and its first reconcile baselines instead of pulling
+    _p3_setup rs
+    local s=TMUX--ms--p3-resumed
+    _p3_rec "$s" "kept" "$(_p3_rec_conv "$s")"
+    _p3_title "$s" "claude says"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == kept ]] || fail "pulled on the first reconcile: $(_p3_purpose "$s")"
+    [[ -n "$(_p3_known "$s")" ]] || fail "no baseline written"
+    # a resume with no id (-r picker, -c, --resume=<id>) is not a fresh launch either
+    _p3_setup rs3
+    local s2=TMUX--ms--p3-picker
+    CCTRL_HOST_PREFIX=ms cctrl_source_eval '_session_write_metadata "$1" /tmp @x @x @x "lbl" "" cmd "" claude "" "" "" "" "" "" "" "" worker "" "" 1' "$s2" \
+        || fail "resuming fixture"
+    [[ -z "$(_p3_known "$s2")" ]] || fail "a resume without an id seeded the set: $(_p3_known "$s2")"
+    echo "ok: a restored record with no set is baselined, never seeded from the purpose"
+}
+
+test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled() {
+    _p3_setup lr
+    local s=TMUX--ms--p3-legrename
+    _p3_rec "$s" "old label" "$(_p3_rec_conv "$s")"
+    _p3_title "$s" "older name"
+    _p3_rename "$s" "new label"
+    _p3_reconcile >/dev/null
+    _p3_title "$s" "older name"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "new label" ]] || fail "legacy re-stamp reverted the label: $(_p3_purpose "$s")"
+    echo "ok: legacy record, cctrl rename, baseline, re-stamp of the older name: nothing pulled"
+}
+
+test_reconcile_names_older_restamped_title_is_never_pulled() {
+    _p3_setup ol
+    local s=TMUX--ms--p3-older
+    _p3_rec "$s" "now" ""
+    _p3_title "$s" "now"; _p3_title "$s" "mid"; _p3_title "$s" "now"
+    _p3_rename "$s" "latest"
+    _p3_title "$s" "mid"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == latest ]] || fail "an older title was pulled: $(_p3_purpose "$s")"
+    echo "ok: any title that is earlier in the transcript is never pulled"
+}
+
+test_reconcile_names_in_claude_rename_then_cctrl_rename_stays() {
+    _p3_setup ic
+    local s=TMUX--ms--p3-inclaude
+    _p3_rec "$s" "start" ""
+    _p3_title "$s" "start"
+    _p3_title "$s" "X typed in claude"      # never reconciled
+    _p3_rename "$s" "Y from cctrl"
+    _p3_title "$s" "X typed in claude"      # re-stamped
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "Y from cctrl" ]] || fail "Y was reverted: $(_p3_purpose "$s")"
+    echo "ok: in-Claude rename X, cctrl rename Y, re-stamp of X: Y stays"
+}
+
+test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled() {
+    _p3_setup nw
+    local s=TMUX--ms--p3-newname
+    _p3_rec "$s" "start" ""
+    _p3_title "$s" "start"
+    _p3_rename "$s" "from cctrl"
+    _p3_title "$s" "a brand new name"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "a brand new name" ]] || fail "new in-Claude name not pulled: $(_p3_purpose "$s")"
+    echo "ok: a name in no earlier title is pulled even after a cctrl rename"
+}
+
+test_reconcile_names_strips_old_tmux_suffix_after_restore() {
+    _p3_setup sf
+    local s=TMUX--ms--p3-newtmux
+    _p3_rec "$s" "the label" ""
+    _p3_title "TMUX--ms--p3-oldtmux" "the label"
+    _p3_reconcile >/dev/null
+    [[ "$(_p3_purpose "$s")" == "the label" ]] || fail "old-suffix title was pulled: $(_p3_purpose "$s")"
+    assert_not_contains "$(_p3_known "$s")" "TMUX--"
+    echo "ok: a title carrying an older tmux name is the same name"
+}
+
+test_reconcile_names_normalises_suffix_on_store_and_compare() {
+    cctrl_source_eval '
+        [[ "$(_session_name_normalise "a b (TMUX--ms--x)")" == "a b" ]] || exit 1
+        [[ "$(_session_name_normalise "a b (TMUX--other--y)  ")" == "a b" ]] || exit 2
+        [[ "$(_session_name_normalise "  a (b) ")" == "a (b)" ]] || exit 3
+        [[ -z "$(_session_name_normalise "(TMUX--only)")" ]] || exit 4
+        [[ -z "$(_session_name_normalise "TMUX--ms--bare")" ]] || exit 5
+        [[ "$(_session_names_known_json "[]" "n (TMUX--a)" "m" "n (TMUX--b)")" == "[\"m\",\"n\"]" ]] || exit 6' \
+        || fail "normalisation check failed at step $?"
+    echo "ok: names are normalised before store and compare"
+}
+
+test_reconcile_names_dry_run_writes_nothing() {
+    _p3_setup dr
+    local s=TMUX--ms--p3-dry t=TMUX--ms--p3-dry2 sum
+    _p3_rec "$s" "mine" "$(_p3_rec_conv "$s")"   # baseline case
+    _p3_title "$s" "foreign"
+    sum="$(_p3_state_sum)"
+    _p3_reconcile --dry-run >/dev/null; [[ "$(_p3_state_sum)" == "$sum" ]] || fail "dry run (text, baseline) wrote"
+    _p3_reconcile --dry-run --json >/dev/null; [[ "$(_p3_state_sum)" == "$sum" ]] || fail "dry run (json, baseline) wrote"
+    # correction case: a record with a set and a new name
+    _p3_reconcile >/dev/null
+    _p3_title "$s" "typed later"
+    sum="$(_p3_state_sum)"
+    _p3_reconcile --json --dry-run >/dev/null; [[ "$(_p3_state_sum)" == "$sum" ]] || fail "dry run (json, correction) wrote"
+    _p3_reconcile --dry-run >/dev/null; [[ "$(_p3_state_sum)" == "$sum" ]] || fail "dry run (text, correction) wrote"
+    echo "ok: --dry-run writes no metadata, tmux option or transcript line"
+}
+
+test_reconcile_names_dry_run_reports_would_be_corrections() {
+    _p3_setup dc
+    local s=TMUX--ms--p3-would out
+    _p3_rec "$s" "mine" ""
+    _p3_title "$s" "mine"; _p3_reconcile >/dev/null
+    _p3_title "$s" "typed in claude"
+    out="$(_p3_reconcile --dry-run --json)"
+    jq -e '.dry_run == true and .corrections == 1 and .details[0].new == "typed in claude" and .details[0].old == "mine"' <<< "$out" >/dev/null \
+        || fail "dry-run json: $out"
+    [[ "$(_p3_purpose "$s")" == mine ]] || fail "dry run changed the label"
+    jq -e '.dry_run == false' <<< "$(_p3_reconcile --json)" >/dev/null || fail "real json must say dry_run false"
+    echo "ok: --dry-run reports the corrections it would make"
+}
+
+test_reconcile_names_help_and_unknown_flag_write_nothing() {
+    _p3_setup hf
+    local s=TMUX--ms--p3-help out rc=0 sum
+    _p3_rec "$s" "mine" "$(_p3_rec_conv "$s")"
+    _p3_title "$s" "foreign"
+    sum="$(_p3_state_sum)"
+    out="$(_p3_reconcile --help)" || fail "--help must exit 0"
+    assert_contains "$out" "Usage: cctrl session reconcile-names"
+    out="$(_p3_reconcile -h --json)" || fail "-h must exit 0"
+    [[ "$(_p3_state_sum)" == "$sum" ]] || fail "--help wrote"
+    _p3_cc '_session_reconcile_names "$@"' --bogus >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "unknown flag must exit 64, got $rc"
+    rc=0; _p3_cc '_session_reconcile_names "$@"' --dry-run --bogus >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "unknown flag after --dry-run must exit 64, got $rc"
+    [[ "$(_p3_state_sum)" == "$sum" ]] || fail "an unknown flag wrote"
+    echo "ok: --help and an unknown flag write nothing (unknown exits 64)"
+}
+
+test_rename_self_resolves_current_session() {
+    _p3_setup rs1
+    local s=TMUX--ms--p3-self
+    _p3_rec "$s" "before" ""
+    TMUX_FAKE_STATE="$P2_STATE" TMUX_LOG="$RF_LOG" PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="$s" \
+        "$RF_COPY/cctrl" rename --self "after self" </dev/null >/dev/null 2>&1 || fail "rename --self failed"
+    [[ "$(_p3_purpose "$s")" == "after self" ]] || fail "label not changed: $(_p3_purpose "$s")"
+    echo "ok: rename --self resolves the current session"
+}
+
+test_rename_self_outside_session_exits_64() {
+    _p3_setup rs2
+    local s=TMUX--ms--p3-noself rc=0 sum
+    _p3_rec "$s" "before" ""
+    sum="$(_p3_state_sum)"
+    TMUX_FAKE_STATE="$P2_STATE" TMUX_LOG="$RF_LOG" PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_SESSION_NAME="$s" \
+        "$RF_COPY/cctrl" rename --self "x" </dev/null >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "no CCTRL_SESSION_KIND must exit 64, got $rc"
+    rc=0
+    TMUX_FAKE_STATE="$P2_STATE" TMUX_LOG="$RF_LOG" PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_SESSION_KIND=codex CCTRL_SESSION_NAME="$s" \
+        "$RF_COPY/cctrl" rename --self "x" </dev/null >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "a non-tmux kind must exit 64, got $rc"
+    [[ "$(_p3_state_sum)" == "$sum" ]] || fail "a refused --self changed state"
+    echo "ok: rename --self outside a cctrl tmux session exits 64"
+}
+
+test_auto_label_for_handoff_prompt_uses_slug() {
+    cctrl_source_eval '
+        [[ "$(_generate_auto_purpose "resume from handoff smoke-x" myrepo)" == "myrepo: smoke-x" ]] || exit 1
+        [[ "$(_generate_auto_purpose "Resume from handoff plan100-phase3. Then do more things" myrepo)" == "myrepo: plan100-phase3" ]] || exit 2
+        [[ "$(CCTRL_TITLE_MODE=heuristic _generate_auto_purpose "fix the login bug" myrepo)" == "myrepo: fix the login bug" ]] || exit 3' \
+        || fail "auto label check failed at step $?"
+    _p2_setup hs '{}'
+    local out
+    out="$(CCTRL_TITLE_MODE=heuristic _p2 start -d "$RF_PROJ" -m "resume from handoff smoke-x")" || fail "launch failed: $out"
+    [[ "$(_rf_field "$out" purpose)" == "${RF_PROJ##*/}: smoke-x" ]] || fail "launch label: $(_rf_field "$out" purpose)"
+    echo "ok: a resume-from-handoff prompt is labelled <repo>: <slug>"
+}
+
 test_set_role_relabel_writes_canonical_label() {
     _p2_setup rl '{}'
     local out sess
@@ -14368,6 +14726,32 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        role-phase3)
+            test_reconcile_names_legacy_record_without_known_names_is_not_pulled
+            test_reconcile_names_writes_baseline_once
+            test_reconcile_names_does_not_pull_launch_name_restamp
+            test_reconcile_names_cctrl_label_stays_after_cctrl_rename
+            test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator
+            test_reconcile_names_cctrl_rename_after_pull_stays
+            test_reconcile_names_no_pull_when_baseline_cannot_be_written
+            test_restore_keeps_known_names_and_pulls_nothing
+            test_reconcile_names_full_set_pulls_nothing
+            test_restore_of_record_without_known_names_gets_baseline_not_seed
+            test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled
+            test_reconcile_names_older_restamped_title_is_never_pulled
+            test_reconcile_names_in_claude_rename_then_cctrl_rename_stays
+            test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled
+            test_reconcile_names_strips_old_tmux_suffix_after_restore
+            test_reconcile_names_normalises_suffix_on_store_and_compare
+            test_reconcile_names_dry_run_writes_nothing
+            test_reconcile_names_dry_run_reports_would_be_corrections
+            test_reconcile_names_help_and_unknown_flag_write_nothing
+            test_rename_self_resolves_current_session
+            test_rename_self_outside_session_exits_64
+            test_auto_label_for_handoff_prompt_uses_slug
+            echo "ok"
+            exit 0
+            ;;
         role-phase2)
             test_fleet_orchestrator_name_and_star_label
             test_repo_orchestrator_name_and_star_label
@@ -14619,6 +15003,28 @@ test_restore_keeps_recorded_name_for_tagged_fleet_row
 test_restore_keeps_recorded_name_for_tagged_repo_row_with_index
 test_restore_beside_live_session_of_same_name_gets_next_index
 test_restore_keeps_phase2_style_names
+test_reconcile_names_legacy_record_without_known_names_is_not_pulled
+test_reconcile_names_writes_baseline_once
+test_reconcile_names_does_not_pull_launch_name_restamp
+test_reconcile_names_cctrl_label_stays_after_cctrl_rename
+test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator
+test_reconcile_names_cctrl_rename_after_pull_stays
+test_reconcile_names_no_pull_when_baseline_cannot_be_written
+test_restore_keeps_known_names_and_pulls_nothing
+test_reconcile_names_full_set_pulls_nothing
+test_restore_of_record_without_known_names_gets_baseline_not_seed
+test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled
+test_reconcile_names_older_restamped_title_is_never_pulled
+test_reconcile_names_in_claude_rename_then_cctrl_rename_stays
+test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled
+test_reconcile_names_strips_old_tmux_suffix_after_restore
+test_reconcile_names_normalises_suffix_on_store_and_compare
+test_reconcile_names_dry_run_writes_nothing
+test_reconcile_names_dry_run_reports_would_be_corrections
+test_reconcile_names_help_and_unknown_flag_write_nothing
+test_rename_self_resolves_current_session
+test_rename_self_outside_session_exits_64
+test_auto_label_for_handoff_prompt_uses_slug
 test_realign_of_tagged_orchestrator_keeps_recorded_name
 test_fresh_orchestrator_launch_still_gets_role_name
 test_dir_launch_no_shortcut_match_unchanged

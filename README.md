@@ -1076,6 +1076,22 @@ tmux options. It never renames or restarts a session and relabels only with
 `--relabel` (the canonical star label, for an orchestrator of known kind).
 `--orch-kind fleet` goes through the guard (the session itself excluded).
 
+**Labels stay put (`reconcile-names`).** `cctrl session reconcile-names` pulls a
+name typed inside Claude into cctrl's label only if cctrl has never seen that
+name: each record keeps a set of known names (the launch label, every
+`cctrl rename`, every title already in the transcript, every name already
+pulled), compared without the ` (TMUX--...)` suffix and without the star. So
+cctrl's label wins after `cctrl rename`, even while the running Claude keeps
+re-stamping its older name. A record with no set (every session from before this
+change, and a resumed launch) gets a baseline on its first reconcile and pulls
+nothing. A set of more than 32 names fails closed: nothing is pulled and the
+session is reported. `--dry-run` prints what would change and writes nothing;
+`--json` carries `"dry_run":true|false`, `baselines` and `full`; an unknown
+flag exits 64. `cctrl rename --self "<label>"` renames the session this process
+runs in (`CCTRL_SESSION_KIND=tmux` and `CCTRL_SESSION_NAME` set; otherwise exit
+64). A worker launched with a prompt starting `resume from handoff <slug>` gets
+the label `<repo>: <slug>`.
+
 ### Peers
 
 Peers are named coding agents that other cctrl workflows can address. The peer

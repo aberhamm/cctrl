@@ -450,8 +450,8 @@ later one the launch name again. `_claude_get_display_name` returns only the
 last title, from a 500-line tail scan.
 
 The record gains `label_names_known`: a JSON array stored as a string (both
-update paths accept strings only), newest last, capped at 32 distinct names,
-managed by `_session_names_known_add` / `_session_names_known_has`. It holds
+update paths accept strings only), newest last,
+managed by `_session_names_known_add` / `_session_names_known_has`. A set of more than 32 distinct names is stored as 33 entries and means FULL (no separate field; sticky). It holds
 every label cctrl launched the session with, set by `cctrl rename`, already
 pulled, **and every title that was already in the transcript at the baseline or
 at a `cctrl rename`**.
@@ -465,7 +465,7 @@ ignored: never stored, never pulled.
 
 **Transcript sweep** (`_session_names_known_sweep`): one pass over the whole
 transcript file for `custom-title` lines (not the 500-line tail scan), each
-`customTitle` normalised, distinct names added in file order. No transcript
+`customTitle` normalised, distinct names added. No transcript
 yet: nothing to add.
 
 | Event | Effect |
@@ -484,9 +484,11 @@ Checked against M9 and the rev3 review's two cases:
 Known limits: renaming inside Claude back to a name cctrl has already seen is
 not pulled; use `cctrl rename`.
 
-The set never evicts silently. Names are ordered by their LAST occurrence in the transcript (a name the process still re-stamps is always recent). When a session has more than 32 distinct names the record is marked full and reconcile pulls nothing for that session; it reports the session (also in `--dry-run`). `cctrl rename` keeps working.
+The set never evicts, so name order does not matter. When a session has more than 32 distinct names the set is FULL (33 entries, sticky) and reconcile pulls nothing for that session; it reports the session (also in `--dry-run`). `cctrl rename` keeps working on a full set: it writes `.purpose` and adds nothing to the set. `label_names_known` is in the provisional-record allow-list, so rename and the baseline also work before the stable id exists.
 
-A launch with a resume id never seeds the set from the purpose alone: `_session_write_metadata` leaves `label_names_known` out when `-r` is given. A record that already has a set keeps it (the field is not in the relaunch merge list); a record without one gets the normal baseline (pull nothing) on its first reconcile.
+A launch with a resume id never seeds the set from the purpose alone: `_session_write_metadata` leaves `label_names_known` out when `conversation_id` (its 11th argument, `$resume_id` at the call site) is non-empty. A record that already has a set keeps it (the field is not in the relaunch merge list); a record without one gets the normal baseline (pull nothing) on its first reconcile.
+
+**Pull rules.** Names are compared without the kind's star and without a ` (TMUX--...)` suffix; a bare `TMUX--...` title is never a label. A pulled name on a known-kind orchestrator goes through `_role_apply_glyph`, so the star stays (D9). Write order for a pull: the set, then `.purpose`, then `@cctrl_purpose`; if the set cannot be written nothing is pulled, and a later failure leaves the old label. `cctrl rename` on a record with no set writes the set (transcript sweep + the new label).
 
 **Dry run.** `cctrl session reconcile-names` gets a real argument loop:
 `--dry-run`, `--json`, `-h`/`--help` in any order; an unknown argument exits 64
@@ -501,8 +503,8 @@ reaching a running Claude process is plan 101.
 ### D12. Labelling after creation (phase 3)
 
 - `-n` stays mandatory in the spawn doctrine.
-- `cctrl rename --self "<label>"`: resolves the session from `CCTRL_SESSION_NAME` when `CCTRL_SESSION_KIND=tmux`; otherwise exit 64.
-- Worker auto label for a prompt starting `resume from handoff <slug>`: `<repo>: <slug>` instead of the first eight words.
+- `cctrl rename --self "<label>"`: the `--self` arm is parsed first; it resolves the session from `CCTRL_SESSION_NAME` when `CCTRL_SESSION_KIND=tmux`; otherwise exit 64.
+- Worker auto label for a prompt starting `resume from handoff <slug>`: `<repo>: <slug>` instead of the first eight words. The slug is the first token after the phrase with trailing punctuation stripped; it runs before the LLM title path; an empty slug falls back to the normal title.
 
 ### D13. Data migration
 
@@ -885,3 +887,10 @@ Left as follow-ups:
 - #8: `_session_ls_role_footers` calls `_session_role_of` three times per session (unknown-kind pass, claude, codex). Compute the role once per session; about 150 extra subprocesses on a 20-session host, human `session ls` only.
 - `set-role` writes the record and tmux options before `--relabel` renames; a failed rename leaves the tag applied (the output says so).
 - The fleet lock is per machine and per runtime; a remote fleet manager is not seen by the guard (plan: per machine for now).
+
+## Phase 3 review follow-ups
+
+Text review (Opus, before coding): design sound. REQUIRED text fixes 1-6 applied above (provisional allow-list, FULL encoding, cap/ordering wording, `conversation_id` as the resume signal, star glyph on a pull, write order). RECOMMENDED taken: `--self` parsed first, jq-built JSON with `baselines` and `full` entries, rename writes a missing set, slug rules. RECOMMENDED skipped: cross-checking `CCTRL_SESSION_NAME` against `tmux display -p '#S'` (an untargeted tmux call, see docs/findings/tmux-untargeted-default-server.md).
+
+
+Diff review (Opus, `.mstack/handoffs/2026-10-07-plan100-phase3-opus-review.md`): REQUIRED 1 fixed (`_start` parser sets `resuming` for `-r` with or without an id, `-c`, `--continue`, `--resume=`; passed as the 22nd argument of `_session_write_metadata`, which then leaves the set out). RECOMMENDED taken: 2 (`★★ ` stripped), 8 (leading quotes in the slug). Skipped: 3 (rename without a transcript adds nothing; a later baseline covers it), 4 (unlocked read-modify-write, fails safe), 5 (baseline store may promote a legacy record with a stable id: noted in the ship step), 6 (`baseline_failed` report), 7 (labels containing backslash sequences are mangled in text output only).
