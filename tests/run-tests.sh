@@ -783,6 +783,29 @@ test_syntax() {
     done
 }
 
+test_every_defined_test_is_registered() {
+    # A test_* function that is defined but never called is a dead test: it
+    # gives false confidence. dbe923e silently dropped 31 restore/snapshot
+    # tests from the call list this way (plan 097). A test counts as
+    # registered when some other line consists solely of its name (a call in
+    # the main list, a focused group, or a nested block). Intentionally
+    # skipped tests are listed in the allowlist below WITH a reason; the
+    # listing line itself counts as the use.
+    : <<'ALLOWLIST'
+    # hangs on macOS bash 3.2 (flock issue); call is commented out in the main list
+    test_peer_mailbox_concurrency_and_stale_lock
+ALLOWLIST
+    local dead
+    dead="$(awk '
+        match($0, /^test_[A-Za-z0-9_]+\(\)/) { n=substr($0, 1, RLENGTH-2); defs[n]=1; next }
+        { t=$0; gsub(/^[ \t]+|[ \t]+$/, "", t); if (t ~ /^test_[A-Za-z0-9_]+$/) used[t]=1 }
+        END { for (n in defs) if (!(n in used)) print n }
+    ' "$ROOT/tests/run-tests.sh" | sort)"
+    [[ -z "$dead" ]] || fail "test_* functions defined but never called (register them, or allowlist with a reason):
+$dead"
+    echo "ok: every defined test_* function is registered"
+}
+
 test_no_errexit_unsafe_post_increment() {
     # Under bash >= 4.1 with `set -e`, a standalone `((x++))` whose old value
     # is 0 evaluates to 0, returns status 1, and exits the script. bash 3.2
@@ -8634,6 +8657,47 @@ JSON
 JSON
 }
 
+# Durable host id shared by the ported snapshot/restore fixtures below.
+_SR_HOST_ID=0123456789abcdef0123456789abcdef
+
+_snapshot_v2_evidence() {
+    # args: dir [catalogue-rows-json-array]
+    # Writes the evidence a schema-v2 capture needs besides the fake tmux:
+    # a schema-2 task catalogue (all mandatory sources available), a process
+    # snapshot, and a durable host id. Default rows: one live cctrl/tmux row
+    # owning TMUX--snap for the _snapshot_fixture conversation. Nothing is
+    # exported; _snapshot_run passes every seam per command.
+    local dir="$1" rows="${2:-}"
+    mkdir -p "$dir"
+    if [[ -z "$rows" ]]; then
+        rows="$(jq -nc '[{provider:"claude",provider_task_id:"snap-conv-uuid",origin:"cctrl",execution_runtime:"tmux",control_owner:"cctrl",lifecycle_state:"active",restore_strategy:"tmux",registered_by_cctrl:true,launched_by_cctrl:true,cwd:"/tmp/demo",display_title:"snap",tmux_session:"TMUX--snap",action_capabilities:{tmux_attach:{supported:true}}}]')"
+    fi
+    printf '%s\n' "$_SR_HOST_ID" > "$dir/host-id"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-09-24T10:00:00Z","source_cursor":"p","processes":[],"error":null}' > "$dir/process.json"
+    jq -n --arg host "$_SR_HOST_ID" --argjson rows "$rows" \
+        '{schema_version:2,host_id:$host,source_status:{registry:"available",tmux:"available",codex_provider:"available"},source_errors:[],rows:($rows|map({host_id:$host}+.))}' \
+        > "$dir/catalogue.json"
+}
+
+_snapshot_run() {
+    # args: evidence-dir bindir sessdir projdir metadir snapdir [snapshot flags...]
+    # Live sessions come from the real `session ls` path over the fake tmux
+    # (TMUX--snap); the catalogue and process table are injected.
+    local ev="$1" bin="$2" sdir="$3" pdir="$4" meta="$5" snapdir="$6"
+    shift 6
+    PATH="$bin:$PATH" CCTRL_HOST_ID_FILE="$ev/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$ev/catalogue.json" \
+        CCTRL_SNAPSHOT_PROCESS_FILE="$ev/process.json" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
+        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
+        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" "$@"
+}
+
+_snapshot_ls_json() {
+    # args: evidence-dir bindir sessdir projdir metadir -- `session ls --json`
+    # over the same fake tmux and host id a _snapshot_run sees.
+    PATH="$2:$PATH" CCTRL_HOST_ID_FILE="$1/host-id" CCTRL_CLAUDE_SESSIONS_DIR="$3" CCTRL_CLAUDE_PROJECTS_DIR="$4" \
+        CCTRL_SESSION_METADATA_DIR="$5" TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session ls --json
+}
+
 test_tmux_inventory_survives_sanitized_formats() {
     # tmux 3.7 prints control characters in -F output as "_". The read-only
     # inventory must still parse every session, including names with ":".
@@ -8685,31 +8749,27 @@ SH
 
 test_snapshot_header_and_session_shape() {
     local bin="$TMPDIR/sh-bin" sdir="$TMPDIR/sh-sess" pdir="$TMPDIR/sh-proj" meta="$TMPDIR/sh-meta"
-    local snapdir="$TMPDIR/sh-snapshots"
+    local snapdir="$TMPDIR/sh-snapshots" ev="$TMPDIR/sh-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev"
 
     local out
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --json)"
-
-    assert_contains "$out" '"schema_version": 1'
-    assert_contains "$out" '"generated_at":'
-    assert_contains "$out" '"hostname":'
-    assert_contains "$out" '"session_count": 1'
-    assert_contains "$out" '"resource_line":'
-    assert_contains "$out" 'mem 50% free'
-    assert_contains "$out" '"name": "TMUX--snap"'
-    assert_contains "$out" '"state":'
-    assert_contains "$out" '"attached":'
-    assert_contains "$out" '"managed":'
-    assert_contains "$out" '"purpose": "test snapshot"'
-    assert_contains "$out" '"display_label": "snap"'
-    assert_contains "$out" '"conversation_id": "snap-conv-uuid"'
-    assert_contains "$out" '"cwd": "/tmp/demo"'
-    assert_contains "$out" '"host": "test-host"'
-    assert_contains "$out" '"launch_flags":'
+    out="$(_snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --json)" || fail "snapshot failed: $out"
+    jq -e --arg host "$_SR_HOST_ID" '
+        .schema_version == 2 and (.generated_at | type == "string" and length > 0)
+        and (.hostname | type == "string" and length > 0) and .host_id == $host
+        and .session_count == 1 and .task_reference_count == 1
+        and .resource_metadata.memory_free_percent == 50 and .resource_metadata.swap_used_mb == 100
+        and .capture_quality.status == "complete"' <<< "$out" >/dev/null \
+        || fail "snapshot header is wrong: $(jq -c 'del(.tasks)' <<< "$out")"
+    jq -e --arg host "$_SR_HOST_ID" '.tasks[0] |
+        .tmux_session == "TMUX--snap" and .live == true and .recovery_action == "already-live"
+        and .provider == "claude" and .provider_task_id == "snap-conv-uuid" and .resume_identity == "snap-conv-uuid"
+        and .resume_identity_kind == "claude-session-id" and .host_id == $host
+        and .purpose == "test snapshot" and .display_label == "snap" and .cwd == "/tmp/demo"
+        and .agent == "claude" and (.launch_flags | type == "object")' <<< "$out" >/dev/null \
+        || fail "snapshot task shape is wrong: $(jq -c '.tasks' <<< "$out")"
     [[ -f "$snapdir/latest.json" ]] || fail "latest.json not created"
     local hcount
     hcount="$(find "$snapdir" -maxdepth 1 -type f -name '[0-9]*.json' -print | wc -l | tr -d ' ')"
@@ -8719,18 +8779,20 @@ test_snapshot_header_and_session_shape() {
 
 test_snapshot_initial_prompt_absent() {
     local bin="$TMPDIR/ip-bin" sdir="$TMPDIR/ip-sess" pdir="$TMPDIR/ip-proj" meta="$TMPDIR/ip-meta"
-    local snapdir="$TMPDIR/ip-snapshots"
+    local snapdir="$TMPDIR/ip-snapshots" ev="$TMPDIR/ip-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev"
     cat > "$meta/TMUX--snap.json" <<'JSON'
 {"name":"TMUX--snap","cwd":"/tmp/demo","target":"/tmp/demo","target_kind":"dir","host":"test-host","display_label":"snap","purpose":"test","initial_prompt":"do the thing","launch_command":"claude","cctrl_managed":true}
 JSON
 
     local out
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --json)"
+    out="$(_snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --json)" || fail "snapshot failed: $out"
+    jq -e '.tasks | length == 1' <<< "$out" >/dev/null || fail "fixture session was not captured: $out"
     assert_not_contains "$out" 'initial_prompt'
+    assert_not_contains "$out" 'do the thing'
+    assert_not_contains "$(cat "$snapdir/latest.json")" 'do the thing'
     echo "ok: initial_prompt absent from snapshot"
 }
 
@@ -8794,13 +8856,12 @@ JSON
 
 test_snapshot_history_and_latest_agree() {
     local bin="$TMPDIR/ha-bin" sdir="$TMPDIR/ha-sess" pdir="$TMPDIR/ha-proj" meta="$TMPDIR/ha-meta"
-    local snapdir="$TMPDIR/ha-snapshots"
+    local snapdir="$TMPDIR/ha-snapshots" ev="$TMPDIR/ha-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev"
 
-    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --quiet
+    _snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --quiet || fail "snapshot failed"
 
     local history_file latest_hash history_hash
     history_file="$(find "$snapdir" -maxdepth 1 -type f -name '[0-9]*.json' -print | sort | head -1)"
@@ -8813,9 +8874,10 @@ test_snapshot_history_and_latest_agree() {
 
 test_snapshot_retention_pruning() {
     local bin="$TMPDIR/rp-bin" sdir="$TMPDIR/rp-sess" pdir="$TMPDIR/rp-proj" meta="$TMPDIR/rp-meta"
-    local snapdir="$TMPDIR/rp-snapshots"
+    local snapdir="$TMPDIR/rp-snapshots" ev="$TMPDIR/rp-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev"
 
     local now_epoch
     now_epoch="$(date +%s)"
@@ -8838,9 +8900,7 @@ test_snapshot_retention_pruning() {
 
     echo '{"session_count":0}' > "$snapdir/latest.json"
 
-    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --quiet
+    _snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --quiet || fail "snapshot failed"
 
     [[ -f "$snapdir/latest.json" ]] || fail "latest.json was deleted"
     [[ -f "$f_recent" ]] || fail "recent file was pruned"
@@ -8860,23 +8920,33 @@ test_snapshot_no_tmux_mutation() {
 }
 
 test_snapshot_tmux_absent_preserves() {
-    local bin="$TMPDIR/ta-bin" snapdir="$TMPDIR/ta-snapshots"
+    # tmux missing from PATH: the live-session source is unavailable, so the
+    # capture is degraded -- exit 69 (evidence unavailable) and latest.json is
+    # preserved byte-for-byte, never replaced by an empty capture.
+    local bin="$TMPDIR/ta-bin" snapdir="$TMPDIR/ta-snapshots" ev="$TMPDIR/ta-ev"
     mkdir -p "$bin" "$snapdir"
     cp "$TMPDIR/hostname" "$bin/hostname"
+    _snapshot_v2_evidence "$ev"
+    command -v jq >/dev/null && ln -sf "$(command -v jq)" "$bin/jq"
     cat > "$snapdir/latest.json" <<'JSON'
 {"schema_version":1,"session_count":3,"sessions":[{"name":"a"},{"name":"b"},{"name":"c"}]}
 JSON
+    local latest_hash
+    latest_hash="$(shasum "$snapdir/latest.json" | awk '{print $1}')"
+    [[ ! -x /usr/bin/tmux && ! -x /bin/tmux ]] || fail "fixture invalid: tmux is on the reduced PATH"
 
     local out rc=0
-    out="$(PATH="$bin:/usr/bin:/bin:/usr/local/bin" \
+    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_HOST_ID_FILE="$ev/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$ev/catalogue.json" \
+        CCTRL_SNAPSHOT_PROCESS_FILE="$ev/process.json" \
         CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/ta-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/ta-nope" \
         CCTRL_SESSION_METADATA_DIR="$TMPDIR/ta-nope" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
         "$ROOT/cctrl" session snapshot --dir "$snapdir" 2>&1)" || rc=$?
-    [[ "$rc" -eq 0 ]] || fail "snapshot with absent tmux should exit 0; got rc=$rc"
+    [[ "$rc" -eq 69 ]] || fail "snapshot with absent tmux should exit 69 (evidence unavailable); got rc=$rc: $out"
     assert_contains "$out" 'tmux'
-    local sc
-    sc="$(jq '.session_count' "$snapdir/latest.json")"
-    [[ "$sc" == "3" ]] || fail "latest.json was modified when tmux absent; session_count=$sc"
+    [[ "$latest_hash" == "$(shasum "$snapdir/latest.json" | awk '{print $1}')" ]] || fail "latest.json was modified when tmux absent"
+    local hcount
+    hcount="$(find "$snapdir" -maxdepth 1 -type f -name '[0-9]*.json' -print | wc -l | tr -d ' ')"
+    [[ "$hcount" == 0 ]] || fail "a capture with tmux absent wrote history"
     echo "ok: tmux absent preserves existing latest.json"
 }
 
@@ -8904,94 +8974,39 @@ SH
     echo "ok: first run with empty fleet writes normally"
 }
 
-test_snapshot_transcript_bytes_null_when_missing() {
-    local bin="$TMPDIR/tb-bin" sdir="$TMPDIR/tb-sess" pdir="$TMPDIR/tb-proj" meta="$TMPDIR/tb-meta"
-    local snapdir="$TMPDIR/tb-snapshots"
-    mkdir -p "$bin" "$sdir" "$pdir" "$meta" "$snapdir"
-    cat > "$bin/tmux" <<'SH'
-#!/usr/bin/env bash
-target=""
-for ((i=1;i<=$#;i++)); do
-    if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
-done
-# Pane/window-target commands (list-panes, display-message, display,
-# capture-pane, ...) require the trailing ":" on tmux's exact "=NAME" match
-# syntax; a bare "=NAME" (no colon) must fail to resolve, matching real tmux
-# (verified against tmux 3.7c; see plan 080's review). Strip a well-formed
-# "=NAME:" down to the bare name; leave a colon-less "=NAME" as a target
-# nothing below will match.
-if [[ "$target" == *: ]]; then
-    target="${target#=}"
-    target="${target%:}"
-elif [[ "$target" == "="* ]]; then
-    target="__cctrl_test_unmatched__"
-fi
-if [[ "${1:-}" == "-u" ]]; then shift; fi
-case "${1:-}" in
-    list-sessions) for s in $TMUX_FAKE_SESSIONS; do printf '%s\n' "$s"; done; exit 0;;
-    list-panes)
-        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
-        echo 9090; exit 0;;
-    display-message|display) echo 0; exit 0;;
-    show-option) echo 1; exit 0;;
-    capture-pane) exit 0;;
-    *) exit 0;;
-esac
-SH
-    chmod +x "$bin/tmux"
-    cat > "$bin/ps" <<'SH'
-#!/usr/bin/env bash
-if [[ "$*" == *9090* ]]; then echo "-zsh"; exit 0; fi
-exec /bin/ps "$@"
-SH
-    chmod +x "$bin/ps"
-    cat > "$meta/TMUX--notranscript.json" <<'JSON'
-{"name":"TMUX--notranscript","cwd":"/tmp","target":"/tmp","target_kind":"dir","host":"test","cctrl_managed":true}
-JSON
-
-    local out
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--notranscript" "$ROOT/cctrl" session snapshot --dir "$snapdir" --json)"
-    local tb
-    tb="$(printf '%s' "$out" | jq '.sessions[0].transcript_bytes')"
-    [[ "$tb" == "null" ]] || fail "expected transcript_bytes null; got: $tb"
-    echo "ok: transcript_bytes null when no transcript"
-}
-
 test_snapshot_managed_matches_session_ls() {
+    # schema-v2 successor of `managed`: the cctrl registration/launch
+    # provenance the snapshot records for a live session (with no catalogue
+    # row to override it) must agree with what `session ls` reports.
     local bin="$TMPDIR/mm-bin" sdir="$TMPDIR/mm-sess" pdir="$TMPDIR/mm-proj" meta="$TMPDIR/mm-meta"
-    local snapdir="$TMPDIR/mm-snapshots"
+    local snapdir="$TMPDIR/mm-snapshots" ev="$TMPDIR/mm-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev" '[]'
 
-    local ls_out snap_out ls_managed snap_managed
-    ls_out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session ls --json)"
-    ls_managed="$(printf '%s' "$ls_out" | jq '.[0].managed')"
+    local ls_out snap_out ls_prov snap_prov
+    ls_out="$(_snapshot_ls_json "$ev" "$bin" "$sdir" "$pdir" "$meta")" || fail "session ls failed: $ls_out"
+    ls_prov="$(jq -c '.[0] | [.registered_by_cctrl, .launched_by_cctrl]' <<< "$ls_out")"
+    snap_out="$(_snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --json)" || fail "snapshot failed: $snap_out"
+    snap_prov="$(jq -c '.tasks[] | select(.tmux_session=="TMUX--snap") | [.registered_by_cctrl, .launched_by_cctrl]' <<< "$snap_out")"
 
-    snap_out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --json)"
-    snap_managed="$(printf '%s' "$snap_out" | jq '.sessions[0].managed')"
-
-    [[ "$ls_managed" == "$snap_managed" ]] || fail "managed mismatch: ls=$ls_managed snapshot=$snap_managed"
-    echo "ok: managed field matches session ls"
+    [[ "$ls_prov" == "[true,true]" ]] || fail "fixture invalid: session ls does not report cctrl provenance: $ls_prov"
+    [[ "$ls_prov" == "$snap_prov" ]] || fail "cctrl provenance mismatch: ls=$ls_prov snapshot=$snap_prov"
+    echo "ok: managed (cctrl provenance) matches session ls"
 }
 
 test_snapshot_launch_flags_round_trip() {
     local bin="$TMPDIR/lf-bin" sdir="$TMPDIR/lf-sess" pdir="$TMPDIR/lf-proj" meta="$TMPDIR/lf-meta"
-    local snapdir="$TMPDIR/lf-snapshots"
+    local snapdir="$TMPDIR/lf-snapshots" ev="$TMPDIR/lf-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta" "claude --model claude-fable-5 --permission-mode bypassPermissions --peer fleet-mgr"
+    _snapshot_v2_evidence "$ev"
 
     local out lf_model lf_perm lf_peer
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --json)"
-    lf_model="$(printf '%s' "$out" | jq -r '.sessions[0].launch_flags.model')"
-    lf_perm="$(printf '%s' "$out" | jq -r '.sessions[0].launch_flags.permission_mode')"
-    lf_peer="$(printf '%s' "$out" | jq -r '.sessions[0].launch_flags.peer')"
+    out="$(_snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --json)" || fail "snapshot failed: $out"
+    lf_model="$(printf '%s' "$out" | jq -r '.tasks[0].launch_flags.model')"
+    lf_perm="$(printf '%s' "$out" | jq -r '.tasks[0].launch_flags.permission_mode')"
+    lf_peer="$(printf '%s' "$out" | jq -r '.tasks[0].launch_flags.peer')"
     [[ "$lf_model" == "claude-fable-5" ]] || fail "launch_flags.model should be claude-fable-5; got: $lf_model"
     [[ "$lf_perm" == "bypassPermissions" ]] || fail "launch_flags.permission_mode should be bypassPermissions; got: $lf_perm"
     [[ "$lf_peer" == "fleet-mgr" ]] || fail "launch_flags.peer should be fleet-mgr; got: $lf_peer"
@@ -9001,50 +9016,52 @@ test_snapshot_launch_flags_round_trip() {
 JSON
     local snapdir2="$TMPDIR/lf-snapshots2"
     mkdir -p "$snapdir2"
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir2" --json)"
+    out="$(_snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir2" --json)" || fail "snapshot failed: $out"
     local lf_keys
-    lf_keys="$(printf '%s' "$out" | jq '.sessions[0].launch_flags | keys | length')"
+    lf_keys="$(printf '%s' "$out" | jq '.tasks[0].launch_flags | keys | length')"
     [[ "$lf_keys" == "0" ]] || fail "empty launch_command should produce empty launch_flags; got $lf_keys keys"
     echo "ok: launch_flags round-trip"
 }
 
 test_snapshot_conversation_id_from_session_id() {
+    # The resume identity of a live session comes from its live session_id
+    # (no catalogue row supplies it here) and matches `session ls`.
     local bin="$TMPDIR/ci-bin" sdir="$TMPDIR/ci-sess" pdir="$TMPDIR/ci-proj" meta="$TMPDIR/ci-meta"
-    local snapdir="$TMPDIR/ci-snapshots"
+    local snapdir="$TMPDIR/ci-snapshots" ev="$TMPDIR/ci-ev"
     mkdir -p "$snapdir"
     _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev" '[]'
 
     local ls_out snap_out ls_sid snap_cid
-    ls_out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session ls --json)"
+    ls_out="$(_snapshot_ls_json "$ev" "$bin" "$sdir" "$pdir" "$meta")" || fail "session ls failed: $ls_out"
     ls_sid="$(printf '%s' "$ls_out" | jq -r '.[0].session_id')"
 
-    snap_out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$pdir" \
-        CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
-        TMUX_FAKE_SESSIONS="TMUX--snap" "$ROOT/cctrl" session snapshot --dir "$snapdir" --json)"
-    snap_cid="$(printf '%s' "$snap_out" | jq -r '.sessions[0].conversation_id')"
+    snap_out="$(_snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" --json)" || fail "snapshot failed: $snap_out"
+    snap_cid="$(printf '%s' "$snap_out" | jq -r '.tasks[0].resume_identity')"
 
-    [[ "$ls_sid" == "$snap_cid" ]] || fail "conversation_id ($snap_cid) should match session_id ($ls_sid)"
-    [[ "$snap_cid" == "snap-conv-uuid" ]] || fail "conversation_id should be snap-conv-uuid; got: $snap_cid"
+    [[ "$ls_sid" == "$snap_cid" ]] || fail "resume_identity ($snap_cid) should match session_id ($ls_sid)"
+    [[ "$snap_cid" == "snap-conv-uuid" ]] || fail "resume_identity should be snap-conv-uuid; got: $snap_cid"
+    [[ "$(jq -r '.tasks[0].provider_task_id' <<< "$snap_out")" == "snap-conv-uuid" ]] || fail "provider_task_id did not follow the live session_id"
     echo "ok: conversation_id from session_id"
 }
 
 _restore_fixture() {
-    # Build a restore test environment: fake snapshot, fake tmux, fake ps,
-    # fake hostname, launch log seam.
+    # Build a restore test environment under DIR: fake hostname/tmux/ps, a
+    # schema-v2 snapshot of five tasks, and the current evidence restore joins
+    # it with -- task catalogue (every task present but not live, i.e. after a
+    # reboot), process table, a Codex ownership pass proving the Codex task's
+    # owners absent, and the durable host id. Nothing is exported: _restore_run
+    # passes every seam (including the launch log) per command, so no fixture
+    # state leaks into later tests in the same shell.
     local dir="$1"
-    mkdir -p "$dir/bin" "$dir/snapshots" "$dir/sessions" "$dir/projects" "$dir/session-metadata"
+    mkdir -p "$dir/bin" "$dir/snapshots" "$dir/session-metadata"
 
-    # Fake hostname
     cat > "$dir/bin/hostname" <<'SH'
 #!/usr/bin/env bash
 printf 'test-host\n'
 SH
     chmod +x "$dir/bin/hostname"
 
-    # Fake tmux that reports controllable session lists
     cat > "$dir/bin/tmux" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "-u" ]]; then shift; fi
@@ -9067,180 +9084,105 @@ esac
 SH
     chmod +x "$dir/bin/tmux"
 
-    # Fake ps
-    cat > "$dir/bin/ps" <<'SH'
-#!/usr/bin/env bash
-exec /bin/ps "$@"
-SH
-    chmod +x "$dir/bin/ps"
-
-    # Launch log
-    export CCTRL_RESTORE_LAUNCH_LOG="$dir/launch.log"
     : > "$dir/launch.log"
+    printf '%s\n' "$_SR_HOST_ID" > "$dir/host-id"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[],"error":null}' > "$dir/process.json"
 
-    # Write a snapshot with diverse sessions
     local now_iso
     now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    cat > "$dir/snapshots/latest.json" <<SNAP
-{
-  "schema_version": 1,
-  "generated_at": "$now_iso",
-  "hostname": "test-host",
-  "session_count": 5,
-  "resource_line": "mem 50% free / 100 MB swap",
-  "sessions": [
-    {
-      "name": "TMUX--cctrl",
-      "state": "working",
-      "attached": false,
-      "managed": true,
-      "purpose": "session management",
-      "display_label": "@cctrl",
-      "conversation_id": "conv-aaa-111",
-      "transcript_path": "/fake/transcripts/conv-aaa-111.jsonl",
-      "transcript_bytes": 500000,
-      "cwd": "/Users/test/dev/cctrl",
-      "host": "test-host",
-      "model": "claude-sonnet-4",
-      "agent": "claude",
-      "last_active": "2026-08-05T11:55:00Z",
-      "created_at": "2026-08-05T10:00:00Z",
-      "launch_flags": {
-        "model": "claude-sonnet-4",
-        "permission_mode": "bypassPermissions",
-        "peer": "fleet-mgr"
-      }
-    },
-    {
-      "name": "TMUX--homelab",
-      "state": "idle",
-      "attached": false,
-      "managed": true,
-      "purpose": "homelab infra",
-      "display_label": "@homelab",
-      "conversation_id": "conv-bbb-222",
-      "transcript_path": "/fake/transcripts/conv-bbb-222.jsonl",
-      "transcript_bytes": 2000000,
-      "cwd": "/Users/test/dev/homelab",
-      "host": "test-host",
-      "model": "claude-fable-5",
-      "agent": "claude",
-      "last_active": "2026-08-05T12:00:00Z",
-      "created_at": "2026-08-05T09:00:00Z",
-      "launch_flags": {
-        "model": "claude-fable-5"
-      }
-    },
-    {
-      "name": "TMUX--nullconv",
-      "state": "idle",
-      "attached": false,
-      "managed": true,
-      "purpose": "no conversation",
-      "display_label": "nullconv",
-      "conversation_id": null,
-      "transcript_path": "/fake/transcripts/orphan.jsonl",
-      "transcript_bytes": 100,
-      "cwd": "/Users/test/dev/other",
-      "host": "test-host",
-      "model": "claude-sonnet-4",
-      "agent": "claude",
-      "last_active": "2026-08-05T10:00:00Z",
-      "created_at": "2026-08-05T08:00:00Z",
-      "launch_flags": {}
-    },
-    {
-      "name": "TMUX--codexproj",
-      "state": "working",
-      "attached": false,
-      "managed": true,
-      "purpose": "codex project",
-      "display_label": "@codexproj",
-      "conversation_id": "conv-ccc-333",
-      "transcript_path": null,
-      "transcript_bytes": 50000,
-      "cwd": "/Users/test/dev/codexproj",
-      "host": "test-host",
-      "model": "o3",
-      "agent": "codex",
-      "last_active": "2026-08-05T11:00:00Z",
-      "created_at": "2026-08-05T07:00:00Z",
-      "launch_flags": {
-        "agent": "codex"
-      }
-    },
-    {
-      "name": "TMUX--bigone",
-      "state": "working",
-      "attached": false,
-      "managed": true,
-      "purpose": "big transcript test",
-      "display_label": "@bigone",
-      "conversation_id": "conv-ddd-444",
-      "transcript_path": "/fake/transcripts/conv-ddd-444.jsonl",
-      "transcript_bytes": 5000000,
-      "cwd": "/Users/test/dev/bigone",
-      "host": "test-host",
-      "model": "claude-opus-4",
-      "agent": "claude",
-      "last_active": "2026-08-05T11:30:00Z",
-      "created_at": "2026-08-05T06:00:00Z",
-      "launch_flags": {
-        "model": "claude-opus-4",
-        "no_bridge": true,
-        "profile": "deep-work"
-      }
-    }
-  ]
-}
-SNAP
+    jq -n --arg host "$_SR_HOST_ID" --arg now "$now_iso" '
+      def task($p; $id; $tmux; $label; $purpose; $cwd; $last; $flags):
+        {provider:$p, provider_task_id:$id, host_id:$host, origin:"cctrl", execution_runtime:"tmux",
+         control_owner:"cctrl", lifecycle_state:"active", restore_strategy:"tmux-resume",
+         registered_by_cctrl:true, launched_by_cctrl:true,
+         registration_provenance:[{source:"registry"}], launch_provenance:[{source:"launch-receipt"}],
+         lineage:{forked_from_id:null,parent_thread_id:null,derived_root_id:null,derived_root_basis:null},
+         tmux_session:$tmux,
+         resume_identity_kind:(if $id == null then null elif $p == "claude" then "claude-session-id" else "codex-thread-id" end),
+         resume_identity:$id, observed_at:$last, ownership_evidence:[], cwd:$cwd, purpose:$purpose,
+         display_label:$label, agent:$p, launch_flags:$flags, transcript_path:null, transcript_bytes:null,
+         last_active:$last, live:false, recovery_action:"insufficient-evidence",
+         recovery_reason:"snapshot is informational until current ownership evidence is joined"};
+      [ task("claude"; "conv-aaa-111"; "TMUX--cctrl"; "@cctrl"; "session management"; "/Users/test/dev/cctrl"; "2026-08-05T11:55:00Z";
+             {model:"claude-sonnet-4", permission_mode:"bypassPermissions", peer:"fleet-mgr"}),
+        task("claude"; "conv-bbb-222"; "TMUX--homelab"; "@homelab"; "homelab infra"; "/Users/test/dev/homelab"; "2026-08-05T12:00:00Z";
+             {model:"claude-fable-5"}),
+        task("claude"; null; "TMUX--nullconv"; "nullconv"; "no conversation"; "/Users/test/dev/other"; "2026-08-05T10:00:00Z"; {}),
+        task("codex"; "conv-ccc-333"; "TMUX--codexproj"; "@codexproj"; "codex project"; "/Users/test/dev/codexproj"; "2026-08-05T11:00:00Z";
+             {agent:"codex"}),
+        task("claude"; "conv-ddd-444"; "TMUX--bigone"; "@bigone"; "big transcript test"; "/Users/test/dev/bigone"; "2026-08-05T11:30:00Z";
+             {model:"claude-opus-4", no_bridge:true, profile:"deep-work"}) ] as $tasks
+      | {schema_version:2, generated_at:$now, host_id:$host, hostname:"test-host",
+         resource_metadata:{memory_free_percent:50,swap_used_mb:100,load_1m:null}, tasks:$tasks,
+         task_reference_count:($tasks|length), catalogue_task_count:($tasks|length),
+         omitted_task_references:{count:0,by_provider_state:{}},
+         restore_candidate_count:([$tasks[] | select(.provider_task_id != null)] | length),
+         capture_quality:{status:"complete",mandatory_sources:{registry:"available",tmux:"available",process:"available",codex_provider:"available"}},
+         source_errors:[], session_count:($tasks|length)}' > "$dir/snapshots/latest.json"
+
+    # Current catalogue: one exact row per task id, none live. The Claude rows
+    # still carry their cctrl/tmux registry ownership; the Codex row's owner
+    # is unknown until the Codex ownership pass below proves absence.
+    jq --arg host "$_SR_HOST_ID" '
+      {schema_version:2, host_id:$host,
+       source_status:{registry:"available",tmux:"available",codex_provider:"available"}, source_errors:[],
+       rows:[.tasks[] | select(.provider_task_id != null) |
+         {task_key:("provider:" + .provider + ":" + $host + ":" + .provider_task_id),
+          provider, provider_task_id, host_id:$host, origin:"cctrl",
+          execution_runtime:(if .provider == "codex" then "unknown" else "tmux" end),
+          control_owner:(if .provider == "codex" then "unknown" else "cctrl" end),
+          lifecycle_state:(if .provider == "codex" then "inactive" else "active" end),
+          restore_strategy:"tmux", registered_by_cctrl:true, launched_by_cctrl:true,
+          registration_provenance:[{source:"registry"}], launch_provenance:[{source:"launch-receipt"}],
+          lineage, ownership_evidence:[], cwd, display_title:.display_label, tmux_session,
+          action_capabilities:{tmux_attach:{supported:false,reason:"no-live-cctrl-tmux-owner"}}}]}' \
+        "$dir/snapshots/latest.json" > "$dir/catalogue.json"
+
+    jq -n --arg host "$_SR_HOST_ID" '
+      {schema_version:1, kind:"codex_reconcile_result_v1", errors:[],
+       records:[{provider_task_id:"conv-ccc-333", host_id:$host,
+         sources:{registry:{status:"available",source_cursor:"r1",error:null},
+                  app_server:{status:"confirmed-absence",source_cursor:"a1",error:null},
+                  tmux:{status:"confirmed-absence",source_cursor:"t1",error:null},
+                  process_table:{status:"confirmed-absence",source_cursor:"p1",error:null}},
+         chosen_outcome:{control_owner:"unknown",execution_runtime:"unknown",lifecycle_state:"inactive",restore_strategy:"tmux-resume"}}]}' \
+        > "$dir/codex.json"
 }
 
-test_restore_ordering_by_last_active() {
-    local dir="$TMPDIR/restore-order"
-    _restore_fixture "$dir"
-    local out
-    out="$(PATH="$dir/bin:$PATH" \
+_restore_run() {
+    # args: dir [restore flags...]. Runs `cctrl session restore` against the
+    # _restore_fixture evidence with every seam passed per command (nothing
+    # exported). Overridable through the caller's command-prefix env:
+    # SR_FROM (snapshot path), SR_CATALOGUE (catalogue path; empty = real
+    # inventory), CCTRL_FAKE_MEM_FREE_PCT, CCTRL_RESTORE_MAX_ACTIVE,
+    # CCTRL_RESTORE_WAVE_SIZE, CCTRL_RESTORE_WAVE_PAUSE. Every run records
+    # spawns to the launch log; nothing is ever really launched.
+    local dir="$1"
+    shift
+    PATH="${SR_PATH:-$dir/bin:$PATH}" CCTRL_HOST_ID_FILE="$dir/host-id" \
         CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --dry-run --json 2>&1)"
-    # last_active order: homelab (12:00) > cctrl (11:55) > bigone (11:30) > codex (11:00) > nullconv (10:00)
-    local order
-    order="$(printf '%s' "$out" | jq -r '.plan[] | select(.disposition=="restore") | .name' | tr '\n' ',')"
-    assert_contains "$order" "TMUX--homelab"
-    # homelab should come before cctrl
-    local pos_homelab pos_cctrl
-    pos_homelab="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="restore") | .name] | to_entries[] | select(.value=="TMUX--homelab") | .key')"
-    pos_cctrl="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="restore") | .name] | to_entries[] | select(.value=="TMUX--cctrl") | .key')"
-    [[ "$pos_homelab" -lt "$pos_cctrl" ]] || fail "homelab (12:00) should sort before cctrl (11:55), got homelab=$pos_homelab cctrl=$pos_cctrl"
-    echo "ok: restore ordering by last_active"
+        CCTRL_RESTORE_CATALOGUE_FILE="${SR_CATALOGUE-$dir/catalogue.json}" \
+        CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
+        CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" \
+        CCTRL_RESTORE_LAUNCH_LOG="$dir/launch.log" \
+        CCTRL_FAKE_MEM_FREE_PCT="${CCTRL_FAKE_MEM_FREE_PCT:-80}" CCTRL_FAKE_SWAP_MB="${CCTRL_FAKE_SWAP_MB:-0}" \
+        CCTRL_RESTORE_MAX_ACTIVE="${CCTRL_RESTORE_MAX_ACTIVE:-10}" \
+        CCTRL_RESTORE_WAVE_SIZE="${CCTRL_RESTORE_WAVE_SIZE:-2}" CCTRL_RESTORE_WAVE_PAUSE="${CCTRL_RESTORE_WAVE_PAUSE:-0}" \
+        "$ROOT/cctrl" session restore --from "${SR_FROM:-$dir/snapshots/latest.json}" "$@"
 }
+
+_restore_spawn_count() { wc -l < "$1/launch.log" | tr -d ' '; }
 
 test_restore_only_filter() {
     local dir="$TMPDIR/restore-only"
     _restore_fixture "$dir"
     local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --only cctrl --only homelab --dry-run --json 2>&1)"
-    local restore_count
-    restore_count="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="restore")] | length')"
-    [[ "$restore_count" -eq 2 ]] || fail "expected 2 restore candidates with --only cctrl --only homelab, got $restore_count"
+    out="$(_restore_run "$dir" --only cctrl --only homelab --dry-run --json)" || fail "restore --only dry-run failed: $out"
+    local restored
+    restored="$(jq -c '[.plan[] | select(.disposition=="restore") | .tmux_session] | sort' <<< "$out")"
+    [[ "$restored" == '["TMUX--cctrl","TMUX--homelab"]' ]] || fail "expected exactly cctrl+homelab restore candidates with --only cctrl --only homelab, got $restored"
     local filtered_count
-    filtered_count="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="filtered")] | length')"
+    filtered_count="$(jq '[.plan[] | select(.reason=="filtered by --only")] | length' <<< "$out")"
     [[ "$filtered_count" -gt 0 ]] || fail "expected some filtered candidates"
     echo "ok: restore --only filter"
 }
@@ -9248,85 +9190,28 @@ test_restore_only_filter() {
 test_restore_cap_on_total() {
     local dir="$TMPDIR/restore-cap"
     _restore_fixture "$dir"
-    # Pre-existing live sessions: set TMUX_FAKE_SESSIONS to simulate 6 live managed sessions
-    # plus set up fake session data to make them look managed
-    mkdir -p "$dir/cap-sessions"
-    for pid_n in 30001 30002 30003 30004 30005 30006; do
-        cat > "$dir/cap-sessions/$pid_n.json" <<JSON
-{"pid":$pid_n,"sessionId":"live-$pid_n"}
-JSON
-    done
-    cat > "$dir/bin/tmux" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then shift; fi
-case "${1:-}" in
-    list-sessions)
-        for s in TMUX--live1 TMUX--live2 TMUX--live3 TMUX--live4 TMUX--live5 TMUX--live6; do
-            printf '%s\n' "$s"
-        done
-        exit 0 ;;
-    list-panes)
-        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
-        target=""
-        for ((i=1;i<=$#;i++)); do
-            if [[ "${!i}" == "-t" ]]; then j=$((i+1)); target="${!j:-}"; break; fi
-        done
-        # list-panes requires the trailing ":" on an exact "=NAME" target; a
-        # colon-less "=NAME" must not resolve (see plan 080's review).
-        if [[ "$target" == *: ]]; then
-            target="${target#=}"
-            target="${target%:}"
-        elif [[ "$target" == "="* ]]; then
-            target="__cctrl_test_unmatched__"
-        fi
-        case "$target" in
-            TMUX--live1) echo 30001 ;; TMUX--live2) echo 30002 ;;
-            TMUX--live3) echo 30003 ;; TMUX--live4) echo 30004 ;;
-            TMUX--live5) echo 30005 ;; TMUX--live6) echo 30006 ;;
-            *) echo 99999 ;;
-        esac
-        exit 0 ;;
-    display-message) echo 0; exit 0 ;;
-    display) echo 0; exit 0 ;;
-    show-option) echo 1; exit 0 ;;
-    new-session) exit 0 ;;
-    set-option) exit 0 ;;
-    *) exit 0 ;;
-esac
-SH
-    chmod +x "$dir/bin/tmux"
-    cat > "$dir/bin/ps" <<'SH'
-#!/usr/bin/env bash
-case "$*" in
-    *3000*) echo "claude --model test"; exit 0 ;;
-esac
-exec /bin/ps "$@"
-SH
-    chmod +x "$dir/bin/ps"
+    # Six other tasks are currently live under cctrl tmux owners.
+    jq --arg host "$_SR_HOST_ID" '.rows += [range(1;7) | tostring | {provider:"claude", provider_task_id:("live-" + .), host_id:$host,
+        origin:"cctrl", execution_runtime:"tmux", control_owner:"cctrl", lifecycle_state:"active", restore_strategy:"tmux",
+        registered_by_cctrl:true, launched_by_cctrl:true, cwd:"/tmp", tmux_session:("TMUX--live" + .),
+        action_capabilities:{tmux_attach:{supported:true}}}]' "$dir/catalogue.json" > "$dir/catalogue-live6.json"
 
-    # Create metadata to make them managed
-    for n in TMUX--live1 TMUX--live2 TMUX--live3 TMUX--live4 TMUX--live5 TMUX--live6; do
-        cat > "$dir/session-metadata/$n.json" <<JSON
-{"name":"$n","cctrl_managed":true,"cwd":"/tmp","purpose":"live"}
-JSON
-    done
+    local out restore_count deferred_count
+    # Contrast: without the cap pressure all four restorable tasks are eligible.
+    out="$(CCTRL_RESTORE_MAX_ACTIVE=10 _restore_run "$dir" --dry-run --json)" || fail "uncapped dry-run failed: $out"
+    [[ "$(jq '[.plan[] | select(.disposition=="restore")] | length' <<< "$out")" -eq 4 ]] \
+        || fail "fixture invalid: expected 4 restore candidates without live sessions: $(jq -c '[.plan[]|{tmux_session,disposition,reason}]' <<< "$out")"
 
-    local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/cap-sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=8 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --dry-run --json 2>&1)"
-    local restore_count deferred_count
-    restore_count="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="restore")] | length')"
-    deferred_count="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="deferred")] | length')"
-    # 6 live + 2 restore = 8 = max. Remaining should be deferred (minus the null-conv skip)
-    [[ "$restore_count" -le 2 ]] || fail "expected at most 2 restores with 6 live and max 8, got $restore_count"
-    [[ "$deferred_count" -gt 0 ]] || fail "expected some deferred candidates with cap at 8"
+    out="$(SR_CATALOGUE="$dir/catalogue-live6.json" CCTRL_RESTORE_MAX_ACTIVE=8 _restore_run "$dir" --dry-run --json)" || fail "capped dry-run failed: $out"
+    restore_count="$(jq '[.plan[] | select(.disposition=="restore")] | length' <<< "$out")"
+    deferred_count="$(jq '[.plan[] | select(.reason=="deferred by CCTRL_RESTORE_MAX_ACTIVE")] | length' <<< "$out")"
+    # 6 live + 2 restore = 8 = max. The remaining candidates are deferred.
+    [[ "$restore_count" -eq 2 ]] || fail "expected exactly 2 restores with 6 live and max 8, got $restore_count"
+    [[ "$deferred_count" -eq 2 ]] || fail "expected exactly 2 deferred candidates with cap at 8, got $deferred_count"
+
+    SR_CATALOGUE="$dir/catalogue-live6.json" CCTRL_RESTORE_MAX_ACTIVE=8 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 \
+        || fail "capped restore failed"
+    [[ "$(_restore_spawn_count "$dir")" -eq 2 ]] || fail "capped restore should spawn exactly 2: $(cat "$dir/launch.log")"
     echo "ok: restore cap on total managed count"
 }
 
@@ -9334,25 +9219,16 @@ test_restore_null_conversation_id_skipped() {
     local dir="$TMPDIR/restore-nullconv"
     _restore_fixture "$dir"
     local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --dry-run --json 2>&1)"
-    # The nullconv session should be skipped
+    out="$(_restore_run "$dir" --dry-run --json)" || fail "restore dry-run failed: $out"
+    # The nullconv task has no provider task id: it is reported and skipped.
     local skipped
-    skipped="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="skipped" and .name=="TMUX--nullconv")] | length')"
-    [[ "$skipped" -eq 1 ]] || fail "expected nullconv to be skipped, got $skipped"
-    # It should never appear in restore
+    skipped="$(jq '[.plan[] | select(.tmux_session=="TMUX--nullconv" and .disposition=="insufficient-evidence" and .reason=="provider task id is missing")] | length' <<< "$out")"
+    [[ "$skipped" -eq 1 ]] || fail "expected nullconv to be skipped, got $(jq -c '[.plan[]|select(.tmux_session=="TMUX--nullconv")]' <<< "$out")"
     local restored_null
-    restored_null="$(printf '%s' "$out" | jq '[.plan[] | select(.disposition=="restore" and .name=="TMUX--nullconv")] | length')"
+    restored_null="$(jq '[.plan[] | select(.disposition=="restore" and .tmux_session=="TMUX--nullconv")] | length' <<< "$out")"
     [[ "$restored_null" -eq 0 ]] || fail "null conversation_id session should never be restored"
-    # Check launch log is empty for nullconv
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore --yes failed"
+    [[ "$(_restore_spawn_count "$dir")" -gt 0 ]] || fail "fixture invalid: nothing was spawned at all"
     ! grep -q "nullconv" "$dir/launch.log" || fail "nullconv should not appear in launch log"
     echo "ok: null conversation_id skipped"
 }
@@ -9360,17 +9236,11 @@ test_restore_null_conversation_id_skipped() {
 test_restore_dry_run_spawns_nothing() {
     local dir="$TMPDIR/restore-dryrun"
     _restore_fixture "$dir"
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --dry-run --quiet 2>&1
-    # Launch log should be empty (dry-run never writes to it)
+    local out
+    out="$(_restore_run "$dir" --dry-run --json)" || fail "restore dry-run failed: $out"
+    [[ "$(jq '[.plan[] | select(.disposition=="restore")] | length' <<< "$out")" -gt 0 ]] \
+        || fail "fixture invalid: the plan has no restore candidates"
+    _restore_run "$dir" --dry-run --quiet >/dev/null 2>&1 || fail "restore --dry-run --quiet failed"
     local log_content
     log_content="$(cat "$dir/launch.log")"
     [[ -z "$log_content" ]] || fail "dry-run should not write to launch log, got: $log_content"
@@ -9381,18 +9251,9 @@ test_restore_gate_stops_below_threshold() {
     local dir="$TMPDIR/restore-gate"
     _restore_fixture "$dir"
     local rc=0
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=5 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --yes --quiet 2>&1 || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 when memory below threshold, got $rc"
-    # Launch log should be empty
+    CCTRL_FAKE_MEM_FREE_PCT=5 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    # Memory below CCTRL_MEM_FREE_MIN_PCT stops restore before any spawn (exit 1).
+    [[ "$rc" -eq 1 ]] || fail "expected exit 1 when memory below threshold, got $rc"
     local log_content
     log_content="$(cat "$dir/launch.log")"
     [[ -z "$log_content" ]] || fail "gate should prevent all spawns, got: $log_content"
@@ -9402,39 +9263,22 @@ test_restore_gate_stops_below_threshold() {
 test_restore_limit_caps_spawns() {
     local dir="$TMPDIR/restore-limit"
     _restore_fixture "$dir"
-    local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --limit 2 --yes --quiet 2>&1)"
+    _restore_run "$dir" --limit 2 --yes --quiet >/dev/null 2>&1 || fail "restore --limit 2 --yes failed"
     local spawn_count
-    spawn_count="$(wc -l < "$dir/launch.log" | tr -d ' ')"
+    spawn_count="$(_restore_spawn_count "$dir")"
     [[ "$spawn_count" -le 2 ]] || fail "expected at most 2 spawns with --limit 2, got $spawn_count"
+    [[ "$spawn_count" -eq 2 ]] || fail "expected --limit 2 to still spawn 2 of 4 candidates, got $spawn_count"
     echo "ok: --limit caps spawns"
 }
 
-test_restore_no_tty_no_yes_exits_2() {
+test_restore_no_tty_no_yes_refused() {
     local dir="$TMPDIR/restore-notty"
     _restore_fixture "$dir"
     local rc=0
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        < /dev/null 2>&1 || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 with no TTY and no --yes, got $rc"
-    echo "ok: no TTY no --yes exits 2"
+    _restore_run "$dir" < /dev/null >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "expected exit 64 with no TTY and no --yes, got $rc"
+    [[ ! -s "$dir/launch.log" ]] || fail "no-TTY restore without --yes spawned: $(cat "$dir/launch.log")"
+    echo "ok: no TTY no --yes is refused"
 }
 
 test_restore_unknown_schema_refused() {
@@ -9444,137 +9288,71 @@ test_restore_unknown_schema_refused() {
 {"schema_version": 42, "hostname": "test-host", "sessions": []}
 JSON
     local out rc=0
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/bad.json" \
-        --yes 2>&1)" || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 for unknown schema, got $rc"
+    out="$(SR_FROM="$dir/snapshots/bad.json" _restore_run "$dir" --yes --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "expected exit 64 for unknown schema, got $rc"
     assert_contains "$out" "42"
+    assert_contains "$out" "unsupported snapshot schema"
+    [[ ! -s "$dir/launch.log" ]] || fail "unknown schema spawned"
     echo "ok: unknown schema_version refused"
 }
 
 test_restore_stale_snapshot_refused() {
     local dir="$TMPDIR/restore-stale"
     _restore_fixture "$dir"
-    # Create a snapshot with an old timestamp
     local old_iso
     old_iso="$(date -u -v-2d +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "2 days ago" +"%Y-%m-%dT%H:%M:%SZ")"
-    cat > "$dir/snapshots/old.json" <<SNAP
-{"schema_version": 1, "generated_at": "$old_iso", "hostname": "test-host", "session_count": 0, "sessions": []}
-SNAP
-    local rc=0
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_SNAPSHOT_AGE=86400 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/old.json" \
-        2>&1 || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 for stale snapshot without --stale-ok, got $rc"
+    jq --arg old "$old_iso" '.generated_at = $old' "$dir/snapshots/latest.json" > "$dir/snapshots/old.json"
+    local out rc=0
+    out="$(SR_FROM="$dir/snapshots/old.json" CCTRL_RESTORE_MAX_SNAPSHOT_AGE=86400 _restore_run "$dir" --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "expected exit 64 for stale snapshot without --stale-ok, got $rc"
+    assert_contains "$out" "snapshot is stale"
+    # --stale-ok is the explicit override: the same snapshot then plans normally.
+    rc=0
+    out="$(SR_FROM="$dir/snapshots/old.json" CCTRL_RESTORE_MAX_SNAPSHOT_AGE=86400 _restore_run "$dir" --stale-ok --dry-run --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "--stale-ok did not accept the stale snapshot (rc=$rc): $out"
+    [[ ! -s "$dir/launch.log" ]] || fail "stale snapshot spawned"
     echo "ok: stale snapshot refused"
 }
 
 test_restore_host_mismatch_refused() {
     local dir="$TMPDIR/restore-host"
     _restore_fixture "$dir"
-    local now_iso
-    now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    cat > "$dir/snapshots/other.json" <<SNAP
-{"schema_version": 1, "generated_at": "$now_iso", "hostname": "other-machine", "session_count": 0, "sessions": []}
-SNAP
+    jq '.hostname = "other-machine"' "$dir/snapshots/latest.json" > "$dir/snapshots/other.json"
     local out rc=0
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/other.json" \
-        --yes 2>&1)" || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 for host mismatch, got $rc"
+    out="$(SR_FROM="$dir/snapshots/other.json" _restore_run "$dir" --yes --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "expected exit 64 for host mismatch, got $rc"
     assert_contains "$out" "other-machine"
     assert_contains "$out" "test-host"
+    [[ ! -s "$dir/launch.log" ]] || fail "host-mismatched snapshot spawned"
     echo "ok: host mismatch refused"
 }
 
 test_restore_cap_fails_closed() {
+    # The live inventory (which the active cap counts) comes from the real
+    # task catalogue here, with tmux absent from PATH. Restore must fail
+    # closed: evidence unavailable (69), nothing spawned.
     local dir="$TMPDIR/restore-capfail"
     _restore_fixture "$dir"
-    # Shadow tmux with a script that fails `command -v` by being absent,
-    # so _session_require_tmux fails inside _session_list.
     rm -f "$dir/bin/tmux"
-    # Build a PATH that includes the fake bin dir (for hostname etc) and
-    # the standard system dirs but excludes homebrew (where real tmux lives).
+    [[ ! -x /usr/bin/tmux && ! -x /bin/tmux && ! -x /usr/sbin/tmux && ! -x /sbin/tmux ]] \
+        || fail "fixture invalid: tmux is on the reduced PATH"
+    command -v jq >/dev/null && ln -sf "$(command -v jq)" "$dir/bin/jq"
     local out rc=0
-    out="$(PATH="$dir/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --yes 2>&1)" || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 when session list fails, got $rc"
+    out="$(SR_PATH="$dir/bin:/usr/bin:/bin:/usr/sbin:/sbin" SR_CATALOGUE="" _restore_run "$dir" --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "expected exit 69 when the live inventory is unavailable, got $rc: $out"
     assert_contains "$out" "unavailable"
+    [[ ! -s "$dir/launch.log" ]] || fail "restore spawned without a live inventory: $(cat "$dir/launch.log")"
     echo "ok: cap fails closed"
-}
-
-test_restore_picker_expected_routing() {
-    local dir="$TMPDIR/restore-picker"
-    _restore_fixture "$dir"
-    local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --dry-run --json 2>&1)"
-    # bigone has 5000000 bytes -> picker expected
-    local bigone_picker
-    bigone_picker="$(printf '%s' "$out" | jq -r '.plan[] | select(.name=="TMUX--bigone") | .picker')"
-    [[ "$bigone_picker" == "expected" ]] || fail "expected picker=expected for bigone (5MB), got: $bigone_picker"
-    # cctrl has 500000 bytes -> picker not expected
-    local cctrl_picker
-    cctrl_picker="$(printf '%s' "$out" | jq -r '.plan[] | select(.name=="TMUX--cctrl") | .picker')"
-    [[ "$cctrl_picker" == "not expected" ]] || fail "expected picker='not expected' for cctrl (500K), got: $cctrl_picker"
-    # codexproj is codex agent -> picker n/a
-    local codex_picker
-    codex_picker="$(printf '%s' "$out" | jq -r '.plan[] | select(.name=="TMUX--codexproj") | .picker')"
-    [[ "$codex_picker" == "n/a (codex)" ]] || fail "expected picker='n/a (codex)' for codex session, got: $codex_picker"
-    echo "ok: picker expected routing"
 }
 
 test_restore_wave_pacing() {
     local dir="$TMPDIR/restore-wave"
     _restore_fixture "$dir"
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        CCTRL_RESTORE_WAVE_SIZE=2 \
-        CCTRL_RESTORE_WAVE_PAUSE=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --yes --quiet 2>&1
+    CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=0 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 \
+        || fail "waved restore failed"
     # With 4 restorable sessions and wave size 2, we should get 4 spawns across 2 waves
     local spawn_count
-    spawn_count="$(wc -l < "$dir/launch.log" | tr -d ' ')"
+    spawn_count="$(_restore_spawn_count "$dir")"
     [[ "$spawn_count" -eq 4 ]] || fail "expected 4 spawns with wave pacing, got $spawn_count"
     echo "ok: wave pacing"
 }
@@ -9582,53 +9360,18 @@ test_restore_wave_pacing() {
 test_restore_already_live_skipped() {
     local dir="$TMPDIR/restore-live"
     _restore_fixture "$dir"
-    # Make one of the snapshot sessions already live
-    mkdir -p "$dir/live-sessions"
-    cat > "$dir/live-sessions/40001.json" <<'JSON'
-{"pid":40001,"sessionId":"conv-aaa-111"}
-JSON
-    cat > "$dir/bin/tmux" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then shift; fi
-case "${1:-}" in
-    list-sessions) printf 'TMUX--already-live\n'; exit 0 ;;
-    list-panes)
-        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
-        echo 40001; exit 0 ;;
-    display-message) echo 0; exit 0 ;;
-    display) echo 0; exit 0 ;;
-    show-option) echo 1; exit 0 ;;
-    new-session) exit 0 ;;
-    set-option) exit 0 ;;
-    *) exit 0 ;;
-esac
-SH
-    chmod +x "$dir/bin/tmux"
-    cat > "$dir/bin/ps" <<'SH'
-#!/usr/bin/env bash
-case "$*" in *40001*) echo "claude --model test"; exit 0 ;; esac
-exec /bin/ps "$@"
-SH
-    chmod +x "$dir/bin/ps"
-    cat > "$dir/session-metadata/TMUX--already-live.json" <<'JSON'
-{"name":"TMUX--already-live","cctrl_managed":true,"cwd":"/tmp","purpose":"live"}
-JSON
+    # conv-aaa-111 currently has a live cctrl tmux owner.
+    jq '(.rows[] | select(.provider_task_id=="conv-aaa-111") | .action_capabilities.tmux_attach) = {supported:true,reason:"available"}' \
+        "$dir/catalogue.json" > "$dir/catalogue-live.json"
 
     local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/live-sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        CCTRL_RESTORE_WAVE_PAUSE=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --yes --json 2>&1)"
+    out="$(SR_CATALOGUE="$dir/catalogue-live.json" _restore_run "$dir" --yes --json 2>&1)" || fail "restore failed: $out"
     local already
-    already="$(printf '%s' "$out" | jq '.already_live')"
+    already="$(jq '.counts["already-live"] // 0' <<< "$out")"
     [[ "$already" -ge 1 ]] || fail "expected at least 1 already-live, got $already"
-    # conv-aaa-111 should not appear in launch log
+    jq -e 'any(.plan[]; .provider_task_id=="conv-aaa-111" and .disposition=="already-live")' <<< "$out" >/dev/null \
+        || fail "the live task was not reported already-live"
+    [[ "$(_restore_spawn_count "$dir")" -gt 0 ]] || fail "fixture invalid: nothing was spawned at all"
     ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "already-live conversation should not be spawned"
     echo "ok: already-live skipped"
 }
@@ -9659,27 +9402,22 @@ JSON
 test_restore_launch_config_replay() {
     local dir="$TMPDIR/restore-config"
     _restore_fixture "$dir"
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        TMUX_FAKE_SESSIONS="" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        CCTRL_RESTORE_WAVE_PAUSE=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --yes --quiet 2>&1
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    local log
+    log="$(cat "$dir/launch.log")"
     # Check that launch_flags.model produces --model in the launch log
-    assert_contains "$(cat "$dir/launch.log")" "--model claude-sonnet-4"
-    assert_contains "$(cat "$dir/launch.log")" "--model claude-fable-5"
-    assert_contains "$(cat "$dir/launch.log")" "--model claude-opus-4"
+    assert_contains "$log" "--model claude-sonnet-4"
+    assert_contains "$log" "--model claude-fable-5"
+    assert_contains "$log" "--model claude-opus-4"
     # Check --no-bridge for bigone
-    assert_contains "$(cat "$dir/launch.log")" "--no-bridge"
-    # Check --peer for cctrl session
-    assert_contains "$(cat "$dir/launch.log")" "--peer fleet-mgr"
+    assert_contains "$log" "--no-bridge"
+    # Check --peer and --permission-mode for cctrl session
+    assert_contains "$log" "--peer fleet-mgr"
+    assert_contains "$log" "--permission-mode bypassPermissions"
     # Check --profile for bigone
-    assert_contains "$(cat "$dir/launch.log")" "--profile deep-work"
+    assert_contains "$log" "--profile deep-work"
+    # The Codex task comes back on the Codex agent
+    assert_contains "$log" "--agent codex"
     echo "ok: launch config replay"
 }
 
@@ -9706,54 +9444,21 @@ test_restore_no_pane_inference_structural() {
 }
 
 test_restore_already_live_record_join() {
-    # A live session whose *record* (metadata JSON) has the conversation_id but
-    # whose live session_id is empty should still be recognized as already-live.
+    # The current registry record for conv-bbb-222 is live under a different
+    # tmux name than the snapshot captured (TMUX--record-holder vs
+    # TMUX--homelab). The exact provider id joins them, so it is already-live.
     local dir="$TMPDIR/restore-recordjoin"
     _restore_fixture "$dir"
-    mkdir -p "$dir/rj-sessions"
-    # No live session file — session_id will be empty
-    cat > "$dir/bin/tmux" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then shift; fi
-case "${1:-}" in
-    list-sessions) printf 'TMUX--record-holder\n'; exit 0 ;;
-    list-panes)
-        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
-        echo 50001; exit 0 ;;
-    display-message) echo 0; exit 0 ;;
-    display) echo 0; exit 0 ;;
-    show-option) echo 1; exit 0 ;;
-    new-session) exit 0 ;;
-    set-option) exit 0 ;;
-    *) exit 0 ;;
-esac
-SH
-    chmod +x "$dir/bin/tmux"
-    cat > "$dir/bin/ps" <<'SH'
-#!/usr/bin/env bash
-case "$*" in *50001*) echo "claude"; exit 0 ;; esac
-exec /bin/ps "$@"
-SH
-    chmod +x "$dir/bin/ps"
-    # Record has conversation_id matching a snapshot session
-    cat > "$dir/session-metadata/TMUX--record-holder.json" <<'JSON'
-{"name":"TMUX--record-holder","cctrl_managed":true,"cwd":"/tmp","purpose":"live","conversation_id":"conv-bbb-222"}
-JSON
+    jq '(.rows[] | select(.provider_task_id=="conv-bbb-222")) |= (.tmux_session = "TMUX--record-holder" | .action_capabilities.tmux_attach = {supported:true,reason:"available"})' \
+        "$dir/catalogue.json" > "$dir/catalogue-join.json"
 
     local out
-    out="$(PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/rj-sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        CCTRL_RESTORE_WAVE_PAUSE=0 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" \
-        --yes --json 2>&1)"
+    out="$(SR_CATALOGUE="$dir/catalogue-join.json" _restore_run "$dir" --yes --json 2>&1)" || fail "restore failed: $out"
     local already
-    already="$(printf '%s' "$out" | jq '.already_live')"
+    already="$(jq '.counts["already-live"] // 0' <<< "$out")"
     [[ "$already" -ge 1 ]] || fail "expected at least 1 already-live from record join, got $already"
+    jq -e 'any(.plan[]; .tmux_session=="TMUX--homelab" and .disposition=="already-live")' <<< "$out" >/dev/null \
+        || fail "the record-joined task was not reported already-live"
     ! grep -q "conv-bbb-222" "$dir/launch.log" || fail "record-joined conversation should not be spawned"
     echo "ok: already-live record join"
 }
@@ -9762,66 +9467,21 @@ test_restore_exit_codes() {
     local dir="$TMPDIR/restore-exit"
     _restore_fixture "$dir"
 
-    # Exit 0: all-already-live (use a snapshot with only one session, and it's already live)
-    local now_iso
-    now_iso="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-    cat > "$dir/snapshots/one.json" <<SNAP
-{"schema_version":1,"generated_at":"$now_iso","hostname":"test-host","session_count":1,"sessions":[
-  {"name":"TMUX--only","managed":true,"conversation_id":"conv-only","cwd":"/tmp","purpose":"test","display_label":"only","agent":"claude","transcript_bytes":100,"last_active":"2026-08-05T12:00:00Z","launch_flags":{}}
-]}
-SNAP
-    mkdir -p "$dir/exit-sessions"
-    cat > "$dir/exit-sessions/60001.json" <<'JSON'
-{"pid":60001,"sessionId":"conv-only"}
-JSON
-    cat > "$dir/bin/tmux" <<'SH'
-#!/usr/bin/env bash
-if [[ "${1:-}" == "-u" ]]; then shift; fi
-case "${1:-}" in
-    list-sessions) printf 'TMUX--live-only\n'; exit 0 ;;
-    list-panes)
-        if [[ "$*" == *pane_current_path* ]]; then echo /tmp/demo; exit 0; fi
-        echo 60001; exit 0 ;;
-    display-message) echo 0; exit 0 ;;
-    display) echo 0; exit 0 ;;
-    show-option) echo 1; exit 0 ;;
-    *) exit 0 ;;
-esac
-SH
-    chmod +x "$dir/bin/tmux"
-    cat > "$dir/bin/ps" <<'SH'
-#!/usr/bin/env bash
-case "$*" in *60001*) echo "claude"; exit 0 ;; esac
-exec /bin/ps "$@"
-SH
-    chmod +x "$dir/bin/ps"
-    cat > "$dir/session-metadata/TMUX--live-only.json" <<'JSON'
-{"name":"TMUX--live-only","cctrl_managed":true,"cwd":"/tmp","purpose":"live"}
-JSON
+    # Exit 0: all-already-live (a snapshot with only one task, and it's already live)
+    jq '.tasks = [.tasks[0] | .provider_task_id = "conv-only" | .resume_identity = "conv-only" | .tmux_session = "TMUX--only"]
+        | .task_reference_count = 1' "$dir/snapshots/latest.json" > "$dir/snapshots/one.json"
+    jq '.rows = [.rows[0] | .provider_task_id = "conv-only" | .tmux_session = "TMUX--live-only"
+        | .action_capabilities.tmux_attach = {supported:true,reason:"available"}]' "$dir/catalogue.json" > "$dir/catalogue-one.json"
 
     local rc=0
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/exit-sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        CCTRL_RESTORE_MAX_ACTIVE=10 \
-        "$ROOT/cctrl" session restore --from "$dir/snapshots/one.json" \
-        --yes --quiet 2>/dev/null || rc=$?
+    SR_FROM="$dir/snapshots/one.json" SR_CATALOGUE="$dir/catalogue-one.json" _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 0 ]] || fail "expected exit 0 for all-already-live, got $rc"
+    [[ ! -s "$dir/launch.log" ]] || fail "all-already-live restore spawned: $(cat "$dir/launch.log")"
 
-    # Exit 2: unreadable snapshot
+    # Exit 64: unreadable snapshot
     rc=0
-    PATH="$dir/bin:$PATH" \
-        CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
-        CCTRL_CLAUDE_SESSIONS_DIR="$dir/exit-sessions" \
-        CCTRL_CLAUDE_PROJECTS_DIR="$dir/projects" \
-        CCTRL_FAKE_MEM_FREE_PCT=80 \
-        CCTRL_FAKE_SWAP_MB=0 \
-        "$ROOT/cctrl" session restore --from "/nonexistent/path.json" \
-        --yes 2>/dev/null || rc=$?
-    [[ "$rc" -eq 2 ]] || fail "expected exit 2 for unreadable snapshot, got $rc"
+    SR_FROM="/nonexistent/path.json" _restore_run "$dir" --yes >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "expected exit 64 for unreadable snapshot, got $rc"
 
     echo "ok: exit codes"
 }
@@ -12894,6 +12554,38 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        snapshot-restore-legacy)
+            test_snapshot_header_and_session_shape
+            test_snapshot_initial_prompt_absent
+            test_snapshot_empty_fleet_guard_preserves
+            test_snapshot_allow_empty_overrides
+            test_snapshot_history_and_latest_agree
+            test_snapshot_retention_pruning
+            test_snapshot_no_tmux_mutation
+            test_snapshot_tmux_absent_preserves
+            test_snapshot_first_run_empty_writes
+            test_snapshot_managed_matches_session_ls
+            test_snapshot_launch_flags_round_trip
+            test_snapshot_conversation_id_from_session_id
+            test_restore_only_filter
+            test_restore_cap_on_total
+            test_restore_null_conversation_id_skipped
+            test_restore_dry_run_spawns_nothing
+            test_restore_gate_stops_below_threshold
+            test_restore_limit_caps_spawns
+            test_restore_no_tty_no_yes_refused
+            test_restore_unknown_schema_refused
+            test_restore_stale_snapshot_refused
+            test_restore_host_mismatch_refused
+            test_restore_cap_fails_closed
+            test_restore_wave_pacing
+            test_restore_already_live_skipped
+            test_restore_launch_config_replay
+            test_restore_already_live_record_join
+            test_restore_exit_codes
+            echo "ok"
+            exit 0
+            ;;
         snapshot-ownership)
             test_snapshot_ownership_policy
             test_snapshot_restore_default_honors_data_dir
@@ -12915,6 +12607,7 @@ fi
 if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-launch-to-app" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
 test_syntax
 test_no_errexit_unsafe_post_increment
+test_every_defined_test_is_registered
 test_live_store_guard_diagnostics_and_churn
 test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release
@@ -13165,6 +12858,34 @@ test_task_registry_replay_order_and_guards
 test_task_registry_lock_stale_timeout_and_release_token
 test_task_registry_structural_boundary
 test_codex_reconcile_ownership_evidence
+test_snapshot_header_and_session_shape
+test_snapshot_initial_prompt_absent
+test_snapshot_empty_fleet_guard_preserves
+test_snapshot_allow_empty_overrides
+test_snapshot_history_and_latest_agree
+test_snapshot_retention_pruning
+test_snapshot_no_tmux_mutation
+test_snapshot_tmux_absent_preserves
+test_snapshot_first_run_empty_writes
+test_snapshot_managed_matches_session_ls
+test_snapshot_launch_flags_round_trip
+test_snapshot_conversation_id_from_session_id
+test_restore_only_filter
+test_restore_cap_on_total
+test_restore_null_conversation_id_skipped
+test_restore_dry_run_spawns_nothing
+test_restore_gate_stops_below_threshold
+test_restore_limit_caps_spawns
+test_restore_no_tty_no_yes_refused
+test_restore_unknown_schema_refused
+test_restore_stale_snapshot_refused
+test_restore_host_mismatch_refused
+test_restore_cap_fails_closed
+test_restore_wave_pacing
+test_restore_already_live_skipped
+test_restore_launch_config_replay
+test_restore_already_live_record_join
+test_restore_exit_codes
 test_snapshot_ownership_policy
 test_snapshot_restore_default_honors_data_dir
 test_snapshot_tmux_row_selection

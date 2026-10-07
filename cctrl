@@ -13000,9 +13000,14 @@ _session_restore() {
     fi
 
     # Filters and limits can demote eligible rows but can never upgrade them.
-    local filtered="$scratch/filtered.json" patterns_json='[]'
+    # The active cap counts tasks the current catalogue shows live under a
+    # cctrl tmux owner; restores stop once live + planned reaches the cap.
+    local filtered="$scratch/filtered.json" patterns_json='[]' max_active="${CCTRL_RESTORE_MAX_ACTIVE:-8}" live_active
+    if [[ "$max_active" =~ ^[0-9]+$ ]]; then max_active=$((10#$max_active)); else max_active=8; fi
+    live_active="$(jq '[.rows[]? | select(.control_owner == "cctrl" and .execution_runtime == "tmux" and .action_capabilities.tmux_attach.supported == true)] | length' "$catalogue_file" 2>/dev/null)"
+    [[ "$live_active" =~ ^[0-9]+$ ]] || live_active="$max_active"
     if [[ ${#only_patterns[@]} -gt 0 ]]; then patterns_json="$(printf '%s\n' "${only_patterns[@]}" | jq -R . | jq -s .)"; fi
-    if ! jq --argjson patterns "$patterns_json" --arg limit "$limit" '
+    if ! jq --argjson patterns "$patterns_json" --arg limit "$limit" --argjson live_active "$live_active" --argjson max_active "$max_active" '
       ($patterns | map(ascii_downcase)) as $needles
       |
       reduce .rows[] as $row ({base:., rows:[], used:0};
@@ -13010,6 +13015,7 @@ _session_restore() {
         | (if ($needles|length)==0 then true else ([$needles[] | . as $needle | $haystack | contains($needle)] | any) end) as $matched
         | if ($row.disposition=="restore" and ($matched|not)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"filtered by --only",action_capabilities:{restore:{supported:false,reason:"filtered by --only"}}}]
           elif ($row.disposition=="restore" and $limit!="" and .used >= ($limit|tonumber)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by --limit",action_capabilities:{restore:{supported:false,reason:"deferred by --limit"}}}]
+          elif ($row.disposition=="restore" and ($live_active + .used) >= $max_active) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by CCTRL_RESTORE_MAX_ACTIVE",action_capabilities:{restore:{supported:false,reason:"deferred by CCTRL_RESTORE_MAX_ACTIVE"}}}]
           else .rows += [$row] | if $row.disposition=="restore" then .used += 1 else . end end)
       | .base + {rows:.rows} | .counts = (.rows | group_by(.disposition) | map({key:.[0].disposition,value:length}) | from_entries)' "$plan_file" > "$filtered"; then
         rm -rf "$scratch"

@@ -124,3 +124,5 @@ resolution.
 **VERDICT:** ENG CLEARED — ready to implement.
 
 NO UNRESOLVED DECISIONS
+
+> Note (2026-10-07): plan 100 (`docs/plans/100-role-aware-session-naming.md`) folds the label-reconcile direction (cctrl label wins for role sessions) into this plan's reconcile-names work.

@@ -843,8 +843,9 @@ ownership conflict/stale evidence, and `1` means an internal or launch failure.
 releases each wave (`y` to proceed, `N` or `q` to stop at the boundary).
 In non-interactive mode (`--yes`), waves advance after a fixed pause
 (`CCTRL_RESTORE_WAVE_PAUSE`, default 60s) and a memory/swap re-check.
-The cap stops when live managed sessions reach `CCTRL_RESTORE_MAX_ACTIVE`
-(default 8).
+The cap stops when live managed sessions plus planned restores reach
+`CCTRL_RESTORE_MAX_ACTIVE` (default 8); deferred rows show as
+`insufficient-evidence`.
 
 **Launch configuration replay.** Restore threads `model`, `permission-mode`,
 `profile`, `peer`, `sandbox`, `--no-bridge`, and `agent` from the snapshot's

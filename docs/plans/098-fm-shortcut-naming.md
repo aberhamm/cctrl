@@ -69,3 +69,5 @@ through the reverse lookup, so it still gets its own fm- name as before.
 - Editing `data/shortcuts.json` (the real file) — fixtures only.
 - A `"role"` field on shortcuts (considered, rejected above).
 - Plan 097 (separate follow-up, tracked independently).
+
+> Note (2026-10-07): plan 100 supersedes the "key starts with `fm-`" test with a `role` field on shortcuts/sessions (see `docs/plans/100-role-aware-session-naming.md`).

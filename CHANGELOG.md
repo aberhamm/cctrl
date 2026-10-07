@@ -19,6 +19,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   works as an alias namespace alongside the existing top-level verbs. (plan
   071 phase 1)
 
+### Fixed
+- `cctrl session restore` honours `CCTRL_RESTORE_MAX_ACTIVE` again (default 8):
+  restores beyond live + planned tasks reaching the cap are deferred as
+  `insufficient-evidence`. The cap silently stopped working in the
+  ownership-aware restore rewrite. (plan 097)
+
+### Internal
+- 28 restore/snapshot tests that had been defined but never called since the
+  ownership-aware restore rewrite are registered again (fixtures ported to the
+  v2 evidence model); 3 tests of removed behaviour were deleted. New guard
+  `test_every_defined_test_is_registered` fails the suite when a `test_*`
+  function is defined but never called. (plan 097)
+
 ### Changed
 - Profiles and the user config move to XDG: `~/.config/cctrl/profiles/*.json`
   and `~/.config/cctrl/config.json` (both overridable — `CCTRL_USER_CONFIG`,
