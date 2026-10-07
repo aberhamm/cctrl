@@ -71,7 +71,20 @@ _suite_exit() {
         local frames="${FUNCNAME[*]:1}" lines="${BASH_LINENO[*]}"
         echo "FAIL: test suite aborted (exit $rc) in [${frames:-main}] (call lines: $lines) at: $cmd" >&2
     fi
-    [[ -n "$TMPDIR" && -d "$TMPDIR" ]] && rm -rf -- "$TMPDIR"
+    if [[ -n "$TMPDIR" && -d "$TMPDIR" ]]; then
+        # Detached launches leave background conversation-id pollers that can
+        # still write into $TMPDIR during cleanup ("Directory not empty").
+        # $TMPDIR is this run's own mktemp dir, so matching it on a command
+        # line only ever hits this run's processes; then retry the rm.
+        local _try
+        pkill -f -- "$TMPDIR/" 2>/dev/null || true
+        for _try in 1 2 3 4 5; do
+            rm -rf -- "$TMPDIR" 2>/dev/null && break
+            sleep 1
+            pkill -f -- "$TMPDIR/" 2>/dev/null || true
+        done
+        [[ ! -d "$TMPDIR" ]] || rm -rf -- "$TMPDIR"
+    fi
     if [[ "${CCTRL_TEST_TMUX_TMPDIR:-}" == /tmp/cctrl-test-tmux.* && -d "$CCTRL_TEST_TMUX_TMPDIR" ]]; then
         # Every server under the private dir is ours (default or a test's
         # -L socket); -S pins each one so nothing else is ever addressed.
@@ -3486,11 +3499,23 @@ test_role_flags_before_at_target_without_detach() {
 test_role_flags_never_reach_child_command() {
     _rf_setup rp3 '{}'
     local out shell_cmd
-    out="$(_rf start -d --role orchestrator --orch-kind repo --succeeds old-one --no-input --purpose p "$RF_PROJ")"
+    out="$(_rf start -d --role orchestrator --orch-kind repo --no-input --purpose p "$RF_PROJ")"
     shell_cmd="$(grep '^SHELL_CMD=' "$RF_LOG" | head -n 1)"
     [[ -n "$shell_cmd" ]] || fail "no tmux new-session command logged: $out"
     local needle
     for needle in "--role" "--orch-kind" "--succeeds" "--no-input" "CCTRL_ROLE" "CCTRL_ORCH" "CCTRL_NO_INPUT"; do
+        assert_not_contains "$shell_cmd" "$needle"
+    done
+    # --succeeds is only valid for a fleet manager: prove it never reaches the child there.
+    _rf_setup rp3f '{}'
+    : > "$RF_LOG"
+    local live_state="$TMPDIR/rp3f.state"
+    printf '$1:TMUX--ms--old-fm\n' > "$live_state"
+    CCTRL_SESSION_METADATA_DIR="$CCTRL_SESSION_METADATA_DIR" CCTRL_HOST_PREFIX=ms cctrl_source_eval '_session_write_metadata "$1" /tmp @x @x @x p "" cmd "" claude "conv-rp3f" "" "" "" "" "" "" "" orchestrator fleet' TMUX--ms--old-fm || fail "fixture record"
+    out="$(TMUX_FAKE_STATE="$live_state" _rf start -d --agent claude --role orchestrator --orch-kind fleet --succeeds TMUX--ms--old-fm --no-input --purpose p "$RF_PROJ")"
+    shell_cmd="$(grep '^SHELL_CMD=' "$RF_LOG" | head -n 1)"
+    [[ -n "$shell_cmd" ]] || fail "no tmux new-session command logged for the fleet launch: $out"
+    for needle in "--role" "--orch-kind" "--succeeds" "--no-input"; do
         assert_not_contains "$shell_cmd" "$needle"
     done
     echo "ok: role flags and role env never reach the pane child"
@@ -3705,19 +3730,6 @@ test_shortcut_add_role_flags_set_and_clear() {
     echo "ok: @add --role/--orch-kind set, clear and validate"
 }
 
-test_at_fm_shortcut_launch_keeps_fm_name() {
-    # Plan 098 regression guard, rewritten by plan 100: an explicit
-    # `cctrl @fm-<x>` launch still names from the fm- key. The fixture now says
-    # what the key is (role + kind); the role-less fixture is case A3 below.
-    _rf_setup atfm '{"fm-atfm":{"dir":"@P@","role":"orchestrator","orch_kind":"repo"}}'
-    local out
-    out="$(_rf start -d --purpose p @fm-atfm)"
-    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fm-atfm"
-    assert_contains "$(cat "$RF_LOG")" "new-session -d -s TMUX--ms--fm-atfm"
-    assert_contains "$(cat "$RF_LOG")" "--name TMUX--ms--fm-atfm"
-    echo "ok: an explicit @fm-<x> launch still names from the fm- key"
-}
-
 test_ask_a1_role_orchestrator_without_kind_exits_78() {
     _rf_setup a1 '{}'
     local before out rc=0
@@ -3836,7 +3848,7 @@ test_ask_tty_prompts_when_stdout_is_captured() {
         bash -c 'out="$("$1" start -d --role orchestrator --purpose p "$2")"; echo "CAPTURED=$out"' _ "$RF_COPY/cctrl" "$RF_PROJ" > "$out_file" 2>&1 || rc=$?
     [[ "$rc" -eq 0 ]] || fail "a captured stdout must still prompt on the tty, got $rc: $(cat "$out_file")"
     assert_contains "$(cat "$out_file")" "Which kind of orchestrator"
-    assert_contains "$(cat "$out_file")" "CCTRL_SESSION=TMUX--ms--rf-ttycap-proj"
+    assert_contains "$(cat "$out_file")" "CCTRL_SESSION=TMUX--ms--orch-rf-ttycap-proj"
     echo "ok: the tty ask works when stdout is captured"
 }
 
@@ -4050,31 +4062,30 @@ test_set_role_clear_removes_fields() {
 
 test_relaunch_with_new_role_replaces_recorded_role() {
     _rf_setup relaunch '{}'
-    local out sess
+    local out sess first
     out="$(_rf start -d --role worker -r conv-relaunch-1 --purpose p "$RF_PROJ")"
-    sess="$(_rf_session "$out")"
+    sess="$(_rf_session "$out")"; first="$sess"
     [[ "$(session_record_json "$sess" | jq -r '.role')" == worker ]] || fail "first launch: $out"
     out="$(_rf start -d --orch-kind repo -r conv-relaunch-1 --purpose p "$RF_PROJ")"
-    sess="$(_rf_session "$out")"
-    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] \
-        || fail "a relaunch with a new role must replace the recorded one: $(session_record_json "$sess")"
+    # One record per conversation: it keeps the first launch's tmux name.
+    [[ "$(session_record_json "$first" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] \
+        || fail "a relaunch with a new role must replace the recorded one: $(session_record_json "$first")"
     echo "ok: a relaunch with a new role replaces the recorded role"
 }
 
 test_roleless_relaunch_keeps_recorded_role_and_kind() {
     _rf_setup keeprole '{}'
-    local out sess
+    local out sess first
     out="$(_rf start -d --role orchestrator --orch-kind repo -r conv-keep-1 --purpose p "$RF_PROJ")"
-    sess="$(_rf_session "$out")"
+    sess="$(_rf_session "$out")"; first="$sess"
     [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] || fail "first launch: $out"
     out="$(_rf start -d -r conv-keep-1 --purpose p "$RF_PROJ")"
     sess="$(_rf_session "$out")"
     [[ "$(session_record_json "$sess" | jq -r '.role + "/" + .orch_kind')" == orchestrator/repo ]] \
         || fail "a role-less relaunch must keep the recorded role: $(session_record_json "$sess")"
     out="$(_rf start -d --role worker -r conv-keep-1 --purpose p "$RF_PROJ")"
-    sess="$(_rf_session "$out")"
-    [[ "$(session_record_json "$sess" | jq -r '.role + "/" + (.orch_kind // "")')" == worker/ ]] \
-        || fail "an explicit --role worker must win and clear the kind: $(session_record_json "$sess")"
+    [[ "$(session_record_json "$first" | jq -r '.role + "/" + (.orch_kind // "")')" == worker/ ]] \
+        || fail "an explicit --role worker must win and clear the kind: $(session_record_json "$first")"
     echo "ok: a role-less relaunch keeps the recorded role and kind; an explicit flag wins"
 }
 
@@ -13399,6 +13410,566 @@ SH
 # Before any test, focused group or not (plan 071 p5 incident).
 test_tmux_default_server_is_private
 
+# ── Plan 100 phase 2: names, labels, the one-fleet-manager guard ───────────
+# Same rules as phase 1: a rootcopy of cctrl, the fake tmux (TMUX_FAKE_STATE
+# says which sessions are live), stdin from /dev/null. The guard's lock lives
+# in the sandbox registry dir, never in a real one.
+
+_p2_setup() {
+    # args: tag shortcuts-json
+    _rf_setup "$@"
+    P2_STATE="$TMPDIR/p2-$1.state"; : > "$P2_STATE"; P2_N=0
+    rm -rf "$CCTRL_SESSION_METADATA_DIR/.fleet-manager-codex.lock" "$CCTRL_SESSION_METADATA_DIR/.fleet-manager-claude.lock"
+}
+_p2_ok() {
+    # args: message command... -> runs the command, its output lands in the caller's $out
+    local msg="$1" rc=0
+    shift
+    out="$("$@")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "$msg ($rc): $out"
+}
+_p2_live() { local n; for n in "$@"; do P2_N=$((P2_N + 1)); printf '$%s:%s\n' "$P2_N" "$n" >> "$P2_STATE"; done; }
+_p2() { TMUX_FAKE_STATE="$P2_STATE" _rf "$@"; }
+_p2_new_name() { grep -o 'new-session -d -s [^ ]*' "$1" | tail -n 1 | awk '{print $NF}'; }
+_p2_new_count() { grep -c 'new-session -d -s' "$RF_LOG" || true; }
+_p2_record() {
+    # args: session role kind agent -> a record for a session this test calls live
+    CCTRL_HOST_PREFIX=ms cctrl_source_eval '_session_write_metadata "$1" /tmp @x @x @x p "" cmd "" "$4" "conv-p2-${1//[^a-z0-9]/-}" "" "" "" "" "" "" "" "$2" "$3"' "$1" "$2" "$3" "$4" \
+        || fail "fixture record for $1 could not be written"
+}
+_p2_fleet_live() {
+    # Launch a fleet manager through the real launcher, then mark it live.
+    local out
+    _p2_ok "first fleet manager did not launch" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    P2_FLEET="$(_rf_session "$out")"
+    _p2_live "$P2_FLEET"
+}
+_p2_lock() {
+    # args: runtime created-epoch pid-or-empty
+    local d="$CCTRL_SESSION_METADATA_DIR/.fleet-manager-$1.lock"
+    mkdir -p "$d"
+    printf '%s\n' "$2" > "$d/created"
+    [[ -n "$3" ]] && printf '%s\n' "$3" > "$d/pid"
+    return 0
+}
+_p2_lock_dir() { printf '%s/.fleet-manager-%s.lock' "$CCTRL_SESSION_METADATA_DIR" "$1"; }
+
+test_fleet_orchestrator_name_and_star_label() {
+    _p2_setup fl1 '{"fm-orchestrator":{"dir":"@P@","role":"orchestrator","orch_kind":"fleet","agent":"codex"}}'
+    local out
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    assert_contains "$(cat "$RF_LOG")" "new-session -d -s TMUX--ms--fleet-codex"
+    assert_contains "$(cat "$RF_LOG")" "--name TMUX--ms--fleet-codex"
+    [[ "$(_rf_field "$out" purpose)" == "★★ fleet manager (codex)" ]] || fail "label: $(_rf_field "$out" purpose)"
+    # The same through the @fm-orchestrator key.
+    _p2_setup fl1b '{"fm-orchestrator":{"dir":"@P@","role":"orchestrator","orch_kind":"fleet","agent":"codex"}}'
+    out="$(_p2 start -d @fm-orchestrator)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    [[ "$(_rf_field "$out" purpose)" == "★★ fleet manager (codex)" ]] || fail "key label: $(_rf_field "$out" purpose)"
+    echo "ok: a fleet manager is fleet-<runtime> with the double-star label"
+}
+
+test_repo_orchestrator_name_and_star_label() {
+    _p2_setup rp1 '{}'
+    local out
+    out="$(_p2 start -d --orch-kind repo "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-rf-rp1-proj"
+    assert_contains "$(cat "$RF_LOG")" "--name TMUX--ms--orch-rf-rp1-proj"
+    [[ "$(_rf_field "$out" purpose)" == "★ orchestrator: rf-rp1-proj" ]] || fail "label: $(_rf_field "$out" purpose)"
+    echo "ok: a repo orchestrator is orch-<repo> with the single-star label"
+}
+
+test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename() {
+    _p2_setup nm '{}'
+    local a="$TMPDIR/p2-names-a" b="$TMPDIR/p2-names-b" c="$TMPDIR/p2-names-c" out
+    mkdir -p "$a" "$b" "$c"
+    printf '{"walias":{"dir":"%s"},"fm-viaalias":{"dir":"%s","role":"orchestrator","orch_kind":"repo"},"orch-solo":{"dir":"%s","role":"orchestrator","orch_kind":"repo"}}\n' \
+        "$a" "$a" "$b" > "$RF_COPY/data/shortcuts.json"
+    out="$(_p2 start -d @fm-viaalias)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-walias"
+    out="$(_p2 start -d @orch-solo)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-solo"
+    out="$(_p2 start -d --orch-kind repo "$c")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-p2-names-c"
+    out="$(_p2 start -d --orch-kind repo "$a")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-walias"
+    echo "ok: the repo name is the dir's worker alias, else the stripped key, else the basename"
+}
+
+test_at_legacy_orch_shortcut_launch_gets_orch_name() {
+    # Plan 098 regression guard, rewritten by plan 100 phase 1 and again here:
+    # an explicit `cctrl @fm-<x>` launch of a repo orchestrator is orch-<x>.
+    _rf_setup atfm '{"fm-atfm":{"dir":"@P@","role":"orchestrator","orch_kind":"repo"}}'
+    local out
+    out="$(_rf start -d --purpose p @fm-atfm)"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--orch-atfm"
+    assert_contains "$(cat "$RF_LOG")" "new-session -d -s TMUX--ms--orch-atfm"
+    assert_contains "$(cat "$RF_LOG")" "--name TMUX--ms--orch-atfm"
+    echo "ok: an explicit @fm-<x> repo orchestrator launch is named orch-<x>"
+}
+
+_p2_restore_row_run() {
+    # args: dir flags-json -> runs a real restore of the cctrl row with those launch_flags
+    local dir="$1"
+    _restore_role_fixture "$dir"
+    jq --argjson f "$2" '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += $f' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    local rrc=0
+    P2_RESTORE_OUT="$(TMUX_LOG="$dir/tmux.log" CCTRL_DEVICE_TAG=ms TMUX_FAKE_STATE="${3:-}" \
+        _restore_run_real "$dir" --only cctrl --yes 2>&1 </dev/null)" || rrc=$?
+    [[ "$rrc" -eq 0 ]] || fail "restore failed ($rrc): $P2_RESTORE_OUT"
+    P2_RESTORE_NAME="$(_p2_new_name "$dir/tmux.log")"
+}
+
+test_unknown_kind_orchestrator_keeps_worker_name() {
+    local dir="$TMPDIR/p2-restore-unknown"
+    _p2_restore_row_run "$dir" '{"role":"orchestrator"}'
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--work ]] || fail "unknown kind must keep the worker name, got: $P2_RESTORE_NAME"
+    echo "ok: an orchestrator of unknown kind keeps the worker name"
+}
+
+test_orchestrator_ignores_prompt_derived_label() {
+    _p2_setup pl '{}'
+    local out
+    out="$(_p2 start -d --orch-kind repo "$RF_PROJ" -- fix the flaky login test in the billing module today)"
+    [[ "$(_rf_field "$out" purpose)" == "★ orchestrator: rf-pl-proj" ]] || fail "label: $(_rf_field "$out" purpose)"
+    echo "ok: an orchestrator never takes a prompt-derived label"
+}
+
+test_orchestrator_explicit_label_gets_glyph_once() {
+    _p2_setup gl '{}'
+    local out
+    out="$(_p2 start -d --orch-kind repo -n "release train" "$RF_PROJ")"
+    [[ "$(_rf_field "$out" purpose)" == "★ release train" ]] || fail "plain -n: $(_rf_field "$out" purpose)"
+    out="$(_p2 start -d --orch-kind repo --purpose "★ already starred" "$RF_PROJ")"
+    [[ "$(_rf_field "$out" purpose)" == "★ already starred" ]] || fail "starred: $(_rf_field "$out" purpose)"
+    out="$(_p2 start -d --orch-kind repo --purpose "☆ hollow star" "$RF_PROJ")"
+    [[ "$(_rf_field "$out" purpose)" == "☆ hollow star" ]] || fail "hollow: $(_rf_field "$out" purpose)"
+    out="$(_p2 start -d --agent codex --orch-kind fleet -n "the manager" "$RF_PROJ")"
+    [[ "$(_rf_field "$out" purpose)" == "★★ the manager" ]] || fail "fleet: $(_rf_field "$out" purpose)"
+    echo "ok: an explicit orchestrator label keeps its text and gets the star once"
+}
+
+test_rename_adds_glyph_for_known_kind_only() {
+    _p2_setup rn '{}'
+    local out sess wsess usess
+    out="$(_p2 start -d --orch-kind repo "$RF_PROJ")"; sess="$(_rf_session "$out")"
+    out="$(_p2 start -d --role worker "$RF_PROJ")"; wsess="$(_rf_session "$out")"
+    usess="TMUX--ms--p2-unk"
+    _p2_record "$usess" orchestrator "" codex
+    _p2_live "$sess" "$wsess" "$usess"
+    _p2 rename "$sess" "new words" >/dev/null
+    [[ "$(session_record_json "$sess" | jq -r .purpose)" == "★ new words" ]] || fail "known kind: $(session_record_json "$sess" | jq -r .purpose)"
+    _p2 rename "$sess" "☆ own glyph" >/dev/null
+    [[ "$(session_record_json "$sess" | jq -r .purpose)" == "☆ own glyph" ]] || fail "own glyph was changed"
+    _p2 rename "$wsess" "plain worker" >/dev/null
+    [[ "$(session_record_json "$wsess" | jq -r .purpose)" == "plain worker" ]] || fail "worker got a glyph"
+    _p2 rename "$usess" "unknown kind" >/dev/null
+    [[ "$(session_record_json "$usess" | jq -r .purpose)" == "unknown kind" ]] || fail "unknown kind got a glyph"
+    echo "ok: rename adds the star for a known-kind orchestrator only"
+}
+
+test_replay_keeps_label_verbatim() {
+    local dir="$TMPDIR/p2-restore-verbatim"
+    _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"repo"}'
+    local rec
+    rec="$(grep -l 'conv-aaa-111' "$dir/session-metadata"/*.json 2>/dev/null | head -n 1)"
+    [[ -n "$rec" ]] || fail "no record: $(ls "$dir/session-metadata")"
+    [[ "$(jq -r .purpose "$rec")" != ★* && "$(jq -r .purpose "$rec")" != ☆* ]] \
+        || fail "a replayed label must stay verbatim, got: $(jq -r .purpose "$rec")"
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--orch-* ]] || fail "a restored repo orchestrator is orch-<repo>, got: $P2_RESTORE_NAME"
+    echo "ok: a replayed label is kept verbatim and the name is re-derived"
+}
+
+test_set_role_relabel_writes_canonical_label() {
+    _p2_setup rl '{}'
+    local out sess
+    out="$(_p2 start -d --role worker --purpose "plain" "$RF_PROJ")"; sess="$(_rf_session "$out")"
+    _p2_live "$sess"
+    _p2 session set-role "$sess" orchestrator --orch-kind repo >/dev/null
+    [[ "$(session_record_json "$sess" | jq -r .purpose)" == plain ]] || fail "set-role without --relabel must not relabel"
+    _p2 session set-role "$sess" orchestrator --orch-kind repo --relabel >/dev/null
+    [[ "$(session_record_json "$sess" | jq -r .purpose)" == "★ orchestrator: rf-rl-proj" ]] \
+        || fail "relabel: $(session_record_json "$sess" | jq -r .purpose)"
+    local rc=0
+    _p2 session set-role "$sess" worker --relabel >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--relabel on a worker must exit 64, got $rc"
+    assert_not_contains "$(cat "$RF_LOG")" "kill-session"
+    echo "ok: set-role --relabel writes the canonical label and nothing renames the session"
+}
+
+test_codex_title_skips_repo_prefix_for_star_label() {
+    local out
+    out="$(cctrl_source_eval '_session_app_display_name TMUX--ms--orch-cctrl "★ orchestrator: cctrl" /x/cctrl; echo; _session_app_display_name TMUX--ms--cctrl "fix it" /x/cctrl')"
+    assert_contains "$out" "★ orchestrator: cctrl (TMUX--ms--orch-cctrl)"
+    assert_not_contains "$out" "cctrl: ★"
+    assert_contains "$out" "cctrl: fix it (TMUX--ms--cctrl)"
+    echo "ok: the Codex title skips its repo prefix for a star label"
+}
+
+test_remote_orchestrator_launch_injects_no_default_purpose() {
+    _remote_role_fixture p2np
+    local out
+    SSH_PRE_OUT='role=orchestrator orch_kind=repo' _p2_ok "remote launch failed" _remote_role @k
+    assert_not_contains "$(tail -n 1 "$RR_LOG")" "--purpose"
+    : > "$RR_LOG"
+    SSH_PRE_OUT='role=worker orch_kind=-' _p2_ok "remote worker launch failed" _remote_role @k
+    assert_contains "$(tail -n 1 "$RR_LOG")" "--purpose"
+    echo "ok: a remote orchestrator launch injects no default purpose"
+}
+
+test_second_fleet_manager_same_runtime_refused_65() {
+    _p2_setup g1 '{}'
+    _p2_fleet_live
+    local before out rc=0
+    before="$(_p2_new_count)"
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected 65, got $rc: $out"
+    assert_contains "$out" "$P2_FLEET"
+    assert_contains "$out" "--succeeds $P2_FLEET"
+    assert_contains "$out" "CCTRL_ALLOW_SECOND_FLEET_MANAGER=1"
+    [[ "$(_p2_new_count)" == "$before" ]] || fail "a refused launch must not create a session"
+    [[ ! -d "$(_p2_lock_dir codex)" ]] || fail "a refusal must release the lock"
+    echo "ok: a second fleet manager of the same runtime is refused with 65"
+}
+
+test_fleet_launch_never_gets_index_suffix() {
+    _p2_setup g2 '{}'
+    local out rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    # A live NON-fleet session holds the exact name: refuse, never fleet-codex--2.
+    _p2_setup g2b '{}'
+    _p2_record TMUX--ms--fleet-codex worker "" codex
+    _p2_live TMUX--ms--fleet-codex
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected 65, got $rc: $out"
+    assert_contains "$out" "not a fleet manager"
+    assert_not_contains "$(cat "$RF_LOG")" "fleet-codex--2"
+    echo "ok: a fleet launch never gets an index suffix"
+}
+
+test_old_named_fleet_manager_with_role_blocks_new_one() {
+    _p2_setup g3 '{}'
+    _p2_record TMUX--ms--fm-orchestrator orchestrator fleet codex
+    _p2_live TMUX--ms--fm-orchestrator
+    local out rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected 65, got $rc: $out"
+    assert_contains "$out" "TMUX--ms--fm-orchestrator"
+    echo "ok: a tagged fm-orchestrator blocks a new fleet manager"
+}
+
+test_fleet_manager_other_runtime_allowed() {
+    _p2_setup g4 '{}'
+    _p2_record TMUX--ms--fleet-claude orchestrator fleet claude
+    _p2_live TMUX--ms--fleet-claude
+    local out
+    _p2_ok "a codex fleet manager beside a live claude one was refused" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    echo "ok: a fleet manager of another runtime is allowed"
+}
+
+test_repo_and_unknown_kind_sessions_never_trip_guard() {
+    _p2_setup g5 '{}'
+    _p2_record TMUX--ms--p2-unkn orchestrator "" codex
+    _p2_record TMUX--ms--orch-other orchestrator repo codex
+    _p2_live TMUX--ms--p2-unkn TMUX--ms--orch-other
+    local out
+    _p2_ok "fleet launch tripped by repo/unknown sessions" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    _p2_ok "repo launch refused" _p2 start -d --orch-kind repo "$RF_PROJ"
+    echo "ok: repo and unknown-kind orchestrators never trip the guard"
+}
+
+test_guard_runs_only_after_kind_known() {
+    _p2_setup g6 '{}'
+    _p2_fleet_live
+    local out rc=0
+    out="$(_p2 start -d --agent codex --role orchestrator "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 78 ]] || fail "an ambiguous launch must answer 78, got $rc: $out"
+    echo "ok: the guard runs only after the kind is known"
+}
+
+test_concurrent_fleet_launch_refused_by_lock() {
+    _p2_setup lk1 '{}'
+    _p2_lock codex "$(date +%s)" "$$"
+    local out rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected 65, got $rc: $out"
+    assert_contains "$out" "in progress"
+    [[ -d "$(_p2_lock_dir codex)" ]] || fail "the held lock must survive a refused launch"
+    [[ "$(_p2_new_count)" == 0 ]] || fail "nothing may be created"
+    echo "ok: a held fleet lock refuses a concurrent launch"
+}
+
+test_stale_fleet_lock_is_reclaimed() {
+    _p2_setup lk2 '{}'
+    local dead
+    ( : ) & dead=$!; wait "$dead" 2>/dev/null || true
+    _p2_lock codex "$(date +%s)" "$dead"
+    local out
+    _p2_ok "a dead-pid lock must be reclaimed" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    [[ ! -d "$(_p2_lock_dir codex)" ]] || fail "the lock must be released after the launch"
+    echo "ok: a lock with a dead pid is reclaimed"
+}
+
+test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid() {
+    _p2_setup lk3 '{}'
+    _p2_lock codex "$(( $(date +%s) - 300 ))" "$$"
+    local out
+    _p2_ok "an old lock must be reclaimed" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    echo "ok: a lock older than the limit is reclaimed whatever its pid"
+}
+
+test_fleet_lock_without_pid_file_is_held_only_briefly() {
+    _p2_setup lk4 '{}'
+    _p2_lock codex "$(date +%s)" ""
+    local out rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a fresh pid-less lock is held, got $rc: $out"
+    rm -rf "$(_p2_lock_dir codex)"
+    _p2_lock codex "$(( $(date +%s) - 30 ))" ""
+    _p2_ok "an older pid-less lock must be reclaimed" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    echo "ok: a lock without a pid file is held only briefly"
+}
+
+test_override_env_is_unset_before_tmux_new_session() {
+    _p2_setup ov1 '{}'
+    _p2_fleet_live
+    mv "$TMPDIR/tmux" "$TMPDIR/tmux.real"
+    cat > "$TMPDIR/tmux" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "new-session" ]]; then
+    printf 'ENV allow=%s noinput=%s\n' "${CCTRL_ALLOW_SECOND_FLEET_MANAGER-unset}" "${CCTRL_NO_INPUT-unset}" >> "${P2_ENVLOG:?}"
+fi
+exec "$(dirname "$0")/tmux.real" "$@"
+SH
+    chmod +x "$TMPDIR/tmux"
+    local envlog="$TMPDIR/p2-env.log" out
+    : > "$envlog"
+    P2_ENVLOG="$envlog" CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 CCTRL_NO_INPUT=1 _p2_ok "override launch failed" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    assert_contains "$(cat "$envlog")" "allow=unset noinput=unset"
+    echo "ok: the override and no-input variables are unset before tmux new-session"
+}
+
+test_allow_second_fleet_manager_env_override() {
+    _p2_setup ov2 '{}'
+    _p2_fleet_live
+    local out
+    CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 _p2_ok "override refused" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    assert_contains "$out" "CCTRL_ALLOW_SECOND_FLEET_MANAGER=1"
+    assert_contains "$out" "$P2_FLEET"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex--2"
+    [[ ! -d "$(_p2_lock_dir codex)" ]] || fail "the override path must not leave a lock"
+    echo "ok: CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 allows a second fleet manager and says so"
+}
+
+test_succeeds_allows_one_handover_and_relabels_predecessor() {
+    _p2_setup su1 '{}'
+    _p2_fleet_live
+    local out
+    _p2_ok "handover refused" _p2 start -d --agent codex --orch-kind fleet --succeeds "$P2_FLEET" "$RF_PROJ"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex--2"
+    [[ "$(_rf_field "$out" succeeds)" == "$P2_FLEET" ]] || fail "succeeds not recorded"
+    [[ "$(session_record_json "$P2_FLEET" | jq -r .purpose)" == "☆ fleet manager (codex), handing over" ]] \
+        || fail "predecessor label: $(session_record_json "$P2_FLEET" | jq -r .purpose)"
+    assert_not_contains "$(cat "$RF_LOG")" "kill-session"
+    # While both are live nothing else can become a fleet manager.
+    _p2_live "$(_rf_session "$out")"
+    local rc=0
+    _p2 start -d --agent codex --orch-kind fleet --succeeds "$P2_FLEET" "$RF_PROJ" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a second handover while two are live must be refused, got $rc"
+    echo "ok: --succeeds allows one handover, relabels the predecessor and closes nothing"
+}
+
+test_succeeds_wrong_session_or_two_live_refused() {
+    _p2_setup su2 '{}'
+    _p2_fleet_live
+    local out rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet --succeeds TMUX--ms--somebody-else "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "--succeeds with the wrong session must exit 65, got $rc: $out"
+    _p2_setup su3 '{}'
+    rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet --succeeds TMUX--ms--fleet-codex "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "--succeeds with no live fleet manager must exit 65, got $rc: $out"
+    echo "ok: --succeeds needs exactly that one live fleet manager"
+}
+
+test_dead_fleet_manager_record_does_not_block() {
+    _p2_setup dd '{}'
+    _p2_record TMUX--ms--fleet-codex orchestrator fleet codex
+    local out
+    _p2_ok "a dead record blocked the launch" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--ms--fleet-codex"
+    echo "ok: a dead fleet manager's record does not block"
+}
+
+test_set_role_fleet_goes_through_guard() {
+    _p2_setup sg '{}'
+    _p2_fleet_live
+    local out wsess rc=0
+    out="$(_p2 start -d --role worker --purpose w "$RF_PROJ")"; wsess="$(_rf_session "$out")"
+    _p2_live "$wsess"
+    out="$(_p2 session set-role "$wsess" orchestrator --orch-kind fleet 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected 65, got $rc: $out"
+    assert_contains "$out" "$P2_FLEET"
+    [[ "$(session_record_json "$wsess" | jq -r .role)" == worker ]] || fail "a refused set-role must not change the role"
+    # The session itself is excluded: re-tagging the live fleet manager is fine.
+    _p2 session set-role "$P2_FLEET" orchestrator --orch-kind fleet >/dev/null || fail "re-tagging the live fleet manager was refused"
+    echo "ok: set-role --orch-kind fleet goes through the guard"
+}
+
+test_succeeds_refused_64_unless_fleet_kind() {
+    _p2_setup sk '{}'
+    local out rc=0 before
+    before="$(_p2_new_count)"
+    out="$(_p2 start -d --agent codex --orch-kind repo --succeeds old-one --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--succeeds with a repo orchestrator must exit 64, got $rc: $out"
+    rc=0
+    out="$(_p2 start -d --agent codex --role worker --succeeds old-one --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--succeeds with a worker must exit 64, got $rc: $out"
+    rc=0
+    out="$(CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 _p2 start -d --agent codex --orch-kind repo --succeeds old-one --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--succeeds with a repo orchestrator under the override must exit 64, got $rc: $out"
+    assert_contains "$out" "--succeeds is only valid"
+    rc=0
+    out="$(CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 _p2 start -d --agent codex --orch-kind fleet --succeeds old-one "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--succeeds under the override must exit 64, got $rc: $out"
+    [[ "$(_p2_new_count)" == "$before" ]] || fail "a refused --succeeds must not create a session"
+    echo "ok: --succeeds is refused with 64 unless the kind is fleet"
+}
+
+test_failed_health_check_leaves_predecessor_label() {
+    _p2_setup hc '{}'
+    _p2_fleet_live
+    local out rc=0 before_label
+    before_label="$(session_record_json "$P2_FLEET" | jq -r .purpose)"
+    mkdir -p "$RF_COPY/lib"
+    printf '_health_check_run() { return 1; }\n' > "$RF_COPY/lib/health-check.sh"
+    out="$(CCTRL_NO_HEALTH_CHECK= _p2 start -d --agent codex --orch-kind fleet --succeeds "$P2_FLEET" "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "a failed health check must fail the launch, got $rc: $out"
+    assert_contains "$out" "did not start"
+    [[ "$(session_record_json "$P2_FLEET" | jq -r .purpose)" == "$before_label" ]] \
+        || fail "predecessor relabelled on a failed launch: $(session_record_json "$P2_FLEET" | jq -r .purpose)"
+    [[ ! -d "$(_p2_lock_dir codex)" ]] || fail "a failed launch must release the lock"
+    echo "ok: a failed health check during --succeeds leaves the predecessor label unchanged"
+}
+
+test_empty_runtime_fleet_manager_counts_as_claude() {
+    _p2_setup er '{}'
+    _p2_record TMUX--ms--fleet-claude orchestrator fleet ""
+    _p2_live TMUX--ms--fleet-claude
+    local out rc=0
+    out="$(_p2 start -d --agent claude --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a tagged fleet manager with no agent must block a claude launch, got $rc: $out"
+    # set-role --relabel never writes an empty runtime.
+    out="$(_p2 start -d --role worker --purpose w "$RF_PROJ")"
+    local wsess
+    wsess="$(_rf_session "$out")"
+    _p2_live "$wsess"
+    rc=0
+    out="$(CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 _p2 session set-role "$wsess" orchestrator --orch-kind fleet --relabel 2>&1)" || rc=$?
+    assert_not_contains "$(session_record_json "$wsess" | jq -r .purpose)" "()"
+    echo "ok: an empty runtime counts as claude and is never written into a label"
+}
+
+test_set_role_fleet_takes_launch_lock() {
+    _p2_setup sl '{}'
+    local out wsess rc=0
+    out="$(_p2 start -d --role worker --purpose w "$RF_PROJ")"; wsess="$(_rf_session "$out")"
+    _p2_live "$wsess"
+    _p2_lock codex "$(date +%s)" "$$"
+    out="$(_p2 session set-role "$wsess" orchestrator --orch-kind fleet 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "set-role fleet with the lock held must exit 65, got $rc: $out"
+    assert_contains "$out" "in progress"
+    [[ "$(session_record_json "$wsess" | jq -r .role)" == worker ]] || fail "a locked-out set-role must not change the role"
+    [[ -d "$(_p2_lock_dir codex)" ]] || fail "the other holder's lock must stay"
+    rm -rf "$(_p2_lock_dir codex)"
+    _p2 session set-role "$wsess" orchestrator --orch-kind fleet >/dev/null 2>&1 || fail "set-role fleet failed with no lock held"
+    [[ ! -d "$(_p2_lock_dir codex)" ]] || fail "set-role must release the lock"
+    echo "ok: set-role --orch-kind fleet takes and releases the launch lock"
+}
+
+test_set_role_relabel_repo_falls_back_to_pane_path() {
+    _p2_setup rp '{}'
+    _p2_live TMUX--ms--p2-bare
+    local out
+    out="$(_p2 session set-role TMUX--ms--p2-bare orchestrator --orch-kind repo 2>&1)" || fail "tag failed: $out"
+    out="$(_p2 session set-role TMUX--ms--p2-bare orchestrator --orch-kind repo --relabel 2>&1)" || true
+    assert_contains "$(cat "$RF_LOG")" "demo"
+    assert_not_contains "$out" "★ orchestrator: "$'\n'
+    # With no pane path either, it refuses instead of writing a nameless label.
+    cp "$TMPDIR/tmux" "$TMPDIR/tmux.real"
+    printf '#!/bin/bash\n[[ "$1" == list-panes ]] && exit 0\nexec "%s/tmux.real" "$@"\n' "$TMPDIR" > "$TMPDIR/tmux"
+    local rc=0
+    out="$(_p2 session set-role TMUX--ms--p2-bare orchestrator --orch-kind repo --relabel 2>&1)" || rc=$?
+    cp "$TMPDIR/tmux.real" "$TMPDIR/tmux"
+    [[ "$rc" -eq 64 ]] || fail "an unnameable repo must exit 64, got $rc: $out"
+    assert_contains "$out" "cannot name the repo"
+    echo "ok: --relabel for a repo orchestrator falls back to the pane path, else refuses"
+}
+
+test_fleet_lock_registry_dir_failure_has_own_message() {
+    _p2_setup rd '{}'
+    : > "$TMPDIR/rd-afile"
+    local out rc=0
+    out="$(CCTRL_SESSION_METADATA_DIR="$TMPDIR/rd-afile/sub" _p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 74 ]] || fail "an uncreatable registry dir must exit 74, got $rc: $out"
+    assert_contains "$out" "cannot create the session registry dir"
+    assert_not_contains "$out" "in progress"
+    echo "ok: an uncreatable registry dir has its own exit code and message"
+}
+
+test_refusal_wording_per_caller() {
+    _p2_setup wd '{}'
+    _p2_fleet_live
+    local out wsess rc=0
+    out="$(_p2 start -d --role worker --purpose w "$RF_PROJ")"; wsess="$(_rf_session "$out")"
+    _p2_live "$wsess"
+    out="$(_p2 session set-role "$wsess" orchestrator --orch-kind fleet 2>&1)" || rc=$?
+    assert_not_contains "$out" "Refusing to launch"
+    assert_contains "$out" "Refusing to tag"
+    assert_not_contains "$out" "--succeeds"
+    # The exact-name refusal says what kind of session holds the name.
+    _p2_setup wd2 '{}'
+    _p2_record TMUX--ms--fleet-codex worker "" codex
+    _p2_live TMUX--ms--fleet-codex
+    rc=0
+    out="$(_p2 start -d --agent codex --orch-kind fleet "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected 65, got $rc: $out"
+    assert_contains "$out" "held by a live worker session"
+    echo "ok: refusal wording names the action and the holder"
+}
+
+test_restore_bypasses_guard_and_reports_predecessor() {
+    local dir="$TMPDIR/p2-restore-fleet" state="$TMPDIR/p2-restore-fleet.state"
+    printf '$1:TMUX--ms--fleet-claude\n' > "$state"
+    _p2_restore_row_run "$dir" '{"role":"orchestrator","orch_kind":"fleet"}' "$state"
+    [[ "$P2_RESTORE_NAME" == TMUX--ms--fleet-claude--2 ]] || fail "restored beside a live fleet manager, got: $P2_RESTORE_NAME"
+    assert_contains "$P2_RESTORE_OUT" "restored=1"
+    assert_contains "$P2_RESTORE_OUT" "beside the live fleet manager TMUX--ms--fleet-claude"
+    echo "ok: restore bypasses the guard and reports the live predecessor"
+}
+
+test_session_ls_warns_on_two_fleet_managers_and_unknown_kind() {
+    _p2_setup ls '{}'
+    _p2_record TMUX--ms--fleet-codex orchestrator fleet codex
+    _p2_live TMUX--ms--fleet-codex TMUX--ms--fleet-codex--2 TMUX--ms--p2-unk2
+    _p2_record TMUX--ms--p2-unk2 orchestrator "" codex
+    local out
+    out="$(TMUX_FAKE_STATE="$P2_STATE" PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms cctrl_source_eval '_session_ls_role_footers' 2>&1)"
+    assert_contains "$out" "2 codex fleet managers are live"
+    assert_contains "$out" "TMUX--ms--p2-unk2"
+    assert_contains "$out" "orch?"
+    : > "$P2_STATE"; _p2_live TMUX--ms--fleet-codex
+    out="$(TMUX_FAKE_STATE="$P2_STATE" PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms cctrl_source_eval '_session_ls_role_footers' 2>&1)"
+    assert_not_contains "$out" "fleet managers are live"
+    echo "ok: session ls footers warn on two fleet managers and unknown kind"
+}
+
+
 if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
     case "$CCTRL_TEST_ONLY" in
         session-prune)
@@ -13599,7 +14170,6 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             exit 0
             ;;
         role-phase1)
-            test_at_fm_shortcut_launch_keeps_fm_name
             test_role_flags_before_dir_target_with_detach
             test_role_flags_before_at_target_without_detach
             test_role_flags_never_reach_child_command
@@ -13666,6 +14236,47 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind
             test_recorded_worker_beats_legacy_name_inference_live
             test_session_ls_json_exposes_role_and_kind
+            echo "ok"
+            exit 0
+            ;;
+        role-phase2)
+            test_fleet_orchestrator_name_and_star_label
+            test_repo_orchestrator_name_and_star_label
+            test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename
+            test_at_legacy_orch_shortcut_launch_gets_orch_name
+            test_unknown_kind_orchestrator_keeps_worker_name
+            test_orchestrator_ignores_prompt_derived_label
+            test_orchestrator_explicit_label_gets_glyph_once
+            test_rename_adds_glyph_for_known_kind_only
+            test_replay_keeps_label_verbatim
+            test_set_role_relabel_writes_canonical_label
+            test_codex_title_skips_repo_prefix_for_star_label
+            test_remote_orchestrator_launch_injects_no_default_purpose
+            test_second_fleet_manager_same_runtime_refused_65
+            test_fleet_launch_never_gets_index_suffix
+            test_old_named_fleet_manager_with_role_blocks_new_one
+            test_fleet_manager_other_runtime_allowed
+            test_repo_and_unknown_kind_sessions_never_trip_guard
+            test_guard_runs_only_after_kind_known
+            test_concurrent_fleet_launch_refused_by_lock
+            test_stale_fleet_lock_is_reclaimed
+            test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid
+            test_fleet_lock_without_pid_file_is_held_only_briefly
+            test_override_env_is_unset_before_tmux_new_session
+            test_allow_second_fleet_manager_env_override
+            test_succeeds_allows_one_handover_and_relabels_predecessor
+            test_succeeds_wrong_session_or_two_live_refused
+            test_dead_fleet_manager_record_does_not_block
+            test_set_role_fleet_goes_through_guard
+            test_restore_bypasses_guard_and_reports_predecessor
+            test_session_ls_warns_on_two_fleet_managers_and_unknown_kind
+            test_succeeds_refused_64_unless_fleet_kind
+            test_failed_health_check_leaves_predecessor_label
+            test_empty_runtime_fleet_manager_counts_as_claude
+            test_set_role_fleet_takes_launch_lock
+            test_set_role_relabel_repo_falls_back_to_pane_path
+            test_fleet_lock_registry_dir_failure_has_own_message
+            test_refusal_wording_per_caller
             echo "ok"
             exit 0
             ;;
@@ -13766,7 +14377,6 @@ test_dir_launch_adopts_shortcut_alias
 test_dir_launch_shortcut_collision_deterministic
 test_dir_launch_skips_manager_shortcut_for_plain_key
 test_dir_launch_only_manager_shortcut_uses_dir_basename
-test_at_fm_shortcut_launch_keeps_fm_name
 test_role_flags_before_dir_target_with_detach
 test_role_flags_before_at_target_without_detach
 test_role_flags_never_reach_child_command
@@ -13833,6 +14443,43 @@ test_realign_keeps_recorded_tmux_name
 test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind
 test_recorded_worker_beats_legacy_name_inference_live
 test_session_ls_json_exposes_role_and_kind
+test_fleet_orchestrator_name_and_star_label
+test_repo_orchestrator_name_and_star_label
+test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename
+test_at_legacy_orch_shortcut_launch_gets_orch_name
+test_unknown_kind_orchestrator_keeps_worker_name
+test_orchestrator_ignores_prompt_derived_label
+test_orchestrator_explicit_label_gets_glyph_once
+test_rename_adds_glyph_for_known_kind_only
+test_replay_keeps_label_verbatim
+test_set_role_relabel_writes_canonical_label
+test_codex_title_skips_repo_prefix_for_star_label
+test_remote_orchestrator_launch_injects_no_default_purpose
+test_second_fleet_manager_same_runtime_refused_65
+test_fleet_launch_never_gets_index_suffix
+test_old_named_fleet_manager_with_role_blocks_new_one
+test_fleet_manager_other_runtime_allowed
+test_repo_and_unknown_kind_sessions_never_trip_guard
+test_guard_runs_only_after_kind_known
+test_concurrent_fleet_launch_refused_by_lock
+test_stale_fleet_lock_is_reclaimed
+test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid
+test_fleet_lock_without_pid_file_is_held_only_briefly
+test_override_env_is_unset_before_tmux_new_session
+test_allow_second_fleet_manager_env_override
+test_succeeds_allows_one_handover_and_relabels_predecessor
+test_succeeds_wrong_session_or_two_live_refused
+test_dead_fleet_manager_record_does_not_block
+test_set_role_fleet_goes_through_guard
+test_restore_bypasses_guard_and_reports_predecessor
+test_session_ls_warns_on_two_fleet_managers_and_unknown_kind
+test_succeeds_refused_64_unless_fleet_kind
+test_failed_health_check_leaves_predecessor_label
+test_empty_runtime_fleet_manager_counts_as_claude
+test_set_role_fleet_takes_launch_lock
+test_set_role_relabel_repo_falls_back_to_pane_path
+test_fleet_lock_registry_dir_failure_has_own_message
+test_refusal_wording_per_caller
 test_dir_launch_no_shortcut_match_unchanged
 test_session_doctor_classifies_bridge
 test_session_doctor_detects_collision

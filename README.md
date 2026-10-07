@@ -1008,7 +1008,7 @@ manages other sessions, and comes in two kinds: `fleet` (the fleet-manager
 orchestrator, at most one per runtime per machine) and `repo` (a repo-level
 orchestrator). A shortcut or a launch declares it; cctrl records it on the
 session (`role`, `orch_kind`, shown in `cctrl session ls --json`) and replays it
-on `restore` and `session doctor --fix`. This release changes no existing session label; the two name effects are that `-d ~/dev/rentkompass` now launches as the `rentkompass` worker name (no longer adopting the orchestrator shortcut) and that `session doctor --fix` realign pins the recorded tmux name.
+on `restore` and `session doctor --fix`. Phase 1 changed no existing session label; its two name effects were that `-d ~/dev/rentkompass` now launches as the `rentkompass` worker name (no longer adopting the orchestrator shortcut) and that `session doctor --fix` realign pins the recorded tmux name.
 
 ```bash
 cctrl start -d ~/dev/myapp --orch-kind repo       # an orchestrator of kind repo
@@ -1037,10 +1037,36 @@ other replays never ask: an unknown kind stays unknown. Remote launches
 remote, ask on the local terminal and forward explicit flags; the remote side
 never asks. `CCTRL_ASK_TIMEOUT` (default 120 s) bounds the prompt.
 
+**Names and labels of new launches (plan 100 phase 2).** A new fleet manager is
+`TMUX--<host>--fleet-<runtime>` and carries the label `★★ fleet manager
+(<runtime>)`; a new repo orchestrator is `TMUX--<host>--orch-<repo>` (`<repo>`:
+the dir's worker shortcut alias, else the shortcut key without `fm-` / `orch-`,
+else the dir basename) with `★ orchestrator: <repo>`; workers are unchanged. An
+orchestrator never takes a prompt-derived label; an explicit `-n` / `--purpose`
+wins and gets the star prepended once (unless it already starts with `★` or
+`☆`). `cctrl rename` does the same for an orchestrator of known kind. Existing
+sessions keep their names and labels, and `restore` / `session doctor --fix`
+keep replaying recorded labels verbatim (a restore re-derives the name, as for
+any restored session; realign keeps the recorded name).
+
+**One fleet manager per runtime per machine.** Launching a second one
+(`--orch-kind fleet`) exits **65** and names the live one. The tmux name
+`fleet-<runtime>` is the lock (no `--2` is ever handed out), plus a short
+launch lock in the registry dir (pid and age checked, so a stale lock never
+blocks). Handover: `--orch-kind fleet --succeeds <live-session>` starts the
+successor beside it, relabels the predecessor `☆ fleet manager (<runtime>),
+handing over` and closes nothing. Override, for the rare deliberate case:
+`CCTRL_ALLOW_SECOND_FLEET_MANAGER=1` (environment only; cctrl unsets it before
+it starts tmux, and prints one line naming the live fleet manager). `restore`
+and `doctor --fix` bypass the guard (a restored fleet manager beside a live one
+comes back as `fleet-<runtime>--2` and the restore summary says so). `cctrl
+session ls` prints a footer line for orchestrators of unknown kind and a
+warning when two fleet managers of a runtime are live.
+
 `session set-role` writes the record and the `@cctrl_role` / `@cctrl_orch_kind`
-tmux options. It never renames, relabels or restarts a session. There is no
-one-fleet-manager guard yet, so `--orch-kind fleet` is not checked against
-other live sessions.
+tmux options. It never renames or restarts a session and relabels only with
+`--relabel` (the canonical star label, for an orchestrator of known kind).
+`--orch-kind fleet` goes through the guard (the session itself excluded).
 
 ### Peers
 

@@ -50,6 +50,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `--app-owned` and `launch-to-app` launches. `session set-role --orch-kind
   fleet` has no one-fleet-manager guard until the next phase.
 
+### Added (plan 100, phase 2: names, labels, the guard)
+- New launches are role-named: a fleet manager is `TMUX--<host>--fleet-<runtime>`
+  (label `★★ fleet manager (<runtime>)`), a repo orchestrator
+  `TMUX--<host>--orch-<repo>` (label `★ orchestrator: <repo>`); workers are
+  unchanged. An explicit `-n` / `--purpose` wins and gets the star once; an
+  orchestrator never takes a prompt-derived label. `cctrl rename` keeps the star
+  of a known-kind orchestrator. Existing sessions are not renamed or relabelled.
+- One fleet manager per runtime per machine: a second `--orch-kind fleet` launch
+  exits 65 (name-atomic; `fleet-<runtime>` is the lock, never an index suffix;
+  a launch lock with pid and age checks guards the race). `--succeeds <session>`
+  hands over beside exactly one live predecessor and relabels it `☆ ... handing
+  over`. `CCTRL_ALLOW_SECOND_FLEET_MANAGER=1` overrides (env only, unset before
+  tmux starts). `restore` / `doctor --fix` bypass the guard.
+- `cctrl session set-role --relabel`; `set-role --orch-kind fleet` goes through
+  the guard. `cctrl session ls` footers for unknown-kind orchestrators and for
+  two live fleet managers. A remote orchestrator launch injects no default
+  purpose. The Codex app title skips its repo prefix for a star label.
+
+### Changed (plan 100, phase 2)
+- A repo orchestrator launch is no longer named like a worker: `@fm-cctrl` is now
+  `orch-cctrl`, not `cctrl`. A restored orchestrator or fleet manager is
+  re-named the same way (a restore replaces the session).
+
 ### Added (plan 089)
 - `cctrl release prune [--keep N] [--apply] [--json]`: manual, dry-run-by-default
   pruning of old releases under `~/.local/lib/cctrl/releases` (default keep 5,

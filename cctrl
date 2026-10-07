@@ -3702,7 +3702,10 @@ _session_app_display_name() {
     local repo
     purpose="$(_session_clean_purpose_label "$purpose")"
     repo="$(_session_repo_name "$cwd")"
-    if [[ -n "$repo" && -n "$purpose" && "$purpose" == "$repo: "* ]]; then
+    if [[ -n "$purpose" && ( "$purpose" == ★* || "$purpose" == ☆* ) ]]; then
+        # Orchestrator star labels already say what the session is (plan 100).
+        printf '%s (%s)' "$purpose" "$session_name"
+    elif [[ -n "$repo" && -n "$purpose" && "$purpose" == "$repo: "* ]]; then
         printf '%s (%s)' "$purpose" "$session_name"
     elif [[ -n "$repo" && -n "$purpose" ]]; then
         printf '%s: %s (%s)' "$repo" "$purpose" "$session_name"
@@ -4312,25 +4315,27 @@ _session_set_role() {
     # cctrl session set-role <session> orchestrator --orch-kind fleet|repo
     # cctrl session set-role <session> --clear
     # Tags a live session. Never renames it, never relabels it, never restarts
-    # it. (The one-fleet-manager guard arrives in phase 2: until then
-    # `--orch-kind fleet` is not checked against other live sessions.)
-    local session="" role="" kind_flag="" clear=false
+    # it. `--orch-kind fleet` goes through the one-fleet-manager guard (D10,
+    # the session itself excluded). `--relabel` writes the canonical label.
+    local session="" role="" kind_flag="" clear=false relabel=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help|help)
                 echo "Usage: cctrl session set-role <session> worker"
-                echo "       cctrl session set-role <session> orchestrator --orch-kind fleet|repo"
+                echo "       cctrl session set-role <session> orchestrator --orch-kind fleet|repo [--relabel]"
                 echo "       cctrl session set-role <session> --clear"
                 echo ""
                 echo "  Tag a live session with a role. Writes the record and the @cctrl_role /"
-                echo "  @cctrl_orch_kind tmux options. Never renames, relabels or restarts it."
-                echo "  The one-fleet-manager guard is not part of this phase: --orch-kind fleet"
-                echo "  is not checked against other live sessions."
+                echo "  @cctrl_orch_kind tmux options. Never renames or restarts it, and never"
+                echo "  relabels it unless --relabel is given (canonical star label)."
+                echo "  --orch-kind fleet is refused (65) while another fleet manager of the same"
+                echo "  runtime is live (CCTRL_ALLOW_SECOND_FLEET_MANAGER=1 overrides)."
                 return 0 ;;
             --orch-kind)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--orch-kind needs a value${RESET}" >&2; return 64; }
                 kind_flag="$2"; shift 2 ;;
             --clear) clear=true; shift ;;
+            --relabel) relabel=true; shift ;;
             -*) echo -e "${RED}Unknown set-role flag: $1${RESET}" >&2; return 64 ;;
             *)
                 if [[ -z "$session" ]]; then session="$1"
@@ -4363,6 +4368,56 @@ _session_set_role() {
         esac
         _role_resolve "$role" "$kind_flag" "" "$session" || return $?
         new_role="$ROLE_RESOLVED"; new_kind="$ORCH_KIND_RESOLVED"
+        if $relabel && [[ "$new_role" != orchestrator || -z "$new_kind" ]]; then
+            echo -e "${RED}--relabel needs an orchestrator of known kind (--orch-kind fleet|repo).${RESET}" >&2
+            return 64
+        fi
+    fi
+    if $clear && $relabel; then
+        echo -e "${RED}--clear takes no --relabel.${RESET}" >&2
+        return 64
+    fi
+    local sr_agent="" sr_lock_runtime="" rl_label="" rl_cwd=""
+    if $relabel && [[ "$new_kind" == repo ]]; then
+        rl_cwd="$(_session_metadata_field "$session" cwd 2>/dev/null || true)"
+        [[ -n "$rl_cwd" ]] || rl_cwd="$(tmux list-panes -t "=$session:" -F '#{pane_current_path}' 2>/dev/null | head -n 1 || true)"
+        local rl_repo
+        rl_repo="$(_role_repo_name "$rl_cwd" "")"
+        if [[ -z "$rl_repo" ]]; then
+            echo -e "${RED}--relabel cannot name the repo for $session (no recorded cwd or pane path).${RESET}" >&2
+            return 64
+        fi
+        rl_label="$(_role_default_label repo "" "$rl_repo")"
+    fi
+    if [[ "$new_kind" == fleet ]]; then
+        sr_agent="$(tmux show-option -qv -t "=$session:" @cctrl_agent 2>/dev/null || true)"
+        if [[ -z "$sr_agent" || "$sr_agent" == "1" ]]; then
+            sr_agent="$(_session_metadata_field "$session" agent 2>/dev/null || true)"
+        fi
+        local sr_live
+        [[ -n "$sr_agent" ]] || sr_agent=claude
+        if [[ "${CCTRL_ALLOW_SECOND_FLEET_MANAGER:-}" != 1 ]]; then
+            local sr_lock_rc=0
+            _fleet_lock_acquire "$sr_agent" || sr_lock_rc=$?
+            if (( sr_lock_rc == 2 )); then
+                echo -e "${RED}cctrl: cannot create the session registry dir $SESSION_METADATA_DIR for the fleet-manager lock.${RESET}" >&2
+                return 74
+            elif (( sr_lock_rc != 0 )); then
+                echo -e "${RED}cctrl: another fleet-manager launch or tag is in progress.${RESET}" >&2
+                return 65
+            fi
+            sr_lock_runtime="$sr_agent"
+        fi
+        sr_live="$(_fleet_live_managers "$sr_agent" "$session")"
+        if [[ -n "$sr_live" ]]; then
+            if [[ "${CCTRL_ALLOW_SECOND_FLEET_MANAGER:-}" == 1 ]]; then
+                echo -e "${YELLOW}cctrl: CCTRL_ALLOW_SECOND_FLEET_MANAGER=1: tagging a second $sr_agent fleet manager (live: $(printf '%s' "$sr_live" | tr '\n' ' ')).${RESET}" >&2
+            else
+                [[ -n "$sr_lock_runtime" ]] && _fleet_lock_release "$sr_lock_runtime"
+                _fleet_refuse "$sr_agent" "$(printf '%s\n' "$sr_live" | head -n 1)" tag
+                return 65
+            fi
+        fi
     fi
     local via="tmux options only"
     if [[ -f "$(_session_metadata_file "$session")" ]] \
@@ -4385,6 +4440,158 @@ _session_set_role() {
     else
         echo "$session: role=$new_role${new_kind:+ orch_kind=$new_kind} ($via)"
     fi
+    [[ -n "$sr_lock_runtime" ]] && _fleet_lock_release "$sr_lock_runtime"
+    if $relabel; then
+        [[ "$new_kind" == fleet ]] && rl_label="$(_role_default_label fleet "$sr_agent" "")"
+        cmd_rename "$session" "$rl_label" || return $?
+    fi
+}
+
+_role_glyph() {
+    # Star for a known orchestrator kind (plan 100 D9): fleet ★★, repo ★.
+    case "$1" in
+        fleet) printf '★★' ;;
+        repo) printf '★' ;;
+    esac
+}
+
+_role_apply_glyph() {
+    # <kind> <label>: prepend the kind's star unless the label already starts
+    # with ★ or ☆. Unknown kind or empty label: unchanged.
+    local kind="$1" label="$2" glyph
+    glyph="$(_role_glyph "$kind")"
+    if [[ -z "$glyph" || -z "$label" ]]; then
+        printf '%s' "$label"
+        return 0
+    fi
+    case "$label" in
+        ★*|☆*) printf '%s' "$label" ;;
+        *) printf '%s %s' "$glyph" "$label" ;;
+    esac
+}
+
+_role_default_label() {
+    # <kind> <runtime> <repo>: the canonical label of a new orchestrator.
+    case "$1" in
+        fleet) printf '★★ fleet manager (%s)' "$2" ;;
+        repo) printf '★ orchestrator: %s' "$3" ;;
+    esac
+}
+
+_role_repo_name() {
+    # <cwd> <explicit_key>: the repo part of an orchestrator name (D9): the
+    # worker shortcut alias for the dir, else the key without fm-/orch-, else
+    # the dir basename. Keeps @key and -d <dir> launches on one name.
+    local cwd="$1" key="$2" alias=""
+    [[ -n "$cwd" ]] && alias="$(_shortcut_for_dir "$cwd")"
+    if [[ -n "$alias" ]]; then
+        printf '%s' "$alias"
+        return 0
+    fi
+    case "$key" in
+        fm-*) key="${key#fm-}" ;;
+        orch-*) key="${key#orch-}" ;;
+    esac
+    if [[ -n "$key" ]]; then
+        printf '%s' "$key"
+        return 0
+    fi
+    cwd="${cwd%/}"
+    printf '%s' "${cwd##*/}"
+}
+
+_fleet_live_managers() {
+    # <runtime> [exclude_session]: live fleet managers of that runtime, one
+    # per line (D10). A recorded (or tagged) orchestrator/fleet of that agent
+    # counts; with no recorded role, the names fleet-<runtime> and
+    # fleet-<runtime>--N count. Unknown-kind sessions never count.
+    local runtime="$1" exclude="${2:-}" name info role kind src agent
+    while IFS= read -r name; do
+        [[ "$name" == TMUX--* && "$name" != "$exclude" ]] || continue
+        info="$(_session_role_of "$name")"
+        role="${info%%|*}"; info="${info#*|}"
+        kind="${info%%|*}"; src="${info#*|}"
+        if [[ "$role" == orchestrator && "$kind" == fleet ]]; then
+            agent="$(tmux show-option -qv -t "=$name:" @cctrl_agent 2>/dev/null || true)"
+            if [[ -z "$agent" || "$agent" == "1" ]]; then
+                agent="$(_session_metadata_field "$name" agent 2>/dev/null || true)"
+            fi
+            [[ -n "$agent" ]] || agent=claude
+            if [[ "$agent" == "$runtime" ]]; then printf '%s\n' "$name"; fi
+        elif [[ "$src" == default ]]; then
+            case "$name" in
+                TMUX--*--fleet-"$runtime"|TMUX--*--fleet-"$runtime"--[0-9]*) printf '%s\n' "$name" ;;
+            esac
+        fi
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    return 0
+}
+
+_fleet_lock_dir() {
+    printf '%s/.fleet-manager-%s.lock' "$SESSION_METADATA_DIR" "$1"
+}
+
+_fleet_lock_acquire() {
+    # Name-independent launch lock (D10 step 1): mkdir is the atomic claim,
+    # the dir holds `created` (epoch) and `pid`. Stale when older than 120 s
+    # whatever its pid says, when its pid is dead, or when it has no pid file
+    # and is more than a few seconds old. Returns 1 when held, 2 when the
+    # registry dir cannot be created.
+    local runtime="$1" dir attempt now created pid age stale
+    dir="$(_fleet_lock_dir "$runtime")"
+    mkdir -p "$SESSION_METADATA_DIR" 2>/dev/null || return 2
+    for attempt in 1 2; do
+        if mkdir "$dir" 2>/dev/null; then
+            date +%s > "$dir/created" 2>/dev/null || true
+            printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+            return 0
+        fi
+        now="$(date +%s)"
+        created="$(cat "$dir/created" 2>/dev/null || true)"
+        if ! [[ "$created" =~ ^[0-9]+$ ]]; then
+            created="$(stat -f %m "$dir" 2>/dev/null || true)"
+            [[ "$created" =~ ^[0-9]+$ ]] || created="$(stat -c %Y "$dir" 2>/dev/null || true)"
+            [[ "$created" =~ ^[0-9]+$ ]] || created="$now"
+        fi
+        age=$((now - created))
+        pid="$(cat "$dir/pid" 2>/dev/null || true)"
+        stale=0
+        if (( age > ${CCTRL_FLEET_LOCK_MAX_AGE:-120} )); then
+            stale=1
+        elif [[ -z "$pid" ]]; then
+            (( age >= 5 )) && stale=1
+        elif ! kill -0 "$pid" 2>/dev/null; then
+            stale=1
+        fi
+        (( stale )) || return 1
+        # Only one launch can move a stale lock away; the loser retries mkdir.
+        if mv "$dir" "$dir.stale.$$" 2>/dev/null; then
+            rm -f "$dir.stale.$$/pid" "$dir.stale.$$/created" 2>/dev/null || true
+            rmdir "$dir.stale.$$" 2>/dev/null || true
+        fi
+    done
+    return 1
+}
+
+_fleet_lock_release() {
+    local dir
+    dir="$(_fleet_lock_dir "$1")"
+    rm -f "$dir/pid" "$dir/created" 2>/dev/null || true
+    rmdir "$dir" 2>/dev/null || true
+}
+
+_fleet_refuse() {
+    # <runtime> <live_session> [message]: the D10 refusal text (exit 65 is the
+    # caller's job).
+    local runtime="$1" live="$2" action="${3:-launch}" label
+    label="$(_session_metadata_field "$live" purpose 2>/dev/null || true)"
+    echo -e "${RED}Refusing to $action: a $runtime fleet manager is already live: $live (\"$label\").${RESET}" >&2
+    echo "There is at most one fleet manager per runtime on this machine." >&2
+    echo "  Repo-level orchestrator:  --orch-kind repo" >&2
+    if [[ "$action" == launch ]]; then
+        echo "  Handover:                 --orch-kind fleet --succeeds $live" >&2
+    fi
+    echo "  Override:                 CCTRL_ALLOW_SECOND_FLEET_MANAGER=1" >&2
 }
 
 _launch_detached() {
@@ -4838,6 +5045,91 @@ _launch_detached() {
         fi
     fi
 
+    # A launch that states no role (no flag, no shortcut role) must not
+    # overwrite the role/kind already recorded for this conversation.
+    if [[ "$ROLE_EXPLICIT" != 1 && -n "$resume_id" ]]; then
+        local keep_file keep_host keep_role
+        keep_host="$(_cctrl_host_id 2>/dev/null || true)"
+        keep_file="$(_task_record_file "$detach_agent" "$keep_host" "$resume_id" 2>/dev/null || true)"
+        if [[ -n "$keep_file" && -f "$keep_file" ]]; then
+            keep_role="$(jq -r '.role // empty' "$keep_file" 2>/dev/null || true)"
+            if [[ "$keep_role" == orchestrator || "$keep_role" == worker ]]; then
+                ROLE_RESOLVED="$keep_role"
+                ORCH_KIND_RESOLVED="$(jq -r '.orch_kind // empty' "$keep_file" 2>/dev/null || true)"
+                [[ "$ORCH_KIND_RESOLVED" == fleet || "$ORCH_KIND_RESOLVED" == repo ]] || ORCH_KIND_RESOLVED=""
+                [[ "$ROLE_RESOLVED" == orchestrator ]] || ORCH_KIND_RESOLVED=""
+            fi
+        fi
+    fi
+    # Role-aware names and labels (plan 100 D9/D10). A fleet manager is
+    # fleet-<runtime>, a repo orchestrator orch-<repo>; workers and
+    # unknown-kind orchestrators keep the worker name. The override and
+    # no-input variables are read into locals and unset now, so the tmux
+    # server (and every later pane) never inherits them.
+    local role_kind="" role_repo="" fleet_lock_runtime="" fleet_exact_name=false
+    local fleet_succeeds_live="" fleet_live="" fleet_lock_rc=0
+    local role_allow_second="${CCTRL_ALLOW_SECOND_FLEET_MANAGER:-}"
+    unset CCTRL_ALLOW_SECOND_FLEET_MANAGER CCTRL_NO_INPUT
+    if [[ "${ROLE_RESOLVED:-worker}" == orchestrator \
+          && ( "$ORCH_KIND_RESOLVED" == fleet || "$ORCH_KIND_RESOLVED" == repo ) ]]; then
+        role_kind="$ORCH_KIND_RESOLVED"
+        if [[ "$role_kind" == fleet ]]; then
+            context_name="$(_tmux_session_slug "fleet-$detach_agent")"
+        else
+            role_repo="$(_role_repo_name "$metadata_cwd" "$role_key")"
+            context_name="$(_tmux_session_slug "orch-$role_repo")"
+        fi
+        session_name="$context_name"
+    fi
+    if [[ -n "$succeeds_flag" && "$role_kind" != fleet && -z "${_CCTRL_REPLAY:-}" ]]; then
+        echo -e "${RED}--succeeds is only valid for a fleet manager launch (--orch-kind fleet).${RESET}" >&2
+        return 64
+    fi
+    if [[ -n "$succeeds_flag" && "$role_allow_second" == 1 && -z "${_CCTRL_REPLAY:-}" ]]; then
+        echo -e "${RED}--succeeds cannot be combined with CCTRL_ALLOW_SECOND_FLEET_MANAGER=1.${RESET}" >&2
+        return 64
+    fi
+    if [[ "$role_kind" == fleet && -z "${_CCTRL_REPLAY:-}" ]]; then
+        fleet_live="$(_fleet_live_managers "$detach_agent")"
+        if [[ "$role_allow_second" == 1 ]]; then
+            echo -e "${YELLOW}cctrl: CCTRL_ALLOW_SECOND_FLEET_MANAGER=1: launching a second $detach_agent fleet manager (live: ${fleet_live:-none}).${RESET}" >&2
+        else
+            _fleet_lock_acquire "$detach_agent" && fleet_lock_rc=0 || fleet_lock_rc=$?
+            if (( fleet_lock_rc == 2 )); then
+                echo -e "${RED}Refusing to launch: cannot create the session registry dir $SESSION_METADATA_DIR for the fleet-manager lock.${RESET}" >&2
+                return 74
+            elif (( fleet_lock_rc != 0 )); then
+                echo -e "${RED}Refusing to launch: another fleet-manager launch is in progress.${RESET}" >&2
+                return 65
+            fi
+            fleet_lock_runtime="$detach_agent"
+            # Re-read under the lock: the winner of a race may have just created it.
+            fleet_live="$(_fleet_live_managers "$detach_agent")"
+            if [[ -n "$succeeds_flag" ]]; then
+                if [[ "$fleet_live" != "$succeeds_flag" ]]; then
+                    _fleet_lock_release "$fleet_lock_runtime"
+                    echo -e "${RED}Refusing to launch: --succeeds $succeeds_flag needs exactly that one live $detach_agent fleet manager (live: ${fleet_live:-none}).${RESET}" >&2
+                    return 65
+                fi
+                fleet_succeeds_live="$succeeds_flag"
+            elif [[ -n "$fleet_live" ]]; then
+                _fleet_lock_release "$fleet_lock_runtime"
+                _fleet_refuse "$detach_agent" "$(printf '%s\n' "$fleet_live" | head -n 1)"
+                return 65
+            else
+                fleet_exact_name=true
+                if tmux has-session -t "=$session_name" 2>/dev/null; then
+                    _fleet_lock_release "$fleet_lock_runtime"
+                    local fleet_holder
+                    fleet_holder="$(_session_role_of "$session_name")"
+                    fleet_holder="${fleet_holder%%|*}"
+                    echo -e "${RED}Refusing to launch: the name $session_name is held by a live ${fleet_holder:-role-less} session that is not a fleet manager.${RESET}" >&2
+                    return 65
+                fi
+            fi
+        fi
+    fi
+
     # Never assign a name whose tmux session is currently live — that would
     # clobber the running session (its metadata is overwritten and, if
     # new-session then fails, deleted). Route every detached-name derivation
@@ -4845,7 +5137,10 @@ _launch_detached() {
     # it reuses freed/dead indices (homelab, homelab--2, ...) but skips any
     # live one, and refuses if no safe slot is available.
     local base_name="$session_name" picked_name
-    if ! picked_name="$(_pick_safe_session_index "$base_name")"; then
+    if [[ "$fleet_exact_name" == true ]]; then
+        picked_name="$base_name"
+    elif ! picked_name="$(_pick_safe_session_index "$base_name")"; then
+        [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
         echo -e "${RED}Refusing to launch: no free session index for '$base_name' (indices 2-999 all have live tmux sessions).${RESET}" >&2
         return 1
     fi
@@ -4857,6 +5152,11 @@ _launch_detached() {
     local default_purpose final_purpose
     if $purpose_set; then
         final_purpose="$purpose"
+        # An explicit label gets the kind's star once; replay keeps it verbatim.
+        [[ -n "$role_kind" && -z "${_CCTRL_REPLAY:-}" ]] \
+            && final_purpose="$(_role_apply_glyph "$role_kind" "$purpose")"
+    elif [[ -n "$role_kind" && -z "${_CCTRL_REPLAY:-}" ]]; then
+        final_purpose="$(_role_default_label "$role_kind" "$detach_agent" "$role_repo")"
     else
         if [[ -n "$initial_prompt" ]]; then
             local repo_label
@@ -4879,7 +5179,8 @@ _launch_detached() {
         CCTRL_PENDING_LAUNCH_ID="$(uuidgen 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
         [[ "$CCTRL_PENDING_LAUNCH_ID" =~ ^[0-9a-f-]{36}$ ]] \
             || CCTRL_PENDING_LAUNCH_ID="$(openssl rand -hex 16 2>/dev/null || true)"
-        [[ "$CCTRL_PENDING_LAUNCH_ID" =~ ^[0-9a-f-]{16,64}$ ]] || return 74
+        [[ "$CCTRL_PENDING_LAUNCH_ID" =~ ^[0-9a-f-]{16,64}$ ]] \
+            || { [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"; return 74; }
     fi
     env_q="$base_env_q CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=$(_launch_quote "$session_name")"
     [[ -n "$CCTRL_PENDING_LAUNCH_ID" ]] \
@@ -4900,22 +5201,6 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
-    # A launch that states no role (no flag, no shortcut role) must not
-    # overwrite the role/kind already recorded for this conversation.
-    if [[ "$ROLE_EXPLICIT" != 1 && -n "$resume_id" ]]; then
-        local keep_file keep_host keep_role
-        keep_host="$(_cctrl_host_id 2>/dev/null || true)"
-        keep_file="$(_task_record_file "$detach_agent" "$keep_host" "$resume_id" 2>/dev/null || true)"
-        if [[ -n "$keep_file" && -f "$keep_file" ]]; then
-            keep_role="$(jq -r '.role // empty' "$keep_file" 2>/dev/null || true)"
-            if [[ "$keep_role" == orchestrator || "$keep_role" == worker ]]; then
-                ROLE_RESOLVED="$keep_role"
-                ORCH_KIND_RESOLVED="$(jq -r '.orch_kind // empty' "$keep_file" 2>/dev/null || true)"
-                [[ "$ORCH_KIND_RESOLVED" == fleet || "$ORCH_KIND_RESOLVED" == repo ]] || ORCH_KIND_RESOLVED=""
-                [[ "$ROLE_RESOLVED" == orchestrator ]] || ORCH_KIND_RESOLVED=""
-            fi
-        fi
-    fi
     if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
         "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" \
         "${ROLE_RESOLVED:-worker}" "$ORCH_KIND_RESOLVED" "$succeeds_flag" 2>/dev/null; then
@@ -4924,13 +5209,16 @@ _launch_detached() {
         if [[ -n "$peer_name" ]]; then
             echo -e "${RED}Failed to write session metadata for peer '$peer_name'.${RESET}" >&2
             echo -e "${DIM}Metadata path: $(_session_metadata_file "$session_name")${RESET}" >&2
+            [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
             return 1
         fi
     fi
     if ! tmux new-session -d -s "$session_name" "$shell_cmd"; then
         rm -f "$(_session_metadata_file "$session_name")" 2>/dev/null || true
+        [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
         return 1
     fi
+    [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
     tmux set-option -t "=$session_name:" -q @cctrl_managed 1 2>/dev/null || true
     tmux set-option -t "=$session_name:" -q @cctrl_agent "$detach_agent" 2>/dev/null || true
     # Display hints only -- metadata (just written above) stays authoritative;
@@ -4979,6 +5267,13 @@ _launch_detached() {
         fi
     fi
 
+    if [[ -n "$fleet_succeeds_live" ]]; then
+        # Handover: the predecessor is relabelled, never closed, and only once
+        # the successor has started.
+        cmd_rename "$fleet_succeeds_live" "☆ fleet manager ($detach_agent), handing over" >/dev/null 2>&1 \
+            || echo -e "${YELLOW}cctrl: could not relabel $fleet_succeeds_live (handing over).${RESET}" >&2
+        echo "cctrl: $session_name succeeds $fleet_succeeds_live; the predecessor stays live until you close it." >&2
+    fi
     # Best-effort background poll for conversation_id on fresh launches (plan 051).
     # MUST drop stdio: _remote_exec captures via $(ssh ...) which returns on
     # pipe EOF, not process exit — an inherited stdout keeps it open.
@@ -11298,6 +11593,30 @@ _session_recap() {
     printf '%s' "$recap"
 }
 
+_session_ls_role_footers() {
+    # Plan 100 D10: one line for orchestrators of unknown kind, one per
+    # runtime with two live fleet managers. Unknown-kind sessions never count
+    # as fleet managers.
+    local name info role kind unknown="" rt live n
+    while IFS= read -r name; do
+        [[ "$name" == TMUX--* ]] || continue
+        info="$(_session_role_of "$name")"
+        role="${info%%|*}"; info="${info#*|}"; kind="${info%%|*}"
+        [[ "$role" == orchestrator && -z "$kind" ]] && unknown+="${unknown:+, }$name"
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    for rt in claude codex; do
+        live="$(_fleet_live_managers "$rt")"
+        n=0
+        [[ -n "$live" ]] && n="$(printf '%s\n' "$live" | grep -c .)"
+        if (( n >= 2 )); then
+            echo -e "${YELLOW}warning: $n $rt fleet managers are live: $(printf '%s' "$live" | tr '\n' ' ')(at most one is expected per runtime)${RESET}"
+        fi
+    done
+    if [[ -n "$unknown" ]]; then
+        echo -e "${DIM}orch?: orchestrator of unknown kind: $unknown (set it: cctrl session set-role <session> orchestrator --orch-kind fleet|repo)${RESET}"
+    fi
+}
+
 _session_list() {
     _session_require_tmux || return 1
     local json=false recap=false a
@@ -11551,6 +11870,7 @@ _session_list() {
         fi
     else
         for idx in "${order[@]}"; do printf '%s\n' "${human_lines[idx]}"; done
+        _session_ls_role_footers
     fi
     return 0
 }
@@ -13466,6 +13786,7 @@ _session_restore() {
     if [[ "$mem_free" =~ ^[0-9]+$ ]] && (( mem_free < ${CCTRL_MEM_FREE_MIN_PCT:-15} )); then rm -rf "$scratch"; return 1; fi
     if [[ "$swap_used" =~ ^[0-9]+$ ]] && (( swap_used >= ${CCTRL_SWAP_USED_HI_MB:-8192} )); then rm -rf "$scratch"; return 1; fi
 
+    local -a predecessor_notes=()
     local row_file restored=0 failed=0 index=0 wave_size="${CCTRL_RESTORE_WAVE_SIZE:-2}" wave_pause="${CCTRL_RESTORE_WAVE_PAUSE:-60}"
     while IFS= read -r row_file; do
         local cwd resume purpose label agent spawn_rc=0
@@ -13545,11 +13866,26 @@ _session_restore() {
         else
             local launch_err="$scratch/launch-err"
             : > "$launch_err"
+            # A fleet row restored while a fleet manager of that runtime is
+            # live comes back as fleet-<runtime>--N (replay skips the guard);
+            # the summary says so (plan 100 D7 item 5).
+            local rs_kind="" rs_agent="" rs_i rs_pred=""
+            for (( rs_i = 0; rs_i < ${#launch_argv[@]}; rs_i++ )); do
+                case "${launch_argv[$rs_i]}" in
+                    --orch-kind) rs_kind="${launch_argv[$((rs_i + 1))]:-}" ;;
+                    --agent) rs_agent="${launch_argv[$((rs_i + 1))]:-}" ;;
+                esac
+            done
+            if [[ "$rs_kind" == fleet ]]; then
+                rs_pred="$(_fleet_live_managers "${rs_agent:-claude}" | head -n 1)"
+            fi
             _CCTRL_REPLAY=restore
             CCTRL_ATTACH_PROMPT=never _launch_detached "${launch_argv[@]}" >/dev/null 2>"$launch_err" || spawn_rc=$?
             unset _CCTRL_REPLAY
             if (( spawn_rc != 0 )); then
                 echo "$(jq -r '.tmux_session // .provider_task_id // "unnamed"' <<< "$row_file"): $(head -n 1 "$launch_err" 2>/dev/null)" >&2
+            elif [[ -n "$rs_pred" ]]; then
+                predecessor_notes+=("$(jq -r '.tmux_session // .provider_task_id // "unnamed"' <<< "$row_file") restored beside the live fleet manager $rs_pred (the guard does not apply to a restore)")
             fi
         fi
         if (( spawn_rc == 0 )); then restored=$((restored+1)); else failed=$((failed+1)); fi
@@ -13557,6 +13893,10 @@ _session_restore() {
         if (( wave_size > 0 && index % wave_size == 0 )) && (( wave_pause > 0 )); then sleep "$wave_pause"; fi
     done < <(jq -c '.rows[] | select(.disposition == "restore" and .action_capabilities.restore.supported == true and .action_capabilities.restore.reason == "tmux-resume")' "$plan_file")
     $quiet || $json || echo "Restore summary: restored=$restored failed=$failed"
+    if ! $quiet && ! $json && [[ ${#predecessor_notes[@]} -gt 0 ]]; then
+        local pn
+        for pn in "${predecessor_notes[@]}"; do echo "Note: $pn"; done
+    fi
     rm -rf "$scratch"
     (( failed == 0 )) || return 1
     return 0
@@ -14990,6 +15330,13 @@ cmd_rename() {
     # Resolve provider identity before touching legacy metadata. Schema-v2
     # provisional records may be updated in place; a legacy input is promoted
     # only when a stable provider id exists and is never rewritten itself.
+    # A known-kind orchestrator keeps its star (D9); unknown kind and workers
+    # are untouched.
+    local rn_info rn_role rn_kind
+    rn_info="$(_session_role_of "$target")"
+    rn_role="${rn_info%%|*}"; rn_info="${rn_info#*|}"; rn_kind="${rn_info%%|*}"
+    [[ "$rn_role" == orchestrator ]] && new_label="$(_role_apply_glyph "$rn_kind" "$new_label")"
+
     local meta_file agent stable_id="" metadata_updated=false
     meta_file="$(_session_metadata_file "$target")"
     agent="$(tmux show-option -qv -t "=$target:" @cctrl_agent 2>/dev/null || true)"
@@ -16834,24 +17181,8 @@ _remote_exec() {
             i=$((i + 1))
         done
     fi
-    if $remote_tmux_launch && ! $remote_has_purpose; then
-        [[ -n "$remote_default_purpose" ]] || remote_default_purpose="$host_alias"
-        remote_purpose="$(_prompt_session_purpose "$remote_default_purpose")"
-        local -a updated_args=()
-        local inserted=false
-        for a in "${remote_args[@]}"; do
-            if [[ "$a" == "--" && "$inserted" == "false" ]]; then
-                updated_args+=("--purpose" "$remote_purpose")
-                inserted=true
-            fi
-            updated_args+=("$a")
-        done
-        if [[ "$inserted" == "false" ]]; then
-            updated_args+=("--purpose" "$remote_purpose")
-        fi
-        remote_args=("${updated_args[@]}")
-        set -- "${remote_args[@]}"
-    fi
+    local remote_purpose_pending=false remote_pre_orch=false
+    $remote_tmux_launch && ! $remote_has_purpose && remote_purpose_pending=true
 
     # Plan 100 D4 preflight: only for a remote tmux launch with an @key target or
     # a role flag. The remote runs the hidden read-only `_role-resolve` verb
@@ -16914,6 +17245,7 @@ _remote_exec() {
                 *) cat "$pre_err" >&2; rm -f "$pre_err"; return "$pre_rc" ;;
             esac
             rm -f "$pre_err"
+            [[ "$add_role" == true && "$pre_role" == orchestrator && ( "$pre_kind" == fleet || "$pre_kind" == repo ) ]] && remote_pre_orch=true
             if $add_role; then
                 local -a rp_flags=(--role "$pre_role")
                 [[ -n "$pre_kind" ]] && rp_flags+=(--orch-kind "$pre_kind")
@@ -16931,6 +17263,27 @@ _remote_exec() {
                 set -- "${remote_args[@]}"
             fi
         fi
+    fi
+
+    # Default purpose (plan 100 D4 item 4): an orchestrator gets the canonical
+    # star label from the remote, so no default purpose is asked or injected.
+    if $remote_purpose_pending && ! $remote_pre_orch; then
+        [[ -n "$remote_default_purpose" ]] || remote_default_purpose="$host_alias"
+        remote_purpose="$(_prompt_session_purpose "$remote_default_purpose")"
+        local -a updated_args=()
+        local inserted=false
+        for a in "${remote_args[@]}"; do
+            if [[ "$a" == "--" && "$inserted" == "false" ]]; then
+                updated_args+=("--purpose" "$remote_purpose")
+                inserted=true
+            fi
+            updated_args+=("$a")
+        done
+        if [[ "$inserted" == "false" ]]; then
+            updated_args+=("--purpose" "$remote_purpose")
+        fi
+        remote_args=("${updated_args[@]}")
+        set -- "${remote_args[@]}"
     fi
 
     # Quote each argument for safe SSH transport after any local-only remote

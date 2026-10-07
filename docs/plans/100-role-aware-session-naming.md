@@ -873,3 +873,13 @@ Deviations from the plan (phase 1):
 1. Registry merge: `terminal_relaunch` needs a provisional launch id, which a launch of a known conversation (`-r <id>`, restore) lacks, so the role fields use a separate, wider merge condition (legacy-promotion, launched_by_cctrl, tmux control surface, incoming role set). A launch that states no role (no `--role`/`--orch-kind`, no shortcut role) now re-reads the recorded role+kind for that conversation before the write, so `start -d <dir> -r <id>` keeps a recorded orchestrator; an explicit flag or shortcut role still wins (test_roleless_relaunch_keeps_recorded_role_and_kind).
 2. `--succeeds` is parsed and recorded only (no relabel or handover behaviour).
 3. The restore failure reason prints the FIRST stderr line, which can be an unrelated warning (legacy-profile WARN) hiding the real error; consider the last error line.
+
+## Phase 2 review follow-ups
+
+Phase 2 review: `.mstack/handoffs/2026-10-07-plan100-phase2-opus-review.md` (1 REQUIRED, 9 RECOMMENDED). Applied in phase 2: REQUIRED 1 (predecessor relabelled only after the health check), RECOMMENDED 1 (stale lock reclaimed by atomic `mv`), 2 (own exit 74 + message when the registry dir cannot be created), 3 (`--succeeds` is exit 64 unless the kind is fleet, override and workers included), 4 (empty runtime counts as claude; `--relabel` never writes an empty runtime), 5 (`set-role --orch-kind fleet` takes the launch lock), 6 (repo `--relabel` falls back to the pane path, else refuses 64), 7 (remote skip only for a known kind), 9 (refusal wording per caller; exact-name refusal names the holder's role).
+
+Left as follow-ups:
+
+- #8: `_session_ls_role_footers` calls `_session_role_of` three times per session (unknown-kind pass, claude, codex). Compute the role once per session; about 150 extra subprocesses on a 20-session host, human `session ls` only.
+- `set-role` writes the record and tmux options before `--relabel` renames; a failed rename leaves the tag applied (the output says so).
+- The fleet lock is per machine and per runtime; a remote fleet manager is not seen by the guard (plan: per machine for now).
