@@ -9,6 +9,7 @@ needs-review: eng
 review-required: eng
 created: 2026-10-08
 tui-fixture: n/a  # launch flags + a read-only process report
+approved-by: Matthew ("Okay, just go with what you think the best decisions are and keep going.", 2026-10-08 15:49Z via the cctrl orchestrator; approvals mdec-1008-cctrl-next-work (item 5c, lean MCP + helper census plan) + mdec-1008-cctrl-orch-successor-2 (carry-over to TMUX--ms--orch-cctrl--2))
 reviews:
   - type=eng verdict=approved date=2026-10-08 by=opus-subagent
 ---
@@ -148,7 +149,7 @@ running app threads. Also: one line in `skills/cctrl-fleet-manager` (add
 
 ## Phases (each ships alone; both full suites green is the gate)
 
-**P1. Census.** `lib/helper_census.py`, `cctrl helpers`, `task ls` footer,
+**P1. Census. [x] DONE 2026-10-08** (both full suites EXIT=0 under bash 3.2.57 and 5.3.20; Opus review changes-requested then REQUIRED applied: fixture now exercises the sets estimate; see .mstack/handoffs/2026-10-08-plan106-p1-opus-review.md). `lib/helper_census.py`, `cctrl helpers`, `task ls` footer,
 README section (census part). No launch-path change.
 
 **P2. `--mcp none` for terminal-owned Claude and Codex.** Flag, env, record

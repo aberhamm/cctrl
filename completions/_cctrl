@@ -95,6 +95,7 @@ _cctrl() {
         'diff:Diff current settings vs a profile'
         'rename:Rename a session display label (--self for the current session)'
         'release:Manage installed cctrl releases (prune)'
+        'helpers:Read-only census of MCP helper processes per codex/claude owner'
         'edit:Open a profile in \$EDITOR'
         'start:Launch selected agent (foreground, or -d for a detached session)'
         's:Launch selected agent (foreground, or -d for a detached session)'
@@ -212,6 +213,13 @@ _cctrl() {
             if (( CURRENT == 3 )); then
                 _arguments '--self[Rename the session this process runs in]' '*:session:_cctrl_tmux_sessions'
             fi
+            ;;
+        helpers)
+            _arguments \
+                '--json[Machine-readable report]' \
+                '--check[Exit 1 when an owner is flagged]' \
+                '--warn-sets[Flag owners above N estimated helper sets]:count:' \
+                '--warn-gb[Flag owners above G GB helper memory]:gigabytes:'
             ;;
         release)
             if (( CURRENT == 3 )); then

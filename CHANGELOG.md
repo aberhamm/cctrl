@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `test_bash_leg_is_honest`. (plan 103)
 
 ### Added
+- `cctrl helpers [--json] [--check] [--warn-sets N] [--warn-gb G]`: read-only census
+  of MCP helper processes per codex/claude owner (redacted: no command lines or
+  environments; no kill path), plus a dim `task ls` footer when an owner is
+  flagged. (plan 106 P1)
 - `cctrl profile migrate [--dry-run] [--remove-old]` copies repo-tracked
   `profiles/*.json` into the new XDG profiles dir (`~/.config/cctrl/profiles/`,
   override with `XDG_CONFIG_HOME`), byte-verified and 0600, and migrates a

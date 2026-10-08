@@ -12152,6 +12152,13 @@ _task_list() {
         if [[ "$(jq '.source_errors | length' <<< "$result")" != "0" ]]; then
             echo -e "${YELLOW}Some inventory sources were partial or unavailable; healthy rows are shown.${RESET}" >&2
         fi
+        # plan 106: one dim line when an MCP-helper owner is flagged. Best
+        # effort: a failed or slow census never changes this command's rc.
+        if [[ "${CCTRL_HELPERS_FOOTER:-on}" != off ]]; then
+            local helpers_line=""
+            helpers_line="$(python3 "$SCRIPT_DIR/lib/helper_census.py" --footer 2>/dev/null)" || helpers_line=""
+            [[ -z "$helpers_line" ]] || echo -e "${DIM}${helpers_line}${RESET}"
+        fi
     fi
     return "$rc"
 }
@@ -16037,6 +16044,8 @@ cmd_help() {
     echo "  cctrl session ls            List sessions (dir, agent/shell, model, state, rc; --json)"
     echo "    --recap                   Add a one-line recap per session (costs a transcript read)"
     echo "  cctrl task ls [--json]      List local tmux and provider tasks with action capabilities"
+    echo "  cctrl helpers [--json]      Read-only census of MCP helper processes per codex/claude owner"
+    echo "                              (--check exits 1 when flagged; --warn-sets N, --warn-gb G; never kills)"
     echo "  cctrl session say <name> -- <msg>  Paste a message into a live session's pane and submit"
     echo "                              (direct chat, no mailbox; --no-submit, --body-file PATH|-,"
     echo "                              --json, --force-busy)"
@@ -17603,6 +17612,12 @@ cmd_release() {
     esac
 }
 
+cmd_helpers() {
+    # plan 106 P1: read-only census of MCP helper processes per codex/claude
+    # owner. Reports only; there is no kill/reap path (lib/helper_census.py).
+    python3 "$SCRIPT_DIR/lib/helper_census.py" "$@"
+}
+
 cmd_host() {
     local action="${1:-list}"
     shift 2>/dev/null || true
@@ -18583,6 +18598,7 @@ _dispatch() {
         shortcuts) cmd_shortcut "$@" ;;
         host) cmd_host "$@" ;;
         release) cmd_release "$@" ;;
+        helpers) cmd_helpers "$@" ;;
         whoami) cmd_whoami "$@" ;;
         use|switch) cmd_use "$@" ;;
         ls|list) cmd_ls "$@" ;;

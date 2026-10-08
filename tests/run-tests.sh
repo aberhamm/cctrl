@@ -60,6 +60,8 @@ export CCTRL_HOST_ID_FILE="$CCTRL_DATA_DIR/host-id"
 # persistence tests override these roots with their own fixtures.
 export CODEX_HOME="$TMPDIR/no-codex-home"
 export CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-config"
+# plan 106: the task ls helper footer reads ps; keep it off unless a test sets fixtures.
+export CCTRL_HELPERS_FOOTER=off
 # Honest bash leg (plan 103): everything cctrl-shaped must run under the SAME
 # bash as this harness. `#!/usr/bin/env bash` shebangs (cctrl, lib/, hooks/) and
 # bare `bash -c` otherwise resolve to whatever bash is first on PATH (Homebrew
@@ -865,6 +867,106 @@ test_no_unreferenced_functions() {
     [[ -z "$dead" ]] || fail "functions defined in cctrl but never referenced (delete them, or allowlist with a reason):
 $dead"
     echo "ok: every top-level cctrl function is referenced"
+}
+
+_helper_census_fixture() {
+    # plan 106 P1: fixture ps tables only; never the live process table.
+    local d="$1"
+    local pl="PLAN""TED"   # assembled at runtime: no secret-shaped literal in the tree
+    HC_NEEDLES=("${pl}-SECRET-123" "sk-${pl}" "${pl}PW" "${pl}-COMM" "${pl}3")
+    mkdir -p "$d"
+    cat > "$d/ps.txt" <<'E'
+  100     1 2000000 /usr/local/bin/codex
+  200     1 3000 /usr/local/bin/codex
+  300     1 400000 /Users/x/.local/bin/claude
+  400     1 100 /usr/sbin/cron
+  500   100 1 /bin/zombie-thing
+  not a row
+E
+    local i
+    for i in $(seq 1 40); do
+        echo "  $((1000 + i))   100 600000 /opt/my tools/mcp-server-$((i % 3))" >> "$d/ps.txt"
+    done
+    echo "  1500  1001 50000 /bin/sh" >> "$d/ps.txt"
+    echo "  600     1 90000 /usr/local/bin/codex" >> "$d/ps.txt"
+    for i in $(seq 1 400); do echo "  $((3000 + i))   600 100 /usr/bin/small-helper" >> "$d/ps.txt"; done
+    echo "  700     1 100 /usr/bin/node /opt/x.js --token=${pl}-COMM-SECRET" >> "$d/ps.txt"
+    echo "  701     600 100 ${pl}-COMM=oops" >> "$d/ps.txt"
+    for i in $(seq 1 18); do printf '[mcp_servers.srv%s]\ncommand = "x"\n' "$i" >> "$d/codex-config.toml"; done
+    echo "  301   300 40000 /usr/bin/node" >> "$d/ps.txt"
+    echo "  201   200 40000 /usr/bin/node" >> "$d/ps.txt"
+    printf '100 /usr/local/bin/codex app-server --remote-control --token=%s-SECRET-123 --api-key sk-%s\n200 codex --api-key=sk-%s2 https://user:%sPW@example.com\n600 codex app-server\n300 claude KEY=%s3\n' "$pl" "$pl" "$pl" "$pl" "$pl" > "$d/args.txt"
+    printf '1 TMUX--ignored\n200 TMUX--demo--1\n' > "$d/panes.txt"
+}
+
+test_helper_census() {
+    local d="$TMPDIR/helper-census" out rc=0 j
+    _helper_census_fixture "$d"
+    out="$(CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "helpers rc=$rc: $out"
+    [[ "$out" == *"codex app-server (remote-control)"* ]] || fail "app-server label missing: $out"
+    [[ "$out" == *"codex tui"* && "$out" == *"claude"* && "$out" == *"TMUX--demo--1"* ]] || fail "tui/claude/session rows missing: $out"
+    [[ "$out" == *"FLAGGED pid 100"* ]] || fail "app-server not flagged: $out"
+    [[ "$out" != *"cron"* ]] || fail "unrelated process leaked: $out"
+    [[ "$out" == *"mcp-server-"* ]] || fail "spaces in comm path broke parsing: $out"
+    [[ "$out" == *"cctrl does not reap helpers"* ]] || fail "reap sentence missing"
+    j="$(CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers --json 2>&1)" || fail "helpers --json failed"
+    [[ "$(jq -r '[.owners[]|select(.pid==100)][0]|"\(.direct_children) \(.label)"' <<< "$j")" == "41 codex app-server (remote-control)" ]] || fail "app-server counts wrong: $j"
+    [[ "$(jq -r '.summary.owners' <<< "$j")" == "4" ]] || fail "owner count wrong"
+    [[ "$(jq -r '[.owners[]|select(.pid==100)][0]|"\(.per_set) \(.est_sets) \(.flagged)"' <<< "$j")" == "18 2 true" ]] || fail "per_set/est_sets/memory flag wrong (18-server config)"
+    [[ "$(jq -r '[.owners[]|select(.pid==600)][0]|"\(.flagged) \(.est_sets)"' <<< "$j")" == "true 22" ]] || fail "sets-only flag wrong"
+    # --warn-sets lowered so the 40-helper owner is flagged whatever the per-set estimate
+    rc=0; CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers --check --warn-sets 0 >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 1 ]] || fail "--check should exit 1 when flagged, got $rc"
+    rc=0; CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers --check --warn-sets 9999 --warn-gb 9999 >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 0 ]] || fail "--check should exit 0 when nothing flagged, got $rc"
+    # planted secrets in args never reach text or json output
+    local needle
+    for needle in "${HC_NEEDLES[@]}"; do
+        grep -qF -- "$needle" "$d/args.txt" "$d/ps.txt" 2>/dev/null || fail "fixture lost its planted value $needle (test would prove nothing)"
+        [[ "$out$j" != *"$needle"* ]] || fail "planted secret $needle leaked into output"
+    done
+    [[ "$out$j" != *example.com* ]] || fail "credential URL leaked into output"
+    # empty / failed ps: exit 69, no traceback
+    : > "$d/ps.txt"
+    out="$(CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers 2>&1)" && rc=0 || rc=$?
+    [[ $rc -eq 69 && "$out" != *Traceback* ]] || fail "empty ps: want rc 69 without traceback, got $rc: $out"
+    printf 'garbage\n\x00\xff binary\n' > "$d/ps.txt"
+    out="$(CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers --json 2>&1)" && rc=0 || rc=$?
+    [[ $rc -eq 69 && "$out" != *Traceback* ]] || fail "odd ps: want rc 69 without traceback, got $rc: $out"
+    rc=0; "$ROOT/cctrl" helpers --bogus >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 64 ]] || fail "bad flag should exit 64, got $rc"
+    echo "ok: helper census counts, labels, flags, redaction, soft failure"
+}
+
+test_helper_census_never_kills_structural() {
+    local f="$ROOT/lib/helper_census.py" hit
+    hit="$(grep -inE 'kill|signal|terminat|os\.remove|unlink|rmtree|os\.system|Popen|os\.write|open\([^)]*[\"'\'']w' "$f" || true)"
+    [[ -z "$hit" ]] || fail "helper_census.py must have no kill/signal/write path: $hit"
+    hit="$(grep -nE 'getenv|eww|printenv|environ\[|environ\.(items|copy|keys|values)|"-E"|"axe' "$f" || true)"
+    [[ -z "$hit" ]] || fail "helper_census.py must not read process environments: $hit"
+    hit="$(grep -oE 'environ\.get\("[A-Z_]+"' "$f" | sort -u | tr '\n' ' ')"
+    [[ "$hit" == 'environ.get("CCTRL_HELPERS_FIXTURE_DIR" environ.get("CODEX_HOME" ' ]] || fail "unexpected environment reads: $hit"
+    echo "ok: helper census has no kill/signal/write path"
+}
+
+test_task_ls_helper_footer() {
+    local d="$TMPDIR/helper-footer" human json_off json_on rc_off rc_on
+    _helper_census_fixture "$d"
+    "$ROOT/cctrl" task ls --json >/dev/null 2>&1 || true   # prime: the first call initializes the host id
+    rc_off=0; json_off="$("$ROOT/cctrl" task ls --json 2>/dev/null)" || rc_off=$?
+    rc_on=0; json_on="$(CCTRL_HELPERS_FOOTER=on CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" task ls --json 2>/dev/null)" || rc_on=$?
+    [[ "$json_off" == "$json_on" && $rc_off -eq $rc_on ]] || fail "task ls --json must be identical with a flagged owner"
+    human="$(CCTRL_HELPERS_FOOTER=on CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" task ls 2>&1 || true)"
+    [[ "$human" == *"MCP helpers:"* ]] || fail "human task ls lacks the footer: $human"
+    human="$(CCTRL_HELPERS_FOOTER=off CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" task ls 2>&1 || true)"
+    [[ "$human" != *"MCP helpers:"* ]] || fail "footer must be switchable off"
+    : > "$d/ps.txt"
+    local rc_a=0 rc_b=0
+    CCTRL_HELPERS_FOOTER=on CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" task ls >/dev/null 2>&1 || rc_a=$?
+    CCTRL_HELPERS_FOOTER=off "$ROOT/cctrl" task ls >/dev/null 2>&1 || rc_b=$?
+    [[ $rc_a -eq $rc_b ]] || fail "a failed census changed task ls rc ($rc_a vs $rc_b)"
+    echo "ok: task ls footer human-only, json identical, census failure keeps rc"
 }
 
 test_release_prune() {
@@ -14950,6 +15052,13 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             echo "ok"
             exit 0
             ;;
+        helper-census)
+            test_helper_census
+            test_helper_census_never_kills_structural
+            test_task_ls_helper_footer
+            echo "ok"
+            exit 0
+            ;;
         snapshot-ownership)
             test_snapshot_ownership_policy
             test_snapshot_restore_default_honors_data_dir
@@ -14974,6 +15083,9 @@ test_no_errexit_unsafe_post_increment
 test_every_defined_test_is_registered
 test_no_unreferenced_functions
 test_release_prune
+test_helper_census
+test_helper_census_never_kills_structural
+test_task_ls_helper_footer
 test_live_store_guard_diagnostics_and_churn
 test_tmux_exact_target_lint
 test_cctrl_launcher_hooks_run_fails_open_on_broken_release

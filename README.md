@@ -1767,6 +1767,26 @@ Displays model, project name, and token count in the Claude Code status bar. Als
 
 Finds the current session JSONL, sums deduplicated token usage, and upserts to the spending log. Called automatically by the `Stop` hook.
 
+## MCP helper processes
+
+Every Claude or Codex session starts the owner's full set of MCP servers; one
+set is roughly 18 helper processes and about 1.7 GB. A terminal session ends
+its helpers when it closes. One shared Codex app-server holds a set per app
+thread and, on 2026-10-08, held about 20 to 41 sets (34 to 39 GB).
+
+`cctrl helpers` is a read-only census: per `codex`/`claude` owner it shows the
+pid, a label, the tmux session when known, direct helpers, descendants, helper
+and own memory, and the top helper executables. Owners above 8 estimated sets
+or 8 GB are flagged (`--warn-sets N`, `--warn-gb G`); `--json` gives the same
+data; `--check` exits 1 when anything is flagged. `cctrl task ls` prints one
+dim line when an owner is flagged (`CCTRL_HELPERS_FOOTER=off` hides it). The census reads `ps` and tmux pane pids
+only. It never prints command lines or environments and never kills, signals
+or reaps anything; there is no `--fix`.
+
+Reaping is the owner's decision: helpers of the Codex app-server end only when
+the app-server or the Codex app restarts, which interrupts running app
+threads.
+
 ## Port management
 
 > Ships as the `cctrl-ports` **plugin** (`plugins/cctrl-ports`), not a core
@@ -1880,6 +1900,7 @@ cctrl/
     codex_app_server.py    # narrow desktop App Server protocol adapter
     usage_costs.py         # usage/cost aggregation for `cctrl usage` and `cctrl costs`
     peer_mcp.py            # stdio MCP server behind `cctrl peer mcp`
+    helper_census.py       # read-only MCP-helper census behind `cctrl helpers`
   plugins/
     cctrl-ports            # `cctrl ports` — port history and suggestions
     cctrl-scan             # `cctrl scan` — directory/repo survey
