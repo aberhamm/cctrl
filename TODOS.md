@@ -226,4 +226,5 @@ shared arg/err helpers and 14 unguarded `$2`, `_session_write_metadata` named fi
 lock + same-dir temp for `peers.json`/`shortcuts.json` writers, completions/help/README
 drift check, embedded Python to `lib/*.py`, `self-install.sh` running the suite with PATH
 bash only, ~29 PATH-shim bypass call sites. Batch 1 (dead code, housekeeping) shipped as
-plan 104.
+plan 104. Test harness items are now plan 105; the MCP helper census / lean MCP mode is plan 106
+(both docs-only, pending implementation).

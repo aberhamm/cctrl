@@ -13,6 +13,8 @@ reviews:
   - type=eng verdict=approved date=2026-07-30 by=mstack-review
 ---
 
+> **Note (2026-10-08):** partly stale. Exact `=` session targets, the lint and prefix-match tests were done by plans 080/085. It will be rewritten smaller (pin pane, copy-mode gate, split-pane fixture) and must land after plan 105's test file split.
+
 ## Requirements
 
 Every tmux operation in cctrl addresses sessions by bare name (`-t "$sess"`),
