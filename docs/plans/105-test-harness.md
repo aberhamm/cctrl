@@ -23,7 +23,36 @@ reviews:
   - Follow-up (option B, product, not done): the schema probe should have its own deadline instead of sharing `CCTRL_CODEX_REQUEST_TIMEOUT` (`lib/codex_app_server.py`, `capability_report` -> `_schema_evidence`).
   - Follow-up (test): the fake sleeps before reading its next message, so a retry sent during the sleep is never traced; `continue` without the sleep would make the "not retried" check sound (Opus review RECOMMENDED).
 - Gate (after the last edit): full suite EXIT=0, 367 `ok:` lines, 0 FAIL on both legs; wall `/bin/bash` 561 s, bash 5.3 583 s; sorted `ok:` names identical to the P0 baseline on both legs (the new lint test prints no `ok:` line); tmux session list unchanged.
-- [ ] P3, P4, P5, P6 pending.
+- [x] **P3 runner, timing, filter** (2026-10-08). 447 call lines (main list, tail, the 2 calls in the unset-group block, the always-on test as `_run_test --always`) converted to `_run_test name` in the same order; runner block `# >>> test runner` ... `# <<< test runner` after `ROOT=` (D2: per-test ms timing, `EPOCHREALTIME` on bash 5, `date +%s` whole seconds on 3.2 instead of perl; test runs as a plain statement so `set -e` is live; fail-fast default, `CCTRL_TEST_KEEP_GOING=1` opt-in via a subshell (state-leaking tests may differ until P4); `_rt_fail_report` from `_suite_exit` prints `FAIL: <name> (rc=N, Ns)`); D3 (positional names / `CCTRL_TEST_NAMES`, registry order, unknown/empty/zero-match = rc 64, group + names = rc 64, `--list`, loud `FILTERED RUN: N of M`); slowest-20 on stderr, `CCTRL_TEST_TIMINGS=<file>` TSV. `CCTRL_TEST_ONLY` groups are unchanged and do not use the runner. The dead-test scanner strips `_run_test [--always] `; planted violations (unreferenced test, unreferenced cctrl function, bare PATH site, runner mutated to run tests in an `if`) each make the matching guard fail. New test `test_runner_filter_and_list` (3-test fixture built from the real runner block + the real harness `--list`/unknown name). Opus review: approve, 3 REQUIRED applied (`.mstack/handoffs/2026-10-08-plan105-p3-opus-review.md`).
+  - **Result lines, old vs new:** the runner prints exactly one line per test on **stderr**: `ok: <test_name> (S.mmms)` / `FAIL: <test_name> (rc=N, S.mmms)`. Test bodies are unchanged and still print their own `ok: <description>` lines on stdout, so the old sorted-`ok:` comparison is: take `^ok: ` lines that do NOT match `^ok: test_[A-Za-z0-9_]+ \([0-9.]+s\)$`, and diff with the P0 list. Result: identical to the P0 baseline on both legs except 4 added lines (3 plan 106 P1 tests, this test's line); the old bare `ok` line is no longer matched by `^ok: ` and was never a test line.
+  - **Proof of no loss:** `--list` (448 names) vs the static pre-runner extraction (447 names) + `test_runner_filter_and_list`: sorted diff empty, order diff empty (new test sits right after `test_no_shimless_test_path`). Every listed name has exactly one runner result line in each final log (448/448, 0 duplicates, no extra names). No test failed under live `set -e`; no previously masked failure surfaced. Artifacts: `fm-cctrl-artifacts/plan-105-106/p3-baseline/` and `p3-logs/`.
+  - **Final gate** (all after the last edit): `/bin/bash` 3.2.57 EXIT=0, 0 FAIL, **476 s**; Homebrew bash 5.3 EXIT=0, 0 FAIL, **508 s**; tmux session list identical before/after each run. Overhead: about 900 `date` forks on 3.2 (about 1.4 s). Earlier pass (before docs edits): 473 s / 502 s.
+  - Stale "about 40 minutes" (plan 090 and its notes) is wrong: a leg is about 8 minutes. README testing note fixed; plan 090 left untouched.
+  - Slowest 20 (bash 5.3, final run, seconds; 3.2 is whole seconds with the same top 2):
+
+| # | test | s |
+|---|------|---|
+| 1 | test_session_close_reaps_pane_processes | 18.811 |
+| 2 | test_session_terminate_records_closed | 13.278 |
+| 3 | test_start_peer_env_and_metadata | 10.926 |
+| 4 | test_codex_handoff_state_machine | 9.404 |
+| 5 | test_no_unreferenced_functions | 8.715 |
+| 6 | test_codex_lifecycle_ingestion | 8.614 |
+| 7 | test_app_owned_launch | 7.434 |
+| 8 | test_peer_orchestrator_status_nudge_watch | 6.990 |
+| 9 | test_peer_mcp_send_deliver_outcomes | 6.577 |
+| 10 | test_session_prune_yes_caps_large_batch | 6.556 |
+| 11 | test_peer_send_refuses_when_caller_tmux_session_unresolved | 6.396 |
+| 12 | test_peer_inline_envelope_reachability | 5.678 |
+| 13 | test_peer_derived_tmux_and_shadowing | 5.218 |
+| 14 | test_peer_send_sender_binding_refuses_mismatch | 5.002 |
+| 15 | test_snapshot_reboot_keeps_live_latest | 4.985 |
+| 16 | test_peer_mcp_say_peer | 4.951 |
+| 17 | test_session_stop_exact_identity | 4.781 |
+| 18 | test_peer_reply_core | 4.650 |
+| 19 | test_session_list_profile_column_mixed | 4.632 |
+| 20 | test_release_prune | 4.392 |
+- [ ] P4, P5, P6 pending. P5 must also unset `CCTRL_TEST_NAMES` / `CCTRL_TEST_ONLY` in `install/self-install.sh` (review REQUIRED 3; P3 only prints the loud filtered-run line).
 
 ## Plain-English Summary
 
@@ -75,9 +104,7 @@ line (with reason) for `CCTRL_HOOK_GUI_PATH` if P1 shows it must stay bare.
 
 **D2. Runner.** One function `_run_test <name>`: records start time, runs the
 test, records end time and status, appends `name<TAB>seconds<TAB>status` to
-an in-memory list. Time source: `EPOCHREALTIME` when set, else one
-`perl -MTime::HiRes` call per test boundary (about 3 s per full run on 3.2,
-unverified). stdout stays exactly as today (plans count `ok` lines). Run each test as a plain statement, never in an `||`, `&&`, `if` or `!` context (bash ignores `set -e` there, and bare failing statements are how failures surface today): `set +e; ( set -e; "$name" ); rc=$?; set -e` (P4); P3 has no subshell, so it times passing tests and fail-fast exits through `_suite_exit`. End-of-run reports (slowest-20, KEEP_GOING summary) must not depend on the EXIT trap; the
+an in-memory list. Time source: `EPOCHREALTIME` when set, else `date +%s` (whole seconds; P3 as shipped, no perl). stdout stays exactly as today (plans count `ok` lines). Run each test as a plain statement, never in an `||`, `&&`, `if` or `!` context (bash ignores `set -e` there, and bare failing statements are how failures surface today): `set +e; ( set -e; "$name" ); rc=$?; set -e` (P4); P3 has no subshell, so it times passing tests and fail-fast exits through `_suite_exit`. End-of-run reports (slowest-20, KEEP_GOING summary) must not depend on the EXIT trap; the
 slowest-20 table goes to stderr at the end of a full run; the full TSV is
 written when `CCTRL_TEST_TIMINGS=<file>` is set.
 

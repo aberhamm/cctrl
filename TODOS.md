@@ -235,3 +235,11 @@ plan 104. Test harness items are now plan 105; the MCP helper census / lean MCP 
 - Test: in the app-owned fake codex, drop the sleep before `continue` in the `thread-timeout` / `turn-timeout` modes so the "not retried" trace check is sound.
 - Test: `test_session_doctor_realign_carries_profile_model_peer` needs the gitignored `profiles/work.json`; make the fixture self-contained (and check how the install gate passes with `profiles/` removed).
 - Test lint: `test_no_shimless_test_path` only catches the literal bare system-PATH tail; a stricter rule (any `PATH="` must start with `$(_test_path` or contain `$PATH`) would also catch PATH without a leading colon and Python env dicts.
+
+### Plan 105 P3 follow-ups (2026-10-08)
+
+- P5 must: `install/self-install.sh` passes its environment to the suite, so a stray `CCTRL_TEST_NAMES` / `CCTRL_TEST_ONLY` would shrink the install gate; unset both there (P3 only prints a loud `FILTERED RUN: N of M` line).
+- Group wart (handoff 19): a group name passed as a positional argument (`run-tests.sh helper-census`) used to be ignored and ran the whole list; groups are only selected with `CCTRL_TEST_ONLY=<group>`. Positional args are now test names, so a group name there exits 64 (unknown test name). `CCTRL_TEST_ONLY` groups are unchanged and do not use the runner (no timing lines).
+- Test lint: tests that assign `_rt_*` variables without `local` clobber the runner state; and a lint for bare `test_x` calls outside group blocks (they would skip timing and `--list`).
+- Keep-going counts a test that runs `exit 0` as ok (pre-existing semantics in fail-fast).
+- 3.2 timing is whole seconds (`date +%s`); the plan's perl/`Time::HiRes` option was not used.

@@ -1696,6 +1696,26 @@ The suite runs cctrl under the *same* bash as the harness (a `bash` shim in
 its private temp dir, first on its PATH) and prints both versions on the first
 line. `CCTRL_TEST_ONLY=bash-leg` runs just the guard tests for this.
 
+A full leg takes about 8 minutes (measured at plan 105 P3: 473 s on `/bin/bash`
+3.2, 502 s on Homebrew bash 5.3; 448 tests), not the 40 minutes older plan
+notes say. The slowest tests are the session-close/terminate fixtures
+(`test_session_close_reaps_pane_processes` about 16 s,
+`test_session_terminate_records_closed` about 13 s).
+
+Run one or a few tests, list the registry, or get timings:
+
+```bash
+bash tests/run-tests.sh test_peer_reply_core test_release_prune  # registry order
+bash tests/run-tests.sh --list                                    # full-run names, run order
+CCTRL_TEST_TIMINGS=/tmp/t.tsv bash tests/run-tests.sh             # name<TAB>seconds<TAB>status
+CCTRL_TEST_KEEP_GOING=1 bash tests/run-tests.sh test_a test_b     # opt-in: do not stop at the first FAIL
+```
+
+Each test prints one `ok: <name> (S.mmms)` or `FAIL: <name> (rc=N, S.mmms)`
+line on stderr, and a full run ends with a slowest-20 table. An unknown name
+exits 64. A filtered run prints `FILTERED RUN: N of M` and skips the Python
+unittests; it is not a gate. (`/bin/bash` 3.2 timings are whole seconds.)
+
 ## Hooks
 
 `cctrl hooks install` configures both Claude Code and Codex with portable

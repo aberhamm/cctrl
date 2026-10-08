@@ -11,6 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   aborted launches under macOS `/bin/bash` 3.2. (plan 103)
 
 ### Changed
+- Test harness runner: every test now runs through `_run_test` (one `ok:`/`FAIL:`
+  line with duration on stderr, slowest-20 table, `CCTRL_TEST_TIMINGS` TSV);
+  `tests/run-tests.sh test_a test_b` runs named tests, `--list` prints the
+  registry, `CCTRL_TEST_KEEP_GOING=1` is opt-in. Same tests, same order, no test
+  body changes. (plan 105 P3)
 - Test harness: `_test_path` helper puts the bash shim first on every fixture
   PATH (38 sites converted, so those tests really run cctrl under the harness
   bash); new lint `test_no_shimless_test_path`. Fixed the `test_app_owned_launch`
