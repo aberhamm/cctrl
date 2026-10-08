@@ -1343,6 +1343,288 @@ test_helper_census() {
     echo "ok: helper census counts, labels, flags, redaction, soft failure"
 }
 
+# ---- plan 106 P2: --mcp none (fake agents + fake tmux only; no real launch) ----
+
+_mcp_args_of() {
+    # ARG[n]=value lines of a fake agent run, one value per line
+    printf '%s\n' "$1" | sed -n 's/^ARG\[[0-9]*\]=//p'
+}
+
+_mcp_file_mode() { stat -f %Lp "$1" 2>/dev/null || stat -c %a "$1"; }
+
+test_launch_mcp_none_claude() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local data="$TMPDIR/mcp-claude-data" runtime="$TMPDIR/mcp-claude-runtime" out file args
+    mkdir -p "$TMPDIR/comet"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent claude >/dev/null
+    local envn="CCTRL_MCP_MODE CCTRL_PROFILE_MCP_FILE"
+
+    # default: byte-identical to the pre-P2 launch (golden argv, inline peer JSON)
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --peer comet -m hi)"
+    args="$(_mcp_args_of "$out")"
+    local peer_json
+    peer_json="$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' "$ROOT/cctrl" comet)"
+    [[ "$args" == "$(printf '%s\n' --permission-mode bypassPermissions --chrome --mcp-config "$peer_json" hi)" ]] \
+        || fail "inherit argv changed (want the pre-P2 golden argv): $args"
+    assert_not_contains "$out" "mcp: lean"
+    assert_not_contains "$out" "strict-mcp-config"
+    [[ -z "$(ls "$runtime"/cctrl-*/profile-settings/*.mcp.json 2>/dev/null)" ]] || fail "inherit must not write an MCP file"
+    # explicit inherit (flag, and env) is the same launch
+    local out2 out3
+    out2="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --peer comet --mcp inherit -m hi)"
+    out3="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$data" CCTRL_MCP_MODE=inherit "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --peer comet -m hi)"
+    [[ "$(_mcp_args_of "$out2")" == "$args" && "$(_mcp_args_of "$out3")" == "$args" ]] || fail "--mcp inherit / CCTRL_MCP_MODE=inherit changed the argv"
+
+    # none + peer: strict flag, one --mcp-config FILE (mode 600, exactly cctrl-peer), never JSON in argv
+    out="$(PATH="$TMPDIR:$PATH" FAKE_AGENT_ENV_NAMES="$envn" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --peer comet --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    assert_contains "$out" "mcp: lean (none; kept: cctrl-peer)"
+    [[ "$(printf '%s\n' "$args" | grep -c '^--strict-mcp-config$')" == 1 ]] || fail "want exactly one --strict-mcp-config: $args"
+    [[ "$(printf '%s\n' "$args" | grep -c '^--mcp-config$')" == 1 ]] || fail "want exactly one --mcp-config: $args"
+    file="$(printf '%s\n' "$args" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+    [[ "$file" == "$runtime"/cctrl-*/profile-settings/fg-*.mcp.json && -f "$file" ]] || fail "mcp-config value is not the per-session file: $file"
+    [[ "$(_mcp_file_mode "$file")" == 600 ]] || fail "MCP file mode is $(_mcp_file_mode "$file"), want 600"
+    jq -e '.mcpServers | keys == ["cctrl-peer"] and .["cctrl-peer"].args == ["peer","mcp","--as","comet"]' "$file" >/dev/null || fail "MCP file must hold exactly cctrl-peer"
+    # guard: no secret-bearing value reaches argv (a path, never a '{')
+    [[ "$args" != *"{"* ]] || fail "JSON reached the agent argv under --mcp none: $args"
+    assert_contains "$out" "ENV_CCTRL_MCP_MODE=<unset>"
+    assert_contains "$out" "ENV_CCTRL_PROFILE_MCP_FILE=$file"
+
+    # none without a peer: empty server map; env var works; flag beats env
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_MCP_MODE=none "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge -m hi)"
+    assert_contains "$out" "mcp: lean (none; kept: nothing)"
+    file="$(_mcp_args_of "$out" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+    jq -e '.mcpServers == {}' "$file" >/dev/null || fail "no-peer MCP file must hold an empty server map"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_MCP_MODE=none "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp inherit -m hi)"
+    assert_not_contains "$out" "strict-mcp-config"
+
+    # passthrough still wins: a caller's own --mcp-config comes after ours
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp none --mcp-config /caller/own.json -m hi)"
+    args="$(_mcp_args_of "$out")"
+    [[ "$(printf '%s\n' "$args" | grep -n '^--strict-mcp-config$' | cut -d: -f1)" -lt "$(printf '%s\n' "$args" | grep -n '^/caller/own.json$' | cut -d: -f1)" ]] \
+        || fail "caller passthrough must follow the lean flags: $args"
+    # an unwritable MCP dir fails the launch (70), it never silently falls back to inherit
+    local rc=0
+    mkdir -p "$TMPDIR/mcp-claude-blocked"; : > "$TMPDIR/mcp-claude-blocked/cctrl-$(id -u)"
+    out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$TMPDIR/mcp-claude-blocked" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp none -m hi 2>&1)" || rc=$?
+    [[ "$rc" -eq 70 ]] || fail "unwritable MCP dir: want rc 70, got $rc: $out"
+    assert_not_contains "$out" "ARG["
+}
+
+test_launch_mcp_none_codex() {
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local home="$TMPDIR/mcp-codex-home" out args n pl="PLAN""TED"
+    mkdir -p "$home"
+    # names are read; values never are (a planted value must not reach argv/output)
+    printf '[mcp_servers.alpha]\ncommand = "%s-cmd"\n\n[mcp_servers.beta]\nurl = "https://x.invalid/%s"\n[mcp_servers.beta.env]\nTOKEN = "%s-tok"\n  [mcp_servers.gamma-3]  # trailing comment\ncommand = "g"\n[mcp_servers.cctrl_runtime]\ncommand = "own"\n[mcp_servers."quoted.name"]\ncommand = "q"\n[other]\nk = 1\n' "$pl" "$pl" "$pl" > "$home/config.toml"
+
+    # default: no overrides at all (byte-identical to today)
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none -m hi)"
+    assert_not_contains "$out" "enabled=false"
+    assert_not_contains "$out" "mcp: lean"
+    local base_args; base_args="$(_mcp_args_of "$out")"
+
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    n="$(printf '%s\n' "$args" | grep -c '^mcp_servers\..*\.enabled=false$')"
+    [[ "$n" == 3 ]] || fail "want 3 enabled=false overrides (alpha beta gamma-3), got $n: $args"
+    local s
+    for s in alpha beta gamma-3; do
+        printf '%s\n' "$args" | grep -qx "mcp_servers.$s.enabled=false" || fail "missing override for $s: $args"
+    done
+    [[ "$args" != *cctrl_runtime* ]] || fail "cctrl_runtime must not be disabled or rewritten: $args"
+    assert_contains "$out" "disabled: 3; not controllable: 1"
+    assert_not_contains "$out" "$pl"
+    # nothing else changed: dropping the 3 override pairs gives the default argv
+    [[ "$(printf '%s\n' "$args" | awk '$0 == "-c" { getline v; if (v ~ /^mcp_servers\..*\.enabled=false$/) next; print; print v; next } { print }')" == "$base_args" ]] \
+        || fail "--mcp none changed more than the enabled=false overrides"
+
+    # tmux-owned: the cctrl_runtime -c pair is still present and untouched
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--mcp-codex "$ROOT/cctrl" start --foreground --agent codex --profile none --no-bridge --mcp none -m hi)"
+    assert_contains "$out" "mcp: lean (kept: cctrl_runtime; disabled: 3"
+    assert_contains "$out" "mcp_servers.cctrl_runtime.command="
+    assert_contains "$out" "mcp_servers.cctrl_runtime.args="
+
+    # passthrough still wins: the caller's -c follows ours
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi -c mcp_servers.alpha.enabled=true)"
+    args="$(_mcp_args_of "$out")"
+    [[ "$(printf '%s\n' "$args" | grep -n '^mcp_servers.alpha.enabled=false$' | cut -d: -f1)" -lt "$(printf '%s\n' "$args" | grep -n '^mcp_servers.alpha.enabled=true$' | cut -d: -f1)" ]] \
+        || fail "caller -c must come after the lean overrides: $args"
+
+    # missing config.toml: no overrides, no error
+    mkdir -p "$TMPDIR/mcp-codex-empty"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$TMPDIR/mcp-codex-empty" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    assert_not_contains "$out" "enabled=false"
+    assert_contains "$out" "disabled: 0"
+}
+
+test_launch_mcp_mode_validation() {
+    # NOTE: the profile leg of the precedence (flag > profile > env) is P3
+    # (agents.<agent>.mcp); P2 covers flag > CCTRL_MCP_MODE > inherit.
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local runtime="$TMPDIR/mcp-valid-runtime" out rc
+    local run=(env PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime")
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp bogus -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "bad --mcp value: want 64, got $rc"; assert_contains "$out" "unknown MCP mode 'bogus'"
+    assert_not_contains "$out" "ARG["
+    rc=0; out="$("${run[@]}" CCTRL_MCP_MODE=bogus "$ROOT/cctrl" start --foreground --agent claude --profile none -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "bad CCTRL_MCP_MODE: want 64, got $rc"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp minimal -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--mcp minimal: want 64 (not available in P2), got $rc"; assert_contains "$out" "not available yet"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--mcp without a value: want 64, got $rc"
+    # shortcut-style and detached entry points validate too
+    mkdir -p "$TMPDIR/mcp-valid-proj"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start -d --agent claude --mcp bogus "$TMPDIR/mcp-valid-proj" 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "start -d bad --mcp: want 64, got $rc: $out"
+    # app-owned threads: lean MCP is rejected with the documented message
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --agent codex --app-owned --mcp none "$TMPDIR/mcp-valid-proj" 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--app-owned --mcp none: want 64, got $rc: $out"
+    assert_contains "$out" "app-owned threads use the app-server's MCP configuration"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --agent codex --mcp minimal --app-owned "$TMPDIR/mcp-valid-proj" 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--mcp minimal --app-owned: want 64, got $rc"
+    # the flag never reaches the agent argv, with or without a value
+    out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp none -m hi)"
+    assert_not_contains "$(_mcp_args_of "$out")" "--mcp$(printf '\n')none"
+    [[ "$(_mcp_args_of "$out" | grep -cx -- '--mcp')" == 0 ]] || fail "--mcp leaked into the agent argv"
+}
+
+test_launch_mcp_detached_record_and_env() {
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_ps "$TMPDIR/ps"
+    local meta="$TMPDIR/mcp-det-meta" proj="$TMPDIR/mcp-det-proj" log="$TMPDIR/mcp-det-tmux.log" out
+    mkdir -p "$meta" "$proj"
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent claude --profile none --mcp none "$proj")"
+    assert_contains "$out" "detached session started"
+    local shell_cmd; shell_cmd="$(grep '^SHELL_CMD=' "$log" | tail -n 1)"
+    assert_contains "$shell_cmd" "CCTRL_LAUNCH_MCP_MODE=none"
+    [[ "$shell_cmd" != *" --mcp"* ]] || fail "--mcp reached the pane child argv: $shell_cmd"
+    assert_contains "$(CCTRL_SESSION_METADATA_DIR="$meta" session_record_json "TMUX--mcp-det-proj")" '"mcp_mode": "none"'
+    # default launch: env and record unchanged
+    : > "$log"; mkdir -p "$TMPDIR/mcp-det-proj2"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent claude --profile none "$TMPDIR/mcp-det-proj2")"
+    shell_cmd="$(grep '^SHELL_CMD=' "$log" | tail -n 1)"
+    assert_not_contains "$shell_cmd" "MCP_MODE"
+    assert_not_contains "$(CCTRL_SESSION_METADATA_DIR="$meta" session_record_json "TMUX--mcp-det-proj2")" "mcp_mode"
+    # a stale CCTRL_MCP_MODE=none in the pane's env (long-lived tmux server) is ignored by the pane child
+    make_fake_agent "$TMPDIR/codex" codex
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$TMPDIR/mcp-det-home" CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--mcp-stale CCTRL_MCP_MODE=none "$ROOT/cctrl" start --foreground --agent codex --profile none --no-bridge -m hi 2>&1)"
+    assert_not_contains "$out" "mcp: lean"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$TMPDIR/mcp-det-home" CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--mcp-lean CCTRL_LAUNCH_MCP_MODE=none CCTRL_MCP_MODE=inherit "$ROOT/cctrl" start --foreground --agent codex --profile none --no-bridge -m hi 2>&1)"
+    assert_contains "$out" "mcp: lean"
+    # an explicit --mcp inherit beats an env CCTRL_MCP_MODE=none on a detached launch
+    : > "$log"; mkdir -p "$TMPDIR/mcp-det-proj3"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_MCP_MODE=none "$ROOT/cctrl" start -d --agent claude --profile none --mcp inherit "$TMPDIR/mcp-det-proj3")"
+    assert_not_contains "$(grep '^SHELL_CMD=' "$log" | tail -n 1)" "MCP_MODE"
+}
+
+test_profile_settings_gc_keeps_live_mcp_file() {
+    # Plan 106 P2 (eng-review REQUIRED): <key>.mcp.json must be judged by <key>,
+    # or a live session's MCP file reads as key "<key>.mcp" and is swept.
+    make_fake_tmux "$TMPDIR/tmux"
+    local runtime="$TMPDIR/mcp-gc-runtime"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings"
+    mkdir -p "$dir"
+    printf '{}\n' > "$dir/TMUX--mcp-live.mcp.json"
+    printf '{}\n' > "$dir/TMUX--mcp-live.json"
+    printf '{}\n' > "$dir/fg-$$.mcp.json"
+    printf '{}\n' > "$dir/TMUX--mcp-dead.mcp.json"
+    printf '{}\n' > "$dir/TMUX--mcp-dead.json"
+    printf '{}\n' > "$dir/fg-999999.mcp.json"
+    touch -t 202001010000 "$dir"/*.json
+    local state="$TMPDIR/mcp-gc-state"
+    printf '%s\n' '$0:TMUX--mcp-live' > "$state"
+    CCTRL_RUNTIME_DIR="$runtime" TMUX_FAKE_STATE="$state" PATH="$TMPDIR:$PATH" cctrl_source_eval '_profile_settings_gc'
+    [[ -f "$dir/TMUX--mcp-live.mcp.json" ]] || fail "GC removed a live session's MCP file"
+    [[ -f "$dir/TMUX--mcp-live.json" ]] || fail "GC removed a live session's settings file"
+    [[ -f "$dir/fg-$$.mcp.json" ]] || fail "GC removed a live foreground launch's MCP file"
+    [[ ! -f "$dir/TMUX--mcp-dead.mcp.json" ]] || fail "GC kept a dead session's MCP file"
+    [[ ! -f "$dir/TMUX--mcp-dead.json" ]] || fail "GC kept a dead session's settings file"
+    [[ ! -f "$dir/fg-999999.mcp.json" ]] || fail "GC kept a dead foreground launch's MCP file"
+}
+
+test_profile_mcp_restart_and_wrapper_cleanup() {
+    # cmd_restart rewrites the MCP file whenever the record says mcp_mode=none
+    # (no profile involved); the wrapper removes it on exit like the settings file.
+    local runtime="$TMPDIR/mcp-restart-runtime" meta="$TMPDIR/mcp-restart-meta" marker="$TMPDIR/mcp-restart-marker"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings" out
+    mkdir -p "$dir" "$meta"
+    printf '{"mcpServers":{"stale":{"command":"x"}}}\n' > "$dir/TMUX--restart-mcp.mcp.json"
+    printf '{"mcp_mode":"none","cctrl_managed":true}\n' > "$meta/TMUX--restart-mcp.json"
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/mcp-restart-tmux.log"; : > "$log"
+    out="$(CLAUDE_CODE_SESSION_ID="sess-restart-mcp" CCTRL_RESTART_MARKER="$marker" CCTRL_PEER=comet \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="TMUX--restart-mcp" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1)"
+    jq -e '.mcpServers | keys == ["cctrl-peer"]' "$dir/TMUX--restart-mcp.mcp.json" >/dev/null \
+        || fail "cmd_restart should rewrite the MCP file from the record's mcp_mode: $out"
+    [[ "$(_mcp_file_mode "$dir/TMUX--restart-mcp.mcp.json")" == 600 ]] || fail "rewritten MCP file is not mode 600"
+    # inherit record: restart leaves a (hypothetical) file alone
+    printf '{"mcpServers":{"keep":{"command":"x"}}}\n' > "$dir/TMUX--restart-inh.mcp.json"
+    printf '{"cctrl_managed":true}\n' > "$meta/TMUX--restart-inh.json"
+    out="$(CLAUDE_CODE_SESSION_ID="sess-restart-inh" CCTRL_RESTART_MARKER="$marker" \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="TMUX--restart-inh" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1)"
+    jq -e '.mcpServers | keys == ["keep"]' "$dir/TMUX--restart-inh.mcp.json" >/dev/null || fail "restart touched an inherit session's file"
+    # wrapper cleanup
+    local bin="$TMPDIR/mcp-wrap-bin" mcpf="$dir/TMUX--wrap.mcp.json"
+    mkdir -p "$bin"; make_fake_agent "$bin/claude" claude
+    printf '{}\n' > "$mcpf"
+    CCTRL_EARLY_EXIT_WINDOW_SECONDS=0 CCTRL_PROFILE_MCP_FILE="$mcpf" PATH="$bin:$PATH" \
+        "$ROOT/lib/session-wrapper.sh" claude "$TMPDIR/mcp-wrap-marker" --flag >/dev/null 2>&1
+    [[ ! -f "$mcpf" ]] || fail "wrapper exit should remove the per-session MCP file"
+}
+
+test_launch_to_app_mcp_notice() {
+    # launch-to-app: the lean mode applies to the terminal phase; one stderr
+    # line says the app-server owns MCP after release. Validation errors still
+    # exit 64. No real launch: the workflow is stopped at its first step.
+    make_fake_tmux "$TMPDIR/tmux"; make_fake_agent "$TMPDIR/codex" codex; make_fake_ps "$TMPDIR/ps"
+    mkdir -p "$TMPDIR/mcp-l2a-proj"
+    local out rc=0
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" launch-to-app "$TMPDIR/mcp-l2a-proj" --mcp bogus 2>&1)" || rc=$?
+    [[ $rc -ne 0 && "$out" == *"unknown MCP mode 'bogus'"* ]] || fail "launch-to-app --mcp bogus must be rejected (rc=$rc): $out"
+    assert_contains "$out" "applies to the terminal phase only"
+}
+
+test_helper_census_comm_name_safe() {
+    # P1 follow-up: a crafted comm ("/x y/<token>") must not surface its tail
+    # as an executable name. Secret-shaped strings are assembled at runtime.
+    local d="$TMPDIR/helper-census-comm" out pl="PLAN""TED"
+    mkdir -p "$d"
+    local tok1="sk-ant-api03-${pl}9f8e7d6c5b4a3210" tok2="${pl}Zq83kd02Lm91xv55TTT7" tok3="ghp_${pl}1234567890abcdef"
+    {
+        echo "  100     1 2000 /usr/local/bin/codex"
+        echo "  101   100 100 /opt/with space/${tok1}"
+        echo "  102   100 100 /opt/with space/${tok2}"
+        echo "  103   100 100 /opt/with space/${tok3}"
+        echo "  104   100 100 /opt/with space/KEY=${pl}-v"
+        echo "  105   100 100 /opt/my tools/mcp-server-x"
+        echo "  106   100 100 /usr/bin/chrome_crashpad_handler"
+    } > "$d/ps.txt"
+    printf '100 codex app-server\n' > "$d/args.txt"
+    : > "$d/panes.txt"
+    out="$(CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers --json 2>&1)" || fail "helpers failed: $out"
+    local needle
+    for needle in "$tok1" "$tok2" "$tok3" "${pl}-v"; do
+        [[ "$out" != *"$needle"* ]] || fail "credential-shaped comm text reached the output: $needle"
+    done
+    [[ "$out" == *"mcp-server-x"* && "$out" == *"chrome_crashpad_handler"* ]] || fail "ordinary executable names must still be shown: $out"
+    # one unsafe character must not leave a partly masked secret behind
+    printf '  107   100 100 /x y/postgres:%shunter2@db\n  108   100 100 /a/abcd1234efgh5678ijkl9012:\n' "$pl" >> "$d/ps.txt"
+    out="$(CCTRL_HELPERS_FIXTURE_DIR="$d" "$ROOT/cctrl" helpers --json 2>&1)" || fail "helpers failed: $out"
+    [[ "$out" != *"hunter2"* && "$out" != *"abcd1234"* ]] || fail "partly masked credential reached the output: $out"
+}
+
 test_helper_census_never_kills_structural() {
     local f="$ROOT/lib/helper_census.py" hit
     hit="$(grep -inE 'kill|signal|terminat|os\.remove|unlink|rmtree|os\.system|Popen|os\.write|open\([^)]*[\"'\'']w' "$f" || true)"

@@ -119,7 +119,7 @@ _codex_launch_to_app() {
                     echo "launch-to-app supports only Codex." >&2; return 64;
                 }
                 shift 2 ;;
-            --profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--purpose|--message|--prompt|-m|--health-check-timeout|-c|--config)
+            --profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--purpose|--message|--prompt|-m|--health-check-timeout|-c|--config|--mcp)
                 [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }
                 launch_args+=("$arg" "$2")
                 shift 2 ;;
@@ -155,6 +155,15 @@ _codex_launch_to_app() {
     CCTRL_LAST_LAUNCH_RECORD=""
     # Exact recovery, not rollout/title correlation, owns identity assignment in
     # this workflow. Suppress both existing best-effort heuristic pollers.
+    # Plan 106 P2: lean MCP applies to the terminal phase only.
+    local _l2a_i _l2a_mcp="${CCTRL_MCP_MODE:-}"
+    for (( _l2a_i = 0; _l2a_i < ${#launch_args[@]}; _l2a_i++ )); do
+        [[ "${launch_args[$_l2a_i]}" == -- ]] && break
+        [[ "${launch_args[$_l2a_i]}" == --mcp ]] && _l2a_mcp="${launch_args[$((_l2a_i + 1))]:-}"
+    done
+    if [[ -n "$_l2a_mcp" && "$_l2a_mcp" != inherit && "$json" != true ]]; then
+        echo "mcp: ${_l2a_mcp} applies to the terminal phase only; the app-server owns MCP after release." >&2
+    fi
     if ! _launch_detached -d --agent codex "${launch_args[@]}" >"$launch_log" 2>&1; then
         if [[ -f "$CCTRL_LAUNCH_RECEIPT_FILE" ]]; then
             session="$(jq -r '.session // empty' "$CCTRL_LAUNCH_RECEIPT_FILE" 2>/dev/null || true)"

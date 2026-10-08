@@ -249,3 +249,10 @@ plan 104. Test harness items are now plan 105; the MCP helper census / lean MCP 
 - `test_task_inventory_provider_neutral_readonly` is SKIP-listed: it fails at HEAD d0f93f0 (its fake tmux `list-sessions` rows are reported as `invalid-session-identity`; also reached by the `task-inventory` and `codex-ownership-matrix` groups). Fix the fixture, then remove the SKIP entry.
 - Fail-fast abort detail: the `test suite aborted` line now reads `in [_run_test main] ... at: exit "$_rt_rc"` (the test name still prints); an ERR trap inside the per-test subshell would restore the failing command and line (Opus review RECOMMENDED).
 - P5/P6 still pending: install gate on both bashes (also unset `CCTRL_TEST_NAMES` / `CCTRL_TEST_ONLY` there); file split (the guard's "every suite file sourced" check arrives with it).
+
+### Plan 106 P2 follow-ups (2026-10-09)
+
+- `session snapshot` / `restore` do not carry `mcp_mode`: a restored lean worker comes back as `inherit` (add `mcp_mode` to the snapshot `launch_flags` and the restore replay).
+- `_session_realign` relaunch also drops `mcp_mode` (lean session realigned = inherit); `_remote_exec` forwards `--mcp` to an older remote cctrl, which would pass it to the agent. Codex scan misses inline-table / dotted-key server declarations.
+- P3: profile key `agents.<agent>.mcp`, `mcp.minimal.<agent>` keep list, Claude definition copy, shortcut field, D3 skill lines.
+- `launch-to-app --mcp ...` prints its notice before the launch result is known (also for a value the launch then rejects).

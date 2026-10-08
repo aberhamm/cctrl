@@ -7,7 +7,8 @@ tmux pane pids (`tmux list-panes -a`). It only reports. This module has no
 code path that acts on a process or writes anything.
 
 Command-line arguments are used to classify an owner (does it say
-`app-server`?) and are never printed or returned. Process environments are
+`app-server`?) and are simply never printed or returned (nothing is redacted:
+there is no code path that emits them). Process environments are
 never read. Output holds only: pids, a fixed label, tmux session names,
 executable basenames, counts and sizes.
 
@@ -28,6 +29,10 @@ DEFAULT_WARN_SETS = 8
 DEFAULT_WARN_GB = 8.0
 LABELS = ("codex app-server (remote-control)", "codex app-server (other)", "codex tui", "codex (unclassified)", "claude")
 SAFE_NAME = re.compile(r"[^A-Za-z0-9._+@-]")
+# A displayed name that looks like a credential is shown as "?". A crafted comm
+# ("/x y/<token>") would otherwise surface its tail as the executable name.
+SECRET_PREFIX = re.compile(r"^(sk|pk|rk|ghp|gho|ghu|ghs|github_pat|glpat|xox[a-z]|AKIA|ASIA|AIza|eyJ|npm|hf)[-_A-Za-z0-9]", re.I)
+SECRET_SHAPE = re.compile(r"^[A-Za-z0-9_+@.-]{20,}$")
 FOOTER_NOTE = "cctrl does not reap helpers; see README: MCP helper processes"
 
 
@@ -51,14 +56,19 @@ def _fixture(name):
 
 
 def exe_name(comm):
-    """Executable basename of a ps comm field, reduced to a safe token."""
+    """Executable basename of a ps comm field, reduced to a safe display token.
+
+    comm is a path that may hold spaces, so the name is the text after the last
+    "/" and then its first whitespace-delimited token. A token with any
+    character outside a small safe set (so KEY=value, user:pw@host), anything
+    credential-shaped and anything past 40 characters is shown as "?", not
+    partly masked."""
     base = comm.rstrip("/").rsplit("/", 1)[-1].strip("()")
-    # a rewritten process title can hold arguments: keep the first token only
-    # and drop anything that looks like KEY=value
     base = (base.split() or [""])[0]
-    if "=" in base:
+    digits = sum(ch.isdigit() for ch in base)
+    if (SAFE_NAME.search(base) or SECRET_PREFIX.match(base) or len(base) > 40
+            or (SECRET_SHAPE.match(base) and digits >= 3) or (len(base) >= 12 and digits >= 3)):
         base = "?"
-    base = SAFE_NAME.sub("?", base)[:40]
     return base or "?"
 
 

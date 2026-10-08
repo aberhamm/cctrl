@@ -1817,6 +1817,35 @@ Reaping is the owner's decision: helpers of the Codex app-server end only when
 the app-server or the Codex app restarts, which interrupts running app
 threads.
 
+### Lean MCP mode (`--mcp none`, opt-in)
+
+`cctrl start ... --mcp none` (also `cctrl @key --mcp none`, `cctrl launch-to-app
+... --mcp none`, or `CCTRL_MCP_MODE=none`) starts a terminal-owned worker with
+only cctrl's own MCP server. The flag beats the env var; the default is
+`inherit` and changes nothing. A bad value exits 64; `--mcp minimal` is not
+available yet.
+
+- Claude: a mode-600 file `<session>.mcp.json` next to the settings overlay
+  (in `cctrl-<uid>/profile-settings`) holds `cctrl-peer` when `--peer` is set
+  and nothing otherwise; Claude gets `--strict-mcp-config --mcp-config <file>`.
+  The file is removed when the session ends, rewritten by `cctrl restart` and
+  kept by the orphan sweep while the session lives. Whether strict mode also
+  drops claude.ai connectors or plugin servers is checked by the manual smoke
+  test, not assumed.
+- Codex: every `[mcp_servers.<name>]` table in `$CODEX_HOME/config.toml`
+  (names only; values are never read) gets `-c mcp_servers.<name>.enabled=false`;
+  `cctrl_runtime` stays. Plugin-provided servers cannot be disabled this way and
+  stay on. A name with characters outside `[A-Za-z0-9_-]` is reported as "not
+  controllable" in the launch line.
+- The mode is shown in the launch line and as `mcp_mode` in `cctrl session ls
+  --json`. Anything after `--` (your own `-c` or `--mcp-config`) still wins.
+- Not covered: app-owned threads (`start --app-owned` rejects `--mcp`, exit 64)
+  and the Codex app-server itself. `launch-to-app` applies the mode to the
+  terminal phase only; the app-server owns MCP after release. Nothing here
+  reduces the helpers the shared app-server already holds. `cctrl session
+  snapshot` / `restore` do not carry the mode yet: a restored worker is
+  `inherit`.
+
 ## Port management
 
 > Ships as the `cctrl-ports` **plugin** (`plugins/cctrl-ports`), not a core

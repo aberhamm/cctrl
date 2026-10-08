@@ -94,6 +94,7 @@ _cleanup() {
     # accumulate. _profile_settings_gc also sweeps orphans from crashes that
     # skip both paths (e.g. SIGKILL of the whole pane).
     [[ -n "${CCTRL_PROFILE_SETTINGS_FILE:-}" ]] && rm -f "$CCTRL_PROFILE_SETTINGS_FILE"
+    [[ -n "${CCTRL_PROFILE_MCP_FILE:-}" ]] && rm -f "$CCTRL_PROFILE_MCP_FILE"
 }
 trap _cleanup SIGTERM SIGINT SIGHUP
 
@@ -180,5 +181,6 @@ while true; do
     break
 done
 [[ -n "${CCTRL_PROFILE_SETTINGS_FILE:-}" ]] && rm -f "$CCTRL_PROFILE_SETTINGS_FILE"
+[[ -n "${CCTRL_PROFILE_MCP_FILE:-}" ]] && rm -f "$CCTRL_PROFILE_MCP_FILE"
 exit "$_rc"
 }

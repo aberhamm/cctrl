@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased] - 2026-10-02
 
+### Added
+- Lean MCP mode (plan 106 P2, opt-in): `--mcp none` / `CCTRL_MCP_MODE=none` on `cctrl start`, `cctrl @key` and `launch-to-app` starts a terminal-owned worker with only cctrl's own MCP server. Claude gets `--strict-mcp-config --mcp-config <per-session mode-600 file>`; Codex gets `-c mcp_servers.<name>.enabled=false` for each server named in `config.toml` (names only). Default `inherit` is byte-identical to before; `mcp_mode` is recorded and shown in `session ls --json`; `--app-owned` rejects `--mcp` (64); `--mcp minimal` is not available yet (64). `_profile_settings_gc` now keeps a live session's `.mcp.json` file.
+
+### Fixed
+- `cctrl helpers`: a crafted `comm` can no longer surface its tail (or a credential-shaped token) as an executable name; the docstring no longer says "redaction" (arguments are simply never printed). (plan 106 P1 follow-up)
+
 ### Changed
 - Test harness (plan 105 P4): tests are discovered from their definitions instead of two hand-kept call lists, run in source order, each in a subshell; `SKIP` / `RUN_FIRST` / `RUN_LAST` lists carry reasons; focused groups are data (`_group_tests`) and go through the runner. Five tests made self-sufficient (they only passed after a neighbour ran or with a local `profiles/work.json`); two more fixed for the new order. `test_task_inventory_provider_neutral_readonly` is SKIP-listed (it fails at HEAD, fixture drift).
 

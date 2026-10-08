@@ -953,6 +953,94 @@ _profile_settings_write() {
     printf '%s' "$file"
 }
 
+# Plan 106 P2: lean MCP mode (opt-in; `inherit` is the default and changes
+# nothing). Precedence in P2: --mcp flag, then CCTRL_MCP_MODE, then inherit.
+# P3 seam: the profile key agents.<agent>.mcp slots in between the flag and
+# the env var, right here.
+#   $1 = the --mcp value ("" when the flag was not given)
+# Prints the resolved mode (inherit|none); returns 64 on anything else.
+_mcp_mode_resolve() {
+    local mode="${1:-}"
+    if [[ -z "$mode" ]]; then
+        if [[ "${CCTRL_TMUX_CONTEXT:-}" == 1 && "${CCTRL_SESSION_KIND:-}" == tmux ]]; then
+            # Pane child of a detached launch: only the mode the parent resolved
+            # counts. CCTRL_MCP_MODE here could be a stale value held by a tmux
+            # server that was once started from a lean shell.
+            mode="${CCTRL_LAUNCH_MCP_MODE:-}"
+        else
+            mode="${CCTRL_MCP_MODE:-}"
+        fi
+    fi
+    [[ -n "$mode" ]] || mode="inherit"
+    case "$mode" in
+        inherit|none)
+            printf '%s' "$mode"
+            ;;
+        minimal)
+            echo "cctrl: --mcp minimal is not available yet (use --mcp none or --mcp inherit)" >&2
+            return 64
+            ;;
+        *)
+            echo "cctrl: unknown MCP mode '${mode:0:40}' (use inherit or none)" >&2
+            return 64
+            ;;
+    esac
+}
+
+# Per-session Claude MCP file for `--mcp none`, next to the settings overlay
+# (same dir, mode 600, key = tmux session name or fg-$$, suffix .mcp.json).
+# A FILE, never JSON in argv, so a server definition can never reach `ps`.
+# Holds exactly cctrl-peer when a peer identity is set, an empty server map
+# otherwise. Prints the path; returns nonzero on any failure.
+#   $1=key $2=peer name (may be empty)
+_profile_mcp_write() {
+    local key="$1" peer="${2:-}"
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -n "$key" ]] || return 1
+    local dir
+    dir="$(_profile_settings_dir)"
+    _profile_settings_ensure_dir "$dir" || return 1
+    local file="$dir/${key}.mcp.json" tmp="$dir/.${key}.mcp.json.tmp.$$"
+    ( umask 077 && jq -n --arg cmd "$SCRIPT_DIR/cctrl" --arg peer "$peer" '
+        {mcpServers: (if $peer == "" then {}
+                      else {"cctrl-peer": {command: $cmd, args: ["peer","mcp","--as",$peer]}} end)}
+    ' > "$tmp" ) 2>/dev/null || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    printf '%s' "$file"
+}
+
+# Names of the MCP servers declared in $CODEX_DIR/config.toml, by a line scan
+# of the [mcp_servers.<name>] table headers. Names only: values are never
+# read, so no secret can reach argv. Only [A-Za-z0-9_-]+ is accepted; any
+# other header (quoted or exotic names) is counted as not controllable.
+# cctrl_runtime is cctrl's own server and is never listed. A sub-table such
+# as [mcp_servers.foo.env] names server foo. A missing file means no names.
+# Sets LAUNCH_CODEX_MCP_NAMES (newline-separated) and
+# LAUNCH_CODEX_MCP_UNCONTROLLABLE (count).
+_codex_mcp_server_names() {
+    LAUNCH_CODEX_MCP_NAMES=""
+    LAUNCH_CODEX_MCP_UNCONTROLLABLE=0
+    local cfg="${CODEX_DIR:-$HOME/.codex}/config.toml"
+    [[ -f "$cfg" ]] || return 0
+    local line raw name seen=$'\n'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^[[:space:]]*\[mcp_servers\.([^]]+)\][[:space:]]*(#.*)?$ ]]; then
+            raw="${BASH_REMATCH[1]}"
+            name="${raw%%.*}"
+            if [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                if [[ "$name" != cctrl_runtime && "$seen" != *$'\n'"$name"$'\n'* ]]; then
+                    seen+="$name"$'\n'
+                    LAUNCH_CODEX_MCP_NAMES+="$name"$'\n'
+                fi
+            else
+                LAUNCH_CODEX_MCP_UNCONTROLLABLE=$((LAUNCH_CODEX_MCP_UNCONTROLLABLE + 1))
+            fi
+        fi
+    done < "$cfg"
+    return 0
+}
+
 # Orphan sweep (D5, R3): a key of the form fg-<pid> is removed once that pid
 # is dead; any other key is a tmux session name and is removed once no live
 # tmux session on this server has it (exact match -- tmux -t falls back to a
@@ -993,6 +1081,11 @@ _profile_settings_gc() {
     for f in "$dir"/*.json; do
         [[ -e "$f" ]] || continue
         key="$(basename "$f" .json)"
+        # Plan 106 P2: <key>.mcp.json belongs to the same session as <key>.json.
+        # Strip the suffix before the fg-<pid> match and the live-session check,
+        # or a live session's MCP file reads as key "<key>.mcp", matches no
+        # session and is swept after 10 minutes.
+        key="${key%.mcp}"
         if [[ "$key" =~ ^fg-([0-9]+)$ ]]; then
             pid="${BASH_REMATCH[1]}"
             kill -0 "$pid" 2>/dev/null || rm -f "$f"
@@ -1156,6 +1249,12 @@ _launch_exec_agent() {
         fi
     fi
 
+    # Plan 106 P2: the resolved MCP mode arrives in LAUNCH_MCP_MODE (set by the
+    # caller). CCTRL_MCP_MODE only carried it across the tmux hop; drop it so
+    # it never reaches the agent or a nested launch it makes.
+    local _mcp_mode="${LAUNCH_MCP_MODE:-inherit}"
+    unset CCTRL_MCP_MODE CCTRL_LAUNCH_MCP_MODE
+
     LAUNCH_FLAGS=()
     LAUNCH_PROFILE_ARGS=()
     _launch_apply_profile_args "$agent" "$pf" || return 1
@@ -1242,7 +1341,25 @@ _launch_exec_agent() {
 
         # Auto-register the peer MCP server when --peer was used so the
         # Claude agent has cctrl peer tools (send_message, etc.) available.
-        if [[ -n "${CCTRL_PEER:-}" ]]; then
+        if [[ "$_mcp_mode" == none ]]; then
+            # Plan 106 P2: only cctrl's own server, from a mode-600 file.
+            local _mcp_key _mcp_file
+            if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
+                _mcp_key="$CCTRL_SESSION_NAME"
+            else
+                _mcp_key="fg-$$"
+            fi
+            _mcp_file="$(_profile_mcp_write "$_mcp_key" "${CCTRL_PEER:-}")" || _mcp_file=""
+            if [[ -z "$_mcp_file" ]]; then
+                echo -e "${RED}cctrl: could not write the MCP config file for --mcp none; nothing was launched.${RESET}" >&2
+                return 70
+            fi
+            export CCTRL_PROFILE_MCP_FILE="$_mcp_file"
+            LAUNCH_FLAGS+=("--strict-mcp-config" "--mcp-config" "$_mcp_file")
+            local _mcp_kept_claude="nothing"
+            [[ -n "${CCTRL_PEER:-}" ]] && _mcp_kept_claude="cctrl-peer"
+            echo -e "${DIM}mcp: lean (none; kept: ${_mcp_kept_claude})${RESET}"
+        elif [[ -n "${CCTRL_PEER:-}" ]]; then
             local _peer_mcp_json
             _peer_mcp_json=$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' \
                 "$SCRIPT_DIR/cctrl" "$CCTRL_PEER")
@@ -1279,6 +1396,20 @@ _launch_exec_agent() {
         else
             LAUNCH_FLAGS=("--yolo")
         fi
+    fi
+    if [[ "$_mcp_mode" == none ]]; then
+        # Plan 106 P2: disable every server config.toml declares (names only).
+        # Passthrough is appended after this, so a caller's own -c still wins.
+        _codex_mcp_server_names
+        local _mcp_n _mcp_count=0 _mcp_kept="nothing" _mcp_note=""
+        while IFS= read -r _mcp_n; do
+            [[ -n "$_mcp_n" ]] || continue
+            LAUNCH_FLAGS+=("-c" "mcp_servers.${_mcp_n}.enabled=false")
+            _mcp_count=$((_mcp_count + 1))
+        done <<< "$LAUNCH_CODEX_MCP_NAMES"
+        [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]] && _mcp_kept="cctrl_runtime"
+        (( LAUNCH_CODEX_MCP_UNCONTROLLABLE > 0 )) && _mcp_note="; not controllable: $LAUNCH_CODEX_MCP_UNCONTROLLABLE"
+        echo -e "${DIM}mcp: lean (kept: ${_mcp_kept}; disabled: ${_mcp_count}${_mcp_note})${RESET}"
     fi
     [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
     if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && "$no_bridge" != "true" ]] && ! _launch_flags_has_codex_remote; then
@@ -1974,7 +2105,7 @@ _start_args_have_explicit_target() {
             -d|--detach|--foreground|--no-tmux|--tmux|--yolo|--dangerously-bypass-approvals-and-sandbox|--no-bridge|--no-input)
                 shift
                 ;;
-            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|--role|--orch-kind|--succeeds)
+            --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|--role|--orch-kind|--succeeds|--mcp)
                 [[ $# -ge 2 ]] || return 1
                 shift 2
                 ;;
@@ -2008,7 +2139,7 @@ _start_requests_app_owned() {
         case "$1" in
             --) return 1 ;;
             --app-owned) return 0 ;;
-            --agent|--profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|-c|--config|--role|--orch-kind|--succeeds)
+            --agent|--profile|--model|--reasoning-effort|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|-c|--config|--role|--orch-kind|--succeeds|--mcp)
                 (( $# >= 2 )) || return 1
                 shift 2
                 ;;
@@ -2115,6 +2246,11 @@ _launch_app_owned_codex() {
         arg="$1"
         case "$arg" in
             --app-owned|--no-input) shift ;;
+            --mcp)
+                [[ $# -ge 2 ]] || { echo "--mcp needs a value" >&2; return 64; }
+                # Plan 106 P2: lean MCP is for terminal-owned launches only.
+                [[ "$2" == inherit ]] || { printf '%b--mcp %s is incompatible with --app-owned: app-owned threads use the app-server'"'"'s MCP configuration.%b\n' "$RED" "$2" "$RESET" >&2; return 64; }
+                shift 2 ;;
             --json) json=true; shift ;;
             --agent) [[ $# -ge 2 ]] || { echo "--agent needs a value" >&2; return 64; }; agent="$(_normalize_agent "$2")" || return 64; shift 2 ;;
             --profile) [[ $# -ge 2 ]] || { echo "--profile needs a value" >&2; return 64; }; profile="$2"; profile_explicit=true; shift 2 ;;
@@ -2287,6 +2423,7 @@ cmd_start() {
     local full_bypass=false
     local access_explicit=false
     local permission_mode=""
+    local mcp_flag=""
     local passthrough=()
 
     while [[ $# -gt 0 ]]; do
@@ -2294,6 +2431,10 @@ cmd_start() {
             --agent)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
                 agent="$2"; shift 2
+                ;;
+            --mcp)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--mcp needs a value${RESET}"; return 64; }
+                mcp_flag="$2"; shift 2
                 ;;
             --profile)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
@@ -2380,6 +2521,8 @@ cmd_start() {
                 ;;
         esac
     done
+
+    LAUNCH_MCP_MODE="$(_mcp_mode_resolve "$mcp_flag")" || return $?
 
     # Resolve profile: explicit --profile > configured default > legacy
     # .active-profile > none (see _resolve_profile). A missing explicit
@@ -3433,7 +3576,7 @@ if not (record.get("schema_version") == 2 and record.get("lifecycle_state") == "
         and key == "launch-" + str(record.get("provisional_launch_id"))):
     raise SystemExit("Not a matching provisional cctrl launch receipt")
 receipt = {"control_surface", "tmux_session", "pane_id", "pane_pid", "wrapper_pid", "pane_started"}
-allowed = receipt | {"health_status", "health_reason", "health_info", "purpose", "role", "orch_kind", "succeeds", "label_names_known"}
+allowed = receipt | {"health_status", "health_reason", "health_info", "purpose", "role", "orch_kind", "succeeds", "label_names_known", "mcp_mode"}
 updates = json.loads(value) if field == "_terminal_anchor_receipt" else {field: value}
 if not isinstance(updates, dict) or (field == "_terminal_anchor_receipt" and set(updates) != receipt):
     raise SystemExit("Terminal receipt must contain exactly the anchor fields")
@@ -4613,6 +4756,7 @@ _launch_detached() {
     local role_flag="" kind_flag="" succeeds_flag="" pinned_name=""
     local no_health_check=false
     local health_check_timeout=30
+    local mcp_flag="" mcp_mode="inherit"
     local passthrough_count=0
     local passthrough=()
     while [[ $# -gt 0 ]]; do
@@ -4728,6 +4872,16 @@ _launch_detached() {
                 esac
                 shift 2
                 ;;
+            --mcp)
+                # Plan 106 P2: consumed here; the pane child gets the resolved
+                # mode through CCTRL_MCP_MODE, never through the agent's argv.
+                if [[ $# -lt 2 ]]; then
+                    echo -e "${RED}--mcp needs a value${RESET}" >&2
+                    return 64
+                fi
+                mcp_flag="$2"
+                shift 2
+                ;;
             --no-input)
                 # Decided once in main(); consumed so it never reaches the agent.
                 shift
@@ -4787,6 +4941,8 @@ _launch_detached() {
                 ;;
         esac
     done
+
+    mcp_mode="$(_mcp_mode_resolve "$mcp_flag")" || return $?
 
     if ! command -v tmux &>/dev/null; then
         echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
@@ -4965,6 +5121,11 @@ _launch_detached() {
     # phase 6).
     [[ -n "$resolved_claude_config_dir" ]] && base_env_q+=" CLAUDE_CONFIG_DIR=$(_launch_quote "$resolved_claude_config_dir")"
     [[ -n "$peer_name" ]] && base_env_q+=" CCTRL_PEER=$(_launch_quote "$peer_name")"
+    # Plan 106 P2: carry the resolved MCP mode across the tmux hop in a
+    # cctrl-internal variable (the pane child ignores CCTRL_MCP_MODE, which a
+    # long-lived tmux server could hold stale). Nothing is added for a default
+    # launch, so its argv and env stay byte-identical.
+    [[ "$mcp_mode" == inherit ]] || base_env_q+=" CCTRL_LAUNCH_MCP_MODE=$mcp_mode"
     # R1 one-shot source handoff: the child below sees the resolved profile as
     # an explicit `--profile` flag (injected just below, for every source the
     # user didn't type themselves) and would otherwise correctly-from-its-own-
@@ -5224,6 +5385,7 @@ _launch_detached() {
             return 1
         fi
     fi
+    [[ "$mcp_mode" == inherit ]] || _session_update_metadata_field "$session_name" mcp_mode "$mcp_mode" 2>/dev/null || true
     if ! tmux new-session -d -s "$session_name" "$shell_cmd"; then
         rm -f "$(_session_metadata_file "$session_name")" 2>/dev/null || true
         [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
@@ -11467,7 +11629,7 @@ _session_list() {
     $json || echo -e "${DIM}✦ = cctrl-managed · rc = remote-control bridge (live/dead/off/na/na-inferred/unknown) · profile = personal/work·bedrock/none/? (? = pre-071 record). Repair: cctrl session doctor --fix${RESET}"
     local name cmd dir attached state kind model managed claude_yes marker disp_dir base agent agent_meta purpose created_at peer metadata_managed purpose_display rc_state bridge_id cpid display_label
     local session_id transcript last_active_ms last_active_disp last_active_iso i idx base_state recap_text recap_display
-    local profile profile_source auth_backend profile_display has_profile_raw has_profile role orch_kind role_fb
+    local profile profile_source auth_backend profile_display has_profile_raw has_profile role orch_kind role_fb mcp_mode
     local record_schema provider origin host_id registered_by_cctrl launched_by_cctrl execution_runtime control_owner lifecycle_state restore_strategy last_observed_at lineage_json evidence_json normalized_record
     for i in "${!names[@]}"; do
         name="${names[i]}"
@@ -11481,12 +11643,12 @@ _session_list() {
         local meta_file
         meta_file="$(_session_metadata_file "$name")"
         purpose=""; created_at=""; peer=""; display_label=""; metadata_managed=""; agent_meta=""; stored_conv_id=""
-        profile=""; profile_source=""; auth_backend=""; has_profile_raw="false"; role=""; orch_kind=""
+        profile=""; profile_source=""; auth_backend=""; has_profile_raw="false"; role=""; orch_kind=""; mcp_mode=""
         record_schema=""; provider=""; origin=""; host_id=""; registered_by_cctrl=false; launched_by_cctrl=false; execution_runtime=unknown; control_owner=unknown; lifecycle_state=unknown; restore_strategy=""; last_observed_at=""; lineage_json='{}'; evidence_json='[]'
         if [[ -f "$meta_file" ]]; then
             normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
             if [[ -n "$normalized_record" ]]; then
-                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r profile; IFS= read -r has_profile_raw; IFS= read -r profile_source; IFS= read -r auth_backend; IFS= read -r role; IFS= read -r orch_kind; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.profile // ""), (has("profile")|tostring), (.profile_source // ""), (.auth_backend // ""), (.role // ""), (.orch_kind // "")' <<< "$normalized_record" 2>/dev/null) || true
+                { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r profile; IFS= read -r has_profile_raw; IFS= read -r profile_source; IFS= read -r auth_backend; IFS= read -r role; IFS= read -r orch_kind; IFS= read -r mcp_mode; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.profile // ""), (has("profile")|tostring), (.profile_source // ""), (.auth_backend // ""), (.role // ""), (.orch_kind // ""), (.mcp_mode // "")' <<< "$normalized_record" 2>/dev/null) || true
                 record_schema="$(jq -r '.schema_version // empty' <<< "$normalized_record")"
                 provider="$(jq -r '.provider // empty' <<< "$normalized_record")"
                 origin="$(jq -r '.origin // empty' <<< "$normalized_record")"
@@ -11605,7 +11767,7 @@ _session_list() {
                 [[ "${role_fb#*|}" == default ]] && { role=""; orch_kind=""; }
             fi
             json_items+=("$(jq -n \
-                --arg role "$role" --arg orch_kind "$orch_kind" \
+                --arg role "$role" --arg orch_kind "$orch_kind" --arg mcp_mode "$mcp_mode" \
                 --arg name "$name" --arg kind "$kind" --arg dir "$dir" \
                 --arg model "$model" --arg state "$state" --arg agent "$agent" \
                 --arg purpose "$purpose" --arg created_at "$created_at" \
@@ -11623,7 +11785,7 @@ _session_list() {
                 --argjson lineage "$lineage_json" --argjson ownership_evidence "$evidence_json" \
                 --argjson managed "$managed" --argjson claude "$claude_yes" \
                 --arg profile "$profile" --arg profile_source "$profile_source" --arg auth_backend "$auth_backend" \
-                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence, profile:(if $profile=="" then null else $profile end), profile_source:(if $profile_source=="" then null else $profile_source end), auth_backend:(if $auth_backend=="" then null else $auth_backend end), role:(if $role=="" then null else $role end), orch_kind:(if $orch_kind=="" then null else $orch_kind end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
+                '{name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), claude:$claude, model:(if $model=="" then null else $model end), dir:$dir, state:$base, attached:($state=="attached"), remote_control:(if $rc=="-" then null else $rc end), bridge:(if $bridge=="" then null else $bridge end), session_id:(if $session_id=="" then null else $session_id end), execution_id:(if $execution_id=="" then null else $execution_id end), transcript:(if $transcript=="" then null else $transcript end), last_active:(if $last_active=="" then null else $last_active end), purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end), peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end), schema_version:(if $schema=="" then null else ($schema|tonumber) end), provider:(if $provider=="" then null else $provider end), provider_task_id:(if $session_id=="" then null else $session_id end), origin:(if $origin=="" then null else $origin end), host_id:(if $host_id=="" then null else $host_id end), registered_by_cctrl:$registered_by_cctrl, launched_by_cctrl:$launched_by_cctrl, execution_runtime:$execution_runtime, control_owner:$control_owner, lifecycle_state:$lifecycle_state, restore_strategy:(if $restore_strategy=="" then null else $restore_strategy end), last_observed_at:(if $last_observed_at=="" then null else $last_observed_at end), lineage:$lineage, ownership_evidence:$ownership_evidence, profile:(if $profile=="" then null else $profile end), profile_source:(if $profile_source=="" then null else $profile_source end), auth_backend:(if $auth_backend=="" then null else $auth_backend end), role:(if $role=="" then null else $role end), orch_kind:(if $orch_kind=="" then null else $orch_kind end), mcp_mode:(if $mcp_mode != "" then $mcp_mode elif $managed then "inherit" else null end)} + (if $want_recap then {recap:(if $recap=="" then null else $recap end)} else {} end)')")
         else
             $managed && marker="✦" || marker=" "
             purpose_display="$purpose"
@@ -15040,6 +15202,14 @@ cmd_restart() {
         fi
     fi
 
+    # Plan 106 P2: a lean (--mcp none) session has a per-session MCP file next
+    # to the settings overlay. Rewrite it from the record's mcp_mode, whatever
+    # the profile (the block above only runs when a profile is set).
+    if [[ -n "${CCTRL_SESSION_NAME:-}" && "$(_session_metadata_field "$CCTRL_SESSION_NAME" mcp_mode 2>/dev/null || true)" == none ]]; then
+        _profile_mcp_write "$CCTRL_SESSION_NAME" "${CCTRL_PEER:-}" >/dev/null \
+            || echo -e "${YELLOW}WARN: could not refresh the MCP config file for restart; continuing with the existing file.${RESET}" >&2
+    fi
+
     # Resolve the agent to stop BEFORE writing the marker, from this
     # process's own ancestry -- never from tmux's "current" pane. An
     # untargeted `tmux display-message` outside a pane (TMUX unset, e.g.
@@ -16011,6 +16181,7 @@ cmd_help() {
     echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
     echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
+    echo "    --mcp inherit|none        MCP servers for a terminal-owned worker (default inherit; none keeps only cctrl's own; env CCTRL_MCP_MODE)"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
     echo "    --role orchestrator|worker  Session role (default worker); needs -d"
@@ -17158,7 +17329,7 @@ _remote_exec() {
                     ((i+=2))
                     continue
                     ;;
-                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--role|--orch-kind|--succeeds)
+                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--role|--orch-kind|--succeeds|--mcp)
                     ((i+=2))
                     continue
                     ;;
@@ -17199,7 +17370,7 @@ _remote_exec() {
             case "$rp_a" in
                 --) break ;;
                 --role|--orch-kind|--succeeds) rp_needs=true; rp_role_typed=true; rp_i=$((rp_i + 2)); continue ;;
-                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m)
+                --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|--mcp)
                     rp_i=$((rp_i + 2)); continue ;;
                 @*) rp_needs=true ;;
             esac
@@ -18343,12 +18514,16 @@ _shortcut_jump() {
     local full_bypass=false
     local access_explicit=false
     local permission_mode=""
+    local mcp_flag=""
     local passthrough=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --agent)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}"; return 1; }
                 agent="$2"; shift 2 ;;
+            --mcp)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--mcp needs a value${RESET}"; return 64; }
+                mcp_flag="$2"; shift 2 ;;
             --profile)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
                 cli_profile="$2"; shift 2 ;;
@@ -18405,6 +18580,7 @@ _shortcut_jump() {
                 passthrough+=("$1"); shift ;;
         esac
     done
+    LAUNCH_MCP_MODE="$(_mcp_mode_resolve "$mcp_flag")" || return $?
     local resolved rc=0
     resolved="$(_resolve_profile "$cli_profile" "$shortcut_profile")" || rc=$?
     (( rc == 0 )) || return "$rc"

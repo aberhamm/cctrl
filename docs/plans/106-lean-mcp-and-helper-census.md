@@ -152,11 +152,22 @@ running app threads. Also: one line in `skills/cctrl-fleet-manager` (add
 **P1. Census. [x] DONE 2026-10-08** (both full suites EXIT=0 under bash 3.2.57 and 5.3.20; Opus review changes-requested then REQUIRED applied: fixture now exercises the sets estimate; see .mstack/handoffs/2026-10-08-plan106-p1-opus-review.md). `lib/helper_census.py`, `cctrl helpers`, `task ls` footer,
 README section (census part). No launch-path change.
 
-**P2. `--mcp none` for terminal-owned Claude and Codex.** Flag, env, record
+**P2. `--mcp none` for terminal-owned Claude and Codex. [x] IMPLEMENTED 2026-10-09** (commit and install status: see the P2 notes below; the manual real-launch smoke is the orchestrator's). Flag, env, record
 field, launch line, `--app-owned` rejection, `launch-to-app` notice. Before
 shipping: one manual check per runtime on the Studio (launch a throwaway
 lean session, compare its `cctrl helpers` row with an inherit session,
 close it).
+
+P2 as built (deviations and choices, 2026-10-09):
+- `--mcp minimal` is rejected with exit 64 ("not available yet"); the plan was silent for P2. `--mcp inherit|none` and `CCTRL_MCP_MODE` work; precedence is flag > env > inherit, with the P3 profile key's seam in `_mcp_mode_resolve`.
+- The mode crosses the tmux hop as `CCTRL_LAUNCH_MCP_MODE=<mode>` in the pane child's env (added only when the mode is not `inherit`; the pane child ignores `CCTRL_MCP_MODE`, which a long-lived tmux server could hold stale), never in the agent's argv. `_launch_exec_agent` captures it into `LAUNCH_MCP_MODE` and unsets both env vars before `exec`, so neither the agent nor a nested launch inherits it.
+- `mcp_mode` is written to the record only when not `inherit` (`_session_update_metadata_field`; `mcp_mode` added to the provisional-receipt whitelist). `session ls --json` shows `mcp_mode` (`inherit` for a managed session without the field, `null` for an unmanaged one). `cmd_restart` reads the record, not the env.
+- Claude file: `{"mcpServers":{}}` without a peer, exactly `cctrl-peer` with one; `CCTRL_PROFILE_MCP_FILE` names it for the wrapper; a failed write exits 70 and never falls back to `inherit`. Under `none` the inline peer JSON is replaced by the file; under `inherit` the inline JSON path is untouched.
+- Codex: a sub-table header such as `[mcp_servers.foo.env]` names server `foo`; `cctrl_runtime` is never listed; headers with other characters are counted and printed as "not controllable: N" (plugin servers cannot be seen from `config.toml`). Lean flags come before passthrough, so a caller's `-c` wins.
+- `--app-owned --mcp <non-inherit>` exits 64 with the documented message; `launch-to-app --mcp ...` prints one stderr line (human mode) that the app-server owns MCP after release.
+- Not done (follow-ups): `session snapshot`/`restore` do not carry the mode, so a restored lean worker is `inherit`.
+- P1 follow-up shipped here: `lib/helper_census.py` `exe_name` no longer shows a credential-shaped or `KEY=value` token, and the docstring no longer says "redaction".
+- Tests: `test_launch_mcp_none_claude` (incl. the golden inherit argv), `test_launch_mcp_none_codex`, `test_launch_mcp_mode_validation`, `test_launch_mcp_detached_record_and_env`, `test_profile_settings_gc_keeps_live_mcp_file`, `test_profile_mcp_restart_and_wrapper_cleanup`, `test_launch_to_app_mcp_notice`, `test_helper_census_comm_name_safe`.
 
 **P3. Profile key and `minimal`.** `agents.<agent>.mcp`, `mcp.minimal.<agent>`
 keep list, Claude definition copy, shortcut field, help/README, completions.
