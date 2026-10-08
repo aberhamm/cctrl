@@ -1,7 +1,9 @@
 ---
 id: 103
 title: Make the bash 3.2 suite leg real (cctrl under the harness bash) and fix the 3.2 breaks it exposes
-status: in-progress
+status: done
+completed: 2026-10-07
+status-note: 2026-10-08 shipped in adfcc8f
 blocked-by: []
 priority: 103
 allows-migrations: false

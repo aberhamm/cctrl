@@ -1,7 +1,8 @@
 ---
 id: 100
 title: Role-aware session naming (orchestrators: fleet-manager and repo-level; workers)
-status: pending
+status: done
+completed: 2026-10-07
 blocked-by: []
 priority: 100
 allows-migrations: false
@@ -11,9 +12,10 @@ created: 2026-10-07
 tui-fixture: n/a  # naming, guard, ask and label tests use the fake agent, fake tmux, fake ssh and the pty helper
 approved-by: Matthew 2026-10-07 (mdec-1007-cctrl-plan100, amended by mdec-1007-role-model-b)
 reviews:
-  - type=eng verdict=changes-requested date=2026-10-07 by=agent  # review of rev2
-  - type=eng verdict=changes-requested date=2026-10-07 by=agent  # review of rev3
   - type=eng verdict=approved date=2026-10-07 by=agent  # rev4 confirmation review: approved for phases 1-2; phase 3 text items A and B applied in this commit
+  - type=eng verdict=approved date=2026-10-07 by=opus-subagent  # independent final review of the plan as shipped (phases 1-4): APPROVED, no REQUIRED items
+  # SUPERSEDED (kept for history; see "Review history" below): type=eng verdict=changes-requested date=2026-10-07 by=agent  # review of rev2
+  # SUPERSEDED (kept for history; see "Review history" below): type=eng verdict=changes-requested date=2026-10-07 by=agent  # review of rev3
 ---
 
 <!-- rev4, 2026-10-07. State: approved by Matthew (decisions M1-M9 + the "ask"
@@ -896,3 +898,15 @@ Text review (Opus, before coding): design sound. REQUIRED text fixes 1-6 applied
 
 
 Diff review (Opus, `.mstack/handoffs/2026-10-07-plan100-phase3-opus-review.md`): REQUIRED 1 fixed (`_start` parser sets `resuming` for `-r` with or without an id, `-c`, `--continue`, `--resume=`; passed as the 22nd argument of `_session_write_metadata`, which then leaves the set out). RECOMMENDED taken: 2 (`★★ ` stripped), 8 (leading quotes in the slug). Skipped: 3 (rename without a transcript adds nothing; a later baseline covers it), 4 (unlocked read-modify-write, fails safe), 5 (baseline store may promote a legacy record with a stable id: noted in the ship step), 6 (`baseline_failed` report), 7 (labels containing backslash sequences are mangled in text output only).
+
+## Review history
+
+Closed 2026-10-08 (plan 104, approval mdec-1008-cctrl-next-work, choice 1a).
+The mstack gate (`_type_cleared`) requires every `type=eng` entry to be
+`approved` and has no supersede rule, so the two early entries were moved out
+of the machine-read list into comments in the frontmatter. Nothing was deleted:
+
+- rev2 eng review: `changes-requested` (2026-10-07). Superseded by the rev4 approval and the final as-shipped review.
+- rev3 eng review: `changes-requested` (2026-10-07). Superseded by the rev4 approval and the final as-shipped review.
+- rev4 confirmation review: `approved` (phases 1-2; phase 3 text items A and B applied).
+- Final independent review of the shipped plan (phases 1-4), Opus, 2026-10-07: `approved`, no REQUIRED items.

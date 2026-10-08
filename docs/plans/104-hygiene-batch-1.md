@@ -1,7 +1,8 @@
 ---
 id: 104
 title: Hygiene batch 1 (delete unreachable functions, plan status drift, TODOS, temp dirs)
-status: in-progress
+status: done
+completed: 2026-10-08
 blocked-by: []
 priority: 104
 allows-migrations: false
@@ -56,8 +57,32 @@ dead functions.
 
 ## Commit B: bookkeeping (docs only)
 
-Filled in after commit A (plan statuses changed/left, plan 100 closure,
-TODOS.md decision, temp-dir cleanup counts).
+Plan statuses (verified per plan against git log, CHANGELOG and code):
+- Changed: 103 -> done (adfcc8f); 104 -> done; 100 -> done (below).
+- 079: SHIPPED (9f92064, 2026-09-28) but left `pending` with a status-note: the
+  gate has no `reviews:` record (only a free-text `eng-review:` line); writing
+  an `approved` entry would restate someone else's review.
+- Left as is, genuinely open: 028, 029 (blocked on 028), 034-038, 041-049, 050
+  (blocked, partial), 039/040 (partial). Left as is, accurate: 033, 054, 055
+  (`skipped`, documented reasons: 054 shipped in 53994fb, 055 folded into 100),
+  075 (`split` into 084-089).
+
+Plan 100: the gate (`_type_cleared`) fails when ANY `type=eng` entry is not
+`approved`. The rev2 and rev3 `changes-requested` lines were moved to
+`# SUPERSEDED` comments inside the `reviews:` block (the parser stops at the
+first non-`- ` line, so they sit after the active entries), the final
+as-shipped Opus approval was recorded, and a "Review history" section in the
+body names both old verdicts as superseded. Nothing deleted; `assert-completable`
+passes; gate, hook and mstack untouched.
+
+TODOS.md: removed the done `_active_session_count` entry (now a 3-line
+tmux/awk count), fixed the stale "119 tests", added one entry pointing at the
+audit file for the open items.
+
+Temp dirs: only 1 candidate matched the guards (older than 24 h, not in
+lsof/ps, no live socket): `/tmp/cctrl-test-tmux.02M0Qg`; deleted. The other 33
+`/tmp/cctrl-*` entries are under 24 h old or are not matching patterns
+(benchmark, tmux-before snapshots), so were left. Skipped: 0.
 
 ## Out of scope / follow-ups
 

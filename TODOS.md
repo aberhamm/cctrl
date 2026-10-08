@@ -1,40 +1,5 @@
 # TODOS
 
-## `_active_session_count` needs a cheap path — it runs the full row loop to get a number
-
-**What:** Give `_active_session_count` (cctrl:1401) a lightweight implementation that
-counts managed tmux sessions without running `_session_list`'s full per-row enumeration.
-
-**Why:** It is on the launch hot path — `_launch_resource_guardrail` calls it on every
-`cctrl start` (cctrl:1440), and `_res_health_line` calls it for every `cctrl fleet`
-(cctrl:1412, 7950). To produce a single integer it currently runs `_session_list --json`,
-whose row loop spawns ~18 subprocesses per session: six `_session_metadata_field` jq
-calls, several tmux round-trips, `_session_id`, `_session_transcript_path`,
-`_session_last_active_ms`, and `_session_rich_state` (which itself costs a tmux display,
-a capture-pane, and a bounded transcript tail read). Measured on ms-128g-bln 2026-08-05:
-1.06s for 10 sessions (~106ms/session, three runs 1.07/1.05/1.06). At the 20-30 sessions
-this fleet routinely holds that is 2-3.2s of work on every single launch, purely to
-compute a count that needs two fields.
-
-Plan 053 makes it hotter still: restore calls it before every wave, so a 20-session
-restore in waves of 2 pays it ten times.
-
-**Pros:** Takes the guardrail from seconds to milliseconds on every launch; removes the
-pane-capture and transcript-read side cost from a path that only wants a number.
-**Cons:** A second enumeration path to keep consistent with `_session_list`'s `managed`
-determination — which is a three-way OR at cctrl:6058, not a single field, so the cheap
-path must replicate that logic or it will disagree with the ✦ column.
-
-**Context:** Surfaced by the eng review of plans 051-053 (2026-08-05, Performance section).
-Plan 051 does two things that reduce but do not remove the cost: it collapses the six
-`_session_metadata_field` calls into one jq read, and it corrects the function to
-`select(.managed)`. Neither avoids the rich-state and transcript work, which is the
-expensive part. Start from `_session_list`'s name enumeration (cctrl:6021-6022) and the
-managed determination at cctrl:6058-6065; everything between is skippable for a count.
-
-**Depends on / blocked by:** plan 051 (which fixes the filter and the jq collapse — do
-this after, so the cheap path is written against the corrected semantics).
-
 ## 053 full automation — picker Enter + readiness-released waves (deferred, gated)
 
 **What:** Revive the automation cut from plan 053 in its 2026-08-05 re-scope: the
@@ -180,7 +145,7 @@ at PLAN time for TUI-dependent plans) is proposed separately in the mstack repo.
 
 **What:** Let `tests/run-tests.sh` take test-function names as arguments
 (`bash tests/run-tests.sh test_peer_reply_core …`) instead of always running
-all 119; and make `fail()` record-and-continue (or at least print which tests
+all 440+; and make `fail()` record-and-continue (or at least print which tests
 never ran) instead of exiting the whole suite on first failure.
 
 **Why:** The runner is a bare list of 119 sequential calls with fail-fast
@@ -251,3 +216,14 @@ stale after a macOS update. Check `log show --predicate 'subsystem == "com.apple
 **Last log entry:** clean SIGTERM shutdown, CouchDB target at `http://100.67.240.85:5984/obsidian`
 
 **Depends on / blocked by:** nothing; fix requires Matthew in a GUI terminal on ms-128g-bln.
+
+## Hygiene audit follow-ups (2026-10-07)
+
+**What:** Still-open items from the code-hygiene audit at
+`~/.local/state/fleet/fm-cctrl-artifacts/hygiene/2026-10-07-cctrl-hygiene-audit.md`
+(outside the repo): test-harness DX (per-test filter, auto-registration, timing),
+shared arg/err helpers and 14 unguarded `$2`, `_session_write_metadata` named fields,
+lock + same-dir temp for `peers.json`/`shortcuts.json` writers, completions/help/README
+drift check, embedded Python to `lib/*.py`, `self-install.sh` running the suite with PATH
+bash only, ~29 PATH-shim bypass call sites. Batch 1 (dead code, housekeeping) shipped as
+plan 104.

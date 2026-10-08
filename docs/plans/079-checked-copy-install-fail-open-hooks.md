@@ -2,6 +2,7 @@
 id: 079
 title: checked-copy install for ~/.local/bin/cctrl + fail-open hook entrypoint
 status: pending
+status-note: 2026-10-08 SHIPPED in 9f92064 (2026-09-28); left pending because the gate has no eng review record (frontmatter eng-review is the old free-text form); close with a reviews entry when someone re-reviews
 blocked-by: []
 priority: 79
 allows-migrations: false
