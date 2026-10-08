@@ -9,9 +9,21 @@ needs-review: eng
 review-required: eng
 created: 2026-10-08
 tui-fixture: n/a  # test harness + install gate only
+approved-by: Matthew ("Okay, just go with what you think the best decisions are and keep going.", 2026-10-08 15:49Z via the cctrl orchestrator; approvals mdec-1008-cctrl-next-work (item 3a, test-harness plan) + mdec-1008-cctrl-orch-successor-2 (carry-over to TMUX--ms--orch-cctrl--2))
 reviews:
   - type=eng verdict=approved date=2026-10-08 by=opus-subagent
 ---
+
+## Progress
+
+- [x] **P0 baseline** (2026-10-08, clean HEAD cab3eb4, run from a `git archive` copy plus the gitignored `profiles/` and `.active-profile`, see note). Both legs EXIT=0, 367 `ok:` lines each (identical sorted name lists). Wall time: `/bin/bash` 3.2 **478 s**, Homebrew bash 5.3 **502 s** (so the "about 40 minutes" in plan 090 is wrong: a full leg is about 8 minutes, install gate with two legs about 16). 445 definitions, 441 distinct top-level call names. Artifacts: `~/.local/state/fleet/fm-cctrl-artifacts/plan-105-106/p0-baseline/`.
+  - Finding: `test_session_doctor_realign_carries_profile_model_peer` fails (`expected output to contain: --profile work`) when the tree has no `profiles/work.json`, so the suite has a hidden dependency on the gitignored `profiles/` dir (the installer's scratch copy deletes `profiles/` at `install/self-install.sh:71`; check how the gate still passes before P5). Follow-up in TODOS.
+- [x] **P1 PATH helper.** `_test_path [--sbin] <dir>...` added; all 28 shim-less + 10 shim-first sites converted (38 lines, mechanical). Allowlisted: the 2 `CCTRL_HOOK_GUI_PATH="$doctor_bin:..."` sites (cctrl uses that variable only for `command -v cctrl`; matched by exact assignment). No site needed to stay bare for a bash 5 failure: the six converted tests passed under bash 5 unchanged, and no product bug was found. Lint `test_no_shimless_test_path` (does not match itself: pattern and helper are assembled from parts) has a built-in self-test (planted site must be flagged, allowlisted form must not) and was also proven with a planted bare site in a /tmp copy via `CCTRL_LINT_ROOT`. `test_bash_leg_is_honest` checks `_test_path` output starts with the shim.
+- [x] **P2 flake.** `FAKE_APP_SCHEMA_DELAY` added to the app-owned fake codex. **Confirmed**: with `FAKE_APP_SCHEMA_DELAY=0.1` the old test fails with `ambiguous creation result is wrong ... "reason": "required App Server capability is not proven: thread/start"` (the recorded text). Option A applied: the two timeout cases use `CCTRL_CODEX_REQUEST_TIMEOUT=.5` with the fake sleeping 2 s (adds about 2 s). After the change the test passes even with `FAKE_APP_SCHEMA_DELAY=0.1`. Loop of the `app-owned-launch` group, strictly sequential: **50/50 pass under `/bin/bash` 3.2 and 50/50 under bash 5.3**.
+  - Follow-up (option B, product, not done): the schema probe should have its own deadline instead of sharing `CCTRL_CODEX_REQUEST_TIMEOUT` (`lib/codex_app_server.py`, `capability_report` -> `_schema_evidence`).
+  - Follow-up (test): the fake sleeps before reading its next message, so a retry sent during the sleep is never traced; `continue` without the sleep would make the "not retried" check sound (Opus review RECOMMENDED).
+- Gate (after the last edit): full suite EXIT=0, 367 `ok:` lines, 0 FAIL on both legs; wall `/bin/bash` 561 s, bash 5.3 583 s; sorted `ok:` names identical to the P0 baseline on both legs (the new lint test prints no `ok:` line); tmux session list unchanged.
+- [ ] P3, P4, P5, P6 pending.
 
 ## Plain-English Summary
 

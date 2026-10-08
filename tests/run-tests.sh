@@ -70,6 +70,20 @@ mkdir -p "$TMPDIR/bash-shim"
 ln -s "$BASH" "$TMPDIR/bash-shim/bash"
 export PATH="$TMPDIR/bash-shim:$PATH"
 echo "bash: harness=$BASH_VERSION ($BASH) cctrl-under-test=$(printf '%s\n' 'echo "$BASH_VERSION"' | env bash -s) (via env bash shim)"
+# `_test_path [--sbin] <dir>...` prints a PATH for fixture runs: the bash shim
+# first (so cctrl runs under THIS harness bash), then the given dirs, then the
+# system dirs. Every `PATH=` that builds a restricted PATH must use it
+# (test_no_shimless_test_path). The system dirs are assembled from parts so this
+# file holds no literal of the bare form the lint searches for.
+_test_path() {
+    local sys=/usr/bin out dir sbin=0
+    if [[ "${1:-}" == "--sbin" ]]; then sbin=1; shift; fi
+    out="$TMPDIR/bash-shim"
+    for dir in "$@"; do out="$out:$dir"; done
+    out="$out:$sys:/bin"
+    if [[ "$sbin" -eq 1 ]]; then out="$out:/usr/sbin:/sbin"; fi
+    printf '%s' "$out"
+}
 # Name the aborting test on any non-zero exit. A bare statement such as
 # `cmd >/dev/null 2>&1` that fails under `set -e` otherwise kills the suite
 # with no FAIL line at all -- that hid a real bash-5 regression for two
@@ -1765,6 +1779,35 @@ test_bash_leg_is_honest() {
     got="$(cctrl_source_eval 'echo "$BASH_VERSION"')"
     [[ "$got" == "$want" ]] || fail "cctrl_source_eval ran bash $got, harness is $want"
     [[ "$(command -v bash)" == "$TMPDIR/bash-shim/bash" ]] || fail "PATH shim is not first for bash"
+    [[ "$(_test_path)" == "$TMPDIR/bash-shim:"* ]] || fail "_test_path does not start with the bash shim"
+    [[ "$(_test_path --sbin /x /y)" == "$TMPDIR/bash-shim:/x:/y:/usr/bin"":/bin:/usr/sbin:/sbin" ]] \
+        || fail "_test_path --sbin output is wrong: $(_test_path --sbin /x /y)"
+}
+
+_shimless_path_hits() {
+    # args: root. Prints offending lines; CCTRL_HOOK_GUI_PATH (2 sites in the
+    # codex hook test) is allowlisted by its exact assignment: it only simulates
+    # a GUI PATH for `hooks doctor`, which uses it for `command -v cctrl`.
+    local pat=':/usr/bin'"$(printf ':/bin')"
+    [[ -d "$1/tests" ]] || { echo "no tests dir under $1"; return 0; }
+    grep -rnF --include='*.sh' --include='*.py' --exclude-dir=__pycache__ -e "$pat" "$1/tests" \
+        | grep -vF 'CCTRL_HOOK_GUI_PATH="$doctor_bin:' || true
+}
+
+test_no_shimless_test_path() {
+    # A fixture PATH that ends in the system dirs without the bash shim makes
+    # `#!/usr/bin/env bash` resolve to /bin/bash 3.2 on the bash 5 leg. Build
+    # PATH with _test_path. The pattern is assembled so this test does not match
+    # itself.
+    local hits root="${CCTRL_LINT_ROOT:-$ROOT}" plant="$TMPDIR/lint-plant"
+    hits="$(_shimless_path_hits "$root")"
+    [[ -z "$hits" ]] || fail "fixture PATH without the bash shim (use _test_path): $(printf '%s' "$hits" | cut -c1-160 | head -n 5)"
+    # Self-test: a planted bare PATH site must be reported.
+    mkdir -p "$plant/tests"
+    printf 'x() { PATH="$b%s" true; }\n' ':/usr/bin'":/bin" > "$plant/tests/planted.sh"
+    [[ -n "$(_shimless_path_hits "$plant")" ]] || fail "shimless-PATH lint did not flag a planted site"
+    printf '        CCTRL_HOOK_GUI_PATH="$doctor_bin%s" true\n' ':/usr/bin'":/bin" > "$plant/tests/planted.sh"
+    [[ -z "$(_shimless_path_hits "$plant")" ]] || fail "shimless-PATH lint flagged the allowlisted CCTRL_HOOK_GUI_PATH form"
 }
 
 test_profile_settings_gc_portable_membership() {
@@ -3320,7 +3363,7 @@ SH
     : > "$log"
 
     # shellcheck disable=SC2016 # positional parameter belongs to the sourced shell
-    PATH="$bin:/usr/bin:/bin" SSH_LOG="$log" cctrl_source_eval \
+    PATH="$(_test_path "$bin")" SSH_LOG="$log" cctrl_source_eval \
         'HOSTS_FILE="$1"; _remote_exec remote start -d' "$hosts" >/dev/null 2>&1 || true
 
     local ssh_log; ssh_log="$(cat "$log")"
@@ -6495,12 +6538,12 @@ test_peer_tmux_missing_still_resolves_manual() {
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register offline --agent codex --capability polling)"
     assert_contains "$out" "Registered peer"
 
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
+    out="$(PATH="$(_test_path --sbin)" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ls --json)"
     assert_contains "$out" '"derived_skipped": true'
     assert_contains "$out" '"derived_skip_reason": "tmux unavailable"'
     assert_contains "$out" '"name": "offline"'
 
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve offline --json)"
+    out="$(PATH="$(_test_path --sbin)" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer resolve offline --json)"
     assert_contains "$out" '"name": "offline"'
     assert_contains "$out" '"polling"'
 }
@@ -6997,7 +7040,7 @@ test_peer_overview() {
     # (3) derived_skipped passthrough: with tmux unavailable the manual identity and
     # mailbox counts still resolve, no derived peers appear, and the skip reason is
     # surfaced instead of failing the whole call.
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin:/usr/sbin:/sbin" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json)"
+    out="$(PATH="$(_test_path --sbin)" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer overview --as comet --json)"
     printf '%s\n' "$out" | jq -e '
         .derived_skipped == true
         and .derived_skip_reason == "tmux unavailable"
@@ -10092,7 +10135,7 @@ JSON
     [[ ! -x /usr/bin/tmux && ! -x /bin/tmux ]] || fail "fixture invalid: tmux is on the reduced PATH"
 
     local out rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_HOST_ID_FILE="$ev/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$ev/catalogue.json" \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_HOST_ID_FILE="$ev/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$ev/catalogue.json" \
         CCTRL_SNAPSHOT_PROCESS_FILE="$ev/process.json" \
         CCTRL_CLAUDE_SESSIONS_DIR="$TMPDIR/ta-nope" CCTRL_CLAUDE_PROJECTS_DIR="$TMPDIR/ta-nope" \
         CCTRL_SESSION_METADATA_DIR="$TMPDIR/ta-nope" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=100 \
@@ -10494,7 +10537,7 @@ test_restore_cap_fails_closed() {
         || fail "fixture invalid: tmux is on the reduced PATH"
     command -v jq >/dev/null && ln -sf "$(command -v jq)" "$dir/bin/jq"
     local out rc=0
-    out="$(SR_PATH="$dir/bin:/usr/bin:/bin:/usr/sbin:/sbin" SR_CATALOGUE="" _restore_run "$dir" --yes 2>&1)" || rc=$?
+    out="$(SR_PATH="$(_test_path --sbin "$dir/bin")" SR_CATALOGUE="" _restore_run "$dir" --yes 2>&1)" || rc=$?
     [[ "$rc" -eq 69 ]] || fail "expected exit 69 when the live inventory is unavailable, got $rc: $out"
     assert_contains "$out" "unavailable"
     [[ ! -s "$dir/launch.log" ]] || fail "restore spawned without a live inventory: $(cat "$dir/launch.log")"
@@ -11472,7 +11515,7 @@ JSON
 
     local before after out legacy human
     before="$(live_data_manifest)"
-    out="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
+    out="$(PATH="$(_test_path "$bin")" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
         CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet --json-v2)" || fail "fleet v2 failed"
     after="$(live_data_manifest)"
@@ -11501,12 +11544,12 @@ JSON
       (all(.rows[]; has("name") and has("host") and has("managed") and has("agent") and has("claude") and has("model") and has("dir") and has("state") and has("attached") and has("remote_control") and has("bridge") and has("session_id") and has("transcript") and has("last_active") and has("purpose") and has("created_at") and has("peer") and has("display_label")))
     ' <<< "$out" >/dev/null || fail "fleet v2 ownership, compatibility, or failure envelope is wrong: $out"
 
-    legacy="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
+    legacy="$(PATH="$(_test_path "$bin")" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
         CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet --json)"
     jq -e 'type=="array" and any(.[]; .host=="new") and any(.[]; .host=="old")' <<< "$legacy" >/dev/null \
         || fail "fleet --json no longer returns the compatibility array"
-    human="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
+    human="$(PATH="$(_test_path "$bin")" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex" \
         CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" "$root/cctrl" fleet)"
     assert_contains "$human" "OWNER"
@@ -11523,15 +11566,15 @@ JSON
     # changes, and legacy registrations migrate only on explicit refresh.
     local host_data="$TMPDIR/fleet-v2-host-data" first_id renamed_id
     rm -rf "$host_data"; mkdir -p "$host_data"
-    PATH="$bin:/usr/bin:/bin" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" "$root/cctrl" host add alpha new.invalid >/dev/null
+    PATH="$(_test_path "$bin")" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" "$root/cctrl" host add alpha new.invalid >/dev/null
     first_id="$(jq -r '.alpha.federation_host_id' "$host_data/hosts.json")"
     [[ "$first_id" =~ ^[0-9a-f]{32}$ ]] || fail "host add did not create a federation id"
     [[ "$(stat -f %Lp "$host_data/hosts.json")" == 600 ]] || fail "host registry is not private"
-    PATH="$bin:/usr/bin:/bin" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" "$root/cctrl" host rename alpha beta >/dev/null
+    PATH="$(_test_path "$bin")" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" "$root/cctrl" host rename alpha beta >/dev/null
     renamed_id="$(jq -r '.beta.federation_host_id' "$host_data/hosts.json")"
     [[ "$first_id" == "$renamed_id" ]] || fail "alias rename changed federation identity"
     printf '{"legacy":{"hostname":"new.invalid","user":""}}\n' > "$host_data/hosts.json"
-    PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" \
+    PATH="$(_test_path "$bin")" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" \
         "$root/cctrl" host refresh-identity legacy >/dev/null
     jq -e '.legacy.federation_host_id | test("^[0-9a-f]{32}$")' "$host_data/hosts.json" >/dev/null \
         || fail "refresh-identity did not initialize legacy registration"
@@ -11541,7 +11584,7 @@ JSON
     jq '.legacy.remote_host_id="different-remote"' "$host_data/hosts.json" > "$host_data/hosts.tmp"
     mv "$host_data/hosts.tmp" "$host_data/hosts.json"
     identity_before="$(shasum -a 256 "$host_data/hosts.json" | awk '{print $1}')"
-    PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" \
+    PATH="$(_test_path "$bin")" FLEET_FIXTURES="$fix" CCTRL_DATA_DIR="$host_data" CCTRL_HOSTS_FILE="$host_data/hosts.json" \
         "$root/cctrl" host refresh-identity legacy >/dev/null 2>&1 || identity_rc=$?
     (( identity_rc != 0 )) || fail "refresh-identity replaced an immutable remote identity"
     identity_after="$(shasum -a 256 "$host_data/hosts.json" | awk '{print $1}')"
@@ -11551,7 +11594,7 @@ JSON
     local timeout_hosts="$TMPDIR/fleet-timeout-hosts.json" timeout_results="$TMPDIR/fleet-timeout-results" timeout_path
     printf '{"slow":{"hostname":"slow.invalid","user":"","federation_host_id":"fed-slow","remote_host_id":null}}\n' > "$timeout_hosts"
     rm -rf "$timeout_results"
-    timeout_path="$(PATH="$bin:/usr/bin:/bin" FLEET_FIXTURES="$fix" python3 "$ROOT/lib/cctrl_fleet_collect.py" collect \
+    timeout_path="$(PATH="$(_test_path "$bin")" FLEET_FIXTURES="$fix" python3 "$ROOT/lib/cctrl_fleet_collect.py" collect \
         --hosts-file "$timeout_hosts" --output-dir "$timeout_results" --workers 4 --timeout .1)" || fail "timeout collector crashed"
     jq -e '.status=="timeout" and .error.code=="timeout"' "$timeout_path" >/dev/null \
         || fail "timed-out worker did not emit a structured timeout envelope"
@@ -11562,7 +11605,7 @@ JSON
     rm -rf "$empty_root" "$empty_data"; mkdir -p "$empty_root/lib" "$empty_data"
     cp "$ROOT/cctrl" "$empty_root/cctrl"; chmod +x "$empty_root/cctrl"
     cp "$ROOT/lib/cctrl_fleet_collect.py" "$empty_root/lib/cctrl_fleet_collect.py"
-    PATH="$bin:/usr/bin:/bin" CCTRL_DATA_DIR="$empty_data" CCTRL_SESSION_METADATA_DIR="$meta" \
+    PATH="$(_test_path "$bin")" CCTRL_DATA_DIR="$empty_data" CCTRL_SESSION_METADATA_DIR="$meta" \
         CCTRL_HOST_ID_FILE="$empty_data/host-id" CODEX_HOME="$codex" CCTRL_CODEX_STATE_DB="$codex/missing.sqlite" \
         "$empty_root/cctrl" fleet --json-v2 >/dev/null
     [[ ! -e "$empty_root/data/hosts.json" ]] || fail "fleet listing initialized host registry identity state"
@@ -14557,6 +14600,7 @@ if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
             ;;
         bash-leg)
             test_bash_leg_is_honest
+            test_no_shimless_test_path
             test_profile_settings_gc_portable_membership
             echo "ok"
             exit 0
@@ -14952,6 +14996,7 @@ test_detached_launch_writes_profile_identity_fields
 test_profile_settings_file_written_scoped_and_not_in_argv
 test_profile_settings_none_profile_no_file
 test_bash_leg_is_honest
+test_no_shimless_test_path
 test_profile_settings_gc_portable_membership
 test_profile_settings_gc_removes_dead_keeps_live
 test_profile_settings_gc_skips_sweep_when_list_sessions_fails
@@ -16262,7 +16307,7 @@ PY
 
     : > "$trace"
     local out rc=0
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_PLATFORM_CANDIDATES="$fake" \
+    out="$(PATH="$(_test_path)" CCTRL_CODEX_PLATFORM_CANDIDATES="$fake" \
         FAKE_CODEX_TRACE="$trace" FAKE_CODEX_PID="$pid_file" \
         "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "capability discovery failed: $out"
@@ -16278,7 +16323,7 @@ PY
         || fail "capability discovery invoked a non-read-only RPC: $(cat "$trace")"
 
     : > "$trace"
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_SERVER_VERSION=9.9.9 \
+    out="$(PATH="$(_test_path)" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_SERVER_VERSION=9.9.9 \
         FAKE_CODEX_TRACE="$trace" "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "version mismatch diagnostics should complete"
     jq -e '[.methods[].status] | all(. == "unknown")' <<< "$out" >/dev/null \
@@ -16287,21 +16332,21 @@ PY
         || fail "version mismatch evidence not recorded"
 
     rc=0
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_APP_SERVER_SOCKET=/tmp/fake-codex.sock \
+    out="$(PATH="$(_test_path)" CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_APP_SERVER_SOCKET=/tmp/fake-codex.sock \
         FAKE_CODEX_DAEMON_FAIL=1 "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "explicit socket discovery incorrectly required the default daemon: $out"
     [[ "$(jq -r '.transport.endpoint' <<< "$out")" == "/tmp/fake-codex.sock" ]] \
         || fail "explicit App Server socket was not reported"
 
     rc=0
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_MODE=schema-malformed \
+    out="$(PATH="$(_test_path)" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_MODE=schema-malformed \
         "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "malformed schema diagnostics should complete"
     jq -e '[.methods[].status] | all(. == "unknown")' <<< "$out" >/dev/null \
         || fail "malformed schema must leave method support unknown"
 
     rc=0
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_CONNECT_TIMEOUT=invalid \
+    out="$(PATH="$(_test_path)" CCTRL_CODEX_BIN="$fake" CCTRL_CODEX_CONNECT_TIMEOUT=invalid \
         "$ROOT/cctrl" codex capabilities --json)" || rc=$?
     [[ "$rc" -eq 64 ]] || fail "invalid timeout environment should exit 64, got $rc"
     jq -e '.errors[0].code == 64 and .errors[0].phase == "usage"' <<< "$out" >/dev/null \
@@ -16442,12 +16487,12 @@ assert caught is not None and caught.exit_code == module.EXIT_REQUEST_TIMEOUT
 assert_reaped()
 PY
 
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" "$ROOT/cctrl" codex capabilities --help)" \
+    out="$(PATH="$(_test_path)" "$ROOT/cctrl" codex capabilities --help)" \
         || fail "Codex capabilities help command failed"
     assert_contains "$out" "capabilities"
 
     rc=0
-    out="$(PATH="$TMPDIR/bash-shim:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_THREAD_LIST=1 \
+    out="$(PATH="$(_test_path)" CCTRL_CODEX_BIN="$fake" FAKE_CODEX_THREAD_LIST=1 \
         python3 "$ROOT/lib/codex_app_server.py" threads --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "App Server thread snapshot failed: $out"
     jq -e '.schema_version == 1 and .status == "available" and .complete == true and
@@ -16710,6 +16755,7 @@ tasks=counter.with_name("tasks.json")
 if args == ["--version"]: print("codex-cli 1.2.3"); raise SystemExit
 if args[:3] == ["app-server","daemon","version"]: print('{"cliVersion":"1.2.3","appServerVersion":"1.2.3"}'); raise SystemExit
 if args[:2] == ["app-server","generate-json-schema"]:
+    time.sleep(float(os.environ.get("FAKE_APP_SCHEMA_DELAY","0")))
     out=Path(args[args.index("--out")+1]); out.mkdir(parents=True,exist_ok=True)
     methods=["thread/start","thread/read","thread/list","turn/start"]
     (out/"ClientRequest.json").write_text(json.dumps({"title":"ClientRequest","oneOf":[{"properties":{"method":{"enum":[m]}}} for m in methods]}))
@@ -16724,7 +16770,7 @@ for line in sys.stdin:
     elif method == "initialized": pass
     elif method == "thread/start":
         n=int(counter.read_text())+1 if counter.exists() else 1; counter.write_text(str(n))
-        if mode == "thread-timeout": time.sleep(1); continue
+        if mode == "thread-timeout": time.sleep(2); continue
         task_id=f"thread-{n}"; known=json.loads(tasks.read_text()) if tasks.exists() else {}
         known[task_id]=m.get("params",{}).get("cwd"); tasks.write_text(json.dumps(known))
         send({"id":m["id"],"result":{"thread":{"id":task_id,"cwd":known[task_id]}}})
@@ -16740,7 +16786,7 @@ for line in sys.stdin:
               "ownership_evidence":[],"lifecycle_observations":[],"registry_event_ids":[],"registry_source_high_water":{},
               "ownership_observations":[],"cwd":json.loads(tasks.read_text())[task_id],"agent":"codex","conversation_id":task_id}
             Path(os.environ["CCTRL_SESSION_METADATA_DIR"],f"task-{key}.json").write_text(json.dumps(record))
-        if mode == "turn-timeout": time.sleep(1); continue
+        if mode == "turn-timeout": time.sleep(2); continue
         send({"id":m["id"],"result":{"turn":{"id":"turn-1"}}})
     elif method == "thread/read":
         task_id=m["params"]["threadId"]; known=json.loads(tasks.read_text()) if tasks.exists() else {}
@@ -16756,7 +16802,7 @@ SH
     : > "$trace"; : > "$tmux_log"
     local before after out rc=0 record
     before="$(live_data_manifest)"
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" start --agent codex --app-owned "$root" --model gpt-6-astra --reasoning-effort high \
         --sandbox workspace-write --ask-for-approval on-request -m "do it" --json)" || rc=$?
@@ -16777,14 +16823,14 @@ SH
     jq -e '.provider_task_id=="thread-1" and .origin=="cctrl" and .registered_by_cctrl==true and
       .launched_by_cctrl==true and .execution_runtime=="app-server" and .control_owner=="app" and
       .restore_strategy=="provider-managed" and .tmux_session==null' "$record" >/dev/null || fail "app-owned record is wrong"
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" start --agent codex --app-owned "$root" --json)" || fail "second same-cwd app launch failed"
     [[ "$(jq -r '.provider_task_id' <<< "$out")" == thread-2 ]] || fail "same-cwd launch was deduplicated by cwd"
     [[ "$(find "$meta" -name 'task-*.json' | wc -l | tr -d ' ')" == 2 ]] || fail "same-cwd provider identities did not remain distinct"
 
     : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=hook-before-register \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=hook-before-register \
         FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" start --agent codex --app-owned "$root" -m hi --json)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "hook-race launch failed: $out"
@@ -16796,7 +16842,7 @@ SH
     mkdir -p "$profiles"
     printf '%s\n' '{"agents":{"codex":{"model":"profile-model","reasoningEffort":"low","args":["--sandbox","workspace-write","--ask-for-approval","untrusted"]}}}' > "$profiles/app.json"
     # shellcheck disable=SC2016
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" cctrl_source_eval \
         'CCTRL_PROFILES_DIR="$1"; shift; _launch_app_owned_codex "$@"' "$profiles" --app-owned "$root" --profile app \
         --model cli-model --reasoning-effort high --sandbox read-only --json)" || fail "profile-normalized app launch failed"
@@ -16806,7 +16852,7 @@ SH
       || fail "CLI-over-profile precedence was not preserved"
 
     : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=thread-timeout CCTRL_CODEX_REQUEST_TIMEOUT=.05 \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=thread-timeout CCTRL_CODEX_REQUEST_TIMEOUT=.5 \
         FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" start --agent codex --app-owned "$root" --json)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "ambiguous thread/start unexpectedly succeeded"
@@ -16817,7 +16863,7 @@ SH
       || fail "omitted app-owned settings did not retain provider defaults"
 
     : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=turn-timeout CCTRL_CODEX_REQUEST_TIMEOUT=.05 \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_MODE=turn-timeout CCTRL_CODEX_REQUEST_TIMEOUT=.5 \
         FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" CCTRL_DATA_DIR="$data" \
         CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" start --agent codex --app-owned "$root" -m hi --json)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "ambiguous turn unexpectedly succeeded"
@@ -16826,7 +16872,7 @@ SH
     [[ "$(jq -s '[.[]|select(.method=="turn/start")]|length' "$trace")" == 1 ]] || fail "ambiguous turn was retried"
 
     : > "$trace"; rm -f "$counter"; rm -rf "$meta"; mkdir -p "$meta"; rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" FAKE_TMUX_LOG="$tmux_log" \
         CCTRL_TASK_REGISTRY_FAIL_BEFORE_RENAME=1 CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" start --agent codex --app-owned "$root" --json 2>/dev/null)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "registry persistence failure unexpectedly succeeded"
@@ -16834,14 +16880,14 @@ SH
       || fail "partial recovery result is wrong: $out"
     local recovery_cwd="$root/recovery-cwd"
     mkdir -p "$recovery_cwd"
-    out="$(cd "$recovery_cwd" && PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+    out="$(cd "$recovery_cwd" && PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" session recover-app-owned thread-1 --json)" || fail "known-id recovery failed"
     jq -e '.verified==true and .registry_persisted==true' <<< "$out" >/dev/null || fail "recovery output is wrong"
     record="$(find "$meta" -name 'task-*.json' -print -quit)"
     [[ "$(jq -r '.cwd' "$record")" == "$canonical_root" ]] || fail "recovery substituted its shell cwd"
     rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+    out="$(PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" session recover-app-owned native-task --json)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "unrelated native task was relabeled as cctrl-launched"
@@ -16861,18 +16907,18 @@ SH
             permission) bad_args=(--permission-mode bypassPermissions) ;;
             raw-config) bad_args=(-c raw=true) ;;
         esac
-        if PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+        if PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
             CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
             "$ROOT/cctrl" start --agent codex --app-owned "$root" "${bad_args[@]}" >/dev/null 2>&1; then
             fail "incompatible app-owned args were accepted: $bad"
         fi
     done
-    if CCTRL_AGENT=claude PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+    if CCTRL_AGENT=claude PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" start --app-owned "$root" >/dev/null 2>&1; then
         fail "CCTRL_AGENT=claude was ignored by app-owned launch"
     fi
-    if PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
+    if PATH="$(_test_path "$bin")" CCTRL_CODEX_BIN="$fake" FAKE_APP_TRACE="$trace" FAKE_APP_COUNTER="$counter" \
         CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" \
         "$ROOT/cctrl" --agent claude start --app-owned "$root" >/dev/null 2>&1; then
         fail "global --agent claude was ignored by app-owned launch"
@@ -16889,14 +16935,14 @@ SH
     chmod +x "$bin/ssh"
     # Positional parameters expand inside cctrl_source_eval's child shell.
     # shellcheck disable=SC2016
-    PATH="$bin:/usr/bin:/bin" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
+    PATH="$(_test_path "$bin")" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
       'HOSTS_FILE="$1"; _remote_exec remote start --agent codex --app-owned "$2" --json' "$hosts" "$root" >/dev/null
     assert_not_contains "$(cat "$ssh_log")" " -t "
     assert_not_contains "$(cat "$ssh_log")" "--purpose"
     assert_contains "$(cat "$ssh_log")" "CCTRL_HOST_PREFIX=remote"
     assert_contains "$(cat "$ssh_log")" "--app-owned"
     # shellcheck disable=SC2016 # positional parameter belongs to the sourced shell
-    PATH="$bin:/usr/bin:/bin" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
+    PATH="$(_test_path "$bin")" FAKE_SSH_LOG="$ssh_log" cctrl_source_eval \
       'HOSTS_FILE="$1"; _remote_exec remote start --message --app-owned --purpose fixed' "$hosts" >/dev/null
     assert_contains "$(cat "$ssh_log")" "-t tester@example.invalid"
     after="$(live_data_manifest)"
@@ -17007,7 +17053,7 @@ PY
         local -a release_cmd=("$ROOT/cctrl" session release-to-app TMUX--handoff)
         [[ "${HANDOFF_NO_YES:-0}" == 1 ]] || release_cmd+=(--yes)
         release_cmd+=(--wait 0 --json)
-        PATH="$bin:/usr/bin:/bin" FAKE_HANDOFF_TMUX_STATE="$state" FAKE_HANDOFF_PROCESS_STATE="$proc" \
+        PATH="$(_test_path "$bin")" FAKE_HANDOFF_TMUX_STATE="$state" FAKE_HANDOFF_PROCESS_STATE="$proc" \
           CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex_home" \
           CCTRL_CODEX_LOCK_BACKUP_DIR="$backup" CCTRL_CODEX_RECONCILE_APP_SERVER_FILE="${HANDOFF_APP_FILE:-$app}" \
           CCTRL_CODEX_RECONCILE_TMUX_FILE="${HANDOFF_RECONCILE_TMUX_FILE:-$tmux_snapshot}" CCTRL_CODEX_RECONCILE_PROCESS_FILE="${HANDOFF_RECONCILE_PROCESS_FILE:-$proc_snapshot}" \
@@ -17034,7 +17080,7 @@ PY
     jq -e '.[0].status=="already-app-owned" and .[0].ok==true' <<< "$out" >/dev/null || fail "app-owned retry result is wrong: $out"
 
     rc=0
-    out="$(PATH="$bin:/usr/bin:/bin" FAKE_HANDOFF_TMUX_STATE="$state" FAKE_HANDOFF_PROCESS_STATE="$proc" \
+    out="$(PATH="$(_test_path "$bin")" FAKE_HANDOFF_TMUX_STATE="$state" FAKE_HANDOFF_PROCESS_STATE="$proc" \
       CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_HOST_ID_FILE="$data/host-id" CODEX_HOME="$codex_home" \
       "$ROOT/cctrl" session attach TMUX--handoff 2>&1)" || rc=$?
     [[ "$rc" -eq 2 && "$out" == *"app-owned"* && "$out" == *"no longer owns"* ]] || fail "attach did not guard released app-owned task: $out"

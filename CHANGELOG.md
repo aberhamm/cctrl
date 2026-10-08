@@ -11,6 +11,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   aborted launches under macOS `/bin/bash` 3.2. (plan 103)
 
 ### Changed
+- Test harness: `_test_path` helper puts the bash shim first on every fixture
+  PATH (38 sites converted, so those tests really run cctrl under the harness
+  bash); new lint `test_no_shimless_test_path`. Fixed the `test_app_owned_launch`
+  schema-probe timing flake (test timing only). (plan 105 P0-P2)
 - Removed 8 unreachable functions from `cctrl` (240 lines) and added a guard test
   that fails on any unreferenced top-level function. (plan 104)
 - The test suite now runs cctrl under the same bash as the harness (private

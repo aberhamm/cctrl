@@ -228,3 +228,10 @@ drift check, embedded Python to `lib/*.py`, `self-install.sh` running the suite 
 bash only, ~29 PATH-shim bypass call sites. Batch 1 (dead code, housekeeping) shipped as
 plan 104. Test harness items are now plan 105; the MCP helper census / lean MCP mode is plan 106
 (both docs-only, pending implementation).
+
+### Plan 105 P0-P2 follow-ups (2026-10-08)
+
+- Product (flake fix option B): give the Codex schema probe its own deadline instead of sharing `CCTRL_CODEX_REQUEST_TIMEOUT` (`lib/codex_app_server.py`, `capability_report` -> `_schema_evidence`). Test-side fix A shipped in plan 105 P2.
+- Test: in the app-owned fake codex, drop the sleep before `continue` in the `thread-timeout` / `turn-timeout` modes so the "not retried" trace check is sound.
+- Test: `test_session_doctor_realign_carries_profile_model_peer` needs the gitignored `profiles/work.json`; make the fixture self-contained (and check how the install gate passes with `profiles/` removed).
+- Test lint: `test_no_shimless_test_path` only catches the literal bare system-PATH tail; a stricter rule (any `PATH="` must start with `$(_test_path` or contain `$PATH`) would also catch PATH without a leading colon and Python env dicts.
