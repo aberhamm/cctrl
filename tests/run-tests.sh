@@ -1413,6 +1413,38 @@ test_launch_mcp_none_claude() {
     assert_not_contains "$out" "ARG["
 }
 
+# Models the real claude's `--mcp-config <configs...>`: after it, every token
+# that does not start with '-' is another config path. Prints the swallowed
+# non-config tokens (the seed prompt / a passthrough positional), one per line.
+_mcp_variadic_swallowed() {
+    printf '%s\n' "$1" | awk -v f="$2" '
+        /^-/ { v = ($0 == "--mcp-config"); next }
+        v && $0 != f { print }'
+}
+
+test_launch_mcp_none_claude_variadic() {
+    make_fake_agent "$TMPDIR/claude" claude
+    local data="$TMPDIR/mcp-var-data" runtime="$TMPDIR/mcp-var-runtime" out args file swallowed
+    mkdir -p "$TMPDIR/comet"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent claude >/dev/null
+    local shape
+    for shape in "-m seedprompt" "" "--peer comet -m seedprompt" "--peer comet" "-m seedprompt --effort high" "--peer comet --effort high -m seedprompt" "--peer comet -- seedprompt"; do
+        # shellcheck disable=SC2086
+        out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp none $shape)"
+        args="$(_mcp_args_of "$out")"
+        file="$(printf '%s\n' "$args" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+        [[ -f "$file" ]] || fail "shape [$shape]: no MCP file in argv: $args"
+        swallowed="$(_mcp_variadic_swallowed "$args" "$file")"
+        [[ -z "$swallowed" ]] || fail "shape [$shape]: variadic --mcp-config would swallow: $swallowed (argv: $args)"
+        [[ "$shape" != *seedprompt* || "$args" == *seedprompt* ]] || fail "shape [$shape]: seed prompt missing from argv: $args"
+        [[ "$shape" != *"--effort high"* || "$args" == *high* ]] || fail "shape [$shape]: passthrough value missing: $args"
+    done
+    # the model itself must catch the old order (guards against a vacuous test)
+    swallowed="$(_mcp_variadic_swallowed "$(printf '%s\n' --strict-mcp-config --mcp-config /x.json seedprompt)" /x.json)"
+    [[ "$swallowed" == seedprompt ]] || fail "variadic model failed to flag the old argv order"
+    echo "ok: lean claude argv is safe against variadic --mcp-config"
+}
+
 test_launch_mcp_none_codex() {
     make_fake_agent "$TMPDIR/codex" codex
     make_fake_tmux "$TMPDIR/tmux"

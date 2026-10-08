@@ -1355,7 +1355,10 @@ _launch_exec_agent() {
                 return 70
             fi
             export CCTRL_PROFILE_MCP_FILE="$_mcp_file"
-            LAUNCH_FLAGS+=("--strict-mcp-config" "--mcp-config" "$_mcp_file")
+            # --mcp-config is variadic in the real claude (<configs...>): it keeps
+            # consuming non-option tokens. End it with an option so the passthrough
+            # args and the seed prompt that follow are not read as config files.
+            LAUNCH_FLAGS+=("--mcp-config" "$_mcp_file" "--strict-mcp-config")
             local _mcp_kept_claude="nothing"
             [[ -n "${CCTRL_PEER:-}" ]] && _mcp_kept_claude="cctrl-peer"
             echo -e "${DIM}mcp: lean (none; kept: ${_mcp_kept_claude})${RESET}"

@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - Lean MCP mode (plan 106 P2, opt-in): `--mcp none` / `CCTRL_MCP_MODE=none` on `cctrl start`, `cctrl @key` and `launch-to-app` starts a terminal-owned worker with only cctrl's own MCP server. Claude gets `--strict-mcp-config --mcp-config <per-session mode-600 file>`; Codex gets `-c mcp_servers.<name>.enabled=false` for each server named in `config.toml` (names only). Default `inherit` is byte-identical to before; `mcp_mode` is recorded and shown in `session ls --json`; `--app-owned` rejects `--mcp` (64); `--mcp minimal` is not available yet (64). `_profile_settings_gc` now keeps a live session's `.mcp.json` file.
 
 ### Fixed
+- Lean MCP mode (plan 106 P2): the Claude argv is now `--mcp-config <file> --strict-mcp-config`; the real `claude` declares `--mcp-config <configs...>` (variadic), so the old order made it read the seed prompt as a second config file and exit. New test `test_launch_mcp_none_claude_variadic` models the variadic rule.
 - `cctrl helpers`: a crafted `comm` can no longer surface its tail (or a credential-shaped token) as an executable name; the docstring no longer says "redaction" (arguments are simply never printed). (plan 106 P1 follow-up)
 
 ### Changed
