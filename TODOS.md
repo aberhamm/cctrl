@@ -243,3 +243,9 @@ plan 104. Test harness items are now plan 105; the MCP helper census / lean MCP 
 - Test lint: tests that assign `_rt_*` variables without `local` clobber the runner state; and a lint for bare `test_x` calls outside group blocks (they would skip timing and `--list`).
 - Keep-going counts a test that runs `exit 0` as ok (pre-existing semantics in fail-fast).
 - 3.2 timing is whole seconds (`date +%s`); the plan's perl/`Time::HiRes` option was not used.
+
+### Plan 105 P4 follow-ups (2026-10-08)
+
+- `test_task_inventory_provider_neutral_readonly` is SKIP-listed: it fails at HEAD d0f93f0 (its fake tmux `list-sessions` rows are reported as `invalid-session-identity`; also reached by the `task-inventory` and `codex-ownership-matrix` groups). Fix the fixture, then remove the SKIP entry.
+- Fail-fast abort detail: the `test suite aborted` line now reads `in [_run_test main] ... at: exit "$_rt_rc"` (the test name still prints); an ERR trap inside the per-test subshell would restore the failing command and line (Opus review RECOMMENDED).
+- P5/P6 still pending: install gate on both bashes (also unset `CCTRL_TEST_NAMES` / `CCTRL_TEST_ONLY` there); file split (the guard's "every suite file sourced" check arrives with it).

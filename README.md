@@ -1697,7 +1697,7 @@ its private temp dir, first on its PATH) and prints both versions on the first
 line. `CCTRL_TEST_ONLY=bash-leg` runs just the guard tests for this.
 
 A full leg takes about 8 minutes (measured at plan 105 P3: 473 s on `/bin/bash`
-3.2, 502 s on Homebrew bash 5.3; 448 tests), not the 40 minutes older plan
+3.2, 502 s on Homebrew bash 5.3; 448 tests, 449 since P4), not the 40 minutes older plan
 notes say. The slowest tests are the session-close/terminate fixtures
 (`test_session_close_reaps_pane_processes` about 16 s,
 `test_session_terminate_records_closed` about 13 s).
@@ -1715,6 +1715,16 @@ Each test prints one `ok: <name> (S.mmms)` or `FAIL: <name> (rc=N, S.mmms)`
 line on stderr, and a full run ends with a slowest-20 table. An unknown name
 exits 64. A filtered run prints `FILTERED RUN: N of M` and skips the Python
 unittests; it is not a gate. (`/bin/bash` 3.2 timings are whole seconds.)
+
+Since plan 105 P4 there is no call list: every `test_*()` definition in
+`tests/run-tests.sh` runs, in source order, each in its own subshell (so an
+`export`, `cd` or trap in one test cannot leak into the next). Three small
+lists in the file, each entry with a reason, are the only exceptions:
+`RUN_FIRST` (the private-tmux guard), `SKIP` (defined, never run) and
+`RUN_LAST` (`test_tmux_sockets_left_behind`). To add a test, define it; to
+run a focused group use `CCTRL_TEST_ONLY=<group>` (groups are the
+`_group_tests` table). `test_every_defined_test_is_registered` fails on a
+stale list entry or a test the discovery pattern cannot see.
 
 ## Hooks
 

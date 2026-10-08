@@ -94,8 +94,7 @@ _runner_parse() { # "$@" of the harness; sets _RT_LIST/_RT_FILTER/_RT_WANT
 # The test runs as a plain statement, never in an ||, &&, if or ! context, so
 # `set -e` stays live inside it. Default is fail-fast: the first failing test
 # exits the harness through its EXIT trap (which calls _rt_fail_report).
-# CCTRL_TEST_KEEP_GOING=1 runs each test in a subshell and continues (opt-in;
-# tests that leak shell state to a later test can differ until plan 105 P4).
+# CCTRL_TEST_KEEP_GOING=1 records the failure and continues.
 _run_test() { # [--always] <name>
     local _rt_always=0
     if [[ "${1:-}" == "--always" ]]; then _rt_always=1; shift; fi
@@ -111,13 +110,18 @@ _run_test() { # [--always] <name>
     _rt_t0=$_RT_NOW
     _RT_CURRENT="$_rt_name"
     _RT_CURRENT_T0=$_rt_t0
-    if [[ "${CCTRL_TEST_KEEP_GOING:-0}" == "1" ]]; then
-        set +e
-        ( set -e; "$_rt_name" )
-        _rt_rc=$?
-        set -e
-    else
-        "$_rt_name"
+    # Each test runs in its own subshell (plan 105 P4): exports, cd, traps and
+    # function redefinitions no longer leak into the next test. The subshell
+    # is a plain statement, never in an ||, &&, if or ! context, so `set -e`
+    # stays live inside the test. Fail-fast is the default: the first failing
+    # test exits the harness with the test's own status; the EXIT trap then
+    # names it through _rt_fail_report.
+    set +e
+    ( set -e; "$_rt_name" )
+    _rt_rc=$?
+    set -e
+    if [[ "$_rt_rc" -ne 0 && "${CCTRL_TEST_KEEP_GOING:-0}" != "1" ]]; then
+        exit "$_rt_rc"
     fi
     _rt_now
     _rt_ms=$(( _RT_NOW - _rt_t0 ))
@@ -1007,27 +1011,98 @@ test_syntax() {
     done
 }
 
+_registration_problems() { # <harness file> -> one problem per line; empty when the registry is sound
+    # plan 105 P4. Reads the file as text (never sources it), so a fixture can
+    # be checked the same way as the real harness.
+    local f="$1" defs kind name entry
+    defs="$(awk '/^test_[A-Za-z0-9_]+\(\)/ { n = $0; sub(/\(\).*/, "", n); print n }' "$f" | sort)"
+    # 1. every SKIP / RUN_FIRST / RUN_LAST entry names a defined test and has a reason
+    while IFS= read -r entry; do
+        [[ -n "$entry" ]] || continue
+        if ! printf '%s\n' "$entry" | grep -Eq "^_rt_register (RUN_FIRST|SKIP|RUN_LAST) test_[A-Za-z0-9_]+ '.+'$"; then
+            echo "registry entry without a name or reason: $entry"
+            continue
+        fi
+        kind="$(printf '%s\n' "$entry" | awk '{print $2}')"
+        name="$(printf '%s\n' "$entry" | awk '{print $3}')"
+        printf '%s\n' "$defs" | grep -Fxq -- "$name" || echo "$kind entry names no defined test: $name"
+    done < <(grep '^_rt_register [A-Z]' "$f" || true)
+    # 2. every group entry names a defined, discoverable test (a test the
+    # discovery pattern cannot see would be reachable only through a group)
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        printf '%s\n' "$defs" | grep -Fxq -- "$name" || echo "group entry names no defined (discoverable) test: $name"
+    done < <(awk '/^_group_tests\(\) \{/ { g = 1; next } g && /^\}/ { g = 0 } g && /printf/ { while (match($0, /test_[A-Za-z0-9_]+/)) { print substr($0, RSTART, RLENGTH); $0 = substr($0, RSTART + RLENGTH) } }' "$f")
+    # 3. discovery sees as many tests as a second, independent grep finds
+    local n_awk n_grep
+    n_awk="$(printf '%s\n' "$defs" | grep -c . || true)"
+    n_grep="$(grep -Ec '^function +test_[A-Za-z0-9_]+|^test_[A-Za-z0-9_]+ *\(\)' "$f" || true)"
+    [[ "$n_awk" == "$n_grep" ]] || echo "discovery found $n_awk tests but grep found $n_grep definitions (a test the discovery pattern cannot see)"
+    # 4. no test defined twice
+    printf '%s\n' "$defs" | uniq -d | sed 's/^/test defined twice: /'
+}
+
 test_every_defined_test_is_registered() {
-    # A test_* function that is defined but never called is a dead test: it
-    # gives false confidence. dbe923e silently dropped 31 restore/snapshot
-    # tests from the call list this way (plan 097). A test counts as
-    # registered when some other line consists solely of its name (a call in
-    # the main list, a focused group, or a nested block). Intentionally
-    # skipped tests are listed in the allowlist below WITH a reason; the
-    # listing line itself counts as the use.
-    : <<'ALLOWLIST'
-    # hangs on macOS bash 3.2 (flock issue); call is commented out in the main list
-    test_peer_mailbox_concurrency_and_stale_lock
-ALLOWLIST
-    local dead
-    dead="$(awk '
-        match($0, /^test_[A-Za-z0-9_]+\(\)/) { n=substr($0, 1, RLENGTH-2); defs[n]=1; next }
-        { t=$0; gsub(/^[ \t]+|[ \t]+$/, "", t); sub(/^_run_test( --always)? /, "", t); if (t ~ /^test_[A-Za-z0-9_]+$/) used[t]=1 }
-        END { for (n in defs) if (!(n in used)) print n }
-    ' "$ROOT/tests/run-tests.sh" | sort)"
-    [[ -z "$dead" ]] || fail "test_* functions defined but never called (register them, or allowlist with a reason):
-$dead"
+    # A test_* function that is defined but never run is a dead test: it gives
+    # false confidence (dbe923e silently dropped 31 tests that way, plan 097).
+    # Since plan 105 P4 tests are discovered, so the risks that remain are
+    # stale registry entries and tests the discovery pattern cannot see.
+    # Checks (see _registration_problems): every SKIP/RUN_FIRST/RUN_LAST/group
+    # entry names a defined test (SKIP and RUN_* entries carry a reason);
+    # no test is reachable only through a group (undiscoverable); discovery equals an
+    # independent grep count; no duplicates. "Every tests/suite/*.sh was
+    # sourced" arrives with the split (P6).
+    local problems
+    problems="$(_registration_problems "$ROOT/tests/run-tests.sh")"
+    [[ -z "$problems" ]] || fail "test registry problems:
+$problems"
     echo "ok: every defined test_* function is registered"
+}
+
+test_registration_guard_self_test() {
+    # plan 105 P4: the guard must bite. Fixtures are written with the test
+    # names assembled at runtime so none starts a line in this file.
+    local d="$TMPDIR/reg-guard-fx" fx out t_a="test_fx""_a" t_b="test_fx""_b" t_g="test_fx""_gonly" t_sk="test_fx""_skipped"
+    mkdir -p "$d"
+    fx="$d/fx.sh"
+    _fx_registry() { # skip-name group-names...  [GONLY=1 defines the group test in a form discovery cannot see]
+        local skip="$1"; shift
+        {
+            printf '%s() { :; }\n%s() { :; }\n%s() { :; }\n' "$t_a" "$t_b" "$t_sk"
+            if [[ "${GONLY:-0}" == "1" ]]; then printf '%s () { :; }\n' "$t_g"; fi
+            printf "_rt_register SKIP %s 'fixture reason'\n" "$skip"
+            printf "_rt_register RUN_LAST %s 'fixture reason'\n" "$t_b"
+            printf '_group_tests() {\n    case "$1" in\n        g1) printf '"'"'%%s\\n'"'"' %s ;;\n    esac\n}\n' "$*"
+        } > "$fx"
+    }
+    _fx_registry "$t_sk" "$t_a $t_b"
+    out="$(_registration_problems "$fx")"
+    [[ -z "$out" ]] || fail "guard flagged a sound fixture registry: $out"
+    # a SKIP entry that names no defined test
+    _fx_registry "test_fx_no_such_test" "$t_a"
+    out="$(_registration_problems "$fx")"
+    assert_contains "$out" "SKIP entry names no defined test: test_fx_no_such_test"
+    # a SKIP-listed test may be named by a group (a manual focused run)
+    _fx_registry "$t_sk" "$t_a $t_sk"
+    out="$(_registration_problems "$fx")"
+    [[ -z "$out" ]] || fail "guard flagged a SKIP-listed test named by a group: $out"
+    # a group test the discovery pattern cannot see
+    GONLY=1 _fx_registry "$t_sk" "$t_a $t_g"
+    out="$(_registration_problems "$fx")"
+    assert_contains "$out" "group entry names no defined (discoverable) test: $t_g"
+    assert_contains "$out" "discovery found 3 tests but grep found 4 definitions"
+    # a SKIP entry without a reason
+    _fx_registry "$t_sk" "$t_a"
+    printf "_rt_register SKIP %s\n" "$t_a" >> "$fx"
+    out="$(_registration_problems "$fx")"
+    assert_contains "$out" "registry entry without a name or reason"
+    # the same test defined twice
+    _fx_registry "$t_sk" "$t_a"
+    printf '%s() { :; }\n' "$t_a" >> "$fx"
+    out="$(_registration_problems "$fx")"
+    assert_contains "$out" "test defined twice: $t_a"
+    unset -f _fx_registry
+    echo "ok: the registration guard flags bad SKIP names, group-only tests, hidden definitions, missing reasons and duplicates"
 }
 
 test_no_unreferenced_functions() {
@@ -1141,12 +1216,57 @@ FX
     assert_contains "$out" "ok: test_fx_after ("
     assert_contains "$out" "failed tests: test_fx_fail"
 
+    # Isolation (P4): every test runs in its own subshell. An export, a cd, a
+    # function redefinition and an EXIT trap set by one test must not leak
+    # into the next, the trap fires at the end of that test, and a bare
+    # `false` still aborts the test (set -e live) with the harness exiting
+    # with the test's own status.
+    local fx2="$d/fixture-iso.sh"
+    {
+        printf '%s\n' 'set -euo pipefail'
+        sed -n '/^# >>> test runner/,/^# <<< test runner/p' "$ROOT/tests/run-tests.sh"
+        cat <<'FX'
+    _RT_SELF="$0"
+    fail() { echo "FAIL: $*" >&2; exit 1; }
+    trap '_rt_fail_report "$?"' EXIT
+    _runner_parse "$@"
+    fx_helper() { echo "helper: original"; }
+    test_iso_dirty() { export FX_LEAK=1; cd /; fx_helper() { echo "helper: redefined"; }; trap 'echo "TRAP-FIRED-AT-TEST-END"' EXIT; echo "body: dirty"; }
+    test_iso_clean() { [[ -z "${FX_LEAK:-}" && "$PWD" != "/" ]] || { echo "LEAKED"; return 1; }; [[ "$(fx_helper)" == "helper: original" ]] || { echo "LEAKED-FN"; return 1; }; echo "body: clean"; }
+    test_iso_status() { echo "body: status"; ( exit 7 ); echo "SET-E-NOT-LIVE-7"; }
+    test_iso_never() { echo "body: never"; }
+    _run_test test_iso_dirty
+    _run_test test_iso_clean
+    _run_test test_iso_status
+    _run_test test_iso_never
+FX
+    } > "$fx2"
+    rc=0; out="$("${clean[@]}" "$BASH" "$fx2" 2>&1)" || rc=$?
+    assert_contains "$out" "TRAP-FIRED-AT-TEST-END"
+    assert_contains "$out" "ok: test_iso_clean ("
+    assert_not_contains "$out" "LEAKED"
+    [[ "$rc" -eq 7 ]] || fail "isolation fixture should exit with the failing test's status 7, got $rc: $out"
+    assert_contains "$out" "FAIL: test_iso_status (rc=7,"
+    assert_not_contains "$out" "SET-E-NOT-LIVE-7"
+    assert_not_contains "$out" "body: never"
+
     # The real harness: --list is the registry (first entry is the always-on
     # test, this test is in it) and an unknown name is refused with rc 64.
     rc=0; out="$("${clean[@]}" "$BASH" "$ROOT/tests/run-tests.sh" --list 2>/dev/null)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "real --list rc=$rc"
     [[ "$(printf '%s\n' "$out" | sed -n 1p)" == "test_tmux_default_server_is_private" ]] || fail "real --list should start with the always-on test"
     printf '%s\n' "$out" | grep -Fxq test_runner_filter_and_list || fail "real --list does not contain this test"
+    # Discovery (P4): --list is every definition minus the SKIP entries, in
+    # source order, with RUN_LAST last.
+    local n_def n_skip
+    n_def="$(grep -Ec '^test_[A-Za-z0-9_]+\(\)' "$ROOT/tests/run-tests.sh")"
+    n_skip="$(grep -c '^_rt_register SKIP ' "$ROOT/tests/run-tests.sh")"
+    [[ "$(printf '%s\n' "$out" | grep -c '^test_')" -eq $(( n_def - n_skip )) ]] || fail "real --list should be every definition minus the $n_skip SKIP entries"
+    local n_sk
+    while IFS= read -r n_sk; do
+        if printf '%s\n' "$out" | grep -Fxq -- "$n_sk"; then fail "real --list contains the SKIP-listed test $n_sk"; fi
+    done < <(grep '^_rt_register SKIP ' "$ROOT/tests/run-tests.sh" | awk '{print $3}')
+    [[ "$(printf '%s\n' "$out" | tail -n 1)" == "test_tmux_sockets_left_behind" ]] || fail "real --list should end with the RUN_LAST test"
     [[ "$(printf '%s\n' "$out" | grep -c '^test_')" -gt 400 ]] || fail "real --list has too few tests"
     rc=0; out="$("${clean[@]}" "$BASH" "$ROOT/tests/run-tests.sh" test_no_such_test_zz 2>&1)" || rc=$?
     [[ "$rc" -eq 64 ]] || fail "real unknown name rc=$rc (want 64)"
@@ -2598,6 +2718,8 @@ test_profile_shadow_identical_warn_quiet() {
     # Plan 099: once the repo and XDG copies of a profile are byte-identical
     # (the normal post-`profile migrate` state), ls/current must NOT print
     # the "exists in both" WARN -- there is nothing to warn about.
+    # plan 105 P4: `use` writes the user config; keep it private so it cannot
+    # leak a default profile into later tests (shared $CCTRL_USER_CONFIG path).
     local rootcopy="$TMPDIR/cctrl-shadowsame-copy"
     local fakehome="$rootcopy/home"
     mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl/profiles" "$fakehome/.claude"
@@ -2608,12 +2730,12 @@ test_profile_shadow_identical_warn_quiet() {
     printf '{"model":"same-version","env":{}}\n' > "$fakehome/.config/cctrl/profiles/twin.json"
 
     local out
-    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" ls)"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="$rootcopy/user-config.json" "$rootcopy/cctrl" ls)"
     assert_contains "$out" "twin"
     assert_not_contains "$out" "WARN: twin exists in both"
 
-    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" use twin 2>&1)"
-    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" current)"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="$rootcopy/user-config.json" "$rootcopy/cctrl" use twin 2>&1)"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="$rootcopy/user-config.json" "$rootcopy/cctrl" current)"
     assert_contains "$out" "twin"
     assert_not_contains "$out" "WARN: twin exists in both"
 
@@ -2624,6 +2746,8 @@ test_profile_shadow_current_warns_when_differs() {
     # Plan 099 counterpart: when the two copies genuinely differ, `current`'s
     # own WARN (not just `ls`'s, covered by test_profile_repo_fallback_and_clash)
     # must still print.
+    # plan 105 P4: `use` writes the user config; keep it private so it cannot
+    # leak a default profile into later tests (shared $CCTRL_USER_CONFIG path).
     local rootcopy="$TMPDIR/cctrl-shadowdiff-copy"
     local fakehome="$rootcopy/home"
     mkdir -p "$rootcopy/data" "$rootcopy/profiles" "$fakehome/.config/cctrl/profiles" "$fakehome/.claude"
@@ -2633,9 +2757,9 @@ test_profile_shadow_current_warns_when_differs() {
     printf '{"model":"repo-version","env":{}}\n' > "$rootcopy/profiles/diverged.json"
     printf '{"model":"xdg-version","env":{}}\n' > "$fakehome/.config/cctrl/profiles/diverged.json"
 
-    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" use diverged >/dev/null 2>&1
+    HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="$rootcopy/user-config.json" "$rootcopy/cctrl" use diverged >/dev/null 2>&1
     local out
-    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" "$rootcopy/cctrl" current)"
+    out="$(HOME="$fakehome" XDG_CONFIG_HOME="$fakehome/.config" CCTRL_USER_CONFIG="$rootcopy/user-config.json" "$rootcopy/cctrl" current)"
     assert_contains "$out" "WARN: diverged exists in both"
 
     echo "ok: current still warns when the repo/XDG profile copies genuinely differ"
@@ -4022,7 +4146,7 @@ _rf_field() {
     session_record_json "$sess" | jq -r --arg f "$2" '.[$f] // empty'
 }
 
-_rf_records() { ls "$CCTRL_SESSION_METADATA_DIR" 2>/dev/null | wc -l | tr -d ' '; }
+_rf_records() { { ls "$CCTRL_SESSION_METADATA_DIR" 2>/dev/null || true; } | wc -l | tr -d ' '; }
 
 _assert_ask_78() {
     # args: output rc
@@ -4843,6 +4967,7 @@ test_recorded_worker_beats_legacy_name_inference_live() {
 
 test_session_ls_json_exposes_role_and_kind() {
     local meta="$TMPDIR/role-ls-meta" out
+    make_fake_tmux "$TMPDIR/tmux"
     mkdir -p "$meta"
     printf '{"target":"/tmp","cwd":"/tmp","role":"orchestrator","orch_kind":"repo","purpose":"p"}\n' > "$meta/TMUX--ms--ls-role.json"
     out="$(PATH="$TMPDIR:$PATH" CCTRL_SESSION_METADATA_DIR="$meta" TMUX_FAKE_SESSIONS="TMUX--ms--ls-role" "$ROOT/cctrl" session ls --json </dev/null)"
@@ -5145,9 +5270,11 @@ test_session_doctor_realign_carries_profile_model_peer() {
 {"name":"TMUX--ms--portal","tmux_session":"TMUX--ms--portal","target":"$TMPDIR/rl-proj","cwd":"$TMPDIR/rl-proj","purpose":"realign me","profile":"work","launch_command":"cctrl start --foreground --model X --peer p"}
 JSON
     : > "$relog"
+    # own fixture profile: do not depend on the gitignored profiles/work.json
+    mkdir -p "$TMPDIR/rl6-profiles"; printf '{}\n' > "$TMPDIR/rl6-profiles/work.json"
 
     local out
-    out="$(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
+    out="$(PATH="$bin:$PATH" CCTRL_PROFILES_DIR="$TMPDIR/rl6-profiles" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 "$ROOT/cctrl" session doctor --fix --yes --json)"
     assert_contains "$out" '"action": "realigned'
 
     local cmd
@@ -7636,6 +7763,7 @@ test_peer_send_sender_binding_applies_to_remote_recipients() {
     # `$TMUX`/pane ancestry are meaningful (the remote host never sees them
     # over a non-interactive SSH command).
     make_fake_ssh "$TMPDIR/ssh"
+    make_fake_tmux "$TMPDIR/tmux"
     local data="$TMPDIR/peer-remote-bind-data" hosts="$TMPDIR/peer-remote-bind-hosts.json"
     local log="$TMPDIR/peer-remote-bind-ssh.log"
     mkdir -p "$CCTRL_SESSION_METADATA_DIR"
@@ -13969,8 +14097,6 @@ SH
     echo "ok: task inventory is provider-neutral, stable-identity fused, capability explicit, partial, and read-only"
 }
 
-# Before any test, focused group or not (plan 071 p5 incident).
-_run_test --always test_tmux_default_server_is_private
 
 # ── Plan 100 phase 2: names, labels, the one-fleet-manager guard ───────────
 # Same rules as phase 1: a rootcopy of cctrl, the fake tmux (TMUX_FAKE_STATE
@@ -14977,819 +15103,6 @@ test_role_skills_ask_rule() {
     echo "ok: orchestrator skills and cctrl-spawn state the ask rule and exit 78"
 }
 
-if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
-    case "$CCTRL_TEST_ONLY" in
-        role-skills)
-            test_role_skills_ask_rule
-            echo "ok"
-            exit 0
-            ;;
-        bash-leg)
-            test_bash_leg_is_honest
-            test_no_shimless_test_path
-            test_profile_settings_gc_portable_membership
-            echo "ok"
-            exit 0
-            ;;
-        session-prune)
-            test_session_prune_never_prompted_claude
-            test_session_prune_fresh_active_not_candidate
-            test_session_prune_codex_no_claude_transcript_bug_guard
-            test_session_prune_codex_never_prompted
-            test_session_prune_dry_run_closes_nothing
-            test_session_prune_claude_long_transcript_user_turn_not_flagged
-            test_session_prune_yes_caps_large_batch
-            echo "ok"
-            exit 0
-            ;;
-        codex-adapter) ;;
-        provider-neutral)
-            python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
-            test_session_list_codex_default_model
-            test_session_list_agent_not_mislabelled_by_prompt
-            test_session_list_agent_prefers_recorded_metadata
-            test_session_list_malformed_metadata_uses_unknown_defaults
-            echo "ok"
-            exit 0
-            ;;
-        task-inventory)
-            test_task_inventory_provider_neutral_readonly
-            echo "ok"
-            exit 0
-            ;;
-        codex-reconcile)
-            test_codex_reconcile_ownership_evidence
-            echo "ok"
-            exit 0
-            ;;
-        codex-lifecycle)
-            # Defined in the later Codex-hook section; dispatched there.
-            ;;
-        app-owned-launch)
-            # Defined in the later Codex App Server section; dispatched there.
-            ;;
-        codex-handoff)
-            # Defined after the Codex App Server fixtures; dispatched there.
-            ;;
-        codex-launch-to-app)
-            # Defined after the Codex App Server fixtures; dispatched there.
-            ;;
-        codex-ownership-matrix)
-            # Defined after all Codex ownership-path fixtures; dispatched there.
-            ;;
-        session-attest)
-            test_session_attest_live_tmux_process_matches
-            test_session_attest_direct_metadata
-            test_session_attest_stale_tmux_session_missing
-            test_session_attest_malformed_metadata_fails_human_mode
-            test_session_runtime_mcp_attests_fixed_session
-            echo "ok"
-            exit 0
-            ;;
-        session-stop-exact)
-            test_session_stop_exact_identity
-            test_session_terminate_records_closed
-            test_session_close_reaps_pane_processes
-            test_tmux_sockets_left_behind
-            test_session_mark_closed_provisional_launch_record
-            test_session_task_records_for_name_launch_liveness_gate
-            test_task_record_close_provisional_honors_digest_guard
-            test_session_record_terminated_closes_fresh_anchored_provisional
-            echo "ok"
-            exit 0
-            ;;
-        task-records)
-            test_task_record_host_id_is_stable_exclusive_and_private
-            test_task_record_schema_v2_and_provisional_promotion
-            test_task_record_legacy_validation_and_lazy_promotion
-            test_task_record_merge_conflict_preserves_evidence
-            test_task_record_relaunch_moves_terminal_anchors
-            test_task_record_relaunch_reclaims_and_reopens
-            test_task_resolve_conflicts_digest_guarded
-            test_task_record_identity_independent_close_continues
-            test_task_registry_atomic_concurrent_updates
-            test_task_registry_replay_order_and_guards
-            test_task_registry_lock_stale_timeout_and_release_token
-            test_task_registry_structural_boundary
-            echo "ok"
-            exit 0
-            ;;
-        task-record-compat)
-            test_codex_rename_updates_app_title
-            test_codex_rename_prefers_prompt_match_over_stale_id
-            test_session_app_ls_codex_records
-            test_codex_close_archives_and_resolves_rollout_identity
-            test_session_release_to_app_quarantines_stale_codex_lock
-            test_update_metadata_field_preserves_keys
-            test_backfill_ids_fills_resume_flag
-            test_backfill_ids_idempotent
-            test_session_list_refresh_writes_on_change
-            test_session_list_refresh_skips_when_unchanged
-            echo "ok"
-            exit 0
-            ;;
-        task-record-launch)
-            test_detached_arg_parsing
-            test_start_peer_env_and_metadata
-            test_live_aware_index_picker
-            test_launch_resume_captures_conversation_id
-            test_resume_no_uuid_no_conversation_id
-            test_session_write_metadata_includes_new_fields
-            echo "ok"
-            exit 0
-            ;;
-        task-record-launch-basic)
-            test_detached_arg_parsing
-            echo "ok"
-            exit 0
-            ;;
-        task-record-launch-peer)
-            test_start_peer_env_and_metadata
-            test_live_aware_index_picker
-            echo "ok"
-            exit 0
-            ;;
-        task-record-launch-peer-only)
-            test_start_peer_env_and_metadata
-            echo "ok"
-            exit 0
-            ;;
-        task-record-launch-index)
-            test_live_aware_index_picker
-            echo "ok"
-            exit 0
-            ;;
-        task-record-launch-resume)
-            test_launch_resume_captures_conversation_id
-            test_resume_no_uuid_no_conversation_id
-            test_session_write_metadata_includes_new_fields
-            echo "ok"
-            exit 0
-            ;;
-        task-record-list)
-            test_session_list_codex_default_model
-            test_session_list_agent_not_mislabelled_by_prompt
-            test_session_list_agent_prefers_recorded_metadata
-            test_session_list_malformed_metadata_uses_unknown_defaults
-            test_session_list_refresh_writes_on_change
-            test_session_list_refresh_skips_when_unchanged
-            echo "ok"
-            exit 0
-            ;;
-        fleet-v2)
-            test_fleet_merges_multiple_hosts
-            test_fleet_sorts_by_recency_across_hosts
-            test_fleet_offline_host_non_fatal
-            test_fleet_version_skew_missing_fields
-            test_fleet_v2_provider_neutral_federation
-            echo "ok"
-            exit 0
-            ;;
-        health-check) ;;
-        pane-draft)
-            test_session_pane_has_draft_glyph_fixtures
-            test_session_rich_state_detects_glyph_draft
-            test_session_autoheal_skips_glyph_draft
-            test_pane_draft_plan086_followups
-            test_pane_draft_plan086_hotfix_titled_divider
-            test_strip_sgr_shared_regex
-            echo "ok"
-            exit 0
-            ;;
-        snapshot-restore-legacy)
-            test_snapshot_header_and_session_shape
-            test_snapshot_initial_prompt_absent
-            test_snapshot_empty_fleet_guard_preserves
-            test_snapshot_allow_empty_overrides
-            test_snapshot_history_and_latest_agree
-            test_snapshot_retention_pruning
-            test_snapshot_no_tmux_mutation
-            test_snapshot_tmux_absent_preserves
-            test_snapshot_first_run_empty_writes
-            test_snapshot_managed_matches_session_ls
-            test_snapshot_launch_flags_round_trip
-            test_snapshot_conversation_id_from_session_id
-            test_restore_only_filter
-            test_restore_cap_on_total
-            test_restore_null_conversation_id_skipped
-            test_restore_dry_run_spawns_nothing
-            test_restore_gate_stops_below_threshold
-            test_restore_limit_caps_spawns
-            test_restore_no_tty_no_yes_refused
-            test_restore_unknown_schema_refused
-            test_restore_stale_snapshot_refused
-            test_restore_host_mismatch_refused
-            test_restore_cap_fails_closed
-            test_restore_wave_pacing
-            test_restore_already_live_skipped
-            test_restore_launch_config_replay
-            test_restore_already_live_record_join
-            test_restore_exit_codes
-            echo "ok"
-            exit 0
-            ;;
-        role-phase1)
-            test_role_flags_before_dir_target_with_detach
-            test_role_flags_before_at_target_without_detach
-            test_role_flags_never_reach_child_command
-            test_role_flags_with_foreground_exit_64
-            test_role_flags_with_app_owned_and_launch_to_app_exit_64
-            test_remote_role_value_not_taken_as_purpose
-            test_role_flag_recorded_in_metadata_and_tmux_option
-            test_role_and_orch_kind_invalid_values_exit_64
-            test_orch_kind_flag_implies_orchestrator_role
-            test_role_worker_with_orch_kind_exits_64
-            test_shortcut_role_and_kind_resolve_on_at_launch
-            test_shortcut_orch_kind_without_role_is_orchestrator
-            test_shortcut_invalid_role_exits_64_naming_key
-            test_orch_kind_flag_overrides_shortcut_kind
-            test_dir_launch_never_inherits_shortcut_role
-            test_dir_launch_with_orch_key_and_plain_key_uses_plain_key
-            test_dir_launch_with_only_orch_key_uses_basename
-            test_dir_launch_matches_stored_dir_with_trailing_slash
-            test_dir_launch_skips_role_shortcut_without_legacy_prefix
-            test_legacy_prefixed_key_with_worker_role_is_adopted
-            test_no_env_var_supplies_role_or_kind
-            test_shortcut_add_preserves_role_fields
-            test_shortcut_add_role_flags_set_and_clear
-            test_ask_a1_role_orchestrator_without_kind_exits_78
-            test_ask_a2_shortcut_role_without_kind_exits_78
-            test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78
-            test_ask_a4_set_role_orchestrator_without_kind_exits_78
-            test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78
-            test_non_interactive_never_reads_stdin
-            test_no_input_flag_and_env_force_78_on_pty
-            test_agent_env_markers_force_78_on_pty
-            test_ask_tty_accepts_fleet
-            test_ask_tty_accepts_repo
-            test_ask_tty_prompts_when_stdout_is_captured
-            test_ask_tty_three_invalid_answers_exit_78
-            test_ask_tty_read_timeout_exits_78
-            test_ask_tty_abort_exits_78_nothing_launched
-            test_remote_preflight_forwards_resolved_role_and_kind
-            test_remote_ambiguous_prompts_locally_and_forwards_kind
-            test_remote_ambiguous_non_interactive_returns_78_with_message
-            test_remote_sets_no_input_on_remote_side
-            test_remote_old_cctrl_with_role_flags_exits_69
-            test_remote_dir_launch_without_role_flags_skips_preflight
-            test_remote_preflight_exit_0_without_role_line_launches_unchanged
-            test_remote_preflight_66_falls_through_to_launch
-            test_remote_foreground_skips_preflight_and_role_flags
-            test_remote_preflight_other_exit_code_is_relayed
-            test_set_role_updates_live_session_and_keeps_label
-            test_set_role_on_provisional_record
-            test_set_role_clear_removes_fields
-            test_relaunch_with_new_role_replaces_recorded_role
-            test_roleless_relaunch_keeps_recorded_role_and_kind
-            test_snapshot_launch_flags_carry_role_and_kind
-            test_restore_replays_role_and_kind
-            test_restore_legacy_row_infers_orchestrator_from_tmux_name
-            test_restore_unknown_kind_row_never_asks
-            test_restore_old_snapshot_does_not_erase_recorded_kind
-            test_restore_current_record_beats_snapshot_row_role
-            test_recorded_worker_beats_legacy_name_inference
-            test_ask_rechecks_tty_at_read_site
-            test_restore_prints_reason_for_failed_row
-            test_realign_flags_carry_role_and_kind
-            test_realign_keeps_recorded_tmux_name
-            test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind
-            test_recorded_worker_beats_legacy_name_inference_live
-            test_session_ls_json_exposes_role_and_kind
-            echo "ok"
-            exit 0
-            ;;
-        role-phase3)
-            test_reconcile_names_legacy_record_without_known_names_is_not_pulled
-            test_reconcile_names_writes_baseline_once
-            test_reconcile_names_does_not_pull_launch_name_restamp
-            test_reconcile_names_cctrl_label_stays_after_cctrl_rename
-            test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator
-            test_reconcile_names_cctrl_rename_after_pull_stays
-            test_reconcile_names_no_pull_when_baseline_cannot_be_written
-            test_restore_keeps_known_names_and_pulls_nothing
-            test_reconcile_names_full_set_pulls_nothing
-            test_restore_of_record_without_known_names_gets_baseline_not_seed
-            test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled
-            test_reconcile_names_older_restamped_title_is_never_pulled
-            test_reconcile_names_in_claude_rename_then_cctrl_rename_stays
-            test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled
-            test_reconcile_names_strips_old_tmux_suffix_after_restore
-            test_reconcile_names_normalises_suffix_on_store_and_compare
-            test_reconcile_names_dry_run_writes_nothing
-            test_reconcile_names_dry_run_reports_would_be_corrections
-            test_reconcile_names_help_and_unknown_flag_write_nothing
-            test_rename_self_resolves_current_session
-            test_rename_self_outside_session_exits_64
-            test_auto_label_for_handoff_prompt_uses_slug
-            echo "ok"
-            exit 0
-            ;;
-        role-phase2)
-            test_fleet_orchestrator_name_and_star_label
-            test_repo_orchestrator_name_and_star_label
-            test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename
-            test_at_legacy_orch_shortcut_launch_gets_orch_name
-            test_unknown_kind_orchestrator_keeps_worker_name
-            test_orchestrator_ignores_prompt_derived_label
-            test_orchestrator_explicit_label_gets_glyph_once
-            test_rename_adds_glyph_for_known_kind_only
-            test_replay_keeps_label_verbatim
-            test_set_role_relabel_writes_canonical_label
-            test_codex_title_skips_repo_prefix_for_star_label
-            test_remote_orchestrator_launch_injects_no_default_purpose
-            test_second_fleet_manager_same_runtime_refused_65
-            test_fleet_launch_never_gets_index_suffix
-            test_old_named_fleet_manager_with_role_blocks_new_one
-            test_fleet_manager_other_runtime_allowed
-            test_repo_and_unknown_kind_sessions_never_trip_guard
-            test_guard_runs_only_after_kind_known
-            test_concurrent_fleet_launch_refused_by_lock
-            test_stale_fleet_lock_is_reclaimed
-            test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid
-            test_fleet_lock_without_pid_file_is_held_only_briefly
-            test_override_env_is_unset_before_tmux_new_session
-            test_allow_second_fleet_manager_env_override
-            test_succeeds_allows_one_handover_and_relabels_predecessor
-            test_succeeds_wrong_session_or_two_live_refused
-            test_dead_fleet_manager_record_does_not_block
-            test_set_role_fleet_goes_through_guard
-            test_restore_bypasses_guard_and_reports_predecessor
-            test_session_ls_warns_on_two_fleet_managers_and_unknown_kind
-            test_succeeds_refused_64_unless_fleet_kind
-            test_failed_health_check_leaves_predecessor_label
-            test_empty_runtime_fleet_manager_counts_as_claude
-            test_set_role_fleet_takes_launch_lock
-            test_set_role_relabel_repo_falls_back_to_pane_path
-            test_fleet_lock_registry_dir_failure_has_own_message
-            test_refusal_wording_per_caller
-            test_restore_keeps_recorded_name_for_tagged_fleet_row
-            test_restore_keeps_recorded_name_for_tagged_repo_row_with_index
-            test_restore_beside_live_session_of_same_name_gets_next_index
-            test_restore_keeps_phase2_style_names
-            test_realign_of_tagged_orchestrator_keeps_recorded_name
-            test_fresh_orchestrator_launch_still_gets_role_name
-            echo "ok"
-            exit 0
-            ;;
-        release-prune)
-            test_release_prune
-            echo "ok"
-            exit 0
-            ;;
-        helper-census)
-            test_helper_census
-            test_helper_census_never_kills_structural
-            test_task_ls_helper_footer
-            echo "ok"
-            exit 0
-            ;;
-        snapshot-ownership)
-            test_snapshot_ownership_policy
-            test_snapshot_restore_default_honors_data_dir
-            test_snapshot_tmux_row_selection
-            test_snapshot_size_controls
-            test_snapshot_reboot_keeps_live_latest
-            test_restore_no_force_structural
-            test_restore_no_pane_inference_structural
-            test_snapshot_excludes_stale_provisional_restore_candidates
-            echo "ok"
-            exit 0
-            ;;
-        *)
-            fail "unknown focused test group: $CCTRL_TEST_ONLY"
-            ;;
-    esac
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "codex-adapter" && "${CCTRL_TEST_ONLY:-}" != "codex-lifecycle" && "${CCTRL_TEST_ONLY:-}" != "app-owned-launch" && "${CCTRL_TEST_ONLY:-}" != "codex-handoff" && "${CCTRL_TEST_ONLY:-}" != "codex-launch-to-app" && "${CCTRL_TEST_ONLY:-}" != "codex-ownership-matrix" ]]; then
-_run_test test_syntax
-_run_test test_no_errexit_unsafe_post_increment
-_run_test test_every_defined_test_is_registered
-_run_test test_no_unreferenced_functions
-_run_test test_release_prune
-_run_test test_helper_census
-_run_test test_helper_census_never_kills_structural
-_run_test test_task_ls_helper_footer
-_run_test test_live_store_guard_diagnostics_and_churn
-_run_test test_tmux_exact_target_lint
-_run_test test_cctrl_launcher_hooks_run_fails_open_on_broken_release
-_run_test test_cctrl_launcher_hooks_run_passes_deliberate_exit_through
-_run_test test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit
-_run_test test_cctrl_launcher_non_hooks_run_commands_fail_loudly
-_run_test test_cctrl_launcher_hooks_run_fails_open_when_release_missing
-_run_test test_cctrl_launcher_hooks_run_passes_exit_2_through
-_run_test test_cctrl_launcher_hooks_run_fails_open_on_exit_42
-_run_test test_cctrl_hooks_run_exits_2_when_target_hook_script_missing
-_run_test test_cctrl_current_swap_is_atomic_on_bsd_mv
-_run_test test_git_dirty_check_matches_self_install_semantics
-_run_test test_launch_args
-_run_test test_launch_env_scrub_claude
-_run_test test_launch_env_scrub_codex
-_run_test test_launch_env_scrub_source_label_not_inherited
-_run_test test_launch_env_scrub_dir_adopted_profile_source_handoff
-_run_test test_shortcut_profile_none_is_explicit_no_overlay
-_run_test test_detached_launch_writes_profile_identity_fields
-_run_test test_profile_settings_file_written_scoped_and_not_in_argv
-_run_test test_profile_settings_none_profile_no_file
-_run_test test_bash_leg_is_honest
-_run_test test_no_shimless_test_path
-_run_test test_runner_filter_and_list
-_run_test test_profile_settings_gc_portable_membership
-_run_test test_profile_settings_gc_removes_dead_keeps_live
-_run_test test_profile_settings_gc_skips_sweep_when_list_sessions_fails
-_run_test test_profile_settings_gc_removes_dead_only_after_age_threshold
-_run_test test_profile_settings_wrapper_removes_file_on_exit
-_run_test test_profile_settings_restart_regenerates_file
-_run_test test_restart_write_failure_warns_but_restarts
-_run_test test_agent_model_py_settings_flag
-_run_test test_agent_prompt_without_default
-_run_test test_profile_prompt_overrides_global_default
-_run_test test_resolve_profile_precedence
-_run_test test_shortcut_foreground_profile_flag_not_leaked_and_overlay_applied
-_run_test test_detached_dir_adopts_shortcut_profile
-_run_test test_local_config_overrides_shared_defaults
-_run_test test_profile_writes_are_owner_only
-_run_test test_profile_use_current_diff
-_run_test test_profile_xdg_config_home
-_run_test test_profile_repo_fallback_and_clash
-_run_test test_profile_shadow_identical_warn_quiet
-_run_test test_profile_shadow_current_warns_when_differs
-_run_test test_profile_find_sole_dir_override
-_run_test test_profile_writes_and_edit_copy_on_write_use_xdg
-_run_test test_profile_migrate
-_run_test test_profile_use_symlinked_user_config
-_run_test test_profile_use_migrates_legacy_active_profile
-_run_test test_profile_current_source_file_and_warnings
-_run_test test_profile_diff_redaction
-_run_test test_profile_auth_backend_table
-_run_test test_profile_bridge_override_table
-_run_test test_launch_skips_bridge_for_non_subscription_backend
-_run_test test_profile_rename_dispatch_and_defaultProfile
-_run_test test_profile_ls_shows_auth_backend_and_current_lists_sessions
-_run_test test_detached_agent_prompt_exports_selection
-_run_test test_detached_arg_parsing
-_run_test test_live_aware_index_picker
-_run_test test_start_defaults_to_tmux
-_run_test test_start_peer_env_and_metadata
-_run_test test_shortcut_no_args_defaults_to_tmux
-_run_test test_purpose_prompt_uses_controlling_tty
-_run_test test_remote_shortcut_injects_purpose
-_run_test test_remote_detach_attach_escapes_exact_target
-_run_test test_attach_prompt_after_start
-_run_test test_codex_statusline_tui_config
-_run_test test_context_names
-_run_test test_bridge_prefix_matches_explicit_name
-_run_test test_dir_launch_adopts_shortcut_alias
-_run_test test_dir_launch_shortcut_collision_deterministic
-_run_test test_dir_launch_skips_manager_shortcut_for_plain_key
-_run_test test_dir_launch_only_manager_shortcut_uses_dir_basename
-_run_test test_role_flags_before_dir_target_with_detach
-_run_test test_role_flags_before_at_target_without_detach
-_run_test test_role_flags_never_reach_child_command
-_run_test test_role_flags_with_foreground_exit_64
-_run_test test_role_flags_with_app_owned_and_launch_to_app_exit_64
-_run_test test_remote_role_value_not_taken_as_purpose
-_run_test test_role_flag_recorded_in_metadata_and_tmux_option
-_run_test test_role_and_orch_kind_invalid_values_exit_64
-_run_test test_orch_kind_flag_implies_orchestrator_role
-_run_test test_role_worker_with_orch_kind_exits_64
-_run_test test_shortcut_role_and_kind_resolve_on_at_launch
-_run_test test_shortcut_orch_kind_without_role_is_orchestrator
-_run_test test_shortcut_invalid_role_exits_64_naming_key
-_run_test test_orch_kind_flag_overrides_shortcut_kind
-_run_test test_dir_launch_never_inherits_shortcut_role
-_run_test test_dir_launch_with_orch_key_and_plain_key_uses_plain_key
-_run_test test_dir_launch_with_only_orch_key_uses_basename
-_run_test test_dir_launch_matches_stored_dir_with_trailing_slash
-_run_test test_dir_launch_skips_role_shortcut_without_legacy_prefix
-_run_test test_legacy_prefixed_key_with_worker_role_is_adopted
-_run_test test_no_env_var_supplies_role_or_kind
-_run_test test_shortcut_add_preserves_role_fields
-_run_test test_shortcut_add_role_flags_set_and_clear
-_run_test test_ask_a1_role_orchestrator_without_kind_exits_78
-_run_test test_ask_a2_shortcut_role_without_kind_exits_78
-_run_test test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78
-_run_test test_ask_a4_set_role_orchestrator_without_kind_exits_78
-_run_test test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78
-_run_test test_non_interactive_never_reads_stdin
-_run_test test_no_input_flag_and_env_force_78_on_pty
-_run_test test_agent_env_markers_force_78_on_pty
-_run_test test_ask_tty_accepts_fleet
-_run_test test_ask_tty_accepts_repo
-_run_test test_ask_tty_prompts_when_stdout_is_captured
-_run_test test_ask_tty_three_invalid_answers_exit_78
-_run_test test_ask_tty_read_timeout_exits_78
-_run_test test_ask_tty_abort_exits_78_nothing_launched
-_run_test test_remote_preflight_forwards_resolved_role_and_kind
-_run_test test_remote_ambiguous_prompts_locally_and_forwards_kind
-_run_test test_remote_ambiguous_non_interactive_returns_78_with_message
-_run_test test_remote_sets_no_input_on_remote_side
-_run_test test_remote_old_cctrl_with_role_flags_exits_69
-_run_test test_remote_dir_launch_without_role_flags_skips_preflight
-_run_test test_remote_preflight_exit_0_without_role_line_launches_unchanged
-_run_test test_remote_preflight_66_falls_through_to_launch
-_run_test test_remote_foreground_skips_preflight_and_role_flags
-_run_test test_remote_preflight_other_exit_code_is_relayed
-_run_test test_set_role_updates_live_session_and_keeps_label
-_run_test test_set_role_on_provisional_record
-_run_test test_set_role_clear_removes_fields
-_run_test test_relaunch_with_new_role_replaces_recorded_role
-_run_test test_roleless_relaunch_keeps_recorded_role_and_kind
-_run_test test_snapshot_launch_flags_carry_role_and_kind
-_run_test test_restore_replays_role_and_kind
-_run_test test_restore_legacy_row_infers_orchestrator_from_tmux_name
-_run_test test_restore_unknown_kind_row_never_asks
-_run_test test_restore_old_snapshot_does_not_erase_recorded_kind
-_run_test test_restore_current_record_beats_snapshot_row_role
-_run_test test_recorded_worker_beats_legacy_name_inference
-_run_test test_ask_rechecks_tty_at_read_site
-_run_test test_restore_prints_reason_for_failed_row
-_run_test test_realign_flags_carry_role_and_kind
-_run_test test_realign_keeps_recorded_tmux_name
-_run_test test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind
-_run_test test_recorded_worker_beats_legacy_name_inference_live
-_run_test test_session_ls_json_exposes_role_and_kind
-_run_test test_fleet_orchestrator_name_and_star_label
-_run_test test_repo_orchestrator_name_and_star_label
-_run_test test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename
-_run_test test_at_legacy_orch_shortcut_launch_gets_orch_name
-_run_test test_unknown_kind_orchestrator_keeps_worker_name
-_run_test test_orchestrator_ignores_prompt_derived_label
-_run_test test_orchestrator_explicit_label_gets_glyph_once
-_run_test test_rename_adds_glyph_for_known_kind_only
-_run_test test_replay_keeps_label_verbatim
-_run_test test_set_role_relabel_writes_canonical_label
-_run_test test_codex_title_skips_repo_prefix_for_star_label
-_run_test test_remote_orchestrator_launch_injects_no_default_purpose
-_run_test test_second_fleet_manager_same_runtime_refused_65
-_run_test test_fleet_launch_never_gets_index_suffix
-_run_test test_old_named_fleet_manager_with_role_blocks_new_one
-_run_test test_fleet_manager_other_runtime_allowed
-_run_test test_repo_and_unknown_kind_sessions_never_trip_guard
-_run_test test_guard_runs_only_after_kind_known
-_run_test test_concurrent_fleet_launch_refused_by_lock
-_run_test test_stale_fleet_lock_is_reclaimed
-_run_test test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid
-_run_test test_fleet_lock_without_pid_file_is_held_only_briefly
-_run_test test_override_env_is_unset_before_tmux_new_session
-_run_test test_allow_second_fleet_manager_env_override
-_run_test test_succeeds_allows_one_handover_and_relabels_predecessor
-_run_test test_succeeds_wrong_session_or_two_live_refused
-_run_test test_dead_fleet_manager_record_does_not_block
-_run_test test_set_role_fleet_goes_through_guard
-_run_test test_restore_bypasses_guard_and_reports_predecessor
-_run_test test_session_ls_warns_on_two_fleet_managers_and_unknown_kind
-_run_test test_succeeds_refused_64_unless_fleet_kind
-_run_test test_failed_health_check_leaves_predecessor_label
-_run_test test_empty_runtime_fleet_manager_counts_as_claude
-_run_test test_set_role_fleet_takes_launch_lock
-_run_test test_set_role_relabel_repo_falls_back_to_pane_path
-_run_test test_fleet_lock_registry_dir_failure_has_own_message
-_run_test test_refusal_wording_per_caller
-_run_test test_restore_keeps_recorded_name_for_tagged_fleet_row
-_run_test test_restore_keeps_recorded_name_for_tagged_repo_row_with_index
-_run_test test_restore_beside_live_session_of_same_name_gets_next_index
-_run_test test_restore_keeps_phase2_style_names
-_run_test test_reconcile_names_legacy_record_without_known_names_is_not_pulled
-_run_test test_reconcile_names_writes_baseline_once
-_run_test test_reconcile_names_does_not_pull_launch_name_restamp
-_run_test test_reconcile_names_cctrl_label_stays_after_cctrl_rename
-_run_test test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator
-_run_test test_reconcile_names_cctrl_rename_after_pull_stays
-_run_test test_reconcile_names_no_pull_when_baseline_cannot_be_written
-_run_test test_restore_keeps_known_names_and_pulls_nothing
-_run_test test_reconcile_names_full_set_pulls_nothing
-_run_test test_restore_of_record_without_known_names_gets_baseline_not_seed
-_run_test test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled
-_run_test test_reconcile_names_older_restamped_title_is_never_pulled
-_run_test test_reconcile_names_in_claude_rename_then_cctrl_rename_stays
-_run_test test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled
-_run_test test_reconcile_names_strips_old_tmux_suffix_after_restore
-_run_test test_reconcile_names_normalises_suffix_on_store_and_compare
-_run_test test_reconcile_names_dry_run_writes_nothing
-_run_test test_reconcile_names_dry_run_reports_would_be_corrections
-_run_test test_reconcile_names_help_and_unknown_flag_write_nothing
-_run_test test_rename_self_resolves_current_session
-_run_test test_rename_self_outside_session_exits_64
-_run_test test_auto_label_for_handoff_prompt_uses_slug
-_run_test test_realign_of_tagged_orchestrator_keeps_recorded_name
-_run_test test_fresh_orchestrator_launch_still_gets_role_name
-_run_test test_dir_launch_no_shortcut_match_unchanged
-_run_test test_session_doctor_classifies_bridge
-_run_test test_session_doctor_detects_collision
-_run_test test_session_doctor_quarantines_orphan_codex_writer_lock
-_run_test test_session_doctor_realign_reports_hint
-_run_test test_session_doctor_realign_fix_emits_relaunch
-_run_test test_session_doctor_realign_skips_busy
-_run_test test_session_doctor_realign_idempotent
-_run_test test_session_doctor_realign_real_relaunch
-_run_test test_session_doctor_realign_carries_profile_model_peer
-_run_test test_launch_flags_for_prefers_metadata_profile
-_run_test test_session_autoheal_dry_run_selects_dead_and_no_repair
-_run_test test_session_autoheal_skips_unsent_draft
-_run_test test_session_autoheal_skips_glyph_draft
-_run_test test_session_autoheal_skips_busy
-_run_test test_session_autoheal_skips_copy_mode
-_run_test test_session_autoheal_heals_clean_dead_bridge
-_run_test test_session_autoheal_ignores_live_bridge
-_run_test test_session_bridge_state_na_backend
-_run_test test_session_bridge_state_subscription_dead_still_heals
-_run_test test_session_bridge_state_pre_change_inferred_and_unknown
-_run_test test_session_bridge_state_never_prints_ps_env
-_run_test test_session_autoheal_install_uninstall_plist
-_run_test test_session_list_profile_column_mixed
-_run_test test_statusline_bridge_label_and_rate_limit_gate
-_run_test test_session_log_concurrency_regression
-_run_test test_hooks_run_stop_tees_stdin_to_notify_and_session_log
-_run_test test_session_list_codex_default_model
-_run_test test_session_list_agent_not_mislabelled_by_prompt
-_run_test test_session_list_agent_prefers_recorded_metadata
-_run_test test_session_list_malformed_metadata_uses_unknown_defaults
-_run_test test_session_list_last_active_from_updated_at
-_run_test test_session_list_last_active_from_transcript_mtime
-_run_test test_session_list_unresolvable_session
-_run_test test_session_list_sorts_by_last_active
-_run_test test_session_list_base_state
-_run_test test_session_list_recap
-_run_test test_session_list_rich_state
-_run_test test_session_pane_has_draft_glyph_fixtures
-_run_test test_session_rich_state_detects_glyph_draft
-_run_test test_pane_draft_plan086_followups
-_run_test test_pane_draft_plan086_hotfix_titled_divider
-_run_test test_strip_sgr_shared_regex
-_run_test test_needs_me_digest
-_run_test test_host_registry_crud
-_run_test test_fleet_merges_multiple_hosts
-_run_test test_fleet_sorts_by_recency_across_hosts
-_run_test test_fleet_offline_host_non_fatal
-_run_test test_fleet_version_skew_missing_fields
-_run_test test_fleet_v2_provider_neutral_federation
-_run_test test_peer_registry_manual_alias_and_identity
-_run_test test_peer_derived_tmux_and_shadowing
-_run_test test_peer_validation_and_errors
-_run_test test_peer_alias_derived_requires_manual_registration
-_run_test test_peer_tmux_missing_still_resolves_manual
-_run_test test_peer_mailbox_send_list_show
-_run_test test_peer_sender_snapshot
-_run_test test_peer_mailbox_ack_authorization_and_states
-_run_test test_peer_mailbox_unknowns_and_identity
-# SKIPPED: hangs on macOS bash 3.2 (flock issue) — pre-existing, not 051/052
-# test_peer_mailbox_concurrency_and_stale_lock
-_run_test test_peer_polling_json_contracts
-_run_test test_peer_polling_identity_and_errors
-_run_test test_peer_mcp_bridge_stdio
-_run_test test_peer_overview
-_run_test test_peer_deliver_tmux_nudge_lifecycle
-_run_test test_peer_deliver_addressee_guard_replaced_occupant
-_run_test test_peer_deliver_busy_no_submit_and_inline
-_run_test test_peer_inline_envelope_and_ack
-_run_test test_peer_inline_envelope_reachability
-_run_test test_peer_inline_paste_failure_keeps_queued
-_run_test test_peer_inline_delivery_idempotent
-_run_test test_peer_inline_pastes_into_recipient_pane
-_run_test test_peer_reachability_class_is_pure
-_run_test test_peer_inline_body_bytes_preserved
-_run_test test_peer_inline_delivered_appears_in_stale_sweep
-_run_test test_peer_deliver_claude_modal_detection
-_run_test test_peer_deliver_codex_modal_detection
-_run_test test_peer_deliver_failures_all_and_concurrency
-_run_test test_peer_orchestrator_status_nudge_watch
-_run_test test_peer_gc_retention_and_doctor
-_run_test test_peer_doorbell_hook
-_run_test test_peer_send_deliver_outcomes
-_run_test test_peer_send_sender_binding_refuses_mismatch
-_run_test test_peer_send_refuses_when_caller_tmux_session_unresolved
-_run_test test_peer_send_recipient_created_at_is_audit_only
-_run_test test_peer_send_sender_binding_applies_to_remote_recipients
-_run_test test_peer_reply_core
-_run_test test_peer_reply_ack_and_refusals
-_run_test test_peer_reply_single_enumeration
-_run_test test_peer_mcp_send_deliver_outcomes
-_run_test test_session_close_self_graceful
-_run_test test_session_close_stale_tmux_refuses_current
-_run_test test_session_current_identity_json
-_run_test test_session_stop_exact_identity
-_run_test test_session_terminate_records_closed
-_run_test test_session_close_reaps_pane_processes
-_run_test test_tmux_sockets_left_behind
-_run_test test_session_attest_live_tmux_process_matches
-_run_test test_session_attest_direct_metadata
-_run_test test_session_attest_stale_tmux_session_missing
-_run_test test_session_attest_malformed_metadata_fails_human_mode
-_run_test test_session_runtime_mcp_attests_fixed_session
-_run_test test_session_say_submit_and_no_submit
-_run_test test_session_say_body_file_preserves_newlines
-_run_test test_session_say_long_body_bracketed_exact
-_run_test test_tmux_paste_buffer_names_unique_per_invocation
-_run_test test_peer_socket_deliver_payload_exact
-_run_test test_session_say_modal_deferral_not_overridden_by_force_busy
-_run_test test_session_say_claude_modal_blocks_and_benign_pane_passes
-_run_test test_session_say_unknown_readiness_requires_force_busy
-_run_test test_session_say_errors
-_run_test test_peer_session_resolves_and_alias
-_run_test test_peer_session_offline_unknown_stale
-_run_test test_peer_attach_targets_resolved_session
-_run_test test_peer_say_delegates_and_no_mailbox
-_run_test test_peer_help_agent
-_run_test test_peer_mcp_say_peer
-_run_test test_peer_direct_non_local_host_hint
-_run_test test_peer_attach_remote_forwarding_tty
-_run_test test_peer_ls_shows_session_and_status
-_run_test test_session_close_named_immediate
-_run_test test_session_kill_exact_target_no_prefix_match
-_run_test test_session_close_exact_target_no_prefix_match
-_run_test test_session_close_outside_requires_name
-_run_test test_session_prune_never_prompted_claude
-_run_test test_session_prune_fresh_active_not_candidate
-_run_test test_session_prune_codex_no_claude_transcript_bug_guard
-_run_test test_session_prune_codex_never_prompted
-_run_test test_codex_rename_updates_app_title
-_run_test test_codex_rename_prefers_prompt_match_over_stale_id
-_run_test test_session_app_ls_codex_records
-_run_test test_codex_wrapper_exit_preserves_app_task
-_run_test test_codex_wrapper_resume_and_restart_args
-_run_test test_codex_close_archives_and_resolves_rollout_identity
-_run_test test_session_release_to_app_quarantines_stale_codex_lock
-_run_test test_session_prune_dry_run_closes_nothing
-_run_test test_session_prune_excludes_self_and_attached
-_run_test test_session_prune_claude_long_transcript_user_turn_not_flagged
-_run_test test_session_prune_yes_caps_large_batch
-_run_test test_session_mark_closed_provisional_launch_record
-_run_test test_session_task_records_for_name_launch_liveness_gate
-_run_test test_task_record_close_provisional_honors_digest_guard
-_run_test test_session_record_terminated_closes_fresh_anchored_provisional
-_run_test test_snapshot_excludes_stale_provisional_restore_candidates
-_run_test test_usage_cost_fixtures
-_run_test test_project_name_derives_home_at_runtime
-_run_test test_peer_contract_docs
-_run_test test_update_metadata_field_preserves_keys
-_run_test test_update_metadata_field_missing_record
-_run_test test_update_metadata_field_malformed_json
-_run_test test_backfill_ids_fills_resume_flag
-_run_test test_backfill_ids_refuses_uuid_in_cwd
-_run_test test_backfill_ids_already_set
-_run_test test_backfill_ids_dry_run_writes_nothing
-_run_test test_backfill_ids_idempotent
-_run_test test_backfill_ids_json
-_run_test test_active_session_count_excludes_unmanaged
-_run_test test_session_list_refresh_writes_on_change
-_run_test test_session_list_refresh_skips_when_unchanged
-_run_test test_launch_resume_captures_conversation_id
-_run_test test_launch_stdout_closes_promptly
-_run_test test_launch_metadata_write_warns
-_run_test test_resume_no_uuid_no_conversation_id
-_run_test test_session_write_metadata_includes_new_fields
-_run_test test_task_record_host_id_is_stable_exclusive_and_private
-_run_test test_task_record_schema_v2_and_provisional_promotion
-_run_test test_task_record_legacy_validation_and_lazy_promotion
-_run_test test_task_record_merge_conflict_preserves_evidence
-_run_test test_task_record_relaunch_moves_terminal_anchors
-_run_test test_task_record_relaunch_moves_profile_identity
-_run_test test_task_record_relaunch_reclaims_and_reopens
-_run_test test_task_resolve_conflicts_digest_guarded
-_run_test test_tmux_inventory_survives_sanitized_formats
-_run_test test_task_record_identity_independent_close_continues
-_run_test test_task_registry_atomic_concurrent_updates
-_run_test test_task_registry_replay_order_and_guards
-_run_test test_task_registry_lock_stale_timeout_and_release_token
-_run_test test_task_registry_structural_boundary
-_run_test test_codex_reconcile_ownership_evidence
-_run_test test_snapshot_header_and_session_shape
-_run_test test_snapshot_initial_prompt_absent
-_run_test test_snapshot_empty_fleet_guard_preserves
-_run_test test_snapshot_allow_empty_overrides
-_run_test test_snapshot_history_and_latest_agree
-_run_test test_snapshot_retention_pruning
-_run_test test_snapshot_no_tmux_mutation
-_run_test test_snapshot_tmux_absent_preserves
-_run_test test_snapshot_first_run_empty_writes
-_run_test test_snapshot_managed_matches_session_ls
-_run_test test_snapshot_launch_flags_round_trip
-_run_test test_snapshot_conversation_id_from_session_id
-_run_test test_restore_only_filter
-_run_test test_restore_cap_on_total
-_run_test test_restore_null_conversation_id_skipped
-_run_test test_restore_dry_run_spawns_nothing
-_run_test test_restore_gate_stops_below_threshold
-_run_test test_restore_limit_caps_spawns
-_run_test test_restore_no_tty_no_yes_refused
-_run_test test_restore_unknown_schema_refused
-_run_test test_restore_stale_snapshot_refused
-_run_test test_restore_host_mismatch_refused
-_run_test test_restore_cap_fails_closed
-_run_test test_restore_wave_pacing
-_run_test test_restore_already_live_skipped
-_run_test test_restore_launch_config_replay
-_run_test test_restore_already_live_record_join
-_run_test test_restore_exit_codes
-_run_test test_snapshot_ownership_policy
-_run_test test_snapshot_restore_default_honors_data_dir
-_run_test test_snapshot_tmux_row_selection
-_run_test test_snapshot_size_controls
-_run_test test_snapshot_reboot_keeps_live_latest
-_run_test test_restore_no_force_structural
-_run_test test_restore_no_pane_inference_structural
-fi
 
 # =====================================================================
 # Health check pattern table & health check tests (plan 056)
@@ -17843,109 +17156,128 @@ run_codex_ownership_matrix_paths() {
     while IFS= read -r path; do
         case "$path" in
             cctrl-terminal-worker)
-                test_detached_arg_parsing
-                test_start_defaults_to_tmux
-                test_codex_handoff_state_machine
+                _run_test test_detached_arg_parsing
+                _run_test test_start_defaults_to_tmux
+                _run_test test_codex_handoff_state_machine
                 ;;
             cctrl-app-owned)
-                test_app_owned_launch
+                _run_test test_app_owned_launch
                 ;;
             native-app)
-                test_codex_lifecycle_ingestion
-                test_codex_reconcile_ownership_evidence
-                test_task_inventory_provider_neutral_readonly
+                _run_test test_codex_lifecycle_ingestion
+                _run_test test_codex_reconcile_ownership_evidence
+                _run_test test_task_inventory_provider_neutral_readonly
                 ;;
             *) fail "unknown ownership-matrix path: $path" ;;
         esac
     done < <(jq -r '.paths[].path' "$fixture")
 }
 
-if [[ "${CCTRL_TEST_ONLY:-}" == "codex-ownership-matrix" ]]; then
-    ownership_live_before="$(ownership_live_store_manifest)"
-    test_codex_ownership_matrix_contract
-    test_codex_lifecycle_fixture_contract
-    run_codex_ownership_matrix_paths
-    test_fleet_v2_provider_neutral_federation
-    test_snapshot_ownership_policy
-    ownership_live_after="$(ownership_live_store_manifest)"
-    assert_live_store_unchanged "$ownership_live_before" "$ownership_live_after" \
-        "three-path ownership matrix changed the real cctrl live store"
-    echo "ok: three ownership paths are isolated, single-writer, exact-id, federated, and restore-safe"
-    echo "ok"
+# Groups as data (plan 105 P4): `_group_tests <group>` prints the tests a
+# CCTRL_TEST_ONLY group runs, in order. codex-ownership-matrix has its own
+# block below (live-store manifest around the run); provider-neutral and
+# codex-adapter add a python unittest step next to their tests.
+_group_tests() {
+    case "$1" in
+        role-skills) printf '%s\n' test_role_skills_ask_rule ;;
+        bash-leg) printf '%s\n' test_bash_leg_is_honest test_no_shimless_test_path test_profile_settings_gc_portable_membership ;;
+        session-prune) printf '%s\n' test_session_prune_never_prompted_claude test_session_prune_fresh_active_not_candidate test_session_prune_codex_no_claude_transcript_bug_guard test_session_prune_codex_never_prompted test_session_prune_dry_run_closes_nothing test_session_prune_claude_long_transcript_user_turn_not_flagged test_session_prune_yes_caps_large_batch ;;
+        codex-adapter) printf '%s\n' test_codex_app_server_adapter ;;
+        provider-neutral) printf '%s\n' test_session_list_codex_default_model test_session_list_agent_not_mislabelled_by_prompt test_session_list_agent_prefers_recorded_metadata test_session_list_malformed_metadata_uses_unknown_defaults ;;
+        task-inventory) printf '%s\n' test_task_inventory_provider_neutral_readonly ;;
+        codex-reconcile) printf '%s\n' test_codex_reconcile_ownership_evidence ;;
+        codex-lifecycle) printf '%s\n' test_codex_lifecycle_fixture_contract test_codex_lifecycle_ingestion ;;
+        app-owned-launch) printf '%s\n' test_app_owned_launch ;;
+        codex-handoff) printf '%s\n' test_codex_handoff_state_machine ;;
+        codex-launch-to-app) printf '%s\n' test_codex_launch_to_app_workflow ;;
+        codex-ownership-matrix) ;;
+        session-attest) printf '%s\n' test_session_attest_live_tmux_process_matches test_session_attest_direct_metadata test_session_attest_stale_tmux_session_missing test_session_attest_malformed_metadata_fails_human_mode test_session_runtime_mcp_attests_fixed_session ;;
+        session-stop-exact) printf '%s\n' test_session_stop_exact_identity test_session_terminate_records_closed test_session_close_reaps_pane_processes test_tmux_sockets_left_behind test_session_mark_closed_provisional_launch_record test_session_task_records_for_name_launch_liveness_gate test_task_record_close_provisional_honors_digest_guard test_session_record_terminated_closes_fresh_anchored_provisional ;;
+        task-records) printf '%s\n' test_task_record_host_id_is_stable_exclusive_and_private test_task_record_schema_v2_and_provisional_promotion test_task_record_legacy_validation_and_lazy_promotion test_task_record_merge_conflict_preserves_evidence test_task_record_relaunch_moves_terminal_anchors test_task_record_relaunch_reclaims_and_reopens test_task_resolve_conflicts_digest_guarded test_task_record_identity_independent_close_continues test_task_registry_atomic_concurrent_updates test_task_registry_replay_order_and_guards test_task_registry_lock_stale_timeout_and_release_token test_task_registry_structural_boundary ;;
+        task-record-compat) printf '%s\n' test_codex_rename_updates_app_title test_codex_rename_prefers_prompt_match_over_stale_id test_session_app_ls_codex_records test_codex_close_archives_and_resolves_rollout_identity test_session_release_to_app_quarantines_stale_codex_lock test_update_metadata_field_preserves_keys test_backfill_ids_fills_resume_flag test_backfill_ids_idempotent test_session_list_refresh_writes_on_change test_session_list_refresh_skips_when_unchanged ;;
+        task-record-launch) printf '%s\n' test_detached_arg_parsing test_start_peer_env_and_metadata test_live_aware_index_picker test_launch_resume_captures_conversation_id test_resume_no_uuid_no_conversation_id test_session_write_metadata_includes_new_fields ;;
+        task-record-launch-basic) printf '%s\n' test_detached_arg_parsing ;;
+        task-record-launch-peer) printf '%s\n' test_start_peer_env_and_metadata test_live_aware_index_picker ;;
+        task-record-launch-peer-only) printf '%s\n' test_start_peer_env_and_metadata ;;
+        task-record-launch-index) printf '%s\n' test_live_aware_index_picker ;;
+        task-record-launch-resume) printf '%s\n' test_launch_resume_captures_conversation_id test_resume_no_uuid_no_conversation_id test_session_write_metadata_includes_new_fields ;;
+        task-record-list) printf '%s\n' test_session_list_codex_default_model test_session_list_agent_not_mislabelled_by_prompt test_session_list_agent_prefers_recorded_metadata test_session_list_malformed_metadata_uses_unknown_defaults test_session_list_refresh_writes_on_change test_session_list_refresh_skips_when_unchanged ;;
+        fleet-v2) printf '%s\n' test_fleet_merges_multiple_hosts test_fleet_sorts_by_recency_across_hosts test_fleet_offline_host_non_fatal test_fleet_version_skew_missing_fields test_fleet_v2_provider_neutral_federation ;;
+        health-check) printf '%s\n' test_health_check_patterns_syntax test_health_check_pattern_matching test_health_check_transition_guard test_health_check_needs_human_path test_health_check_timeout_path test_health_check_ready_requires_visible_prompt test_health_check_startup_selectors_need_human test_health_check_detects_startup_exit test_session_pane_has_dialog_refactored ;;
+        pane-draft) printf '%s\n' test_session_pane_has_draft_glyph_fixtures test_session_rich_state_detects_glyph_draft test_session_autoheal_skips_glyph_draft test_pane_draft_plan086_followups test_pane_draft_plan086_hotfix_titled_divider test_strip_sgr_shared_regex ;;
+        snapshot-restore-legacy) printf '%s\n' test_snapshot_header_and_session_shape test_snapshot_initial_prompt_absent test_snapshot_empty_fleet_guard_preserves test_snapshot_allow_empty_overrides test_snapshot_history_and_latest_agree test_snapshot_retention_pruning test_snapshot_no_tmux_mutation test_snapshot_tmux_absent_preserves test_snapshot_first_run_empty_writes test_snapshot_managed_matches_session_ls test_snapshot_launch_flags_round_trip test_snapshot_conversation_id_from_session_id test_restore_only_filter test_restore_cap_on_total test_restore_null_conversation_id_skipped test_restore_dry_run_spawns_nothing test_restore_gate_stops_below_threshold test_restore_limit_caps_spawns test_restore_no_tty_no_yes_refused test_restore_unknown_schema_refused test_restore_stale_snapshot_refused test_restore_host_mismatch_refused test_restore_cap_fails_closed test_restore_wave_pacing test_restore_already_live_skipped test_restore_launch_config_replay test_restore_already_live_record_join test_restore_exit_codes ;;
+        role-phase1) printf '%s\n' test_role_flags_before_dir_target_with_detach test_role_flags_before_at_target_without_detach test_role_flags_never_reach_child_command test_role_flags_with_foreground_exit_64 test_role_flags_with_app_owned_and_launch_to_app_exit_64 test_remote_role_value_not_taken_as_purpose test_role_flag_recorded_in_metadata_and_tmux_option test_role_and_orch_kind_invalid_values_exit_64 test_orch_kind_flag_implies_orchestrator_role test_role_worker_with_orch_kind_exits_64 test_shortcut_role_and_kind_resolve_on_at_launch test_shortcut_orch_kind_without_role_is_orchestrator test_shortcut_invalid_role_exits_64_naming_key test_orch_kind_flag_overrides_shortcut_kind test_dir_launch_never_inherits_shortcut_role test_dir_launch_with_orch_key_and_plain_key_uses_plain_key test_dir_launch_with_only_orch_key_uses_basename test_dir_launch_matches_stored_dir_with_trailing_slash test_dir_launch_skips_role_shortcut_without_legacy_prefix test_legacy_prefixed_key_with_worker_role_is_adopted test_no_env_var_supplies_role_or_kind test_shortcut_add_preserves_role_fields test_shortcut_add_role_flags_set_and_clear test_ask_a1_role_orchestrator_without_kind_exits_78 test_ask_a2_shortcut_role_without_kind_exits_78 test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78 test_ask_a4_set_role_orchestrator_without_kind_exits_78 test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78 test_non_interactive_never_reads_stdin test_no_input_flag_and_env_force_78_on_pty test_agent_env_markers_force_78_on_pty test_ask_tty_accepts_fleet test_ask_tty_accepts_repo test_ask_tty_prompts_when_stdout_is_captured test_ask_tty_three_invalid_answers_exit_78 test_ask_tty_read_timeout_exits_78 test_ask_tty_abort_exits_78_nothing_launched test_remote_preflight_forwards_resolved_role_and_kind test_remote_ambiguous_prompts_locally_and_forwards_kind test_remote_ambiguous_non_interactive_returns_78_with_message test_remote_sets_no_input_on_remote_side test_remote_old_cctrl_with_role_flags_exits_69 test_remote_dir_launch_without_role_flags_skips_preflight test_remote_preflight_exit_0_without_role_line_launches_unchanged test_remote_preflight_66_falls_through_to_launch test_remote_foreground_skips_preflight_and_role_flags test_remote_preflight_other_exit_code_is_relayed test_set_role_updates_live_session_and_keeps_label test_set_role_on_provisional_record test_set_role_clear_removes_fields test_relaunch_with_new_role_replaces_recorded_role test_roleless_relaunch_keeps_recorded_role_and_kind test_snapshot_launch_flags_carry_role_and_kind test_restore_replays_role_and_kind test_restore_legacy_row_infers_orchestrator_from_tmux_name test_restore_unknown_kind_row_never_asks test_restore_old_snapshot_does_not_erase_recorded_kind test_restore_current_record_beats_snapshot_row_role test_recorded_worker_beats_legacy_name_inference test_ask_rechecks_tty_at_read_site test_restore_prints_reason_for_failed_row test_realign_flags_carry_role_and_kind test_realign_keeps_recorded_tmux_name test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind test_recorded_worker_beats_legacy_name_inference_live test_session_ls_json_exposes_role_and_kind ;;
+        role-phase3) printf '%s\n' test_reconcile_names_legacy_record_without_known_names_is_not_pulled test_reconcile_names_writes_baseline_once test_reconcile_names_does_not_pull_launch_name_restamp test_reconcile_names_cctrl_label_stays_after_cctrl_rename test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator test_reconcile_names_cctrl_rename_after_pull_stays test_reconcile_names_no_pull_when_baseline_cannot_be_written test_restore_keeps_known_names_and_pulls_nothing test_reconcile_names_full_set_pulls_nothing test_restore_of_record_without_known_names_gets_baseline_not_seed test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled test_reconcile_names_older_restamped_title_is_never_pulled test_reconcile_names_in_claude_rename_then_cctrl_rename_stays test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled test_reconcile_names_strips_old_tmux_suffix_after_restore test_reconcile_names_normalises_suffix_on_store_and_compare test_reconcile_names_dry_run_writes_nothing test_reconcile_names_dry_run_reports_would_be_corrections test_reconcile_names_help_and_unknown_flag_write_nothing test_rename_self_resolves_current_session test_rename_self_outside_session_exits_64 test_auto_label_for_handoff_prompt_uses_slug ;;
+        role-phase2) printf '%s\n' test_fleet_orchestrator_name_and_star_label test_repo_orchestrator_name_and_star_label test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename test_at_legacy_orch_shortcut_launch_gets_orch_name test_unknown_kind_orchestrator_keeps_worker_name test_orchestrator_ignores_prompt_derived_label test_orchestrator_explicit_label_gets_glyph_once test_rename_adds_glyph_for_known_kind_only test_replay_keeps_label_verbatim test_set_role_relabel_writes_canonical_label test_codex_title_skips_repo_prefix_for_star_label test_remote_orchestrator_launch_injects_no_default_purpose test_second_fleet_manager_same_runtime_refused_65 test_fleet_launch_never_gets_index_suffix test_old_named_fleet_manager_with_role_blocks_new_one test_fleet_manager_other_runtime_allowed test_repo_and_unknown_kind_sessions_never_trip_guard test_guard_runs_only_after_kind_known test_concurrent_fleet_launch_refused_by_lock test_stale_fleet_lock_is_reclaimed test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid test_fleet_lock_without_pid_file_is_held_only_briefly test_override_env_is_unset_before_tmux_new_session test_allow_second_fleet_manager_env_override test_succeeds_allows_one_handover_and_relabels_predecessor test_succeeds_wrong_session_or_two_live_refused test_dead_fleet_manager_record_does_not_block test_set_role_fleet_goes_through_guard test_restore_bypasses_guard_and_reports_predecessor test_session_ls_warns_on_two_fleet_managers_and_unknown_kind test_succeeds_refused_64_unless_fleet_kind test_failed_health_check_leaves_predecessor_label test_empty_runtime_fleet_manager_counts_as_claude test_set_role_fleet_takes_launch_lock test_set_role_relabel_repo_falls_back_to_pane_path test_fleet_lock_registry_dir_failure_has_own_message test_refusal_wording_per_caller test_restore_keeps_recorded_name_for_tagged_fleet_row test_restore_keeps_recorded_name_for_tagged_repo_row_with_index test_restore_beside_live_session_of_same_name_gets_next_index test_restore_keeps_phase2_style_names test_realign_of_tagged_orchestrator_keeps_recorded_name test_fresh_orchestrator_launch_still_gets_role_name ;;
+        release-prune) printf '%s\n' test_release_prune ;;
+        helper-census) printf '%s\n' test_helper_census test_helper_census_never_kills_structural test_task_ls_helper_footer ;;
+        snapshot-ownership) printf '%s\n' test_snapshot_ownership_policy test_snapshot_restore_default_honors_data_dir test_snapshot_tmux_row_selection test_snapshot_size_controls test_snapshot_reboot_keeps_live_latest test_restore_no_force_structural test_restore_no_pane_inference_structural test_snapshot_excludes_stale_provisional_restore_candidates ;;
+        *) return 1 ;;
+    esac
+}
+
+# --- Registry and run (plan 105 P4) -------------------------------------
+# A test is any `test_*()` definition in this file (awk, source order; not
+# `declare -F`, which sorts alphabetically on bash 3.2). Three small explicit
+# lists, each entry registered with a reason:
+#   RUN_FIRST  runs before everything else, also in a focused group
+#   SKIP       defined but never run
+#   RUN_LAST   runs after every discovered test
+_RT_RUN_FIRST=""
+_RT_SKIP=""
+_RT_RUN_LAST=""
+_rt_register() { # RUN_FIRST|SKIP|RUN_LAST <test_name> '<reason>'  (test_every_defined_test_is_registered checks the reason is there)
+    case "$1" in
+        RUN_FIRST) _RT_RUN_FIRST="$_RT_RUN_FIRST $2" ;;
+        SKIP) _RT_SKIP="$_RT_SKIP $2" ;;
+        RUN_LAST) _RT_RUN_LAST="$_RT_RUN_LAST $2" ;;
+        *) echo "run-tests.sh: bad registry kind: $1" >&2; exit 64 ;;
+    esac
+}
+_rt_register RUN_FIRST test_tmux_default_server_is_private 'before any test, focused group or not: proves a bare tmux hits the private server (plan 071 p5 incident)'
+_rt_register SKIP test_peer_mailbox_concurrency_and_stale_lock 'hangs on macOS bash 3.2 (flock issue), pre-existing, not plan 051/052'
+_rt_register SKIP test_task_inventory_provider_neutral_readonly 'fails at HEAD d0f93f0 too (its fake tmux list-sessions output is rejected as invalid-session-identity); it was only ever run through the task-inventory and codex-ownership-matrix groups. Plan 105 P4c: fixing the stale fixture is a follow-up'
+_rt_register RUN_LAST test_tmux_sockets_left_behind 'backstop: fails if any earlier test left a socket in the private dir, so it must run after all of them'
+_rt_discover() { # discovered test names in source order, minus the three lists
+    awk -v special="$_RT_RUN_FIRST $_RT_SKIP $_RT_RUN_LAST" '
+        BEGIN { n = split(special, a, " "); for (i = 1; i <= n; i++) sp[a[i]] = 1 }
+        /^test_[A-Za-z0-9_]+\(\)/ { name = $0; sub(/\(\).*/, "", name); if (!(name in sp)) print name }
+    ' "$_RT_SELF"
+}
+
+_rt_n=""
+for _rt_n in $_RT_RUN_FIRST; do _run_test --always "$_rt_n"; done
+
+if [[ -n "${CCTRL_TEST_ONLY:-}" ]]; then
+    _group_tests "$CCTRL_TEST_ONLY" >/dev/null || fail "unknown focused test group: $CCTRL_TEST_ONLY"
+    case "$CCTRL_TEST_ONLY" in
+        provider-neutral)
+            python3 -m unittest discover -s "$ROOT/tests" -p 'test_*.py'
+            ;;
+        codex-ownership-matrix)
+            ownership_live_before="$(ownership_live_store_manifest)"
+            _run_test test_codex_ownership_matrix_contract
+            _run_test test_codex_lifecycle_fixture_contract
+            run_codex_ownership_matrix_paths
+            _run_test test_fleet_v2_provider_neutral_federation
+            _run_test test_snapshot_ownership_policy
+            ownership_live_after="$(ownership_live_store_manifest)"
+            assert_live_store_unchanged "$ownership_live_before" "$ownership_live_after" \
+                "three-path ownership matrix changed the real cctrl live store"
+            echo "ok: three ownership paths are isolated, single-writer, exact-id, federated, and restore-safe"
+            ;;
+    esac
+    for _rt_n in $(_group_tests "$CCTRL_TEST_ONLY"); do _run_test "$_rt_n"; done
+    if [[ "$CCTRL_TEST_ONLY" == "codex-adapter" ]]; then
+        python3 -m unittest discover -s "$ROOT/tests" -p "test_codex_websocket*.py"
+    else
+        echo "ok"
+    fi
+    _runner_report || exit 1
     exit 0
 fi
 
-if [[ -z "${CCTRL_TEST_ONLY:-}" ]]; then
-    _run_test test_codex_ownership_matrix_contract
-    _run_test test_role_skills_ask_rule
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" == "codex-handoff" ]]; then
-    test_codex_handoff_state_machine
-    echo "ok"
-    exit 0
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" == "codex-launch-to-app" ]]; then
-    test_codex_launch_to_app_workflow
-    echo "ok"
-    exit 0
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" == "app-owned-launch" ]]; then
-    test_app_owned_launch
-    echo "ok"
-    exit 0
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" == "codex-adapter" ]]; then
-    test_codex_app_server_adapter
-    python3 -m unittest discover -s "$ROOT/tests" -p "test_codex_websocket*.py"
-    exit 0
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" == "health-check" ]]; then
-    test_health_check_patterns_syntax
-    test_health_check_pattern_matching
-    test_health_check_transition_guard
-    test_health_check_needs_human_path
-    test_health_check_timeout_path
-    test_health_check_ready_requires_visible_prompt
-    test_health_check_startup_selectors_need_human
-    test_health_check_detects_startup_exit
-    test_session_pane_has_dialog_refactored
-    echo "ok"
-    exit 0
-fi
-
-if [[ "${CCTRL_TEST_ONLY:-}" == "codex-lifecycle" ]]; then
-    test_codex_lifecycle_fixture_contract
-    test_codex_lifecycle_ingestion
-    echo "ok"
-    exit 0
-fi
-
-_run_test test_health_check_patterns_syntax
-_run_test test_health_check_pattern_matching
-_run_test test_health_check_transition_guard
-_run_test test_health_check_needs_human_path
-_run_test test_health_check_timeout_path
-_run_test test_health_check_ready_requires_visible_prompt
-_run_test test_health_check_startup_selectors_need_human
-_run_test test_health_check_detects_startup_exit
-_run_test test_session_wrapper_reports_startup_exit
-_run_test test_cctrl_partial_file_fails_before_running
-_run_test test_running_scripts_ignore_inplace_rewrite
-_run_test test_health_check_bypass_flag
-_run_test test_session_pane_has_dialog_refactored
-_run_test test_codex_lifecycle_fixture_contract
-_run_test test_codex_lifecycle_ingestion
-_run_test test_codex_app_server_adapter
-_run_test test_app_owned_launch
-_run_test test_codex_handoff_state_machine
-_run_test test_codex_launch_to_app_workflow
-_run_test test_codex_hook_installation_is_additive_and_observer_is_bounded
-
+for _rt_n in $(_rt_discover) $_RT_RUN_LAST; do _run_test "$_rt_n"; done
 _runner_finish
 
 echo "ok"

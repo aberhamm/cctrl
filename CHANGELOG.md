@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased] - 2026-10-02
 
+### Changed
+- Test harness (plan 105 P4): tests are discovered from their definitions instead of two hand-kept call lists, run in source order, each in a subshell; `SKIP` / `RUN_FIRST` / `RUN_LAST` lists carry reasons; focused groups are data (`_group_tests`) and go through the runner. Five tests made self-sufficient (they only passed after a neighbour ran or with a local `profiles/work.json`); two more fixed for the new order. `test_task_inventory_provider_neutral_readonly` is SKIP-listed (it fails at HEAD, fixture drift).
+
 ### Fixed
 - `_profile_settings_gc` no longer uses an associative array (`local -A`), which
   aborted launches under macOS `/bin/bash` 3.2. (plan 103)
