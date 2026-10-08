@@ -832,6 +832,27 @@ $dead"
     echo "ok: every defined test_* function is registered"
 }
 
+test_no_unreferenced_functions() {
+    # plan 104: a top-level cctrl function whose name appears nowhere else (cctrl,
+    # lib, hooks, completions, tests; whole-name match) is dead code. Intentional
+    # entry points go in the allowlist WITH a reason (one "name  # reason" per
+    # line). Approximate: any second mention (comment, string) keeps a function
+    # alive; install/, contrib/, plugins/ and skills/ are not scanned, so a
+    # function used only there must be allowlisted.
+    local allow=" " dead="" f n files=("$ROOT/cctrl" "$ROOT/tests/run-tests.sh")
+    [[ -d "$ROOT/lib" ]] && files+=("$ROOT/lib")
+    [[ -d "$ROOT/hooks" ]] && files+=("$ROOT/hooks")
+    [[ -d "$ROOT/completions" ]] && files+=("$ROOT/completions")
+    while IFS= read -r f; do
+        [[ "$allow" == *" $f "* ]] && continue
+        n="$(grep -rwo -- "$f" "${files[@]}" 2>/dev/null | wc -l | tr -d ' ')"
+        [[ "$n" -gt 1 ]] || dead+="$f"$'\n'
+    done < <(grep -oE '^[A-Za-z_][A-Za-z0-9_]*\(\) \{' "$ROOT/cctrl" | sed 's/() {$//' | sort -u)
+    [[ -z "$dead" ]] || fail "functions defined in cctrl but never referenced (delete them, or allowlist with a reason):
+$dead"
+    echo "ok: every top-level cctrl function is referenced"
+}
+
 test_release_prune() {
     # plan 089: sandbox releases dir ONLY (CCTRL_HOME), stub ps/lsof/tmux; never
     # touches ~/.local/lib/cctrl.
@@ -13196,7 +13217,7 @@ test_task_registry_lock_stale_timeout_and_release_token() {
 
 test_task_registry_structural_boundary() {
     rg -q '^_task_registry_apply_event\(\)' "$ROOT/cctrl" || fail "registry apply boundary is missing"
-    rg -q '^_task_registry_reduce\(\)' "$ROOT/cctrl" || fail "pure registry reducer boundary is missing"
+    rg -q '^_task_registry_reduce_files\(\)' "$ROOT/cctrl" || fail "pure registry reducer boundary is missing"
     local update transition direct_rewrite
     update="$(awk '/^_session_update_metadata_field\(\)/,/^}/' "$ROOT/cctrl")"
     transition="$(awk '/^_task_record_transition\(\)/,/^}/' "$ROOT/cctrl")"
@@ -14907,6 +14928,7 @@ if [[ "${CCTRL_TEST_ONLY:-}" != "health-check" && "${CCTRL_TEST_ONLY:-}" != "cod
 test_syntax
 test_no_errexit_unsafe_post_increment
 test_every_defined_test_is_registered
+test_no_unreferenced_functions
 test_release_prune
 test_live_store_guard_diagnostics_and_churn
 test_tmux_exact_target_lint

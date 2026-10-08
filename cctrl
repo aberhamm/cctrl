@@ -520,10 +520,6 @@ _configured_default_agent() {
     _config_default_agent
 }
 
-_default_agent() {
-    _configured_default_agent
-}
-
 _default_agent_label() {
     local agent pref active
     active="$(_default_profile_name)"
@@ -1093,12 +1089,6 @@ _launch_apply_profile_args() {
                 ;;
         esac
     done
-}
-
-_codex_remote_control_enabled() {
-    local settings="$CODEX_DIR/app-server-daemon/settings.json"
-    [[ -f "$settings" ]] || return 1
-    jq -e '.remoteControlEnabled == true' "$settings" >/dev/null 2>&1
 }
 
 _launch_flags_has_codex_remote() {
@@ -3211,18 +3201,6 @@ if requested_owner:
 
 emit("created" if created_record else "applied", record)
 PY
-}
-
-_task_registry_reduce() {
-    # Pure JSON boundary: neither argument is evaluated by the shell or jq.
-    local record_json="$1" event_json="$2" scratch record_file event_file rc
-    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-task-reduce.XXXXXX")" || return 1
-    record_file="$scratch/record.json"; event_file="$scratch/event.json"
-    printf '%s' "$record_json" > "$record_file"
-    printf '%s' "$event_json" > "$event_file"
-    if _task_registry_reduce_files "$record_file" "$event_file"; then rc=0; else rc=$?; fi
-    rm -rf "$scratch"
-    return "$rc"
 }
 
 _task_registry_apply_event() {
@@ -5499,10 +5477,6 @@ _peer_derived_name_exists() {
     jq -e --arg n "$label" '.peers[]? | select(.name == $n or ((.aliases // []) | index($n)))' <<< "$doc" >/dev/null 2>&1
 }
 
-_peer_derived_identity_exists() {
-    _peer_derived_identity_conflict_exists "${1:-}" ""
-}
-
 _peer_derived_identity_conflict_exists() {
     local name="$1" doc
     local allowed_session="${2:-}"
@@ -6523,19 +6497,6 @@ _mailbox_require_peer() {
         echo -e "${DIM}Register it first, or use --allow-unknown for peer send.${RESET}" >&2
         return 1
     fi
-}
-
-_mailbox_resolve_identity() {
-    local explicit="$1" env_identity="${CCTRL_PEER:-}" identity
-    identity="$explicit"
-    [[ -n "$identity" ]] || identity="$env_identity"
-    if [[ -z "$identity" ]]; then
-        echo -e "${RED}No peer identity provided.${RESET}" >&2
-        echo -e "${DIM}Use --as <peer> or set CCTRL_PEER.${RESET}" >&2
-        return 1
-    fi
-    _mailbox_require_peer "peer" "$identity" false || return 1
-    _peer_resolve_json "$identity" | jq -r '.name'
 }
 
 _mailbox_status_filter_json() {
@@ -11009,15 +10970,6 @@ _codex_thread_has_live_tmux_owner() {
     return 1
 }
 
-_codex_writer_lock_is_stale() {
-    local thread_id="$1" lock
-    lock="$(_codex_thread_writer_lock_path "$thread_id" 2>/dev/null)" || return 1
-    [[ -f "$lock" ]] || return 1
-    _codex_thread_has_live_tmux_owner "$thread_id" && return 1
-    _codex_thread_has_live_process "$thread_id" && return 1
-    return 0
-}
-
 _codex_quarantine_writer_lock() {
     local thread_id="$1" lock backup_dir
     lock="$(_codex_thread_writer_lock_path "$thread_id" 2>/dev/null)" || return 1
@@ -11090,198 +11042,6 @@ _codex_orphan_writer_lock_items() {
                 '{type:"codex_writer_lock", thread_id:$id, lock:$lock, status:"orphan", codex_db:$db, rollout_exists:$has_rollout, live_owner:$has_owner, action:(if $action=="" then null else $action end), quarantine_path:(if $quarantine=="" then null else $quarantine end)}'
         fi
     done
-}
-
-_codex_app_threads_json() {
-    local include_all="${1:-false}" db
-    db="$(_codex_state_db)"
-    python3 - "$SESSION_METADATA_DIR" "$db" "$CODEX_DIR" "$include_all" <<'PY'
-import glob
-import json
-import os
-import re
-import sqlite3
-import sys
-
-metadata_dir, db, codex_dir, include_all = sys.argv[1:5]
-include_all = include_all == "true"
-
-def clean_purpose(value):
-    if not isinstance(value, str):
-        return value
-    return " ".join(value.replace("[Codex restore]", "").replace("[codex restore]", "").split())
-
-records = {}
-for path in glob.glob(os.path.join(metadata_dir, "*.json")):
-    try:
-        with open(path, encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception:
-        continue
-    version = meta.get("schema_version")
-    if version not in (None, 2):
-        continue
-    provider = meta.get("provider") if version == 2 else meta.get("agent")
-    if provider not in ("codex", "openai"):
-        continue
-    name = meta.get("name") or os.path.splitext(os.path.basename(path))[0]
-    thread_id = meta.get("provider_task_id") if version == 2 else meta.get("conversation_id")
-    key = thread_id or f"metadata:{name}"
-    # Canonical schema-v2 records beat legacy aliases for the same provider id.
-    if key in records and records[key].get("schema_version") == 2 and version is None:
-        continue
-    records[key] = {
-        "name": name,
-        "agent": "codex",
-        "provider": "codex",
-        "runtime": meta.get("execution_runtime", "unknown"),
-        "control_owner": meta.get("control_owner", "unknown"),
-        "lifecycle_state": meta.get("lifecycle_state", "unknown"),
-        "source": "metadata",
-        "dir": meta.get("cwd"),
-        "purpose": clean_purpose(meta.get("purpose")),
-        "display_label": meta.get("display_label"),
-        "created_at": meta.get("created_at"),
-        "session_id": thread_id,
-        "title": None,
-        "archived": None,
-        "updated_at": None,
-        "schema_version": version or 1,
-    }
-
-threads = {}
-if db and os.path.exists(db):
-    try:
-        con = sqlite3.connect(db)
-        con.row_factory = sqlite3.Row
-        cols = {row[1] for row in con.execute("PRAGMA table_info(threads)")}
-        wanted = [
-            "id",
-            "title" if "title" in cols else None,
-            "name" if "name" in cols else None,
-            "cwd" if "cwd" in cols else None,
-            "archived" if "archived" in cols else None,
-            "updated_at" if "updated_at" in cols else None,
-            "updated_at_ms" if "updated_at_ms" in cols else None,
-            "recency_at" if "recency_at" in cols else None,
-            "recency_at_ms" if "recency_at_ms" in cols else None,
-        ]
-        selected = [c for c in wanted if c]
-        if "id" in cols and selected:
-            query = "SELECT " + ", ".join(selected) + " FROM threads"
-            for row in con.execute(query):
-                d = dict(row)
-                tid = d.get("id")
-                if not tid:
-                    continue
-                threads[tid] = d
-    except Exception:
-        threads = {}
-
-for key, rec in list(records.items()):
-    tid = rec.get("session_id")
-    row = threads.get(tid or "")
-    if not row:
-        continue
-    title = row.get("title") or row.get("name")
-    rec["title"] = title
-    rec["dir"] = rec.get("dir") or row.get("cwd")
-    rec["archived"] = bool(row.get("archived")) if row.get("archived") is not None else False
-    rec["updated_at"] = (
-        row.get("recency_at")
-        or row.get("updated_at")
-        or row.get("recency_at_ms")
-        or row.get("updated_at_ms")
-    )
-
-if include_all:
-    for tid, row in threads.items():
-        if tid in records:
-            continue
-        title = row.get("title") or row.get("name")
-        records[tid] = {
-            "name": None,
-            "agent": "codex",
-            "provider": "codex",
-            "runtime": "unknown",
-            "control_owner": "unknown",
-            "lifecycle_state": "unknown",
-            "source": "codex",
-            "dir": row.get("cwd"),
-            "purpose": None,
-            "display_label": None,
-            "created_at": None,
-            "session_id": tid,
-            "title": title,
-            "archived": bool(row.get("archived")) if row.get("archived") is not None else False,
-            "updated_at": row.get("recency_at") or row.get("updated_at") or row.get("recency_at_ms") or row.get("updated_at_ms"),
-            "schema_version": None,
-        }
-
-lock_dir = os.path.join(codex_dir, "thread-writer-locks")
-for rec in records.values():
-    tid = rec.get("session_id")
-    lock = os.path.join(lock_dir, f"{tid}.lock") if tid else None
-    rec["writer_lock"] = bool(lock and os.path.exists(lock))
-    if rec.get("archived") or rec.get("lifecycle_state") == "archived":
-        rec["state"] = "archived"
-    elif rec.get("control_owner") == "conflict" or rec.get("runtime") == "conflict":
-        rec["state"] = "conflict"
-    elif rec["writer_lock"]:
-        rec["state"] = "locked"
-    elif rec.get("control_owner") == "app":
-        rec["state"] = "app-owned"
-    elif rec.get("control_owner") == "cctrl":
-        rec["state"] = "cctrl-owned"
-    else:
-        rec["state"] = "unknown"
-
-def sort_key(rec):
-    return (
-        rec.get("updated_at") is not None,
-        str(rec.get("updated_at") or rec.get("created_at") or ""),
-        rec.get("title") or rec.get("name") or "",
-    )
-
-print(json.dumps(sorted(records.values(), key=sort_key, reverse=True)))
-PY
-}
-
-_codex_rollout_matches_prompt() {
-    local rollout="$1" prompt="$2"
-    [[ -f "$rollout" && -n "$prompt" ]] || return 1
-    python3 - "$rollout" "$prompt" <<'PY'
-import json
-import sys
-
-path, prompt = sys.argv[1], sys.argv[2]
-try:
-    with open(path, encoding="utf-8") as f:
-        for i, line in enumerate(f):
-            if i > 80:
-                break
-            try:
-                d = json.loads(line)
-            except Exception:
-                continue
-            payload = d.get("payload") or {}
-            texts = []
-            if d.get("type") == "response_item" and payload.get("role") == "user":
-                for item in payload.get("content") or []:
-                    texts.append(item.get("text") or "")
-            if d.get("type") == "event_msg":
-                item = payload.get("item") or {}
-                if item.get("type") == "UserMessage":
-                    for part in item.get("content") or []:
-                        texts.append(part.get("text") or "")
-                if payload.get("type") == "user_message":
-                    texts.append(payload.get("message") or "")
-            if any(text == prompt for text in texts):
-                sys.exit(0)
-except Exception:
-    pass
-sys.exit(1)
-PY
 }
 
 _session_last_active_ms() {

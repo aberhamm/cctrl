@@ -44,11 +44,11 @@ not line numbers:
   only as an ambiguous final fallback.
 - `_codex_rollout_thread_id` reads `payload.id` or `payload.session_id` from
   rollout `session_meta`.
-- `_codex_app_threads_json` joins cctrl metadata with the SQLite task
-  inventory.
-- `_codex_thread_writer_lock_path` locates a task's lock, while
-  `_codex_writer_lock_is_stale` deliberately requires the absence of a live
-  tmux or matching Codex process before treating it as stale.
+- (Historical, removed in plan 104 as unreachable: `_codex_app_threads_json`
+  joined cctrl metadata with the SQLite task inventory, and
+  `_codex_writer_lock_is_stale` required the absence of a live tmux or matching
+  Codex process before a lock counted as stale.)
+- `_codex_thread_writer_lock_path` locates a task's lock.
 - `_session_release_to_app` stops the tmux owner, waits, handles only a stale
   lock, and then records `control_surface: app` as the requested destination.
   It does not observe the app acquiring the task.

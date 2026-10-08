@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   aborted launches under macOS `/bin/bash` 3.2. (plan 103)
 
 ### Changed
+- Removed 8 unreachable functions from `cctrl` (240 lines) and added a guard test
+  that fails on any unreferenced top-level function. (plan 104)
 - The test suite now runs cctrl under the same bash as the harness (private
   PATH shim; `cctrl_source_eval` uses `"$BASH"`), so `/bin/bash
   tests/run-tests.sh` really exercises cctrl on bash 3.2. New guard test
