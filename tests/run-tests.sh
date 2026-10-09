@@ -1366,8 +1366,8 @@ test_launch_mcp_none_claude() {
     args="$(_mcp_args_of "$out")"
     local peer_json
     peer_json="$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' "$ROOT/cctrl" comet)"
-    [[ "$args" == "$(printf '%s\n' --permission-mode bypassPermissions --chrome --mcp-config "$peer_json" hi)" ]] \
-        || fail "inherit argv changed (want the pre-P2 golden argv): $args"
+    [[ "$args" == "$(printf '%s\n' --mcp-config "$peer_json" --permission-mode bypassPermissions --chrome hi)" ]] \
+        || fail "inherit --peer argv changed (want peer --mcp-config first, plan 106 P2 follow-up A): $args"
     assert_not_contains "$out" "mcp: lean"
     assert_not_contains "$out" "strict-mcp-config"
     [[ -z "$(ls "$runtime"/cctrl-*/profile-settings/*.mcp.json 2>/dev/null)" ]] || fail "inherit must not write an MCP file"
@@ -1443,6 +1443,102 @@ test_launch_mcp_none_claude_variadic() {
     swallowed="$(_mcp_variadic_swallowed "$(printf '%s\n' --strict-mcp-config --mcp-config /x.json seedprompt)" /x.json)"
     [[ "$swallowed" == seedprompt ]] || fail "variadic model failed to flag the old argv order"
     echo "ok: lean claude argv is safe against variadic --mcp-config"
+}
+
+test_launch_mcp_inherit_peer_variadic() {
+    make_fake_agent "$TMPDIR/claude" claude
+    local data="$TMPDIR/mcp-ivar-data" runtime="$TMPDIR/mcp-ivar-runtime" out args swallowed
+    mkdir -p "$TMPDIR/comet"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent claude >/dev/null
+    local peer_json
+    peer_json="$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' "$ROOT/cctrl" comet)"
+    local shape
+    # the real claude's --mcp-config is variadic: the inline peer JSON must be
+    # followed by an option token before any positional (seed prompt, passthrough)
+    for shape in "--peer comet -m seedprompt" "--peer comet" "--peer comet -- seedprompt" "--peer comet -- seedprompt extra" "--peer comet --effort high -m seedprompt" "--peer comet --mcp inherit -m seedprompt"; do
+        # shellcheck disable=SC2086
+        out="$(PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge $shape)"
+        args="$(_mcp_args_of "$out")"
+        [[ "$args" == *"$peer_json"* ]] || fail "shape [$shape]: peer MCP JSON missing from argv: $args"
+        [[ "$(printf '%s\n' "$args" | grep -cx -- '--mcp-config')" == 1 ]] || fail "shape [$shape]: want exactly one --mcp-config: $args"
+        swallowed="$(_mcp_variadic_swallowed "$args" "$peer_json")"
+        [[ -z "$swallowed" ]] || fail "shape [$shape]: variadic --mcp-config would swallow: $swallowed (argv: $args)"
+        [[ "$shape" != *seedprompt* || "$args" == *seedprompt* ]] || fail "shape [$shape]: seed prompt missing from argv: $args"
+    done
+    echo "ok: inherit --peer argv is safe against variadic --mcp-config"
+}
+
+# Plan 106 P2 follow-up B: every value-taking scanner must skip the value of
+# --mcp. Each assertion below fails if its scanner's --mcp arm is removed.
+test_mcp_value_skipped_by_scanners() {
+    # _start_args_have_explicit_target: without the arm, "--mcp" hits the -* arm and stops early
+    cctrl_source_eval '_start_args_have_explicit_target --mcp none @x' || fail "explicit-target scan must skip the --mcp value and find @x"
+    if cctrl_source_eval '_start_args_have_explicit_target --mcp none'; then fail "--mcp none is not a target"; fi
+    cctrl_source_eval '_start_args_have_explicit_target --mcp=none @x' || fail "explicit-target scan must skip --mcp=none and find @x"
+    # _start_requests_app_owned: a literal "--app-owned" as the --mcp value is not the flag
+    if cctrl_source_eval '_start_requests_app_owned --mcp --app-owned'; then fail "--mcp value --app-owned must not select app-owned"; fi
+    cctrl_source_eval '_start_requests_app_owned --mcp none --app-owned' || fail "--app-owned after --mcp none must still select app-owned"
+    echo "ok: the start-arg scanners skip --mcp values"
+}
+
+test_mcp_value_skipped_by_remote_and_launch_to_app() {
+    # _remote_exec arm 2 (preflight scan): an @-looking --mcp value must not trigger a role preflight
+    _remote_role_fixture mcpv
+    local out rc=0 proj="$RR_PROJ"
+    out="$(SSH_PRE_OUT='role=orchestrator orch_kind=repo' _remote_role start -d --mcp @k "$proj")" || rc=$?
+    [[ "$(grep -c '_role-resolve' "$RR_LOG")" -eq 0 ]] || fail "--mcp @k value was read as a shortcut target (rc=$rc): $(cat "$RR_LOG")"
+    # _remote_exec arm 1 (default purpose): the --mcp value must not become the default purpose
+    : > "$RR_LOG"
+    out="$(_remote_role start -d --mcp none "$proj")" || rc=$?
+    assert_not_contains "$(cat "$RR_LOG")" "purpose\\ none"
+    assert_not_contains "$(cat "$RR_LOG")" "none\\ $(basename "$proj")"
+    # launch-to-app arm: --mcp VALUE before the dir is consumed with its value
+    make_fake_tmux "$TMPDIR/tmux"; make_fake_agent "$TMPDIR/codex" codex; make_fake_ps "$TMPDIR/ps"
+    mkdir -p "$TMPDIR/mcp-l2a-proj2"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" launch-to-app --mcp bogus "$TMPDIR/mcp-l2a-proj2" 2>&1)" || rc=$?
+    [[ $rc -ne 0 && "$out" == *"unknown MCP mode 'bogus'"* ]] || fail "launch-to-app --mcp bogus <dir> must be rejected as a bad mode (rc=$rc): $out"
+    rc=0
+    # the arm consumes the next token as the value even when it looks like a flag
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" launch-to-app --mcp --foreground "$TMPDIR/mcp-l2a-proj2" 2>&1)" || rc=$?
+    [[ $rc -ne 0 && "$out" == *"unknown MCP mode '--foreground'"* ]] || fail "launch-to-app --mcp --foreground must take it as the (bad) value (rc=$rc): $out"
+    rc=0
+    out="$(PATH="$TMPDIR:$PATH" "$ROOT/cctrl" launch-to-app --mcp=bogus "$TMPDIR/mcp-l2a-proj2" 2>&1)" || rc=$?
+    [[ $rc -ne 0 && "$out" == *"unknown MCP mode 'bogus'"* ]] || fail "launch-to-app --mcp=bogus <dir> must be rejected as a bad mode (rc=$rc): $out"
+    echo "ok: remote and launch-to-app scanners skip --mcp values"
+}
+
+# Plan 106 P2 follow-up C: --mcp=VALUE behaves exactly like --mcp VALUE.
+test_launch_mcp_equals_form() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local runtime="$TMPDIR/mcp-eq-runtime" out rc args
+    local run=(env PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime")
+    out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp=none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    assert_contains "$out" "mcp: lean"
+    printf '%s\n' "$args" | grep -qx -- '--strict-mcp-config' || fail "--mcp=none must be lean: $args"
+    [[ "$args" != *"--mcp="* ]] || fail "--mcp=none leaked into the agent argv: $args"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp=bogus -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--mcp=bogus: want 64, got $rc"; assert_contains "$out" "unknown MCP mode 'bogus'"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp=minimal -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--mcp=minimal: want 64, got $rc"
+    mkdir -p "$TMPDIR/mcp-eq-proj"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start -d --agent claude --mcp=bogus "$TMPDIR/mcp-eq-proj" 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "start -d --mcp=bogus: want 64, got $rc: $out"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --agent codex --app-owned --mcp=none "$TMPDIR/mcp-eq-proj" 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--app-owned --mcp=none: want 64, got $rc: $out"
+    assert_contains "$out" "app-owned threads use the app-server's MCP configuration"
+    # detached: the resolved mode reaches the pane child through the env, never argv
+    local log="$TMPDIR/mcp-eq-tmux.log" meta="$TMPDIR/mcp-eq-meta" shell_cmd
+    mkdir -p "$meta"; : > "$log"
+    "${run[@]}" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" start -d --agent claude --profile none --mcp=none "$TMPDIR/mcp-eq-proj" >/dev/null
+    shell_cmd="$(grep '^SHELL_CMD=' "$log" | tail -n 1)"
+    assert_contains "$shell_cmd" "CCTRL_LAUNCH_MCP_MODE=none"
+    [[ "$shell_cmd" != *" --mcp"* ]] || fail "--mcp=none reached the pane child argv: $shell_cmd"
+    echo "ok: --mcp=VALUE behaves like --mcp VALUE"
 }
 
 test_launch_mcp_none_codex() {

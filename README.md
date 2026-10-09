@@ -1823,7 +1823,12 @@ threads.
 ... --mcp none`, or `CCTRL_MCP_MODE=none`) starts a terminal-owned worker with
 only cctrl's own MCP server. The flag beats the env var; the default is
 `inherit` and changes nothing. A bad value exits 64; `--mcp minimal` is not
-available yet.
+available yet. `--mcp=none` works like `--mcp none`.
+
+Inside a cctrl pane `CCTRL_MCP_MODE` is ignored on purpose (a long-lived tmux
+server can hold a stale value), so an orchestrator that spawns workers from its
+own pane must pass `--mcp none` as a flag. A passthrough `-- --mcp-config
+other.json` adds a second config on top of cctrl's; it does not replace it.
 
 - Claude: a mode-600 file `<session>.mcp.json` next to the settings overlay
   (in `cctrl-<uid>/profile-settings`) holds `cctrl-peer` when `--peer` is set

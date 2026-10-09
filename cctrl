@@ -1366,7 +1366,9 @@ _launch_exec_agent() {
             local _peer_mcp_json
             _peer_mcp_json=$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' \
                 "$SCRIPT_DIR/cctrl" "$CCTRL_PEER")
-            LAUNCH_FLAGS+=("--mcp-config" "$_peer_mcp_json")
+            # --mcp-config is variadic in the real claude: put it FIRST so the
+            # always-present --permission-mode ends its list before any positional.
+            LAUNCH_FLAGS=("--mcp-config" "$_peer_mcp_json" "${LAUNCH_FLAGS[@]}")
         fi
 
         [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
@@ -2112,6 +2114,9 @@ _start_args_have_explicit_target() {
                 [[ $# -ge 2 ]] || return 1
                 shift 2
                 ;;
+            --mcp=*)
+                shift
+                ;;
             --resume|-r)
                 shift
                 if [[ $# -gt 0 && "$1" != -* && "$1" != @* ]]; then
@@ -2146,6 +2151,7 @@ _start_requests_app_owned() {
                 (( $# >= 2 )) || return 1
                 shift 2
                 ;;
+            --mcp=*) shift ;;
             --resume|-r)
                 shift
                 if [[ $# -gt 0 && "$1" != -* && "$1" != @* ]]; then shift; fi
@@ -2254,6 +2260,9 @@ _launch_app_owned_codex() {
                 # Plan 106 P2: lean MCP is for terminal-owned launches only.
                 [[ "$2" == inherit ]] || { printf '%b--mcp %s is incompatible with --app-owned: app-owned threads use the app-server'"'"'s MCP configuration.%b\n' "$RED" "$2" "$RESET" >&2; return 64; }
                 shift 2 ;;
+            --mcp=*)
+                [[ "${arg#--mcp=}" == inherit ]] || { printf '%b--mcp %s is incompatible with --app-owned: app-owned threads use the app-server'"'"'s MCP configuration.%b\n' "$RED" "${arg#--mcp=}" "$RESET" >&2; return 64; }
+                shift ;;
             --json) json=true; shift ;;
             --agent) [[ $# -ge 2 ]] || { echo "--agent needs a value" >&2; return 64; }; agent="$(_normalize_agent "$2")" || return 64; shift 2 ;;
             --profile) [[ $# -ge 2 ]] || { echo "--profile needs a value" >&2; return 64; }; profile="$2"; profile_explicit=true; shift 2 ;;
@@ -2438,6 +2447,9 @@ cmd_start() {
             --mcp)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--mcp needs a value${RESET}"; return 64; }
                 mcp_flag="$2"; shift 2
+                ;;
+            --mcp=*)
+                mcp_flag="${1#--mcp=}"; shift
                 ;;
             --profile)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
@@ -4884,6 +4896,10 @@ _launch_detached() {
                 fi
                 mcp_flag="$2"
                 shift 2
+                ;;
+            --mcp=*)
+                mcp_flag="${1#--mcp=}"
+                shift
                 ;;
             --no-input)
                 # Decided once in main(); consumed so it never reaches the agent.
@@ -16184,7 +16200,7 @@ cmd_help() {
     echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
     echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
-    echo "    --mcp inherit|none        MCP servers for a terminal-owned worker (default inherit; none keeps only cctrl's own; env CCTRL_MCP_MODE)"
+    echo "    --mcp inherit|none        MCP servers for a terminal-owned worker (default inherit; none keeps only cctrl's own; env CCTRL_MCP_MODE, ignored inside a cctrl pane: pass the flag; --mcp=none works too; a passthrough --mcp-config adds a second config)"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
     echo "    --role orchestrator|worker  Session role (default worker); needs -d"
@@ -17336,6 +17352,10 @@ _remote_exec() {
                     ((i+=2))
                     continue
                     ;;
+                --mcp=*)
+                    ((i+=1))
+                    continue
+                    ;;
                 @*)
                     [[ -z "$remote_default_purpose" ]] && remote_default_purpose="$a"
                     ;;
@@ -17375,6 +17395,7 @@ _remote_exec() {
                 --role|--orch-kind|--succeeds) rp_needs=true; rp_role_typed=true; rp_i=$((rp_i + 2)); continue ;;
                 --agent|--profile|--model|--permission-mode|--sandbox|-s|--ask-for-approval|-a|--remote|--remote-auth-token-env|--name|-n|--peer|--purpose|--message|--prompt|-m|--mcp)
                     rp_i=$((rp_i + 2)); continue ;;
+                --mcp=*) rp_i=$((rp_i + 1)); continue ;;
                 @*) rp_needs=true ;;
             esac
             rp_i=$((rp_i + 1))
@@ -18527,6 +18548,8 @@ _shortcut_jump() {
             --mcp)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--mcp needs a value${RESET}"; return 64; }
                 mcp_flag="$2"; shift 2 ;;
+            --mcp=*)
+                mcp_flag="${1#--mcp=}"; shift ;;
             --profile)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--profile needs a value${RESET}"; return 1; }
                 cli_profile="$2"; shift 2 ;;

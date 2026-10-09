@@ -234,6 +234,13 @@ Still open (default applies unless the owner says otherwise):
 
 Re-verified: no `helpers` command and no `--mcp` flag / `CCTRL_MCP_MODE` / `mcp_mode` exist in `cctrl`; `--mcp-config` appears once (`cctrl:1249`, the peer config); `lib/release_prune.py` exists as the module-shape model; `lib/peer_mcp.py` and `lib/runtime_mcp.py` exist. Process and Codex/Claude CLI measurements were not re-run (read-only `ps` not needed for the doc).
 
+## P2 follow-ups (2026-10-09)
+
+- A: the inherit `--peer` Claude argv put `--mcp-config <json>` directly before the positional prompt; the real claude's variadic `--mcp-config` swallowed it. Fix: the peer `--mcp-config <json>` is prepended, so the always-present `--permission-mode` follows it in every shape (no new flag, no `--strict-mcp-config`). Inherit argv without `--peer` is unchanged; the golden `--peer` assertion in `test_launch_mcp_none_claude` was updated to the new order. Test: `test_launch_mcp_inherit_peer_variadic`.
+- B: `test_mcp_value_skipped_by_scanners` and `test_mcp_value_skipped_by_remote_and_launch_to_app` each fail when one of the five `--mcp` scanner arms is removed (verified by mutation).
+- C: `--mcp=VALUE` is accepted at every parse and skip site (`test_launch_mcp_equals_form`).
+- D: README and `cmd_help` document that `CCTRL_MCP_MODE` is ignored inside a cctrl pane and that a passthrough `--mcp-config` adds a second config.
+
 ## Review history
 
 - Eng pass 1 (Opus sub-agent, 2026-10-08): changes-requested. REQUIRED: `_profile_settings_gc` would delete a live session's `<key>.mcp.json`; restart would not rewrite it. Applied in D2 plus a new test.

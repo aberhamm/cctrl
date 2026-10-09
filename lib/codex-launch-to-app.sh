@@ -123,6 +123,9 @@ _codex_launch_to_app() {
                 [[ $# -ge 2 ]] || { echo "$arg needs a value" >&2; return 64; }
                 launch_args+=("$arg" "$2")
                 shift 2 ;;
+            --mcp=*)
+                launch_args+=("$arg")
+                shift ;;
             --)
                 launch_args+=("--")
                 shift
@@ -160,6 +163,7 @@ _codex_launch_to_app() {
     for (( _l2a_i = 0; _l2a_i < ${#launch_args[@]}; _l2a_i++ )); do
         [[ "${launch_args[$_l2a_i]}" == -- ]] && break
         [[ "${launch_args[$_l2a_i]}" == --mcp ]] && _l2a_mcp="${launch_args[$((_l2a_i + 1))]:-}"
+        [[ "${launch_args[$_l2a_i]}" == --mcp=* ]] && _l2a_mcp="${launch_args[$_l2a_i]#--mcp=}"
     done
     if [[ -n "$_l2a_mcp" && "$_l2a_mcp" != inherit && "$json" != true ]]; then
         echo "mcp: ${_l2a_mcp} applies to the terminal phase only; the app-server owns MCP after release." >&2
