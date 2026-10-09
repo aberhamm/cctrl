@@ -953,89 +953,202 @@ _profile_settings_write() {
     printf '%s' "$file"
 }
 
-# Plan 106 P2: lean MCP mode (opt-in; `inherit` is the default and changes
-# nothing). Precedence in P2: --mcp flag, then CCTRL_MCP_MODE, then inherit.
-# P3 seam: the profile key agents.<agent>.mcp slots in between the flag and
-# the env var, right here.
+# Plan 106 P2/P3: lean MCP mode (opt-in; `inherit` is the default and changes
+# nothing). Precedence: --mcp flag, then the shortcut's `mcp` field, then the
+# profile key agents.<agent>.mcp, then CCTRL_MCP_MODE, then inherit. Inside a
+# pane child of a detached launch only the mode the parent resolved counts.
 #   $1 = the --mcp value ("" when the flag was not given)
-# Prints the resolved mode (inherit|none); returns 64 on anything else.
+#   $2 = the shortcut's mcp field ("" when none)   $3 = agent   $4 = profile file
+#   $5 = shortcut key (for the error message only)
+#   $6 = "parent" when the caller is the detached-launch parent (it may itself
+#        run inside a cctrl pane, e.g. an orchestrator): then the profile key and
+#        shortcut field apply; CCTRL_MCP_MODE is still ignored inside a pane
+# Called early (flag/env only, to fail fast) and again once agent and profile
+# are known. Prints the resolved mode (inherit|minimal|none); 64 on anything else.
 _mcp_mode_resolve() {
-    local mode="${1:-}"
+    local mode="${1:-}" sc_mode="${2:-}" agent="${3:-}" pf="${4:-}" sc_key="${5:-}" parent="${6:-}"
+    local src="the --mcp flag" in_pane=false
+    [[ "${CCTRL_TMUX_CONTEXT:-}" == 1 && "${CCTRL_SESSION_KIND:-}" == tmux ]] && in_pane=true
     if [[ -z "$mode" ]]; then
-        if [[ "${CCTRL_TMUX_CONTEXT:-}" == 1 && "${CCTRL_SESSION_KIND:-}" == tmux ]]; then
+        if $in_pane && [[ -z "$parent" ]]; then
             # Pane child of a detached launch: only the mode the parent resolved
             # counts. CCTRL_MCP_MODE here could be a stale value held by a tmux
             # server that was once started from a lean shell.
             mode="${CCTRL_LAUNCH_MCP_MODE:-}"
+            src="the launch mode"
         else
-            mode="${CCTRL_MCP_MODE:-}"
+            if [[ -n "$sc_mode" ]]; then
+                mode="$sc_mode"
+                src="shortcut @${sc_key} field mcp"
+            elif [[ -n "$agent" && -n "$pf" && -f "$pf" ]]; then
+                # Fail closed: a profile that cannot be read is exit 64, not inherit.
+                mode="$(jq -r --arg a "$agent" '
+                    (try .agents[$a].mcp catch null) as $v
+                    | if $v == null then ""
+                      elif ($v | type) == "string" then $v
+                      else "<not a string>" end' "$pf" 2>/dev/null)" || {
+                    echo "cctrl: cannot read profile '$(basename "$pf" .json)' (key agents.${agent}.mcp)" >&2
+                    return 64
+                }
+                src="profile '$(basename "$pf" .json)' key agents.${agent}.mcp"
+            fi
+            if [[ -z "$mode" ]] && ! $in_pane; then
+                mode="${CCTRL_MCP_MODE:-}"
+                src="CCTRL_MCP_MODE"
+            fi
         fi
     fi
     [[ -n "$mode" ]] || mode="inherit"
     case "$mode" in
-        inherit|none)
+        inherit|minimal|none)
             printf '%s' "$mode"
             ;;
-        minimal)
-            echo "cctrl: --mcp minimal is not available yet (use --mcp none or --mcp inherit)" >&2
-            return 64
-            ;;
         *)
-            echo "cctrl: unknown MCP mode '${mode:0:40}' (use inherit or none)" >&2
+            local shown="<invalid>"
+            [[ "$mode" =~ ^[A-Za-z0-9_.-]{1,40}$ ]] && shown="$mode"
+            echo "cctrl: unknown MCP mode '${shown}' from ${src} (use inherit, minimal or none)" >&2
             return 64
             ;;
     esac
 }
 
-# Per-session Claude MCP file for `--mcp none`, next to the settings overlay
-# (same dir, mode 600, key = tmux session name or fg-$$, suffix .mcp.json).
-# A FILE, never JSON in argv, so a server definition can never reach `ps`.
-# Holds exactly cctrl-peer when a peer identity is set, an empty server map
-# otherwise. Prints the path; returns nonzero on any failure.
-#   $1=key $2=peer name (may be empty)
+# The operator's keep list for --mcp minimal: mcp.minimal.<agent> (array of
+# server names) in the cctrl config files. Names only; anything outside
+# [A-Za-z0-9_-]+ is counted and ignored, and cctrl's own servers are never
+# listed (they are added by the launch code). Sets LAUNCH_MCP_KEEP
+# (newline-separated) and LAUNCH_MCP_KEEP_BAD (count). Returns 1 when a
+# config file exists but cannot be read (fail closed).
+_mcp_keep_list() {
+    local agent="$1" out line name
+    LAUNCH_MCP_KEEP=""
+    LAUNCH_MCP_KEEP_BAD=0
+    [[ "$agent" == claude || "$agent" == codex ]] || return 0
+    out="$(_config_jq "(.mcp.minimal.${agent} // []) | if type == \"array\" then .[] | tojson else (null | tojson) end")" || {
+        [[ -z "$(_config_files)" ]] && return 0
+        return 1
+    }
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ "$line" =~ ^\"([A-Za-z0-9_-]+)\"$ ]]; then
+            name="${BASH_REMATCH[1]}"
+            [[ "$name" == cctrl-peer || "$name" == cctrl_runtime ]] && continue
+            [[ $'\n'"$LAUNCH_MCP_KEEP" == *$'\n'"$name"$'\n'* ]] && continue
+            LAUNCH_MCP_KEEP+="$name"$'\n'
+        else
+            LAUNCH_MCP_KEEP_BAD=$((LAUNCH_MCP_KEEP_BAD + 1))
+        fi
+    done <<< "$out"
+    return 0
+}
+
+# Per-session Claude MCP file for `--mcp none|minimal`, next to the settings
+# overlay (same dir, mode 600, key = tmux session name or fg-$$, suffix
+# .mcp.json). A FILE, never JSON in argv, so a server definition can never
+# reach `ps`. Holds cctrl-peer when a peer identity is set; for `minimal` also
+# the kept servers' definitions, copied FILE TO FILE through jq (never through
+# argv or a shell variable) from the user's Claude MCP configuration:
+# ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json .mcpServers (user scope), then
+# $PWD/.mcp.json (project), then .projects[$PWD].mcpServers (local); later
+# wins. A config file that exists but is not valid JSON fails the write
+# (fail closed). Prints the path; returns nonzero on any failure.
+#   $1=key $2=peer name (may be empty) $3=mode (none|minimal, default none)
 _profile_mcp_write() {
-    local key="$1" peer="${2:-}"
+    local key="$1" peer="${2:-}" mode="${3:-none}"
     command -v jq >/dev/null 2>&1 || return 1
     [[ -n "$key" ]] || return 1
     local dir
     dir="$(_profile_settings_dir)"
     _profile_settings_ensure_dir "$dir" || return 1
     local file="$dir/${key}.mcp.json" tmp="$dir/.${key}.mcp.json.tmp.$$"
-    ( umask 077 && jq -n --arg cmd "$SCRIPT_DIR/cctrl" --arg peer "$peer" '
-        {mcpServers: (if $peer == "" then {}
-                      else {"cctrl-peer": {command: $cmd, args: ["peer","mcp","--as",$peer]}} end)}
+    local keep_json='[]' ucfg=/dev/null pcfg=/dev/null
+    if [[ "$mode" == minimal ]]; then
+        _mcp_keep_list claude || return 1
+        keep_json="$(printf '%s' "$LAUNCH_MCP_KEEP" | jq -R -s -c 'split("\n") | map(select(length > 0))')" || return 1
+        [[ -f "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json" ]] && ucfg="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
+        [[ -f "$PWD/.mcp.json" ]] && pcfg="$PWD/.mcp.json"
+    fi
+    ( umask 077 && jq -n --arg cmd "$SCRIPT_DIR/cctrl" --arg peer "$peer" --arg cwd "$PWD" \
+        --argjson keep "$keep_json" --slurpfile u "$ucfg" --slurpfile p "$pcfg" '
+        def objs: if type == "object" then . else {} end;
+        ($u[0] | objs) as $U | ($p[0] | objs) as $P
+        | (($U.mcpServers | objs) + ($P.mcpServers | objs)
+           + (($U.projects | objs)[$cwd] | objs | .mcpServers | objs)) as $all
+        | {mcpServers: (
+            ([$keep[] | . as $k | select($all | has($k)) | {($k): $all[$k]}] | add // {})
+            + (if $peer == "" then {}
+               else {"cctrl-peer": {command: $cmd, args: ["peer","mcp","--as",$peer]}} end))}
     ' > "$tmp" ) 2>/dev/null || { rm -f "$tmp"; return 1; }
     chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
     printf '%s' "$file"
 }
 
-# Names of the MCP servers declared in $CODEX_DIR/config.toml, by a line scan
-# of the [mcp_servers.<name>] table headers. Names only: values are never
-# read, so no secret can reach argv. Only [A-Za-z0-9_-]+ is accepted; any
-# other header (quoted or exotic names) is counted as not controllable.
-# cctrl_runtime is cctrl's own server and is never listed. A sub-table such
-# as [mcp_servers.foo.env] names server foo. A missing file means no names.
-# Sets LAUNCH_CODEX_MCP_NAMES (newline-separated) and
+# Names of the MCP servers declared in $CODEX_DIR/config.toml, by a line scan.
+# Names only: values are never read, so no secret can reach argv. Only
+# [A-Za-z0-9_-]+ is accepted; every other form is counted as not controllable.
+# Recognised: [mcp_servers.<name>] and sub-table headers ([mcp_servers.foo.env]
+# names foo); inside a [mcp_servers] table `foo = { ... }` and `foo.key = ...`;
+# at the top level `mcp_servers.foo = { ... }` and `mcp_servers.foo.key = ...`.
+# A whole-table `mcp_servers = { ... }`, quoted keys and quoted header names
+# are counted, not parsed. Multi-line inline values are not followed.
+# cctrl_runtime is cctrl's own server and is never listed. A missing file means
+# no names. Sets LAUNCH_CODEX_MCP_NAMES (newline-separated) and
 # LAUNCH_CODEX_MCP_UNCONTROLLABLE (count).
 _codex_mcp_server_names() {
     LAUNCH_CODEX_MCP_NAMES=""
     LAUNCH_CODEX_MCP_UNCONTROLLABLE=0
     local cfg="${CODEX_DIR:-$HOME/.codex}/config.toml"
     [[ -f "$cfg" ]] || return 0
-    local line raw name seen=$'\n'
+    local line raw name ctx=root ml="" rest q3
+    local re_hdr_srv='^[[:space:]]*\[mcp_servers\.([^]]+)\][[:space:]]*(#.*)?$'
+    local re_hdr_tbl='^[[:space:]]*\[mcp_servers\][[:space:]]*(#.*)?$'
+    local re_hdr_any='^[[:space:]]*\['
+    local re_root_key='^[[:space:]]*mcp_servers[[:space:]]*\.[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[.=]'
+    local re_root_quoted="^[[:space:]]*mcp_servers[[:space:]]*\\.[[:space:]]*[\"']"
+    local re_root_whole='^[[:space:]]*mcp_servers[[:space:]]*='
+    local re_tbl_key='^[[:space:]]*([A-Za-z0-9_-]+)[[:space:]]*[.=]'
+    local re_tbl_quoted="^[[:space:]]*[\"']"
     while IFS= read -r line || [[ -n "$line" ]]; do
-        if [[ "$line" =~ ^[[:space:]]*\[mcp_servers\.([^]]+)\][[:space:]]*(#.*)?$ ]]; then
+        name=""
+        # Lines inside a multi-line string are values, never keys or headers.
+        if [[ -n "$ml" ]]; then
+            rest="${line#*"$ml"}"
+            [[ "$rest" != "$line" ]] && ml=""
+            continue
+        fi
+        for q3 in '"""' "'''"; do
+            if [[ "$line" == *"$q3"* ]]; then
+                rest="${line#*"$q3"}"
+                [[ "$rest" == *"$q3"* ]] || ml="$q3"
+            fi
+        done
+        if [[ "$line" =~ $re_hdr_srv ]]; then
+            ctx=server
             raw="${BASH_REMATCH[1]}"
             name="${raw%%.*}"
-            if [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
-                if [[ "$name" != cctrl_runtime && "$seen" != *$'\n'"$name"$'\n'* ]]; then
-                    seen+="$name"$'\n'
-                    LAUNCH_CODEX_MCP_NAMES+="$name"$'\n'
-                fi
-            else
+            if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                LAUNCH_CODEX_MCP_UNCONTROLLABLE=$((LAUNCH_CODEX_MCP_UNCONTROLLABLE + 1))
+                name=""
+            fi
+        elif [[ "$line" =~ $re_hdr_tbl ]]; then
+            ctx=table
+        elif [[ "$line" =~ $re_hdr_any ]]; then
+            ctx=other
+        elif [[ "$ctx" == root ]]; then
+            if [[ "$line" =~ $re_root_key ]]; then
+                name="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ $re_root_quoted || "$line" =~ $re_root_whole ]]; then
                 LAUNCH_CODEX_MCP_UNCONTROLLABLE=$((LAUNCH_CODEX_MCP_UNCONTROLLABLE + 1))
             fi
+        elif [[ "$ctx" == table ]]; then
+            if [[ "$line" =~ $re_tbl_key ]]; then
+                name="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ $re_tbl_quoted ]]; then
+                LAUNCH_CODEX_MCP_UNCONTROLLABLE=$((LAUNCH_CODEX_MCP_UNCONTROLLABLE + 1))
+            fi
+        fi
+        if [[ -n "$name" && "$name" != cctrl_runtime ]]; then
+            [[ $'\n'"$LAUNCH_CODEX_MCP_NAMES" == *$'\n'"$name"$'\n'* ]] || LAUNCH_CODEX_MCP_NAMES+="$name"$'\n'
         fi
     done < "$cfg"
     return 0
@@ -1341,17 +1454,25 @@ _launch_exec_agent() {
 
         # Auto-register the peer MCP server when --peer was used so the
         # Claude agent has cctrl peer tools (send_message, etc.) available.
-        if [[ "$_mcp_mode" == none ]]; then
-            # Plan 106 P2: only cctrl's own server, from a mode-600 file.
+        if [[ "$_mcp_mode" == none || "$_mcp_mode" == minimal ]]; then
+            # Plan 106 P2/P3: cctrl's own server (+ the keep list for minimal),
+            # from a mode-600 file.
             local _mcp_key _mcp_file
             if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
                 _mcp_key="$CCTRL_SESSION_NAME"
             else
                 _mcp_key="fg-$$"
             fi
-            _mcp_file="$(_profile_mcp_write "$_mcp_key" "${CCTRL_PEER:-}")" || _mcp_file=""
+            LAUNCH_MCP_KEEP=""; LAUNCH_MCP_KEEP_BAD=0
+            # The keep list is read here too (the writer below runs in a subshell)
+            # for the launch line; a failed read fails the launch like a failed write.
+            if [[ "$_mcp_mode" == minimal ]] && ! _mcp_keep_list claude; then
+                echo -e "${RED}cctrl: could not read the cctrl config for the --mcp minimal keep list; nothing was launched.${RESET}" >&2
+                return 70
+            fi
+            _mcp_file="$(_profile_mcp_write "$_mcp_key" "${CCTRL_PEER:-}" "$_mcp_mode")" || _mcp_file=""
             if [[ -z "$_mcp_file" ]]; then
-                echo -e "${RED}cctrl: could not write the MCP config file for --mcp none; nothing was launched.${RESET}" >&2
+                echo -e "${RED}cctrl: could not write the MCP config file for --mcp ${_mcp_mode}; nothing was launched.${RESET}" >&2
                 return 70
             fi
             export CCTRL_PROFILE_MCP_FILE="$_mcp_file"
@@ -1359,9 +1480,22 @@ _launch_exec_agent() {
             # consuming non-option tokens. End it with an option so the passthrough
             # args and the seed prompt that follow are not read as config files.
             LAUNCH_FLAGS+=("--mcp-config" "$_mcp_file" "--strict-mcp-config")
-            local _mcp_kept_claude="nothing"
-            [[ -n "${CCTRL_PEER:-}" ]] && _mcp_kept_claude="cctrl-peer"
-            echo -e "${DIM}mcp: lean (none; kept: ${_mcp_kept_claude})${RESET}"
+            local _mcp_kept_claude="nothing" _mcp_warn_claude=""
+            if [[ "$_mcp_mode" == minimal ]]; then
+                local _mcp_have _mcp_n
+                _mcp_have="$(jq -r '.mcpServers | keys | join(", ")' "$_mcp_file" 2>/dev/null || true)"
+                [[ -n "$_mcp_have" ]] && _mcp_kept_claude="$_mcp_have"
+                while IFS= read -r _mcp_n; do
+                    [[ -n "$_mcp_n" ]] || continue
+                    jq -e --arg n "$_mcp_n" '.mcpServers | has($n)' "$_mcp_file" >/dev/null 2>&1 \
+                        || _mcp_warn_claude+="${_mcp_warn_claude:+, }${_mcp_n}"
+                done <<< "$LAUNCH_MCP_KEEP"
+                [[ -n "$_mcp_warn_claude" ]] && _mcp_warn_claude="; WARNING: kept but not found in the Claude MCP config: ${_mcp_warn_claude}"
+                (( LAUNCH_MCP_KEEP_BAD > 0 )) && _mcp_warn_claude+="; WARNING: ignored ${LAUNCH_MCP_KEEP_BAD} invalid keep-list entries"
+            else
+                [[ -n "${CCTRL_PEER:-}" ]] && _mcp_kept_claude="cctrl-peer"
+            fi
+            echo -e "${DIM}mcp: lean (${_mcp_mode}; kept: ${_mcp_kept_claude}${_mcp_warn_claude})${RESET}"
         elif [[ -n "${CCTRL_PEER:-}" ]]; then
             local _peer_mcp_json
             _peer_mcp_json=$(printf '{"mcpServers":{"cctrl-peer":{"command":"%s","args":["peer","mcp","--as","%s"]}}}' \
@@ -1402,19 +1536,44 @@ _launch_exec_agent() {
             LAUNCH_FLAGS=("--yolo")
         fi
     fi
-    if [[ "$_mcp_mode" == none ]]; then
-        # Plan 106 P2: disable every server config.toml declares (names only).
-        # Passthrough is appended after this, so a caller's own -c still wins.
+    if [[ "$_mcp_mode" == none || "$_mcp_mode" == minimal ]]; then
+        # Plan 106 P2/P3: disable every server config.toml declares (names only),
+        # except the keep list for minimal. Passthrough is appended after this,
+        # so a caller's own -c still wins.
+        if [[ "$_mcp_mode" == minimal ]]; then
+            _mcp_keep_list codex || {
+                echo -e "${RED}cctrl: could not read the cctrl config for the --mcp minimal keep list; nothing was launched.${RESET}" >&2
+                return 70
+            }
+        else
+            LAUNCH_MCP_KEEP=""; LAUNCH_MCP_KEEP_BAD=0
+        fi
         _codex_mcp_server_names
-        local _mcp_n _mcp_count=0 _mcp_kept="nothing" _mcp_note=""
+        local _mcp_n _mcp_count=0 _mcp_kept="nothing" _mcp_note="" _mcp_keptn="" _mcp_missing=""
         while IFS= read -r _mcp_n; do
             [[ -n "$_mcp_n" ]] || continue
+            if [[ $'\n'"$LAUNCH_MCP_KEEP" == *$'\n'"$_mcp_n"$'\n'* ]]; then
+                _mcp_keptn+="${_mcp_keptn:+, }${_mcp_n}"
+                continue
+            fi
             LAUNCH_FLAGS+=("-c" "mcp_servers.${_mcp_n}.enabled=false")
             _mcp_count=$((_mcp_count + 1))
         done <<< "$LAUNCH_CODEX_MCP_NAMES"
+        while IFS= read -r _mcp_n; do
+            [[ -n "$_mcp_n" ]] || continue
+            [[ $'\n'"$LAUNCH_CODEX_MCP_NAMES" == *$'\n'"$_mcp_n"$'\n'* ]] \
+                || _mcp_missing+="${_mcp_missing:+, }${_mcp_n}"
+        done <<< "$LAUNCH_MCP_KEEP"
         [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]] && _mcp_kept="cctrl_runtime"
+        if [[ -n "$_mcp_keptn" ]]; then
+            if [[ "$_mcp_kept" == nothing ]]; then _mcp_kept="$_mcp_keptn"; else _mcp_kept+=", ${_mcp_keptn}"; fi
+        fi
         (( LAUNCH_CODEX_MCP_UNCONTROLLABLE > 0 )) && _mcp_note="; not controllable: $LAUNCH_CODEX_MCP_UNCONTROLLABLE"
-        echo -e "${DIM}mcp: lean (kept: ${_mcp_kept}; disabled: ${_mcp_count}${_mcp_note})${RESET}"
+        [[ -n "$_mcp_missing" ]] && _mcp_note+="; WARNING: kept but not found in config.toml: ${_mcp_missing}"
+        (( LAUNCH_MCP_KEEP_BAD > 0 )) && _mcp_note+="; WARNING: ignored ${LAUNCH_MCP_KEEP_BAD} invalid keep-list entries"
+        local _mcp_label="lean"
+        [[ "$_mcp_mode" == minimal ]] && _mcp_label="lean, minimal"
+        echo -e "${DIM}mcp: ${_mcp_label} (kept: ${_mcp_kept}; disabled: ${_mcp_count}${_mcp_note})${RESET}"
     fi
     [[ ${#LAUNCH_PASSTHROUGH[@]} -gt 0 ]] && LAUNCH_FLAGS+=("${LAUNCH_PASSTHROUGH[@]}")
     if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && "$no_bridge" != "true" ]] && ! _launch_flags_has_codex_remote; then
@@ -2552,6 +2711,7 @@ cmd_start() {
     agent="$(_resolve_agent_or_prompt "$agent" "Choose agent runtime" "$profile")" || return 1
     local pf=""
     [[ -n "$profile" ]] && pf="$(_profile_find "$profile")"
+    LAUNCH_MCP_MODE="$(_mcp_mode_resolve "$mcp_flag" "" "$agent" "$pf")" || return $?
     # Narrow peer-path overlay (matches the one _launch_detached keeps, per
     # plan 071 phase 4): a profile may set CCTRL_DATA_DIR/
     # CCTRL_SESSION_METADATA_DIR to namespace its own peer registry, and the
@@ -4961,7 +5121,7 @@ _launch_detached() {
         esac
     done
 
-    mcp_mode="$(_mcp_mode_resolve "$mcp_flag")" || return $?
+    mcp_mode="$(_mcp_mode_resolve "$mcp_flag" "" "" "" "" parent)" || return $?
 
     if ! command -v tmux &>/dev/null; then
         echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
@@ -5014,9 +5174,9 @@ _launch_detached() {
             echo -e "${DIM}List with: cctrl @${RESET}" >&2
             return 1
         fi
-        local shortcut_profile="" shortcut_agent=""
-        { IFS= read -r shortcut_profile; IFS= read -r shortcut_agent; } < <(jq -r --arg k "$shortcut_canonical" '
-            .[$k] | (.profile // ""), (.agent // "")
+        local shortcut_profile="" shortcut_agent="" shortcut_mcp=""
+        { IFS= read -r shortcut_profile; IFS= read -r shortcut_agent; IFS= read -r shortcut_mcp; } < <(jq -r --arg k "$shortcut_canonical" '
+            .[$k] | (.profile // ""), (.agent // ""), (.mcp // "" | if type == "string" then . else "<not a string>" end)
         ' "$SHORTCUTS_FILE")
         [[ -z "$profile" && -n "$shortcut_profile" ]] && profile="$shortcut_profile"
         if [[ "$agent_explicit" != "true" && -n "$shortcut_agent" ]]; then
@@ -5084,6 +5244,7 @@ _launch_detached() {
     local resolved_profile_file="" resolved_auth_backend="" resolved_requested_model=""
     [[ -n "$resolved_profile" ]] && resolved_profile_file="$(_profile_find "$resolved_profile")"
     resolved_auth_backend="$(_profile_auth_backend "$detach_agent" "$resolved_profile_file")"
+    mcp_mode="$(_mcp_mode_resolve "$mcp_flag" "${shortcut_mcp:-}" "$detach_agent" "$resolved_profile_file" "${shortcut_canonical:-}" parent)" || return $?
     local cli_model_for_metadata="" _pt_i
     for (( _pt_i = 0; _pt_i < ${#passthrough[@]}; _pt_i++ )); do
         # Stop at a literal "--": everything after it is the initial prompt
@@ -15224,8 +15385,10 @@ cmd_restart() {
     # Plan 106 P2: a lean (--mcp none) session has a per-session MCP file next
     # to the settings overlay. Rewrite it from the record's mcp_mode, whatever
     # the profile (the block above only runs when a profile is set).
-    if [[ -n "${CCTRL_SESSION_NAME:-}" && "$(_session_metadata_field "$CCTRL_SESSION_NAME" mcp_mode 2>/dev/null || true)" == none ]]; then
-        _profile_mcp_write "$CCTRL_SESSION_NAME" "${CCTRL_PEER:-}" >/dev/null \
+    local _restart_mcp_mode=""
+    [[ -n "${CCTRL_SESSION_NAME:-}" ]] && _restart_mcp_mode="$(_session_metadata_field "$CCTRL_SESSION_NAME" mcp_mode 2>/dev/null || true)"
+    if [[ "$_restart_mcp_mode" == none || ( "$_restart_mcp_mode" == minimal && "${CCTRL_AGENT:-claude}" == claude ) ]]; then
+        _profile_mcp_write "$CCTRL_SESSION_NAME" "${CCTRL_PEER:-}" "$_restart_mcp_mode" >/dev/null \
             || echo -e "${YELLOW}WARN: could not refresh the MCP config file for restart; continuing with the existing file.${RESET}" >&2
     fi
 
@@ -16200,7 +16363,7 @@ cmd_help() {
     echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
     echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
-    echo "    --mcp inherit|none        MCP servers for a terminal-owned worker (default inherit; none keeps only cctrl's own; env CCTRL_MCP_MODE, ignored inside a cctrl pane: pass the flag; --mcp=none works too; a passthrough --mcp-config adds a second config)"
+    echo "    --mcp inherit|minimal|none MCP servers for a terminal-owned worker (default inherit; none keeps only cctrl's own; minimal = none + the keep list mcp.minimal.<agent> in the cctrl config; precedence: flag, shortcut field mcp, profile key agents.<agent>.mcp, env CCTRL_MCP_MODE (ignored inside a cctrl pane: pass the flag); --mcp=none works too; a passthrough --mcp-config adds a second config)"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
     echo "    --role orchestrator|worker  Session role (default worker); needs -d"
@@ -18281,7 +18444,7 @@ _shortcut_list() {
 _shortcut_add() {
     local name="${1:-}" dir="${2:-}"
     if [[ -z "$name" || -z "$dir" ]]; then
-        echo -e "${RED}Usage: cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--resume [id]] [--message TEXT]${RESET}"
+        echo -e "${RED}Usage: cctrl @add <name> <dir> [--profile X] [--agent claude|codex] [--mcp inherit|minimal|none] [--resume [id]] [--message TEXT]${RESET}"
         return 1
     fi
     shift 2
@@ -18290,9 +18453,14 @@ _shortcut_add() {
     local agent=""
     local resume="false"
     local prompt=""
-    local role_flag="" kind_flag=""
+    local role_flag="" kind_flag="" mcp_flag=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --mcp)
+                [[ $# -ge 2 ]] || { echo -e "${RED}--mcp needs a value${RESET}"; return 64; }
+                mcp_flag="$2"; shift 2 ;;
+            --mcp=*)
+                mcp_flag="${1#--mcp=}"; shift ;;
             --role)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--role needs a value${RESET}"; return 64; }
                 role_flag="$2"; shift 2 ;;
@@ -18323,6 +18491,10 @@ _shortcut_add() {
     if [[ -n "$profile" ]] && ! _profile_exists "$profile"; then
         echo -e "${YELLOW}Warning: profile '$profile' does not exist (saving anyway).${RESET}"
     fi
+    case "$mcp_flag" in
+        ""|inherit|minimal|none) ;;
+        *) echo -e "${RED}cctrl: --mcp must be inherit, minimal or none${RESET}" >&2; return 64 ;;
+    esac
 
     _shortcuts_init
 
@@ -18364,6 +18536,7 @@ _shortcut_add() {
        --arg dir "$dir" \
        --arg role "$final_role" \
        --arg orch_kind "$final_kind" \
+       --arg mcp "$mcp_flag" \
        --arg profile "$profile" \
        --arg agent "$agent" \
        --arg resume "$resume" \
@@ -18381,6 +18554,7 @@ _shortcut_add() {
                 + (if $prompt != "" then {prompt: $prompt} else {} end)
                 + (if $role != "" then {role: $role} else {} end)
                 + (if $orch_kind != "" then {orch_kind: $orch_kind} else {} end)
+                + (if $mcp != "" then {mcp: $mcp} else {} end)
             )
         }
     ' "$SHORTCUTS_FILE" > "$tmp" && mv "$tmp" "$SHORTCUTS_FILE"
@@ -18391,6 +18565,7 @@ _shortcut_add() {
     [[ "$resume" != "false" ]] && echo -e "${DIM}  resume=$resume${RESET}"
     [[ -n "$prompt" ]] && echo -e "${DIM}  prompt=\"$prompt\"${RESET}"
     [[ -n "$final_role" ]] && echo -e "${DIM}  role=$final_role${final_kind:+ orch_kind=$final_kind}${RESET}"
+    [[ -n "$mcp_flag" ]] && echo -e "${DIM}  mcp=$mcp_flag${RESET}"
     return 0
 }
 
@@ -18464,9 +18639,9 @@ _shortcut_jump() {
         return 1
     fi
 
-    local dir shortcut_profile shortcut_agent resume prompt
-    { IFS= read -r dir; IFS= read -r shortcut_profile; IFS= read -r shortcut_agent; IFS= read -r resume; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
-        .[$k] | (.dir // ""), (.profile // ""), (.agent // ""), (.resume // false | tostring), (.prompt // "")
+    local dir shortcut_profile shortcut_agent resume prompt shortcut_mcp
+    { IFS= read -r dir; IFS= read -r shortcut_profile; IFS= read -r shortcut_agent; IFS= read -r resume; IFS= read -r shortcut_mcp; IFS= read -r prompt; } < <(jq -r --arg k "$key" '
+        .[$k] | (.dir // ""), (.profile // ""), (.agent // ""), (.resume // false | tostring), (.mcp // "" | if type == "string" then . else "<not a string>" end), (.prompt // "")
     ' "$SHORTCUTS_FILE")
 
     # Expand leading ~
@@ -18624,6 +18799,7 @@ _shortcut_jump() {
     # still only ever sees scrub-then-overlay.
     local pf=""
     [[ -n "$profile" ]] && pf="$(_profile_find "$profile")"
+    LAUNCH_MCP_MODE="$(_mcp_mode_resolve "$mcp_flag" "$shortcut_mcp" "$agent" "$pf" "$key")" || return $?
     _apply_profile_overlay "$agent" "$pf"
     _peer_refresh_paths
     _session_refresh_paths

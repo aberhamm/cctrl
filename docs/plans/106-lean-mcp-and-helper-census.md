@@ -172,6 +172,16 @@ P2 as built (deviations and choices, 2026-10-09):
 
 **P3. Profile key and `minimal`.** `agents.<agent>.mcp`, `mcp.minimal.<agent>`
 keep list, Claude definition copy, shortcut field, help/README, completions.
+**P3 part A: IMPLEMENTED 2026-10-09 (not committed-as-done: part B follows, P3 stays open).**
+
+P3 as built (part A):
+- `_mcp_mode_resolve flag shortcut_mode agent profile_file shortcut_key`: precedence flag > shortcut field `mcp` > profile `agents.<agent>.mcp` > `CCTRL_MCP_MODE` > inherit (the shortcut sits above the profile: it is the more specific, per-launch-target setting). Called early (flag/env, fail fast) and again once agent and profile file are known (`cmd_start`, `_launch_detached`, shortcut foreground). A pane child of a detached launch trusts only `CCTRL_LAUNCH_MCP_MODE`. A bad value exits 64 naming the source; an unreadable profile exits 64; a non-string value is invalid.
+- Keep list: `_mcp_keep_list <agent>` reads `mcp.minimal.<agent>` through `_config_jq` (same three files as every other cctrl key). Names validated against `[A-Za-z0-9_-]+` before use; invalid entries are counted ("ignored N invalid keep-list entries"); `cctrl-peer` / `cctrl_runtime` are dropped silently. A config file that exists but is invalid JSON exits 70.
+- Claude definitions come from files, found by reading KEY NAMES and types only: user scope `${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json` `.mcpServers` (stdio: `type`, `command`, `args`, optional `env`; http: `type`, `url`, `headers`), project scope `$PWD/.mcp.json`, local scope `.projects["$PWD"].mcpServers`; later scope wins (local > project > user). `_profile_mcp_write key peer mode` builds the 600 file with one jq run (`--slurpfile` of the two source files, keep names as `--argjson`, nothing secret in argv); `cctrl-peer` is added after the copy. Claude plugin servers and claude.ai connectors live in no file and are reported as not found.
+- Codex: kept names skip `enabled=false`; `_codex_mcp_server_names` additionally recognises `[mcp_servers]` + `foo = {`/`foo.key =`, and top-level `mcp_servers.foo = {`/`.key =`; quoted keys/names and a whole `mcp_servers = {` count as not controllable. Multi-line inline values are not followed.
+- `cmd_restart` rewrites the file for `minimal` (Claude sessions) as well as `none`. Shortcut field: `cctrl @add NAME DIR --mcp inherit|minimal|none`.
+- Tests: `test_launch_mcp_minimal_keep_list`, `test_launch_mcp_minimal_no_secret_in_argv`, `test_launch_mcp_profile_key_precedence`, `test_launch_mcp_shortcut_field`, `test_codex_mcp_scan_inline_and_dotted`; `test_launch_mcp_mode_validation` updated (minimal is valid). The keep-list filter, profile precedence and secret guard were mutation-checked (each mutation fails its test).
+- Part B (not done): `session snapshot`/`restore`/`_session_realign` carrying `mcp_mode`; `_remote_exec` forwarding `--mcp`; the possibly dead `rm` of `CCTRL_PROFILE_MCP_FILE` in `lib/session-wrapper.sh`; the two skills/ lines (D3).
 
 **P4. Spike: app-owned threads (no code unless proven). NEEDS-OWNER: blocked on Matthew; do not run, and no worker may start it.** With a throwaway
 thread, test whether `thread/start` `config` carrying

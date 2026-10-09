@@ -1822,8 +1822,14 @@ threads.
 `cctrl start ... --mcp none` (also `cctrl @key --mcp none`, `cctrl launch-to-app
 ... --mcp none`, or `CCTRL_MCP_MODE=none`) starts a terminal-owned worker with
 only cctrl's own MCP server. The flag beats the env var; the default is
-`inherit` and changes nothing. A bad value exits 64; `--mcp minimal` is not
-available yet. `--mcp=none` works like `--mcp none`.
+`inherit` and changes nothing. A bad value exits 64. `--mcp=none` works like
+`--mcp none`. `--mcp minimal` is `none` plus an operator keep list (below).
+
+Precedence: `--mcp` flag, then the shortcut's `mcp` field, then the profile key
+`agents.<agent>.mcp`, then `CCTRL_MCP_MODE`, then `inherit`. A bad value in a
+profile or shortcut exits 64 and names the profile and key (or the shortcut).
+Set the shortcut field with `cctrl @add NAME DIR --mcp minimal`; it applies to
+`cctrl @NAME` and `cctrl start -d @NAME`.
 
 Inside a cctrl pane `CCTRL_MCP_MODE` is ignored on purpose (a long-lived tmux
 server can hold a stale value), so an orchestrator that spawns workers from its
@@ -1842,6 +1848,26 @@ other.json` adds a second config on top of cctrl's; it does not replace it.
   `cctrl_runtime` stays. Plugin-provided servers cannot be disabled this way and
   stay on. A name with characters outside `[A-Za-z0-9_-]` is reported as "not
   controllable" in the launch line.
+- `minimal`: the keep list is `mcp.minimal.<agent>` (an array of server names,
+  `claude` and `codex` separately) in your cctrl config (`~/.config/cctrl/config.json`
+  or `data/config.local.json`; `CCTRL_USER_CONFIG` points elsewhere). It ships
+  empty, so `minimal` equals `none` until you list servers. Names outside
+  `[A-Za-z0-9_-]` are ignored and counted in the launch line; a kept name that
+  does not exist is a WARNING on the launch line, not an error. cctrl's own
+  servers (`cctrl-peer`, `cctrl_runtime`) cannot be removed or listed.
+  - Claude: the kept servers' definitions are copied, file to file, into the
+    per-session mode-600 file (never into argv, the record or a log) from
+    `${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json` (`.mcpServers`, user scope),
+    `$PWD/.mcp.json` (project) and `.projects[$PWD].mcpServers` (local); later
+    wins. Servers that live in no file (claude.ai connectors, plugin-provided
+    servers) cannot be copied and are reported as not found. An unreadable
+    (invalid JSON) Claude or cctrl config exits 70; it never falls back to
+    `inherit`.
+  - Codex: kept names get no `enabled=false`; everything else named in
+    `config.toml` does. The scan also sees `mcp_servers.foo = { ... }`,
+    `mcp_servers.foo.key = ...` and `foo = { ... }` / `foo.key = ...` under a
+    `[mcp_servers]` table; quoted names and a whole `mcp_servers = { ... }` are
+    counted as not controllable.
 - The mode is shown in the launch line and as `mcp_mode` in `cctrl session ls
   --json`. Anything after `--` (your own `-c` or `--mcp-config`) still wins.
 - Not covered: app-owned threads (`start --app-owned` rejects `--mcp`, exit 64)

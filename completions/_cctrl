@@ -191,7 +191,7 @@ _cctrl() {
                 '--resume[Resume a session]' \
                 '--agent[Agent runtime]:agent:_cctrl_agents' \
                 '--peer[Peer mailbox identity]:peer:_cctrl_peers' \
-                '--mcp[MCP servers for the worker: inherit (default) or none]:mode:(inherit none)' \
+                '--mcp[MCP servers for the worker: inherit (default), minimal or none]:mode:(inherit minimal none)' \
                 '--purpose[Session purpose metadata]:purpose:' \
                 '--foreground[Launch directly without tmux]' \
                 '--no-tmux[Launch directly without tmux]' \
@@ -250,7 +250,7 @@ _cctrl() {
                 '--reasoning-effort[Codex reasoning effort]:effort:(none minimal low medium high xhigh max ultra)' \
                 {--name,-n}'[Session display name]:name:' \
                 '--peer[Peer mailbox identity]:peer:_cctrl_peers' \
-                '--mcp[MCP servers for the worker: inherit (default) or none]:mode:(inherit none)' \
+                '--mcp[MCP servers for the worker: inherit (default), minimal or none]:mode:(inherit minimal none)' \
                 '--purpose[Session purpose metadata]:purpose:' \
                 '--yolo[Full bypass mode]' \
                 '--permission-mode[Claude permission mode]:mode:' \
@@ -284,7 +284,7 @@ _cctrl() {
                 '--remote[Codex TUI transport during bootstrap only]:addr:(unix://)' \
                 '--remote-auth-token-env[Env var containing remote auth token]:envvar:' \
                 '--no-bridge[Disable the phone-control bridge]' \
-                '--mcp[MCP servers for the terminal phase: inherit (default) or none]:mode:(inherit none)' \
+                '--mcp[MCP servers for the terminal phase: inherit (default), minimal or none]:mode:(inherit minimal none)' \
                 '*:target:->launch_to_app_target'
             if [[ "$state" == launch_to_app_target ]]; then
                 _cctrl_shortcuts

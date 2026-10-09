@@ -1523,8 +1523,8 @@ test_launch_mcp_equals_form() {
     [[ "$args" != *"--mcp="* ]] || fail "--mcp=none leaked into the agent argv: $args"
     rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp=bogus -m hi 2>&1)" || rc=$?
     [[ $rc -eq 64 ]] || fail "--mcp=bogus: want 64, got $rc"; assert_contains "$out" "unknown MCP mode 'bogus'"
-    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp=minimal -m hi 2>&1)" || rc=$?
-    [[ $rc -eq 64 ]] || fail "--mcp=minimal: want 64, got $rc"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp=minimal -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "--mcp=minimal is valid from P3: got $rc"; assert_contains "$out" "mcp: lean (minimal"
     mkdir -p "$TMPDIR/mcp-eq-proj"
     rc=0; out="$("${run[@]}" "$ROOT/cctrl" start -d --agent claude --mcp=bogus "$TMPDIR/mcp-eq-proj" 2>&1)" || rc=$?
     [[ $rc -eq 64 ]] || fail "start -d --mcp=bogus: want 64, got $rc: $out"
@@ -1591,8 +1591,8 @@ test_launch_mcp_none_codex() {
 }
 
 test_launch_mcp_mode_validation() {
-    # NOTE: the profile leg of the precedence (flag > profile > env) is P3
-    # (agents.<agent>.mcp); P2 covers flag > CCTRL_MCP_MODE > inherit.
+    # The profile leg of the precedence (flag > shortcut > profile > env) is in
+    # test_launch_mcp_profile_key_precedence / test_launch_mcp_shortcut_field.
     make_fake_agent "$TMPDIR/claude" claude
     make_fake_agent "$TMPDIR/codex" codex
     make_fake_tmux "$TMPDIR/tmux"
@@ -1604,8 +1604,10 @@ test_launch_mcp_mode_validation() {
     assert_not_contains "$out" "ARG["
     rc=0; out="$("${run[@]}" CCTRL_MCP_MODE=bogus "$ROOT/cctrl" start --foreground --agent claude --profile none -m hi 2>&1)" || rc=$?
     [[ $rc -eq 64 ]] || fail "bad CCTRL_MCP_MODE: want 64, got $rc"
-    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp minimal -m hi 2>&1)" || rc=$?
-    [[ $rc -eq 64 ]] || fail "--mcp minimal: want 64 (not available in P2), got $rc"; assert_contains "$out" "not available yet"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp Minimal -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "--mcp Minimal (wrong case): want 64, got $rc"; assert_contains "$out" "unknown MCP mode 'Minimal'"
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp minimal -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "--mcp minimal is valid from P3: got $rc: $out"
     rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --mcp 2>&1)" || rc=$?
     [[ $rc -eq 64 ]] || fail "--mcp without a value: want 64, got $rc"
     # shortcut-style and detached entry points validate too
@@ -1622,6 +1624,261 @@ test_launch_mcp_mode_validation() {
     out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp none -m hi)"
     assert_not_contains "$(_mcp_args_of "$out")" "--mcp$(printf '\n')none"
     [[ "$(_mcp_args_of "$out" | grep -cx -- '--mcp')" == 0 ]] || fail "--mcp leaked into the agent argv"
+}
+
+# ---- plan 106 P3 part A: --mcp minimal, profile key, shortcut field ----
+
+# Claude MCP fixture: user scope (.claude.json), project scope (.mcp.json),
+# local scope (.projects[cwd]). Secret-shaped values are built at runtime and
+# kept in $_MCPMIN_SECRET so a test can assert where they do and do not appear.
+_mcpmin_claude_fixture() {
+    local cfgdir="$1" proj="$2" sec="PLAN""TED-$$-tok"
+    _MCPMIN_SECRET="$sec"
+    mkdir -p "$cfgdir" "$proj"
+    jq -n --arg sec "$sec" --arg cwd "$proj" '{
+        mcpServers: {
+            keepme: {type: "stdio", command: "user-cmd", args: [], env: {TOKEN: $sec}},
+            dropme: {type: "stdio", command: "drop-cmd", args: [], env: {TOKEN: $sec}},
+            svc:    {type: "http", url: "https://svc.invalid/mcp", headers: {Authorization: ("Bearer " + $sec)}}
+        },
+        projects: {($cwd): {mcpServers: {projonly: {type: "stdio", command: "local-cmd", args: []}}}}
+    }' > "$cfgdir/.claude.json"
+    jq -n '{mcpServers: {keepme: {command: "proj-cmd", args: []}, projonly: {command: "proj-cmd", args: []}}}' > "$proj/.mcp.json"
+}
+
+test_launch_mcp_minimal_keep_list() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local cfgdir="$TMPDIR/mcpmin-claudecfg" proj="$TMPDIR/mcpmin-proj" runtime="$TMPDIR/mcpmin-runtime" out args file uc="$TMPDIR/mcpmin-user.json"
+    mkdir -p "$proj"; proj="$(cd "$proj" && pwd)"
+    _mcpmin_claude_fixture "$cfgdir" "$proj"
+    printf '{"mcp":{"minimal":{"claude":["keepme","svc","nosuch","projonly","bad name","cctrl-peer"],"codex":["alpha","ghost"]}}}\n' > "$uc"
+    mkdir -p "$TMPDIR/comet"
+    CCTRL_DATA_DIR="$TMPDIR/mcpmin-data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent claude >/dev/null
+
+    # Claude: kept servers' definitions are copied file-to-file; precedence local > project > user
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_USER_CONFIG="$uc" CCTRL_RUNTIME_DIR="$runtime" CCTRL_DATA_DIR="$TMPDIR/mcpmin-data" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --peer comet --mcp minimal -m hi)"
+    args="$(_mcp_args_of "$out")"
+    file="$(printf '%s\n' "$args" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+    [[ -f "$file" && "$(_mcp_file_mode "$file")" == 600 ]] || fail "MCP file missing or not mode 600: $file"
+    [[ "$(jq -c '.mcpServers | keys' "$file")" == '["cctrl-peer","keepme","projonly","svc"]' ]] || fail "wrong server set: $(jq -c '.mcpServers | keys' "$file")"
+    [[ "$(jq -r '.mcpServers.keepme.command' "$file")" == proj-cmd ]] || fail "project scope must beat user scope"
+    [[ "$(jq -r '.mcpServers.projonly.command' "$file")" == local-cmd ]] || fail "local scope must beat project scope"
+    [[ "$(jq -r '.mcpServers["cctrl-peer"].args | join(" ")' "$file")" == "peer mcp --as comet" ]] || fail "cctrl-peer must be cctrl's own definition"
+    jq -e '.mcpServers | has("dropme") | not' "$file" >/dev/null || fail "a server outside the keep list must not be copied"
+    [[ "$(printf '%s\n' "$args" | grep -c '^--mcp-config$')" == 1 && "$(printf '%s\n' "$args" | grep -c '^--strict-mcp-config$')" == 1 ]] || fail "want one --mcp-config and one --strict-mcp-config: $args"
+    assert_contains "$out" "mcp: lean (minimal; kept: cctrl-peer, keepme, projonly, svc;"
+    assert_contains "$out" "WARNING: kept but not found in the Claude MCP config: nosuch"
+    assert_contains "$out" "WARNING: ignored 1 invalid keep-list entries"
+    assert_not_contains "$out" "dropme"
+    # a missing kept name is a warning, not an error (rc 0 above); an empty keep list == none
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_RUNTIME_DIR="$runtime" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp minimal -m hi)"
+    file="$(_mcp_args_of "$out" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+    jq -e '.mcpServers == {}' "$file" >/dev/null || fail "minimal with an empty keep list must equal none (empty map)"
+    # a malformed cctrl config fails closed (70), never falls back to inherit
+    printf '{"mcp": ' > "$TMPDIR/mcpmin-bad.json"
+    local rc=0
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_USER_CONFIG="$TMPDIR/mcpmin-bad.json" CCTRL_RUNTIME_DIR="$runtime" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp minimal -m hi 2>&1)" || rc=$?
+    [[ "$rc" -eq 70 ]] || fail "malformed cctrl config: want rc 70, got $rc: $out"
+    assert_not_contains "$out" "ARG["
+    # a malformed Claude config fails closed too
+    printf '{"mcpServers": ' > "$cfgdir/.claude.json"
+    rc=0
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_USER_CONFIG="$uc" CCTRL_RUNTIME_DIR="$runtime" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp minimal -m hi 2>&1)" || rc=$?
+    [[ "$rc" -eq 70 ]] || fail "malformed Claude config: want rc 70, got $rc"
+    assert_not_contains "$out" "ARG["
+
+    # Codex: kept names get no enabled=false; a kept name that does not exist is a warning
+    local home="$TMPDIR/mcpmin-codex-home"
+    mkdir -p "$home"
+    printf '[mcp_servers.alpha]\ncommand = "a"\n[mcp_servers.beta]\ncommand = "b"\n[mcp_servers.gamma-3]\ncommand = "g"\n' > "$home/config.toml"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" CCTRL_USER_CONFIG="$uc" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp minimal -m hi)"
+    args="$(_mcp_args_of "$out")"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.alpha.enabled=false' && fail "kept alpha must not be disabled: $args"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.beta.enabled=false' || fail "beta must be disabled: $args"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.gamma-3.enabled=false' || fail "gamma-3 must be disabled: $args"
+    assert_contains "$out" "mcp: lean, minimal (kept: alpha; disabled: 2"
+    assert_contains "$out" "WARNING: kept but not found in config.toml: ghost"
+    # empty keep list: minimal == none
+    local none_args min_args
+    none_args="$(_mcp_args_of "$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)")"
+    min_args="$(_mcp_args_of "$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp minimal -m hi)")"
+    [[ "$none_args" == "$min_args" ]] || fail "minimal with an empty keep list must equal none"
+    # the keep list is per agent: the claude list does not apply to codex and vice versa
+    printf '{"mcp":{"minimal":{"claude":["alpha"]}}}\n' > "$uc"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" CCTRL_USER_CONFIG="$uc" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp minimal -m hi)"
+    _mcp_args_of "$out" | grep -qx 'mcp_servers.alpha.enabled=false' || fail "a claude keep list must not keep a codex server"
+}
+
+test_launch_mcp_minimal_no_secret_in_argv() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local cfgdir="$TMPDIR/mcpsec-claudecfg" proj="$TMPDIR/mcpsec-proj" runtime="$TMPDIR/mcpsec-runtime" uc="$TMPDIR/mcpsec-user.json" out args file
+    mkdir -p "$proj"; proj="$(cd "$proj" && pwd)"
+    _mcpmin_claude_fixture "$cfgdir" "$proj"
+    local sec="$_MCPMIN_SECRET"
+    printf '{"mcp":{"minimal":{"claude":["keepme","svc"]}}}\n' > "$uc"
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_USER_CONFIG="$uc" CCTRL_RUNTIME_DIR="$runtime" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp minimal -m hi)"
+    args="$(_mcp_args_of "$out")"
+    file="$(printf '%s\n' "$args" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+    grep -qF -- "$sec" "$file" || fail "fixture secret missing from the 600 file (test would prove nothing)"
+    [[ "$(_mcp_file_mode "$file")" == 600 ]] || fail "MCP file not mode 600"
+    [[ "$args" != *"{"* ]] || fail "JSON reached the Claude argv under --mcp minimal: $args"
+    [[ "$out" != *"$sec"* ]] || fail "secret reached the agent output / launch line"
+    [[ "$out" != *"svc.invalid"* ]] || fail "server URL reached the launch line"
+    # detached: the record, the tmux shell command and the metadata dir stay secret-free
+    local meta="$TMPDIR/mcpsec-meta" log="$TMPDIR/mcpsec-tmux.log" dproj="$proj"
+    mkdir -p "$meta"; : > "$log"
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_USER_CONFIG="$uc" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent claude --profile none --mcp minimal "$dproj")"
+    assert_contains "$out" "detached session started"
+    grep -qF -- "CCTRL_LAUNCH_MCP_MODE=minimal" "$log" || fail "detached shell command must carry the mode"
+    ! grep -rqF -- "$sec" "$log" "$meta" || fail "secret reached the tmux log or the session record"
+    ! grep -rqF -- "svc.invalid" "$log" "$meta" || fail "server definition reached the tmux log or the session record"
+    assert_contains "$(CCTRL_SESSION_METADATA_DIR="$meta" session_record_json "TMUX--mcpsec-proj")" '"mcp_mode": "minimal"'
+}
+
+test_launch_mcp_profile_key_precedence() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local profiles="$TMPDIR/mcpprof-profiles" runtime="$TMPDIR/mcpprof-runtime" out rc
+    mkdir -p "$profiles"
+    printf '{"agents":{"claude":{"mcp":"none"},"codex":{"mcp":"minimal"}}}\n' > "$profiles/leanp.json"
+    printf '{"agents":{"claude":{"mcp":"bogus"}}}\n' > "$profiles/badp.json"
+    printf '{"agents":{"claude":{"mcp":7}}}\n' > "$profiles/numeric.json"
+    printf '{"agents":{"claude":{"model":"x"}}}\n' > "$profiles/plain.json"
+    local run=(env PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_PROFILES_DIR="$profiles")
+    # profile key alone
+    out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile leanp --no-bridge -m hi)"
+    assert_contains "$out" "mcp: lean (none; kept: nothing)"
+    # flag > profile
+    out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile leanp --no-bridge --mcp inherit -m hi)"
+    assert_not_contains "$out" "mcp: lean"
+    # profile > env
+    out="$("${run[@]}" CCTRL_MCP_MODE=inherit "$ROOT/cctrl" start --foreground --agent claude --profile leanp --no-bridge -m hi)"
+    assert_contains "$out" "mcp: lean (none"
+    # a profile without the key falls through to env
+    out="$("${run[@]}" CCTRL_MCP_MODE=none "$ROOT/cctrl" start --foreground --agent claude --profile plain --no-bridge -m hi)"
+    assert_contains "$out" "mcp: lean (none"
+    # the key is per agent: the codex key does not apply to claude and vice versa
+    out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent codex --profile leanp -m hi)"
+    assert_contains "$out" "mcp: lean, minimal (kept: nothing"
+    # a bad value names the profile and the key, exit 64, nothing launched
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile badp --no-bridge -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "bad profile mcp value: want 64, got $rc: $out"
+    assert_contains "$out" "profile 'badp' key agents.claude.mcp"
+    assert_contains "$out" "unknown MCP mode 'bogus'"
+    assert_not_contains "$out" "ARG["
+    rc=0; out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile numeric --no-bridge -m hi 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "non-string profile mcp value: want 64, got $rc"
+    # the flag overrides even a bad profile value (the profile is never consulted)
+    out="$("${run[@]}" "$ROOT/cctrl" start --foreground --agent claude --profile badp --no-bridge --mcp none -m hi)"
+    assert_contains "$out" "mcp: lean (none"
+    # detached: the resolved profile mode crosses to the pane child and the record
+    local meta="$TMPDIR/mcpprof-meta" log="$TMPDIR/mcpprof-tmux.log" proj="$TMPDIR/mcpprof-proj"
+    mkdir -p "$meta" "$proj"; : > "$log"
+    out="$("${run[@]}" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent claude --profile leanp "$proj")"
+    grep -qF -- "CCTRL_LAUNCH_MCP_MODE=none" "$log" || fail "detached launch must carry the profile's mode"
+    # the same launch made from INSIDE a cctrl pane (an orchestrator): the profile key still applies
+    : > "$log"; mkdir -p "$TMPDIR/mcpprof-proj2"
+    out="$("${run[@]}" CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--orch TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent claude --profile leanp "$TMPDIR/mcpprof-proj2")"
+    grep -qF -- "CCTRL_LAUNCH_MCP_MODE=none" "$log" || fail "profile key ignored for a launch made inside a cctrl pane"
+    # ... and CCTRL_MCP_MODE stays ignored there (documented)
+    : > "$log"; mkdir -p "$TMPDIR/mcpprof-proj3"
+    out="$("${run[@]}" CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--orch CCTRL_MCP_MODE=none TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent claude --profile plain "$TMPDIR/mcpprof-proj3")"
+    ! grep -qF -- "CCTRL_LAUNCH_MCP_MODE" "$log" || fail "CCTRL_MCP_MODE must stay ignored inside a cctrl pane"
+    assert_contains "$(CCTRL_SESSION_METADATA_DIR="$meta" session_record_json "TMUX--mcpprof-proj")" '"mcp_mode": "none"'
+}
+
+test_launch_mcp_shortcut_field() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local rootcopy="$TMPDIR/cctrl-mcp-shortcut-copy" project="$TMPDIR/mcp-shortcut-project" runtime="$TMPDIR/mcp-shortcut-runtime" out rc
+    mkdir -p "$rootcopy/data" "$rootcopy/lib" "$project"
+    cp "$ROOT/cctrl" "$rootcopy/cctrl"; chmod +x "$rootcopy/cctrl"
+    cp -R "$ROOT/lib/." "$rootcopy/lib/"
+    local profiles="$TMPDIR/mcp-shortcut-profiles"
+    mkdir -p "$profiles"; printf '{"agents":{"claude":{"mcp":"none"}}}\n' > "$profiles/leanp.json"
+    printf '{"lean":{"dir":"%s","agent":"claude","profile":"none","mcp":"none"},"mini":{"dir":"%s","agent":"claude","profile":"none","mcp":"minimal"},"bad":{"dir":"%s","agent":"claude","profile":"none","mcp":"bogus"},"plain":{"dir":"%s","agent":"claude","profile":"none"},"over":{"dir":"%s","agent":"claude","profile":"leanp","mcp":"inherit"}}\n' "$project" "$project" "$project" "$project" "$project" > "$rootcopy/data/shortcuts.json"
+    local run=(env PATH="$TMPDIR:$PATH" CCTRL_RUNTIME_DIR="$runtime" CCTRL_PROFILES_DIR="$profiles")
+    # a raw multi-line prompt must not leak into the mcp field (default path unchanged)
+    jq --arg d "$project" '. + {multi: {dir: $d, agent: "claude", profile: "none", prompt: "line one\nnone"}}' "$rootcopy/data/shortcuts.json" > "$rootcopy/data/s.tmp" && mv "$rootcopy/data/s.tmp" "$rootcopy/data/shortcuts.json"
+    out="$("${run[@]}" "$rootcopy/cctrl" @multi --foreground --no-bridge)"
+    assert_not_contains "$out" "mcp: lean"
+    assert_contains "$out" "line one"
+    out="$("${run[@]}" "$rootcopy/cctrl" @lean --foreground --no-bridge)"
+    assert_contains "$out" "mcp: lean (none; kept: nothing)"
+    out="$("${run[@]}" "$rootcopy/cctrl" @mini --foreground --no-bridge)"
+    assert_contains "$out" "mcp: lean (minimal; kept: nothing)"
+    # the flag wins over the shortcut field
+    out="$("${run[@]}" "$rootcopy/cctrl" @lean --foreground --no-bridge --mcp inherit)"
+    assert_not_contains "$out" "mcp: lean"
+    # no field: default launch unchanged
+    out="$("${run[@]}" "$rootcopy/cctrl" @plain --foreground --no-bridge)"
+    assert_not_contains "$out" "mcp: lean"
+    # the shortcut field beats the profile key
+    out="$("${run[@]}" "$rootcopy/cctrl" @over --foreground --no-bridge)"
+    assert_not_contains "$out" "mcp: lean"
+    # a bad field names the shortcut, exit 64, nothing launched
+    rc=0; out="$("${run[@]}" "$rootcopy/cctrl" @bad --foreground --no-bridge 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "bad shortcut mcp field: want 64, got $rc: $out"
+    assert_contains "$out" "shortcut @bad field mcp"
+    assert_not_contains "$out" "ARG["
+    # detached @key carries the field to the pane child and the record
+    local meta="$TMPDIR/mcp-shortcut-meta" log="$TMPDIR/mcp-shortcut-tmux.log"
+    mkdir -p "$meta"; : > "$log"
+    out="$("${run[@]}" TMUX_LOG="$log" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_EMIT_SESSION=1 "$rootcopy/cctrl" start -d @lean)"
+    grep -qF -- "CCTRL_LAUNCH_MCP_MODE=none" "$log" || fail "detached @lean must carry the shortcut's mode"
+    rc=0; "${run[@]}" "$rootcopy/cctrl" start -d @bad >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 64 ]] || fail "detached @bad: want 64, got $rc"
+    # @add stores the field and validates it
+    "${run[@]}" "$rootcopy/cctrl" @add added "$project" --agent claude --profile none --mcp minimal >/dev/null
+    [[ "$(jq -r '.added.mcp' "$rootcopy/data/shortcuts.json")" == minimal ]] || fail "@add --mcp minimal did not store the field"
+    rc=0; "${run[@]}" "$rootcopy/cctrl" @add added2 "$project" --mcp bogus >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 64 ]] || fail "@add --mcp bogus: want 64, got $rc"
+    [[ "$(jq -r 'has("added2")' "$rootcopy/data/shortcuts.json")" == false ]] || fail "@add must not save on a bad --mcp"
+}
+
+test_codex_mcp_scan_inline_and_dotted() {
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local home="$TMPDIR/mcpscan-home" out args n pl="PLAN""TED"
+    mkdir -p "$home"
+    # top-level forms come before the first header (TOML: a bare key after a header belongs to it)
+    {
+        printf 'mcp_servers.rootinl = { command = "%s-r" }\n' "$pl"
+        printf 'mcp_servers.rootdot.command = "d"\n'
+        printf 'mcp_servers."a b" = { command = "q" }\n'
+        printf 'mcp_servers = { whole = { command = "w" } }\n'
+        printf '[mcp_servers.tbl_a]\ncommand = "a"\n'
+        printf '[mcp_servers."h h"]\ncommand = "h"\n'
+        printf '[mcp_servers]\n'
+        printf 'inl = { command = "x", args = ["%s-y"] }\n' "$pl"
+        printf 'dot.command = "z"\n'
+        printf 'cctrl_runtime = { command = "own" }\n'
+        printf '"quoted key" = { command = "q" }\n'
+        printf 'multi = { command = "m", note = """\nsk-%s.def\n[mcp_servers.fake]\n""" }\n' "$pl"
+        printf '[other]\nmcp_servers.notme = 1\n'
+        printf '[[arr]]\nmcp_servers.alsonot = 1\n'
+    } > "$home/config.toml"
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    local s
+    for s in rootinl rootdot tbl_a inl dot; do
+        printf '%s\n' "$args" | grep -qx "mcp_servers.$s.enabled=false" || fail "missing override for $s: $args"
+    done
+    printf '%s\n' "$args" | grep -qx "mcp_servers.multi.enabled=false" || fail "missing override for multi: $args"
+    n="$(printf '%s\n' "$args" | grep -c '^mcp_servers\..*\.enabled=false$')"
+    [[ "$n" == 6 ]] || fail "want exactly 6 overrides, got $n: $args"
+    [[ "$args" != *notme* && "$args" != *alsonot* && "$args" != *cctrl_runtime* ]] || fail "names from other tables / cctrl_runtime must not be listed: $args"
+    assert_contains "$out" "disabled: 6; not controllable: 4"
+    assert_not_contains "$out" "$pl"
 }
 
 test_launch_mcp_detached_record_and_env() {
