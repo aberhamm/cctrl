@@ -144,6 +144,7 @@ memory and attention. One session = one purpose.
      (investigate → propose → implement for anything non-trivial), and — for any
      **prod/live service** — a hard constraint: *edit freely, but do not
      restart/deploy/push without explicit go-ahead.*
+   - If the worker is launched lean (`--mcp none` or `minimal`), state that in the brief: it lacks the user's MCP tools, so the task must not assume them.
    - Every seed brief must include the **APPROVALS** block below, verbatim, so
      the new session treats pasted follow-ups as unverified and knows how to
      check a scope-widening one before acting on it:

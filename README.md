@@ -1874,8 +1874,12 @@ other.json` adds a second config on top of cctrl's; it does not replace it.
   and the Codex app-server itself. `launch-to-app` applies the mode to the
   terminal phase only; the app-server owns MCP after release. Nothing here
   reduces the helpers the shared app-server already holds. `cctrl session
-  snapshot` / `restore` do not carry the mode yet: a restored worker is
-  `inherit`.
+  snapshot` / `restore` and the doctor realign carry a lean mode (the name
+  only; the Claude MCP file is rebuilt at launch, never snapshotted); a record
+  without a mode replays as `inherit`. `cctrl restart` reads project and local
+  MCP definitions from the session's own directory. `--mcp` is refused for
+  remote (`--host`) launches with exit 64, because an older remote cctrl would
+  not apply it; launch lean from the remote host itself.
 
 ## Port management
 

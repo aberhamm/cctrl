@@ -295,6 +295,7 @@ the blind spot that has wedged a machine (RAM exhausted → swap full → every 
 session hangs at startup).
 - Add local health to **every** tick: free-memory %, swap, load. Act when swap
   fills or load stays high.
+- Add `cctrl helpers --check` to the same local-health tick: it flags a host whose agent runtimes hold an excessive number of MCP helper process sets (report only; cctrl never reaps helpers).
 - Cap concurrent working sessions (~8–10 active; park/close the rest). Prune stale
   idle-done sessions.
 - Hand off heavy sessions at ~200k context — big contexts are the memory hogs.

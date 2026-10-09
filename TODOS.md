@@ -252,7 +252,6 @@ plan 104. Test harness items are now plan 105; the MCP helper census / lean MCP 
 
 ### Plan 106 P2 follow-ups (2026-10-09)
 
-- `session snapshot` / `restore` do not carry `mcp_mode`: a restored lean worker comes back as `inherit` (add `mcp_mode` to the snapshot `launch_flags` and the restore replay).
-- `_session_realign` relaunch also drops `mcp_mode` (lean session realigned = inherit); `_remote_exec` forwards `--mcp` to an older remote cctrl, which would pass it to the agent. Codex scan misses inline-table / dotted-key server declarations.
-- P3: profile key `agents.<agent>.mcp`, `mcp.minimal.<agent>` keep list, Claude definition copy, shortcut field, D3 skill lines.
+- `cctrl session list --json` takes about 22 s with 31 tmux sessions (about 0.7 s per session, many subprocesses); every `peer` command pays it. The peer MCP server no longer waits on it (plan 106 P3b), but speeding it up is a separate follow-up.
+- A symlinked `$PWD` does not match the `.projects` key in `~/.claude.json` when `--mcp minimal` reads local-scope definitions (known limit, plan 106).
 - `launch-to-app --mcp ...` prints its notice before the launch result is known (also for a value the launch then rejects).

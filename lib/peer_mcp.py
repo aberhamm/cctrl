@@ -200,6 +200,19 @@ class Bridge:
     def __init__(self, cctrl: str, identity: str) -> None:
         self.cctrl = cctrl
         self.identity = identity
+        self._canonical = ""
+
+    def canonical_identity(self) -> str:
+        # Resolved lazily (plan 106 P3b): startup no longer waits on discovery,
+        # so tools that compare names themselves (show_message) resolve the
+        # identity on first use. An unknown identity raises the cctrl error.
+        if not self._canonical:
+            peer = self.cli(["peer", "whoami", "--as", self.identity, "--json"])
+            name = peer.get("name") if isinstance(peer, dict) else ""
+            if not isinstance(name, str) or not name:
+                raise McpError("unknown-peer", f"Cannot resolve peer identity: {self.identity}")
+            self._canonical = name
+        return self._canonical
 
     def cli(self, args: list[str], stdin: str | None = None) -> Any:
         proc = subprocess.run(
@@ -265,9 +278,8 @@ class Bridge:
             # when tmux peer discovery is skipped, `peer overview` still exits 0 with
             # identity + mailbox counts and `derived_skipped: true`, which we surface
             # unchanged. A hard document-build failure that would prevent identity
-            # resolution is unreachable by construction — main() resolves whoami
-            # before this bridge ever reads stdin — so there is nothing to fall back
-            # to and no separate re-enumeration is attempted.
+            # resolution surfaces here as a tool error (main() no longer resolves
+            # whoami before reading stdin), and no re-enumeration is attempted.
             ensure_no_extra(args, set())
             return ok(self.cli(["peer", "overview", "--as", self.identity, "--json"]))
         if name == "whoami":
@@ -323,7 +335,8 @@ class Bridge:
             message = self.cli(["peer", "show", message_id, "--json"])
             if not isinstance(message, dict):
                 raise McpError("invalid-response", "cctrl returned an invalid message envelope")
-            if message.get("to") != self.identity and message.get("from") != self.identity:
+            me = self.canonical_identity()
+            if message.get("to") != me and message.get("from") != me:
                 raise McpError("forbidden", f"Message {message_id} is not visible to {self.identity}")
             return ok(message)
         if name == "ack_message":
@@ -478,16 +491,12 @@ def main(argv: list[str]) -> int:
     if not args.identity:
         print("cctrl peer mcp needs --as <peer> or CCTRL_PEER", file=sys.stderr)
         return 66
-    try:
-        peer = Bridge(args.cctrl, args.identity).cli(["peer", "whoami", "--as", args.identity, "--json"])
-    except McpError as exc:
-        print(f"cctrl peer mcp identity failed: {exc.message}", file=sys.stderr)
-        return 66
-    identity = peer.get("name") if isinstance(peer, dict) else ""
-    if not isinstance(identity, str) or not identity:
-        print("cctrl peer mcp identity failed: cctrl returned an invalid peer identity", file=sys.stderr)
-        return 66
-    bridge = Bridge(args.cctrl, identity)
+    # Plan 106 P3b: answer `initialize` without waiting on session discovery
+    # (`peer whoami` costs ~22 s on a big fleet; Claude gives up after 30 s). The
+    # identity is passed to cctrl on every tool call, and cctrl resolves it and
+    # applies the sender-binding rules there (unknown peer: exit 66 / unknown-peer;
+    # sender mismatch: refused), so a stale identity still cannot send.
+    bridge = Bridge(args.cctrl, args.identity)
     return run(bridge)
 
 

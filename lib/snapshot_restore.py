@@ -259,6 +259,13 @@ def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]
         value = record.get(field)
         if isinstance(value, str) and value:
             flags[field] = value
+    # Plan 106 P3b: a lean MCP mode travels with the flags. Only the two lean
+    # values are replayed; a record without the field (or "inherit") adds
+    # nothing, so a restore never invents a mode. Only the mode NAME is kept:
+    # the Claude <key>.mcp.json is rebuilt at launch, never snapshotted.
+    mcp_mode = record.get("mcp_mode")
+    if mcp_mode in ("none", "minimal"):
+        flags["mcp_mode"] = mcp_mode
     return flags
 
 

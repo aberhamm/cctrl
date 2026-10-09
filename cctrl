@@ -1048,12 +1048,14 @@ _mcp_keep_list() {
 # the kept servers' definitions, copied FILE TO FILE through jq (never through
 # argv or a shell variable) from the user's Claude MCP configuration:
 # ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json .mcpServers (user scope), then
-# $PWD/.mcp.json (project), then .projects[$PWD].mcpServers (local); later
+# <dir>/.mcp.json (project), then .projects[<dir>].mcpServers (local); later
 # wins. A config file that exists but is not valid JSON fails the write
 # (fail closed). Prints the path; returns nonzero on any failure.
 #   $1=key $2=peer name (may be empty) $3=mode (none|minimal, default none)
+#   $4=project directory for the project/local scopes (default $PWD; restart
+#   passes the session's own directory, not the caller's)
 _profile_mcp_write() {
-    local key="$1" peer="${2:-}" mode="${3:-none}"
+    local key="$1" peer="${2:-}" mode="${3:-none}" pdir="${4:-$PWD}"
     command -v jq >/dev/null 2>&1 || return 1
     [[ -n "$key" ]] || return 1
     local dir
@@ -1065,9 +1067,9 @@ _profile_mcp_write() {
         _mcp_keep_list claude || return 1
         keep_json="$(printf '%s' "$LAUNCH_MCP_KEEP" | jq -R -s -c 'split("\n") | map(select(length > 0))')" || return 1
         [[ -f "${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json" ]] && ucfg="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
-        [[ -f "$PWD/.mcp.json" ]] && pcfg="$PWD/.mcp.json"
+        [[ -f "$pdir/.mcp.json" ]] && pcfg="$pdir/.mcp.json"
     fi
-    ( umask 077 && jq -n --arg cmd "$SCRIPT_DIR/cctrl" --arg peer "$peer" --arg cwd "$PWD" \
+    ( umask 077 && jq -n --arg cmd "$SCRIPT_DIR/cctrl" --arg peer "$peer" --arg cwd "$pdir" \
         --argjson keep "$keep_json" --slurpfile u "$ucfg" --slurpfile p "$pcfg" '
         def objs: if type == "object" then . else {} end;
         ($u[0] | objs) as $U | ($p[0] | objs) as $P
@@ -9664,7 +9666,7 @@ _peer_cmd_doctor() {
 }
 
 _peer_cmd_mcp() {
-    local as_identity="" identity peer_json
+    local as_identity="" identity
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --as)
@@ -9682,11 +9684,9 @@ _peer_cmd_mcp() {
         echo "cctrl peer mcp needs --as <peer> or CCTRL_PEER" >&2
         return 66
     fi
-    if ! peer_json="$(_peer_resolve_json "$identity" 2>/dev/null)"; then
-        echo "cctrl peer mcp could not resolve peer identity: $identity" >&2
-        return 66
-    fi
-    identity="$(jq -r '.name' <<< "$peer_json")"
+    # Plan 106 P3b: no identity pre-resolve here (it ran a full session discovery,
+    # ~22 s on a big fleet, before the server could answer `initialize`). The
+    # server passes the identity to cctrl on every tool call, which resolves it.
     exec python3 "$SCRIPT_DIR/lib/peer_mcp.py" --as "$identity" --cctrl "$SCRIPT_DIR/cctrl"
 }
 
@@ -13205,6 +13205,7 @@ _session_realign_flags() {
         + (if .model then ["--model", .model] else [] end)
         + (if .peer then ["--peer", .peer] else [] end)
         + (if .no_bridge == true then ["--no-bridge"] else [] end)
+        + (if (.mcp_mode == "none" or .mcp_mode == "minimal") then ["--mcp", .mcp_mode] else [] end)
         | .[]
     ' <<< "$out" 2>/dev/null
     # Role and kind (plan 100 D7). A pure default worker adds nothing; a
@@ -13951,6 +13952,7 @@ _session_restore() {
                 ask_for_approval) launch_argv+=(--ask-for-approval "$value") ;;
                 peer) launch_argv+=(--peer "$value") ;;
                 no_bridge) [[ "$value" == true ]] && launch_argv+=(--no-bridge) ;;
+                mcp_mode) case "$value" in none|minimal) launch_argv+=(--mcp "$value") ;; esac ;;
                 role) flag_role="$value" ;;
                 orch_kind) flag_kind="$value" ;;
             esac
@@ -15388,7 +15390,13 @@ cmd_restart() {
     local _restart_mcp_mode=""
     [[ -n "${CCTRL_SESSION_NAME:-}" ]] && _restart_mcp_mode="$(_session_metadata_field "$CCTRL_SESSION_NAME" mcp_mode 2>/dev/null || true)"
     if [[ "$_restart_mcp_mode" == none || ( "$_restart_mcp_mode" == minimal && "${CCTRL_AGENT:-claude}" == claude ) ]]; then
-        _profile_mcp_write "$CCTRL_SESSION_NAME" "${CCTRL_PEER:-}" "$_restart_mcp_mode" >/dev/null \
+        # Project/local scope definitions are read relative to the SESSION's
+        # directory (the record's cwd, else target), not the caller's $PWD.
+        local _restart_mcp_dir=""
+        _restart_mcp_dir="$(_session_metadata_field "$CCTRL_SESSION_NAME" cwd 2>/dev/null || true)"
+        [[ -n "$_restart_mcp_dir" ]] || _restart_mcp_dir="$(_session_metadata_field "$CCTRL_SESSION_NAME" target 2>/dev/null || true)"
+        [[ -d "$_restart_mcp_dir" ]] || _restart_mcp_dir="$PWD"
+        _profile_mcp_write "$CCTRL_SESSION_NAME" "${CCTRL_PEER:-}" "$_restart_mcp_mode" "$_restart_mcp_dir" >/dev/null \
             || echo -e "${YELLOW}WARN: could not refresh the MCP config file for restart; continuing with the existing file.${RESET}" >&2
     fi
 
@@ -16363,7 +16371,7 @@ cmd_help() {
     echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
     echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
-    echo "    --mcp inherit|minimal|none MCP servers for a terminal-owned worker (default inherit; none keeps only cctrl's own; minimal = none + the keep list mcp.minimal.<agent> in the cctrl config; precedence: flag, shortcut field mcp, profile key agents.<agent>.mcp, env CCTRL_MCP_MODE (ignored inside a cctrl pane: pass the flag); --mcp=none works too; a passthrough --mcp-config adds a second config)"
+    echo "    --mcp inherit|minimal|none MCP servers for a terminal-owned worker (not for --host launches; default inherit; none keeps only cctrl's own; minimal = none + the keep list mcp.minimal.<agent> in the cctrl config; precedence: flag, shortcut field mcp, profile key agents.<agent>.mcp, env CCTRL_MCP_MODE (ignored inside a cctrl pane: pass the flag); --mcp=none works too; a passthrough --mcp-config adds a second config)"
     echo "    -m, --message TEXT        Start with an initial prompt"
     echo "    --purpose TEXT            Session purpose metadata (not sent to the agent)"
     echo "    --role orchestrator|worker  Session role (default worker); needs -d"
@@ -17400,6 +17408,24 @@ _remote_exec() {
     else
         ssh_target="$hostname"
     fi
+
+    # Plan 106 P3b (B2): --mcp is NOT forwarded. A remote cctrl older than plan
+    # 106 does not know the flag: its launch parser would take `--mcp` for an
+    # agent passthrough option (and `none` for the target), i.e. a silent
+    # non-lean or misparsed launch. Refuse here, before anything is sent.
+    case "${1:-}" in
+        start|s|@*|launch-to-app)
+            local _mcp_a
+            for _mcp_a in "$@"; do
+                [[ "$_mcp_a" == "--" ]] && break
+                case "$_mcp_a" in
+                    --mcp|--mcp=*)
+                        echo -e "${RED}cctrl: --mcp is not supported for remote launches (a remote cctrl may predate it and would not apply it). Launch lean from the remote host itself.${RESET}" >&2
+                        return 64 ;;
+                esac
+            done
+            ;;
+    esac
 
     # Decide TTY (-t) and auto-attach behavior based on the command.
     local use_tty=false

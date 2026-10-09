@@ -1482,16 +1482,29 @@ test_mcp_value_skipped_by_scanners() {
 }
 
 test_mcp_value_skipped_by_remote_and_launch_to_app() {
-    # _remote_exec arm 2 (preflight scan): an @-looking --mcp value must not trigger a role preflight
+    # plan 106 P3b (B2): _remote_exec refuses --mcp / --mcp=VALUE before anything
+    # is sent (an older remote would take it for an agent passthrough option).
+    # No ssh call, no _role-resolve preflight, whatever the value looks like.
     _remote_role_fixture mcpv
-    local out rc=0 proj="$RR_PROJ"
-    out="$(SSH_PRE_OUT='role=orchestrator orch_kind=repo' _remote_role start -d --mcp @k "$proj")" || rc=$?
-    [[ "$(grep -c '_role-resolve' "$RR_LOG")" -eq 0 ]] || fail "--mcp @k value was read as a shortcut target (rc=$rc): $(cat "$RR_LOG")"
-    # _remote_exec arm 1 (default purpose): the --mcp value must not become the default purpose
-    : > "$RR_LOG"
-    out="$(_remote_role start -d --mcp none "$proj")" || rc=$?
-    assert_not_contains "$(cat "$RR_LOG")" "purpose\\ none"
-    assert_not_contains "$(cat "$RR_LOG")" "none\\ $(basename "$proj")"
+    local out rc=0 proj="$RR_PROJ" form
+    for form in "--mcp @k" "--mcp none" "--mcp=none" "--mcp inherit"; do
+        : > "$RR_LOG"; rc=0
+        # shellcheck disable=SC2086
+        out="$(_remote_role start -d $form "$proj" 2>&1)" || rc=$?
+        [[ "$rc" -eq 64 ]] || fail "remote start $form must exit 64, got $rc: $out"
+        assert_contains "$out" "--mcp is not supported for remote launches"
+        [[ ! -s "$RR_LOG" ]] || fail "remote start $form reached ssh: $(cat "$RR_LOG")"
+    done
+    : > "$RR_LOG"; rc=0
+    out="$(_remote_role launch-to-app --mcp none "$proj" 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 && ! -s "$RR_LOG" ]] || fail "remote launch-to-app --mcp must be refused before ssh (rc=$rc): $out"
+    : > "$RR_LOG"; rc=0
+    out="$(_remote_role @k --mcp none 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 && ! -s "$RR_LOG" ]] || fail "remote @key --mcp must be refused before ssh (rc=$rc): $out"
+    # without --mcp the remote launch is forwarded as before
+    : > "$RR_LOG"; rc=0
+    out="$(_remote_role start -d "$proj" 2>&1)" || rc=$?
+    [[ -s "$RR_LOG" ]] || fail "a remote start without --mcp must still reach ssh (rc=$rc): $out"
     # launch-to-app arm: --mcp VALUE before the dir is consumed with its value
     make_fake_tmux "$TMPDIR/tmux"; make_fake_agent "$TMPDIR/codex" codex; make_fake_ps "$TMPDIR/ps"
     mkdir -p "$TMPDIR/mcp-l2a-proj2"
@@ -1967,6 +1980,25 @@ test_profile_mcp_restart_and_wrapper_cleanup() {
     CCTRL_EARLY_EXIT_WINDOW_SECONDS=0 CCTRL_PROFILE_MCP_FILE="$mcpf" PATH="$bin:$PATH" \
         "$ROOT/lib/session-wrapper.sh" claude "$TMPDIR/mcp-wrap-marker" --flag >/dev/null 2>&1
     [[ ! -f "$mcpf" ]] || fail "wrapper exit should remove the per-session MCP file"
+}
+
+test_restart_mcp_reads_session_dir_not_caller_pwd() {
+    # plan 106 P3b (B5): a minimal restart reads project-scope MCP definitions
+    # from the SESSION's directory (record cwd), not from the caller's $PWD.
+    local runtime="$TMPDIR/mcp-rsd-runtime" meta="$TMPDIR/mcp-rsd-meta" marker="$TMPDIR/mcp-rsd-marker"
+    local dir="$runtime/cctrl-$(id -u)/profile-settings" proj="$TMPDIR/mcp-rsd-proj" other="$TMPDIR/mcp-rsd-other" out
+    mkdir -p "$dir" "$meta" "$proj" "$other" "$TMPDIR/mcp-rsd-home"
+    printf '{"mcpServers":{"sessonly":{"command":"a"}}}\n' > "$proj/.mcp.json"
+    printf '{"mcpServers":{"calleronly":{"command":"b"}}}\n' > "$other/.mcp.json"
+    printf '{"mcp":{"minimal":{"claude":["sessonly","calleronly"]}}}\n' > "$TMPDIR/mcp-rsd-cfg.json"
+    jq -n --arg p "$proj" '{mcp_mode:"minimal",cctrl_managed:true,cwd:$p}' > "$meta/TMUX--restart-rsd.json"
+    make_fake_tmux "$TMPDIR/tmux"
+    local log="$TMPDIR/mcp-rsd-tmux.log"; : > "$log"
+    out="$(cd "$other" && HOME="$TMPDIR/mcp-rsd-home" CCTRL_USER_CONFIG="$TMPDIR/mcp-rsd-cfg.json" CLAUDE_CODE_SESSION_ID="sess-rsd" CCTRL_RESTART_MARKER="$marker" \
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="TMUX--restart-rsd" CCTRL_SESSION_METADATA_DIR="$meta" \
+        CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1)"
+    jq -e '.mcpServers | keys == ["sessonly"]' "$dir/TMUX--restart-rsd.mcp.json" >/dev/null \
+        || fail "restart must read the session dir's .mcp.json, not the caller's: $(jq -c '.mcpServers|keys' "$dir/TMUX--restart-rsd.mcp.json" 2>&1) / $out"
 }
 
 test_launch_to_app_mcp_notice() {
@@ -5602,6 +5634,77 @@ test_realign_flags_carry_role_and_kind() {
     echo "ok: realign carries role and orch_kind (the printed hint carries neither)"
 }
 
+test_snapshot_launch_flags_carry_mcp_mode() {
+    # plan 106 P3b (B1): the recorded lean mode travels in launch_flags; only the
+    # two lean names do, and nothing but the NAME (no server definitions).
+    local md="$TMPDIR/mcpflags-md" out secret
+    mkdir -p "$md"
+    secret="sk-live-$(printf 'abcdef0123456789')"
+    jq -n --arg s "$secret" '{tmux_session:"TMUX--lean",mcp_mode:"none",mcp_servers:{x:{env:{TOKEN:$s}}}}' > "$md/TMUX--lean.json"
+    jq -n '{tmux_session:"TMUX--inh",mcp_mode:"inherit"}' > "$md/TMUX--inh.json"
+    jq -n '{tmux_session:"TMUX--old"}' > "$md/TMUX--old.json"
+    jq -n '{tmux_session:"TMUX--bad",mcp_mode:"bogus"}' > "$md/TMUX--bad.json"
+    out="$(python3 "$ROOT/lib/snapshot_restore.py" launch-flags --metadata-dir "$md" --name TMUX--lean)"
+    [[ "$(jq -r '.mcp_mode' <<< "$out")" == none ]] || fail "lean record: mcp_mode not carried: $out"
+    assert_not_contains "$out" "$secret"
+    assert_not_contains "$out" "mcp_servers"
+    for n in inh old bad; do
+        out="$(python3 "$ROOT/lib/snapshot_restore.py" launch-flags --metadata-dir "$md" --name "TMUX--$n")"
+        [[ "$(jq 'has("mcp_mode")' <<< "$out")" == false ]] || fail "TMUX--$n must not carry mcp_mode: $out"
+    done
+    echo "ok: launch_flags carry a lean mcp_mode (name only) and invent none"
+}
+
+test_restore_replays_mcp_mode() {
+    local dir="$TMPDIR/restore-mcp" line
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {mcp_mode:"none"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    assert_contains "$(grep -- 'conv-aaa-111' "$dir/launch.log" | head -n 1)" "--mcp none"
+    # rows without the field (and a hostile value) replay exactly as today
+    line="$(grep -- 'conv-bbb-222' "$dir/launch.log" | head -n 1)"
+    assert_not_contains "$line" "--mcp"
+    echo "ok: restore replays a lean mcp_mode and invents none"
+}
+
+test_restore_ignores_bad_mcp_mode() {
+    local dir="$TMPDIR/restore-mcp-bad"
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {mcp_mode:"--evil"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    assert_not_contains "$(cat "$dir/launch.log")" "--mcp"
+    echo "ok: restore ignores an invalid mcp_mode value"
+}
+
+_realign_mcp_run() {
+    # args: mode ("" = record without the field) -> prints the relaunch log
+    local mode="$1" bin="$TMPDIR/rl-mcp-bin$1" sdir="$TMPDIR/rl-mcp-sessions$1" relog="$TMPDIR/rl-mcp-relaunch$1.log"
+    _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
+    if [[ -n "$mode" ]]; then
+        jq --arg m "$mode" '. + {tmux_session:"TMUX--ms--portal",mcp_mode:$m}' "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json" > "$TMPDIR/rl-mcp.tmp" \
+            && mv "$TMPDIR/rl-mcp.tmp" "$CCTRL_SESSION_METADATA_DIR/TMUX--ms--portal.json"
+    fi
+    : > "$relog"
+    PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DOCTOR_RELAUNCH_LOG="$relog" TMUX_FAKE_SESSIONS="TMUX--ms--portal" TMUX_FAKE_PANE_PID=4242 \
+        "$ROOT/cctrl" session doctor --fix --yes --json >/dev/null </dev/null
+    cat "$relog"
+}
+
+test_realign_flags_carry_mcp_mode() {
+    assert_contains "$(_realign_mcp_run minimal)" "--mcp minimal"
+    echo "ok: realign carries a lean mcp_mode"
+}
+
+test_realign_without_mcp_mode_adds_nothing() {
+    local log
+    log="$(_realign_mcp_run "")"
+    assert_contains "$log" "--resume"
+    assert_not_contains "$log" "--mcp"
+    echo "ok: realign of a record without mcp_mode is unchanged"
+}
+
 test_realign_keeps_recorded_tmux_name() {
     local bin="$TMPDIR/rl-name-bin" sdir="$TMPDIR/rl-name-sessions" log="$TMPDIR/rl-name-tmux.log"
     _doctor_realign_fixture "$bin" "$sdir" "TMUX--ms--unstructured-data-portal-" "idle"
@@ -8183,6 +8286,55 @@ test_peer_mcp_bridge_stdio() {
     printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.to == "comet"' >/dev/null || fail "expected MCP send_message to canonicalize recipient aliases through CLI"
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json)"
     printf '%s\n' "$out" | jq -e '.queued == 1 and .delivered_unacked == 1' >/dev/null || fail "expected alias-addressed MCP message to be visible to canonical peer"
+}
+
+test_peer_mcp_initialize_not_blocked_by_discovery() {
+    # plan 106 P3b (B4): `peer mcp` must answer `initialize` without waiting on
+    # session discovery (22 s on a big fleet; Claude's MCP budget is 30 s). A tmux
+    # that stalls 15 s stands in for the slow discovery; the unknown-identity case
+    # must still be refused at the first tool call, and nothing may be queued.
+    local stall="$TMPDIR/stall-bin" data="$TMPDIR/mcp-init-data" out t0 t1 init
+    mkdir -p "$stall"
+    printf '#!/bin/sh\nsleep 15\nexit 1\n' > "$stall/tmux"
+    chmod +x "$stall/tmux"
+    printf '#!/bin/sh\nsleep 15\nexit 1\n' > "$stall/fake-cctrl"
+    chmod +x "$stall/fake-cctrl"
+    setup_mailbox_peers "$data"
+    init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+    # (a) the cctrl entry point: no pre-resolve before exec
+    t0="$(date +%s)"
+    out="$(printf '%s\n' "$init" | PATH="$(_test_path "$stall")" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as ghost-never-registered)"
+    t1="$(date +%s)"
+    printf '%s\n' "$out" | jq -e '.id == 1 and (.result | has("protocolVersion"))' >/dev/null || fail "expected initialize answer from peer mcp with a stalled tmux, got: $out"
+    [[ $((t1 - t0)) -lt 8 ]] || fail "peer mcp initialize waited $((t1 - t0))s on discovery (cctrl entry point)"
+
+    # (b) the python server on its own: no eager whoami against a stalled cctrl
+    t0="$(date +%s)"
+    out="$(printf '%s\n' "$init" | python3 "$ROOT/lib/peer_mcp.py" --as ghost-never-registered --cctrl "$stall/fake-cctrl")"
+    t1="$(date +%s)"
+    printf '%s\n' "$out" | jq -e '.id == 1 and (.result | has("protocolVersion"))' >/dev/null || fail "expected initialize answer from peer_mcp.py with a stalled cctrl, got: $out"
+    [[ $((t1 - t0)) -lt 8 ]] || fail "peer_mcp.py initialize waited $((t1 - t0))s on cctrl (eager whoami)"
+
+    # (d) show_message with an ALIAS identity sees its own messages; an unknown
+    # identity cannot read stored messages
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer alias comet halley2 >/dev/null
+    local mid show_req
+    mid="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --as orchestrator --impersonate --body-file - --json <<< "for comet" | jq -r '.id')"
+    show_req="$(jq -cn --arg id "$mid" '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"show_message",arguments:{id:$id}}}')"
+    out="$(printf '%s\n' "$show_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as halley2)"
+    printf '%s\n' "$out" | jq -e '.result.structuredContent.ok == true' >/dev/null || fail "alias identity must see its own message: $out"
+    out="$(printf '%s\n' "$show_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as ghost-never-registered)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true' >/dev/null || fail "unknown identity must not read messages: $out"
+
+    # (c) an unknown identity cannot send: the first tool call is refused, nothing queued
+    local before after send_req
+    before="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json | jq -c '[.queued,.delivered_unacked]')"
+    send_req="$(jq -cn '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:"comet",body:"from a ghost"}}}')"
+    out="$(printf '%s\n' "$send_req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as ghost-never-registered)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.ok == false' >/dev/null || fail "expected an unknown identity to be refused at send_message, got: $out"
+    after="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json | jq -c '[.queued,.delivered_unacked]')"
+    [[ "$before" == "$after" ]] || fail "unknown identity queued a message: $before -> $after"
 }
 
 test_peer_overview() {
