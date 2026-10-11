@@ -62,11 +62,14 @@ See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
   shared code path — with `TMUX` unset it hits the default server's
   *current* session, not nothing. See
   [docs/findings/tmux-untargeted-default-server.md](./docs/findings/tmux-untargeted-default-server.md).
-- **tmux isolation:** only an explicit socket isolates (`tmux -S "$D/sock"`).
+- **tmux isolation:** only an explicit socket isolates (`tmux -S "$D/sock"`,
+  with `D` your own `mktemp -d` dir, set again in every shell block).
   `TMUX_TMPDIR` alone does not: tmux prefers `$TMUX`, and every shell in a
   pane (a sub-agent's too) has it set. Never kill a tmux server you did not
   start on your own socket. The test harness enforces both with a PATH shim
-  and a static lint (same findings doc, 2026-10-09 note).
+  and a static lint (same findings doc, 2026-10-09 note); for agent tool
+  calls the PreToolUse hook blocks a server kill without `-S`/`-L`
+  (`hooks/tmux_kill_guard.py`, plan 107).
 
 ## Peer messaging
 

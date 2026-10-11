@@ -172,12 +172,17 @@ without the right prefix has killed every session of a fleet.
   tmux command" into the brief; they read code; they run a test entry point
   only when the brief names it, and only one that isolates tmux with an
   explicit socket.
-- An agent that must use tmux starts **every** shell block with
-  `unset TMUX TMUX_PANE`, uses `tmux -S "$D/sock"` (a socket in its own temp
-  dir) for every call, never `TMUX_TMPDIR`, and cleans up by killing only its
-  own sessions by exact name on that socket
-  (`tmux -S "$D/sock" kill-session -t '=NAME'`).
-- **No agent ever runs `kill-server`**, on any socket. <!-- tmux-lint: allow (a rule that forbids the command) -->
+- An agent that must use tmux makes its own temp dir once (`mktemp -d`) and
+  keeps the printed path. It starts **every** shell block with
+  `unset TMUX TMUX_PANE; D=<that path>` (a shell variable does not survive
+  from one block to the next; with an empty `D` the call fails on `/sock`, it
+  never reaches another server). It uses `tmux -S "$D/sock"` for every call,
+  never `TMUX_TMPDIR`, and cleans up by killing only its own sessions by exact
+  name on that socket (`tmux -S "$D/sock" kill-session -t '=NAME'`).
+- `unset TMUX` alone is not an isolation either: a plain `tmux` then goes to
+  the default server, which is normally the fleet's. Only `-S` on the same
+  call is.
+- **No agent ever runs `kill-server`**, on any socket. Where cctrl's hooks are installed, the PreToolUse hook blocks the form without a socket flag; that is a backstop, not a licence. <!-- tmux-lint: allow (a rule that forbids the command) -->
 - Only a real-launch smoke may touch the fleet server, and only through
   `cctrl` commands on sessions it created itself.
 

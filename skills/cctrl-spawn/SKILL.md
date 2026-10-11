@@ -192,7 +192,8 @@ memory and attention. One session = one purpose.
 - **Sub-agents inherit your `$TMUX`.** A sub-agent's plain `tmux` reaches the
   live server, and `TMUX_TMPDIR` does not change that (tmux prefers `$TMUX`).
   Give validation agents no tmux work. An agent that must use tmux runs
-  `unset TMUX TMUX_PANE` at the top of every shell block, uses
+  `unset TMUX TMUX_PANE; D=<its own mktemp -d path>` at the top of every
+  shell block (variables do not survive between blocks), uses
   `tmux -S "$D/sock"` for every call, and never kills a tmux server; it kills
   its own sessions by exact name on its own socket. Full rule: "Sub-agents and
   tmux" in the `cctrl-repo-orchestrator` skill.
