@@ -508,8 +508,9 @@ the generating CLI version matches the connected server `userAgent`; a
 version mismatch is reported as `unknown`.
 
 Runtime discovery checks `CCTRL_CODEX_BIN` (or
-`codex.appServerExecutable` in cctrl's merged JSON config), then `PATH`, then a
-validated platform installation such as the Codex runtime bundled with the
+`codex.appServerExecutable` in cctrl's merged JSON config), then the validated
+managed desktop package under `CODEX_HOME`, then `PATH`, then a validated
+platform installation such as the Codex runtime bundled with the
 macOS ChatGPT app. This lets GUI hooks with a minimal `PATH` use the bundled
 runtime without a user-specific bundle path. Set
 `CCTRL_CODEX_APP_SERVER_SOCKET` only when the daemon uses a non-default control
@@ -1106,7 +1107,8 @@ and exit 78, handover with `--succeeds`) lives in
 
 Peers are named coding agents that other cctrl workflows can address. The peer
 registry combines manual entries from `data/peers.json` with live cctrl-managed
-tmux sessions derived from `cctrl session ls --json`.
+tmux sessions derived from `cctrl session ls --json`. An app-owned Codex peer
+can instead bind to its exact provider task id.
 
 ```bash
 cctrl peer register comet --dir ~/dev/comet-automation --agent codex
@@ -1120,6 +1122,56 @@ cctrl peer whoami --as comet --json
 CCTRL_PEER=comet cctrl peer whoami --json
 cctrl peer unregister comet
 ```
+
+### App-owned Codex peers
+
+Create an app-owned task, then register the returned `provider_task_id`:
+
+```bash
+cctrl start --agent codex --app-owned /path/to/project --json
+cctrl peer register planner --agent codex --thread-id THREAD_ID --dir /path/to/project
+```
+
+Registration requires a canonical cctrl record proving app/App Server ownership
+and a fresh exact-thread check against the connected server. An app inventory
+row alone does not grant ownership. A peer cannot be silently rebound to another
+thread. A successful terminal-to-app release preserves the existing peer name
+and binds it to the same provider id, so its mailbox remains reachable.
+
+Inside the registered app task, cctrl resolves its sender from `CODEX_THREAD_ID`
+(or `CODEX_SESSION_ID`) and the exact peer binding. An explicit `--as` must match
+that thread. Use the usual mailbox commands:
+
+```bash
+cctrl peer overview --json
+cctrl peer send reviewer --deliver --json -- "Please review the change."
+cctrl peer recv --json
+cctrl peer reply MESSAGE_ID --json -- "Review complete."
+cctrl peer ack MESSAGE_ID --json
+```
+
+App delivery submits a fixed mailbox notification through the existing managed
+desktop App Server. Message bodies remain in the durable mailbox until received;
+a submitted notification does not mean the recipient has received or acknowledged
+the message. Busy or approval-waiting tasks defer delivery. Run `cctrl peer watch`
+in a supervising process to retry deferred deliveries, or `cctrl peer watch
+--once --json` for one pass. No watcher is started automatically.
+
+Each submission has a durable attempt receipt. A lost response is reported as
+ambiguous and is never blindly retried; the original notification and its marker
+are retained for reconciliation. If the server cannot read the necessary history,
+the attempt remains ambiguous. App delivery preserves omitted model, permission,
+and workspace settings and never creates another runtime writer or deletes a
+writer lock. A lock is accepted only when the exact task is loaded in the same
+connected server.
+
+The server has no atomic "start only if idle" operation: user input can race with
+the idle check, in which case the notification may join an active turn. Observed
+busy state is deferred, but strict ordering against simultaneous app input is not
+guaranteed. This cctrl transport does not restore missing native Codex thread-send
+tools. App `peer say` uses durable mailbox delivery; `--no-submit` queues only.
+App `peer deliver --inline` defers with `app-inline-unsupported`; use the durable
+mailbox notification path instead.
 
 Manual peers can carry `--host`, `--dir`, `--agent`, `--session`,
 `--purpose`, and repeated `--capability` metadata. Live tmux peers are derived

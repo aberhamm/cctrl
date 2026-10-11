@@ -5801,6 +5801,8 @@ def deliverable($p):
   or ($p == null or $p == "")
   or ((.created_at // "") == "")
   or (((.created_at | fixed_ts) and ($p | fixed_ts)) and (.created_at > $p));
+def deliverable_provider($p;$id):
+  if (.recipient_provider_task_id // "") != "" then .recipient_provider_task_id == $id else deliverable($p) end;
 def block_reason($p):
   if ((.created_at | fixed_ts) and ($p | fixed_ts) and (.created_at < $p))
   then "addressee-replaced" else "addressee-ambiguous" end;
@@ -5945,7 +5947,7 @@ _peer_all_json_build() {
             | .value as $v
             | ([ $derived_peers[] | select(.name == $k) ][0] // null) as $derived_name_match
             | ([ $derived_peers[] | select((.aliases // []) | index($k)) ][0] // null) as $derived_alias_match
-            | ($derived_name_match // null) as $derived_merge
+            | (if ($v.provider_task_id // "") != "" then null else ($derived_name_match // null) end) as $derived_merge
             | ($derived_name_match // $derived_alias_match // null) as $derived_shadow
             | (($derived_merge.aliases // []) | map(. as $alias | select(($manual_labels | index($alias)) | not))) as $derived_aliases
             | (($derived_shadow.session // $derived_shadow.name // "") // "") as $shadow
@@ -5960,6 +5962,8 @@ _peer_all_json_build() {
                 display_label: ($v.display_label // $derived_merge.display_label // null),
                 capabilities: ((($v.capabilities // []) + ($derived_merge.capabilities // [])) | unique),
                 registered_at: ($v.registered_at // null),
+                provider_task_id: ($v.provider_task_id // null),
+                created_at: ($v.created_at // null),
                 source: "manual"
               }
               | with_tmux_target
@@ -6088,7 +6092,7 @@ _peer_cmd_register() {
     shift
     _peer_validate_label "name" "$name" || return 1
 
-    local host="local" dir="" agent="" session="" purpose=""
+    local host="local" dir="" agent="" session="" purpose="" thread_id=""
     local -a aliases=() capabilities=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -6106,6 +6110,9 @@ _peer_cmd_register() {
                 [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value${RESET}" >&2; return 1; }
                 [[ -n "$2" ]] || { echo -e "${RED}--agent cannot be empty${RESET}" >&2; return 1; }
                 agent="$2"; shift 2 ;;
+            --thread-id)
+                [[ $# -ge 2 && -n "$2" ]] || return 64
+                thread_id="$2"; shift 2 ;;
             --session)
                 [[ $# -ge 2 ]] || { echo -e "${RED}--session needs a value${RESET}" >&2; return 1; }
                 session="$2"; shift 2 ;;
@@ -6123,7 +6130,19 @@ _peer_cmd_register() {
     done
 
     _peer_init
+    if [[ -n "$thread_id" ]]; then
+        [[ "$agent" == codex && -n "$dir" && -z "$session" ]] || { echo "--thread-id requires --agent codex --dir and no --session" >&2; return 64; }
+        [[ "$host" == local || "$host" == "${CCTRL_HOST_PREFIX:-local}" ]] || _host_is_local "$host" || { echo "Register app peers on their owning host" >&2; return 64; }
+        _peer_app_owned_verify "$thread_id" "$dir" || { echo "Exact app ownership could not be verified" >&2; return 65; }
+        local previous_id
+        previous_id="$(jq -r --arg name "$name" '.[$name].provider_task_id // empty' "$PEERS_FILE")"
+        [[ -z "$previous_id" || "$previous_id" == "$thread_id" ]] || { echo "App peer identity cannot be rebound to a different thread" >&2; return 65; }
+        capabilities+=("app-server")
+    fi
     local existing owner alias
+    if [[ -z "$thread_id" ]] && jq -e --arg name "$name" '.[$name].provider_task_id != null' "$PEERS_FILE" >/dev/null; then
+        echo "An app peer must retain its exact --thread-id binding" >&2; return 65
+    fi
     existing="$(_peer_lookup_manual_key "$name")"
     if [[ -n "$existing" && "$existing" != "$name" ]]; then
         echo -e "${RED}Peer name '$name' collides with alias on '$existing'.${RESET}" >&2
@@ -6174,6 +6193,7 @@ _peer_cmd_register() {
        --arg agent "$agent" \
        --arg session "$session" \
        --arg purpose "$purpose" \
+       --arg thread_id "$thread_id" \
        --arg now "$now" \
        --argjson aliases "$aliases_json" \
        --argjson capabilities "$capabilities_json" '
@@ -6190,6 +6210,7 @@ _peer_cmd_register() {
             + (if $agent != "" then {agent: $agent} else {} end)
             + (if $session != "" then {session: $session} else {} end)
             + (if $purpose != "" then {purpose: $purpose} else {} end)
+            + (if $thread_id != "" then {provider_task_id: $thread_id, created_at:(.[$name].created_at // $now)} else {} end)
           )
         }' "$PEERS_FILE" > "$tmp" && mv "$tmp" "$PEERS_FILE"
 
@@ -6481,6 +6502,37 @@ _peer_cmd_say() {
         esac
     done
 
+    local app_peer
+    app_peer="$(_peer_resolve_json "$identity" 2>/dev/null || true)"
+    if [[ -n "$app_peer" ]] && jq -e '(.capabilities // []) | index("app-server") != null' <<< "$app_peer" >/dev/null; then
+        local queue_only=false flag app_sender="${CCTRL_PEER:-}"
+        [[ -n "$app_sender" ]] || app_sender="$(_peer_app_self_identity 2>/dev/null || true)"
+        if [[ -z "$app_sender" ]]; then
+            if [[ -n "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" ]]; then
+                _json_error "missing-identity" "Register this exact app thread before sending as an agent"
+                return 66
+            fi
+            app_sender=user
+        fi
+        local -a app_flags=()
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --no-submit) queue_only=true; shift ;;
+                --force-busy) shift ;; # App delivery always checks provider readiness.
+                --body-file) [[ $# -ge 2 ]] || return 64; app_flags+=("$1" "$2"); shift 2 ;;
+                --json) app_flags+=("$1"); shift ;;
+                --) app_flags+=("$@"); break ;;
+                *) app_flags+=("$1"); shift ;;
+            esac
+        done
+        if [[ "$queue_only" == true ]]; then
+            _peer_cmd_send "$identity" --from "$app_sender" "${app_flags[@]}"
+        else
+            _peer_cmd_send "$identity" --from "$app_sender" --deliver "${app_flags[@]}"
+        fi
+        return $?
+    fi
+
     local rc=0; _peer_direct_resolve "$identity" || rc=$?
     if (( rc != 0 )); then
         if $json; then
@@ -6516,6 +6568,18 @@ _peer_cmd_resolve() {
     jq '.' <<< "$peer_json" | _peer_print_human
 }
 
+_peer_app_self_identity() {
+    local thread="${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" matches name peer
+    [[ -n "$thread" ]] || return 1
+    matches="$(_peer_all_json | jq -c --arg id "$thread" '[.peers[] | select(.provider_task_id==$id)]')" || return 1
+    [[ "$(jq length <<< "$matches")" == 1 ]] || return 1
+    peer="$(jq -c '.[0]' <<< "$matches")"
+    local host="$(jq -r '.host' <<< "$peer")"
+    [[ "$host" == local || "$host" == "${CCTRL_HOST_PREFIX:-local}" ]] || _host_is_local "$host" || return 1
+    _peer_sender_binding_mismatch "$(jq -r '.name' <<< "$peer")" "$peer" "" false false || return 1
+    jq -r '.name' <<< "$peer"
+}
+
 _peer_cmd_whoami() {
     local json=false identity="" a peer_json
     while [[ $# -gt 0 ]]; do
@@ -6531,6 +6595,7 @@ _peer_cmd_whoami() {
         esac
     done
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
         echo -e "${RED}No peer identity provided.${RESET}" >&2
         echo -e "${DIM}Use: cctrl peer whoami --as <peer>  or set CCTRL_PEER.${RESET}" >&2
@@ -6567,6 +6632,7 @@ _peer_cmd_help_agent() {
         esac
     done
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
     if [[ -n "$identity" ]]; then
         if ! peer_json="$(_peer_resolve_json "$identity" 2>/dev/null)"; then
             if $json; then
@@ -6672,6 +6738,7 @@ _peer_cmd_overview() {
     done
     identity="$as_identity"
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
         if $json; then _json_error "missing-identity" "Use --as <peer> or set CCTRL_PEER."; return 66; fi
         echo -e "${RED}No peer identity provided.${RESET}" >&2
@@ -6977,6 +7044,7 @@ _mailbox_resolve_identity_for_mode() {
     local explicit="$1" json="${2:-false}" identity
     identity="$explicit"
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
         if [[ "$json" == "true" ]]; then
             _json_error "missing-identity" "Use --as <peer> or set CCTRL_PEER."
@@ -7003,11 +7071,16 @@ _mailbox_resolve_identity_for_mode() {
         _mailbox_require_peer "peer" "$identity" false
         return 1
     fi
+    if [[ -n "$(jq -r '.provider_task_id // empty' <<< "$peer_json")" ]] && ! _peer_sender_binding_mismatch "$identity" "$peer_json" "" false false; then
+        _json_error "sender-mismatch" "App mailbox identity does not match the exact caller thread"
+        return 66
+    fi
     MAILBOX_RESOLVED_IDENTITY="$(jq -r '.name' <<< "$peer_json")"
     # Stash the current occupant's created_at so read paths (recv, inbox) can
     # apply the addressee guard without re-resolving. Empty when the peer carries
     # no stamp (manual peer) — the guard treats that as absence and delivers.
     MAILBOX_RESOLVED_PEER_CREATED="$(jq -r '.created_at // ""' <<< "$peer_json")"
+    MAILBOX_RESOLVED_PROVIDER_ID="$(jq -r '.provider_task_id // ""' <<< "$peer_json")"
 }
 
 # Plan 077: does a resolved sender peer's tmux_target/session match the
@@ -7031,11 +7104,56 @@ _mailbox_resolve_identity_for_mode() {
 #   $1 = from name   $2 = resolved peer json for from (or "")
 #   $3 = caller's own tmux session name (or "")   $4 = impersonate (bool)
 #   $5 = caller_unresolved (bool, default false)
+# Authoritative registry binding plus fresh provider verification. A listed thread
+# alone never proves that its terminal writer has released ownership.
+_peer_preserve_app_binding() {
+    local name="$1" record="$2" peer thread cwd stamp tmp
+    peer="$(jq -r '.peer // .tmux_session // .name // empty' <<< "$record")"
+    [[ -n "$peer" ]] || peer="$name"
+    thread="$(jq -r '.provider_task_id' <<< "$record")"
+    cwd="$(jq -r '.cwd' <<< "$record")"
+    stamp="$(jq -r '.created_at // .registered_at // empty' <<< "$record")"
+    _peer_init
+    # A name already bound elsewhere must never be silently retargeted.
+    jq -e --arg p "$peer" --arg id "$thread" '(.[$p].provider_task_id // $id)==$id' "$PEERS_FILE" >/dev/null || return 65
+    tmp="$(mktemp)" || return 1
+    jq --arg p "$peer" --arg id "$thread" --arg cwd "$cwd" --arg stamp "$stamp" --arg now "$(_peer_now_utc)" --arg host "${CCTRL_HOST_PREFIX:-local}" '
+        .[$p] = ((.[$p] // {}) + {name:$p,host:$host,agent:"codex",dir:$cwd,provider_task_id:$id,
+            created_at:(.[$p].created_at // (if $stamp=="" then $now else $stamp end)),
+            registered_at:(.[$p].registered_at // $now),
+            capabilities:(((.[$p].capabilities // []) | map(select(. != "tmux"))) + ["mailbox","app-server"] | unique)} | del(.session,.tmux_target))
+    ' "$PEERS_FILE" > "$tmp" && mv "$tmp" "$PEERS_FILE"
+}
+
+_peer_app_owned_verify() {
+    local thread_id="$1" cwd="$2" record host_id
+    host_id="$(_cctrl_host_id)" || return 1
+    record="$(_task_record_file codex "$host_id" "$thread_id")" || return 1
+    [[ -f "$record" ]] || return 1
+    jq -e --arg id "$thread_id" --arg cwd "$cwd" '
+        .provider_task_id == $id and .control_owner == "app" and
+        .execution_runtime == "app-server" and .cwd == $cwd and
+        (.lifecycle_state != "archived" and .lifecycle_state != "closed")
+    ' "$record" >/dev/null || return 1
+    python3 "$SCRIPT_DIR/lib/codex_peer_delivery.py" --thread-id "$thread_id" \
+        --expected-cwd "$cwd" --app-owned --verify-only >/dev/null
+}
+
 _peer_sender_binding_mismatch() {
     local from_name="$1" from_peer_json="$2" caller_session="$3" impersonate="$4" caller_unresolved="${5:-false}"
     _PEER_BIND_TARGET=""
     [[ "$impersonate" == "true" ]] && return 0
     [[ "$from_name" != "user" && -n "$from_peer_json" ]] || return 0
+    local app_thread app_cwd
+    app_thread="$(jq -r '.provider_task_id // empty' <<< "$from_peer_json")"
+    if [[ -n "$app_thread" ]]; then
+        _PEER_BIND_TARGET="$app_thread"
+        [[ "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" == "$app_thread" ]] || return 1
+        [[ -z "${CODEX_THREAD_ID:-}" || -z "${CODEX_SESSION_ID:-}" || "$CODEX_THREAD_ID" == "$CODEX_SESSION_ID" ]] || return 1
+        app_cwd="$(jq -r '.dir // empty' <<< "$from_peer_json")"
+        _peer_app_owned_verify "$app_thread" "$app_cwd"
+        return $?
+    fi
     local bind_target
     bind_target="$(jq -r '.tmux_target // .session // empty' <<< "$from_peer_json")"
     [[ -n "$bind_target" ]] || return 0
@@ -7152,10 +7270,11 @@ _peer_cmd_send() {
     local requested_from="$as_identity"
     [[ -n "$requested_from" ]] || requested_from="$from"
     [[ -n "$requested_from" ]] || requested_from="${CCTRL_PEER:-}"
+    [[ -n "$requested_from" ]] || requested_from="$(_peer_app_self_identity 2>/dev/null || true)"
 
     if [[ -z "$from" ]]; then
-        if [[ -n "$as_identity" || -n "${CCTRL_PEER:-}" ]]; then
-            _mailbox_resolve_identity_for_mode "$as_identity" "$json" || return $?
+        if [[ -n "$as_identity" || -n "${CCTRL_PEER:-}" || -n "$requested_from" ]]; then
+            _mailbox_resolve_identity_for_mode "${as_identity:-$requested_from}" "$json" || return $?
             from="$MAILBOX_RESOLVED_IDENTITY"
         elif $json; then
             _json_error "missing-identity" "Use --from NAME, --as NAME, CCTRL_PEER, or --allow-unknown."
@@ -7239,8 +7358,9 @@ _peer_cmd_send() {
     # actual reissue (2026-09-28 eng review). Left as a design question in
     # docs/plans/075-close-and-draft-review-followups.md rather than re-added
     # naively.
-    local recipient_created_at=""
+    local recipient_created_at="" recipient_provider_task_id=""
     [[ -n "$to_peer_json" ]] && recipient_created_at="$(jq -r '.created_at // empty' <<< "$to_peer_json")"
+    [[ -n "$to_peer_json" ]] && recipient_provider_task_id="$(jq -r '.provider_task_id // empty' <<< "$to_peer_json")"
 
     if ! _peer_sender_binding_mismatch "$from" "$from_peer_json" "$caller_tmux_session" "$impersonate" "$caller_unresolved"; then
         if [[ "$caller_unresolved" == "true" ]]; then
@@ -7313,12 +7433,14 @@ _peer_cmd_send() {
             --arg requested_from "$requested_from" \
             --arg caller_tmux_session "$caller_tmux_session" \
             --arg recipient_created_at "$recipient_created_at" \
+            --arg recipient_provider_task_id "$recipient_provider_task_id" \
             --argjson impersonated "$impersonate" \
             --argjson caller_unresolved "$caller_unresolved" \
             '{
               id: $id,
               from: $from,
               to: $to,
+              recipient_provider_task_id: (if $recipient_provider_task_id=="" then null else $recipient_provider_task_id end),
               status: "queued",
               subject: $subject,
               body: $body,
@@ -7381,8 +7503,8 @@ _peer_cmd_inbox() {
     statuses="$(_mailbox_status_filter_json "$status_csv" "queued,delivered")"
     # Addressee guard: a listing must not reveal mail (or its id) queued for a
     # previous occupant of this name, or a receiver could then `peer show` it.
-    messages="$(jq --arg who "$identity" --arg peer "$peer_created" --argjson statuses "$statuses" "$guard"'
-        [ .[] | .status as $status | select(.to == $who and ($statuses | index($status)) and deliverable($peer)) ]
+    messages="$(jq --arg who "$identity" --arg peer "$peer_created" --arg provider "${MAILBOX_RESOLVED_PROVIDER_ID:-}" --argjson statuses "$statuses" "$guard"'
+        [ .[] | .status as $status | select(.to == $who and ($statuses | index($status)) and deliverable_provider($peer;$provider)) ]
     ' <<< "$messages")"
     if $json; then
         jq '.' <<< "$messages"
@@ -7609,10 +7731,10 @@ _peer_cmd_recv() {
             # Addressee guard: never read out a message whose current occupant
             # post-dates it (a recycled name). recv is the primary body-handover
             # path, so this is the load-bearing disclosure gate.
-            selected_id="$(jq -r --arg who "$identity" --arg peer "$peer_created" --argjson statuses "$statuses" "$guard"'
+            selected_id="$(jq -r --arg who "$identity" --arg peer "$peer_created" --arg provider "${MAILBOX_RESOLVED_PROVIDER_ID:-}" --argjson statuses "$statuses" "$guard"'
                 def allowed($s): ($statuses | index($s)) != null;
-                ([.[] | select(.to == $who and .status == "queued" and allowed("queued") and deliverable($peer))][0].id)
-                // ([.[] | select(.to == $who and .status == "delivered" and allowed("delivered") and deliverable($peer))][0].id)
+                ([.[] | select(.to == $who and .status == "queued" and allowed("queued") and deliverable_provider($peer;$provider))][0].id)
+                // ([.[] | select(.to == $who and .status == "delivered" and allowed("delivered") and deliverable_provider($peer;$provider))][0].id)
                 // empty
             ' <<< "$messages")"
             if [[ -z "$selected_id" ]]; then
@@ -7781,6 +7903,14 @@ _tmux_run_stdin_with_timeout() {
 # tmux `has-session` to distinguish a live pane from a dead one.
 _peer_reachability_class() {
     local peer_json="$1" target
+    if _peer_has_capability "$peer_json" app-server; then
+        if _peer_app_owned_verify "$(jq -r '.provider_task_id // empty' <<< "$peer_json")" "$(jq -r '.dir // empty' <<< "$peer_json")"; then
+            printf 'live\n'
+        else
+            printf 'unreachable\n'
+        fi
+        return 0
+    fi
     if ! _peer_has_capability "$peer_json" "tmux"; then
         printf 'mailbox-only\n'
         return 0
@@ -8079,6 +8209,64 @@ _peer_print_delivery_human() {
     esac
 }
 
+_peer_app_deliver_locked() {
+    local peer_json="$1" messages="$2" payload="$3" inline_id="$4"
+    local thread cwd attempt receipt body_file out status updated now reused=false
+    if [[ -n "$inline_id" ]]; then
+        PEER_DELIVER_STATUS=deferred; PEER_DELIVER_REASON=app-inline-unsupported
+        _peer_delivery_result_json; return 0
+    fi
+    thread="$(jq -r '.provider_task_id' <<< "$peer_json")"
+    cwd="$(jq -r '.dir' <<< "$peer_json")"
+    PEER_DELIVER_TARGET="$thread"
+    if ! _peer_app_owned_verify "$thread" "$cwd"; then
+        PEER_DELIVER_STATUS=failed; PEER_DELIVER_REASON=app-ownership-unverified
+        _peer_delivery_result_json; return 1
+    fi
+    # Reuse a durable in-flight attempt after an uncertain request. The helper
+    # reconciles its marker before allowing any resend.
+    attempt="$(jq -r --arg peer "$PEER_DELIVER_PEER" '[.[] | select(.to==$peer and .status=="queued") | .app_delivery_attempt // empty][0] // empty' <<< "$messages")"
+    if [[ -n "$attempt" ]]; then reused=true; else attempt="$(openssl rand -hex 16)"; fi
+    [[ "$attempt" =~ ^[0-9a-f]{32}$ ]] || return 1
+    mkdir -p "$PEER_DATA_DIR/app-delivery"
+    receipt="$PEER_DATA_DIR/app-delivery/$attempt.json"
+    body_file="$PEER_DATA_DIR/app-delivery/$attempt.body"
+    if [[ "$reused" == false ]]; then printf '%s' "$payload" > "$body_file"; fi
+    [[ -f "$body_file" ]] || { PEER_DELIVER_STATUS=ambiguous; PEER_DELIVER_REASON=attempt-body-missing; _peer_delivery_result_json; return 1; }
+    updated="$(jq --arg peer "$PEER_DELIVER_PEER" --arg id "$inline_id" --arg attempt "$attempt" --argjson reused "$reused" '
+        map(if ($reused|not) and .to==$peer and .status=="queued" and ($id=="" or .id==$id) then .app_delivery_attempt=$attempt else . end)
+    ' <<< "$messages")"
+    _mailbox_rewrite_json_locked "$updated" || return 1
+    messages="$updated"
+    out="$(python3 "$SCRIPT_DIR/lib/codex_peer_delivery.py" --thread-id "$thread" --expected-cwd "$cwd" \
+        --body-file "$body_file" --attempt-id "$attempt" --receipt-file "$receipt" --app-owned)" || true
+    status="$(jq -r '.status // "ambiguous"' <<< "$out" 2>/dev/null || true)"
+    case "$status" in accepted|deferred|ambiguous|failed) ;; *) status=ambiguous ;; esac
+    PEER_DELIVER_REASON="$(jq -r '.reason // empty' <<< "$out" 2>/dev/null || true)"
+    now="$(_peer_now_utc)"
+    if [[ "$status" == accepted ]]; then
+        PEER_DELIVER_STATUS=nudged; PEER_DELIVER_SUBMITTED=true
+        if [[ -n "$inline_id" ]]; then
+            updated="$(_peer_record_inline_json "$messages" "$inline_id" true "" "$now")"
+        else
+            local covered recorded
+            covered="$(jq --arg a "$attempt" '[.[] | select(.app_delivery_attempt==$a)]' <<< "$messages")"
+            recorded="$(_peer_record_nudge_json "$covered" "$PEER_DELIVER_PEER" true "" "$now" true "app-server")"
+            updated="$(jq --argjson recorded "$recorded" 'map(.id as $id | ([$recorded[] | select(.id==$id)][0] // .))' <<< "$messages")"
+        fi
+        updated="$(jq --arg a "$attempt" 'map(if .app_delivery_attempt==$a then del(.app_delivery_attempt) else . end)' <<< "$updated")"
+        _mailbox_rewrite_json_locked "$updated"
+        _peer_delivery_result_json; return 0
+    fi
+    PEER_DELIVER_STATUS="${status:-ambiguous}"
+    if [[ "$status" == deferred || "$status" == failed ]]; then
+        updated="$(jq --arg a "$attempt" 'map(if .app_delivery_attempt==$a then del(.app_delivery_attempt) else . end)' <<< "$messages")"
+        _mailbox_rewrite_json_locked "$updated"
+    fi
+    _peer_delivery_result_json
+    [[ "$status" == deferred ]]
+}
+
 _peer_deliver_one_locked() {
     local peer_json="$1" messages="$2" dry_run="$3" json="$4" no_submit="$5" force_busy="$6" inline_id="$7"
     local peer agent target queued now nudge buffer submit payload result message_body message_to updated recent
@@ -8096,6 +8284,15 @@ _peer_deliver_one_locked() {
     PEER_DELIVER_INLINE=false
     PEER_DELIVER_SUBMITTED=false
 
+    if [[ -n "$inline_id" ]] && _peer_has_capability "$peer_json" app-server; then
+        PEER_DELIVER_INLINE=true
+        PEER_DELIVER_QUEUED="$(jq --arg p "$peer" '[.[] | select(.to==$p and .status=="queued")] | length' <<< "$messages")"
+        PEER_DELIVER_STATUS=deferred
+        PEER_DELIVER_REASON=app-inline-unsupported
+        _peer_delivery_result_json
+        return 0
+    fi
+
     # Addressee guard (plan 032): before nudging or counting, terminally block
     # any queued message whose CURRENT occupant of this name post-dates it — a
     # recycled tmux name now held by a different session. Marking blocked (not
@@ -8103,9 +8300,9 @@ _peer_deliver_one_locked() {
     # message from the queued count so no nudge fires. Runs inside the caller's
     # mailbox lock, like the failure-record rewrite below.
     guard="$(_peer_guard_defs)"
-    blocked_now="$(jq --arg who "$peer" --arg peer "$peer_created" --arg now "$(_peer_now_utc)" "$guard"'
+    blocked_now="$(jq --arg who "$peer" --arg peer "$peer_created" --arg provider "$(jq -r '.provider_task_id // ""' <<< "$peer_json")" --arg now "$(_peer_now_utc)" "$guard"'
         map(
-          if (.to == $who and .status == "queued" and (deliverable($peer) | not)) then
+          if (.to == $who and .status == "queued" and (deliverable_provider($peer;$provider) | not)) then
             .status = "blocked"
             | .updated_at = $now
             | .blocked_reason = block_reason($peer)
@@ -8191,6 +8388,15 @@ _peer_deliver_one_locked() {
         PEER_DELIVER_SUBMITTED="$submit"
         _peer_delivery_result_json
         return 0
+    fi
+
+    if jq -e '(.capabilities // []) | index("app-server") != null' <<< "$peer_json" >/dev/null; then
+        if [[ "$no_submit" == true ]]; then
+            PEER_DELIVER_STATUS=deferred; PEER_DELIVER_REASON=no-submit
+            _peer_delivery_result_json; return 0
+        fi
+        _peer_app_deliver_locked "$peer_json" "$messages" "$payload" "$inline_id"
+        return $?
     fi
 
     # Socket adapter: try Claude Code native socket before tmux paste.
@@ -8967,6 +9173,7 @@ _peer_status_summary_json() {
         def epoch($ts): if $ts == null or $ts == "" then null else try ($ts | fromdateiso8601 | floor) catch null end;
         def transports($peer):
           ([ if (($peer.capabilities // []) | index("tmux")) then "tmux" else empty end,
+             if (($peer.capabilities // []) | index("app-server")) then "app-server" else empty end,
              if (($peer.capabilities // []) | index("polling")) then "polling" else empty end,
              "mcp"
           ] | unique);
@@ -9136,7 +9343,7 @@ _peer_orchestrate_recipients_locked() {
         else
             target="$(jq -r '.name' <<< "$peer_json")"
             queued="$(jq -r --arg peer "$target" '[.[] | select(.to == $peer and .status == "queued")] | length' <<< "$messages")"
-            if [[ "$polling_skip" == "true" ]] && ! _peer_has_capability "$peer_json" "tmux"; then
+            if [[ "$polling_skip" == "true" ]] && ! _peer_has_capability "$peer_json" "tmux" && ! _peer_has_capability "$peer_json" "app-server"; then
                 PEER_DELIVER_PEER="$target"
                 PEER_DELIVER_STATUS="polling"
                 PEER_DELIVER_REASON="no-tmux-capability"
@@ -9717,6 +9924,7 @@ _peer_cmd_mcp() {
 
     identity="$as_identity"
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
+    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
         echo "cctrl peer mcp needs --as <peer> or CCTRL_PEER" >&2
         return 66
@@ -9765,7 +9973,7 @@ cmd_peer() {
             echo "  cctrl peer say <peer> [--no-submit] [--force-busy] [--body-file PATH|-] [--json] -- <msg>"
             echo "                                     Direct live-tmux chat (no mailbox); use 'peer send' for async mailbox"
             echo "  cctrl peer resolve <name-or-alias> [--json]"
-            echo "  cctrl peer register <name> [--alias NAME] [--host HOST] [--dir DIR] [--agent AGENT] [--session SESSION] [--purpose TEXT] [--capability NAME]"
+            echo "  cctrl peer register <name> [--alias NAME] [--host HOST] [--dir DIR] [--agent AGENT] [--session SESSION] [--thread-id ID] [--purpose TEXT] [--capability NAME]"
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer whoami [--as NAME] [--json]"
@@ -13119,6 +13327,10 @@ _session_release_to_app_one() {
     resulting="$(jq -c '{control_owner,execution_runtime,lifecycle_state,restore_strategy}' <<< "$normalized")"
     provider_postcondition="$(jq -c '{verified:.ok,source_cursor,reason:"exact-provider-task-app-openable"}' <<< "$provider_check")"
     status="handed-off"; ok=true
+    if ! _peer_preserve_app_binding "$name" "$normalized"; then
+        _codex_handoff_result "$attempt_id" "$name" "$provider_task_id" "$previous" "handed-off-peer-binding-failed" true "$provider_postcondition" "$resulting" "Register the exact app thread with an unused peer name; existing peer identity was preserved." "peer-binding-conflict" false
+        rm -rf "$scratch"; return 65
+    fi
 
     # App Server may already hold this task's provider lock without its ID in
     # argv. Preserve provider lock files; the provider owns their lifecycle.

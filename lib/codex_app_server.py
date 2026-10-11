@@ -177,7 +177,7 @@ def discover_runtime(
     validation_timeout: float = 2.0,
     platform_candidates: Sequence[str] = (),
 ) -> Runtime:
-    """Discover Codex in override -> PATH -> platform-installation order."""
+    """Discover override -> validated managed desktop current -> PATH -> platform."""
 
     if override:
         runtime = _validated_runtime(override, "configured-override", validation_timeout)
@@ -188,6 +188,26 @@ def discover_runtime(
                 f"configured Codex executable is not runnable: {override}",
             )
         return runtime
+
+    # The managed current pointer is authoritative; never choose a newest release.
+    package_root = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))) / "packages" / "app-server-daemon"
+    current = package_root / "current"
+    if current.exists():
+        try:
+            release = current.resolve(strict=True)
+            release.relative_to((package_root / "releases").resolve())
+            metadata = json.loads((release / "codex-package.json").read_text())
+            entry = metadata["entrypoint"]
+            if metadata.get("layoutVersion") != 1 or metadata.get("variant") != "codex" or not isinstance(entry, str):
+                raise ValueError("unsupported managed package metadata")
+            executable = (release / entry).resolve(strict=True)
+            executable.relative_to(release)
+            runtime = _validated_runtime(str(executable), "managed-desktop-package", validation_timeout)
+            if runtime is None or runtime.cli_version != metadata.get("version"):
+                raise ValueError("managed package version mismatch")
+            return runtime
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise AdapterError(EXIT_RUNTIME, "runtime-discovery", f"invalid managed desktop package: {exc}") from exc
 
     path_candidate = shutil.which("codex")
     if path_candidate:

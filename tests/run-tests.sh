@@ -17068,6 +17068,11 @@ PY
     echo "ok: Codex lifecycle ingestion is bounded, conservative, convergent, lineage-aware, and fail-open"
 }
 
+test_app_peer_binding_and_delivery() {
+    python3 "$ROOT/tests/test_app_peer_shell.py"
+    python3 "$ROOT/tests/test_codex_peer_delivery.py"
+}
+
 test_codex_app_server_adapter() {
     local -x CCTRL_CODEX_APP_SERVER_TRANSPORT=jsonl
     local fake_root="$TMPDIR/codex-app-server" fake="$TMPDIR/codex-app-server/codex"

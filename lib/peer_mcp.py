@@ -74,14 +74,17 @@ TOOLS = [
             "tool-call form of `cctrl peer say`. DEFAULT RULE: use `say_peer` for a "
             "live tmux agent you want to act immediately; use `send_message` for "
             "durable async work that must survive the recipient being away/offline. "
-            "Unlike `send_message`, this creates NO mailbox message: it types the "
-            "body straight into the peer's tmux session. Address `to` with a peer "
+            "For tmux peers this creates NO mailbox message: it types the "
+            "body straight into the peer's tmux session. For a verified app-owned "
+            "Codex peer, it queues durable mailbox mail and attempts app delivery; "
+            "submit:false queues without waking the app task. Address `to` with a peer "
             "`name` from `peer_overview` or `list_peers` (aliases are accepted and "
             "canonicalized). `submit` defaults to true (the message is submitted for "
             "the peer); pass submit:false to type a draft without pressing Enter. "
             "`force_busy:true` overrides the readiness guard when the peer looks busy "
-            "(never a known modal). Fails (nothing typed) if the peer has no live "
-            "local tmux session — fall back to `send_message` in that case."
+            "(never a known modal; app tasks still defer while busy). Fails if a "
+            "terminal peer has no live local tmux session — fall back to "
+            "`send_message` in that case."
         ),
         "inputSchema": {
             "type": "object",
