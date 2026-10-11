@@ -4,10 +4,13 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import no_real_tmux  # noqa: E402,F401  side effect: no real tmux is reachable when this file is run directly
 HOST = '0123456789abcdef0123456789abcdef'
 
 

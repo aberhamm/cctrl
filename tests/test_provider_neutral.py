@@ -4,12 +4,15 @@ import os
 from pathlib import Path
 import subprocess
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import no_real_tmux  # noqa: E402,F401  side effect: no real tmux is reachable when this file is run directly
 spec = importlib.util.spec_from_file_location("agent_model", ROOT / "lib/agent_model.py")
 model_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(model_module)

@@ -11,6 +11,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import no_real_tmux  # noqa: E402,F401  side effect: no real tmux is reachable when this file is run directly
 sys.path.insert(0, str(ROOT / 'lib'))
 spec = importlib.util.spec_from_file_location('identity', ROOT / 'lib/terminal_identity.py')
 identity = importlib.util.module_from_spec(spec)
