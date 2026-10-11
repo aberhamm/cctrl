@@ -366,6 +366,14 @@ _test_path() {
     if [[ "${1:-}" == "--sbin" ]]; then sbin=1; shift; fi
     out="$TMPDIR/bash-shim"
     for dir in "$@"; do out="$out:$dir"; done
+    # A host with tmux in a system dir (not macOS): the private-socket shim
+    # goes in front of it, after the fixture dirs, so a reduced PATH cannot
+    # reach the real binary without it. No system tmux: nothing is added, and
+    # the "tmux is absent" fixtures stay valid.
+    if [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] \
+        && [[ -x "$sys/tmux" || -x /bin/tmux || -x /usr/sbin/tmux || -x /sbin/tmux ]]; then
+        out="$out:${CCTRL_TEST_TMUX_SHIM%/tmux}"
+    fi
     out="$out:$sys:/bin"
     if [[ "$sbin" -eq 1 ]]; then out="$out:/usr/sbin:/sbin"; fi
     printf '%s' "$out"
@@ -404,7 +412,11 @@ _suite_exit() {
         local _sock
         if [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" && -x "$CCTRL_TEST_TMUX_SHIM" ]]; then
             for _sock in "$CCTRL_TEST_TMUX_TMPDIR"/tmux-*/*; do
-                [[ -S "$_sock" ]] && "$CCTRL_TEST_TMUX_SHIM" -S "$_sock" kill-server 2>/dev/null || true
+                # Never through a symlink ([[ -S ]] follows one): a link
+                # planted in the private dir could name a socket outside it.
+                if [[ -S "$_sock" && ! -L "$_sock" && ! -L "${_sock%/*}" ]]; then
+                    "$CCTRL_TEST_TMUX_SHIM" -S "$_sock" kill-server 2>/dev/null || true
+                fi
             done
         fi
         rm -rf -- "$CCTRL_TEST_TMUX_TMPDIR"
@@ -514,6 +526,14 @@ test_tmux_default_server_is_private() {
             || fail "bare tmux resolved outside the private dir: ${sock:-<none>}"
         [[ "$sock_foreign" == "$sock" ]] \
             || fail "a re-exported foreign TMUX moved tmux off the private server: ${sock_foreign:-<none>}"
+    else
+        # No shim was installed. That is only right when this PATH holds no
+        # tmux at all, or only the shim of an outer harness (which sandboxes
+        # on its own). Any other tmux here would be the real one, unguarded.
+        case "$real_tmux" in
+            ""|*/cctrl-test-tmux.*/bin/tmux) ;;
+            *) fail "a tmux is on the suite PATH but no private-socket shim was installed: $real_tmux" ;;
+        esac
     fi
 
     # Static half: an untargeted display-message falls back to the default
@@ -613,10 +633,15 @@ _tmux_isolation_hits() {
     #   1. a server kill whose command carries no -S/-L socket;
     #   2. a TMUX_TMPDIR assignment used as the only isolation of a tmux
     #      command (tmux prefers $TMUX, so that reaches the caller's server).
+    # A socket flag counts only in front of the server-kill word, with a value
+    # that is not "default" and is not built from $TMUX (those still mean the
+    # default or the inherited server).
     # A line is exempt when it, or the line above it, carries the allow marker
-    # (a doc quoting the bad pattern as a warning; a fixture). The search
+    # (a doc quoting the bad pattern as a warning; a fixture). A file that is
+    # about the pattern itself (the hook guard's test table, its plan) opts
+    # out as a whole with the file marker in its first 20 lines. The search
     # words are assembled so this function does not match itself.
-    local root="$1" p f ks="kill-""server" tt="TMUX_TMP""DIR=" ok="tmux-lint: ""allow"
+    local root="$1" p f ks="kill-""server" tt="TMUX_TMP""DIR=" ok="tmux-lint: ""allow" okf="tmux-lint: ""allow-file"
     local -a paths=()
     for p in tests docs skills AGENTS.md; do
         if [[ -e "$root/$p" ]]; then paths+=("$root/$p"); fi
@@ -624,8 +649,21 @@ _tmux_isolation_hits() {
     [[ "${#paths[@]}" -gt 0 ]] || return 0
     while IFS= read -r f; do
         [[ -n "$f" ]] || continue
-        awk -v ks="$ks" -v tt="$tt" -v ok="$ok" -v name="${f#"$root"/}" '
-            function sockflag(s) { return s ~ /(^|[ \t"])-[SL]/ }
+        if awk -v okf="$okf" 'FNR > 20 { exit } index($0, okf) > 0 { found = 1; exit } END { exit !found }' "$f"; then
+            continue
+        fi
+        awk -v ks="$ks" -v tt="$tt" -v ok="$ok" -v sq="'" -v name="${f#"$root"/}" '
+            function sockflag(s,    k, pre, v) {
+                k = index(s, ks)
+                pre = (k > 0) ? substr(s, 1, k - 1) : s
+                if (!match(pre, /(^|[ \t"])-[SL][ \t]*[^ \t]+/)) return 0
+                v = substr(pre, RSTART, RLENGTH)
+                sub(/^[ \t"]*-[SL][ \t]*/, "", v)
+                gsub("[\"" sq "]", "", v)
+                if (v == "" || v == "default" || v ~ /^-/) return 0
+                if (v ~ /[$][{]?TMUX([^A-Za-z0-9_]|$)/ || v ~ /socket_path/) return 0
+                return 1
+            }
             {
                 why = ""
                 if (index($0, ok) == 0 && index(prev, ok) == 0) {
@@ -652,7 +690,7 @@ test_no_unsafe_tmux_isolation() {
     # agent brief's shell block, a server kill isolated only by TMUX_TMPDIR
     # while $TMUX pointed at the fleet server. Static: no tmux is started.
     local hits root="${CCTRL_LINT_ROOT:-$ROOT}" plant="$TMPDIR/tmux-lint-plant"
-    local ks="kill-""server" tt="TMUX_TMP""DIR=" ok="tmux-lint: ""allow"
+    local ks="kill-""server" tt="TMUX_TMP""DIR=" ok="tmux-lint: ""allow" okf="tmux-lint: ""allow-file"
     hits="$(_tmux_isolation_hits "$root")"
     [[ -z "$hits" ]] || fail "unsafe tmux isolation (use tmux -S <private socket>; mark a quoted warning with '$ok'):
 $(printf '%s\n' "$hits" | cut -c1-220 | head -n 10)"
@@ -676,15 +714,28 @@ $(printf '%s\n' "$hits" | cut -c1-220 | head -n 10)"
     _lint_plant 1 skills/x/SKILL.md 'Run `%s"$D" tmux ls` to list them.\n' "$tt"
     _lint_plant 1 AGENTS.md 'Reset with `tmux %s`.\n' "$ks"
     _lint_plant 1 tests/second.sh 'tmux -S "$D/sock" ls; tmux %s\n' "$ks"
+    # a socket flag that is no isolation: the default server by name, the
+    # inherited server, a flag behind the command, a flag without a value
+    _lint_plant 1 tests/ldefault.sh 'tmux -L default %s\n' "$ks"
+    _lint_plant 1 tests/ldefaultq.sh 'tmux -L "default" %s\n' "$ks"
+    _lint_plant 1 tests/inherited.sh 'tmux -S "${TMUX%%%%,*}" %s\n' "$ks"
+    _lint_plant 1 tests/inherited2.sh 'tmux -S $TMUX %s\n' "$ks"
+    _lint_plant 1 tests/after.sh 'tmux %s -S "$D/sock"\n' "$ks"
+    _lint_plant 1 tests/novalue.sh 'tmux -S %s\n' "$ks"
     # safe forms
     _lint_plant 0 tests/s.sh 'tmux -S "$D/sock" %s\n' "$ks"
     _lint_plant 0 tests/l.sh '"$real_tmux" -L "$socket" %s 2>/dev/null || true\n' "$ks"
     _lint_plant 0 tests/export.sh 'export %s"$dir"\n' "$tt"
     _lint_plant 0 tests/both.sh '%s"$D" tmux -S "$D/sock" ls\n' "$tt"
+    _lint_plant 0 tests/attached.sh 'tmux -S"$D/sock" %s\n' "$ks"
+    _lint_plant 0 tests/tmpdirsock.sh 'tmux -S "$TMUX_TMPDIR/sock" %s\n' "$ks"
     # the allow marker: same line, or the line above; not two lines above
     _lint_plant 0 docs/warn.md 'Never run `tmux %s`. <!-- %s (quoted as a warning) -->\n' "$ks" "$ok"
     _lint_plant 0 docs/warn2.md '<!-- %s -->\nNever run `tmux %s`.\n' "$ok" "$ks"
     _lint_plant 1 docs/warn3.md '<!-- %s -->\n\nNever run `tmux %s`.\n' "$ok" "$ks"
+    # the file marker: in the first 20 lines it exempts the whole file
+    _lint_plant 0 tests/table.py '# %s (a table of the bad forms)\nBLOCK = ["tmux %s"]\n\n\nMORE = ["tmux %s"]\n' "$okf" "$ks" "$ks"
+    _lint_plant 1 tests/late.py '\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n# %s\n\nBLOCK = ["tmux %s"]\n' "$okf" "$ks"
     unset -f _lint_plant
     echo "ok: no tmux server kill without a socket and no TMUX_TMPDIR-only isolation in tests, docs or skills"
 }
@@ -1526,11 +1577,12 @@ FX
     assert_not_contains "$out" "SET-E-NOT-LIVE-7"
     assert_not_contains "$out" "body: never"
 
-    # The real harness: --list is the registry (first entry is the always-on
-    # test, this test is in it) and an unknown name is refused with rc 64.
+    # The real harness: --list is the registry (the first entries are the
+    # always-on tests, this test is in it) and an unknown name is refused with rc 64.
     rc=0; out="$("${clean[@]}" "$BASH" "$ROOT/tests/run-tests.sh" --list 2>/dev/null)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "real --list rc=$rc"
-    [[ "$(printf '%s\n' "$out" | sed -n 1p)" == "test_tmux_default_server_is_private" ]] || fail "real --list should start with the always-on test"
+    [[ "$(printf '%s\n' "$out" | sed -n 1p)" == "test_private_tmux_shim_contract" && "$(printf '%s\n' "$out" | sed -n 2p)" == "test_tmux_default_server_is_private" ]] \
+        || fail "real --list should start with the two always-on tests (shim contract, then the private-server guard)"
     printf '%s\n' "$out" | grep -Fxq test_runner_filter_and_list || fail "real --list does not contain this test"
     # Discovery (P4): --list is every definition minus the SKIP entries, in
     # source order, with RUN_LAST last.
@@ -18435,6 +18487,7 @@ _rt_register() { # RUN_FIRST|SKIP|RUN_LAST <test_name> '<reason>'  (test_every_d
         *) echo "run-tests.sh: bad registry kind: $1" >&2; exit 64 ;;
     esac
 }
+_rt_register RUN_FIRST test_private_tmux_shim_contract 'before the guard below: checks the shim against a stub, so a shim bug fails the run before any real tmux is called through it (2026-10-09 incident)'
 _rt_register RUN_FIRST test_tmux_default_server_is_private 'before any test, focused group or not: proves a bare tmux hits the private server (plan 071 p5 incident)'
 _rt_register SKIP test_peer_mailbox_concurrency_and_stale_lock 'hangs on macOS bash 3.2 (flock issue), pre-existing, not plan 051/052'
 _rt_register SKIP test_task_inventory_provider_neutral_readonly 'fails at HEAD d0f93f0 too (its fake tmux list-sessions output is rejected as invalid-session-identity); it was only ever run through the task-inventory and codex-ownership-matrix groups. Plan 105 P4c: fixing the stale fixture is a follow-up'

@@ -1773,7 +1773,7 @@ Since plan 105 P4 there is no call list: every `test_*()` definition in
 `tests/run-tests.sh` runs, in source order, each in its own subshell (so an
 `export`, `cd` or trap in one test cannot leak into the next). Three small
 lists in the file, each entry with a reason, are the only exceptions:
-`RUN_FIRST` (the private-tmux guard), `SKIP` (defined, never run) and
+`RUN_FIRST` (the tmux shim contract, then the private-tmux guard), `SKIP` (defined, never run) and
 `RUN_LAST` (`test_tmux_sockets_left_behind`). To add a test, define it; to
 run a focused group use `CCTRL_TEST_ONLY=<group>` (groups are the
 `_group_tests` table). `test_every_defined_test_is_registered` fails on a
