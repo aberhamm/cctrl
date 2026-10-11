@@ -9,10 +9,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-spec = importlib.util.spec_from_file_location('codex_app_server', ROOT / 'lib/codex_app_server.py')
-adapter = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = adapter
-spec.loader.exec_module(adapter)
+sys.path.insert(0, str(ROOT / 'lib'))
+import codex_app_server as adapter
 
 PROXY = r'''#!/usr/bin/env python3
 import base64, hashlib, json, os, struct, sys, time
