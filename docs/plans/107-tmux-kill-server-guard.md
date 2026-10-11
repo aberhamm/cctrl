@@ -131,11 +131,23 @@ The same branch closes the open findings on the test-harness tmux isolation
    as shell text. Without a script argument, its standard input is: the
    here-document, the here-string, or the words of the pipeline stage in front
    (`echo '...' | sh`). `eval`, `trap` and `alias` strings are checked too.
-7. Commands that run a string as code (`ssh`, `python3 -c`, `perl -e`,
-   `osascript`, `watch`, `xargs`, `find -exec`, `timeout`, ...): a string
-   argument that mentions the kill is checked as shell text and with the regex
-   check.
-8. Nothing matched: allow.
+7. Commands that hand a string to a shell (`ssh`, `su`, `watch`, ...): a
+   string argument that mentions the kill is parsed as shell text. `ssh host`
+   with no remote command: its standard input is a script too.
+8. Commands that run code in their own language (`python3`, `perl`, `ruby`,
+   `node`, `osascript`, ...): string arguments, here-documents and
+   here-strings go through the regex check (a tmux word followed by the kill
+   with no `-S`/`-L` between them).
+9. A variable as the command name: `"$TMUX_BIN" kill-server` blocks when the
+   line mentions tmux; `"$SHELL" -c '...'` is read as a shell; `cmd="..."; $cmd`
+   and `eval "$X"` are checked against what the same line assigned to that
+   variable.
+10. Nothing matched: allow.
+
+Bounds: recursion depth 6, 400 checked texts per command, 200 kB of command
+text; beyond a bound the regex check decides. Measured after the review
+fixes: 0.16 s for 180 kB of artificial input, under 1 ms for ordinary
+commands.
 
 ### Decisions the brief asked for
 
@@ -143,8 +155,10 @@ The same branch closes the open findings on the test-harness tmux isolation
   session is normally the fleet's. (With a private `TMUX_TMPDIR` on the same
   command it would be private; the guard does not try to tell. Use `-S`.)
 - **Other socket flags that are not an isolation: blocked.** `-S` with an
-  empty literal path, `-S` built from `$TMUX` or from `#{socket_path}`, and
-  `-S /tmp/tmux-<uid>/default` (also under `/private/tmp`).
+  empty literal path, `-S` built from `$TMUX` or from `#{socket_path}`, a
+  `-S` path that ends in `/tmp/tmux-<uid>/default` (also `${TMUX_TMPDIR:-/tmp}`
+  and `/private/tmp`), and `-S "$var"` on a line that names `/tmp/tmux-`
+  (the "clean up every socket" loop).
 - **`tmux kill-session` without `-t '=NAME'`: not in this change** (F1).
 - **Malformed hook input: fail-open** (see Protocol).
 - **Escape hatch: none built. Proposal: keep it that way.**
@@ -175,9 +189,10 @@ The same branch closes the open findings on the test-harness tmux isolation
   argument and it passes.
 - A bare tmux whose string argument holds the kill word as a word of its own
   (`tmux send-keys -t X 'echo kill-server' Enter`).
-- Text piped into a shell (`echo "tmux kill-server" | sh`) and a string
-  argument of `ssh`, `python3 -c` and the like that mentions it, even when it
-  would only print it (`python3 -c "print('tmux kill-server')"`).
+- Text piped into a shell (`echo "tmux kill-server" | sh`, also `| bash -n`)
+  and code given to `python3`, `perl`, `osascript` and the like that mentions
+  it, even when it would only print it
+  (`python3 -c "print('tmux kill-server')"`, `python3 - <<'EOF'`).
 - Unescaped backticks or `$(...)` around it inside double quotes or an
   unquoted here-document: bash does run those.
 
@@ -192,10 +207,19 @@ The same branch closes the open findings on the test-harness tmux isolation
 - Text assembled at run time (`printf` into `sh` through a variable,
   `$'\x6b'`-style escapes inside the kill word, base64).
 - A safe-looking socket that is not private: `-S "$SOCK"` where the variable
-  holds the fleet socket; `-L <name>` of a server someone else runs.
+  holds the fleet socket (set in an earlier call, or from
+  `tmux display-message -p '#{socket_path}'` on another line); `-L <name>` of
+  a server someone else runs.
+- `-S "$UNSET"`: believed harmless (tmux fails to connect to an empty path
+  and does not fall back to `$TMUX`), but not verified: no tmux may run under
+  the STOP. Worth one check of `tmux.c` or a run outside the fleet.
 - A bare tmux inside a string argument of a tmux call that has a safe socket
-  is allowed: in that pane `$TMUX` is the private server.
-- tmux commands other than `kill-server` (F1).
+  is allowed: in that pane `$TMUX` is the private server. (Not when the
+  string clears `TMUX` itself.)
+- A command whose kill word only exists at run time (`tmux kill-$c`), a
+  script passed as `sh <(...)`, `xargs -I{} tmux {}`.
+- tmux commands other than `kill-server`, and `pkill tmux` / `killall tmux`
+  (F1).
 - Sessions without the cctrl hook installed or, for Codex, not trusted.
 
 ## Tasks
@@ -210,20 +234,50 @@ The same branch closes the open findings on the test-harness tmux isolation
       exit codes, fail-open inputs. Strings only; no tmux.
 - [x] `tests/run-tests.sh`: the missing-hook-script test names the new file.
 - [x] Docs: README hooks section, CHANGELOG, the findings doc.
-- [ ] Independent review (one Opus sub-agent, reading only): bypass and
-      false-positive strings against the parser.
+- [x] Independent review (one Opus sub-agent, reading only; 77 candidate
+      strings against the parser): APPROVED WITH REQUIRED FIXES. R1-R5 applied,
+      see "Review".
 - [ ] Install: waits for Matthew.
 
 ### B. Open findings on the harness fix
 
-1. [ ] Python tests run directly cannot reach a real tmux.
-2. [ ] The guard test no longer passes silently when no shim was installed.
-3. [ ] Teardown does not follow symlinks.
-4. [ ] The lint accepts only a socket flag in front of the kill word, with a
-       value that is not `default` and not built from `$TMUX`.
-5. [ ] Skill and AGENTS text define `$D`.
-6. [ ] The shim contract test runs first (RUN_FIRST), before any real tmux.
-7. [ ] `_test_path` puts the shim in front of a system-dir tmux.
+All done as code; none of it has run (test STOP).
+
+1. [x] Python tests run directly cannot reach a real tmux by name
+       (`tests/no_real_tmux.py`).
+2. [x] The guard test no longer passes silently when no shim was installed.
+3. [x] Teardown does not follow symlinks.
+4. [x] The lint accepts only a socket flag in front of the kill word, with a
+       value that is not `default` and not built from `$TMUX`. A file about
+       the pattern itself opts out with a file marker.
+5. [x] Skill and AGENTS text define `$D`.
+6. [x] The shim contract test runs first (RUN_FIRST), before any real tmux.
+7. [x] `_test_path` puts the shim in front of a system-dir tmux
+       (`test_bash_leg_is_honest` expects the same).
+
+## Review
+
+Independent Opus sub-agent, 2026-10-11, reading only (no tmux, no test); it
+called `check_command` on 77 strings. Report:
+`~/.local/state/fleet/fm-cctrl-artifacts/plan-107/review-hook-guard.md`.
+Verdict: APPROVED WITH REQUIRED FIXES. The fixes were not re-reviewed.
+
+- R1 an apostrophe inside `"${var:-...}"` hid the rest of the line: fixed.
+- R2 `"$SHELL" -c '...'`: fixed.
+- R3 `bash -s -- arg <<EOF`: fixed.
+- R4 `python3 - <<EOF` and other interpreters on a here-document: fixed
+  (regex check; a here-document that only prints the words now blocks).
+- R5 `_test_path` against the exact assert in `test_bash_leg_is_honest`: fixed.
+- Recommended, applied: here-documents inside `$(...)` (the standard commit
+  and PR form no longer blocks on `1)` or `:)`), `xargs grep` / `find -exec
+  grep` / `ssh host "grep ..."` no longer block, text piped to
+  `ssh host 'cat > file'` no longer blocks, `[[ a && b ]]`, the default
+  socket through `${TMUX_TMPDIR:-/tmp}` and the socket-cleanup loop block,
+  a variable holding the whole command, `sudo -u`, `timeout N`, `(( 1 << 4 ))`,
+  time bounds, a guarded stdin read.
+- Recommended, not applied: `sh <(...)`, `xargs -I{} tmux {}` (listed under
+  known bypasses); the lint still takes a `-S`/`-L` of another program on the
+  same line (`ssh -L ...`) as a socket flag.
 
 ## Verification
 

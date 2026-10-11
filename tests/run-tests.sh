@@ -3410,7 +3410,14 @@ test_bash_leg_is_honest() {
     [[ "$got" == "$want" ]] || fail "cctrl_source_eval ran bash $got, harness is $want"
     [[ "$(command -v bash)" == "$TMPDIR/bash-shim/bash" ]] || fail "PATH shim is not first for bash"
     [[ "$(_test_path)" == "$TMPDIR/bash-shim:"* ]] || fail "_test_path does not start with the bash shim"
-    [[ "$(_test_path --sbin /x /y)" == "$TMPDIR/bash-shim:/x:/y:/usr/bin"":/bin:/usr/sbin:/sbin" ]] \
+    # On a host with tmux in a system dir, _test_path puts the private-socket
+    # shim dir in front of the system dirs (plan 107); nowhere else.
+    local shim_part=""
+    if [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] \
+        && [[ -x /usr/bin/tmux || -x /bin/tmux || -x /usr/sbin/tmux || -x /sbin/tmux ]]; then
+        shim_part=":${CCTRL_TEST_TMUX_SHIM%/tmux}"
+    fi
+    [[ "$(_test_path --sbin /x /y)" == "$TMPDIR/bash-shim:/x:/y$shim_part:/usr/bin"":/bin:/usr/sbin:/sbin" ]] \
         || fail "_test_path --sbin output is wrong: $(_test_path --sbin /x /y)"
 }
 
