@@ -56,7 +56,10 @@ def _tmux_guard(raw):
 
 
 def main():
-    raw = sys.stdin.read()
+    try:
+        raw = sys.stdin.read()
+    except Exception:  # undecodable bytes, a closed stdin: nothing to check
+        return 0
     blocked = _tmux_guard(raw)
     if blocked is not None:
         return blocked

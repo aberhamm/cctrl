@@ -25,18 +25,23 @@ import re
 
 MAX_DEPTH = 6
 MAX_LEN = 200_000
+MAX_STEPS = 400  # texts checked per command; beyond it the regex check decides
 
 # tmux accepts any unambiguous prefix of a command name. "kill-s" is ambiguous
 # (kill-session), so the shortest form that means kill-server is "kill-ser".
 _KILL = r"kill-ser(?:v(?:e(?:r)?)?)?"
 KILL_RE = re.compile(r"(?<![\w-])" + _KILL + r"(?![\w-])")
 TMUX_RE = re.compile(r"(?<![\w.-])tmux(?![\w.-])")
-_SOCK_FLAG_RE = re.compile(r"(?<!\S)-[0-9A-Za-z]*[SL]")
+_SOCK_FLAG_RE = re.compile(r"(?<![\w$-])-[0-9A-Za-z]*[SL]")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
 _ANSI_NUM_RE = re.compile(r"x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|([0-7]{1,3})")
 _PYTHON_RE = re.compile(r"^python[0-9.]*$")
 _INHERITED_SOCK_RE = re.compile(r"\$\{?TMUX(?![A-Za-z0-9_])|socket_path")
-_DEFAULT_SOCK_RE = re.compile(r"^(?:/private)?/tmp/tmux-[^/]+/default$")
+_DEFAULT_SOCK_RE = re.compile(r"/tmp\}?/tmux-[^/]+/default$")
+_DEFAULT_SOCK_DIR_RE = re.compile(r"/tmp\}?/tmux-")
+_HEREDOC_WORD_RE = re.compile(r"[A-Za-z_]")
+_VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
+_HEREDOC_OPEN_RE = re.compile(r"<<(-?)[ \t]*((?:\\|'|\")?[A-Za-z_][A-Za-z0-9_]*['\"]?)")
 _ANSI_SIMPLE = {
     "n": "\n", "t": "\t", "\\": "\\", "'": "'", '"': '"', "a": "\a",
     "b": "\b", "e": "\x1b", "f": "\f", "r": "\r", "v": "\v",
@@ -59,15 +64,23 @@ TEXT_HEADS = frozenset({
 WRAPPERS = frozenset({
     "command", "builtin", "exec", "nohup", "nice", "sudo", "doas",
     "caffeinate", "stdbuf", "setsid", "noglob", "nocorrect", "chronic",
+    "timeout", "gtimeout", "flock",
 })
+# Their options that take a separate value, and those with one operand
+# (a duration, a lock file) in front of the command.
+WRAPPER_VALUE_OPTS = {
+    "sudo": "ughpCDRTUrt", "doas": "uC", "nice": "n", "exec": "a",
+    "timeout": "ks", "gtimeout": "ks", "flock": "wEc",
+}
+WRAPPER_OPERAND = frozenset({"timeout", "gtimeout", "flock"})
 SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh"})
-# Commands that run a string argument as code (in a shell or in their own
-# language). A string argument that mentions the kill is scanned as shell text.
-EXEC_HEADS = frozenset({
-    "ssh", "mosh", "su", "osascript", "watch", "xargs", "find", "parallel",
-    "at", "batch", "script", "expect", "timeout", "gtimeout", "flock", "perl",
-    "ruby", "node", "deno", "bun", "php", "lua", "env",
-})
+# Commands that hand a string argument to a shell: the string is parsed as
+# shell text.
+SHELL_STRING_HEADS = frozenset({"ssh", "mosh", "su", "watch", "parallel", "at", "batch", "script"})
+# Commands that run a string argument, or their standard input, as code in a
+# language of their own: no shell parse is possible, the regex check decides.
+CODE_HEADS = frozenset({"osascript", "expect", "perl", "ruby", "node", "deno", "bun", "php", "lua"})
+SSH_VALUE_OPTS = "BbcDEeFIiJLlmOoPpQRSWw"
 
 
 def _dequote(text):
@@ -93,6 +106,17 @@ def _loose(text):
     return False
 
 
+class _Ctx:
+    """State of one check_command call."""
+    __slots__ = ("full", "has_tmux", "seen", "assigned")
+
+    def __init__(self, full):
+        self.full = full
+        self.has_tmux = re.search("tmux", full, re.I) is not None
+        self.seen = set()   # texts already checked and found clean
+        self.assigned = {}  # NAME -> value of the NAME=value words seen so far
+
+
 class _Word:
     __slots__ = ("text", "literal", "plain", "assign")
 
@@ -112,17 +136,39 @@ class _Cmd:
         self.prev = prev  # the pipeline stage that feeds this one
 
 
-def _match(s, i, opener, closer):
-    """Index of the closer that matches the opener at s[i], or len(s)."""
+def _match(s, i, opener, closer, squote=True):
+    """Index of the closer that matches the opener at s[i], or len(s).
+    squote: single quotes quote (false inside double quotes, where an
+    apostrophe is a plain character). Here-document bodies are skipped."""
     depth = 0
     n = len(s)
     k = i
+    pending = []
     while k < n:
         c = s[k]
         if c == "\\":
             k += 2
             continue
-        if c == "'":
+        if c == "\n" and pending:
+            k += 1
+            for delim, strip in pending:
+                while k < n:
+                    j = s.find("\n", k)
+                    if j < 0:
+                        j = n
+                    line = s[k:j]
+                    k = min(j + 1, n)
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        break
+            pending = []
+            continue
+        if c == "<" and s.startswith("<<", k) and not s.startswith("<<<", k):
+            m = _HEREDOC_OPEN_RE.match(s, k)
+            if m:
+                pending.append((m.group(2).strip("'\"").replace("\\", ""), m.group(1) == "-"))
+                k = m.end()
+                continue
+        if squote and c == "'":
             e = s.find("'", k + 1)
             k = n if e < 0 else e + 1
             continue
@@ -235,7 +281,8 @@ class _Lexer:
             return i
         target, i = self._word(i)
         if op in ("<<", "<<-"):
-            self.pending.append((target.text, op == "<<-", not target.plain, self.cur))
+            if _HEREDOC_WORD_RE.match(target.text):  # not the shift in (( 1 << 4 ))
+                self.pending.append((target.text, op == "<<-", not target.plain, self.cur))
         elif op == "<<<":
             self.cur.stdin.append(target.text)
         return i
@@ -297,8 +344,9 @@ class _Lexer:
         buf.append(s[i:e + 1])
         return e + 1
 
-    def _dollar(self, i, buf):
-        """At s[i] == '$'. Returns (next index, still literal)."""
+    def _dollar(self, i, buf, dq=False):
+        """At s[i] == '$'. dq: inside double quotes. Returns (next index,
+        still literal)."""
         s, n = self.s, self.n
         nx = s[i + 1] if i + 1 < n else ""
         if nx == "(":
@@ -307,8 +355,8 @@ class _Lexer:
             buf.append(s[i:j + 1])
             return j + 1, False
         if nx == "{":
-            j = _match(s, i + 1, "{", "}")
-            self._nested(s[i + 2:j], True)
+            j = _match(s, i + 1, "{", "}", not dq)
+            self._nested(s[i + 2:j], not dq)
             buf.append(s[i:j + 1])
             return j + 1, False
         if nx.isalpha() or nx == "_":
@@ -343,7 +391,7 @@ class _Lexer:
                     i += 1
                 continue
             if c == "$":
-                i, lit = self._dollar(i, buf)
+                i, lit = self._dollar(i, buf, True)
                 literal = literal and lit
                 continue
             if c == "`":
@@ -446,7 +494,7 @@ def _base(word):
     return base
 
 
-def _socket_problem(sock_s, sock_l):
+def _socket_problem(sock_s, sock_l, ctx):
     """None when the invocation names a server of its own; else what is wrong."""
     if sock_s is not None:
         text, literal = sock_s
@@ -454,8 +502,10 @@ def _socket_problem(sock_s, sock_l):
             return "-S has an empty path"
         if _INHERITED_SOCK_RE.search(text):
             return "-S resolves to the inherited server ($TMUX / socket_path)"
-        if _DEFAULT_SOCK_RE.match(text):
+        if _DEFAULT_SOCK_RE.search(text):
             return "-S names the default server's socket"
+        if not literal and "/" not in text and _DEFAULT_SOCK_DIR_RE.search(ctx.full):
+            return "-S is a variable and the line names the default socket directory (/tmp/tmux-<uid>)"
         return None
     if sock_l is not None:
         text, literal = sock_l
@@ -467,7 +517,7 @@ def _socket_problem(sock_s, sock_l):
     return "no -S/-L on this tmux invocation"
 
 
-def _check_tmux(args, cmd, full, strict=False):
+def _check_tmux(args, cmd, ctx, strict=False):
     """args: the words after the tmux word. strict: the command name is an
     expansion, so only an explicit kill word counts."""
     sock_s = sock_l = None
@@ -502,14 +552,14 @@ def _check_tmux(args, cmd, full, strict=False):
             j += 1
         i += 1
     rest = args[i:]
-    problem = _socket_problem(sock_s, sock_l)
+    problem = _socket_problem(sock_s, sock_l, ctx)
     if problem is None:
         return None
     at_command = True
     for arg in rest:
         if KILL_RE.search(arg.text):
             return "tmux kill-server: " + problem
-        if at_command and not arg.literal and not strict and _mentions_kill(full):
+        if at_command and not arg.literal and not strict:
             return ("a tmux command name is a variable and the line mentions kill-server "
                     "(cannot tell them apart): " + problem)
         at_command = arg.text.endswith(";")
@@ -537,45 +587,96 @@ def _stdin_texts(cmd):
     return out
 
 
-def _check_shell(args, cmd, depth, full):
-    """args: the words after a shell's name (sh, bash, ...)."""
+def _check_shell(args, cmd, depth, ctx, c_only=False):
+    """args: the words after a shell's name (sh, bash, ...). c_only: the name
+    is an expansion ("$SHELL"), so only a -c string is taken as a script."""
     j = 0
+    from_stdin = False
     while j < len(args):
         arg = args[j]
         text = arg.text
         if arg.literal and len(text) > 1 and text[0] in "-+":
-            if text[0] == "-" and not text.startswith("--") and "c" in text[1:]:
-                k = j + 1
-                while k < len(args) and args[k].literal and args[k].text.startswith("-"):
-                    k += 1
-                if k < len(args):
-                    return _check_text(args[k].text, depth + 1, full)
-                return None
+            if text[0] == "-" and not text.startswith("--"):
+                if "c" in text[1:]:
+                    k = j + 1
+                    while k < len(args) and args[k].literal and args[k].text.startswith("-"):
+                        k += 1
+                    if k < len(args):
+                        return _check_script(args[k], depth, ctx)
+                    return None
+                if "s" in text[1:]:
+                    from_stdin = True  # bash -s -- arg: the script is stdin whatever follows
             if text in ("-o", "-O", "+o", "+O", "--rcfile", "--init-file"):
                 j += 1
             j += 1
             continue
         break
-    if j >= len(args) or args[j].text == "-":  # no script file: the script is stdin
+    if c_only:
+        return None
+    # No script file: the script is stdin. /dev/stdin is stdin too.
+    if from_stdin or j >= len(args) or args[j].text in ("-", "/dev/stdin"):
         for text in _stdin_texts(cmd):
-            reason = _check_text(text, depth + 1, full)
+            reason = _check_text(text, depth + 1, ctx)
             if reason:
                 return reason
     return None
 
 
-def _check_cmd(cmd, depth, full):
+def _check_script(word, depth, ctx):
+    """A word that a shell or eval runs as a script."""
+    reason = _check_text(word.text, depth + 1, ctx)
+    if reason or word.literal:
+        return reason
+    # The script is a variable: check what the line assigned to it.
+    return _check_assigned([word], depth, ctx)
+
+
+def _check_assigned(words, depth, ctx):
+    """words run as a command or a script: check the values this line
+    assigned to the variables they name (`cmd="tmux ..."; $cmd`)."""
+    for word in words:
+        for var in _VAR_RE.findall(word.text):
+            value = ctx.assigned.get(var)
+            if value and _mentions_kill(value):
+                reason = _check_text(value, depth + 1, ctx)
+                if reason:
+                    return "through $%s, set on this line: %s" % (var, reason)
+    return None
+
+
+def _ssh_remote_command(args):
+    """The words of ssh's remote command (empty: a login shell on stdin)."""
+    i = 0
+    while i < len(args):
+        text = args[i].text
+        if args[i].literal and text.startswith("-") and len(text) > 1:
+            i += 2 if (len(text) == 2 and text[1] in SSH_VALUE_OPTS) else 1
+            continue
+        return args[i + 1:]  # args[i] is the host
+    return []
+
+
+def _check_cmd(cmd, depth, ctx):
     words = list(cmd.words)
     while words:
         word = words[0]
-        if word.assign or (word.plain and word.text in RESERVED):
+        if word.assign:
+            ctx.assigned[word.text.partition("=")[0].rstrip("+")] = word.text.partition("=")[2]
+            words.pop(0)
+            continue
+        if word.plain and word.text in RESERVED:
             words.pop(0)
             continue
         name = _base(word)
         if name in WRAPPERS:
             words.pop(0)
+            value_opts = WRAPPER_VALUE_OPTS.get(name, "")
             while words and words[0].literal and words[0].text.startswith("-"):
-                words.pop(0)
+                text = words.pop(0).text
+                if len(text) == 2 and text[1] in value_opts and words:
+                    words.pop(0)  # sudo -u root, nice -n 5, exec -a name
+            if name in WRAPPER_OPERAND and words:
+                words.pop(0)  # timeout 5, flock /path/lock
             continue
         if name == "env":
             words.pop(0)
@@ -585,7 +686,7 @@ def _check_cmd(cmd, depth, full):
                     words.pop(0)
                 elif word.literal and word.text.startswith("-"):
                     if word.text in ("-S", "--split-string"):
-                        return _check_text(" ".join(w.text for w in words[1:]), depth + 1, full)
+                        return _check_text(" ".join(w.text for w in words[1:]), depth + 1, ctx)
                     del words[:2 if word.text in ("-u", "-C", "-P", "--unset", "--chdir") else 1]
                 else:
                     break
@@ -598,16 +699,19 @@ def _check_cmd(cmd, depth, full):
         return None
     args = words[1:]
     if name == "eval":
-        return _check_text(" ".join(w.text for w in args), depth + 1, full)
+        reason = _check_text(" ".join(w.text for w in args), depth + 1, ctx)
+        if reason is None:
+            reason = _check_assigned(args, depth, ctx)
+        return reason
     if name == "trap":
         for arg in args:
-            reason = _check_text(arg.text, depth + 1, full)
+            reason = _check_text(arg.text, depth + 1, ctx)
             if reason:
                 return reason
         return None
     if name == "alias":
         for arg in args:
-            reason = _check_text(arg.text.partition("=")[2], depth + 1, full)
+            reason = _check_text(arg.text.partition("=")[2], depth + 1, ctx)
             if reason:
                 return reason
         return None
@@ -615,50 +719,72 @@ def _check_cmd(cmd, depth, full):
     names = [_base(w) for w in words]
     if "tmux" in names:
         # Also when tmux is not the first word: an unknown command in front of
-        # it (timeout, xargs, a wrapper script) may run it.
-        reason = _check_tmux(words[names.index("tmux") + 1:], cmd, full)
+        # it (xargs, find -exec, a wrapper script) may run it.
+        reason = _check_tmux(words[names.index("tmux") + 1:], cmd, ctx)
         if reason:
             return reason
-    elif name is None and re.search("tmux", full, re.I):
-        # `"$TMUX_BIN" kill-server`, `$(command -v tmux) kill-server`.
-        reason = _check_tmux(args, cmd, full, strict=True)
+    elif name is None:
+        if ctx.has_tmux:
+            # `"$TMUX_BIN" kill-server`, `$(command -v tmux) kill-server`.
+            reason = _check_tmux(args, cmd, ctx, strict=True)
+            if reason:
+                return "the command name is a variable and the line mentions tmux; " + reason
+        # `"$SHELL" -c '...'`, `"$BASH" -lc "..."`.
+        reason = _check_shell(args, cmd, depth, ctx, c_only=True)
         if reason:
-            return "the command name is a variable and the line mentions tmux; " + reason
+            return reason
+        # `cmd="tmux ..."; $cmd`
+        reason = _check_assigned(words[:1], depth, ctx)
+        if reason:
+            return reason
     shell_at = next((n for n, base in enumerate(names) if base in SHELLS), None)
     if shell_at is not None:
-        reason = _check_shell(words[shell_at + 1:], cmd, depth, full)
+        reason = _check_shell(words[shell_at + 1:], cmd, depth, ctx)
         if reason:
             return reason
-    if name in ("ssh", "mosh") and shell_at is None:
+    if name in ("ssh", "mosh") and shell_at is None and not _ssh_remote_command(args):
         # `ssh host <<EOF`: the remote login shell reads the script from stdin.
         for text in _stdin_texts(cmd):
-            reason = _check_text(text, depth + 1, full)
+            reason = _check_text(text, depth + 1, ctx)
             if reason:
                 return reason
-    if name in EXEC_HEADS or (name and _PYTHON_RE.match(name)):
+    if name in SHELL_STRING_HEADS:
         for arg in args:
-            if not _mentions_kill(arg.text):
-                continue
-            reason = _check_text(arg.text, depth + 1, full)
-            if reason:
-                return reason
-            if _loose(arg.text):
-                return "a string argument of `%s` runs tmux kill-server without -S/-L" % name
+            if _mentions_kill(arg.text):
+                reason = _check_text(arg.text, depth + 1, ctx)
+                if reason:
+                    return reason
+    if name in CODE_HEADS or (name and _PYTHON_RE.match(name)):
+        # String arguments, here-documents and here-strings (not the pipeline
+        # stage in front: `echo '{json}' | python3 script.py` is data).
+        for text in [a.text for a in args] + list(cmd.stdin):
+            if _mentions_kill(text) and _loose(text):
+                return "code given to `%s` runs tmux kill-server without -S/-L" % name
     return None
 
 
-def _check_text(text, depth, full):
-    if depth > MAX_DEPTH:
-        return "nested too deep to parse; tmux kill-server without -S/-L" if _loose(text) else None
+def _check_text(text, depth, ctx):
+    if text in ctx.seen:
+        return None
+    if depth > MAX_DEPTH or len(ctx.seen) >= MAX_STEPS:
+        return "too nested to parse; tmux kill-server without -S/-L" if _loose(text) else None
     cmds, subs = _Lexer(text).run()
     for sub in subs:
-        reason = _check_text(sub, depth + 1, full)
+        reason = _check_text(sub, depth + 1, ctx)
         if reason:
             return reason
+    in_test = False
     for cmd in cmds:
-        reason = _check_cmd(cmd, depth, full)
+        # [[ a && b ]] is split at && like a command list: skip up to "]]".
+        if not in_test and cmd.words and cmd.words[0].plain and cmd.words[0].text == "[[":
+            in_test = True
+        if in_test:
+            in_test = not any(w.plain and w.text == "]]" for w in cmd.words)
+            continue
+        reason = _check_cmd(cmd, depth, ctx)
         if reason:
             return reason
+    ctx.seen.add(text)
     return None
 
 
@@ -671,7 +797,7 @@ def check_command(command):
     try:
         if len(command) > MAX_LEN:
             return "command too long to parse; tmux kill-server without -S/-L" if _loose(command) else None
-        return _check_text(command, 0, command)
+        return _check_text(command, 0, _Ctx(command))
     except Exception:  # fail open unless the fallback itself is a positive match
         try:
             return "could not parse the command; tmux kill-server without -S/-L" if _loose(command) else None
