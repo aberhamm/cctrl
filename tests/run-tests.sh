@@ -6368,6 +6368,10 @@ test_session_doctor_realign_real_relaunch() {
     # name with app-prefix TMUX--ms--portal-.
     local bin="$TMPDIR/rl5bin" sdir="$TMPDIR/rl5-sessions" log="$TMPDIR/rl5-tmux.log"
     local proj="$TMPDIR/portal"
+    # Earlier launches create canonical records that take precedence over legacy
+    # fixtures. Give this relaunch its own registry to avoid source-order leaks.
+    local CCTRL_SESSION_METADATA_DIR="$TMPDIR/rl5-metadata"
+    export CCTRL_SESSION_METADATA_DIR
     mkdir -p "$bin" "$sdir" "$CCTRL_SESSION_METADATA_DIR" "$proj"
     make_fake_tmux "$bin/tmux"
     cat > "$bin/ps" <<'SH'
