@@ -26,6 +26,7 @@ workers). Each of those three tests already had an `EXIT` trap calling
 
 ## Root cause
 
+<!-- tmux-lint: allow (describes the socket-file leak; not a command to run) -->
 `tmux kill-server` does not unlink its own socket file on this host's tmux.
 Confirmed directly:
 
@@ -48,6 +49,7 @@ long as these tests have existed.
   helper, defined once near `fail()`.
 - Each of the three cleanup traps (`cleanup_terminate`,
   `cleanup_reap`, `cleanup_exact_stop`) now also calls
+  <!-- tmux-lint: allow (describes the socket-file leak; not a command to run) -->
   `_test_tmux_socket_rm "$socket"` after `kill-server`, so the socket file
   is removed on every exit path the trap covers (normal completion, `fail`,
   a `set -e` abort).
@@ -64,6 +66,7 @@ long as these tests have existed.
 
 ## Verification
 
+<!-- tmux-lint: allow (describes the socket-file leak; not a command to run) -->
 - Confirmed via the reproduction above that `kill-server` alone leaves the
   socket file (this is the bug, not a hypothesis).
 - Socket count before the focused run: 338 `cctrl-*` files in

@@ -161,6 +161,25 @@ Hand a worker off at a clean boundary, never mid-task.
   from memory; re-resolve the recipient with `cctrl peer ls` first, because
   names are recycled.
 
+## Sub-agents and tmux (write this into every brief)
+
+A sub-agent runs inside your pane and inherits your `$TMUX`, so a plain `tmux`
+command it runs talks to the live fleet server. tmux prefers `$TMUX` over
+`TMUX_TMPDIR`: a "private `TMUX_TMPDIR`" is not an isolation. One cleanup line
+without the right prefix has killed every session of a fleet.
+
+- **Code-validation and review agents get no live tmux work.** Write "run no
+  tmux command" into the brief; they read code and run the repo's own test
+  entry point, nothing else.
+- An agent that must use tmux starts **every** shell block with
+  `unset TMUX TMUX_PANE`, uses `tmux -S "$D/sock"` (a socket in its own temp
+  dir) for every call, never `TMUX_TMPDIR`, and cleans up by killing only its
+  own sessions by exact name on that socket
+  (`tmux -S "$D/sock" kill-session -t '=NAME'`).
+- **No agent ever runs `kill-server`**, on any socket. <!-- tmux-lint: allow (a rule that forbids the command) -->
+- Only a real-launch smoke may touch the fleet server, and only through
+  `cctrl` commands on sessions it created itself.
+
 ## Closing workers: the close gate
 
 **Never close a worker on its label and a clean `git status` alone.** Work can

@@ -189,6 +189,13 @@ memory and attention. One session = one purpose.
 - **Long briefs / apostrophes:** pass via a quoted heredoc into a shell var, or
   write to a file and load it — inline quoting breaks on apostrophes.
 - **tmux ops may need the right socket** sourced first (env brief has the how).
+- **Sub-agents inherit your `$TMUX`.** A sub-agent's plain `tmux` reaches the
+  live server, and `TMUX_TMPDIR` does not change that (tmux prefers `$TMUX`).
+  Give validation agents no tmux work. An agent that must use tmux runs
+  `unset TMUX TMUX_PANE` at the top of every shell block, uses
+  `tmux -S "$D/sock"` for every call, and never kills a tmux server; it kills
+  its own sessions by exact name on its own socket. Full rule: "Sub-agents and
+  tmux" in the `cctrl-repo-orchestrator` skill.
 - **Peer identity is derived from the tmux session name, and it's brittle.**
   Once the new session is up, its own `cctrl peer send`/`reply` must run
   `--as "$(tmux display -p '#S')"` (or a registered role alias), never a
