@@ -266,7 +266,7 @@ while [[ $# -gt 0 ]]; do
         -L?*) label_sock "${1#-L}"; shift ;;
         -c|-f|-T) [[ $# -ge 2 ]] || refuse "$1 without a value"; globals+=("$1" "$2"); shift 2 ;;
         -c?*|-f?*|-T?*) globals+=("$1"); shift ;;
-        --) shift; break ;;
+        --) shift; case "${1:-}" in -*) refuse "option after --: $1" ;; esac; break ;;
         -*)
             [[ -n "${1#-}" && "${1#-}" != *[!2CDlNuVv]* ]] \
                 || refuse "unsupported option form before the tmux command: $1"
@@ -595,6 +595,7 @@ STUB
     _shim_refuses "a clustered -S" -uS "$sd/fx3" list-sessions
     _shim_refuses "a clustered -L" -2uL fx3 list-sessions
     _shim_refuses "an unknown option before the command" -t x list-sessions
+    _shim_refuses "a second socket after --" -- -S "/nonexistent/cctrl-foreign-tmux/tmux-$uid/default" "$ks"
     unset -f _shim_refuses
 
     # A harness started under another harness must wrap the real tmux, not the

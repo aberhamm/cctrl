@@ -280,8 +280,9 @@ command it runs talks to the live fleet server. tmux prefers `$TMUX` over
 without the right prefix has killed every session of a fleet.
 
 - **Code-validation and review agents get no live tmux work.** Write "run no
-  tmux command" into the brief; they read code and run the repo's own test
-  entry point, nothing else.
+  tmux command" into the brief; they read code; they run a test entry point
+  only when the brief names it, and only one that isolates tmux with an
+  explicit socket.
 - An agent that must use tmux starts **every** shell block with
   `unset TMUX TMUX_PANE`, uses `tmux -S "$D/sock"` (a socket in its own temp
   dir) for every call, never `TMUX_TMPDIR`, and cleans up by killing only its
