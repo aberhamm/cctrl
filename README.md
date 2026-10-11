@@ -1830,6 +1830,41 @@ Distinguishes "done" from "needs input" by parsing the session transcript and ch
 }
 ```
 
+### pre-tool-use.py + tmux_kill_guard.py — tmux kill-server guard (blocks)
+
+`cctrl hooks run pre-tool-use` (the `PreToolUse` entry `cctrl hooks install`
+writes for `Bash`) runs `hooks/pre-tool-use.py`: one process, two checks.
+
+The first one **blocks** (exit 2, reason on stderr for the agent) a command
+that would run `tmux kill-server` without `-S <path>` or `-L <name>` on that
+same tmux invocation. tmux prefers `$TMUX` over `TMUX_TMPDIR`, and every shell
+in a tmux pane (a sub-agent's too) inherits `$TMUX`, so a bare server kill
+there takes down the server the session itself runs on. One such cleanup line
+once killed a whole fleet.
+
+- Blocked: the bare form, with any environment prefix (`TMUX_TMPDIR=...`,
+  `TMUX=`, `env -u TMUX`), an absolute path, `command`/`exec`/`sudo`, after
+  `\;`, inside `sh -c '...'`, `eval`, `ssh host '...'`, a pipe or
+  here-document into a shell, `$(...)` and backticks, and in any `;` `&&` `|`
+  chain. A `-S`/`-L` on a different tmux call of the same line does not count.
+  `-L default`, `-S "$TMUX..."` and `-S /tmp/tmux-<uid>/default` are blocked
+  too: they name the inherited or the default server.
+- Allowed: `tmux -S "$D/sock" kill-server`, `tmux -L <name> kill-server`,
+  and the words as text only (a `grep` pattern, `echo`, a commit message, a
+  quoted here-document written to a file, a comment).
+- Uncertain parses block (a socket flag held in a variable, a variable as the
+  command name on a line that mentions tmux). The message names the safe
+  form. Quote text as one argument and it passes.
+- It is an accident guard, not a security boundary: a script written to a file
+  and run later is not seen. There is no override; a human runs the command
+  in their own terminal, where no hook runs.
+- Errors fail open: malformed hook input or a broken guard lets the command
+  run. Only a positive match blocks.
+
+Details and the list of known bypasses: `docs/plans/107-tmux-kill-server-guard.md`.
+
+The second check is the commit warning below, unchanged.
+
 ### block-git-commit.py — commit warning
 
 A `PreToolUse` hook that warns when Claude is about to run a git commit-like command — advisory only, it does not block (exits 1, not 2, so the command always still runs). Catches `git commit`, `git revert`, `git cherry-pick`, and variants through `eval`/subshell.
@@ -2039,7 +2074,9 @@ cctrl/
   profiles/*.json          # named settings configs (gitignored)
   hooks/
     notify.sh              # sound notifications (stop/needs-input/permission)
-    block-git-commit.py    # commit guardrail hook
+    pre-tool-use.py        # PreToolUse entry point: tmux guard, then the commit warning
+    tmux_kill_guard.py     # parser: blocks a tmux kill-server without -S/-L
+    block-git-commit.py    # commit warning (advisory)
     peer-doorbell.sh       # Stop/Notification hook: exit 2 on queued peer mail
     session-log.py         # token tracking hook
     statusline.sh          # status bar + rate limit capture

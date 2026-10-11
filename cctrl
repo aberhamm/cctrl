@@ -17011,7 +17011,8 @@ _hooks_run() {
     if [[ -z "$name" || "$name" == "-h" || "$name" == "--help" ]]; then
         echo "Usage: cctrl hooks run <name>"
         echo ""
-        echo "  pre-tool-use   Advisory checks on tool calls (stdin passthrough; none block yet)"
+        echo "  pre-tool-use   Checks on Bash tool calls. BLOCKS (exit 2) a 'tmux kill-server' without"
+        echo "                 -S/-L on that tmux invocation; warns (exit 1, no block) on a git commit"
         echo "  stop           Post-turn logging and notifications"
         echo "  notify         Push notification on agent events"
         echo "  codex-observe  Observe bounded Codex lifecycle payloads (fail-open registry write)"
@@ -17020,7 +17021,9 @@ _hooks_run() {
 
     case "$name" in
         pre-tool-use)
-            exec python3 "$SCRIPT_DIR/hooks/block-git-commit.py"
+            # One process: the tmux kill-server guard (blocks, plan 107), then
+            # the advisory git-commit warning (hooks/block-git-commit.py).
+            exec python3 "$SCRIPT_DIR/hooks/pre-tool-use.py"
             ;;
         stop)
             # Capture stdin once and tee it to both: each script used to read
@@ -17252,7 +17255,7 @@ _hooks_doctor() {
     fi
 
     # Check hook scripts exist
-    for script in block-git-commit.py notify.sh session-log.py codex-session-observer.py codex-hook-config.py; do
+    for script in pre-tool-use.py tmux_kill_guard.py block-git-commit.py notify.sh session-log.py codex-session-observer.py codex-hook-config.py; do
         if [[ -f "$SCRIPT_DIR/hooks/$script" ]]; then
             echo -e "${GREEN}✓${RESET} $script exists"
         else

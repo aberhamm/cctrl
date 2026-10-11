@@ -72,5 +72,13 @@ Rules that follow:
   for `TMUX_TMPDIR` used as the only isolation of a tmux command. A doc that
   quotes the bad pattern as a warning carries `tmux-lint: allow` on that line
   or the line above.
+- Agent tool calls: the PreToolUse hook (`cctrl hooks run pre-tool-use`,
+  `hooks/tmux_kill_guard.py`, plan 107) blocks a Bash command that would run
+  a server kill without `-S`/`-L` on the same tmux invocation, also behind an
+  environment prefix, `sh -c`, `ssh` or a pipe into a shell. `-L default` and
+  a `-S` built from `$TMUX` count as no socket. It reads the command text of
+  one tool call, so it is an accident guard: a script written to a file and
+  run later is not seen, and it only exists in sessions that have the cctrl
+  hooks installed.
 - Agents: see the "sub-agents and tmux" rule in the `cctrl-repo-orchestrator`,
   `cctrl-fleet-manager` and `cctrl-spawn` skills.

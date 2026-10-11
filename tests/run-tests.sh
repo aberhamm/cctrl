@@ -3010,7 +3010,7 @@ SH
 
 # docs/plans/079's "Hook exit-code convention" note and docs/plans/088: if a
 # release's target hook script is missing, `_hooks_run pre-tool-use`'s `exec
-# python3 "$SCRIPT_DIR/hooks/block-git-commit.py"` itself exits 2 (python3's
+# python3 "$SCRIPT_DIR/hooks/pre-tool-use.py"` itself exits 2 (python3's
 # own file-not-found code) with no marker distinguishing it from a
 # deliberate block. Pins the real mechanism, not just the launcher's generic
 # exit-2 passthrough (already covered by
@@ -3024,7 +3024,7 @@ test_cctrl_hooks_run_exits_2_when_target_hook_script_missing() {
 
     out="$("$home/current/cctrl" hooks run pre-tool-use 2>&1)" || rc=$?
     [[ $rc -eq 2 ]] || fail "expected a missing target hook script to make cctrl exit 2 (python3's own file-not-found code), got $rc: $out"
-    assert_contains "$out" "block-git-commit.py"
+    assert_contains "$out" "pre-tool-use.py"
 
     rc=0
     CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run pre-tool-use >/dev/null 2>&1 || rc=$?
