@@ -64,18 +64,6 @@ tar -x -C "$SCRATCH" -f "$SCRATCH.tar"
 rm -f "$SCRATCH.tar"
 printf '%s\n' "$SHA" > "$SCRATCH/VERSION"
 
-# data/config.json is tracked despite data/ being gitignored (it ships a
-# default config for fresh installs), so the archive leaves a real
-# data/config.json behind. Clear it before symlinking -- the repo's own
-# data/config.json is the same file; the symlink is authoritative.
-rm -rf "$SCRATCH/data" "$SCRATCH/costs" "$SCRATCH/profiles" "$SCRATCH/.active-profile"
-
-# Mutable state lives in the repo, never duplicated into a release.
-for link in data costs profiles; do
-    ln -s "$ROOT/$link" "$SCRATCH/$link"
-done
-ln -s "$ROOT/.active-profile" "$SCRATCH/.active-profile"
-
 echo "cctrl self-install: checking syntax" >&2
 bash -n "$SCRATCH/cctrl"
 [[ -f "$SCRATCH/install.sh" ]] && bash -n "$SCRATCH/install.sh"
@@ -96,6 +84,20 @@ done
 
 echo "cctrl self-install: running full test suite (LANG=en_US.UTF-8)" >&2
 LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"
+
+# Keep validation isolated from live registry churn. Mutable state is linked
+# only after the staged release has passed every gate.
+# data/config.json is tracked despite data/ being gitignored (it ships a
+# default config for fresh installs), so the archive leaves a real
+# data/config.json behind. Clear it before symlinking -- the repo's own
+# data/config.json is the same file; the symlink is authoritative.
+rm -rf "$SCRATCH/data" "$SCRATCH/costs" "$SCRATCH/profiles" "$SCRATCH/.active-profile"
+
+# Mutable state lives in the repo, never duplicated into a release.
+for link in data costs profiles; do
+    ln -s "$ROOT/$link" "$SCRATCH/$link"
+done
+ln -s "$ROOT/.active-profile" "$SCRATCH/.active-profile"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RELEASE_NAME="${SHORT_SHA}-${TS}"

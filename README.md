@@ -49,7 +49,8 @@ This refuses to run against a dirty tree, builds a release from
 gates it on syntax checks and the full test suite (`tests/run-tests.sh`),
 and only then atomically swaps in `~/.local/lib/cctrl/current` and
 `~/.local/bin/cctrl`. `data/`, `costs/`, `profiles/`, and `.active-profile`
-are always symlinked back to this repo, never copied, so nothing forks.
+are symlinked back to this repo after validation, never copied, so nothing forks.
+The test gate runs against isolated staged state rather than the live registry.
 Re-run it after pulling or committing changes to update. Rollback to a
 plain symlink into the working tree:
 
