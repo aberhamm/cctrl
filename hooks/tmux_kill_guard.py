@@ -40,6 +40,7 @@ _INHERITED_SOCK_RE = re.compile(r"\$\{?TMUX(?![A-Za-z0-9_])|socket_path")
 _DEFAULT_SOCK_RE = re.compile(r"/tmp\}?/tmux-[^/]+/default$")
 _DEFAULT_SOCK_DIR_RE = re.compile(r"/tmp\}?/tmux-")
 _HEREDOC_WORD_RE = re.compile(r"[A-Za-z_]")
+_SHELL_VAR_RE = re.compile(r"^\$\{?(?:SHELL|BASH|ZSH_NAME|ZSH)\b")
 _VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 _HEREDOC_OPEN_RE = re.compile(r"<<(-?)[ \t]*((?:\\|'|\")?[A-Za-z_][A-Za-z0-9_]*['\"]?)")
 _ANSI_SIMPLE = {
@@ -506,6 +507,10 @@ def _socket_problem(sock_s, sock_l, ctx):
             return "-S names the default server's socket"
         if not literal and "/" not in text and _DEFAULT_SOCK_DIR_RE.search(ctx.full):
             return "-S is a variable and the line names the default socket directory (/tmp/tmux-<uid>)"
+        for var in _VAR_RE.findall(text) if not literal else ():
+            value = ctx.assigned.get(var, "")
+            if _INHERITED_SOCK_RE.search(value) or _DEFAULT_SOCK_RE.search(value):
+                return "-S is $%s, which this line set from the inherited or the default server" % var
         return None
     if sock_l is not None:
         text, literal = sock_l
@@ -513,6 +518,8 @@ def _socket_problem(sock_s, sock_l, ctx):
             return "-L has an empty name"
         if text == "default":
             return "-L default names the default server"
+        if _INHERITED_SOCK_RE.search(text):
+            return "-L is built from the inherited server ($TMUX / socket_path)"
         return None
     return "no -S/-L on this tmux invocation"
 
@@ -729,8 +736,9 @@ def _check_cmd(cmd, depth, ctx):
             reason = _check_tmux(args, cmd, ctx, strict=True)
             if reason:
                 return "the command name is a variable and the line mentions tmux; " + reason
-        # `"$SHELL" -c '...'`, `"$BASH" -lc "..."`.
-        reason = _check_shell(args, cmd, depth, ctx, c_only=True)
+        # `"$SHELL" -c '...'`, `"$BASH" -lc "..."`. A variable that names a
+        # shell by convention also reads a script from stdin (`"$BASH" <<EOF`).
+        reason = _check_shell(args, cmd, depth, ctx, c_only=not _SHELL_VAR_RE.search(words[0].text))
         if reason:
             return reason
         # `cmd="tmux ..."; $cmd`
@@ -742,12 +750,25 @@ def _check_cmd(cmd, depth, ctx):
         reason = _check_shell(words[shell_at + 1:], cmd, depth, ctx)
         if reason:
             return reason
-    if name in ("ssh", "mosh") and shell_at is None and not _ssh_remote_command(args):
-        # `ssh host <<EOF`: the remote login shell reads the script from stdin.
-        for text in _stdin_texts(cmd):
-            reason = _check_text(text, depth + 1, ctx)
-            if reason:
-                return reason
+    if name in ("ssh", "mosh") and shell_at is None:
+        remote = _ssh_remote_command(args)
+        if not remote:
+            # `ssh host <<EOF`: the remote login shell reads the script from stdin.
+            for text in _stdin_texts(cmd):
+                reason = _check_text(text, depth + 1, ctx)
+                if reason:
+                    return reason
+        elif depth < MAX_DEPTH:
+            # `ssh host 'bash -s' <<EOF`: the remote command gets ssh's stdin.
+            # 'cat > file' stays text; a shell or an interpreter is checked.
+            stdin = _stdin_texts(cmd)
+            if any(_mentions_kill(text) for text in stdin):
+                remote_cmds, _ = _Lexer(" ".join(w.text for w in remote)).run()
+                for remote_cmd in remote_cmds:
+                    remote_cmd.stdin = list(remote_cmd.stdin) + stdin
+                    reason = _check_cmd(remote_cmd, depth + 1, ctx)
+                    if reason:
+                        return reason
     if name in SHELL_STRING_HEADS:
         for arg in args:
             if _mentions_kill(arg.text):

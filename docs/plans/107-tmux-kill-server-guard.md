@@ -207,9 +207,9 @@ commands.
 - Text assembled at run time (`printf` into `sh` through a variable,
   `$'\x6b'`-style escapes inside the kill word, base64).
 - A safe-looking socket that is not private: `-S "$SOCK"` where the variable
-  holds the fleet socket (set in an earlier call, or from
-  `tmux display-message -p '#{socket_path}'` on another line); `-L <name>` of
-  a server someone else runs.
+  holds the fleet socket and was set in an earlier call (set on the same
+  line from `$TMUX`, `#{socket_path}` or the default socket path, it
+  blocks); `-L <name>` of a server someone else runs.
 - `-S "$UNSET"`: believed harmless (tmux fails to connect to an empty path
   and does not fall back to `$TMUX`), but not verified: no tmux may run under
   the STOP. Worth one check of `tmux.c` or a run outside the fleet.
@@ -275,6 +275,13 @@ Verdict: APPROVED WITH REQUIRED FIXES. The fixes were not re-reviewed.
   socket through `${TMUX_TMPDIR:-/tmp}` and the socket-cleanup loop block,
   a variable holding the whole command, `sudo -u`, `timeout N`, `(( 1 << 4 ))`,
   time bounds, a guarded stdin read.
+- Confirmation review (second Opus pass on 9b960ac/1e9d86f, 183 strings):
+  SAFE TO INSTALL AFTER REQUIRED FIXES. Its one required item is applied:
+  `ssh host 'bash -s' <<EOF` (a quoted remote command of two or more words
+  with the script on stdin) blocks again. Also applied: `"$BASH" <<EOF` and
+  `... | "$SHELL"`, a `-S` variable that the same line set from `$TMUX`,
+  `#{socket_path}` or the default socket path, `-L` built from `$TMUX`. Its
+  other recommended items (C4-C15 there) are open.
 - Recommended, not applied: `sh <(...)`, `xargs -I{} tmux {}` (listed under
   known bypasses); the lint still takes a `-S`/`-L` of another program on the
   same line (`ssh -L ...`) as a socket flag.

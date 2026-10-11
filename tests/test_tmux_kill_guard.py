@@ -166,6 +166,21 @@ BLOCK = [
     "case $x in a) tmux kill-server;; esac",
     "[[ -n \"$x\" ]] && tmux kill-server",
     "[[ -n \"$x\" && -n \"$y\" ]]; tmux kill-server",
+    # found by the confirmation review (2026-10-11)
+    "ssh studio 'bash -s' <<'EOF'\ntmux kill-server\nEOF",
+    "ssh -T studio 'zsh -l' <<'EOF'\ntmux kill-server\nEOF",
+    "ssh studio \"bash -s\" <<EOF\ntmux kill-server\nEOF",
+    "cat <<'EOF' | ssh studio 'bash -s'\ntmux kill-server\nEOF",
+    "ssh studio 'cd /tmp && bash -s' <<'EOF'\ntmux kill-server\nEOF",
+    "ssh studio 'python3 -' <<'EOF'\nimport os\nos.system('tmux kill-server')\nEOF",
+    "\"$BASH\" <<'EOF'\ntmux kill-server\nEOF",
+    "echo 'tmux kill-server' | \"$SHELL\"",
+    "\"$SHELL\" -s <<'EOF'\ntmux kill-server\nEOF",
+    "sock=\"${TMUX%%,*}\"; tmux -S \"$sock\" kill-server",
+    "S=$(echo $TMUX | cut -d, -f1); tmux -S \"$S\" kill-server",
+    "S=$(tmux display-message -p '#{socket_path}'); tmux -S \"$S\" kill-server",
+    "S=/tmp/tmux-501/default; tmux -S \"$S\" kill-server",
+    "tmux -L \"$(basename \"${TMUX%%,*}\")\" kill-server",
     # uncertain: words after an unknown command (documented: blocks)
     "mywrapper tmux kill-server",
 ]
@@ -242,6 +257,12 @@ ALLOW = [
     "echo '{\"tool_input\": {\"command\": \"tmux kill-server\"}}' | python3 hooks/pre-tool-use.py",
     "x=\"note: tmux kill-server\"; \"$EDITOR\" notes.md",
     "n=$(( 1 << 4 )); echo kill-server",
+    # confirmation review: must stay allowed
+    "ssh studio 'cat > ~/b.md; wc -l ~/b.md' <<'EOF'\nNever run tmux kill-server.\nEOF",
+    "ssh studio 'bash -s' <<'EOF'\ntmux -S /tmp/x/sock kill-server\nEOF",
+    "S=\"$D/sock\"; tmux -S \"$S\" kill-server",
+    "S=$(mktemp -d)/sock; tmux -S \"$S\" new-session -d; tmux -S \"$S\" kill-server",
+    "\"$PAGER\" <<'EOF'\nNever run tmux kill-server.\nEOF",
     # other programs, other tmux commands
     "adb kill-server",
     "\"$ANDROID_HOME/platform-tools/adb\" kill-server",
