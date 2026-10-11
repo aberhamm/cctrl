@@ -259,6 +259,13 @@ Re-verified: no `helpers` command and no `--mcp` flag / `CCTRL_MCP_MODE` / `mcp_
 - C: `--mcp=VALUE` is accepted at every parse and skip site (`test_launch_mcp_equals_form`).
 - D: README and `cmd_help` document that `CCTRL_MCP_MODE` is ignored inside a cctrl pane and that a passthrough `--mcp-config` adds a second config.
 
+## P3 follow-ups (2026-10-09)
+
+From the independent validation of 244fca1 (findings R1, M2):
+- F1 (fail-open): the Codex scan counted triple quotes anywhere on a line, so a comment or single-line string containing `"""`/`'''` flipped it into "inside a multi-line string" and the rest of config.toml was skipped. Now `_codex_toml_ml_scan` walks each line with comments and single-line strings skipped (basic-string escapes honoured), so only a real opener starts a multi-line string; lines that start inside one are still ignored. If the file ends inside a multi-line string, `LAUNCH_CODEX_MCP_INCOMPLETE=1` and the launch line carries "WARNING: config.toml could not be scanned completely". Decision: the launch CONTINUES with the names found so far plus the warning (exiting would break lean launches on an odd but valid config); the Opus reviewer may overrule with a reason.
+- F2: Claude `minimal` skips a kept server whose definition is not a JSON object (string, null, number, array); it is reported with the not-found warning (name only, never the value).
+- Tests: `test_launch_mcp_codex_scan_triple_quotes`, `test_launch_mcp_minimal_claude_non_object_definition` (F1 test proven to fail on 86cda67's code).
+
 ## Review history
 
 - Eng pass 1 (Opus sub-agent, 2026-10-08): changes-requested. REQUIRED: `_profile_settings_gc` would delete a live session's `<key>.mcp.json`; restart would not rewrite it. Applied in D2 plus a new test.

@@ -2001,6 +2001,103 @@ test_launch_mcp_minimal_keep_list() {
     _mcp_args_of "$out" | grep -qx 'mcp_servers.alpha.enabled=false' || fail "a claude keep list must not keep a codex server"
 }
 
+# Plan 106 P3 follow-ups: F1 (Codex config scan must not skip servers after a
+# triple quote in a comment or single-line string; fails safe on an unterminated
+# multi-line string) and F2 (Claude minimal skips non-object definitions).
+test_launch_mcp_codex_scan_triple_quotes() {
+    make_fake_agent "$TMPDIR/codex" codex
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local home="$TMPDIR/p3fu-codex-home" out args
+    mkdir -p "$home"
+    # 1: a comment holding three double quotes
+    cat > "$home/config.toml" <<'EOF'
+# note """ here
+[mcp_servers.a1]
+command = "x"
+[mcp_servers.a2]
+command = "y"
+EOF
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.a1.enabled=false' || fail "comment with three quotes: a1 must be disabled: $args"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.a2.enabled=false' || fail "comment with three quotes: a2 must be disabled: $args"
+    assert_not_contains "$out" "could not be scanned completely"
+    # 2: a basic string holding three single quotes, a literal string holding three double quotes
+    cat > "$home/config.toml" <<'EOF'
+[mcp_servers.b1]
+command = "it's '''"
+note = 'say """ hi'
+[mcp_servers.b2]
+command = "y"
+EOF
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.b1.enabled=false' || fail "quotes in strings: b1 must be disabled: $args"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.b2.enabled=false' || fail "quotes in strings: b2 must be disabled: $args"
+    assert_not_contains "$out" "could not be scanned completely"
+    # 3: a REAL multi-line string holding a header-looking line is still skipped
+    cat > "$home/config.toml" <<'EOF'
+[mcp_servers.c1]
+command = "x"
+doc = """
+[mcp_servers.fake]
+"""
+[mcp_servers.c2]
+command = "y"
+EOF
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.c1.enabled=false' || fail "multi-line: c1 must be disabled: $args"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.c2.enabled=false' || fail "multi-line: c2 must be disabled: $args"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.fake.enabled=false' && fail "a header inside a multi-line string must be ignored: $args"
+    assert_contains "$out" "disabled: 2"
+    # 3b: an escaped quote inside a basic multi-line string must not close it early
+    cat > "$home/config.toml" <<'EOF'
+[mcp_servers.e1]
+note = """x \""" y"""
+[mcp_servers.e2]
+args = ['"""']
+[mcp_servers.e3]
+command = "z"
+EOF
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    local _e
+    for _e in e1 e2 e3; do
+        printf '%s\n' "$args" | grep -qx "mcp_servers.${_e}.enabled=false" || fail "escape case: $_e must be disabled: $args"
+    done
+    assert_not_contains "$out" "could not be scanned completely"
+    # 4: an unterminated multi-line string: names found so far are disabled, the launch line warns
+    cat > "$home/config.toml" <<'EOF'
+[mcp_servers.d1]
+command = "x"
+doc = """
+never closed
+[mcp_servers.d2]
+EOF
+    out="$(PATH="$TMPDIR:$PATH" CODEX_HOME="$home" "$ROOT/cctrl" start --foreground --agent codex --profile none --mcp none -m hi)"
+    args="$(_mcp_args_of "$out")"
+    printf '%s\n' "$args" | grep -qx 'mcp_servers.d1.enabled=false' || fail "unterminated: d1 must still be disabled: $args"
+    assert_contains "$out" "WARNING: config.toml could not be scanned completely"
+}
+
+test_launch_mcp_minimal_claude_non_object_definition() {
+    make_fake_agent "$TMPDIR/claude" claude
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local cfgdir="$TMPDIR/p3fu-claudecfg" proj="$TMPDIR/p3fu-proj" uc="$TMPDIR/p3fu-user.json" out file
+    mkdir -p "$cfgdir" "$proj"; proj="$(cd "$proj" && pwd)"
+    printf '{"mcpServers":{"asstr":"SECRETVALUE","asnull":null,"asobj":{"command":"ok"},"asarr":["x"],"asnum":7}}\n' > "$cfgdir/.claude.json"
+    printf '{"mcp":{"minimal":{"claude":["asstr","asnull","asobj","asarr","asnum"]}}}\n' > "$uc"
+    out="$(cd "$proj" && PATH="$TMPDIR:$PATH" CLAUDE_CONFIG_DIR="$cfgdir" CCTRL_USER_CONFIG="$uc" CCTRL_RUNTIME_DIR="$TMPDIR/p3fu-runtime" "$ROOT/cctrl" start --foreground --agent claude --profile none --no-bridge --mcp minimal -m hi)"
+    file="$(_mcp_args_of "$out" | awk 'p { print; exit } $0 == "--mcp-config" { p = 1 }')"
+    [[ "$(jq -c '.mcpServers | keys' "$file")" == '["asobj"]' ]] || fail "only the object definition may be kept: $(jq -c '.mcpServers | keys' "$file")"
+    assert_contains "$out" "kept: asobj;"
+    assert_contains "$out" "WARNING: kept but not found in the Claude MCP config: asstr, asnull, asarr, asnum"
+    assert_not_contains "$out" "SECRETVALUE"
+}
+
 test_launch_mcp_minimal_no_secret_in_argv() {
     make_fake_agent "$TMPDIR/claude" claude
     make_fake_tmux "$TMPDIR/tmux"

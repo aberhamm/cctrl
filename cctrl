@@ -1049,8 +1049,9 @@ _mcp_keep_list() {
 # argv or a shell variable) from the user's Claude MCP configuration:
 # ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json .mcpServers (user scope), then
 # <dir>/.mcp.json (project), then .projects[<dir>].mcpServers (local); later
-# wins. A config file that exists but is not valid JSON fails the write
-# (fail closed). Prints the path; returns nonzero on any failure.
+# wins. A kept name whose definition is not a JSON object is skipped (the
+# launch line then warns). A config file that exists but is not valid JSON
+# fails the write (fail closed). Prints the path; returns nonzero on any failure.
 #   $1=key $2=peer name (may be empty) $3=mode (none|minimal, default none)
 #   $4=project directory for the project/local scopes (default $PWD; restart
 #   passes the session's own directory, not the caller's)
@@ -1076,13 +1077,46 @@ _profile_mcp_write() {
         | (($U.mcpServers | objs) + ($P.mcpServers | objs)
            + (($U.projects | objs)[$cwd] | objs | .mcpServers | objs)) as $all
         | {mcpServers: (
-            ([$keep[] | . as $k | select($all | has($k)) | {($k): $all[$k]}] | add // {})
+            ([$keep[] | . as $k | select(($all | has($k)) and ($all[$k] | type == "object")) | {($k): $all[$k]}] | add // {})
             + (if $peer == "" then {}
                else {"cctrl-peer": {command: $cmd, args: ["peer","mcp","--as",$peer]}} end))}
     ' > "$tmp" ) 2>/dev/null || { rm -f "$tmp"; return 1; }
     chmod 600 "$tmp" 2>/dev/null || true
     mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
     printf '%s' "$file"
+}
+
+# Advance the multi-line-string state (_CODEX_ML: empty, '"""' or "'''") over
+# one config.toml line. Comments and single-line strings are skipped, so a
+# triple quote inside them cannot open a phantom multi-line string.
+_codex_toml_ml_scan() {
+    local line="$1" i=0 n c q3 rest
+    n=${#line}
+    while (( i < n )); do
+        if [[ -n "$_CODEX_ML" ]]; then
+            q3="$_CODEX_ML"
+            c="${line:i:1}"
+            if [[ "$q3" == '"""' && "$c" == "\\" ]]; then i=$((i + 2)); continue; fi
+            if [[ "${line:i:3}" == "$q3" ]]; then _CODEX_ML=""; i=$((i + 3)); continue; fi
+            i=$((i + 1)); continue
+        fi
+        c="${line:i:1}"
+        case "$c" in
+            "#") return 0 ;;
+            '"'|"'")
+                q3="$c$c$c"
+                if [[ "${line:i:3}" == "$q3" ]]; then _CODEX_ML="$q3"; i=$((i + 3)); continue; fi
+                i=$((i + 1))
+                while (( i < n )); do
+                    if [[ "$c" == '"' && "${line:i:1}" == "\\" ]]; then i=$((i + 2)); continue; fi
+                    [[ "${line:i:1}" == "$c" ]] && break
+                    i=$((i + 1))
+                done
+                i=$((i + 1)) ;;
+            *) i=$((i + 1)) ;;
+        esac
+    done
+    return 0
 }
 
 # Names of the MCP servers declared in $CODEX_DIR/config.toml, by a line scan.
@@ -1094,14 +1128,17 @@ _profile_mcp_write() {
 # A whole-table `mcp_servers = { ... }`, quoted keys and quoted header names
 # are counted, not parsed. Multi-line inline values are not followed.
 # cctrl_runtime is cctrl's own server and is never listed. A missing file means
-# no names. Sets LAUNCH_CODEX_MCP_NAMES (newline-separated) and
-# LAUNCH_CODEX_MCP_UNCONTROLLABLE (count).
+# no names. Sets LAUNCH_CODEX_MCP_NAMES (newline-separated),
+# LAUNCH_CODEX_MCP_UNCONTROLLABLE (count) and LAUNCH_CODEX_MCP_INCOMPLETE (1 when
+# the file ends inside a multi-line string; the launch line then warns).
 _codex_mcp_server_names() {
     LAUNCH_CODEX_MCP_NAMES=""
     LAUNCH_CODEX_MCP_UNCONTROLLABLE=0
+    LAUNCH_CODEX_MCP_INCOMPLETE=0
+    _CODEX_ML=""
     local cfg="${CODEX_DIR:-$HOME/.codex}/config.toml"
     [[ -f "$cfg" ]] || return 0
-    local line raw name ctx=root ml="" rest q3
+    local line raw name ctx=root
     local re_hdr_srv='^[[:space:]]*\[mcp_servers\.([^]]+)\][[:space:]]*(#.*)?$'
     local re_hdr_tbl='^[[:space:]]*\[mcp_servers\][[:space:]]*(#.*)?$'
     local re_hdr_any='^[[:space:]]*\['
@@ -1112,18 +1149,14 @@ _codex_mcp_server_names() {
     local re_tbl_quoted="^[[:space:]]*[\"']"
     while IFS= read -r line || [[ -n "$line" ]]; do
         name=""
-        # Lines inside a multi-line string are values, never keys or headers.
-        if [[ -n "$ml" ]]; then
-            rest="${line#*"$ml"}"
-            [[ "$rest" != "$line" ]] && ml=""
+        # Lines that start inside a multi-line string are values, never keys or
+        # headers; the state is advanced over every line (comments and
+        # single-line strings skipped).
+        if [[ -n "$_CODEX_ML" ]]; then
+            _codex_toml_ml_scan "$line"
             continue
         fi
-        for q3 in '"""' "'''"; do
-            if [[ "$line" == *"$q3"* ]]; then
-                rest="${line#*"$q3"}"
-                [[ "$rest" == *"$q3"* ]] || ml="$q3"
-            fi
-        done
+        _codex_toml_ml_scan "$line"
         if [[ "$line" =~ $re_hdr_srv ]]; then
             ctx=server
             raw="${BASH_REMATCH[1]}"
@@ -1153,6 +1186,9 @@ _codex_mcp_server_names() {
             [[ $'\n'"$LAUNCH_CODEX_MCP_NAMES" == *$'\n'"$name"$'\n'* ]] || LAUNCH_CODEX_MCP_NAMES+="$name"$'\n'
         fi
     done < "$cfg"
+    # Still inside a multi-line string at end of file: the scan may have missed
+    # servers, so the launch line says so (it never silently trusts the result).
+    [[ -n "$_CODEX_ML" ]] && LAUNCH_CODEX_MCP_INCOMPLETE=1
     return 0
 }
 
@@ -1570,7 +1606,8 @@ _launch_exec_agent() {
         if [[ -n "$_mcp_keptn" ]]; then
             if [[ "$_mcp_kept" == nothing ]]; then _mcp_kept="$_mcp_keptn"; else _mcp_kept+=", ${_mcp_keptn}"; fi
         fi
-        (( LAUNCH_CODEX_MCP_UNCONTROLLABLE > 0 )) && _mcp_note="; not controllable: $LAUNCH_CODEX_MCP_UNCONTROLLABLE"
+        (( LAUNCH_CODEX_MCP_INCOMPLETE > 0 )) && _mcp_note+="; WARNING: config.toml could not be scanned completely (unterminated multi-line string): servers after it may still be enabled"
+        (( LAUNCH_CODEX_MCP_UNCONTROLLABLE > 0 )) && _mcp_note+="; not controllable: $LAUNCH_CODEX_MCP_UNCONTROLLABLE"
         [[ -n "$_mcp_missing" ]] && _mcp_note+="; WARNING: kept but not found in config.toml: ${_mcp_missing}"
         (( LAUNCH_MCP_KEEP_BAD > 0 )) && _mcp_note+="; WARNING: ignored ${LAUNCH_MCP_KEEP_BAD} invalid keep-list entries"
         local _mcp_label="lean"
