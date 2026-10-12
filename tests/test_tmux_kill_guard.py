@@ -8,8 +8,10 @@ payload on stdin (it reads the payload and never runs the command)."""
 # tmux-lint: allow-file (the table of blocked and allowed command strings; none is ever run)
 import importlib.util
 import json
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -389,8 +391,20 @@ class EntryPointTests(unittest.TestCase):
                 self.assertEqual(result.stderr, "")
 
     def test_no_bytecode_is_written_next_to_the_hook(self):
-        self.run_hook_for_command("tmux kill-server")
-        self.assertFalse(list((ROOT / "hooks").glob("__pycache__/tmux_kill_guard*")))
+        # Run a copy: test_syntax's py_compile of hooks/*.py writes hooks/__pycache__ earlier in a full run.
+        with tempfile.TemporaryDirectory() as tmp:
+            for source in (ROOT / "hooks").glob("*.py"):
+                shutil.copy(source, tmp)
+            payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": "tmux kill-server"}})
+            result = subprocess.run(
+                [sys.executable, str(Path(tmp) / "pre-tool-use.py")],
+                input=payload,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 2)  # the guard really ran from the copy
+            self.assertEqual(list(Path(tmp).rglob("__pycache__")), [])
 
 
 if __name__ == "__main__":
