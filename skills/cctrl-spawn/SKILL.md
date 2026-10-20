@@ -1,6 +1,6 @@
 ---
 name: cctrl-spawn
-version: 1.1.0
+version: 1.1.1
 description: Properly spin up a new cctrl-managed agent session from any repo — pick the runtime, create it detached, seed a brief, verify boot, and (optionally) open it in a terminal tab. Generic doctrine, no environment specifics.
 triggers:
   - spin up a new session
@@ -79,6 +79,14 @@ memory and attention. One session = one purpose.
    Pick the **explicit target directory** — the repo the work
    belongs to, not `$HOME`. Pick a short, descriptive `-n` label (the *purpose*;
    the tmux id is derived from the dir, not the label).
+
+   For isolated work, follow the project's worktree location and branch policy.
+   Record the exact task-owned worktree paths, intended integration ref, and
+   cleanup owner in the brief. Require a worktree disposition in the worker's
+   completion report: removed, or retained with a reason and cleanup trigger.
+   If cleanup must wait for merge or session exit, the integrating agent or
+   parent session owns that final check; the worker must not delete the
+   directory from under a live session.
 
    Pick the **role** too. A plain `-d <dir>` launch is a **worker**, and that is
    what you want almost every time. Only an **orchestrator** takes `--role` /

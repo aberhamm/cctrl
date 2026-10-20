@@ -1,6 +1,6 @@
 ---
 name: cctrl-session-end
-version: 1.1.0
+version: 1.1.1
 description: Gracefully wind down and close a cctrl-managed agent session — save state, check for uncommitted work, optionally hand off, then self-close. Generic doctrine, no environment specifics.
 triggers:
   - end this session
@@ -102,11 +102,27 @@ this.
 
 ### 5. Report completion
 
+First account for every worktree created for this task, including delegated
+workers' worktrees. Inspect `git worktree list --porcelain`, tracked/untracked
+changes, and ignored files. Only a task-owned checkout whose work is integrated
+or explicitly discarded, whose needed evidence/media/config is preserved, and
+whose users and configured dependencies are gone may be removed. A clean
+status alone is not enough; never force-remove or unlock other tasks' checkouts.
+
+From the primary checkout, remove eligible paths with `git worktree remove
+<exact-path>`; remove an empty dedicated container with `rmdir`. Respect the
+harness's archive mechanism for harness-managed worktrees. If this session is
+still using the checkout, or merge is pending, keep it and include the exact
+path, reason, cleanup owner, and trigger (merge or verified session exit) in
+the handoff. The parent/integrating agent performs that cleanup afterward.
+Do not close another session merely to free a directory.
+
 State clearly what was accomplished and what (if anything) remains:
 > Done — [one-line summary of what shipped/changed]. [Any follow-up needed.]
 
-Keep it to one or two sentences. The user reads this in the pane capture after
-the session is gone.
+Include `Worktrees: removed <paths>` or `Worktrees: retained <path> — <reason>;
+cleanup owner <owner>, after <trigger>` when applicable. The user reads this
+in the pane capture after the session is gone.
 
 ### 6. Self-close
 
