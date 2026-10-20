@@ -13504,6 +13504,103 @@ SH
     echo "ok: socket delivery sends the exact payload"
 }
 
+test_peer_socket_deliver_node_bounded() {
+    # The node fallback (no socat on the host) used to wait for the peer to
+    # close the socket; a listener that accepts and never closes hung the
+    # sender with no timeout. It must now return within ~2 s like socat -t2,
+    # with the frame written.
+    local node_bin jq_bin dir sock got rc=0 start elapsed
+    node_bin="$(command -v node || true)"
+    [[ -n "$node_bin" ]] || { echo "skip: node not installed"; return 0; }
+    jq_bin="$(command -v jq)"
+    mkdir -p "$TMPDIR/nodeonly"
+    ln -sf "$node_bin" "$TMPDIR/nodeonly/node"
+    ln -sf "$jq_bin" "$TMPDIR/nodeonly/jq"
+    # sun_path is 104 bytes on macOS: keep the socket path short.
+    dir="$(mktemp -d /tmp/cctrl-sock.XXXXXX)" || fail "mktemp failed"
+    sock="$dir/s"
+    python3 -I -c '
+import socket, sys, time
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sys.argv[1]); srv.listen(1)
+conn, _ = srv.accept()
+data = b""
+deadline = time.time() + 20
+conn.settimeout(0.5)
+while time.time() < deadline:
+    try:
+        chunk = conn.recv(65536)
+    except socket.timeout:
+        if data: open(sys.argv[2], "wb").write(data)
+        continue
+    if not chunk: break
+    data += chunk
+open(sys.argv[2], "wb").write(data)
+time.sleep(20)   # hold the connection open: never close from this side
+' "$sock" "$dir/got" &
+    local srv_pid=$!
+    local i=0
+    while [[ ! -S "$sock" && $i -lt 50 ]]; do sleep 0.1; i=$((i + 1)); done
+    [[ -S "$sock" ]] || { kill "$srv_pid" 2>/dev/null; rm -rf -- "$dir"; fail "test socket server did not start"; }
+    start=$SECONDS
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        PATH="$(_test_path "$TMPDIR/nodeonly")" _peer_socket_deliver "$sock" "held open"
+    ) || rc=$?
+    elapsed=$((SECONDS - start))
+    sleep 0.6
+    got="$(jq -r '.message.content' "$dir/got" 2>/dev/null || true)"
+    kill "$srv_pid" 2>/dev/null || true; wait "$srv_pid" 2>/dev/null || true
+    rm -rf -- "$dir"
+    (( elapsed <= 6 )) || fail "node socket delivery took ${elapsed}s against a never-closing listener"
+    [[ "$rc" -eq 0 ]] || fail "node socket delivery returned $rc after writing the frame"
+    [[ "$got" == "held open" ]] || fail "frame not received by the listener (got: $got)"
+    echo "ok: node socket delivery is bounded when the listener never closes"
+}
+
+test_peer_send_lists_sessions_once_lean() {
+    # 2026-10-20: every `peer send` resolved peers three times, each a full
+    # `session list --json` (pid walks, pane captures, bridge and transcript
+    # probes): ~6 s per resolve on 17 idle sessions, minutes under load, so
+    # senders' timeouts killed sends before they were stored. One lean listing
+    # per send, with no pane capture.
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    local data="$TMPDIR/send-lean-data" log="$TMPDIR/send-lean.log" out lists
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    cat > "$CCTRL_SESSION_METADATA_DIR/alpha.json" <<'JSON'
+{"purpose":"alpha work","created_at":"2026-10-20T00:00:00Z","peer":"alpha","cctrl_managed":true,"role":"orchestrator","orch_kind":"repo","display_label":"@alpha"}
+JSON
+    cat > "$CCTRL_SESSION_METADATA_DIR/beta.json" <<'JSON'
+{"purpose":"beta work","created_at":"2026-10-20T00:00:01Z","peer":"beta","cctrl_managed":true}
+JSON
+    : > "$log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="alpha beta" CCTRL_DATA_DIR="$data" \
+        "$ROOT/cctrl" peer send alpha --from beta --json -- "lean send")" || fail "peer send failed: $out"
+    printf '%s\n' "$out" | jq -e '.to == "alpha" and .status == "queued"' >/dev/null || fail "unexpected send result: $out"
+    lists="$(grep -c '^TMUX.* list-sessions' "$log" || true)"
+    [[ "$lists" == "1" ]] || fail "expected one tmux list-sessions per send, got $lists"
+    assert_not_contains "$(cat "$log")" "capture-pane"
+    # --deliver (the MCP send path): still one listing for send + deliver.
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_SESSIONS="alpha beta" CCTRL_DATA_DIR="$data" \
+        "$ROOT/cctrl" peer send alpha --from beta --deliver --json -- "lean deliver" >/dev/null || true
+    lists="$(grep -c '^TMUX.* list-sessions' "$log" || true)"
+    [[ "$lists" == "1" ]] || fail "expected one tmux list-sessions per send --deliver, got $lists"
+
+    # The lean listing carries every field peer derivation reads, equal to the
+    # full listing's values.
+    local full lite
+    full="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_SESSIONS="alpha beta" "$ROOT/cctrl" session list --json \
+        | jq -S 'map({name,managed,agent,dir,purpose,created_at,peer,display_label,role,orch_kind}) | sort_by(.name)')"
+    lite="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_SESSIONS="alpha beta" "$ROOT/cctrl" session list --peer-lite \
+        | jq -S 'sort_by(.name)')"
+    [[ "$full" == "$lite" ]] || fail "peer-lite listing differs from the full listing:"$'\n'"$full"$'\n'"$lite"
+    printf '%s\n' "$lite" | jq -e 'map(select(.name == "alpha"))[0] | .purpose == "alpha work" and .role == "orchestrator" and .display_label == "@alpha"' >/dev/null \
+        || fail "peer-lite listing lost metadata fields: $lite"
+    echo "ok: peer send lists sessions once, lean, with the fields peers need"
+}
+
 test_session_say_modal_deferral_not_overridden_by_force_busy() {
     # A known modal (codex approval dialog visible in the pane) is a hard stop:
     # status busy, non-zero exit, no paste — and --force-busy must NOT override it.

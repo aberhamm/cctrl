@@ -5891,7 +5891,7 @@ _peer_derived_json() {
         return
     fi
 
-    if ! sessions_json="$(_session_list --json 2>/dev/null)"; then
+    if ! sessions_json="$(_session_list --peer-lite 2>/dev/null)"; then
         jq -n '{skipped:true, reason:"tmux session discovery failed", peers:[]}'
         return
     fi
@@ -7166,7 +7166,23 @@ _peer_sender_binding_mismatch() {
     return 1
 }
 
+# One `peer send` resolves the sender identity, the recipient and the --as
+# binding: build the peer document once for all of them (it lists every tmux
+# session). A nested call (the --deliver path's inner send) reuses the caller's.
 _peer_cmd_send() {
+    local _send_rc _send_owns_cache=false
+    if [[ "${_PEER_ALL_JSON_CACHED:-0}" != "1" ]] && _peer_all_json_cache_begin >/dev/null 2>&1; then
+        _send_owns_cache=true
+    fi
+    # A plain statement, not `|| rc=$?`: that would switch errexit off for the
+    # whole send body.
+    _peer_cmd_send_impl "$@"
+    _send_rc=$?
+    if $_send_owns_cache; then _peer_all_json_cache_end; fi
+    return "$_send_rc"
+}
+
+_peer_cmd_send_impl() {
     local to="${1:-}"
     [[ -n "$to" ]] || { echo -e "${RED}Usage: cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--impersonate] [--json] -- <body>${RESET}" >&2; return 64; }
     shift
@@ -7255,11 +7271,9 @@ _peer_cmd_send() {
         [[ -n "$subject" ]] && send_flags+=(--subject "$subject")
         [[ -n "$sender_host_override" ]] && send_flags+=(--sender-host "$sender_host_override")
         $impersonate && send_flags+=(--impersonate)
-        _peer_all_json_cache_begin >/dev/null 2>&1 || true
         _peer_send_and_deliver "$to" "$body" ${send_flags[@]+"${send_flags[@]}"} || true
         local _sd_rc=$PEER_SD_RC
         _peer_send_deliver_emit "$json" "${PEER_SD_TO:-$to}" send
-        _peer_all_json_cache_end
         return "$_sd_rc"
     fi
 
@@ -7969,6 +7983,9 @@ const c=net.createConnection(process.env.CCTRL_SOCKET_PATH,()=>{
 });
 c.on('error',()=>process.exit(1));
 c.on('end',()=>process.exit(0));
+// Bound the wait like socat -t2: a listener that accepts and never closes
+// must not hang the sender (no socat on the Studio, so this path is live).
+setTimeout(()=>process.exit(c.writableFinished?0:1),2000).unref();
 " >/dev/null 2>&1
         return $?
     fi
@@ -11999,11 +12016,17 @@ _session_ls_role_footers() {
 
 _session_list() {
     _session_require_tmux || return 1
-    local json=false recap=false a
+    local json=false recap=false peer_lite=false a
     for a in "$@"; do
         case "$a" in
             --json)  json=true ;;
             --recap) recap=true ;;
+            # Internal: the subset peer resolution reads (_peer_derived_json).
+            # Every `peer send` / `check` / `recv` resolves peers through this
+            # listing, so it must not pay for the per-session pid walks, pane
+            # captures, bridge, transcript and model probes a full listing does
+            # (6 s for 17 sessions idle, minutes under load, 2026-10-20).
+            --peer-lite) peer_lite=true; json=true ;;
         esac
     done
 
@@ -12013,7 +12036,7 @@ _session_list() {
     # A replacement server therefore differs even if it restores the guard and
     # reuses the same socket, name, and $N id.
     local execution_server_id=""
-    if $json; then
+    if $json && ! $peer_lite; then
         execution_server_id="$(_session_execution_server_id_ensure 2>/dev/null || true)"
     fi
 
@@ -12061,7 +12084,8 @@ _session_list() {
         execution_id="${execution_ids[i]}"
         # `|| true`: see _session_agent_cmd (plan 081, P1a pipefail audit).
         dir="$(tmux list-panes -t "=$name:" -F '#{pane_current_path}' 2>/dev/null | head -1)" || true
-        attached="$(tmux display-message -p -t "=$name:" '#{session_attached}' 2>/dev/null)"
+        attached=""
+        $peer_lite || attached="$(tmux display-message -p -t "=$name:" '#{session_attached}' 2>/dev/null)"
         cmd="$(_session_agent_cmd "$name")"
         # Read all needed metadata fields in one jq call (was six separate calls).
         local stored_conv_id=""
@@ -12074,6 +12098,9 @@ _session_list() {
             normalized_record="$(_task_record_normalize_json "$meta_file" 2>/dev/null || true)"
             if [[ -n "$normalized_record" ]]; then
                 { IFS= read -r purpose; IFS= read -r created_at; IFS= read -r peer; IFS= read -r display_label; IFS= read -r metadata_managed; IFS= read -r agent_meta; IFS= read -r stored_conv_id; IFS= read -r profile; IFS= read -r has_profile_raw; IFS= read -r profile_source; IFS= read -r auth_backend; IFS= read -r role; IFS= read -r orch_kind; IFS= read -r mcp_mode; } < <(jq -r '(.purpose // ""), (.created_at // ""), (.peer // ""), (.display_label // ""), (.cctrl_managed // .registered_by_cctrl // ""), (.agent // .provider // ""), (.provider_task_id // .conversation_id // ""), (.profile // ""), (has("profile")|tostring), (.profile_source // ""), (.auth_backend // ""), (.role // ""), (.orch_kind // ""), (.mcp_mode // "")' <<< "$normalized_record" 2>/dev/null) || true
+                $peer_lite && normalized_record=""
+            fi
+            if [[ -n "$normalized_record" ]]; then
                 record_schema="$(jq -r '.schema_version // empty' <<< "$normalized_record")"
                 provider="$(jq -r '.provider // empty' <<< "$normalized_record")"
                 origin="$(jq -r '.origin // empty' <<< "$normalized_record")"
@@ -12100,7 +12127,8 @@ _session_list() {
         [[ -n "$agent" && ( -z "$provider" || "$provider" == "unknown" ) ]] && provider="$agent"
         if [[ -n "$agent" ]]; then
             [[ "$agent" == "claude" ]] && claude_yes=true || claude_yes=false
-            model="$(printf '%s' "$cmd" | python3 "$SCRIPT_DIR/lib/agent_model.py" "$agent")"
+            model=""
+            $peer_lite || model="$(printf '%s' "$cmd" | python3 "$SCRIPT_DIR/lib/agent_model.py" "$agent")"
             [[ -z "$model" ]] && model="?"
             kind="$agent ($model)"
             if [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "=$name:" @cctrl_managed 2>/dev/null)" == "1" || "$cmd" == *"--name TMUX."* || "$cmd" == *"--name TMUX--"* ]]; then
@@ -12113,6 +12141,22 @@ _session_list() {
             [[ "$metadata_managed" == "true" || "$(tmux show-option -qv -t "=$name:" @cctrl_managed 2>/dev/null)" == "1" ]] && managed=true || managed=false
             base="${cmd%% *}"; base="${base##*/}"; base="${base#-}"
             kind="shell (${base:-sh})"
+        fi
+        if $peer_lite; then
+            if [[ -z "$role" ]]; then
+                role_fb="$(_session_role_fallback "$name")"
+                role="${role_fb%%|*}"; role_fb="${role_fb#*|}"; orch_kind="${role_fb%%|*}"
+                [[ "${role_fb#*|}" == default ]] && { role=""; orch_kind=""; }
+            fi
+            sort_keys+=("-1")
+            json_items+=("$(jq -nc --arg name "$name" --argjson managed "$managed" --arg agent "$agent" \
+                --arg dir "$dir" --arg purpose "$purpose" --arg created_at "$created_at" --arg peer "$peer" \
+                --arg display_label "$display_label" --arg role "$role" --arg orch_kind "$orch_kind" '
+                {name:$name, managed:$managed, agent:(if $agent=="" then null else $agent end), dir:$dir,
+                 purpose:(if $purpose=="" then null else $purpose end), created_at:(if $created_at=="" then null else $created_at end),
+                 peer:(if $peer=="" then null else $peer end), display_label:(if $display_label=="" then null else $display_label end),
+                 role:(if $role=="" then null else $role end), orch_kind:(if $orch_kind=="" then null else $orch_kind end)}')")
+            continue
         fi
         [[ "$attached" == "1" ]] && state="attached" || state="detached"
         disp_dir="${dir/#$HOME/~}"
