@@ -4294,6 +4294,10 @@ _res_mem_free_pct() {
     if [[ -n "${CCTRL_FAKE_MEM_FREE_PCT:-}" ]]; then
         printf '%d' "$CCTRL_FAKE_MEM_FREE_PCT"; return 0
     fi
+    # Test seam: a reading that can change mid-run (restore's between-wave gate).
+    if [[ -n "${CCTRL_FAKE_MEM_FREE_PCT_FILE:-}" ]]; then
+        printf '%d' "$(head -n 1 "$CCTRL_FAKE_MEM_FREE_PCT_FILE")"; return 0
+    fi
     if [[ "$(uname -s)" == "Darwin" ]]; then
         local pct
         pct="$(memory_pressure 2>/dev/null \
@@ -4378,6 +4382,33 @@ _res_health_line() {
         "$mf_d" "$sw_d" "${ld:-n/a}" "${sc:-n/a}"
 }
 
+_res_pressure_reason() {
+    # The one memory-pressure rule, shared by `cctrl start` and `cctrl session
+    # restore` so the two cannot drift. Pressure means free memory below
+    # CCTRL_MEM_FREE_MIN_PCT (15), or below CCTRL_MEM_FREE_SOFT_PCT (20) while
+    # swap used >= CCTRL_SWAP_USED_HI_MB (8192). Swap alone never counts: macOS
+    # keeps stale swap for days with plenty of RAM free. Under pressure, prints
+    # the reason naming the number that tripped and returns 0; otherwise prints
+    # nothing and returns 1. An unmeasurable memory reading is never pressure.
+    local mem_min="${CCTRL_MEM_FREE_MIN_PCT:-15}"
+    local mem_soft="${CCTRL_MEM_FREE_SOFT_PCT:-20}"
+    local swap_hi="${CCTRL_SWAP_USED_HI_MB:-8192}"
+    local mem_free swap_used
+    mem_free="$(_res_mem_free_pct)"
+    swap_used="$(_res_swap_used_mb)"
+    [[ "$mem_free" =~ ^[0-9]+$ ]] || return 1
+    if (( mem_free < mem_min )); then
+        printf 'free memory %s%% is below %s%%' "$mem_free" "$mem_min"
+        return 0
+    fi
+    if (( mem_free < mem_soft )) && [[ "$swap_used" =~ ^[0-9]+$ ]] && (( swap_used >= swap_hi )); then
+        printf 'free memory %s%% is below %s%% and swap used %sMB is at or above %sMB' \
+            "$mem_free" "$mem_soft" "$swap_used" "$swap_hi"
+        return 0
+    fi
+    return 1
+}
+
 _launch_resource_guardrail() {
     # Before adding another heavy session, warn (and require confirmation or
     # --force) ONLY when the box is genuinely low on memory. We deliberately do
@@ -4390,25 +4421,10 @@ _launch_resource_guardrail() {
     local force="$1"
     [[ "$force" == "true" || "${CCTRL_FORCE:-}" == "1" ]] && return 0
 
-    local mem_min="${CCTRL_MEM_FREE_MIN_PCT:-15}"     # hard floor: refuse below this
-    local mem_soft="${CCTRL_MEM_FREE_SOFT_PCT:-20}"   # low-ish band ...
-    local swap_hi="${CCTRL_SWAP_USED_HI_MB:-8192}"    # ... + heavy swap = pressure
-    local mem_free sess_count swap_used
-    mem_free="$(_res_mem_free_pct)"
-    sess_count="$(_active_session_count)"
-    swap_used="$(_res_swap_used_mb)"
-
-    # Undeterminable memory reading: don't block (best-effort, never a hard stop
-    # on a platform we can't measure).
-    [[ "$mem_free" =~ ^[0-9]+$ ]] || return 0
-
     local -a reasons=()
-    if [[ "$mem_free" -lt "$mem_min" ]]; then
-        reasons+=("free memory ${mem_free}% is below ${mem_min}%")
-    elif [[ "$mem_free" -lt "$mem_soft" && "$swap_used" =~ ^[0-9]+$ && "$swap_used" -ge "$swap_hi" ]]; then
-        reasons+=("free memory ${mem_free}% low and swap filling (${swap_used}MB used)")
-    fi
-    [[ ${#reasons[@]} -eq 0 ]] && return 0
+    local reason
+    reason="$(_res_pressure_reason)" || return 0
+    reasons+=("$reason")
 
     echo -e "${YELLOW}⚠  Resource guardrail:${RESET} another session may thrash this machine." >&2
     local r
@@ -14217,14 +14233,26 @@ _session_restore() {
         [[ "$answer" == y || "$answer" == yes ]] || { rm -rf "$scratch"; return 0; }
     fi
 
-    local mem_free swap_used
-    mem_free="$(_res_mem_free_pct)"; swap_used="$(_res_swap_used_mb)"
-    if [[ "$mem_free" =~ ^[0-9]+$ ]] && (( mem_free < ${CCTRL_MEM_FREE_MIN_PCT:-15} )); then rm -rf "$scratch"; return 1; fi
-    if [[ "$swap_used" =~ ^[0-9]+$ ]] && (( swap_used >= ${CCTRL_SWAP_USED_HI_MB:-8192} )); then rm -rf "$scratch"; return 1; fi
+    # Same memory rule as `cctrl start` (_res_pressure_reason), checked before
+    # the first wave and again before each later one; a refusal names the
+    # number that tripped and stops at a clean wave boundary.
+    local pressure total_restorable
+    total_restorable="$(jq '[.rows[] | select(.disposition == "restore" and .action_capabilities.restore.supported == true and .action_capabilities.restore.reason == "tmux-resume")] | length' "$plan_file")"
+    if pressure="$(_res_pressure_reason)"; then
+        echo "Refusing to restore: $pressure; $(_res_health_line)" >&2
+        rm -rf "$scratch"; return 1
+    fi
 
     local -a predecessor_notes=()
-    local row_file restored=0 failed=0 index=0 wave_size="${CCTRL_RESTORE_WAVE_SIZE:-2}" wave_pause="${CCTRL_RESTORE_WAVE_PAUSE:-60}"
+    local row_file restored=0 failed=0 index=0 gated_at=0 wave_size="${CCTRL_RESTORE_WAVE_SIZE:-2}" wave_pause="${CCTRL_RESTORE_WAVE_PAUSE:-60}"
     while IFS= read -r row_file; do
+        if (( wave_size > 0 && index > 0 && index % wave_size == 0 && gated_at != index )); then
+            gated_at=$index
+            if pressure="$(_res_pressure_reason)"; then
+                echo "stopped: $restored of $total_restorable restored, $pressure; re-run to continue" >&2
+                rm -rf "$scratch"; return 1
+            fi
+        fi
         local cwd resume purpose label agent spawn_rc=0
         cwd="$(jq -r '.cwd' <<< "$row_file")"; resume="$(jq -r '.resume_identity' <<< "$row_file")"
         purpose="$(jq -r '.purpose // "restored task"' <<< "$row_file")"; label="$(jq -r '.display_label // empty' <<< "$row_file")"

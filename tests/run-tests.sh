@@ -12133,7 +12133,7 @@ _restore_run() {
         CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
         CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" \
         CCTRL_RESTORE_LAUNCH_LOG="$dir/launch.log" \
-        CCTRL_FAKE_MEM_FREE_PCT="${CCTRL_FAKE_MEM_FREE_PCT:-80}" CCTRL_FAKE_SWAP_MB="${CCTRL_FAKE_SWAP_MB:-0}" \
+        CCTRL_FAKE_MEM_FREE_PCT="${CCTRL_FAKE_MEM_FREE_PCT-80}" CCTRL_FAKE_SWAP_MB="${CCTRL_FAKE_SWAP_MB:-0}" \
         CCTRL_RESTORE_MAX_ACTIVE="${CCTRL_RESTORE_MAX_ACTIVE:-10}" \
         CCTRL_RESTORE_WAVE_SIZE="${CCTRL_RESTORE_WAVE_SIZE:-2}" CCTRL_RESTORE_WAVE_PAUSE="${CCTRL_RESTORE_WAVE_PAUSE:-0}" \
         "$ROOT/cctrl" session restore --from "${SR_FROM:-$dir/snapshots/latest.json}" "$@"
@@ -12219,13 +12219,89 @@ test_restore_gate_stops_below_threshold() {
     local dir="$TMPDIR/restore-gate"
     _restore_fixture "$dir"
     local rc=0
-    CCTRL_FAKE_MEM_FREE_PCT=5 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    CCTRL_FAKE_MEM_FREE_PCT=5 _restore_run "$dir" --yes --quiet >/dev/null 2>"$dir/err" || rc=$?
     # Memory below CCTRL_MEM_FREE_MIN_PCT stops restore before any spawn (exit 1).
     [[ "$rc" -eq 1 ]] || fail "expected exit 1 when memory below threshold, got $rc"
     local log_content
     log_content="$(cat "$dir/launch.log")"
     [[ -z "$log_content" ]] || fail "gate should prevent all spawns, got: $log_content"
+    assert_contains "$(cat "$dir/err")" "free memory 5% is below 15%"
     echo "ok: resource gate stops below threshold"
+}
+
+test_restore_gate_matches_start_rule() {
+    # Restore uses start's rule (_res_pressure_reason): stale swap with plenty
+    # of RAM free never blocks; swap only counts inside the soft band.
+    local dir="$TMPDIR/restore-gate-rule" rc
+    _restore_fixture "$dir"
+    rc=0; CCTRL_FAKE_MEM_FREE_PCT=88 CCTRL_FAKE_SWAP_MB=20000 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "swap high + RAM free: expected restore to proceed, got rc $rc"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "swap high + RAM free: expected 4 spawns, got $(_restore_spawn_count "$dir")"
+
+    _restore_fixture "$dir"; : > "$dir/launch.log"
+    rc=0; CCTRL_FAKE_MEM_FREE_PCT=18 CCTRL_FAKE_SWAP_MB=9000 _restore_run "$dir" --yes --quiet >/dev/null 2>"$dir/err" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "RAM soft + swap high: expected exit 1, got $rc"
+    [[ ! -s "$dir/launch.log" ]] || fail "RAM soft + swap high spawned: $(cat "$dir/launch.log")"
+    assert_contains "$(cat "$dir/err")" "free memory 18% is below 20% and swap used 9000MB is at or above 8192MB"
+
+    _restore_fixture "$dir"; : > "$dir/launch.log"
+    rc=0; CCTRL_FAKE_MEM_FREE_PCT=18 CCTRL_FAKE_SWAP_MB=100 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "RAM soft + swap low: expected restore to proceed, got rc $rc"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "RAM soft + swap low: expected 4 spawns, got $(_restore_spawn_count "$dir")"
+
+    # The env overrides still move the thresholds.
+    _restore_fixture "$dir"; : > "$dir/launch.log"
+    rc=0; CCTRL_MEM_FREE_SOFT_PCT=90 CCTRL_SWAP_USED_HI_MB=10000 CCTRL_FAKE_MEM_FREE_PCT=88 CCTRL_FAKE_SWAP_MB=20000 \
+        _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "overridden soft band: expected exit 1, got $rc"
+    [[ ! -s "$dir/launch.log" ]] || fail "overridden soft band spawned: $(cat "$dir/launch.log")"
+    _restore_fixture "$dir"; : > "$dir/launch.log"
+    rc=0; CCTRL_MEM_FREE_MIN_PCT=90 CCTRL_FAKE_MEM_FREE_PCT=88 CCTRL_FAKE_SWAP_MB=0 \
+        _restore_run "$dir" --yes --quiet >/dev/null 2>"$dir/err" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "overridden floor: expected exit 1, got $rc"
+    assert_contains "$(cat "$dir/err")" "free memory 88% is below 90%"
+    echo "ok: restore gate matches start's rule"
+}
+
+test_restore_gate_rechecks_between_waves() {
+    # The gate runs again before every later wave: memory that drops during the
+    # wave pause stops restore at the boundary with the count so far.
+    local dir="$TMPDIR/restore-gate-waves" rc=0
+    _restore_fixture "$dir"
+    printf '80\n' > "$dir/mem"
+    cat > "$dir/bin/sleep" <<'SH'
+#!/usr/bin/env bash
+printf '5\n' > "${RESTORE_TEST_MEM_FILE:?}"
+SH
+    chmod +x "$dir/bin/sleep"
+    RESTORE_TEST_MEM_FILE="$dir/mem" CCTRL_FAKE_MEM_FREE_PCT= CCTRL_FAKE_MEM_FREE_PCT_FILE="$dir/mem" \
+        CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=1 \
+        _restore_run "$dir" --yes --quiet >/dev/null 2>"$dir/err" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "expected exit 1 when memory drops between waves, got $rc"
+    [[ "$(_restore_spawn_count "$dir")" -eq 2 ]] || fail "expected only the first wave (2) spawned, got $(_restore_spawn_count "$dir")"
+    assert_contains "$(cat "$dir/err")" "stopped: 2 of 4 restored, free memory 5% is below 15%; re-run to continue"
+    echo "ok: restore gate re-checks between waves"
+}
+
+test_res_pressure_reason_rule() {
+    # The shared rule start's guardrail and restore both call.
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        local out
+        CCTRL_FAKE_MEM_FREE_PCT=88 CCTRL_FAKE_SWAP_MB=20000 _res_pressure_reason && fail "swap alone counted as pressure"
+        CCTRL_FAKE_MEM_FREE_PCT=14 CCTRL_FAKE_SWAP_MB=0 _res_pressure_reason >/dev/null || fail "below floor not pressure"
+        CCTRL_FAKE_MEM_FREE_PCT=19 CCTRL_FAKE_SWAP_MB=8191 _res_pressure_reason && fail "soft band + swap below hi counted"
+        out="$(CCTRL_FAKE_MEM_FREE_PCT=19 CCTRL_FAKE_SWAP_MB=8192 _res_pressure_reason)" || fail "soft band + swap at hi not pressure"
+        [[ "$out" == "free memory 19% is below 20% and swap used 8192MB is at or above 8192MB" ]] || fail "unexpected reason: $out"
+        CCTRL_FAKE_MEM_FREE_PCT=20 CCTRL_FAKE_SWAP_MB=99999 _res_pressure_reason && fail "at soft threshold counted"
+        # Start's guardrail: no TTY refuses under pressure; --force / CCTRL_FORCE bypass.
+        CCTRL_FAKE_MEM_FREE_PCT=88 CCTRL_FAKE_SWAP_MB=20000 _launch_resource_guardrail false </dev/null >/dev/null 2>&1 || fail "start refused on swap alone"
+        CCTRL_FAKE_MEM_FREE_PCT=10 _launch_resource_guardrail false </dev/null >/dev/null 2>&1 && fail "start launched below floor without TTY"
+        CCTRL_FAKE_MEM_FREE_PCT=10 _launch_resource_guardrail true </dev/null >/dev/null 2>&1 || fail "--force did not bypass"
+        CCTRL_FORCE=1 CCTRL_FAKE_MEM_FREE_PCT=10 _launch_resource_guardrail false </dev/null >/dev/null 2>&1 || fail "CCTRL_FORCE did not bypass"
+        true
+    ) || fail "_res_pressure_reason rule"
+    echo "ok: shared memory-pressure rule"
 }
 
 test_restore_limit_caps_spawns() {
@@ -18562,7 +18638,7 @@ _group_tests() {
         fleet-v2) printf '%s\n' test_fleet_merges_multiple_hosts test_fleet_sorts_by_recency_across_hosts test_fleet_offline_host_non_fatal test_fleet_version_skew_missing_fields test_fleet_v2_provider_neutral_federation ;;
         health-check) printf '%s\n' test_health_check_patterns_syntax test_health_check_pattern_matching test_health_check_transition_guard test_health_check_needs_human_path test_health_check_timeout_path test_health_check_ready_requires_visible_prompt test_health_check_startup_selectors_need_human test_health_check_detects_startup_exit test_session_pane_has_dialog_refactored ;;
         pane-draft) printf '%s\n' test_session_pane_has_draft_glyph_fixtures test_session_rich_state_detects_glyph_draft test_session_autoheal_skips_glyph_draft test_pane_draft_plan086_followups test_pane_draft_plan086_hotfix_titled_divider test_strip_sgr_shared_regex ;;
-        snapshot-restore-legacy) printf '%s\n' test_snapshot_header_and_session_shape test_snapshot_initial_prompt_absent test_snapshot_empty_fleet_guard_preserves test_snapshot_allow_empty_overrides test_snapshot_history_and_latest_agree test_snapshot_retention_pruning test_snapshot_no_tmux_mutation test_snapshot_tmux_absent_preserves test_snapshot_first_run_empty_writes test_snapshot_managed_matches_session_ls test_snapshot_launch_flags_round_trip test_snapshot_conversation_id_from_session_id test_restore_only_filter test_restore_cap_on_total test_restore_null_conversation_id_skipped test_restore_dry_run_spawns_nothing test_restore_gate_stops_below_threshold test_restore_limit_caps_spawns test_restore_no_tty_no_yes_refused test_restore_unknown_schema_refused test_restore_stale_snapshot_refused test_restore_host_mismatch_refused test_restore_cap_fails_closed test_restore_wave_pacing test_restore_already_live_skipped test_restore_launch_config_replay test_restore_already_live_record_join test_restore_exit_codes ;;
+        snapshot-restore-legacy) printf '%s\n' test_snapshot_header_and_session_shape test_snapshot_initial_prompt_absent test_snapshot_empty_fleet_guard_preserves test_snapshot_allow_empty_overrides test_snapshot_history_and_latest_agree test_snapshot_retention_pruning test_snapshot_no_tmux_mutation test_snapshot_tmux_absent_preserves test_snapshot_first_run_empty_writes test_snapshot_managed_matches_session_ls test_snapshot_launch_flags_round_trip test_snapshot_conversation_id_from_session_id test_restore_only_filter test_restore_cap_on_total test_restore_null_conversation_id_skipped test_restore_dry_run_spawns_nothing test_restore_gate_stops_below_threshold test_restore_gate_matches_start_rule test_restore_gate_rechecks_between_waves test_res_pressure_reason_rule test_restore_limit_caps_spawns test_restore_no_tty_no_yes_refused test_restore_unknown_schema_refused test_restore_stale_snapshot_refused test_restore_host_mismatch_refused test_restore_cap_fails_closed test_restore_wave_pacing test_restore_already_live_skipped test_restore_launch_config_replay test_restore_already_live_record_join test_restore_exit_codes ;;
         role-phase1) printf '%s\n' test_role_flags_before_dir_target_with_detach test_role_flags_before_at_target_without_detach test_role_flags_never_reach_child_command test_role_flags_with_foreground_exit_64 test_role_flags_with_app_owned_and_launch_to_app_exit_64 test_remote_role_value_not_taken_as_purpose test_role_flag_recorded_in_metadata_and_tmux_option test_role_and_orch_kind_invalid_values_exit_64 test_orch_kind_flag_implies_orchestrator_role test_role_worker_with_orch_kind_exits_64 test_shortcut_role_and_kind_resolve_on_at_launch test_shortcut_orch_kind_without_role_is_orchestrator test_shortcut_invalid_role_exits_64_naming_key test_orch_kind_flag_overrides_shortcut_kind test_dir_launch_never_inherits_shortcut_role test_dir_launch_with_orch_key_and_plain_key_uses_plain_key test_dir_launch_with_only_orch_key_uses_basename test_dir_launch_matches_stored_dir_with_trailing_slash test_dir_launch_skips_role_shortcut_without_legacy_prefix test_legacy_prefixed_key_with_worker_role_is_adopted test_no_env_var_supplies_role_or_kind test_shortcut_add_preserves_role_fields test_shortcut_add_role_flags_set_and_clear test_ask_a1_role_orchestrator_without_kind_exits_78 test_ask_a2_shortcut_role_without_kind_exits_78 test_ask_a3_legacy_fm_and_orch_keys_without_role_exit_78 test_ask_a4_set_role_orchestrator_without_kind_exits_78 test_ask_a5_shortcut_add_orchestrator_without_kind_exits_78 test_non_interactive_never_reads_stdin test_no_input_flag_and_env_force_78_on_pty test_agent_env_markers_force_78_on_pty test_ask_tty_accepts_fleet test_ask_tty_accepts_repo test_ask_tty_prompts_when_stdout_is_captured test_ask_tty_three_invalid_answers_exit_78 test_ask_tty_read_timeout_exits_78 test_ask_tty_abort_exits_78_nothing_launched test_remote_preflight_forwards_resolved_role_and_kind test_remote_ambiguous_prompts_locally_and_forwards_kind test_remote_ambiguous_non_interactive_returns_78_with_message test_remote_sets_no_input_on_remote_side test_remote_old_cctrl_with_role_flags_exits_69 test_remote_dir_launch_without_role_flags_skips_preflight test_remote_preflight_exit_0_without_role_line_launches_unchanged test_remote_preflight_66_falls_through_to_launch test_remote_foreground_skips_preflight_and_role_flags test_remote_preflight_other_exit_code_is_relayed test_set_role_updates_live_session_and_keeps_label test_set_role_on_provisional_record test_set_role_clear_removes_fields test_relaunch_with_new_role_replaces_recorded_role test_roleless_relaunch_keeps_recorded_role_and_kind test_snapshot_launch_flags_carry_role_and_kind test_restore_replays_role_and_kind test_restore_legacy_row_infers_orchestrator_from_tmux_name test_restore_unknown_kind_row_never_asks test_restore_old_snapshot_does_not_erase_recorded_kind test_restore_current_record_beats_snapshot_row_role test_recorded_worker_beats_legacy_name_inference test_ask_rechecks_tty_at_read_site test_restore_prints_reason_for_failed_row test_realign_flags_carry_role_and_kind test_realign_keeps_recorded_tmux_name test_legacy_live_prefixed_session_reads_as_orchestrator_unknown_kind test_recorded_worker_beats_legacy_name_inference_live test_session_ls_json_exposes_role_and_kind ;;
         role-phase3) printf '%s\n' test_reconcile_names_legacy_record_without_known_names_is_not_pulled test_reconcile_names_writes_baseline_once test_reconcile_names_does_not_pull_launch_name_restamp test_reconcile_names_cctrl_label_stays_after_cctrl_rename test_reconcile_names_pulls_in_claude_rename_for_worker_and_orchestrator test_reconcile_names_cctrl_rename_after_pull_stays test_reconcile_names_no_pull_when_baseline_cannot_be_written test_restore_keeps_known_names_and_pulls_nothing test_reconcile_names_full_set_pulls_nothing test_restore_of_record_without_known_names_gets_baseline_not_seed test_reconcile_names_restamp_after_cctrl_rename_on_legacy_record_not_pulled test_reconcile_names_older_restamped_title_is_never_pulled test_reconcile_names_in_claude_rename_then_cctrl_rename_stays test_reconcile_names_new_in_claude_rename_after_cctrl_rename_is_pulled test_reconcile_names_strips_old_tmux_suffix_after_restore test_reconcile_names_normalises_suffix_on_store_and_compare test_reconcile_names_dry_run_writes_nothing test_reconcile_names_dry_run_reports_would_be_corrections test_reconcile_names_help_and_unknown_flag_write_nothing test_rename_self_resolves_current_session test_rename_self_outside_session_exits_64 test_auto_label_for_handoff_prompt_uses_slug ;;
         role-phase2) printf '%s\n' test_fleet_orchestrator_name_and_star_label test_repo_orchestrator_name_and_star_label test_repo_name_uses_dir_worker_alias_then_stripped_key_then_basename test_at_legacy_orch_shortcut_launch_gets_orch_name test_unknown_kind_orchestrator_keeps_worker_name test_orchestrator_ignores_prompt_derived_label test_orchestrator_explicit_label_gets_glyph_once test_rename_adds_glyph_for_known_kind_only test_replay_keeps_label_verbatim test_set_role_relabel_writes_canonical_label test_codex_title_skips_repo_prefix_for_star_label test_remote_orchestrator_launch_injects_no_default_purpose test_second_fleet_manager_same_runtime_refused_65 test_fleet_launch_never_gets_index_suffix test_old_named_fleet_manager_with_role_blocks_new_one test_fleet_manager_other_runtime_allowed test_repo_and_unknown_kind_sessions_never_trip_guard test_guard_runs_only_after_kind_known test_concurrent_fleet_launch_refused_by_lock test_stale_fleet_lock_is_reclaimed test_fleet_lock_older_than_limit_is_reclaimed_even_with_live_pid test_fleet_lock_without_pid_file_is_held_only_briefly test_override_env_is_unset_before_tmux_new_session test_allow_second_fleet_manager_env_override test_succeeds_allows_one_handover_and_relabels_predecessor test_succeeds_wrong_session_or_two_live_refused test_dead_fleet_manager_record_does_not_block test_set_role_fleet_goes_through_guard test_restore_bypasses_guard_and_reports_predecessor test_session_ls_warns_on_two_fleet_managers_and_unknown_kind test_succeeds_refused_64_unless_fleet_kind test_failed_health_check_leaves_predecessor_label test_empty_runtime_fleet_manager_counts_as_claude test_set_role_fleet_takes_launch_lock test_set_role_relabel_repo_falls_back_to_pane_path test_fleet_lock_registry_dir_failure_has_own_message test_refusal_wording_per_caller test_restore_keeps_recorded_name_for_tagged_fleet_row test_restore_keeps_recorded_name_for_tagged_repo_row_with_index test_restore_beside_live_session_of_same_name_gets_next_index test_restore_keeps_phase2_style_names test_realign_of_tagged_orchestrator_keeps_recorded_name test_fresh_orchestrator_launch_still_gets_role_name ;;

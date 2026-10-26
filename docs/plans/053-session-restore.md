@@ -130,12 +130,16 @@ source.** A session with no `conversation_id` is reported and skipped, full stop
       parse is reported per session as `launch config: partial (<flag> not
       restored)` rather than silently dropped, and `--dry-run` shows the fully
       resolved argv including these flags.
-- [ ] **Resource gate before every wave.** Restore checks `_res_mem_free_pct`
-      and `_res_swap_used_mb` directly against the existing launch-guardrail
-      thresholds (`CCTRL_MEM_FREE_MIN_PCT` 15, `CCTRL_MEM_FREE_SOFT_PCT` 20,
-      `CCTRL_SWAP_USED_HI_MB` 8192 — `_launch_resource_guardrail`) and stops
-      cleanly with `stopped: N of M restored, free memory X% below threshold;
-      re-run to continue`. It must **not** pass `--force` to `cctrl start` (that
+- [ ] **Resource gate before every wave.** Restore applies the launch
+      guardrail's own rule through the shared `_res_pressure_reason` helper
+      (free memory below `CCTRL_MEM_FREE_MIN_PCT` 15, or below
+      `CCTRL_MEM_FREE_SOFT_PCT` 20 while swap used >= `CCTRL_SWAP_USED_HI_MB`
+      8192; swap alone never blocks). Before the first wave a refusal prints
+      `Refusing to restore: <reason naming the number>; <resource line>`;
+      between waves it stops cleanly with `stopped: N of M restored, <reason>;
+      re-run to continue`. Both exit 1. (2026-10-26:
+      restore previously refused on swap alone, which blocked it at 88% free
+      RAM; it now matches `cctrl start`.) It must **not** pass `--force` to `cctrl start` (that
       defeats the guardrail) and must not rely on the guardrail's own refusal:
       with no TTY the guardrail hard-refuses, which would abort a wave
       mid-flight instead of stopping at a clean boundary.

@@ -987,12 +987,20 @@ The verb reports three counts: filled, already-set, and unrecoverable.
 
 Before creating another session, `cctrl start` checks free memory and refuses to
 launch when the machine is genuinely low, printing the same resource line
-`cctrl fleet` shows. It deliberately does not gate on session count — idle
-sessions cost almost nothing, so counting them would block launches while memory
-is fine. Bypass with `-f` / `--force` or `CCTRL_FORCE=1`. The thresholds are
-overridable (`CCTRL_MEM_FREE_MIN_PCT`, `CCTRL_MEM_FREE_SOFT_PCT`,
-`CCTRL_SWAP_USED_HI_MB`). On a platform where memory cannot be measured the
-guard never fires, and the resource line renders the unavailable probe as `n/a`.
+`cctrl fleet` shows. It refuses when free memory is below
+`CCTRL_MEM_FREE_MIN_PCT` (15%), or below `CCTRL_MEM_FREE_SOFT_PCT` (20%) while
+swap used is at or above `CCTRL_SWAP_USED_HI_MB` (8192 MB). Swap on its own
+never blocks: macOS keeps stale swap for days with plenty of RAM free. It
+deliberately does not gate on session count — idle sessions cost almost
+nothing, so counting them would block launches while memory is fine. Bypass
+with `-f` / `--force` or `CCTRL_FORCE=1`. On a platform where memory cannot be
+measured the guard never fires, and the resource line renders the unavailable
+probe as `n/a`.
+
+`cctrl session restore` applies the same rule (one shared helper) before its
+first wave and again before each later wave. A refusal names the number that
+tripped it; a stop between waves reports `stopped: N of M restored, <reason>;
+re-run to continue`.
 
 ### Shortcuts
 
