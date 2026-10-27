@@ -95,7 +95,7 @@ Queued backlog on 10-27: 735 messages (330 to fleet-claude--2).
     the bell is enabled FOR the recipient (its names in peers, or its role in roles),
     its role is in deliver_default_roles, and its Claude pane is idle (not working,
     no modal, no draft) (verify fixes MF1, SF3). A pilot `enable --peer ONE` changes
-    sends to ONE only. A busy recipient gets a plain send; its Stop bell catches it.
+    sends to ONE only. A recipient that is WORKING gets a plain send; its Stop bell catches it at the end of the turn. A recipient waiting on a question/modal or holding an unsent draft also gets a plain send, but no Stop is pending: the mail stays queued with no bell and no nudge until its next Stop.
   - a default (not requested) delivery that is deferred or fails exits 0 with a
     warning: the message is queued and a retry would duplicate it. Explicit
     --deliver keeps its exit codes;
@@ -138,7 +138,7 @@ Queued backlog on 10-27: 735 messages (330 to fleet-claude--2).
   - (b) Leave idle sessions to the fleet manager's tick.
   - (c) A later `peer watch` daemon (out of scope in 044).
   - Recommendation: (a) default --deliver to live, idle orchestrator/FM recipients the
-    bell is enabled for (a busy one gets a plain send, caught by the Stop bell) + (c) existing `peer watch` with a --since
+    bell is enabled for (a working one gets a plain send, caught by the Stop bell; one waiting on a question/modal or holding a draft stays queued, unrung, until its next Stop) + (c) existing `peer watch` with a --since
     baseline floor as safety net. Starting it resident = separate Matthew approval.
 - **D5. Existing backlog.** On first ring, 100+ old messages would flood
   the fleet manager.
@@ -153,8 +153,8 @@ Queued backlog on 10-27: 735 messages (330 to fleet-claude--2).
 
 1. Merge after the full suite and review pass. Install the release; it is inert (no doorbell.json).
 2. `cctrl peer doorbell enable --peer <one orchestrator> --dry-run`, then run it for real.
-3. Watch one day: ring count, forced-continuation count, Stop latency (bench numbers recorded here).
-4. `cctrl peer doorbell enable --role orchestrator --role fleet-manager`.
+3. Watch one day: ring count, forced-continuation count, Stop latency (bench numbers recorded here). Pilot checks: the bell still rings after /clear (a sessionId mismatch fails closed); and mail sent while the pilot waits on a question/modal or holds an unsent draft stays queued with no ring until its next Stop.
+4. `cctrl peer doorbell enable --role orchestrator --role fleet-manager`. Decide a per-hour ring cap before widening.
 5. Optional, separate approval: a resident `peer watch --interval 60`.
 
 Rollback:

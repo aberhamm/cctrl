@@ -61,6 +61,9 @@ exec /bin/ps "\$@"
 PS
 chmod +x "$D/bin/ps"
 
+# The installed launcher (~/.local/bin/cctrl) finds its release under
+# $CCTRL_HOME; resolve it from the REAL home before HOME is overridden.
+export CCTRL_HOME="${CCTRL_HOME:-$HOME/.local/lib/cctrl}"
 export HOME="$D/home" CCTRL_DATA_DIR="$D/data" CCTRL_SESSION_METADATA_DIR="$D/meta" \
     CCTRL_CLAUDE_SESSIONS_DIR="$D/sessions" CCTRL_CLAUDE_SETTINGS="$D/home/.claude/settings.json" \
     PATH="$D/bin:$PATH"

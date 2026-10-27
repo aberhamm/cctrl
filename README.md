@@ -1440,8 +1440,10 @@ rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell
 - While enabled, `peer send` defaults to `--deliver` only for a recipient the
   bell is enabled for (its name in `peers`, or its role in `roles`) whose role
   is in `deliver_default_roles`, and only while its Claude pane is idle (not
-  working, no modal, no unsent draft). A busy recipient gets a plain send,
-  and its Stop bell rings at the end of the turn. A default delivery that
+  working, no modal, no unsent draft). A working recipient gets a plain send,
+  and its Stop bell rings at the end of the turn; a recipient waiting on a
+  question/modal or holding an unsent draft also gets a plain send, but no Stop
+  is pending, so the mail stays queued with no bell and no nudge until its next Stop. A default delivery that
   still cannot reach the pane exits 0 (`deliver_default: true`, a `warning`):
   the message is queued; do not re-send. An explicit `--deliver` keeps its
   old behaviour and exit codes; `--no-deliver` opts out. `peer watch` ignores
