@@ -9970,7 +9970,7 @@ _peer_doorbell_eval_inner() {
     # 4. Live name from the hook's own pane. A %N pane id is exact: no prefix
     # match is possible (a bare -t NAME would resolve TMUX--x to TMUX--x--2).
     local display
-    display="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}|#{session_created}|#{pane_pid}|#{@cctrl_managed}' 2>/dev/null)" || return 0
+    display="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}|#{session_created}|#{pane_pid}|#{@cctrl_managed}' 2>/dev/null)" || return 0  # tmux-target:exact-id (TMUX_PANE is validated as %N above)
     IFS='|' read -r live_name session_created pane_pid managed <<< "$display"
     [[ -n "$live_name" && "$pane_pid" =~ ^[0-9]+$ ]] || return 0
     [[ "$live_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 0
