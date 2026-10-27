@@ -10394,6 +10394,131 @@ test_doorbell_fast_path_call_budget() {
     echo "ok: fast path = one exact display-message, no list-sessions/list-panes"
 }
 
+test_peer_send_default_deliver_gated() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/send-default-deliver" log="$TMPDIR/send-default-deliver.log" out
+    : > "$log"
+    setup_delivery_peers "$data"   # comet has session TMUX--comet
+    # comet is a manual peer bound to TMUX--comet; the role comes from that
+    # session's recorded metadata.
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--comet.json"
+    # No doorbell.json: unchanged plain send (queued, no delivery attempt).
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- one)"
+    jq -e '.outcome == null and .status == "queued"' <<< "$out" >/dev/null || fail "no doorbell.json: send must stay plain: $out"
+    printf '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":[],"roles":[]}\n' > "$data/doorbell.json"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- two)"
+    jq -e '.outcome == "sent-and-nudged"' <<< "$out" >/dev/null || fail "enabled doorbell + live orchestrator: send must deliver: $out"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --no-deliver --json -- three)"
+    jq -e '.outcome == null and .status == "queued"' <<< "$out" >/dev/null || fail "--no-deliver must only queue: $out"
+    # A worker recipient keeps the plain send.
+    printf '{"role":"worker"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--comet.json"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- four)"
+    jq -e '.outcome == null' <<< "$out" >/dev/null || fail "worker recipient must not default to deliver: $out"
+    local rc=0
+    PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --no-deliver -- x >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--deliver with --no-deliver must exit 64"
+    echo "ok: send defaults to --deliver only for live orchestrators with the doorbell enabled"
+}
+
+test_peer_watch_since_floor() {
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/watch-since" out
+    setup_delivery_peers "$data"
+    CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC=2026-01-01T00:00:00Z "$ROOT/cctrl" peer send comet --from orchestrator --no-deliver -- old >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --dry-run --force --since 2026-06-01T00:00:00Z --json)"
+    jq -e '(.results | length) == 0' <<< "$out" >/dev/null || fail "pre-floor mail must not select a recipient: $out"
+    printf '{"enabled":true,"baseline_at":"2026-06-01T00:00:00Z"}\n' > "$data/doorbell.json"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --dry-run --force --json)"
+    jq -e '(.results | length) == 0' <<< "$out" >/dev/null || fail "baseline_at must be the default floor: $out"
+    CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC=2026-07-01T00:00:00Z "$ROOT/cctrl" peer send comet --from orchestrator --no-deliver -- new >/dev/null
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --dry-run --force --json)"
+    jq -e '[.results[] | .peer // .to] | index("comet") != null' <<< "$out" >/dev/null || fail "post-floor mail must select its recipient: $out"
+    rm -f "$data/doorbell.json"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --dry-run --force --json)"
+    jq -e '(.results | length) >= 1' <<< "$out" >/dev/null || fail "no floor without doorbell.json (back-compat): $out"
+    local rc=0
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer watch --once --since yesterday >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "bad --since must exit 64"
+    echo "ok: peer watch --since (default baseline_at) never nudges the backlog"
+}
+
+test_peer_doorbell_enable_disable_status() {
+    local data="$TMPDIR/doorbell-cmd" out h1 h2 settings="$TMPDIR/doorbell-cmd-settings.json"
+    mkdir -p "$data"
+    printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cctrl hooks run stop"}]}]}}\n' > "$settings"
+    export CCTRL_DATA_DIR="$data" CCTRL_CLAUDE_SETTINGS="$settings"
+    out="$("$ROOT/cctrl" peer doorbell enable --peer TMUX--ms--orch-x --dry-run --json)"
+    [[ ! -e "$data/doorbell.json" ]] || fail "--dry-run must write nothing"
+    jq -e '.dry_run == true and .config.enabled == true and .config.peers == ["TMUX--ms--orch-x"]' <<< "$out" >/dev/null || fail "dry-run output: $out"
+    CCTRL_NOW_UTC=2026-10-27T10:00:00Z "$ROOT/cctrl" peer doorbell enable --peer TMUX--ms--orch-x --json >/dev/null
+    jq -e '.enabled == true and .baseline_at == "2026-10-27T10:00:00Z" and .peers == ["TMUX--ms--orch-x"] and .roles == []
+        and .mode == "blocking" and .deliver_default_roles == ["orchestrator","fleet-manager"]' "$data/doorbell.json" >/dev/null \
+        || fail "enable wrote the wrong file: $(cat "$data/doorbell.json")"
+    [[ "$(stat -f '%Lp' "$data/doorbell.json" 2>/dev/null || stat -c '%a' "$data/doorbell.json")" == "600" ]] || fail "doorbell.json must be mode 600"
+    CCTRL_NOW_UTC=2026-10-28T10:00:00Z "$ROOT/cctrl" peer doorbell enable --role orchestrator --role fleet-manager >/dev/null
+    jq -e '.baseline_at == "2026-10-27T10:00:00Z" and .peers == ["TMUX--ms--orch-x"] and .roles == ["fleet-manager","orchestrator"]' "$data/doorbell.json" >/dev/null \
+        || fail "re-enable must keep baseline_at and merge lists: $(cat "$data/doorbell.json")"
+    local rc=0
+    "$ROOT/cctrl" peer doorbell enable --role boss >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "unknown role must exit 64"
+    h1="$(shasum "$data/doorbell.json")"
+    out="$("$ROOT/cctrl" peer doorbell status --json --backlog)"
+    h2="$(shasum "$data/doorbell.json")"
+    [[ "$h1" == "$h2" ]] || fail "status must be read-only"
+    jq -e '.enabled == true and .stop_registered == true and (.backlog | type) == "array"' <<< "$out" >/dev/null || fail "status json: $out"
+    "$ROOT/cctrl" peer doorbell disable >/dev/null
+    jq -e '.enabled == false and .baseline_at == "2026-10-27T10:00:00Z"' "$data/doorbell.json" >/dev/null || fail "disable must flip enabled only"
+    out="$("$ROOT/cctrl" peer doorbell status --json)"
+    jq -e '.enabled == false and .configured == true' <<< "$out" >/dev/null || fail "status after disable: $out"
+    echo "ok: peer doorbell enable (--dry-run, baseline once, merge) / disable / status (read-only)"
+}
+
+test_doorbell_registered_structural() {
+    local s="$TMPDIR/reg-settings.json" out
+    export CCTRL_DATA_DIR="$TMPDIR/reg-data" CCTRL_CLAUDE_SETTINGS="$s"
+    mkdir -p "$CCTRL_DATA_DIR"
+    _reg() { "$ROOT/cctrl" peer doorbell status --json | jq -r '"\(.stop_registered)|\(.stop_registered_reason // "")"'; }
+    printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cctrl hooks run stop"},{"type":"command","command":"/x/timeline-stop-hook"}]}]}}\n' > "$s"
+    [[ "$(_reg)" == "true|" ]] || fail "active Stop dispatcher must count as registered"
+    printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/Users/x/.local/bin/cctrl hooks run stop"}]}]}}\n' > "$s"
+    [[ "$(_reg)" == "true|" ]] || fail "absolute path to cctrl must count"
+    printf '{"hooks":{"OtherEvent":[{"hooks":[{"type":"command","command":"cctrl hooks run stop"}]}]}}\n' > "$s"
+    [[ "$(_reg)" == false\|* ]] || fail "an OtherEvent-only entry must not count"
+    printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo cctrl hooks run stop # peer-doorbell.sh x"}]}]},"note":"peer-doorbell.sh"}\n' > "$s"
+    [[ "$(_reg)" == false\|* ]] || fail "a filename mention must not count (structural check)"
+    rm -f "$s"
+    [[ "$(_reg)" == "false|settings file not found"* ]] || fail "absent settings = not registered with a reason"
+    printf '{bad' > "$s"
+    [[ "$(_reg)" == "false|settings file is not valid JSON"* ]] || fail "malformed settings = not registered with a reason"
+    out="$("$ROOT/cctrl" peer doctor --json)"
+    jq -e '(.checks[] | select(.name == "doorbell_hook_registered") | .ok == false and (.remedy | contains("cctrl hooks install")))
+        and (.checks[] | select(.name == "doorbell_enabled") | .ok == true and .enabled == false)' <<< "$out" >/dev/null \
+        || fail "doctor must report registration with a remedy and doorbell_enabled: $out"
+    echo "ok: Stop registration check is structural; doctor reports remedy + doorbell_enabled"
+}
+
+test_doorbell_settings_untouched() {
+    # Plan 044's verification, kept: the doorbell tests never read or write the
+    # real settings. HOME is a temp dir; the real file's hash is compared too.
+    local real="$CCTRL_TEST_REAL_HOME/.claude/settings.json" before="" after=""
+    [[ -n "${CCTRL_TEST_REAL_HOME:-}" && -f "$real" ]] && before="$(shasum "$real")"
+    _bell_fixture "$TMPDIR/bell-settings"
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    _bell_enable "$_bell_cfg_default"
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "fixture bell should ring"
+    "$BELL_DIR/cctrl" peer doorbell status --json >/dev/null
+    "$BELL_DIR/cctrl" peer doorbell enable --peer TMUX--t-a >/dev/null
+    "$BELL_DIR/cctrl" peer doorbell disable >/dev/null
+    [[ "$HOME" == "$BELL_DIR/home" ]] || fail "fixture must run with a temp HOME"
+    [[ "$(cat "$BELL_DIR/home/.claude/settings.json")" == '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cctrl hooks run stop"}]}]}}' ]] \
+        || fail "fixture settings must be untouched"
+    [[ -n "$before" ]] && after="$(shasum "$real")"
+    [[ "$before" == "$after" ]] || fail "real settings.json changed"
+    echo "ok: doorbell code paths never touch settings.json"
+}
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"

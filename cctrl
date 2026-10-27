@@ -7205,7 +7205,7 @@ _peer_cmd_send_impl() {
     shift
     local requested_to="$to"
 
-    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false sender_host_override="" impersonate=false
+    local from="" as_identity="" subject="" body="" body_file="" json=false allow_unknown=false saw_body=false deliver=false no_deliver=false sender_host_override="" impersonate=false
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -7228,6 +7228,8 @@ _peer_cmd_send_impl() {
                 allow_unknown=true; shift ;;
             --deliver)
                 deliver=true; shift ;;
+            --no-deliver)
+                no_deliver=true; shift ;;
             --impersonate)
                 impersonate=true; shift ;;
             --json)
@@ -7271,6 +7273,18 @@ _peer_cmd_send_impl() {
     if ! $saw_body; then
         $json && _json_error "validation" "peer send needs --body-file or a body after --." || echo -e "${RED}peer send needs --body-file or a body after --.${RESET}" >&2
         return 64
+    fi
+
+    if $deliver && $no_deliver; then
+        $json && _json_error "validation" "Use either --deliver or --no-deliver, not both." || echo -e "${RED}Use either --deliver or --no-deliver, not both.${RESET}" >&2
+        return 64
+    fi
+    # Plan 108 (D4a): while the doorbell is enabled, a send to a live
+    # orchestrator / fleet manager defaults to --deliver: an idle recipient is
+    # nudged now, a busy one is deferred and the Stop bell catches it at the
+    # end of its turn. --no-deliver opts out. Inert without doorbell.json.
+    if ! $deliver && ! $no_deliver && ! $allow_unknown && _peer_doorbell_send_defaults_deliver "$to"; then
+        deliver=true
     fi
 
     # `--deliver` (plan 027): send, then attempt delivery, then classify the
@@ -8962,7 +8976,9 @@ _peer_send_and_deliver() {
     # all of send's resolution/validation/sender-snapshot with zero duplication.
     # Body flows via --body-file - so an arbitrary body (leading dashes, newlines)
     # can never be mis-parsed as a flag.
-    send_out="$(printf '%s' "$body" | _peer_cmd_send "$to" ${send_flags[@]+"${send_flags[@]}"} --body-file - --json)" || send_rc=$?
+    # --no-deliver: the inner send must stay plain even while the doorbell's
+    # deliver default (plan 108) is on, or it would recurse into this function.
+    send_out="$(printf '%s' "$body" | _peer_cmd_send "$to" ${send_flags[@]+"${send_flags[@]}"} --no-deliver --body-file - --json)" || send_rc=$?
     PEER_SD_SEND_JSON="$send_out"
     if [[ $send_rc -ne 0 ]]; then
         PEER_SD_OUTCOME="send-failed"
@@ -9446,10 +9462,13 @@ _peer_cmd_status() {
 }
 
 _peer_stale_recipients_json() {
-    local messages="$1" older_seconds="$2" now_epoch="$3"
-    jq -c --argjson older "$older_seconds" --argjson now "$now_epoch" '
+    # $4 (plan 108): optional ISO floor; only queued mail created after it
+    # selects a recipient, so `peer watch` never nudges the old backlog.
+    local messages="$1" older_seconds="$2" now_epoch="$3" since="${4:-}"
+    jq -c --argjson older "$older_seconds" --argjson now "$now_epoch" --arg since "$since" '
         [ .[]
           | select(.status == "queued")
+          | select($since == "" or ((.created_at // "") > $since))
           | select(
               (.last_nudge_at // "") == ""
               or ((try ((.last_nudge_at | fromdateiso8601 | floor)) catch 0) as $last | ($now - $last) >= $older)
@@ -9666,7 +9685,7 @@ _peer_watch_pass() {
         _mailbox_read_json_or_error true || lock_rc=$?
         if [[ $lock_rc -eq 0 ]]; then
             messages="$MAILBOX_MESSAGES"
-            recipients="$(_peer_stale_recipients_json "$messages" "$renudge_seconds" "$now_epoch")"
+            recipients="$(_peer_stale_recipients_json "$messages" "$renudge_seconds" "$now_epoch" "${PEER_WATCH_SINCE:-}")"
             delivered="$(_peer_delivered_stale_json "$messages" "$renudge_seconds" "$now_epoch")"
             _peer_orchestrate_recipients_locked "$messages" "$recipients" "$dry_run" false "$force_busy" true "$fail_threshold" "$backoff_seconds" true
             results="$PEER_ORCH_RESULTS"
@@ -9694,7 +9713,7 @@ _peer_watch_pass() {
 }
 
 _peer_cmd_watch() {
-    local once=false force=false interval="" max_passes="" renudge_arg="15m" backoff_arg="10m" dry_run=false json=false force_busy=false fail_threshold=3
+    local once=false force=false interval="" max_passes="" renudge_arg="15m" backoff_arg="10m" dry_run=false json=false force_busy=false fail_threshold=3 since="" since_set=false
     local renudge_seconds=900 backoff_seconds=600 pass=0 lock_rc rc=0 summary
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
@@ -9724,6 +9743,9 @@ _peer_cmd_watch() {
                 json=true; shift ;;
             --force-busy)
                 force_busy=true; shift ;;
+            --since)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || { $json && _json_error "validation" "--since needs an ISO UTC time (YYYY-MM-DDTHH:MM:SSZ)" || echo -e "${RED}--since needs an ISO UTC time (YYYY-MM-DDTHH:MM:SSZ)${RESET}" >&2; return 64; }
+                since="$2"; since_set=true; shift 2 ;;
             *)
                 $json && _json_error "validation" "Unknown peer watch flag: $1" || echo -e "${RED}Unknown peer watch flag: $1${RESET}" >&2
                 return 64 ;;
@@ -9741,6 +9763,11 @@ _peer_cmd_watch() {
     if [[ "$once" != "true" && -z "$interval" ]]; then
         once=true
     fi
+    # Plan 108: default floor = the doorbell baseline, when one exists.
+    if ! $since_set; then
+        since="$(jq -r '.baseline_at // empty' <<< "$(_peer_doorbell_cfg_json)" 2>/dev/null)" || since=""
+    fi
+    PEER_WATCH_SINCE="$since"
     if [[ "$force" == "true" && "$once" != "true" ]]; then
         $json && _json_error "validation" "--force is only valid with --once" || echo -e "${RED}--force is only valid with --once${RESET}" >&2
         return 64
@@ -10145,6 +10172,33 @@ _peer_cmd_doorbell() {
     esac
 }
 
+_peer_doorbell_send_defaults_deliver() { # to -> 0 when the send should default to --deliver
+    local to="$1" cfg roles peer_json role kind target
+    cfg="$(_peer_doorbell_cfg_json)"
+    [[ "$cfg" != "null" ]] || return 1
+    roles="$(jq -r 'select(.enabled == true) | (.deliver_default_roles // ["orchestrator", "fleet-manager"]) | map(tostring) | join(" ")' <<< "$cfg" 2>/dev/null)" || return 1
+    [[ -n "$roles" ]] || return 1
+    peer_json="$(_peer_resolve_json "$to" 2>/dev/null)" || return 1
+    _peer_has_capability "$peer_json" "tmux" || return 1
+    role="$(jq -r '.role // ""' <<< "$peer_json")"
+    kind="$(jq -r '.orch_kind // ""' <<< "$peer_json")"
+    target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
+    [[ -n "$target" ]] || return 1
+    if [[ -z "$role" ]]; then
+        # A manual peer bound to a session (e.g. a `fleet-manager` alias)
+        # carries no role of its own; use the session's recorded one.
+        local meta
+        meta="$(_session_metadata_file "$target" 2>/dev/null)" || meta=""
+        if [[ -n "$meta" && -f "$meta" ]]; then
+            { IFS= read -r role; IFS= read -r kind; } < <(jq -r '(.role // ""), (.orch_kind // "")' "$meta" 2>/dev/null)
+        fi
+    fi
+    [[ -n "$role" ]] || return 1
+    [[ " $roles " == *" $role "* || ( " $roles " == *" fleet-manager "* && "$role" == "orchestrator" && "$kind" == "fleet" ) ]] || return 1
+    command -v tmux >/dev/null 2>&1 || return 1
+    _tmux_run_with_timeout has-session -t "=$target" >/dev/null 2>&1
+}
+
 _peer_doorbell_write_locked() { # json -> atomic write, mode 600
     local f tmp
     f="$(_peer_doorbell_file)"
@@ -10533,7 +10587,8 @@ cmd_peer() {
             echo "  cctrl peer help-agent [--as NAME] [--json]"
             echo "                                     Agent contract: peer say (live) vs peer send (async); not auto-injected"
             echo "  cctrl peer overview [--as NAME] [--json]"
-            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver] [--impersonate] [--json] -- <body>"
+            echo "  cctrl peer send <to> [--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver|--no-deliver] [--impersonate] [--json] -- <body>"
+            echo "                                     With the doorbell enabled, sends to live orchestrator/fleet-manager peers deliver by default"
             echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--impersonate] [--json] -- <body>"
             echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"
             echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"
@@ -10545,7 +10600,8 @@ cmd_peer() {
             echo "  cctrl peer status [--json]"
             echo "  cctrl peer nudge <peer>|--stale [--older-than 15m] [--json] [--dry-run]"
             echo "  cctrl peer gc --older-than 7d [--status acked] [--dry-run] [--json]"
-            echo "  cctrl peer watch [--once|--interval N] [--max-passes N] [--dry-run] [--json]"
+            echo "  cctrl peer watch [--once|--interval N] [--max-passes N] [--since ISO] [--dry-run] [--json]"
+            echo "                                     --since defaults to doorbell.json baseline_at: older queued mail is never nudged"
             echo "  cctrl peer doctor [peer] [--json]"
             echo "  cctrl peer doorbell status [--json] [--backlog] | enable [--peer NAME]... [--role R]... [--dry-run] | disable"
             echo "                                     Stop-hook bell for new mail; off unless \$CCTRL_DATA_DIR/doorbell.json is enabled"
