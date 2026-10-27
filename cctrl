@@ -7605,9 +7605,12 @@ _peer_cmd_show() {
 }
 
 _peer_cmd_ack() {
-    local id="${1:-}" as_identity="" json=false identity messages result updated now rc=0 updated_message=""
-    [[ -n "$id" ]] || { echo -e "${RED}Usage: cctrl peer ack <message-id> [--as NAME] [--json]${RESET}" >&2; return 64; }
-    shift
+    # Plan 108 drain fix: `ack <id> [<id>...]` or `ack --all`. A single id keeps
+    # the original {message,status} contract (and its rc 64 on any refusal); a
+    # batch reports per-id outcomes {acked,noop,errors} and acks every valid id
+    # even when another one is refused (partial success, rc 64).
+    local as_identity="" json=false all=false identity messages now rc=0 batch_json="" updated
+    local -a ids=()
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -7616,79 +7619,115 @@ _peer_cmd_ack() {
                 as_identity="$2"; shift 2 ;;
             --json)
                 json=true; shift ;;
-            *)
+            --all)
+                all=true; shift ;;
+            -*)
                 $json && _json_error "validation" "Unknown peer ack flag: $1" || echo -e "${RED}Unknown peer ack flag: $1${RESET}" >&2
                 return 64 ;;
+            *)
+                ids+=("$1"); shift ;;
         esac
     done
+    if ! $all && [[ ${#ids[@]} -eq 0 ]]; then
+        echo -e "${RED}Usage: cctrl peer ack <message-id> [<message-id>...] | --all [--as NAME] [--json]${RESET}" >&2
+        return 64
+    fi
+    if $all && [[ ${#ids[@]} -gt 0 ]]; then
+        $json && _json_error "validation" "Use either --all or message ids, not both." || echo -e "${RED}Use either --all or message ids, not both.${RESET}" >&2
+        return 64
+    fi
     _mailbox_resolve_identity_for_mode "$as_identity" "$json" || return $?
     identity="$MAILBOX_RESOLVED_IDENTITY"
+    local ids_json
+    ids_json="$(printf '%s\n' ${ids[@]+"${ids[@]}"} | jq -R . | jq -sc 'map(select(. != ""))')"
 
     _mailbox_lock_acquire || return 1
     if ! {
         _mailbox_init
         _mailbox_read_json_or_error "$json" || rc=$?
-        if [[ $rc -ne 0 ]]; then
-            :
-        else
-        messages="$MAILBOX_MESSAGES"
-        result="$(jq -r --arg id "$id" --arg who "$identity" '
-            ([.[] | select(.id == $id)][0]) as $m
-            | if $m == null then "missing"
-              elif $m.to != $who then "forbidden"
-              elif $m.status == "acked" then "noop"
-              elif $m.status == "queued" then "queued"
-              elif $m.status == "delivered" then "ack"
-              else "invalid:" + ($m.status // "unknown")
-              end
-        ' <<< "$messages")"
-        case "$result" in
-            missing)
-                $json && _json_error "validation" "Unknown message: $id" || echo -e "${RED}Unknown message: '$id'${RESET}" >&2
-                rc=64 ;;
-            forbidden)
-                $json && _json_error "validation" "Message '$id' is not addressed to '$identity'." || echo -e "${RED}Message '$id' is not addressed to '$identity'.${RESET}" >&2
-                rc=64 ;;
-            queued)
-                $json && _json_error "validation" "Message '$id' is still queued; receive it first (cctrl peer recv)." || echo -e "${RED}Message '$id' is still queued; receive it first (cctrl peer recv).${RESET}" >&2
-                rc=64 ;;
-            invalid:*)
-                $json && _json_error "validation" "Message '$id' cannot be acked from status '${result#invalid:}'." || echo -e "${RED}Message '$id' cannot be acked from status '${result#invalid:}'.${RESET}" >&2
-                rc=64 ;;
-            noop)
-                updated_message="$(jq --arg id "$id" '[.[] | select(.id == $id)][0]' <<< "$messages")"
-                rc=0 ;;
-            ack)
-                now="$(_peer_now_utc)"
-                updated="$(jq --arg id "$id" --arg who "$identity" --arg now "$now" '
-                    map(
-                      if .id == $id then
-                        .status = "acked"
-                        | .updated_at = $now
-                        | .acked_at = $now
+        if [[ $rc -eq 0 ]]; then
+            messages="$MAILBOX_MESSAGES"
+            now="$(_peer_now_utc)"
+            # One pass classifies every requested id and applies the acks.
+            batch_json="$(jq -c --argjson ids "$ids_json" --argjson all "$(_peer_json_bool "$all")" --arg who "$identity" --arg now "$now" '
+                . as $msgs
+                | (if $all then [$msgs[] | select(.to == $who and .status == "delivered") | .id] else $ids end) as $want
+                | [ $want[] as $id
+                    | ([$msgs[] | select(.id == $id)][0]) as $m
+                    | {id: $id, outcome:
+                        (if $m == null then "missing"
+                         elif $m.to != $who then "forbidden"
+                         elif $m.status == "acked" then "noop"
+                         elif $m.status == "queued" then "queued"
+                         elif $m.status == "delivered" then "ack"
+                         else "invalid:" + ($m.status // "unknown") end)} ] as $res
+                | ([$res[] | select(.outcome == "ack") | .id]) as $ack
+                | { res: $res,
+                    messages: ($msgs | map(if (.id as $i | $ack | index($i)) != null then
+                        .status = "acked" | .updated_at = $now | .acked_at = $now
                         | .history = ((.history // []) + [{at: $now, status: "acked", by: $who}])
-                      else . end
-                    )
-                ' <<< "$messages")"
-                _mailbox_rewrite_json_locked "$updated"
-                updated_message="$(jq --arg id "$id" '[.[] | select(.id == $id)][0]' <<< "$updated")"
-                rc=0 ;;
-        esac
+                      else . end)),
+                    changed: ($ack | length > 0) }
+            ' <<< "$messages")" || rc=1
+            if [[ $rc -eq 0 ]] && [[ "$(jq -r '.changed' <<< "$batch_json")" == "true" ]]; then
+                _mailbox_rewrite_json_locked "$(jq -c '.messages' <<< "$batch_json")"
+            fi
         fi
     }; then
         rc=1
     fi
     _mailbox_lock_release
     [[ $rc -eq 0 ]] || return $rc
-    if $json; then
-        jq -n --argjson message "$updated_message" '{message:$message,status:$message.status}'
-    else
-        echo -e "${GREEN}Acked message: $id${RESET}"
+    updated="$(jq -c '.messages' <<< "$batch_json")"
+
+    if ! $all && [[ ${#ids[@]} -eq 1 ]]; then
+        local id="${ids[0]}" result
+        result="$(jq -r '.res[0].outcome' <<< "$batch_json")"
+        case "$result" in
+            missing)
+                $json && _json_error "validation" "Unknown message: $id" || echo -e "${RED}Unknown message: '$id'${RESET}" >&2
+                return 64 ;;
+            forbidden)
+                $json && _json_error "validation" "Message '$id' is not addressed to '$identity'." || echo -e "${RED}Message '$id' is not addressed to '$identity'.${RESET}" >&2
+                return 64 ;;
+            queued)
+                $json && _json_error "validation" "Message '$id' is still queued; receive it first: cctrl peer recv --all --as $identity" || echo -e "${RED}Message '$id' is still queued; receive it first: cctrl peer recv --all --as $identity${RESET}" >&2
+                return 64 ;;
+            invalid:*)
+                $json && _json_error "validation" "Message '$id' cannot be acked from status '${result#invalid:}'." || echo -e "${RED}Message '$id' cannot be acked from status '${result#invalid:}'.${RESET}" >&2
+                return 64 ;;
+        esac
+        if $json; then
+            jq -c --arg id "$id" '[.[] | select(.id == $id)][0]' <<< "$updated" | jq '{message:., status:.status}'
+        else
+            echo -e "${GREEN}Acked message: $id${RESET}"
+        fi
+        return 0
     fi
+
+    local report errors
+    report="$(jq --arg peer "$identity" '
+        def reason:
+          if . == "missing" then "unknown message"
+          elif . == "forbidden" then "not addressed to \($peer)"
+          elif . == "queued" then "still queued; receive it first: cctrl peer recv --all --as \($peer)"
+          else "cannot be acked from status \(ltrimstr("invalid:"))" end;
+        { peer: $peer,
+          acked: [.res[] | select(.outcome == "ack") | .id],
+          noop: [.res[] | select(.outcome == "noop") | .id],
+          errors: [.res[] | select(.outcome != "ack" and .outcome != "noop") | {id, reason: (.outcome | reason)}] }
+    ' <<< "$batch_json")"
+    errors="$(jq -r '.errors | length' <<< "$report")"
+    if $json; then
+        printf '%s\n' "$report"
+    else
+        jq -r '"Acked: \(.acked | length)  Already acked: \(.noop | length)  Errors: \(.errors | length)", (.errors[] | "  \(.id): \(.reason)")' <<< "$report"
+    fi
+    [[ "$errors" -eq 0 ]] || return 64
 }
 
 _peer_cmd_check() {
-    local as_identity="" json=false exit_on_empty=false identity messages queued delivered oldest_age
+    local as_identity="" json=false exit_on_empty=false identity messages counts queued delivered blocked oldest_age guard
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -7708,19 +7747,30 @@ _peer_cmd_check() {
     identity="$MAILBOX_RESOLVED_IDENTITY"
     _mailbox_read_json_or_error "$json" || return $?
     messages="$MAILBOX_MESSAGES"
-    queued="$(jq -r --arg who "$identity" '[.[] | select(.to == $who and .status == "queued")] | length' <<< "$messages")"
-    delivered="$(jq -r --arg who "$identity" '[.[] | select(.to == $who and .status == "delivered")] | length' <<< "$messages")"
-    oldest_age="$(jq -r --arg who "$identity" '
-        [ .[] | select(.to == $who and .status == "queued") | .created_at ]
-        | if length == 0 then null
-          else ((now - (min | fromdateiso8601)) | floor)
-          end
-    ' <<< "$messages")"
+    # Plan 108: count with the same addressee guard recv applies, so a recycled
+    # name never reports mail it can never receive. Read-only: guard-failing
+    # mail is only counted as blocked_by_guard, never re-statused here.
+    guard="$(_peer_guard_defs)"
+    counts="$(jq -c --arg who "$identity" --arg peer "${MAILBOX_RESOLVED_PEER_CREATED:-}" --arg provider "${MAILBOX_RESOLVED_PROVIDER_ID:-}" "$guard"'
+        [.[] | select(.to == $who and (.status == "queued" or .status == "delivered"))] as $mine
+        | [$mine[] | select(deliverable_provider($peer;$provider))] as $ok
+        | { queued: ([$ok[] | select(.status == "queued")] | length),
+            delivered: ([$ok[] | select(.status == "delivered")] | length),
+            blocked: (($mine | length) - ($ok | length)),
+            age: ([$ok[] | select(.status == "queued") | .created_at]
+                  | if length == 0 then null else ((now - (min | fromdateiso8601)) | floor) end) }
+    ' <<< "$messages")" || return 1
+    queued="$(jq -r '.queued' <<< "$counts")"
+    delivered="$(jq -r '.delivered' <<< "$counts")"
+    blocked="$(jq -r '.blocked' <<< "$counts")"
+    oldest_age="$(jq -r '.age' <<< "$counts")"
     if $json; then
-        jq -n --arg peer "$identity" --argjson queued "$queued" --argjson delivered "$delivered" --argjson age "$oldest_age" \
-            '{peer:$peer,queued:$queued,delivered_unacked:$delivered,oldest_queued_age_seconds:$age}'
+        jq -n --arg peer "$identity" --argjson queued "$queued" --argjson delivered "$delivered" --argjson age "$oldest_age" --argjson blocked "$blocked" \
+            '{peer:$peer,queued:$queued,delivered_unacked:$delivered,oldest_queued_age_seconds:$age,blocked_by_guard:$blocked}'
     else
         printf 'Peer: %s\nQueued: %s\nDelivered unacked: %s\nOldest queued age seconds: %s\n' "$identity" "$queued" "$delivered" "$oldest_age"
+        [[ "$blocked" -eq 0 ]] || printf 'Blocked by addressee guard: %s\n' "$blocked"
+        [[ "$queued" -eq 0 ]] || printf 'Receive them all: cctrl peer recv --all --as %s\n' "$identity"
     fi
     if $exit_on_empty && (( queued == 0 && delivered == 0 )); then
         return 2
@@ -7728,7 +7778,14 @@ _peer_cmd_check() {
 }
 
 _peer_cmd_recv() {
-    local as_identity="" status_csv="" json=false exit_on_empty=false identity statuses messages selected_id selected updated rc=0
+    # Plain recv returns ONE message, oldest queued first. Plan 108 drain fix:
+    # - `--all` / `--limit N` flip every (or the first N) guard-passing queued
+    #   message to delivered under one lock and return them as an array;
+    # - plain recv no longer falls back to re-returning the oldest delivered
+    #   message once the queue is empty (that made "recv until empty" loop
+    #   forever); pass `--status delivered` to re-read delivered mail.
+    local as_identity="" status_csv="" json=false exit_on_empty=false all=false limit="" identity statuses messages selected_id selected updated rc=0
+    local batch="" batch_ids
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -7738,6 +7795,11 @@ _peer_cmd_recv() {
             --status)
                 [[ $# -ge 2 ]] || { $json && _json_error "validation" "--status needs a value" || echo -e "${RED}--status needs a value${RESET}" >&2; return 64; }
                 status_csv="$2"; shift 2 ;;
+            --all)
+                all=true; shift ;;
+            --limit)
+                [[ $# -ge 2 ]] || { $json && _json_error "validation" "--limit needs a number" || echo -e "${RED}--limit needs a number${RESET}" >&2; return 64; }
+                limit="$2"; shift 2 ;;
             --json)
                 json=true; shift ;;
             --exit-on-empty)
@@ -7747,16 +7809,54 @@ _peer_cmd_recv() {
                 return 64 ;;
         esac
     done
+    if [[ -n "$limit" ]] && ! [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 ]]; then
+        $json && _json_error "validation" "--limit must be a whole number >= 1" || echo -e "${RED}--limit must be a whole number >= 1${RESET}" >&2
+        return 64
+    fi
+    if $all && [[ -n "$limit" ]]; then
+        $json && _json_error "validation" "Use either --all or --limit, not both." || echo -e "${RED}Use either --all or --limit, not both.${RESET}" >&2
+        return 64
+    fi
+    [[ -n "$limit" ]] && batch="$limit"
+    $all && batch=0
     _mailbox_resolve_identity_for_mode "$as_identity" "$json" || return $?
     identity="$MAILBOX_RESOLVED_IDENTITY"
     local peer_created="$MAILBOX_RESOLVED_PEER_CREATED" guard
     guard="$(_peer_guard_defs)"
-    statuses="$(_mailbox_status_filter_json "$status_csv" "queued,delivered")"
+    statuses="$(_mailbox_status_filter_json "$status_csv" "queued")"
 
     _mailbox_lock_acquire || return 1
     if ! {
         _mailbox_read_json_or_error "$json" || rc=$?
-        if [[ $rc -eq 0 ]]; then
+        if [[ $rc -eq 0 && -n "$batch" ]]; then
+            messages="$MAILBOX_MESSAGES"
+            # Oldest first by created_at, file order breaking ties. Same guard
+            # as the single path below.
+            batch_ids="$(jq -c --arg who "$identity" --arg peer "$peer_created" --arg provider "${MAILBOX_RESOLVED_PROVIDER_ID:-}" --argjson statuses "$statuses" --argjson limit "$batch" "$guard"'
+                def allowed($s): ($statuses | index($s)) != null;
+                [ to_entries[]
+                  | select(.value.to == $who and allowed(.value.status) and (.value | deliverable_provider($peer;$provider)))
+                  | {k: .key, c: (.value.created_at // ""), id: .value.id} ]
+                | sort_by(.c, .k) | map(.id)
+                | if $limit > 0 then .[:$limit] else . end
+            ' <<< "$messages")" || rc=1
+            if [[ $rc -eq 0 ]]; then
+                local now
+                now="$(_peer_now_utc)"
+                updated="$(jq -c --argjson ids "$batch_ids" --arg who "$identity" --arg now "$now" '
+                    map(if (.status == "queued" and (.id as $i | $ids | index($i)) != null) then
+                          .status = "delivered" | .updated_at = $now | .delivered_at = $now
+                          | .history = ((.history // []) + [{at: $now, status: "delivered", by: $who}])
+                        else . end)
+                ' <<< "$messages")" || rc=1
+                if [[ $rc -eq 0 ]]; then
+                    if [[ "$(jq -r 'length' <<< "$batch_ids")" -gt 0 ]] && [[ -n "$(jq -r --argjson ids "$batch_ids" '[.[] | select(.status == "queued" and (.id as $i | $ids | index($i)) != null)] | .[0].id // empty' <<< "$messages")" ]]; then
+                        _mailbox_rewrite_json_locked "$updated"
+                    fi
+                    selected="$(jq -c --argjson ids "$batch_ids" '[$ids[] as $i | (.[] | select(.id == $i))]' <<< "$updated")"
+                fi
+            fi
+        elif [[ $rc -eq 0 ]]; then
             messages="$MAILBOX_MESSAGES"
             # Addressee guard: never read out a message whose current occupant
             # post-dates it (a recycled name). recv is the primary body-handover
@@ -7797,6 +7897,24 @@ _peer_cmd_recv() {
     _mailbox_lock_release
     [[ $rc -eq 0 ]] || return $rc
 
+    if [[ -n "$batch" ]]; then
+        local count
+        count="$(jq -r 'length' <<< "$selected")"
+        if $json; then
+            jq --arg peer "$identity" '{peer:$peer, messages:., count:length, empty:(length == 0)}' <<< "$selected"
+        elif [[ "$count" -eq 0 ]]; then
+            echo "No messages."
+        else
+            jq -c '.[]' <<< "$selected" | while IFS= read -r one; do
+                jq '.' <<< "$one" | _peer_print_human
+                echo ""
+            done
+            echo "Received $count message(s). Ack what you handled: cctrl peer ack --all --as $identity"
+        fi
+        [[ "$count" -eq 0 ]] && $exit_on_empty && return 2
+        return 0
+    fi
+
     if [[ "$selected" == "null" ]]; then
         if $json; then
             jq -n '{message:null,empty:true}'
@@ -7815,7 +7933,9 @@ _peer_cmd_recv() {
 
 _peer_nudge_line() {
     local peer="$1" count="$2"
-    printf '[cctrl] %s new peer message(s) for %s. Run: cctrl peer recv --as %s --json' "$count" "$peer" "$peer"
+    # Plan 108: one drain instruction for nudges and the Stop doorbell. Never
+    # "recv until empty"; recv --all takes the whole queue in one call.
+    printf '[cctrl] %s new peer message(s) for %s. Read them all: cctrl peer recv --all --as %s --json ; then ack what you handled: cctrl peer ack --all --as %s  (or: cctrl peer ack <id> <id> ... --as %s)' "$count" "$peer" "$peer" "$peer" "$peer"
 }
 
 # Sender envelope prepended to inline peer delivery (plan 024). Renders a compact
@@ -9067,7 +9187,7 @@ _peer_cmd_reply() {
 
     msg_status="$(jq -r '.status // ""' <<< "$ref")"
     if [[ "$msg_status" == "queued" ]]; then
-        $json && _json_error "validation" "Message '$id' is still queued; receive it first (cctrl peer recv --as $identity)." || echo -e "${RED}Message '$id' is still queued; receive it first (cctrl peer recv --as $identity).${RESET}" >&2
+        $json && _json_error "validation" "Message '$id' is still queued; receive it first: cctrl peer recv --all --as $identity" || echo -e "${RED}Message '$id' is still queued; receive it first: cctrl peer recv --all --as $identity${RESET}" >&2
         _peer_all_json_cache_end
         return 64
     fi
@@ -10017,8 +10137,10 @@ cmd_peer() {
             echo "  cctrl peer reply <message-id> [--as NAME] [--subject TEXT] [--body-file PATH|-] [--no-ack] [--impersonate] [--json] -- <body>"
             echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"
             echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"
-            echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]"
-            echo "  cctrl peer recv [--as NAME] [--status queued,delivered] [--json] [--exit-on-empty]"
+            echo "  cctrl peer check [--as NAME] [--json] [--exit-on-empty]   (counts only mail recv can return)"
+            echo "  cctrl peer recv [--as NAME] [--all|--limit N] [--status queued,delivered] [--json] [--exit-on-empty]"
+            echo "                                     Plain recv = one queued message; --all drains the queue in one call."
+            echo "                                     Delivered mail is re-read only with --status delivered."
             echo "  cctrl peer deliver <peer|--all> [--dry-run] [--json] [--no-submit] [--inline ID] [--force-busy]"
             echo "  cctrl peer status [--json]"
             echo "  cctrl peer nudge <peer>|--stale [--older-than 15m] [--json] [--dry-run]"
@@ -10027,7 +10149,7 @@ cmd_peer() {
             echo "  cctrl peer doctor [peer] [--json]"
             echo "  cctrl peer mcp [--as NAME]"
             echo "  cctrl peer show <message-id> [--json]"
-            echo "  cctrl peer ack <message-id> [--as NAME] [--json]"
+            echo "  cctrl peer ack <message-id> [<message-id>...] | --all [--as NAME] [--json]"
             ;;
         *)
             echo -e "${RED}Unknown peer command: $action${RESET}" >&2

@@ -8475,7 +8475,7 @@ test_peer_mailbox_ack_authorization_and_states() {
     rc=0
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id" --as comet 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected ack of queued message to fail"
-    assert_contains "$out" "receive it first (cctrl peer recv)"
+    assert_contains "$out" "receive it first: cctrl peer recv --all --as"
     status="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$id" --json | jq -r '.status')"
     [[ "$status" == "queued" ]] || fail "expected queued status to remain queued"
 
@@ -9161,7 +9161,7 @@ test_peer_reply_ack_and_refusals() {
     rc=0
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer reply "$id" --as orchestrator -- "reply" 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected reply to queued original to fail"
-    assert_contains "$out" "receive it first (cctrl peer recv"
+    assert_contains "$out" "receive it first: cctrl peer recv --all"
 
     # --allow-unknown + --deliver is rejected.
     rc=0
@@ -9260,7 +9260,7 @@ test_peer_deliver_tmux_nudge_lifecycle() {
 
     before="$(cat "$data/messages.jsonl")"
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver comet --dry-run)"
-    assert_contains "$out" "[cctrl] 2 new peer message(s) for comet. Run: cctrl peer recv --as comet --json"
+    assert_contains "$out" "[cctrl] 2 new peer message(s) for comet. Read them all: cctrl peer recv --all --as comet --json"
     after="$(cat "$data/messages.jsonl")"
     [[ "$before" == "$after" ]] || fail "expected dry-run delivery to leave mailbox unchanged"
     assert_not_contains "$(cat "$log")" "load-buffer"
@@ -9974,6 +9974,109 @@ SH
     out="$(CCTRL_BIN="$fake" CCTRL_PEER=comet CCTRL_FAKE_CHECK=queued "$ROOT/hooks/peer-doorbell.sh" codex 2>&1)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "expected Codex notify doorbell to exit 0"
     assert_contains "$out" "cctrl peer recv --as comet --json"
+}
+
+# ── Plan 108: mailbox drain contract (recv --all/--limit, ack batch, check guard)
+
+_drain_setup() { # data-dir -> registers bob + carol, sends N messages to bob
+    local data="$1" n="$2" i
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register bob >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register carol >/dev/null
+    for ((i = 1; i <= n; i++)); do
+        CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send bob --from carol --subject "s$i" -- "body$i" >/dev/null \
+            || fail "drain setup: send $i failed"
+    done
+}
+
+test_peer_check_applies_guard() {
+    local data="$TMPDIR/check-guard" out
+    mkdir -p "$data"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register bob >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register carol >/dev/null
+    CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC=2026-01-01T00:00:00Z "$ROOT/cctrl" peer send bob --from carol -- old >/dev/null
+    # bob's name is now held by an occupant stamped after the old message.
+    jq '.bob.created_at = "2026-06-01T00:00:00Z"' "$data/peers.json" > "$data/p" && mv "$data/p" "$data/peers.json"
+    CCTRL_DATA_DIR="$data" CCTRL_NOW_UTC=2026-07-01T00:00:00Z "$ROOT/cctrl" peer send bob --from carol -- new >/dev/null
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as bob --json)"
+    jq -e '.queued == 1 and .blocked_by_guard == 1' <<< "$out" >/dev/null \
+        || fail "peer check must not count guard-blocked queued mail: $out"
+    jq -e 'select(.status == "queued") | .status' "$data/messages.jsonl" >/dev/null \
+        || fail "peer check must stay read-only"
+    [[ "$(jq -s '[.[] | select(.status == "queued")] | length' "$data/messages.jsonl")" -eq 2 ]] \
+        || fail "peer check re-statused mail"
+    echo "ok: peer check applies the addressee guard read-only"
+}
+
+test_peer_recv_all_and_limit() {
+    local data="$TMPDIR/recv-all" out
+    mkdir -p "$data"
+    _drain_setup "$data" 3
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --limit 2 --json)"
+    jq -e '.count == 2 and ([.messages[].subject] == ["s1","s2"]) and (.messages | all(.status == "delivered"))' <<< "$out" >/dev/null \
+        || fail "recv --limit 2 must return and flip the two oldest: $out"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --all --json)"
+    jq -e '.count == 1 and .messages[0].subject == "s3"' <<< "$out" >/dev/null \
+        || fail "recv --all must return the rest: $out"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --json)"
+    jq -e '.empty == true and .message == null' <<< "$out" >/dev/null \
+        || fail "plain recv after draining must be empty: $out"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --all --json)"
+    jq -e '.count == 0 and .empty == true' <<< "$out" >/dev/null || fail "recv --all on empty queue: $out"
+    local rc=0
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --limit 0 --json >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "recv --limit 0 must be rejected with 64, got $rc"
+    rc=0
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --all --limit 2 >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "recv --all --limit must be rejected with 64, got $rc"
+    echo "ok: recv --all / --limit drain in one call; no re-return after"
+}
+
+test_peer_recv_no_rereturn() {
+    local data="$TMPDIR/recv-noloop" out
+    mkdir -p "$data"
+    _drain_setup "$data" 1
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --json >/dev/null
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --json)"
+    jq -e '.empty == true' <<< "$out" >/dev/null || fail "plain recv re-returned delivered mail: $out"
+    local rc=0
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --exit-on-empty >/dev/null || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "recv --exit-on-empty must exit 2 once queued is empty, got $rc"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --status delivered --json)"
+    jq -e '.message.subject == "s1" and .message.status == "delivered"' <<< "$out" >/dev/null \
+        || fail "recv --status delivered must return the delivered message: $out"
+    echo "ok: plain recv never re-returns delivered mail; --status delivered still can"
+}
+
+test_peer_ack_multi_and_all() {
+    local data="$TMPDIR/ack-multi" out rc=0 id1 id2 id3 q
+    mkdir -p "$data"
+    _drain_setup "$data" 3
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --all --json >/dev/null
+    id1="$(jq -r 'select(.subject == "s1") | .id' "$data/messages.jsonl")"
+    id2="$(jq -r 'select(.subject == "s2") | .id' "$data/messages.jsonl")"
+    id3="$(jq -r 'select(.subject == "s3") | .id' "$data/messages.jsonl")"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id1" "$id2" --as bob --json)"
+    jq -e --arg a "$id1" --arg b "$id2" '.acked == [$a,$b] and .errors == []' <<< "$out" >/dev/null \
+        || fail "ack id1 id2 must ack both: $out"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack --all --as bob --json)"
+    jq -e --arg c "$id3" '.acked == [$c]' <<< "$out" >/dev/null || fail "ack --all must ack the rest: $out"
+    # A queued id in a batch is an error with the recv --all hint; the valid id is still acked.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send bob --from carol --subject s4 -- body4 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send bob --from carol --subject s5 -- body5 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --json >/dev/null
+    id1="$(jq -r 'select(.subject == "s4") | .id' "$data/messages.jsonl")"
+    q="$(jq -r 'select(.subject == "s5") | .id' "$data/messages.jsonl")"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id1" "$q" --as bob --json)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "ack with a queued id must exit 64, got $rc"
+    jq -e --arg a "$id1" --arg q "$q" '.acked == [$a] and (.errors | length == 1) and .errors[0].id == $q
+        and (.errors[0].reason | contains("cctrl peer recv --all --as bob"))' <<< "$out" >/dev/null \
+        || fail "ack batch partial success/hint wrong: $out"
+    [[ "$(jq -r --arg a "$id1" 'select(.id == $a) | .status' "$data/messages.jsonl")" == "acked" ]] \
+        || fail "valid id in a failing batch must still be acked"
+    # Single-id contract unchanged.
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$id1" --as bob --json)"
+    jq -e '.status == "acked" and .message.id != null' <<< "$out" >/dev/null || fail "single-id ack JSON shape changed: $out"
+    echo "ok: ack takes several ids or --all, reports per id, keeps the single-id shape"
 }
 
 test_session_close_self_graceful() {
