@@ -22,8 +22,8 @@ TOOLS = [
             "address these by their `name` in `send_message`), and `mailbox` (unread "
             "`queued` and `delivered_unacked` counts). From here: call `send_message` "
             "to start a conversation, or `recv_message` then `ack_message` to handle "
-            "incoming mail. When `mailbox.queued` or `delivered_unacked` is non-zero, "
-            "read the next message with `recv_message`. Takes no arguments; the "
+            "incoming mail. When `mailbox.queued` is non-zero, read every queued "
+            "message at once with `recv_message` `{\"all\": true}`. Takes no arguments; the "
             "identity is fixed at server startup. If tmux peer discovery is skipped, "
             "`peers` may be empty and `derived_skipped` is true, but `identity` and "
             "`mailbox` are still returned."
@@ -136,24 +136,30 @@ TOOLS = [
             "Return unread mailbox counts (`queued` and `delivered_unacked`) for this "
             "peer. `peer_overview` returns the same counts alongside your identity "
             "and peer list, so prefer it for a first orientation. When either count "
-            "is non-zero, call `recv_message` to read the next message."
+            "is non-zero, call `recv_message` with `all: true` to read them all."
         ),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "recv_message",
         "description": (
-            "Receive the next queued or delivered-unacked message addressed to this "
-            "peer (a queued message is marked delivered). The returned message "
-            "carries a `sender` object identifying who sent it: reply by calling "
-            "`send_message` with `to` set to `sender.name`. After you have handled "
-            "the message, call `ack_message` with its `id` — unacked messages keep "
-            "reappearing here and in `check_messages`. Use `peer_overview` or "
-            "`check_messages` first to see whether anything is waiting."
+            "Receive queued messages addressed to this peer; each one returned is "
+            "marked delivered. `all: true` returns EVERY queued message in one call "
+            "(`{messages, count, empty}`, oldest first); `limit: N` returns at most N. "
+            "With neither, it returns the next one (`{message, empty}`). Once the "
+            "queue is empty it returns empty: it never re-returns delivered mail "
+            "unless you pass `status: \"delivered\"`, so do not loop on it. Each "
+            "message carries a `sender` object: reply with `send_message` `to` = "
+            "`sender.name`. When handled, ack them all at once with `ack_message` "
+            "`{\"all\": true}` or `{\"ids\": [...]}`."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"status": {"type": "string"}},
+            "properties": {
+                "status": {"type": "string"},
+                "all": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1},
+            },
             "additionalProperties": False,
         },
     },
@@ -176,16 +182,20 @@ TOOLS = [
     {
         "name": "ack_message",
         "description": (
-            "Acknowledge a message (by `id`) that was delivered to this peer, marking "
-            "it handled so it stops appearing in `recv_message` and "
-            "`check_messages`. Acknowledge only after you have acted on the message "
-            "and sent any reply via `send_message`. A message must first be received "
+            "Acknowledge delivered messages, marking them handled so they leave "
+            "`check_messages`. Pass one `id`, several `ids`, or `all: true` (every "
+            "delivered message for this peer). A batch (2+ ids or all) returns `{acked, noop, errors}` "
+            "per id and still acks the valid ones. Acknowledge only after you have "
+            "acted on the mail and sent any reply. A message must be received "
             "(`recv_message`) before it can be acked."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "string"}},
-            "required": ["id"],
+            "properties": {
+                "id": {"type": "string"},
+                "ids": {"type": "array", "items": {"type": "string"}},
+                "all": {"type": "boolean"},
+            },
             "additionalProperties": False,
         },
     },
@@ -217,7 +227,7 @@ class Bridge:
             self._canonical = name
         return self._canonical
 
-    def cli(self, args: list[str], stdin: str | None = None) -> Any:
+    def cli(self, args: list[str], stdin: str | None = None, batch_report: bool = False) -> Any:
         proc = subprocess.run(
             [self.cctrl, *args],
             input=stdin,
@@ -229,6 +239,10 @@ class Bridge:
         stdout = proc.stdout.strip()
         if proc.returncode != 0:
             parsed = parse_json(stdout)
+            # A batch ack exits 64 on a partial failure but still acked the
+            # valid ids; its per-id report is the result, not an error.
+            if batch_report and isinstance(parsed, dict) and "acked" in parsed and "errors" in parsed:
+                return parsed
             if isinstance(parsed, dict) and parsed.get("ok") is False:
                 err = parsed.get("error") or {}
                 raise McpError(str(err.get("code") or "cctrl-error"), str(err.get("message") or proc.stderr.strip() or "cctrl command failed"))
@@ -326,11 +340,21 @@ class Bridge:
             ensure_no_extra(args, set())
             return ok(self.cli(["peer", "check", "--as", self.identity, "--json"]))
         if name == "recv_message":
-            ensure_no_extra(args, {"status"})
+            ensure_no_extra(args, {"status", "all", "limit"})
             status = optional_string(args, "status", "")
+            take_all = require_bool(args, "all", False)
+            limit = args.get("limit")
+            if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+                raise McpError("validation", "limit must be an integer >= 1")
+            if take_all and limit is not None:
+                raise McpError("validation", "Use either all or limit, not both.")
             cmd = ["peer", "recv", "--as", self.identity, "--json"]
             if status:
                 cmd.extend(["--status", status])
+            if take_all:
+                cmd.append("--all")
+            elif limit is not None:
+                cmd.extend(["--limit", str(limit)])
             return ok(self.cli(cmd))
         if name == "show_message":
             ensure_no_extra(args, {"id"})
@@ -343,7 +367,19 @@ class Bridge:
                 raise McpError("forbidden", f"Message {message_id} is not visible to {self.identity}")
             return ok(message)
         if name == "ack_message":
-            ensure_no_extra(args, {"id"})
+            ensure_no_extra(args, {"id", "ids", "all"})
+            take_all = require_bool(args, "all", False)
+            ids = args.get("ids")
+            single = args.get("id")
+            if ids is not None and (not isinstance(ids, list) or not ids or not all(isinstance(i, str) and i and not i.startswith("-") for i in ids)):
+                raise McpError("validation", "ids must be a non-empty list of message ids")
+            given = sum(x is not None and x is not False for x in (single, ids, take_all or None))
+            if given != 1:
+                raise McpError("validation", "Pass exactly one of id, ids, or all: true.")
+            if take_all:
+                return ok(self.cli(["peer", "ack", "--all", "--as", self.identity, "--json"], batch_report=True))
+            if ids is not None:
+                return ok(self.cli(["peer", "ack", *ids, "--as", self.identity, "--json"], batch_report=True))
             message_id = require_string(args, "id")
             return ok(self.cli(["peer", "ack", message_id, "--as", self.identity, "--json"]))
         raise McpError("unknown-tool", f"Unknown tool: {name}")

@@ -10519,6 +10519,36 @@ test_doorbell_settings_untouched() {
     echo "ok: doorbell code paths never touch settings.json"
 }
 
+test_peer_mcp_recv_all_ack_ids() {
+    local data="$TMPDIR/mcp-drain" out req id1 id2
+    mkdir -p "$data"
+    _drain_setup "$data" 3
+    _mcp_call() { # name args-json
+        req="$(jq -cn --arg n "$1" --argjson a "$2" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$n,arguments:$a}}')"
+        printf '%s\n' "$req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as bob
+    }
+    out="$(_mcp_call recv_message '{"limit":1}')"
+    jq -e '.result.structuredContent.data.count == 1' <<< "$out" >/dev/null || fail "MCP recv limit 1: $out"
+    out="$(_mcp_call recv_message '{"all":true}')"
+    jq -e '.result.structuredContent.data.count == 2 and ([.result.structuredContent.data.messages[].subject] == ["s2","s3"])' <<< "$out" >/dev/null \
+        || fail "MCP recv all: $out"
+    out="$(_mcp_call recv_message '{}')"
+    jq -e '.result.structuredContent.data.empty == true' <<< "$out" >/dev/null || fail "MCP plain recv after drain must be empty: $out"
+    id1="$(jq -r 'select(.subject == "s1") | .id' "$data/messages.jsonl")"
+    id2="$(jq -r 'select(.subject == "s2") | .id' "$data/messages.jsonl")"
+    out="$(_mcp_call ack_message "$(jq -cn --arg a "$id1" --arg b "$id2" '{ids:[$a,$b]}')")"
+    jq -e --arg a "$id1" --arg b "$id2" '.result.structuredContent.data.acked == [$a,$b]' <<< "$out" >/dev/null || fail "MCP ack ids: $out"
+    out="$(_mcp_call ack_message '{"all":true}')"
+    jq -e '(.result.structuredContent.data.acked | length) == 1' <<< "$out" >/dev/null || fail "MCP ack all: $out"
+    out="$(_mcp_call ack_message '{"ids":["nope","nope2"]}')"
+    jq -e '.result.isError != true and (.result.structuredContent.data.errors | map(.id)) == ["nope","nope2"]' <<< "$out" >/dev/null || fail "MCP batch ack partial report: $out"
+    out="$(_mcp_call ack_message '{"id":"x","all":true}')"
+    jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "MCP ack with id and all must be refused: $out"
+    out="$(_mcp_call ack_message '{"ids":["--all"]}')"
+    jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "MCP ack ids must not pass flags: $out"
+    echo "ok: MCP recv_message all/limit and ack_message ids/all"
+}
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"
