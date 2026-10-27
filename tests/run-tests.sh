@@ -10500,29 +10500,86 @@ test_doorbell_fast_path_call_budget() {
 
 test_peer_send_default_deliver_gated() {
     make_fake_tmux "$TMPDIR/tmux"
-    local data="$TMPDIR/send-default-deliver" log="$TMPDIR/send-default-deliver.log" out
+    local T="$TMPDIR/send-default-deliver" out rc
+    local data="$T/data" log="$T/tmux.log" sdir="$T/sessions"
+    mkdir -p "$data" "$sdir" "$T/home" "$T/o1" "$T/o2" "$T/w"
     : > "$log"
-    setup_delivery_peers "$data"   # comet has session TMUX--comet
-    # comet is a manual peer bound to TMUX--comet; the role comes from that
-    # session's recorded metadata.
+    # Two live Claude orchestrators and a worker; pane pid 12345 is the
+    # Claude backing whichever session is asked about (fake tmux).
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orch1 --dir "$T/o1" --agent claude --session TMUX--orch1 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orch2 --dir "$T/o2" --agent claude --session TMUX--orch2 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register wkr --dir "$T/w" --agent claude --session TMUX--wkr >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register carol --dir "$T/w" --agent claude >/dev/null
     mkdir -p "$CCTRL_SESSION_METADATA_DIR"
-    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--comet.json"
+    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--orch1.json"
+    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--orch2.json"
+    printf '{"role":"worker"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--wkr.json"
+    echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
+    _sdd() { # extra-env... -- send args...
+        local -a envs=()
+        while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done; shift
+        env HOME="$T/home" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--orch1 TMUX--orch2 TMUX--wkr" \
+            TMUX_FAKE_PANE_PID=12345 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" ${envs[@]+"${envs[@]}"} \
+            "$ROOT/cctrl" peer send "$@"
+    }
     # No doorbell.json: unchanged plain send (queued, no delivery attempt).
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- one)"
+    out="$(_sdd -- orch1 --from carol --json -- one)"
     jq -e '.outcome == null and .status == "queued"' <<< "$out" >/dev/null || fail "no doorbell.json: send must stay plain: $out"
-    printf '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":[],"roles":[]}\n' > "$data/doorbell.json"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- two)"
-    jq -e '.outcome == "sent-and-nudged"' <<< "$out" >/dev/null || fail "enabled doorbell + live orchestrator: send must deliver: $out"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --no-deliver --json -- three)"
+    # Fix MF1: the pilot (`enable --peer orch1`) changes sends to orch1 only.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer doorbell enable --peer orch1 >/dev/null
+    : > "$log"
+    out="$(_sdd -- orch2 --from carol --json -- two)"
+    jq -e '.outcome == null and .status == "queued"' <<< "$out" >/dev/null || fail "pilot on orch1 must not change sends to orch2: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    out="$(_sdd -- orch1 --from carol --json -- three)"
+    jq -e '.outcome == "sent-and-nudged" and .deliver_default == true and .ok == true' <<< "$out" >/dev/null \
+        || fail "idle pilot recipient must get the default delivery: $out"
+    # Fix SF3: a working pane is never typed into by the default; plain send.
+    echo '{"status":"busy","sessionId":"s1"}' > "$sdir/12345.json"
+    : > "$log"
+    out="$(_sdd -- orch1 --from carol --json -- four)"
+    jq -e '.outcome == null and .status == "queued"' <<< "$out" >/dev/null || fail "busy recipient must get a plain send: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    # ...an unsent draft or a modal counts as busy too.
+    echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
+    : > "$log"
+    out="$(_sdd TMUX_FAKE_CAPTURE_PANE=$'Do you want to proceed?\n\u276f 1. Yes\n  2. No' -- orch1 --from carol --json -- five)"
+    jq -e '.outcome == null' <<< "$out" >/dev/null || fail "a modal pane must get a plain send: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    # An explicit --deliver keeps its behaviour into a busy pane (no idle gate).
+    echo '{"status":"busy","sessionId":"s1"}' > "$sdir/12345.json"
+    out="$(_sdd CCTRL_NOW_UTC=2026-06-13T00:00:07Z -- orch1 --from carol --deliver --json -- six)"
+    jq -e '.outcome == "sent-and-nudged" and .deliver_default == null' <<< "$out" >/dev/null || fail "explicit --deliver must not be idle-gated: $out"
+    # Fix MF1(b): a DEFAULT delivery that fails is still a successful send.
+    echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
+    rc=0
+    out="$(_sdd TMUX_FAKE_PASTE_FAIL=1 CCTRL_NOW_UTC=2026-06-13T00:00:09Z -- orch1 --from carol --json -- seven)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a failed default delivery must exit 0 (queued), got $rc: $out"
+    jq -e '.ok == true and .outcome == "sent-but-undelivered" and .deliver_default == true and .hint == null
+        and (.warning | contains("Do not re-send"))' <<< "$out" >/dev/null || fail "failed default delivery JSON: $out"
+    rc=0
+    out="$(_sdd TMUX_FAKE_PASTE_FAIL=1 CCTRL_NOW_UTC=2026-06-13T00:00:11Z -- orch1 --from carol -- eight 2>"$T/err")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "human: a failed default delivery must exit 0, got $rc"
+    assert_contains "$out" "Sent and queued for orch1"
+    assert_contains "$(cat "$T/err")" "Do not re-send"
+    # ...while an explicit --deliver keeps its exit semantics.
+    rc=0
+    out="$(_sdd TMUX_FAKE_PASTE_FAIL=1 CCTRL_NOW_UTC=2026-06-13T00:00:13Z -- orch1 --from carol --deliver --json -- nine)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "explicit --deliver failure must keep rc 1, got $rc: $out"
+    jq -e '.ok == false and .outcome == "sent-but-undelivered"' <<< "$out" >/dev/null || fail "explicit failure JSON: $out"
+    [[ "$(jq -s '[.[] | select(.body == "seven")] | length' "$data/messages.jsonl")" -eq 1 ]] || fail "message seven must be queued exactly once"
+    out="$(_sdd -- orch1 --from carol --no-deliver --json -- ten)"
     jq -e '.outcome == null and .status == "queued"' <<< "$out" >/dev/null || fail "--no-deliver must only queue: $out"
-    # A worker recipient keeps the plain send.
-    printf '{"role":"worker"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--comet.json"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- four)"
+    # Role-wide enable: orch2 now defaults too; a worker never does.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer doorbell enable --role orchestrator --role worker >/dev/null
+    out="$(_sdd CCTRL_NOW_UTC=2026-06-13T00:00:15Z -- orch2 --from carol --json -- eleven)"
+    jq -e '.outcome == "sent-and-nudged" and .deliver_default == true' <<< "$out" >/dev/null || fail "role-wide enable must cover orch2: $out"
+    out="$(_sdd -- wkr --from carol --json -- twelve)"
     jq -e '.outcome == null' <<< "$out" >/dev/null || fail "worker recipient must not default to deliver: $out"
-    local rc=0
-    PATH="$TMPDIR:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --no-deliver -- x >/dev/null 2>&1 || rc=$?
+    rc=0
+    _sdd -- orch1 --from carol --deliver --no-deliver -- x >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 64 ]] || fail "--deliver with --no-deliver must exit 64"
-    echo "ok: send defaults to --deliver only for live orchestrators with the doorbell enabled"
+    echo "ok: send defaults to --deliver only for bell-enabled, idle Claude orchestrators; a default failure exits 0"
 }
 
 test_peer_watch_since_floor() {
@@ -10575,6 +10632,15 @@ test_peer_doorbell_enable_disable_status() {
     jq -e '.enabled == false and .baseline_at == "2026-10-27T10:00:00Z"' "$data/doorbell.json" >/dev/null || fail "disable must flip enabled only"
     out="$("$ROOT/cctrl" peer doorbell status --json)"
     jq -e '.enabled == false and .configured == true' <<< "$out" >/dev/null || fail "status after disable: $out"
+    # Fix SF5: re-enable after disable starts a new baseline (mail queued
+    # while off never rings) unless --keep-baseline.
+    CCTRL_NOW_UTC=2026-11-20T10:00:00Z "$ROOT/cctrl" peer doorbell enable >/dev/null
+    jq -e '.enabled == true and .baseline_at == "2026-11-20T10:00:00Z"' "$data/doorbell.json" >/dev/null \
+        || fail "re-enable after disable must reset baseline_at: $(cat "$data/doorbell.json")"
+    "$ROOT/cctrl" peer doorbell disable >/dev/null
+    CCTRL_NOW_UTC=2026-12-01T10:00:00Z "$ROOT/cctrl" peer doorbell enable --keep-baseline >/dev/null
+    jq -e '.enabled == true and .baseline_at == "2026-11-20T10:00:00Z"' "$data/doorbell.json" >/dev/null \
+        || fail "--keep-baseline must keep baseline_at: $(cat "$data/doorbell.json")"
     echo "ok: peer doorbell enable (--dry-run, baseline once, merge) / disable / status (read-only)"
 }
 

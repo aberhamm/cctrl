@@ -7279,12 +7279,17 @@ _peer_cmd_send_impl() {
         $json && _json_error "validation" "Use either --deliver or --no-deliver, not both." || echo -e "${RED}Use either --deliver or --no-deliver, not both.${RESET}" >&2
         return 64
     fi
-    # Plan 108 (D4a): while the doorbell is enabled, a send to a live
-    # orchestrator / fleet manager defaults to --deliver: an idle recipient is
-    # nudged now, a busy one is deferred and the Stop bell catches it at the
-    # end of its turn. --no-deliver opts out. Inert without doorbell.json.
+    # Plan 108 (D4a, fix MF1/SF3): while the doorbell is enabled, a send to a
+    # live orchestrator / fleet manager that the bell is enabled FOR (its
+    # peers/roles) defaults to --deliver, and only while that recipient's
+    # Claude pane is idle. A busy one gets a plain send: queued, and its Stop
+    # bell catches it at the end of the turn. --no-deliver opts out. Inert
+    # without doorbell.json. A default delivery that cannot reach the pane
+    # still exits 0: the message is queued, and a retry would duplicate it.
+    local deliver_implicit=false
     if ! $deliver && ! $no_deliver && ! $allow_unknown && _peer_doorbell_send_defaults_deliver "$to"; then
         deliver=true
+        deliver_implicit=true
     fi
 
     # `--deliver` (plan 027): send, then attempt delivery, then classify the
@@ -7303,8 +7308,16 @@ _peer_cmd_send_impl() {
         [[ -n "$sender_host_override" ]] && send_flags+=(--sender-host "$sender_host_override")
         $impersonate && send_flags+=(--impersonate)
         _peer_send_and_deliver "$to" "$body" ${send_flags[@]+"${send_flags[@]}"} || true
+        PEER_SD_IMPLICIT=""
+        if $deliver_implicit; then
+            PEER_SD_IMPLICIT=1
+            case "$PEER_SD_OUTCOME" in
+                sent-but-deferred|sent-but-undelivered) PEER_SD_RC=0 ;;
+            esac
+        fi
         local _sd_rc=$PEER_SD_RC
         _peer_send_deliver_emit "$json" "${PEER_SD_TO:-$to}" send
+        PEER_SD_IMPLICIT=""
         return "$_sd_rc"
     fi
 
@@ -9062,7 +9075,7 @@ _peer_send_deliver_emit() {
         return 0
     fi
 
-    local ok=false delivered=false hint=""
+    local ok=false delivered=false hint="" implicit="${PEER_SD_IMPLICIT:-}" warning=""
     [[ "$PEER_SD_RC" -eq 0 ]] && ok=true
     [[ "$PEER_SD_OUTCOME" == "sent-and-nudged" ]] && delivered=true
     case "$PEER_SD_OUTCOME" in
@@ -9071,6 +9084,12 @@ _peer_send_deliver_emit() {
         sent-but-deferred)
             hint="Message $PEER_SD_MESSAGE_ID is queued; $to's pane is busy so nothing was pasted. Retry DELIVERY ONLY once it clears: cctrl peer deliver $to (re-running this command would duplicate the message)." ;;
     esac
+    # Plan 108 fix MF1: delivery was the doorbell's default, not asked for.
+    # The send succeeded and the message is queued; say so, exit 0.
+    if [[ -n "$implicit" && -n "$hint" ]]; then
+        warning="Message $PEER_SD_MESSAGE_ID is queued for $to. The doorbell's default delivery did not reach the pane (${PEER_SD_DELIVER_REASON:-${PEER_SD_OUTCOME#sent-but-}}); $to's Stop bell or 'cctrl peer deliver $to' picks it up. Do not re-send: that would duplicate it."
+        hint=""
+    fi
 
     local remote_host="${PEER_SD_REMOTE_HOST:-}"
 
@@ -9087,8 +9106,12 @@ _peer_send_deliver_emit() {
           --arg ackstate "${PEER_SD_ACK_STATE:-}" \
           --arg ackerror "${PEER_SD_ACK_ERROR:-}" \
           --arg remote "$remote_host" \
+          --arg implicit "$implicit" \
+          --arg warning "$warning" \
           '$base
            + {ok:$ok, outcome:$outcome, delivered:$delivered, to:$to, message_id:($base.id // null)}
+           + (if $implicit != "" then {deliver_default:true} else {} end)
+           + (if $warning != "" then {warning:$warning} else {} end)
            + (if $remote != "" then {remote_host:$remote} else {} end)
            + (if $reason != "" then {delivery_reason:$reason} else {} end)
            + (if $hint != "" then {hint:$hint} else {} end)
@@ -9104,8 +9127,15 @@ _peer_send_deliver_emit() {
         case "$PEER_SD_OUTCOME" in
             sent-and-nudged)   echo -e "${GREEN}Sent and nudged $to${via}${RESET} (message $PEER_SD_MESSAGE_ID)" ;;
             sent-and-queued)   echo -e "${GREEN}Sent and queued for $to${via}${RESET} (message $PEER_SD_MESSAGE_ID; $to collects its own mail)" ;;
-            sent-but-deferred) echo -e "${YELLOW}Sent but deferred${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
-            sent-but-undelivered) echo -e "${YELLOW}Sent but not delivered${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2 ;;
+            sent-but-deferred|sent-but-undelivered)
+                if [[ -n "$warning" ]]; then
+                    echo -e "${GREEN}Sent and queued for $to${via}${RESET} (message $PEER_SD_MESSAGE_ID)"
+                    echo -e "${YELLOW}Warning:${RESET} $warning" >&2
+                elif [[ "$PEER_SD_OUTCOME" == "sent-but-deferred" ]]; then
+                    echo -e "${YELLOW}Sent but deferred${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2
+                else
+                    echo -e "${YELLOW}Sent but not delivered${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2
+                fi ;;
         esac
         if [[ "$ctx" == "reply" ]]; then
             case "${PEER_SD_ACK_STATE:-}" in
@@ -10243,12 +10273,16 @@ _peer_cmd_doorbell() {
         help|-h|--help)
             echo "Usage: cctrl peer doorbell <status|enable|disable>"
             echo "  status [--json] [--backlog]   Read-only: enable file, Stop registration, rung state"
-            echo "  enable [--peer NAME]... [--role ROLE]... [--blocking|--advisory] [--replace] [--dry-run] [--json]"
-            echo "                                Write \$CCTRL_DATA_DIR/doorbell.json. baseline_at is set once, on"
-            echo "                                first creation: older mail never rings. Lists merge unless --replace."
+            echo "  enable [--peer NAME]... [--role ROLE]... [--blocking|--advisory] [--replace] [--keep-baseline] [--dry-run] [--json]"
+            echo "                                Write \$CCTRL_DATA_DIR/doorbell.json. baseline_at = now when the bell"
+            echo "                                is off or new: older mail never rings. Enabling more peers/roles on a"
+            echo "                                running bell keeps it; --keep-baseline keeps it on re-enable too."
+            echo "                                Lists merge unless --replace. Sends default to --deliver only for"
+            echo "                                recipients the bell is enabled for, and only into an idle Claude pane."
             echo "                                Roles: orchestrator, worker, fleet-manager (= orchestrator, kind fleet)."
             echo "  disable [--json]              Set enabled:false. Hard rollback: rm \$CCTRL_DATA_DIR/doorbell.json"
-            echo "The bell runs inside 'cctrl hooks run stop'; no settings change is needed or made." ;;
+            echo "The bell runs inside 'cctrl hooks run stop'; no settings change is needed or made."
+            echo "Debug: touch \$CCTRL_DATA_DIR/doorbell/debug (or CCTRL_DOORBELL_DEBUG=1) -> reasons in doorbell/debug.log." ;;
         *)
             echo -e "${RED}Unknown peer doorbell command: $sub${RESET}" >&2
             return 64 ;;
@@ -10256,30 +10290,67 @@ _peer_cmd_doorbell() {
 }
 
 _peer_doorbell_send_defaults_deliver() { # to -> 0 when the send should default to --deliver
-    local to="$1" cfg roles peer_json role kind target
+    # Plan 108 D4a with fix MF1 + SF3. All must hold:
+    # - doorbell.json enabled, and deliver_default_roles non-empty;
+    # - the bell is enabled FOR the recipient, by the same rule the bell uses:
+    #   one of its names (canonical, session, aliases, manual peers bound to
+    #   its session) is in .peers, or its role is in .roles. So the pilot
+    #   (`enable --peer ONE`) changes sends to ONE only;
+    # - its role is in deliver_default_roles; it is a live local tmux session;
+    # - its Claude pane is idle (no modal, no draft, not working). A busy pane
+    #   gets a plain send, and the Stop bell rings at the end of its turn.
+    local to="$1" cfg gates allow_peers allow_roles roles peer_json role kind target host agent names meta="" st
     cfg="$(_peer_doorbell_cfg_json)"
     [[ "$cfg" != "null" ]] || return 1
-    roles="$(jq -r 'select(.enabled == true) | (.deliver_default_roles // ["orchestrator", "fleet-manager"]) | map(tostring) | join(" ")' <<< "$cfg" 2>/dev/null)" || return 1
-    [[ -n "$roles" ]] || return 1
+    gates="$(jq -r 'select(.enabled == true)
+        | ((.peers // []) | map(tostring) | join(" ")),
+          ((.roles // []) | map(tostring) | join(" ")),
+          ((.deliver_default_roles // ["orchestrator", "fleet-manager"]) | map(tostring) | join(" "))' <<< "$cfg" 2>/dev/null)" || return 1
+    { IFS= read -r allow_peers; IFS= read -r allow_roles; IFS= read -r roles; } <<< "$gates"
+    [[ -n "$roles" && -n "$allow_peers$allow_roles" ]] || return 1
     peer_json="$(_peer_resolve_json "$to" 2>/dev/null)" || return 1
     _peer_has_capability "$peer_json" "tmux" || return 1
+    host="$(jq -r '.host // "local"' <<< "$peer_json")"
+    [[ "$host" == "local" || "$host" == "${CCTRL_HOST_PREFIX:-local}" ]] || return 1
     role="$(jq -r '.role // ""' <<< "$peer_json")"
     kind="$(jq -r '.orch_kind // ""' <<< "$peer_json")"
+    agent="$(jq -r '.agent // ""' <<< "$peer_json")"
     target="$(jq -r '.tmux_target // .session // empty' <<< "$peer_json")"
     [[ -n "$target" ]] || return 1
-    if [[ -z "$role" ]]; then
+    meta="$(_session_metadata_file "$target" 2>/dev/null)" || meta=""
+    [[ -n "$meta" && -f "$meta" ]] || meta=""
+    if [[ -n "$meta" ]] && [[ -z "$role" || -z "$agent" || "$agent" == "unknown" ]]; then
         # A manual peer bound to a session (e.g. a `fleet-manager` alias)
         # carries no role of its own; use the session's recorded one.
-        local meta
-        meta="$(_session_metadata_file "$target" 2>/dev/null)" || meta=""
-        if [[ -n "$meta" && -f "$meta" ]]; then
-            { IFS= read -r role; IFS= read -r kind; } < <(jq -r '(.role // ""), (.orch_kind // "")' "$meta" 2>/dev/null)
-        fi
+        local m_role m_kind m_agent
+        { IFS= read -r m_role; IFS= read -r m_kind; IFS= read -r m_agent; } < <(jq -r '(.role // ""), (.orch_kind // ""), (.agent // "")' "$meta" 2>/dev/null)
+        [[ -z "$role" ]] && { role="$m_role"; kind="$m_kind"; }
+        [[ -z "$agent" || "$agent" == "unknown" ]] && agent="$m_agent"
     fi
     [[ -n "$role" ]] || return 1
+    # Enabled for this recipient?
+    local enabled_for=false n r
+    names="$(jq -r --arg t "$target" --argjson p "$peer_json" '
+        ([$p.name, $t] + ($p.aliases // [])
+         + [to_entries[] | select(((.value.tmux_target // .value.session // "") == $t) or (((.value.aliases // []) | index($t)) != null)) | .key])
+        | map(select(type == "string" and . != "")) | unique | .[]' "$PEERS_FILE" 2>/dev/null)" \
+        || names="$(jq -r --arg t "$target" '[.name, $t] + (.aliases // []) | map(select(. != null and . != "")) | unique | .[]' <<< "$peer_json")"
+    for n in $names; do
+        [[ " $allow_peers " == *" $n "* ]] && enabled_for=true
+    done
+    for r in $allow_roles; do
+        [[ "$r" == "$role" ]] && enabled_for=true
+        [[ "$r" == "fleet-manager" && "$role" == "orchestrator" && "$kind" == "fleet" ]] && enabled_for=true
+    done
+    $enabled_for || return 1
     [[ " $roles " == *" $role "* || ( " $roles " == *" fleet-manager "* && "$role" == "orchestrator" && "$kind" == "fleet" ) ]] || return 1
     command -v tmux >/dev/null 2>&1 || return 1
-    _tmux_run_with_timeout has-session -t "=$target" >/dev/null 2>&1
+    _tmux_run_with_timeout has-session -t "=$target" >/dev/null 2>&1 || return 1
+    # Idle only (fix SF3). The doorbell is a Claude Stop hook, so only a
+    # Claude pane has a bell to fall back on; anything else stays plain.
+    [[ "$agent" == "claude" ]] || return 1
+    st="$(_session_rich_state "$target" claude 2>/dev/null)" || return 1
+    [[ "$st" == "idle" || "$st" == "idle-done" ]]
 }
 
 _peer_doorbell_write_locked() { # json -> atomic write, mode 600
@@ -10293,7 +10364,7 @@ _peer_doorbell_write_locked() { # json -> atomic write, mode 600
 }
 
 _peer_doorbell_enable() {
-    local json=false dry_run=false replace=false mode="" peers="[]" roles="[]" r cur new now
+    local json=false dry_run=false replace=false keep_baseline=false mode="" peers="[]" roles="[]" r cur new now
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -10309,6 +10380,7 @@ _peer_doorbell_enable() {
             --blocking) mode="blocking"; shift ;;
             --advisory) mode="advisory"; shift ;;
             --replace) replace=true; shift ;;
+            --keep-baseline) keep_baseline=true; shift ;;
             --dry-run) dry_run=true; shift ;;
             --json) json=true; shift ;;
             *)
@@ -10319,10 +10391,13 @@ _peer_doorbell_enable() {
     cur="$(_peer_doorbell_cfg_json)"
     now="$(_peer_now_utc)"
     new="$(jq -n --argjson cur "$cur" --argjson peers "$peers" --argjson roles "$roles" --arg mode "$mode" \
-        --argjson replace "$(_peer_json_bool "$replace")" --arg now "$now" '
+        --argjson replace "$(_peer_json_bool "$replace")" --argjson keep "$(_peer_json_bool "$keep_baseline")" --arg now "$now" '
         ($cur // {}) as $c
+        # Fix SF5: widening a running bell keeps its baseline; enabling from
+        # disabled starts a new one (mail queued while it was off never
+        # rings) unless --keep-baseline.
         | { enabled: true,
-            baseline_at: ($c.baseline_at // $now),
+            baseline_at: (if ($c.baseline_at // "") != "" and ($c.enabled == true or $keep) then $c.baseline_at else $now end),
             peers: (if $replace then $peers else (($c.peers // []) + $peers) end | unique),
             roles: (if $replace then $roles else (($c.roles // []) + $roles) end | unique),
             deliver_default_roles: ($c.deliver_default_roles // ["orchestrator", "fleet-manager"]),
