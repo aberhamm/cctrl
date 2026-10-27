@@ -7636,12 +7636,23 @@ _peer_cmd_ack() {
                 json=true; shift ;;
             --all)
                 all=true; shift ;;
+            --)
+                # Fix SF7: everything after -- is a message id, never a flag.
+                shift
+                while [[ $# -gt 0 ]]; do ids+=("$1"); shift; done ;;
             -*)
                 $json && _json_error "validation" "Unknown peer ack flag: $1" || echo -e "${RED}Unknown peer ack flag: $1${RESET}" >&2
                 return 64 ;;
             *)
                 ids+=("$1"); shift ;;
         esac
+    done
+    local _id
+    for _id in ${ids[@]+"${ids[@]}"}; do
+        if [[ "$_id" == -* ]]; then
+            $json && _json_error "validation" "Not a message id: $_id" || echo -e "${RED}Not a message id: $_id${RESET}" >&2
+            return 64
+        fi
     done
     if ! $all && [[ ${#ids[@]} -eq 0 ]]; then
         echo -e "${RED}Usage: cctrl peer ack <message-id> [<message-id>...] | --all [--as NAME] [--json]${RESET}" >&2
@@ -7654,7 +7665,7 @@ _peer_cmd_ack() {
     _mailbox_resolve_identity_for_mode "$as_identity" "$json" || return $?
     identity="$MAILBOX_RESOLVED_IDENTITY"
     local ids_json
-    ids_json="$(printf '%s\n' ${ids[@]+"${ids[@]}"} | jq -R . | jq -sc 'map(select(. != ""))')"
+    ids_json="$(printf '%s\n' ${ids[@]+"${ids[@]}"} | jq -R . | jq -sc 'map(select(. != "")) | reduce .[] as $i ([]; if any(.[]; . == $i) then . else . + [$i] end)')"
 
     _mailbox_lock_acquire || return 1
     if ! {

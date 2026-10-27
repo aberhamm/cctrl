@@ -10650,7 +10650,28 @@ test_peer_mcp_recv_all_ack_ids() {
     jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "MCP ack with id and all must be refused: $out"
     out="$(_mcp_call ack_message '{"ids":["--all"]}')"
     jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "MCP ack ids must not pass flags: $out"
-    echo "ok: MCP recv_message all/limit and ack_message ids/all"
+    # Fix SF7: the single id must not pass a flag either, and the CLI takes
+    # everything after -- as an id (a flag-like id is refused, not obeyed).
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send bob --from carol --subject s9 -- body9 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as bob --json >/dev/null
+    local s9
+    s9="$(jq -r 'select(.subject == "s9") | .id' "$data/messages.jsonl")"
+    out="$(_mcp_call ack_message '{"id":"--all"}')"
+    jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "MCP ack id \"--all\" must be refused: $out"
+    out="$(_mcp_call ack_message '{"id":"-x"}')"
+    jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "MCP ack id starting with - must be refused: $out"
+    [[ "$(jq -r --arg i "$s9" 'select(.id == $i) | .status' "$data/messages.jsonl")" == "delivered" ]] \
+        || fail "a refused flag-like id must not ack anything"
+    local rc=0
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack --as bob --json -- --all >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "CLI ack -- --all must refuse the id, got rc $rc"
+    [[ "$(jq -r --arg i "$s9" 'select(.id == $i) | .status' "$data/messages.jsonl")" == "delivered" ]] \
+        || fail "ack -- --all must not ack everything"
+    out="$(_mcp_call ack_message "$(jq -cn --arg a "$s9" '{id:$a}')")"
+    jq -e '.result.structuredContent.data.status == "acked"' <<< "$out" >/dev/null || fail "MCP single-id ack via --: $out"
+    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer ack "$s9" "$s9" --as bob --json)"
+    jq -e --arg a "$s9" '(.noop == [$a]) and (.acked == [])' <<< "$out" >/dev/null || fail "repeated id must be reported once: $out"
+    echo "ok: MCP recv_message all/limit and ack_message ids/all; ids are never flags"
 }
 
 test_doorbell_real_tmux_pane_identity() (

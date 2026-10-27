@@ -378,10 +378,14 @@ class Bridge:
                 raise McpError("validation", "Pass exactly one of id, ids, or all: true.")
             if take_all:
                 return ok(self.cli(["peer", "ack", "--all", "--as", self.identity, "--json"], batch_report=True))
+            # Ids go after `--` so the CLI can never read one as a flag; an id
+            # that looks like a flag ("--all") is refused outright.
             if ids is not None:
-                return ok(self.cli(["peer", "ack", *ids, "--as", self.identity, "--json"], batch_report=True))
+                return ok(self.cli(["peer", "ack", "--as", self.identity, "--json", "--", *ids], batch_report=True))
             message_id = require_string(args, "id")
-            return ok(self.cli(["peer", "ack", message_id, "--as", self.identity, "--json"]))
+            if message_id.startswith("-"):
+                raise McpError("validation", "id must be a message id, not a flag")
+            return ok(self.cli(["peer", "ack", "--as", self.identity, "--json", "--", message_id]))
         raise McpError("unknown-tool", f"Unknown tool: {name}")
 
 
