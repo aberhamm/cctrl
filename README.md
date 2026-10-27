@@ -1272,11 +1272,21 @@ cctrl peer send comet --from orchestrator --body-file prompt.txt --json
 printf 'Handle this\n' | cctrl peer send comet --from orchestrator --body-file - --json
 cctrl peer inbox --as comet --json          # queued + delivered messages for comet
 cctrl peer check --as comet --json          # compact unread summary
-cctrl peer recv --as comet --json           # deliver/read the next message
+cctrl peer recv --all --as comet --json     # receive every queued message in one call
+cctrl peer recv --limit 5 --as comet --json # at most 5, oldest first
+cctrl peer recv --as comet --json           # just the next queued message
 cctrl peer outbox --as orchestrator --json  # messages sent by orchestrator
 cctrl peer show msg_20260608_070000_abc123 --json
 cctrl peer ack msg_20260608_070000_abc123 --as comet --json
+cctrl peer ack --all --as comet --json      # ack every delivered message
+cctrl peer ack ID1 ID2 --as comet --json    # per-id {acked, noop, errors}
 ```
+
+Plain `recv` returns empty once nothing is queued: it never re-returns
+delivered mail (pass `--status delivered` to re-read it), so never loop
+"recv until empty"; use `recv --all`. `peer check` counts only mail `recv`
+can return (the addressee guard applies) and reports the rest as
+`blocked_by_guard`.
 
 Senders and recipients must resolve to known peers unless `peer send` is given
 `--allow-unknown`, which marks the message with `unknown_peer: true`. `--from`
@@ -1323,20 +1333,19 @@ Agents that do not have a tmux session can poll the mailbox directly:
 export CCTRL_PEER=comet
 
 if cctrl peer check --json --exit-on-empty >/tmp/cctrl-check.json; then
-  msg_json="$(cctrl peer recv --json)"
-  msg_id="$(printf '%s\n' "$msg_json" | jq -r '.message.id')"
-  msg_body="$(printf '%s\n' "$msg_json" | jq -r '.message.body')"
-  # handle "$msg_body"
-  cctrl peer ack "$msg_id" --json >/dev/null
+  batch="$(cctrl peer recv --all --json)"     # every queued message, oldest first
+  printf '%s\n' "$batch" | jq -r '.messages[].body'   # handle each body
+  cctrl peer ack --all --json >/dev/null       # ack everything delivered
 elif [ "$?" -eq 2 ]; then
   : # no queued or delivered-unacked messages
 fi
 ```
 
 `peer recv` transitions the oldest queued message for the peer to
-`delivered` and leaves it unacked. If no queued message exists, it returns the
-oldest delivered-but-unacked message without changing it, which lets a crashed
-agent retry before calling `ack`. JSON errors use
+`delivered` and leaves it unacked. If no queued message exists, it returns
+empty (plan 108; it used to re-return the oldest delivered message forever). A
+crashed agent re-reads unacked mail with `peer recv --status delivered`. JSON
+errors use
 `{"ok":false,"error":{"code":"...","message":"..."}}`.
 
 The preferred setup is an idle doorbell: launch the session with a peer
@@ -1354,41 +1363,11 @@ manual `--as` flags. Detached launches may use a new valid peer name because
 the tmux session metadata makes it discoverable; direct foreground launches
 should use an already registered peer name.
 
-Claude Code can use the blocking hook:
-
-```json
-{
-  "hooks": {
-    "Stop": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/path/to/cctrl/hooks/peer-doorbell.sh"
-          }
-        ]
-      }
-    ],
-    "Notification": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/path/to/cctrl/hooks/peer-doorbell.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-The hook exits 0 when `CCTRL_PEER` is unset, the inbox is empty, dependencies
-are missing, or only delivered-but-unacked messages remain. It exits 2 only
-for queued messages, printing the same doorbell text as tmux nudges so Claude
-immediately sees the instruction to run `peer recv`.
+Claude Code needs no extra hook: the global Stop hook `cctrl hooks run stop`
+(installed by `cctrl hooks install`) carries the doorbell; see "Peer doorbell"
+below. Do not also register `hooks/peer-doorbell.sh` as a Stop hook, or it
+rings twice. That script is now a thin wrapper around `cctrl peer doorbell
+--hook <claude|codex>`.
 
 Codex has notification-only `notify` semantics, so it cannot force the model to
 run `peer recv`, but it can surface the same doorbell:
@@ -1415,8 +1394,43 @@ cctrl peer deliver --all --json          # nudge every queued tmux-capable peer
 The nudge format is constant:
 
 ```text
-[cctrl] N new peer message(s) for comet. Run: cctrl peer recv --as comet --json
+[cctrl] N new peer message(s) for comet. Read them all: cctrl peer recv --all --as comet --json ; then ack what you handled: cctrl peer ack --all --as comet  (or: cctrl peer ack <id> <id> ... --as comet)
 ```
+
+### Peer doorbell (Stop hook, plan 108)
+
+A nudge only reaches an idle pane; a busy one is deferred and nothing retries.
+The doorbell is that retry: at the end of a Claude turn, `cctrl hooks run stop`
+(already the registered global Stop hook) first checks for NEW queued mail for
+the session's own peer and, if there is some, exits 2 with the line above, so
+the agent reads its mail before it stops. It is **off** until enabled:
+
+```bash
+cctrl peer doorbell status [--json] [--backlog]   # read-only
+cctrl peer doorbell enable --peer TMUX--ms--orch-x --dry-run   # show the file
+cctrl peer doorbell enable --peer TMUX--ms--orch-x             # write it
+cctrl peer doorbell enable --role orchestrator --role fleet-manager   # widen
+cctrl peer doorbell disable                       # enabled:false
+rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell.json)
+```
+
+- `doorbell.json` holds `enabled`, `baseline_at` (written once, at first
+  enable; older mail never rings), `peers`, `roles`, `mode` (`blocking` exits 2;
+  `advisory` only prints) and `deliver_default_roles`.
+- Identity: the tmux session of the hook's own pane (`$TMUX_PANE`, an exact
+  `%N` target), only when the hook's nearest Claude ancestor is that pane's
+  Claude. A nested `claude -p` never rings its parent's mail. `CCTRL_PEER` and
+  manual peers bound to the session widen the candidate names.
+- Each message rings once (state in `data/doorbell/state/<session>.json`);
+  `stop_hook_active: true` never rings; mail for a recycled name never rings.
+  Any error is a silent no-op. `CCTRL_DOORBELL_DEBUG=1` shows its stderr.
+- While enabled, `peer send` to a live orchestrator / fleet manager defaults to
+  `--deliver` (`--no-deliver` opts out), and `peer watch` ignores mail older
+  than `baseline_at` (`--since ISO` overrides).
+- No settings change: `peer doctor` checks that Stop runs `cctrl hooks run
+  stop` (remedy: `cctrl hooks install`) and reports `doorbell_enabled`.
+- `tests/bench-doorbell.sh [DATA_DIR]` measures the per-Stop cost on a copy of
+  the mailbox and a private tmux socket.
 
 Before pasting, cctrl captures the last lines of the target pane and defers
 delivery when it sees known Claude/Codex approval or permission prompts. A

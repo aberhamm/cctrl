@@ -10549,6 +10549,54 @@ test_peer_mcp_recv_all_ack_ids() {
     echo "ok: MCP recv_message all/limit and ack_message ids/all"
 }
 
+test_doorbell_real_tmux_pane_identity() (
+    # One real-tmux test (eng review §5.13): the doorbell's exact %N pane
+    # lookup and the derived-peer resolution against a live private server.
+    # Every tmux call goes to "$D/sock"; cleanup is kill-session by exact
+    # name (the server exits once empty), never kill-server.
+    unset TMUX TMUX_PANE
+    [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] || { echo "skip: no tmux on this host"; exit 0; }
+    local D a="TMUX--rt-a" b="TMUX--rt-a--2" pane pid
+    D="$(mktemp -d "$CCTRL_TEST_TMUX_TMPDIR/db.XXXXXX")"
+    _rt_cleanup() {
+        "$CCTRL_TEST_TMUX_SHIM" -S "$D/sock" kill-session -t "=$a" 2>/dev/null || true
+        "$CCTRL_TEST_TMUX_SHIM" -S "$D/sock" kill-session -t "=$b" 2>/dev/null || true
+        rm -rf -- "$D"
+    }
+    trap _rt_cleanup EXIT
+    _bell_fixture "$TMPDIR/bell-real"
+    # The fixture's fake tmux is replaced by a pass-through to the private socket.
+    printf '#!/usr/bin/env bash\nprintf "TMUX %%s\\n" "$*" >> "%s"\nexec "%s" -S "%s/sock" "$@"\n' "$BELL_LOG" "$CCTRL_TEST_TMUX_SHIM" "$D" > "$BELL_DIR/bin/tmux"
+    chmod +x "$BELL_DIR/bin/tmux"
+    tmux -S "$D/sock" new-session -d -s "$a" 'sleep 300' || fail "could not start $a"
+    tmux -S "$D/sock" new-session -d -s "$b" 'sleep 300' || fail "could not start $b"
+    tmux -S "$D/sock" set-option -t "=$a:" -q @cctrl_managed 1
+    tmux -S "$D/sock" set-option -t "=$b:" -q @cctrl_managed 1
+    printf '{"role":"orchestrator","orch_kind":"repo","cctrl_managed":true,"created_at":"2026-01-01T00:00:00Z"}\n' > "$BELL_DIR/meta/$a.json"
+    printf '{"role":"orchestrator","orch_kind":"repo","cctrl_managed":true,"created_at":"2026-01-01T00:00:00Z"}\n' > "$BELL_DIR/meta/$b.json"
+    IFS='|' read -r pane pid < <(tmux -S "$D/sock" display-message -p -t "=$b:" '#{pane_id}|#{pane_pid}')
+    [[ "$pane" =~ ^%[0-9]+$ && "$pid" =~ ^[0-9]+$ ]] || fail "could not read pane of $b"
+    echo '{}' > "$BELL_DIR/sessions/$pid.json"
+    export BELL_PS_DEFAULT="$pid" BELL_PANE="$pane"
+    # Mail to the shorter name only: the --2 pane must never ring for it.
+    CCTRL_NOW_UTC=2026-02-01T00:00:00Z "$BELL_DIR/cctrl" peer send "$a" --from carol --no-deliver -- for-a >/dev/null \
+        || fail "send to derived peer $a failed"
+    _bell_enable "$_bell_cfg_default"
+    BELL_RC=0
+    printf '{}' | CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="$b" TMUX="$D/sock,1,0" TMUX_PANE="$pane" \
+        "$BELL_DIR/cctrl" hooks run stop >/dev/null 2>"$BELL_DIR/err" || BELL_RC=$?
+    [[ "$BELL_RC" -eq 0 ]] || fail "pane of $b rang for mail to $a: $(cat "$BELL_DIR/err")"
+    CCTRL_NOW_UTC=2026-02-02T00:00:00Z "$BELL_DIR/cctrl" peer send "$b" --from carol --no-deliver -- for-b >/dev/null \
+        || fail "send to derived peer $b failed"
+    BELL_RC=0
+    printf '{}' | CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="$b" TMUX="$D/sock,1,0" TMUX_PANE="$pane" \
+        "$BELL_DIR/cctrl" hooks run stop >/dev/null 2>"$BELL_DIR/err" || BELL_RC=$?
+    [[ "$BELL_RC" -eq 2 ]] || fail "pane of $b must ring for its own mail (rc=$BELL_RC err=$(cat "$BELL_DIR/err"))"
+    assert_contains "$(cat "$BELL_DIR/err")" "1 new peer message(s) for $b."
+    assert_contains "$(cat "$BELL_DIR/err")" "recv --all --as $b --json"
+    echo "ok: real tmux: exact pane-id identity, derived peer rings, no prefix match"
+)
+
 test_session_close_self_graceful() {
     make_fake_tmux "$TMPDIR/tmux"
     local log="$TMPDIR/close-self.log"
