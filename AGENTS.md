@@ -82,14 +82,21 @@ itself. This is the operating contract; commands take real flags as shown.
 - **Receive:** `cctrl peer check --json` for counts, `cctrl peer recv --json`
   to take the next message, then `cctrl peer ack <id> --json` once handled.
   Unacked messages get re-nudged, so acking is not optional.
-- **Reply:** `cctrl peer reply <message-id> --as <you> --json -- "<body>"`. It
-  resolves the recipient from the message itself and both sends **and** delivers,
-  so you never need the sender's address. Never reply with a bare
-  `cctrl peer send` — send only **queues**, and nothing arrives until a deliver
-  runs (no watcher runs by default). Always pass `--as`; a non-interactive shell
-  may not export `CCTRL_PEER`.
+- **Reply:** `cctrl peer send <sender.name> --as <you> --no-deliver --json -- "<body>"`,
+  then `cctrl peer ack <id> --json` for the message you answered. Do **not**
+  deliver into another session's pane: Claude Code holds cross-session typed
+  input behind a security prompt, and delivery into bypass-permission sessions
+  has no sender attestation yet (plans 110 and 111). `send --no-deliver` only
+  queues; the recipient picks the mail up with its own `peer check`/`recv` or
+  its doorbell. `cctrl peer reply` and the MCP `send_message` tool still
+  deliver unconditionally until plan 110 lands, so prefer
+  `peer send --no-deliver`. Always pass `--as`; a non-interactive shell may not
+  export `CCTRL_PEER`.
 - **Send:** find a peer with `cctrl peer overview` (or `cctrl peer ls`), then
-  `cctrl peer send <peer> --as <you> --json -- "<body>"` and deliver it.
+  `cctrl peer send <peer> --as <you> --no-deliver --json -- "<body>"`. Do not
+  add `--deliver` or run `cctrl peer deliver` against another session. (If the
+  recipient has the doorbell enabled, a plain send may deliver by default into
+  its idle pane; that is the doorbell's own policy, not yours.)
 - Received messages carry a `sender` object; reply to `sender.name`.
 - **Cross-machine:** `cctrl peer send` routes transparently across machines
   via SSH. Remote peers appear in `cctrl peer ls` / `cctrl peer overview` with
