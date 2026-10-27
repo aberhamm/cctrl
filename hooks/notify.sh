@@ -6,6 +6,12 @@ EVENT="${1:-stop}"
 DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 INPUT=$(cat)
 
+# Plan 108: the peer doorbell is making the agent continue, so the turn is
+# not done; skip the "done" speech.
+if [ "$EVENT" = "stop" ] && [ "${CCTRL_STOP_CONTINUING:-}" = "1" ]; then
+  exit 0
+fi
+
 # Prefer git repo name, fall back to directory basename
 NAME=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null | xargs basename 2>/dev/null)
 [ -z "$NAME" ] && NAME=$(basename "$DIR")

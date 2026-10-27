@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Peer-message doorbell for agent idle/notification hooks.
+# Peer-message doorbell (plan 108): a thin wrapper around
+# `cctrl peer doorbell --hook <mode>`. All logic lives in cctrl.
 #
-# Claude Code Stop/Notification hooks can block with exit 2, so the default
-# mode returns 2 only when queued mail exists. Codex notify is notification-only;
-# pass "codex" as the first arg to print the same doorbell and exit 0.
+# claude (default): Stop-hook semantics. Exit 2 with the bell on stderr only
+#   when NEW queued mail waits for this pane's own session and the doorbell is
+#   enabled in $CCTRL_DATA_DIR/doorbell.json; otherwise silent exit 0. The
+#   global `cctrl hooks run stop` dispatcher already runs the same check, so do
+#   not register this script next to it (it would ring twice).
+# codex: notification-only. Prints the notice for $CCTRL_PEER, exit 0.
+# Stdin passes through to cctrl unchanged.
 
 mode="${1:-claude}"
-peer="${CCTRL_PEER:-}"
-
-[ -n "$peer" ] || exit 0
-command -v jq >/dev/null 2>&1 || exit 0
 
 if [ -n "${CCTRL_BIN:-}" ]; then
     cctrl_bin="$CCTRL_BIN"
@@ -22,23 +23,8 @@ else
     fi
 fi
 
-check_json="$("$cctrl_bin" peer check --as "$peer" --json --exit-on-empty 2>/dev/null)"
-check_rc=$?
-[ "$check_rc" -eq 0 ] || exit 0
-
-queued="$(printf '%s\n' "$check_json" | jq -r '.queued // 0' 2>/dev/null)"
-case "$queued" in
-    ''|*[!0-9]*) exit 0 ;;
-esac
-
-if [ "$queued" -gt 0 ]; then
-    message="[cctrl] $queued new peer message(s) for $peer. Run: cctrl peer recv --as $peer --json"
-    if [ "$mode" = "codex" ]; then
-        printf '%s\n' "$message"
-        exit 0
-    fi
-    printf '%s\n' "$message" >&2
-    exit 2
-fi
-
+"$cctrl_bin" peer doorbell --hook "$mode"
+rc=$?
+# Fail open: only a deliberate ring (2, Claude mode) may block.
+if [ "$rc" -eq 2 ] && [ "$mode" != "codex" ]; then exit 2; fi
 exit 0
