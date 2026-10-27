@@ -70,6 +70,11 @@ See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
   and a static lint (same findings doc, 2026-10-09 note); for agent tool
   calls the PreToolUse hook blocks a server kill without `-S`/`-L`
   (`hooks/tmux_kill_guard.py`, plan 107).
+- **Stubbed system tools:** a test that stubs a system tool (`pgrep`, `ps`,
+  `tmux`, `launchctl`, ...) must be paired with at least one test that runs the
+  real tool, isolated (scratch processes, a private `tmux -S` socket). Plan 108's
+  bell gate passed a stubbed-`pgrep` suite but failed live, because macOS
+  `pgrep` excludes the caller's ancestors.
 
 ## Peer messaging
 
