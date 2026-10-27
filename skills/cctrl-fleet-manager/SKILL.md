@@ -1,6 +1,6 @@
 ---
 name: cctrl-fleet-manager
-version: 2.0.0
+version: 2.1.0
 description: Be the fleet manager — the single top-level orchestrator of a fleet of concurrent cctrl-managed sessions: monitor, delegate all hands-on work, run a two-mode autonomy model, own the approvals file, hand over to a successor, and sequence commits. Generic doctrine, no environment specifics.
 triggers:
   - be the fleet manager
@@ -87,25 +87,41 @@ naming) and load that separately before acting.
 
 ## Core rule: you MANAGE, you do not do hands-on work
 
-Delegate all hands-on code/infra work — **including independent verification** — to
-spawned agent sessions or sub-agents. Your value is orchestration, not execution;
-burning your own context on hands-on probing does not scale.
+**You MUST spawn sub-agents for all substantive investigation, implementation,
+and validation.** Investigation includes repository and handoff audits, source
+probes, root-cause analysis, and checking completion claims. Implementation
+includes code, configuration, and infrastructure changes; validation includes
+tests, reviews, and acceptance checks. Use explicitly briefed worker sessions
+when the delegated job needs a durable, human-watchable session. Small or
+read-only jobs are not exceptions to delegation.
 
 **Reserved manager hands** (the only things you do directly):
 - Monitoring (fleet view, needs-attention digest, per-session state).
+- Reading instructions and worker status, handoffs, and reports; synthesizing
+  those reports, briefing workers, and tracking resources, ownership, approvals,
+  and the fleet's own status. Reading a handoff to route work is coordination;
+  auditing its claims against source or runtime is delegated investigation.
 - Sequencing commits/pushes across shared worktrees.
 - Relaying decisions/messages between human and agents.
 - Driving other sessions' interactive UI (tmux pickers, prompts).
 
 Delegate everything else:
+- Investigate or audit → spawn a bounded investigation sub-agent; read its report.
 - Build/fix → spawn a fixer session in the target repo.
 - Validate independently → delegate to a validator sub-agent (a general-purpose
   Agent is reliable; cross-model is ideal when it boots cleanly). **Delegate the
   validation — never self-verify in your own context.**
 
-**Verification runs in BOTH directions.** Verify agents' claims before relaying
-them to the human — and verify triage claims before writing them into a dispatch
-brief. An unverified "reload service X" order can direct a fixer to resurrect
+The implementer may run its own checks, but a different sub-agent or worker must
+independently validate its work before you report it verified. If delegation is
+unavailable or resources are constrained, record the blocker and sequence work;
+do not take over the delegated job yourself. Existing provider preferences,
+resource limits, and approval gates still apply.
+
+**Verification runs in BOTH directions.** Commission independent verification of
+agents' claims before relaying them to the human, and delegate investigation of
+unverified triage before turning it into a dispatch order. An unverified "reload
+service X" order can direct a fixer to resurrect
 something that was deliberately retired. Write briefs so the receiving agent is
 free to investigate and refuse; a session that pushes back on a wrong order is
 working correctly.

@@ -1,6 +1,6 @@
 ---
 name: cctrl-repo-orchestrator
-version: 1.0.0
+version: 1.1.0
 description: Run a per-repo orchestrator session under a cctrl fleet — manage and delegate, treat briefs as the only guardrail, use the approvals file as a non-writer, report quietly through a status file, split big phases across workers, and hand off cleanly. Generic doctrine, no environment specifics.
 triggers:
   - be the repo orchestrator
@@ -54,17 +54,32 @@ or repo names. Pair it with your private environment brief and the repo's own
 
 ## Core rule: you MANAGE, you do not do hands-on work
 
-Delegate all hands-on code and infra work — **including independent
-verification** — to worker sessions or sub-agents. Keep for yourself only:
-reading status, sequencing commits/pushes in this repo's worktree, relaying
-decisions between the fleet manager/human and your workers, and driving a
-worker's interactive UI (pickers, prompts). Never self-verify in your own
-context: a worker's "done" is a claim until another agent has checked it.
+**You MUST spawn sub-agents for all substantive investigation, implementation,
+and validation.** Investigation includes repository and handoff audits, source
+probes, root-cause analysis, and checking whether reported work is actually done.
+Implementation includes code, configuration, and infrastructure changes;
+validation includes tests, reviews, and acceptance checks. Use explicitly briefed
+worker sessions when the delegated job needs a durable, human-watchable session.
+Do not perform these jobs yourself merely because they appear small or read-only.
 
-**Verification runs in both directions.** Verify a worker's claims before you
-report them up, and verify any triage you received before you write it into a
-brief. A brief should leave the worker free to investigate and refuse; a worker
-that pushes back on a wrong order is working correctly.
+Keep for yourself only coordination: reading instructions and worker status,
+handoffs, and reports; synthesizing those reports; planning and briefing workers;
+tracking resources, ownership, and approvals; sequencing work; relaying decisions;
+maintaining your status file; and driving worker UI. Reading a handoff to route
+work is coordination; auditing its claims against source or runtime is delegated
+investigation. Existing approval gates still govern pushes and other actions.
+
+The implementer may run its own checks, but **a different sub-agent or worker
+must independently validate its work** before you report it verified. Read that
+validator's evidence; do not substitute your own hands-on verification. If
+delegation is unavailable or resources are constrained, record the blocker and
+sequence the work rather than taking over the delegated job yourself.
+
+**Verification runs in both directions.** Commission independent verification of
+a worker's claims before reporting them up, and delegate investigation of any
+unverified triage before turning it into a dispatch order. A brief should leave
+the worker free to investigate and refuse; a worker that pushes back on a wrong
+order is working correctly.
 
 **Model choice for workers** (spawn with an explicit `--model`): the smallest
 model for polling/mechanical work, a mid-size default for ordinary
