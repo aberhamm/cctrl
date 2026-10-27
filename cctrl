@@ -10092,7 +10092,11 @@ _peer_doorbell_eval_inner() {
     # the pane pid (cctrl execs claude) or the pane pid's first Claude child.
     # When the Stop input carries session_id it must also equal the pane
     # Claude's sessionId. Unknown or different = no ring (fail closed).
-    local pid="$PPID" hops=0 nearest="" expect="" child pane_sid=""
+    # The pane-child case is decided from the walk itself (nearest's parent
+    # is the pane pid), never by listing the pane's children with pgrep: the
+    # hook descends from that Claude, and macOS pgrep silently drops the
+    # caller's own ancestors (no -a), so `pgrep -P` could never return it.
+    local pid="$PPID" hops=0 nearest="" expect="" nearest_ppid="" pane_sid=""
     while [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && $hops -lt 8 ]]; do
         if _peer_proc_is_claude "$pid"; then nearest="$pid"; break; fi
         pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
@@ -10102,9 +10106,8 @@ _peer_doorbell_eval_inner() {
     if _peer_proc_is_claude "$pane_pid"; then
         expect="$pane_pid"
     else
-        for child in $(pgrep -P "$pane_pid" 2>/dev/null); do
-            _peer_proc_is_claude "$child" && { expect="$child"; break; }
-        done
+        nearest_ppid="$(ps -o ppid= -p "$nearest" 2>/dev/null | tr -d ' ')"
+        [[ -n "$nearest_ppid" && "$nearest_ppid" == "$pane_pid" ]] && expect="$nearest"
     fi
     [[ -n "$expect" && "$nearest" == "$expect" ]] || { _peer_doorbell_dbg "off: nearest Claude $nearest is not the pane's Claude ${expect:-unknown} (nested run?)"; return 0; }
     if [[ -n "$stdin_sid" ]]; then
@@ -11587,6 +11590,15 @@ _session_require_tmux() {
     return 1
 }
 
+_proc_children() { # pid -> its direct child pids, one per line (ascending)
+    # Not `pgrep -P`: macOS pgrep silently excludes the calling process and
+    # all its ancestors unless -a is given (procps' -a means something else),
+    # so a caller running inside a session (a Claude Bash tool or hook) could
+    # never see its own Claude. One ps fork, no ancestor exclusion anywhere.
+    [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
+    ps -A -o pid=,ppid= 2>/dev/null | awk -v p="$1" '$2 == p { print $1 }' || true
+}
+
 _session_agent_cmd() {
     # Echo the foreground command of a session's pane. cctrl detaches with
     # `exec <agent>`, so the pane root usually is the agent; fall back to first child.
@@ -11599,7 +11611,7 @@ _session_agent_cmd() {
     [[ -n "$pid" ]] || return 0
     cmd="$(ps -o command= -p "$pid" 2>/dev/null)"
     if [[ -z "$(_agent_from_cmd "$cmd")" ]]; then
-        child="$(pgrep -P "$pid" 2>/dev/null | head -1)" || true
+        child="$(_proc_children "$pid" | head -1)" || true
         if [[ -n "$child" ]]; then
             ccmd="$(ps -o command= -p "$child" 2>/dev/null)"
             [[ -n "$(_agent_from_cmd "$ccmd")" ]] && cmd="$ccmd"
@@ -11655,7 +11667,7 @@ _session_find_agent_descendant() {
         [[ "$child" =~ ^[0-9]+$ ]] || continue
         found="$(_session_find_agent_descendant "$child" "$agent" $((depth + 1)))"
         [[ -n "$found" ]] && { printf '%s' "$found"; return 0; }
-    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    done < <(_proc_children "$pid")
     return 0
 }
 
@@ -12113,7 +12125,7 @@ _session_claude_pid() {
     pid="$(tmux list-panes -t "=$sess:" -F '#{pane_pid}' 2>/dev/null | head -1)" || true
     [[ -n "$pid" ]] || return 0
     [[ -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]] && { printf '%s' "$pid"; return 0; }
-    for child in $(pgrep -P "$pid" 2>/dev/null); do
+    for child in $(_proc_children "$pid"); do
         [[ -f "$CLAUDE_SESSIONS_DIR/$child.json" ]] && { printf '%s' "$child"; return 0; }
     done
     printf '%s' "$pid"

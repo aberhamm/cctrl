@@ -10119,7 +10119,11 @@ if [[ "${1:-}" == "-o" && ( "${2:-}" == "comm=" || "${2:-}" == "args=" ) && "${3
 fi
 exec /bin/ps "$@"
 SH
-    printf '#!/usr/bin/env bash\nexit 1\n' > "$t/bin/pgrep"
+    # pgrep stand-in that records any call. The doorbell must never use pgrep
+    # to find the pane's Claude: macOS pgrep drops the caller's own ancestors
+    # (no -a), and the hook always descends from that Claude. An `exit 1`
+    # stub here once hid exactly that bug (plan 108 pgrep fix).
+    printf '#!/usr/bin/env bash\necho "pgrep $*" >> "%s/pgrep.log"\nexit 1\n' "$t" > "$t/bin/pgrep"
     chmod +x "$t/bin/tmux" "$t/bin/ps" "$t/bin/pgrep"
     # notify/session-log stand-ins that record stdin and spam stderr.
     cp "$ROOT/cctrl" "$t/cctrl"; chmod +x "$t/cctrl"
@@ -10250,6 +10254,87 @@ test_doorbell_nested_claude_noop() {
     _bell_stop '{"session_id":"sess-a"}'
     [[ "$BELL_RC" -eq 2 ]] || fail "the pane's own Claude with a matching session_id must ring (rc=$BELL_RC err=$BELL_ERR)"
     echo "ok: doorbell rings only for the pane's own Claude (by name, session file or not) and its session_id"
+}
+
+test_doorbell_rings_from_wrapper_child_claude() {
+    _bell_fixture "$TMPDIR/bell-wrapper"
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    _bell_enable "$_bell_cfg_default"
+    # Real-world shape: pane pid 60001 is session-wrapper.sh (not Claude),
+    # Claude 70001 is its child, and the Stop hook descends from 70001.
+    printf '70001 60001\n' > "$BELL_DIR/psmap"
+    export BELL_PS_MAP="$BELL_DIR/psmap" BELL_PS_DEFAULT=70001 BELL_CLAUDE_PIDS="70001" \
+        BELL_DISPLAY="TMUX--t-a|1700000000|60001|1"
+    _bell_stop '{"session_id":"sess-a"}'
+    [[ "$BELL_RC" -eq 2 ]] || fail "a hook under the wrapper's Claude child must ring (rc=$BELL_RC err=$BELL_ERR)"
+    assert_contains "$BELL_ERR" "1 new peer message(s) for TMUX--t-a"
+    [[ ! -s "$BELL_DIR/pgrep.log" ]] || fail "doorbell must not call pgrep: $(cat "$BELL_DIR/pgrep.log")"
+    echo "ok: doorbell rings when the pane runs a wrapper and the hook descends from its Claude child"
+}
+
+test_doorbell_wrapper_nested_claude_noop() {
+    _bell_fixture "$TMPDIR/bell-wrapper-nested"
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    _bell_enable "$_bell_cfg_default"
+    # Wrapper 60001 -> pane Claude 70001 -> tool shell 75001 -> nested
+    # `claude -p` 80001 -> hook. The nearest Claude (80001) is not a direct
+    # child of the pane, so no ring, with or without a sessions file.
+    printf '70001 60001\n75001 70001\n80001 75001\n' > "$BELL_DIR/psmap"
+    export BELL_PS_MAP="$BELL_DIR/psmap" BELL_PS_DEFAULT=80001 BELL_CLAUDE_PIDS="70001 80001" \
+        BELL_DISPLAY="TMUX--t-a|1700000000|60001|1"
+    _bell_stop '{"session_id":"sess-a"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a nested Claude under a wrapper pane must not ring (rc=$BELL_RC err=$BELL_ERR)"
+    echo '{"sessionId":"sess-a"}' > "$BELL_DIR/sessions/80001.json"
+    _bell_stop '{"session_id":"sess-a"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a nested Claude with a matching sessions file must not ring (rc=$BELL_RC)"
+    # A nested Claude that is a direct child of the pane Claude is refused too.
+    printf '70001 60001\n80001 70001\n' > "$BELL_DIR/psmap"
+    _bell_stop '{"session_id":"sess-a"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a Claude child of the pane Claude must not ring (rc=$BELL_RC)"
+    [[ "$(jq -r 'select(.subject == "s1") | .status' "$BELL_DATA/messages.jsonl")" == "queued" ]] || fail "nested path changed mail"
+    echo "ok: doorbell refuses a nested Claude under a wrapper pane"
+}
+
+test_doorbell_real_process_chain() {
+    # No ps/pgrep stub: a scratch chain of REAL processes, so a lookup that
+    # only works against a stub (macOS pgrep ancestor exclusion) fails here.
+    # pane.sh (pane pid) -> "claude" (bash, argv0 claude) -> hook shell ->
+    # cctrl hooks run stop. Only tmux is faked; no tmux server is touched.
+    _bell_fixture "$TMPDIR/bell-real"
+    rm -f "$BELL_DIR/bin/ps" "$BELL_DIR/bin/pgrep"
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    _bell_enable "$_bell_cfg_default"
+    unset BELL_DISPLAY
+    cat > "$BELL_DIR/claude.sh" <<'SH'
+# Runs as "claude" ($0 == claude). $1 = nested depth still to add.
+if [[ "${1:-0}" -gt 0 ]]; then
+    ( exec -a claude bash "$BELL_DIR/claude.sh" $(( $1 - 1 )) ); rc=$?; exit $rc
+fi
+printf '{"sessionId":"sess-real-%s"}\n' "$$" > "$CCTRL_CLAUDE_SESSIONS_DIR/$$.json"
+printf '%s\n' "$$" > "$BELL_DIR/real-claude.pid"
+printf '{"session_id":"sess-real-%s"}' "$$" | bash -c '"$BELL_DIR/cctrl" hooks run stop > "$BELL_DIR/out" 2> "$BELL_DIR/err"; rc=$?; exit $rc'
+rc=$?; exit $rc
+SH
+    cat > "$BELL_DIR/pane.sh" <<'SH'
+# The pane process: a wrapper that is not Claude and does not exec.
+export BELL_DISPLAY="TMUX--t-a|1700000000|$$|1"
+( exec -a claude bash "$BELL_DIR/claude.sh" "${1:-0}" ); rc=$?; exit $rc
+SH
+    local depth
+    for depth in 0 1; do
+        BELL_RC=0
+        CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME=TMUX--t-a TMUX="/tmp/bell-fake-sock,1,0" TMUX_PANE="$BELL_PANE" \
+            BELL_DIR="$BELL_DIR" bash "$BELL_DIR/pane.sh" "$depth" || BELL_RC=$?
+        BELL_ERR="$(cat "$BELL_DIR/err")"
+        if [[ "$depth" -eq 0 ]]; then
+            [[ "$BELL_RC" -eq 2 ]] || fail "real chain: the pane's Claude child must ring (rc=$BELL_RC err=$BELL_ERR log=$(tail -2 "$BELL_DATA/doorbell/debug.log" 2>/dev/null))"
+            assert_contains "$BELL_ERR" "1 new peer message(s) for TMUX--t-a"
+            rm -f "$BELL_DATA/doorbell/state/TMUX--t-a.json"
+        else
+            [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "real chain: a nested Claude must not ring (rc=$BELL_RC err=$BELL_ERR)"
+        fi
+    done
+    echo "ok: doorbell rings through a real wrapper -> claude -> hook chain and refuses a real nested one"
 }
 
 test_doorbell_stop_hook_active_guard() {
