@@ -9918,8 +9918,16 @@ _peer_doctor_mcp_check() {
 # hook is that pane's Claude process. CCTRL_PEER / CCTRL_SESSION_NAME only widen
 # the candidate set; a nested `claude -p` inherits them and must never ring
 # (and so never `recv`) its parent's mail.
+#
+# Debug (plan 108 fix SF4): CCTRL_DOORBELL_DEBUG=1 in the hook's env, or the
+# file $PEER_DATA_DIR/doorbell/debug (touch it; no session restart needed),
+# appends one reason line per evaluation to $PEER_DATA_DIR/doorbell/debug.log
+# (mode 600). Lines carry names, pids and counts, never message bodies.
 
 DOORBELL_RING_MARK="__cctrl_doorbell_ring__"
+# Forced continuations in a row that a ring may cause (stop_hook_active=true
+# stops). Past this, new mail waits for the next ordinary Stop (fix SF2).
+DOORBELL_MAX_CHAIN="${DOORBELL_MAX_CHAIN:-3}"
 
 _peer_doorbell_file() { printf '%s/doorbell.json' "$PEER_DATA_DIR"; }
 _peer_doorbell_state_dir() { printf '%s/doorbell/state' "$PEER_DATA_DIR"; }
@@ -9928,9 +9936,14 @@ _peer_doorbell_eval() {
     # Prints the bell text (and returns 2) only when it rings. Runs the real
     # work in a subshell and trusts only a marker line, so an internal error,
     # errexit or a stray exit status (jq/tmux can exit 2) can never ring.
-    local mode="${1:-claude}" out
-    if [[ -n "${CCTRL_DOORBELL_DEBUG:-}" ]]; then
-        out="$( (set +e; _peer_doorbell_eval_inner "$mode") )" || true
+    local mode="${1:-claude}" out dbg_dir
+    dbg_dir="$PEER_DATA_DIR/doorbell"
+    if [[ -n "${CCTRL_DOORBELL_DEBUG:-}" || -f "$dbg_dir/debug" ]] \
+        && { [[ -f "$dbg_dir/debug.log" ]] || (umask 077; mkdir -p "$dbg_dir" && : > "$dbg_dir/debug.log") 2>/dev/null; }; then
+        # Works inside `cctrl hooks run stop` too: its own stderr is discarded,
+        # so the reasons go to a file, never to the model.
+        out="$( (set +e; printf 'doorbell: --- %s pane=%s session=%s\n' "$(_peer_now_utc)" "${TMUX_PANE:-}" "${CCTRL_SESSION_NAME:-}" >&2
+                 _peer_doorbell_eval_inner "$mode") 2>>"$dbg_dir/debug.log" )" || true
     else
         out="$( (set +e; _peer_doorbell_eval_inner "$mode") 2>/dev/null )" || true
     fi
@@ -9941,38 +9954,43 @@ _peer_doorbell_eval() {
     return 0
 }
 
+_peer_doorbell_dbg() { printf 'doorbell: %s\n' "$*" >&2; return 0; } # stderr: a debug log or /dev/null
+
 _peer_doorbell_eval_inner() {
     local mode="$1" input="" cfg_file state_dir state_file="" gates live_name session_created pane_pid managed
     # 1. Env gate: no forks. Covers every non-cctrl Claude session.
-    [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" && -n "${TMUX:-}" ]] || return 0
-    [[ "${TMUX_PANE:-}" =~ ^%[0-9]+$ ]] || return 0
+    [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" && -n "${TMUX:-}" ]] || { _peer_doorbell_dbg "off: not a cctrl tmux session"; return 0; }
+    [[ "${TMUX_PANE:-}" =~ ^%[0-9]+$ ]] || { _peer_doorbell_dbg "off: TMUX_PANE is not %N"; return 0; }
     # 2. Enable gate: a file test, still no fork.
     cfg_file="$(_peer_doorbell_file)"
-    [[ -f "$cfg_file" ]] || return 0
+    [[ -f "$cfg_file" ]] || { _peer_doorbell_dbg "off: no doorbell.json"; return 0; }
     command -v jq >/dev/null 2>&1 || return 0
     [[ "$mode" == "claude" ]] && input="$(cat 2>/dev/null)"
-    # 2+3. One jq: the enable file and the Stop input's loop guard.
+    # 2+3. One jq: the enable file and the Stop input's loop flag and session id.
     # stop_hook_active is UNVERIFIED in the docs (eng review §3): a missing
-    # field or bad JSON counts as false; ring-once state is the real guard.
+    # field or bad JSON counts as false. It no longer skips the stop (fix
+    # SF2): ring-once state plus the DOORBELL_MAX_CHAIN cap bound the loop,
+    # and mail that arrives during a forced continuation still rings.
     gates="$(jq -rRs --arg cfg "$(<"$cfg_file")" '
         (try fromjson catch {}) as $in
         | ($cfg | fromjson) as $c
         | if ($c | type) != "object" or $c.enabled != true then "off"
-          elif (($in | type) == "object" and $in.stop_hook_active == true) then "loop"
           else "on", ($c.baseline_at // ""), ($c.mode // "blocking"),
                (($c.peers // []) | map(tostring) | join(" ")),
-               (($c.roles // []) | map(tostring) | join(" "))
+               (($c.roles // []) | map(tostring) | join(" ")),
+               (if ($in | type) == "object" and $in.stop_hook_active == true then "loop" else "" end),
+               (if ($in | type) == "object" and ($in.session_id | type) == "string" then $in.session_id else "" end)
           end
     ' <<< "$input")" || return 0
-    local state baseline bell_mode allow_peers allow_roles
-    { IFS= read -r state; IFS= read -r baseline; IFS= read -r bell_mode; IFS= read -r allow_peers; IFS= read -r allow_roles; } <<< "$gates"
-    [[ "$state" == "on" ]] || return 0
+    local state baseline bell_mode allow_peers allow_roles loop_flag stdin_sid
+    { IFS= read -r state; IFS= read -r baseline; IFS= read -r bell_mode; IFS= read -r allow_peers; IFS= read -r allow_roles; IFS= read -r loop_flag; IFS= read -r stdin_sid; } <<< "$gates"
+    [[ "$state" == "on" ]] || { _peer_doorbell_dbg "off: doorbell.json not enabled"; return 0; }
     # 4. Live name from the hook's own pane. A %N pane id is exact: no prefix
     # match is possible (a bare -t NAME would resolve TMUX--x to TMUX--x--2).
     local display
-    display="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}|#{session_created}|#{pane_pid}|#{@cctrl_managed}' 2>/dev/null)" || return 0  # tmux-target:exact-id (TMUX_PANE is validated as %N above)
+    display="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}|#{session_created}|#{pane_pid}|#{@cctrl_managed}' 2>/dev/null)" || { _peer_doorbell_dbg "off: tmux display failed for $TMUX_PANE"; return 0; }  # tmux-target:exact-id (TMUX_PANE is validated as %N above)
     IFS='|' read -r live_name session_created pane_pid managed <<< "$display"
-    [[ -n "$live_name" && "$pane_pid" =~ ^[0-9]+$ ]] || return 0
+    [[ -n "$live_name" && "$pane_pid" =~ ^[0-9]+$ ]] || { _peer_doorbell_dbg "off: unreadable pane display"; return 0; }
     [[ "$live_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 0
     # 5+7. Candidate names and the mailbox prefilter in one jq: queued mail
     # to the live name, CCTRL_PEER, or a manual peer bound to this session,
@@ -9989,15 +10007,24 @@ _peer_doorbell_eval_inner() {
         ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
         | ((try ($pr | fromjson) catch {}) | if type == "object" then . else {} end) as $peers
         | ($state.rung // {} | if type == "object" then . else {} end) as $rung
-        | ([$live, $env_peer]
+        # CCTRL_PEER counts only while it is not bound to ANOTHER session
+        # (fix SF1): a manual peer re-pointed at handover (e.g. fleet-manager
+        # moved to a new FM) must not ring the old session still carrying it.
+        | (($peers[$env_peer] // null) as $ep
+           | if $env_peer == "" or $env_peer == $live then $env_peer
+             elif ($ep | type) != "object" then $env_peer
+             elif (($ep.tmux_target // $ep.session // "") as $s | $s == "" or $s == $live) then $env_peer
+             elif (($ep.aliases // []) | index($live)) != null then $env_peer
+             else "" end) as $env_ok
+        | ([$live, $env_ok]
            + [$peers | to_entries[] | select((.value.session // "") == $live or ((.value.aliases // []) | index($live)) != null) | .key]
           | map(select(. != "")) | unique) as $cands
         | [inputs | select(.status == "queued" and ((.to // "") as $t | $cands | index($t)) != null)] as $q
         | { cands: $cands,
             queued: [$q[].id],
             new: [$q[] | select(((.created_at // "") > $base) and ($rung[.id] == null)) | {id, to, created_at}] }
-    ' "$MESSAGES_FILE")" || return 0
-    [[ "$pre" == *'"new":[]}' ]] && return 0
+    ' "$MESSAGES_FILE")" || { _peer_doorbell_dbg "off: mailbox unreadable"; return 0; }
+    [[ "$pre" == *'"new":[]}' ]] && { _peer_doorbell_dbg "quiet: no new mail for $live_name${loop_flag:+ (stop_hook_active)}"; return 0; }
 
     # ---- slow path: only when new candidate mail exists ----
     # Managed + role/allowlist gate (6). Metadata may lack role (review F13):
@@ -10005,7 +10032,7 @@ _peer_doorbell_eval_inner() {
     local meta_file="" meta_role="" meta_kind="" enabled_for=false cand r
     meta_file="$(_session_metadata_file "$live_name" 2>/dev/null)" || meta_file=""
     [[ -n "$meta_file" && -f "$meta_file" ]] || meta_file=""
-    [[ "$managed" == "1" || -n "$meta_file" ]] || return 0
+    [[ "$managed" == "1" || -n "$meta_file" ]] || { _peer_doorbell_dbg "off: $live_name is not cctrl-managed"; return 0; }
     if [[ -n "$meta_file" ]]; then
         { IFS= read -r meta_role; IFS= read -r meta_kind; } < <(jq -r '(.role // ""), (.orch_kind // "")' "$meta_file" 2>/dev/null)
     fi
@@ -10016,35 +10043,42 @@ _peer_doorbell_eval_inner() {
         [[ -n "$meta_role" && "$r" == "$meta_role" ]] && enabled_for=true
         [[ "$r" == "fleet-manager" && "$meta_role" == "orchestrator" && "$meta_kind" == "fleet" ]] && enabled_for=true
     done
-    $enabled_for || return 0
+    $enabled_for || { _peer_doorbell_dbg "off: $live_name not in peers/roles (role=${meta_role:-unknown})"; return 0; }
 
-    # 8. Process identity: the nearest Claude ancestor of this hook must be the
-    # pane's own Claude (the pane pid, since cctrl execs claude, or its first
-    # child owning a session file). A nested `claude -p` or a stale inherited
-    # TMUX_PANE fails here. UNVERIFIED in the docs that hooks run as children
-    # of the Claude process; if not, this fails closed (no ring).
-    local pid="$PPID" hops=0 nearest="" expect="" child
+    # 8. Process identity (fix MF2). Walk up from the hook to the FIRST Claude
+    # process, by process name, whether or not it wrote a session file (a
+    # nested `claude -p` may not), and require it to be the pane's own Claude:
+    # the pane pid (cctrl execs claude) or the pane pid's first Claude child.
+    # When the Stop input carries session_id it must also equal the pane
+    # Claude's sessionId. Unknown or different = no ring (fail closed).
+    local pid="$PPID" hops=0 nearest="" expect="" child pane_sid=""
     while [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 1 && $hops -lt 8 ]]; do
-        if [[ -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]]; then nearest="$pid"; break; fi
+        if _peer_proc_is_claude "$pid"; then nearest="$pid"; break; fi
         pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
         hops=$((hops + 1))
     done
-    [[ -n "$nearest" ]] || return 0
-    if [[ -f "$CLAUDE_SESSIONS_DIR/$pane_pid.json" ]]; then
+    [[ -n "$nearest" ]] || { _peer_doorbell_dbg "off: no Claude ancestor"; return 0; }
+    if _peer_proc_is_claude "$pane_pid"; then
         expect="$pane_pid"
     else
         for child in $(pgrep -P "$pane_pid" 2>/dev/null); do
-            [[ -f "$CLAUDE_SESSIONS_DIR/$child.json" ]] && { expect="$child"; break; }
+            _peer_proc_is_claude "$child" && { expect="$child"; break; }
         done
     fi
-    [[ -n "$expect" && "$nearest" == "$expect" ]] || return 0
+    [[ -n "$expect" && "$nearest" == "$expect" ]] || { _peer_doorbell_dbg "off: nearest Claude $nearest is not the pane's Claude ${expect:-unknown} (nested run?)"; return 0; }
+    if [[ -n "$stdin_sid" ]]; then
+        [[ -f "$CLAUDE_SESSIONS_DIR/$expect.json" ]] && pane_sid="$(jq -r '.sessionId // "" | tostring' "$CLAUDE_SESSIONS_DIR/$expect.json" 2>/dev/null)"
+        [[ -n "$pane_sid" && "$pane_sid" == "$stdin_sid" ]] || { _peer_doorbell_dbg "off: Stop session_id does not match pane Claude's sessionId (${pane_sid:-unknown})"; return 0; }
+    fi
 
     # 9. Recycled-name guard. Reset the rung set when a different session now
     # holds the name, then check each recipient with the same addressee guard
     # recv applies. A recipient counts only when `recv --as <to>` would return
     # the mail (the address IS its canonical name).
-    local occupant_prev rung_json guard to ok_ids blocked_ids="[]" ring_ids="[]" lines="" n
+    local occupant_prev rung_json guard to ok_ids blocked_ids="[]" ring_ids="[]" lines="" n chain_prev=0 chain_new=0
     occupant_prev="$(jq -r '.occupant_created // "" | tostring' <<< "$state_raw" 2>/dev/null)" || occupant_prev=""
+    chain_prev="$(jq -r '.chain // 0 | tostring' <<< "$state_raw" 2>/dev/null)" || chain_prev=0
+    [[ "$chain_prev" =~ ^[0-9]+$ ]] || chain_prev=0
     rung_json="$(jq -c '.rung // {} | if type == "object" then . else {} end' <<< "$state_raw" 2>/dev/null)" || rung_json="{}"
     [[ -n "$rung_json" ]] || rung_json="{}"
     [[ "$occupant_prev" == "$session_created" ]] || rung_json="{}"
@@ -10073,26 +10107,64 @@ _peer_doorbell_eval_inner() {
     done
     _peer_all_json_cache_end >/dev/null 2>&1 || true
 
+    # Chain cap (fix SF2): a stop_hook_active stop may ring for mail that
+    # arrived during the forced continuation, but only DOORBELL_MAX_CHAIN
+    # times in a row. Past the cap nothing is recorded as rung, so the same
+    # mail rings at the next ordinary Stop instead of being dropped.
+    [[ "$occupant_prev" == "$session_created" ]] || chain_prev=0
+    if [[ -n "$loop_flag" ]]; then
+        if [[ -n "$lines" ]] && (( chain_prev >= DOORBELL_MAX_CHAIN )); then
+            _peer_doorbell_dbg "held: $live_name chain cap $DOORBELL_MAX_CHAIN reached; rings at the next ordinary Stop"
+            ring_ids="[]"; lines=""
+        fi
+        chain_new=$chain_prev
+        [[ -n "$lines" ]] && chain_new=$((chain_prev + 1))
+    else
+        chain_new=0
+        [[ -n "$lines" ]] && chain_new=1
+    fi
+
     # 10. Record what rang (and what the guard blocked, so it never costs a
     # slow path again), pruned to still-queued ids; then ring.
     local now new_state tmp
     now="$(_peer_now_utc)"
     new_state="$(jq -nc --argjson rung "$rung_json" --argjson q "$(jq -c '.queued' <<< "$pre")" \
-        --argjson ring "$ring_ids" --argjson blocked "$blocked_ids" --arg occ "$session_created" --arg now "$now" '
+        --argjson ring "$ring_ids" --argjson blocked "$blocked_ids" --arg occ "$session_created" --arg now "$now" \
+        --argjson chain "$chain_new" '
         { occupant_created: $occ,
+          chain: $chain,
           rung: (($rung | with_entries(select((.key as $k | $q | index($k)) != null)))
                  + ([$ring[] | {key: ., value: $now}] | from_entries)
                  + ([$blocked[] | {key: ., value: "blocked"}] | from_entries)) }
     ')" || return 0
     mkdir -p "$state_dir" 2>/dev/null || return 0
     tmp="$(mktemp "$state_dir/.state.XXXXXX" 2>/dev/null)" || return 0
-    if printf '%s\n' "$new_state" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$state_file"; then :; else rm -f "$tmp"; return 0; fi
-    [[ -n "$lines" ]] || return 0
+    if printf '%s\n' "$new_state" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$state_file"; then :; else rm -f "$tmp"; _peer_doorbell_dbg "off: state write failed"; return 0; fi
+    [[ -n "$lines" ]] || { _peer_doorbell_dbg "quiet: $live_name new mail all guard-blocked or held"; return 0; }
+    _peer_doorbell_dbg "ring: $live_name $(jq -r 'length' <<< "$ring_ids") id(s)${loop_flag:+ (continuation $chain_new)}"
     if [[ "$mode" == "claude" && "$bell_mode" == "advisory" ]]; then
         printf '%s\nADVISORY\n%s\n' "$DOORBELL_RING_MARK" "$lines"
     else
         printf '%s\n%s\n' "$DOORBELL_RING_MARK" "$lines"
     fi
+}
+
+_peer_proc_is_claude() { # pid -> 0 when the process is a Claude Code CLI
+    # By name, not by session file: a nested `claude -p` may write none.
+    # Native installs run as `claude`; npm installs as node running claude.
+    local pid="$1" comm args first
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null)" || return 1
+    comm="${comm%"${comm##*[![:space:]]}"}"; comm="${comm#"${comm%%[![:space:]]*}"}"
+    [[ "${comm##*/}" == "claude" ]] && return 0
+    args="$(ps -o args= -p "$pid" 2>/dev/null)" || return 1
+    args="${args#"${args%%[![:space:]]*}"}"
+    first="${args%% *}"
+    [[ "${first##*/}" == "claude" ]] && return 0
+    if [[ "${comm##*/}" == node* ]]; then
+        [[ "$args" == *"/claude "* || "$args" == *"/claude" || "$args" == *"claude-code"* ]] && return 0
+    fi
+    return 1
 }
 
 _peer_doorbell_codex() {

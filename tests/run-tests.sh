@@ -10107,6 +10107,16 @@ if [[ "${1:-}" == "-o" && "${2:-}" == "ppid=" && "${3:-}" == "-p" ]]; then
     echo " ${BELL_PS_DEFAULT:-1}"
     exit 0
 fi
+# Process names for the Claude ancestry walk: pids in BELL_CLAUDE_PIDS are
+# `claude`, every other pid is a shell.
+if [[ "${1:-}" == "-o" && ( "${2:-}" == "comm=" || "${2:-}" == "args=" ) && "${3:-}" == "-p" ]]; then
+    if [[ " ${BELL_CLAUDE_PIDS:-70001} " == *" $4 "* ]]; then
+        [[ "$2" == "comm=" ]] && echo "claude" || echo "claude --model x"
+    else
+        echo "bash"
+    fi
+    exit 0
+fi
 exec /bin/ps "$@"
 SH
     printf '#!/usr/bin/env bash\nexit 1\n' > "$t/bin/pgrep"
@@ -10117,7 +10127,7 @@ SH
     chmod +x "$t/hooks/notify.sh"
     printf 'import sys\nopen("%s/sessionlog.in","w").write(sys.stdin.read())\nsys.stderr.write("sessionlog-noise\\n")\n' "$t" > "$t/hooks/session-log.py"
     cp "$ROOT/hooks/peer-doorbell.sh" "$t/hooks/peer-doorbell.sh"
-    echo '{}' > "$t/sessions/70001.json"
+    echo '{"sessionId":"sess-a","status":"idle"}' > "$t/sessions/70001.json"
     printf '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"cctrl hooks run stop"}]}]}}\n' > "$t/home/.claude/settings.json"
     printf '{"role":"orchestrator","orch_kind":"repo","cctrl_managed":true}\n' > "$t/meta/TMUX--t-a.json"
     export HOME="$t/home" CCTRL_DATA_DIR="$t/data" CCTRL_SESSION_METADATA_DIR="$t/meta" \
@@ -10125,7 +10135,7 @@ SH
         BELL_TMUX_LOG="$BELL_LOG" BELL_PANE="%5" BELL_PS_DEFAULT=70001 \
         BELL_DISPLAY="TMUX--t-a|1700000000|70001|1"
     export PATH="$t/bin:$PATH"
-    unset CCTRL_PEER BELL_PS_MAP
+    unset CCTRL_PEER BELL_PS_MAP BELL_CLAUDE_PIDS
     "$t/cctrl" peer register carol >/dev/null
     "$t/cctrl" peer register TMUX--t-a --session TMUX--t-a >/dev/null
 }
@@ -10180,7 +10190,7 @@ test_doorbell_derived_name_rings() {
     _bell_fixture "$TMPDIR/bell-rings"
     _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
     _bell_enable "$_bell_cfg_default"
-    _bell_stop '{"session_id":"x","stop_hook_active":false}'
+    _bell_stop '{"session_id":"sess-a","stop_hook_active":false}'
     [[ "$BELL_RC" -eq 2 ]] || fail "new mail must ring with exit 2, got $BELL_RC (err=$BELL_ERR)"
     assert_contains "$BELL_ERR" "1 new peer message(s) for TMUX--t-a"
     assert_contains "$BELL_ERR" "cctrl peer recv --all --as TMUX--t-a --json"
@@ -10209,28 +10219,75 @@ test_doorbell_nested_claude_noop() {
     _bell_fixture "$TMPDIR/bell-nested"
     _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
     _bell_enable "$_bell_cfg_default"
-    echo '{}' > "$BELL_DIR/sessions/80001.json"
+    # Fix MF2: a nested `claude -p` (pid 80001, child of the pane Claude
+    # 70001) that wrote NO sessions file. The walk must stop at it (the first
+    # Claude above the hook) and refuse, not skip past it to the pane Claude.
     printf '80001 70001\n' > "$BELL_DIR/psmap"
-    export BELL_PS_MAP="$BELL_DIR/psmap" BELL_PS_DEFAULT=80001
+    export BELL_PS_MAP="$BELL_DIR/psmap" BELL_PS_DEFAULT=80001 BELL_CLAUDE_PIDS="70001 80001"
+    [[ ! -e "$BELL_DIR/sessions/80001.json" ]] || fail "fixture: the nested Claude must have no sessions file"
+    _bell_stop '{"session_id":"sess-nested"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a nested Claude without a sessions file must not ring (rc=$BELL_RC err=$BELL_ERR)"
     _bell_stop
-    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a nested Claude must not ring (rc=$BELL_RC err=$BELL_ERR)"
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a nested Claude must not ring even without a Stop session_id (rc=$BELL_RC)"
+    # The same nested Claude with a sessions file is refused too.
+    echo '{"sessionId":"sess-nested"}' > "$BELL_DIR/sessions/80001.json"
+    _bell_stop '{"session_id":"sess-nested"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a nested Claude with a sessions file must not ring (rc=$BELL_RC)"
     [[ "$(jq -r 'select(.subject == "s1") | .status' "$BELL_DATA/messages.jsonl")" == "queued" ]] || fail "nested Claude path changed mail"
     # No Claude ancestor at all (a hook not run by Claude) fails closed too.
-    export BELL_PS_DEFAULT=1; unset BELL_PS_MAP
+    export BELL_PS_DEFAULT=1 BELL_CLAUDE_PIDS="70001"; unset BELL_PS_MAP
     _bell_stop
     [[ "$BELL_RC" -eq 0 ]] || fail "no Claude ancestor must not ring"
-    echo "ok: doorbell rings only for the pane's own Claude, not a nested one"
+    # The pane's own Claude: a Stop session_id that differs from the pane
+    # Claude's sessionId, or a pane Claude with no sessionId, fails closed.
+    export BELL_PS_DEFAULT=70001
+    _bell_stop '{"session_id":"some-other-session"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "a mismatched Stop session_id must not ring (rc=$BELL_RC)"
+    echo '{}' > "$BELL_DIR/sessions/70001.json"
+    _bell_stop '{"session_id":"sess-a"}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "an unknown pane sessionId must not ring (rc=$BELL_RC)"
+    echo '{"sessionId":"sess-a"}' > "$BELL_DIR/sessions/70001.json"
+    _bell_stop '{"session_id":"sess-a"}'
+    [[ "$BELL_RC" -eq 2 ]] || fail "the pane's own Claude with a matching session_id must ring (rc=$BELL_RC err=$BELL_ERR)"
+    echo "ok: doorbell rings only for the pane's own Claude (by name, session file or not) and its session_id"
 }
 
 test_doorbell_stop_hook_active_guard() {
     _bell_fixture "$TMPDIR/bell-loop"
     _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
     _bell_enable "$_bell_cfg_default"
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "first stop must ring (rc=$BELL_RC)"
+    # The forced continuation's own Stop: already-rung mail never rings again.
     _bell_stop '{"stop_hook_active":true}'
-    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "stop_hook_active:true must not ring (rc=$BELL_RC)"
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "stop_hook_active with no new mail must not ring (rc=$BELL_RC)"
+    # Fix SF2: mail that arrives during the continuation rings at its Stop,
+    # instead of waiting for a turn that an idle session may never take.
+    _bell_send TMUX--t-a s2 2026-02-02T00:00:00Z
+    _bell_stop '{"stop_hook_active":true}'
+    [[ "$BELL_RC" -eq 2 ]] || fail "mail that arrived during a continuation must ring (rc=$BELL_RC)"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    local st="$BELL_DATA/doorbell/state/TMUX--t-a.json"
+    [[ "$(jq -r '.chain' "$st")" == "2" ]] || fail "chain must count consecutive continuation rings: $(cat "$st")"
+    # Chain cap (DOORBELL_MAX_CHAIN=3): the 3rd continuation ring is allowed,
+    # the 4th is held, not dropped, and rings at the next ordinary Stop.
+    _bell_send TMUX--t-a s3 2026-02-03T00:00:00Z
+    _bell_stop '{"stop_hook_active":true}'
+    [[ "$BELL_RC" -eq 2 ]] || fail "third ring in a chain must be allowed (rc=$BELL_RC)"
+    _bell_send TMUX--t-a s4 2026-02-04T00:00:00Z
+    _bell_stop '{"stop_hook_active":true}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "past the chain cap a continuation must not ring (rc=$BELL_RC)"
+    local s4
+    s4="$(jq -r 'select(.subject == "s4") | .id' "$BELL_DATA/messages.jsonl")"
+    jq -e --arg i "$s4" '.rung[$i] == null' "$st" >/dev/null || fail "held mail must not be recorded as rung: $(cat "$st")"
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "held mail must ring at the next ordinary Stop (rc=$BELL_RC)"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    [[ "$(jq -r '.chain' "$st")" == "1" ]] || fail "an ordinary-Stop ring restarts the chain: $(cat "$st")"
+    _bell_send TMUX--t-a s5 2026-02-05T00:00:00Z
     _bell_stop 'not json at all'
     [[ "$BELL_RC" -eq 2 ]] || fail "bad stdin counts as stop_hook_active=false, expected a ring, got $BELL_RC"
-    echo "ok: stop_hook_active guard; bad stdin treated as false"
+    echo "ok: stop_hook_active: no repeat rings, continuation mail still rings, chain capped, held mail rings later"
 }
 
 test_doorbell_ring_once_per_message() {
@@ -10297,6 +10354,53 @@ test_doorbell_alias_candidates() {
     echo "ok: manual peers bound to the session ring under their canonical name"
 }
 
+test_doorbell_env_peer_bound_elsewhere() {
+    # Fix SF1: CCTRL_PEER names a manual peer that has since been re-pointed
+    # to another session (fleet-manager handover). The old session must not
+    # ring for that peer's mail; the session it is bound to does.
+    _bell_fixture "$TMPDIR/bell-envpeer"
+    "$BELL_DIR/cctrl" peer register fleet-manager --session TMUX--t-new >/dev/null
+    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$BELL_DIR/meta/TMUX--t-new.json"
+    _bell_send fleet-manager s1 2026-02-01T00:00:00Z
+    _bell_enable "$_bell_cfg_default"
+    CCTRL_PEER=fleet-manager _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "CCTRL_PEER bound to another session must not ring (rc=$BELL_RC err=$BELL_ERR)"
+    # Unbound (or bound to this session) it still counts.
+    jq '."fleet-manager".session = "TMUX--t-a"' "$BELL_DATA/peers.json" > "$BELL_DATA/p" && mv "$BELL_DATA/p" "$BELL_DATA/peers.json"
+    jq -e '."fleet-manager".session == "TMUX--t-a"' "$BELL_DATA/peers.json" >/dev/null || fail "fixture: rebind failed"
+    CCTRL_PEER=fleet-manager _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "CCTRL_PEER bound to this session must ring (rc=$BELL_RC err=$BELL_ERR)"
+    assert_contains "$BELL_ERR" "--as fleet-manager"
+    echo "ok: CCTRL_PEER bound to another session never rings the old one"
+}
+
+test_doorbell_debug_log() {
+    # Fix SF4: the debug reasons work inside `cctrl hooks run stop` (whose
+    # own stderr is discarded) by going to doorbell/debug.log, never the model.
+    _bell_fixture "$TMPDIR/bell-debug"
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    _bell_enable "$_bell_cfg_default"
+    mkdir -p "$BELL_DATA/doorbell"; : > "$BELL_DATA/doorbell/debug"
+    export BELL_PS_DEFAULT=1
+    _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "debug must not change the outcome or reach stderr (rc=$BELL_RC err=$BELL_ERR)"
+    local log="$BELL_DATA/doorbell/debug.log"
+    [[ -f "$log" ]] || fail "debug.log must be written by hooks run stop"
+    assert_contains "$(cat "$log")" "off: no Claude ancestor"
+    [[ "$(stat -f '%Lp' "$log" 2>/dev/null || stat -c '%a' "$log")" == "600" ]] || fail "debug.log must be mode 600"
+    export BELL_PS_DEFAULT=70001
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "debug on: must still ring"
+    assert_contains "$(cat "$log")" "ring: TMUX--t-a 1 id(s)"
+    assert_not_contains "$(cat "$log")" "body s1"
+    rm -f "$BELL_DATA/doorbell/debug" "$log"
+    _bell_stop
+    [[ ! -e "$log" ]] || fail "no debug file and no env: nothing logged"
+    CCTRL_DOORBELL_DEBUG=1 _bell_stop
+    assert_contains "$(cat "$log")" "quiet: no new mail for TMUX--t-a"
+    echo "ok: doorbell debug reasons land in doorbell/debug.log from hooks run stop"
+}
+
 test_doorbell_role_gate() {
     _bell_fixture "$TMPDIR/bell-role"
     printf '{"role":"worker","cctrl_managed":true}\n' > "$BELL_DIR/meta/TMUX--t-a.json"
@@ -10337,7 +10441,7 @@ test_hooks_run_stop_ordering() {
     _bell_fixture "$TMPDIR/bell-order"
     _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
     _bell_enable "$_bell_cfg_default"
-    local payload='{"transcript_path":"/tmp/x","session_id":"abc"}'
+    local payload='{"transcript_path":"/tmp/x","session_id":"sess-a"}'
     _bell_stop "$payload"
     [[ "$BELL_RC" -eq 2 ]] || fail "expected the bell to ring"
     [[ "$(cat "$BELL_DIR/notify.in")" == "$payload" ]] || fail "notify.sh must get the same stdin when the bell rings"
@@ -10577,7 +10681,7 @@ test_doorbell_real_tmux_pane_identity() (
     IFS='|' read -r pane pid < <(tmux -S "$D/sock" display-message -p -t "=$b:" '#{pane_id}|#{pane_pid}')
     [[ "$pane" =~ ^%[0-9]+$ && "$pid" =~ ^[0-9]+$ ]] || fail "could not read pane of $b"
     echo '{}' > "$BELL_DIR/sessions/$pid.json"
-    export BELL_PS_DEFAULT="$pid" BELL_PANE="$pane"
+    export BELL_PS_DEFAULT="$pid" BELL_PANE="$pane" BELL_CLAUDE_PIDS="$pid"
     # Mail to the shorter name only: the --2 pane must never ring for it.
     CCTRL_NOW_UTC=2026-02-01T00:00:00Z "$BELL_DIR/cctrl" peer send "$a" --from carol --no-deliver -- for-a >/dev/null \
         || fail "send to derived peer $a failed"
