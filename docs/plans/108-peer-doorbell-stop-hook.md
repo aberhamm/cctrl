@@ -64,24 +64,41 @@ Queued backlog on 10-27: 735 messages (330 to fleet-claude--2).
 - Gates, cheapest first, all fail-open/silent:
   1. env (CCTRL_SESSION_KIND=tmux, CCTRL_SESSION_NAME, TMUX, TMUX_PANE=%N);
   2. $PEER_DATA_DIR/doorbell.json enabled;
-  3. stdin stop_hook_active != true;
+  3. stdin stop_hook_active read as a flag, not a skip (verify fix SF2): a forced
+     continuation's Stop rings only for mail that arrived during that turn, at most
+     3 rings in a row (DOORBELL_MAX_CHAIN); held mail rings at the next ordinary Stop;
   4. live session name via `tmux display-message -p -t "$TMUX_PANE"` (exact), managed check;
-  5. candidate names = live name, CCTRL_PEER, metadata.peer, manual peers whose session or
-     aliases match;
+  5. candidate names = live name, CCTRL_PEER (unless peers.json binds it to another
+     session, verify fix SF1), metadata.peer, manual peers whose session or aliases match;
   6. peer/role allowlist;
   7. jq prefilter of messages.jsonl for post-baseline, un-rung, queued mail;
-  8. nearest Claude ancestor pid == the pane's Claude pid;
+  8. the FIRST Claude process above the hook, found by process name (verify fix MF2: a
+     nested `claude -p` may write no sessions file), is the pane's Claude; and when the
+     Stop stdin carries session_id it equals that Claude's sessionId. Unknown = no ring;
   9. authoritative guarded `peer check`;
   10. record rung ids, print the instruction, exit 2.
 - Bell keys on QUEUED mail only; delivered_unacked never rings.
 - Instruction: `cctrl peer recv --all --as <peer> --json`, then `cctrl peer ack --all --as <peer>`.
-- Ring-once state: $PEER_DATA_DIR/doorbell/state/<session>.json {occupant_created, rung{}}.
+- Ring-once state: $PEER_DATA_DIR/doorbell/state/<session>.json {occupant_created, chain, rung{}}.
+- baseline_at: now on first enable and on enable from disabled, unless --keep-baseline
+  (verify fix SF5); widening a running bell keeps it.
+- Debug: `touch data/doorbell/debug` or CCTRL_DOORBELL_DEBUG=1 → one reason line per
+  Stop in data/doorbell/debug.log, also from inside `hooks run stop` (verify fix SF4).
+- Cost note (verify SF8): the gate order means every cctrl session with post-baseline
+  queued mail pays the metadata/role lookup at each Stop while the bell is enabled,
+  not only enabled sessions (a few ms).
 - Drain fix: `recv --all|--limit N`; plain recv no longer re-returns delivered unless
   --status delivered; `ack <id>...` and `ack --all`; MCP recv/ack equivalents.
 - `peer check` applies the addressee guard (read-only).
 - Idle path:
-  - sends to live orchestrator/FM peers default to --deliver (with --no-deliver),
-    only when doorbell.json is enabled;
+  - sends default to --deliver (with --no-deliver) only when doorbell.json is enabled,
+    the bell is enabled FOR the recipient (its names in peers, or its role in roles),
+    its role is in deliver_default_roles, and its Claude pane is idle (not working,
+    no modal, no draft) (verify fixes MF1, SF3). A pilot `enable --peer ONE` changes
+    sends to ONE only. A busy recipient gets a plain send; its Stop bell catches it.
+  - a default (not requested) delivery that is deferred or fails exits 0 with a
+    warning: the message is queued and a retry would duplicate it. Explicit
+    --deliver keeps its exit codes;
   - `peer watch --since` (default baseline_at) is the safety net.
   - Starting a resident watcher is a separate approval.
 - Registration: none needed. `peer doctor` checks Stop has an active `cctrl hooks run stop`
@@ -120,8 +137,8 @@ Queued backlog on 10-27: 735 messages (330 to fleet-claude--2).
   - (a) Senders to orchestrators default to `--deliver`.
   - (b) Leave idle sessions to the fleet manager's tick.
   - (c) A later `peer watch` daemon (out of scope in 044).
-  - Recommendation: (a) default --deliver to live orchestrator/FM recipients (deferred
-    when busy, caught by the Stop bell) + (c) existing `peer watch` with a --since
+  - Recommendation: (a) default --deliver to live, idle orchestrator/FM recipients the
+    bell is enabled for (a busy one gets a plain send, caught by the Stop bell) + (c) existing `peer watch` with a --since
     baseline floor as safety net. Starting it resident = separate Matthew approval.
 - **D5. Existing backlog.** On first ring, 100+ old messages would flood
   the fleet manager.
@@ -142,7 +159,9 @@ Queued backlog on 10-27: 735 messages (330 to fleet-claude--2).
 
 Rollback:
 - `cctrl peer doorbell disable`, or `rm data/doorbell.json`. Takes effect at the next Stop.
-- Code: `cctrl` rollback to the previous release.
+- Code: disable the bell first (`cctrl peer doorbell disable`), then repoint
+  ~/.local/lib/cctrl/current at the previous release (there is no `cctrl rollback`
+  command; see the impl report's rollback text).
 - No settings.json change at any step.
 
 ## Tests

@@ -2,6 +2,10 @@
 # Plan 108 §5.12: per-Stop cost of the peer doorbell. Not part of the suite.
 #
 #   tests/bench-doorbell.sh [SRC_DATA_DIR] [RUNS]
+#   CCTRL_BIN=~/.local/bin/cctrl tests/bench-doorbell.sh [SRC_DATA_DIR] [RUNS]
+#
+# CCTRL_BIN picks the cctrl under test (default: this checkout's ./cctrl). Set
+# it to the installed launcher to time the INSTALLED release.
 #
 # Copies messages.jsonl and peers.json from SRC_DATA_DIR (default: the repo's
 # data/) into a mktemp -d CCTRL_DATA_DIR, starts ONE private tmux session on
@@ -42,17 +46,26 @@ chmod +x "$D/bin/tmux"
 "$REAL_TMUX" -S "$D/sock" new-session -d -s "$SESSION" 'sleep 3600'
 "$REAL_TMUX" -S "$D/sock" set-option -t "=$SESSION:" -q @cctrl_managed 1
 IFS='|' read -r PANE PANE_PID < <("$REAL_TMUX" -S "$D/sock" display-message -p -t "=$SESSION:" '#{pane_id}|#{pane_pid}')
-echo '{}' > "$D/sessions/$PANE_PID.json"
+echo '{"sessionId":"bench-session"}' > "$D/sessions/$PANE_PID.json"
 printf '{"role":"orchestrator","orch_kind":"repo","cctrl_managed":true}\n' > "$D/meta/$SESSION.json"
-# The ring path walks the hook's ancestry to the pane's Claude; a fake ps
-# answers that walk with the bench pane pid.
-printf '#!/usr/bin/env bash\nif [[ "$1" == "-o" && "$2" == "ppid=" ]]; then echo " %s"; exit 0; fi\nexec /bin/ps "$@"\n' "$PANE_PID" > "$D/bin/ps"
+# The ring path walks the hook's ancestry to the first Claude process; a fake
+# ps answers that walk with the bench pane pid and names that pid `claude`.
+cat > "$D/bin/ps" <<PS
+#!/usr/bin/env bash
+if [[ "\$1" == "-o" && "\$2" == "ppid=" ]]; then echo " $PANE_PID"; exit 0; fi
+if [[ "\$1" == "-o" && ( "\$2" == "comm=" || "\$2" == "args=" ) && "\$3" == "-p" ]]; then
+    [[ "\$4" == "$PANE_PID" ]] && echo claude || echo bash
+    exit 0
+fi
+exec /bin/ps "\$@"
+PS
 chmod +x "$D/bin/ps"
 
 export HOME="$D/home" CCTRL_DATA_DIR="$D/data" CCTRL_SESSION_METADATA_DIR="$D/meta" \
     CCTRL_CLAUDE_SESSIONS_DIR="$D/sessions" CCTRL_CLAUDE_SETTINGS="$D/home/.claude/settings.json" \
     PATH="$D/bin:$PATH"
-CCTRL="$ROOT/cctrl"
+CCTRL="${CCTRL_BIN:-$ROOT/cctrl}"
+[[ -x "$CCTRL" ]] || { echo "cctrl not executable: $CCTRL" >&2; exit 1; }
 "$CCTRL" peer register bench-sender >/dev/null 2>&1 || true
 
 stats() { # label, then ms values on stdin
@@ -64,7 +77,7 @@ run_case() { # label envmode
         [[ "$label" == "ring" ]] && rm -rf "$D/data/doorbell/state"
         t0=$EPOCHREALTIME; rc=0
         if [[ "$mode" == "cctrl" ]]; then
-            printf '{}' | CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="$SESSION" TMUX="$D/sock,1,0" TMUX_PANE="$PANE" \
+            printf '{"session_id":"bench-session"}' | CCTRL_SESSION_KIND=tmux CCTRL_SESSION_NAME="$SESSION" TMUX="$D/sock,1,0" TMUX_PANE="$PANE" \
                 "$CCTRL" peer doorbell --hook claude >/dev/null 2>&1 || rc=$?
         else
             printf '{}' | "$CCTRL" peer doorbell --hook claude >/dev/null 2>&1 || rc=$?
@@ -76,6 +89,7 @@ run_case() { # label envmode
     done | stats "$label"
 }
 
+echo "bench: cctrl=$CCTRL"
 echo "bench: $(wc -l < "$D/data/messages.jsonl" | tr -d ' ') messages, $(wc -c < "$D/data/messages.jsonl" | tr -d ' ') bytes, $RUNS runs per case"
 run_case noncctrl plain
 rm -f "$D/data/doorbell.json"

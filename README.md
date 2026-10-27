@@ -1411,22 +1411,41 @@ cctrl peer doorbell enable --peer TMUX--ms--orch-x --dry-run   # show the file
 cctrl peer doorbell enable --peer TMUX--ms--orch-x             # write it
 cctrl peer doorbell enable --role orchestrator --role fleet-manager   # widen
 cctrl peer doorbell disable                       # enabled:false
+cctrl peer doorbell enable --keep-baseline        # re-enable without a new baseline
 rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell.json)
 ```
 
-- `doorbell.json` holds `enabled`, `baseline_at` (written once, at first
-  enable; older mail never rings), `peers`, `roles`, `mode` (`blocking` exits 2;
-  `advisory` only prints) and `deliver_default_roles`.
+- `doorbell.json` holds `enabled`, `baseline_at`, `peers`, `roles`, `mode`
+  (`blocking` exits 2; `advisory` only prints) and `deliver_default_roles`.
+  `baseline_at` is set to now on first enable and on every enable from
+  disabled (mail queued while the bell was off never rings) unless
+  `--keep-baseline`; adding peers/roles to a running bell keeps it.
 - Identity: the tmux session of the hook's own pane (`$TMUX_PANE`, an exact
-  `%N` target), only when the hook's nearest Claude ancestor is that pane's
-  Claude. A nested `claude -p` never rings its parent's mail. `CCTRL_PEER` and
-  manual peers bound to the session widen the candidate names.
+  `%N` target), only when the FIRST Claude process above the hook (found by
+  process name, whether or not it wrote a sessions file) is that pane's
+  Claude, and, when the Stop input carries `session_id`, it equals that
+  Claude's `sessionId`. A nested `claude -p` never rings its parent's mail;
+  anything unknown fails closed. `CCTRL_PEER` (unless that peer is now bound
+  to another session) and manual peers bound to the session widen the
+  candidate names.
 - Each message rings once (state in `data/doorbell/state/<session>.json`);
-  `stop_hook_active: true` never rings; mail for a recycled name never rings.
-  Any error is a silent no-op. `CCTRL_DOORBELL_DEBUG=1` shows its stderr.
-- While enabled, `peer send` to a live orchestrator / fleet manager defaults to
-  `--deliver` (`--no-deliver` opts out), and `peer watch` ignores mail older
-  than `baseline_at` (`--since ISO` overrides).
+  mail for a recycled name never rings. A `stop_hook_active: true` Stop (the
+  end of a turn the bell forced) never re-rings mail, but rings for mail that
+  arrived during that turn, at most 3 times in a row; past that the mail waits
+  for the next ordinary Stop. Any error is a silent no-op.
+- Debug: `touch data/doorbell/debug` (or `CCTRL_DOORBELL_DEBUG=1` in the
+  hook's env) appends one reason line per Stop to `data/doorbell/debug.log`
+  (names, pids, counts; no message text). It works inside `hooks run stop`.
+  Remove both files when done; the log is not rotated.
+- While enabled, `peer send` defaults to `--deliver` only for a recipient the
+  bell is enabled for (its name in `peers`, or its role in `roles`) whose role
+  is in `deliver_default_roles`, and only while its Claude pane is idle (not
+  working, no modal, no unsent draft). A busy recipient gets a plain send,
+  and its Stop bell rings at the end of the turn. A default delivery that
+  still cannot reach the pane exits 0 (`deliver_default: true`, a `warning`):
+  the message is queued; do not re-send. An explicit `--deliver` keeps its
+  old behaviour and exit codes; `--no-deliver` opts out. `peer watch` ignores
+  mail older than `baseline_at` (`--since ISO` overrides).
 - No settings change: `peer doctor` checks that Stop runs `cctrl hooks run
   stop` (remedy: `cctrl hooks install`) and reports `doorbell_enabled`.
 - `tests/bench-doorbell.sh [DATA_DIR]` measures the per-Stop cost on a copy of
