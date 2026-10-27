@@ -13,7 +13,7 @@
 #   ring       enabled, one new message, rung state cleared each run
 # Reports p50/p95 wall ms per case (whole process, so cctrl's own startup is
 # included). Never touches the real mailbox, settings, or the live tmux
-# server; cleanup is kill-session by exact name, never kill-server.
+# server; cleanup is kill-session by exact name only (no server-wide kill).
 set -euo pipefail
 unset TMUX TMUX_PANE CCTRL_PEER CCTRL_SESSION_KIND CCTRL_SESSION_NAME
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

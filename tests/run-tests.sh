@@ -10553,7 +10553,7 @@ test_doorbell_real_tmux_pane_identity() (
     # One real-tmux test (eng review §5.13): the doorbell's exact %N pane
     # lookup and the derived-peer resolution against a live private server.
     # Every tmux call goes to "$D/sock"; cleanup is kill-session by exact
-    # name (the server exits once empty), never kill-server.
+    # name (the server exits once empty); the server-wide kill is never used.
     unset TMUX TMUX_PANE
     [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] || { echo "skip: no tmux on this host"; exit 0; }
     local D a="TMUX--rt-a" b="TMUX--rt-a--2" pane pid
