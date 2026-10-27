@@ -1,7 +1,9 @@
 ---
 id: 044
 title: peer doctor --fix installs the doorbell hook idempotently
-status: pending
+status: skipped
+skipped-reason: "superseded in part by 108: --fix settings install dropped; kept pieces landed in 108"
+superseded-in-part-by: 108
 blocked-by: []
 priority: 16
 goal: revised-cctrl-audit-backlog
@@ -26,6 +28,8 @@ have mail, which is a root cause of the fleet's silent-non-delivery pain
 (plan 027 fixed the sender leg; this fixes the receiver leg). Additionally,
 the current registration check greps the settings file for the hook's
 *filename*, so a commented-out or disabled entry passes the doctor check.
+
+> Superseded in part by plan 108 (eng review section 7): 108 replaced the `peer doctor --fix` settings-merge, backup/atomic-write, Stop-and-Notification registration of the raw hook path, and spawn-time warning criteria; it kept the `CCTRL_CLAUDE_SETTINGS` override, the structural registration check, and the no-op-outside-cctrl regression test.
 
 **Acceptance criteria:**
 
