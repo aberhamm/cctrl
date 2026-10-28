@@ -10636,7 +10636,10 @@ test_peer_send_default_deliver_gated() {
     _sdd() { # extra-env... -- send args...
         local -a envs=()
         while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done; shift
+        # Plan 110 S4: readiness is fail-closed, so the idle pane must draw an
+        # empty composer (an empty capture is "not ready"); envs can override.
         env HOME="$T/home" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--orch1 TMUX--orch2 TMUX--wkr" \
+            TMUX_FAKE_CAPTURE_PANE=$'\u25cf done.\n────────────────────\n\u276f \n────────────────────' \
             TMUX_FAKE_PANE_PID=12345 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" ${envs[@]+"${envs[@]}"} \
             "$ROOT/cctrl" peer send "$@"
     }
@@ -10664,10 +10667,15 @@ test_peer_send_default_deliver_gated() {
     out="$(_sdd TMUX_FAKE_CAPTURE_PANE=$'Do you want to proceed?\n\u276f 1. Yes\n  2. No' -- orch1 --from carol --json -- five)"
     jq -e '.outcome == null' <<< "$out" >/dev/null || fail "a modal pane must get a plain send: $out"
     assert_not_contains "$(cat "$log")" "paste-buffer"
-    # An explicit --deliver keeps its behaviour into a busy pane (no idle gate).
+    # Plan 110 S4: an explicit --deliver into a busy pane is readiness-gated
+    # too (it used to push): deferred, queued, exit 0, nothing pasted.
     echo '{"status":"busy","sessionId":"s1"}' > "$sdir/12345.json"
-    out="$(_sdd CCTRL_NOW_UTC=2026-06-13T00:00:07Z -- orch1 --from carol --deliver --json -- six)"
-    jq -e '.outcome == "sent-and-nudged" and .deliver_default == null' <<< "$out" >/dev/null || fail "explicit --deliver must not be idle-gated: $out"
+    : > "$log"
+    rc=0
+    out="$(_sdd CCTRL_NOW_UTC=2026-06-13T00:00:07Z -- orch1 --from carol --deliver --json -- six)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "explicit --deliver into a busy pane must exit 0 (deferred), got $rc"
+    jq -e '.ok == true and .outcome == "sent-but-deferred" and .delivered == false and .deliver_default == null' <<< "$out" >/dev/null || fail "explicit --deliver must be readiness-gated: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
     # Fix MF1(b): a DEFAULT delivery that fails is still a successful send.
     echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
     rc=0
