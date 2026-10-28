@@ -8161,9 +8161,10 @@ _peer_claude_push_ready() { # target -> 0 when a push into this Claude pane is s
     #   3. an escaped capture succeeds and is non-empty;
     #   4. no dialog (_session_pane_has_dialog, the CLAUDE_HC_PATTERN table);
     #   5. no draft (_session_pane_has_draft exits 1, nothing else counts);
-    #   6. the transcript's last turn is not an assistant question.
+    #   6. the transcript is readable and its last turn is not an assistant
+    #      question (a missing or unreadable transcript is not ready).
     # Sets PEER_DELIVER_READY_REASON on a non-zero return, PEER_PUSH_PID on 0.
-    local target="$1" mode pid st capture plain draft_rc=0 turn
+    local target="$1" mode pid st capture plain draft_rc=0 turn tpath
     PEER_DELIVER_READY_REASON=""
     PEER_PUSH_PID=""
     if ! _tmux_run_with_timeout has-session -t "=$target"; then
@@ -8196,7 +8197,14 @@ _peer_claude_push_ready() { # target -> 0 when a push into this Claude pane is s
         0) PEER_DELIVER_READY_REASON="unsent draft in pane"; return 1 ;;
         *) PEER_DELIVER_READY_REASON="draft state unverifiable"; return 1 ;;
     esac
+    # A missing, unreadable or unparseable transcript is doubt, so not ready:
+    # the waiting-input check cannot run without it (fail closed).
+    tpath="$(_session_transcript_path "$target" 2>/dev/null)" || tpath=""
+    if [[ -z "$tpath" || ! -f "$tpath" || ! -r "$tpath" ]]; then
+        PEER_DELIVER_READY_REASON="transcript unreadable"; return 1
+    fi
     turn="$(_session_transcript_last_turn "$target" 2>/dev/null)" || turn=""
+    [[ -n "$turn" ]] || { PEER_DELIVER_READY_REASON="transcript unreadable"; return 1; }
     [[ "$turn" != "assistant-question" ]] || { PEER_DELIVER_READY_REASON="waiting for input"; return 1; }
     PEER_PUSH_PID="$pid"
     return 0
@@ -8690,8 +8698,13 @@ _peer_deliver_one_locked() {
     # fail-closed once, before the socket AND the tmux fallback. A pane that
     # is not ready is deferred with no mailbox write; its Stop bell rings.
     # Agent as the gate resolved it (a manual peer takes its session's agent).
-    local claude_agent=false
-    [[ "$agent" == "claude" || "${PEER_PUSH_AGENT:-}" == "claude" ]] && claude_agent=true
+    # Fail closed: only a known Codex pane takes the legacy modal-only check.
+    # An empty or unknown agent gets the Claude check, which --force-busy
+    # cannot override and which defers any pane without an idle Claude
+    # session file.
+    local claude_agent=true eff_agent="${PEER_PUSH_AGENT:-}"
+    [[ -n "$eff_agent" && "$eff_agent" != "unknown" ]] || eff_agent="$agent"
+    [[ "$eff_agent" == "codex" ]] && claude_agent=false
     if $claude_agent; then
         if ! _peer_claude_push_ready "$target"; then
             PEER_DELIVER_STATUS="deferred"
@@ -8700,9 +8713,11 @@ _peer_deliver_one_locked() {
             return 0
         fi
         # Socket adapter first, bound to the checked pid's own session file
-        # (S5). Never for --no-submit: a socket frame is always submitted (F7).
+        # (S5). Only when the push is meant to submit: a socket frame is
+        # always submitted, so --no-submit and --inline (submit=false) take
+        # the tmux paste, which leaves the text unsent (F7).
         local _sock_path
-        if [[ "$no_submit" != "true" ]] && _sock_path="$(_peer_claude_socket_for "$PEER_PUSH_PID")"; then
+        if [[ "$submit" == "true" ]] && _sock_path="$(_peer_claude_socket_for "$PEER_PUSH_PID")"; then
             if _peer_socket_deliver "$_sock_path" "$payload"; then
                 now="$(_peer_now_utc)"
                 if [[ -n "$inline_id" ]]; then
@@ -10150,8 +10165,8 @@ _peer_doorbell_eval_inner() {
         | ($cfg | fromjson) as $c
         | if ($c | type) != "object" or $c.enabled != true then "off"
           else "on", ($c.baseline_at // ""), ($c.mode // "blocking"),
-               (($c.peers // []) | map(tostring) | join(" ")),
-               (($c.roles // []) | map(tostring) | join(" ")),
+               (($c.peers // []) | if type == "array" then map(select(type == "string" and . != "" and (test("\\s") | not))) else [] end | join(" ")),
+               (($c.roles // []) | if type == "array" then map(select(type == "string" and . != "" and (test("\\s") | not))) else [] end | join(" ")),
                (if ($in | type) == "object" and $in.stop_hook_active == true then "loop" else "" end),
                (if ($in | type) == "object" and ($in.session_id | type) == "string" then $in.session_id else "" end)
           end
@@ -10431,6 +10446,8 @@ _peer_doorbell_enabled_for() { # peer_json -> 0 when the doorbell is enabled FOR
     # session, aliases, manual peers bound to its session) is in .peers, or
     # its role is in .roles (fleet-manager = orchestrator of kind fleet); it is
     # a local peer. jq and files only, no tmux: watch runs this per recipient.
+    # .peers/.roles must be arrays of single-word strings; anything else in
+    # them (an object, a number, "a b") matches nothing, as in the bell.
     # Sets PEER_PUSH_REASON on every non-zero return, and PEER_PUSH_ROLE /
     # _KIND / _AGENT / _TARGET for callers that gate further.
     local peer_json="$1" cfg gates allow_peers allow_roles host role kind agent target names meta="" n r
@@ -10439,8 +10456,8 @@ _peer_doorbell_enabled_for() { # peer_json -> 0 when the doorbell is enabled FOR
     cfg="$(_peer_doorbell_cfg_json)"
     [[ "$cfg" != "null" ]] || return 1
     gates="$(jq -r 'select(.enabled == true)
-        | ((.peers // []) | map(tostring) | join(" ")),
-          ((.roles // []) | map(tostring) | join(" "))' <<< "$cfg" 2>/dev/null)" || return 1
+        | ((.peers // []) | if type == "array" then map(select(type == "string" and . != "" and (test("\\s") | not))) else [] end | join(" ")),
+          ((.roles // []) | if type == "array" then map(select(type == "string" and . != "" and (test("\\s") | not))) else [] end | join(" "))' <<< "$cfg" 2>/dev/null)" || return 1
     [[ -n "$gates" ]] || return 1
     { IFS= read -r allow_peers; IFS= read -r allow_roles; } <<< "$gates"
     [[ -n "$allow_peers$allow_roles" ]] || return 1

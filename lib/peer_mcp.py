@@ -258,11 +258,13 @@ class Bridge:
 
     def cli_send_and_deliver(self, args: list[str], stdin: str | None = None) -> Any:
         # Delivery-aware variant of cli(). `peer send --deliver` exits non-zero on
-        # sent-but-undelivered / sent-but-deferred, but those states DID durably
-        # queue the message — turning them into an MCP error would report a
-        # perfectly good queued message as a send failure. Only send-failed
-        # (nothing queued) becomes ok:false; every other outcome is ok:true with
-        # the message id so the caller can retry delivery alone.
+        # sent-but-undelivered (sent-but-deferred and sent-and-queued exit 0 since
+        # plan 110), but every one of those states DID durably queue the message;
+        # turning a non-zero exit into an MCP error would report a perfectly good
+        # queued message as a send failure. This keys off `outcome`, not the exit
+        # code: only send-failed (nothing queued) becomes ok:false; every other
+        # outcome is ok:true with the message id. The message stays queued for
+        # the recipient to collect; do not re-send it.
         proc = subprocess.run(
             [self.cctrl, *args],
             input=stdin,

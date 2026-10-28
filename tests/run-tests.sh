@@ -8299,12 +8299,34 @@ enable_delivery_bell() {
 }
 
 # Plan 110 T0: a Claude Code session file for a fake pane pid in a scratch
-# sessions dir (never ~/.claude/sessions). Args: dir pid status [socket].
+# sessions dir (never ~/.claude/sessions). Args: dir pid status [socket]
+# [turn]. The push readiness check is fail-closed on the transcript too, so
+# the file carries a sessionId unique to dir+pid and a transcript under the
+# scratch projects dir (CCTRL_CLAUDE_PROJECTS_DIR, else the suite's
+# CLAUDE_CONFIG_DIR) whose last turn is: done (default, a finished answer),
+# question (an assistant question: waiting for input) or none (no
+# transcript at all).
 write_claude_session_file() {
-    local dir="$1" pid="$2" status="$3" sock="${4:-}"
+    local dir="$1" pid="$2" status="$3" sock="${4:-}" turn="${5:-done}" sid pdir
     mkdir -p "$dir"
-    jq -n --arg st "$status" --arg sock "$sock" --arg pid "$pid" \
-        '{pid:($pid|tonumber), status:$st, name:"fixture"} + (if $sock != "" then {messagingSocketPath:$sock} else {} end)' > "$dir/$pid.json"
+    sid="fixture-$(printf '%s' "$dir/$pid" | cksum | awk '{print $1}')"
+    pdir="${CCTRL_CLAUDE_PROJECTS_DIR:-${CLAUDE_CONFIG_DIR:?}/projects}/fixture"
+    jq -n --arg st "$status" --arg sock "$sock" --arg pid "$pid" --arg sid "$sid" \
+        '{pid:($pid|tonumber), status:$st, name:"fixture", sessionId:$sid} + (if $sock != "" then {messagingSocketPath:$sock} else {} end)' > "$dir/$pid.json"
+    rm -f "$pdir/$sid.jsonl"
+    case "$turn" in
+        none) return 0 ;;
+        question) write_claude_transcript "$pdir/$sid.jsonl" "Which option should I take?" ;;
+        *) write_claude_transcript "$pdir/$sid.jsonl" "Done." ;;
+    esac
+}
+
+# Plan 110 T0: a one-turn Claude transcript whose last turn is an assistant
+# text message. Args: path text.
+write_claude_transcript() {
+    mkdir -p "$(dirname "$1")"
+    jq -nc '{type:"user",message:{role:"user",content:"go"}}' > "$1"
+    jq -nc --arg t "$2" '{type:"assistant",message:{role:"assistant",content:[{type:"text",text:$t}]}}' >> "$1"
 }
 
 # Shared body for the per-agent modal-detector regression tests. Asserts that a
@@ -10633,6 +10655,9 @@ test_peer_send_default_deliver_gated() {
     printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--orch2.json"
     printf '{"role":"worker"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--wkr.json"
     echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
+    # Plan 110: readiness also needs a readable transcript that is not
+    # waiting on a question.
+    write_claude_transcript "$T/projects/p/s1.jsonl" "Done."
     _sdd() { # extra-env... -- send args...
         local -a envs=()
         while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done; shift
@@ -10640,7 +10665,7 @@ test_peer_send_default_deliver_gated() {
         # empty composer (an empty capture is "not ready"); envs can override.
         env HOME="$T/home" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--orch1 TMUX--orch2 TMUX--wkr" \
             TMUX_FAKE_CAPTURE_PANE=$'\u25cf done.\n────────────────────\n\u276f \n────────────────────' \
-            TMUX_FAKE_PANE_PID=12345 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" ${envs[@]+"${envs[@]}"} \
+            TMUX_FAKE_PANE_PID=12345 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$T/projects" CCTRL_DATA_DIR="$data" ${envs[@]+"${envs[@]}"} \
             "$ROOT/cctrl" peer send "$@"
     }
     # No doorbell.json: unchanged plain send (queued, no delivery attempt).
@@ -14555,6 +14580,14 @@ test_peer_push_gate_blocks_every_path() {
     enable_delivery_bell "$data" someone-else
     out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
     jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "a bell for another peer must not push: $out"
+    # .peers/.roles entries must be single-word strings: "a comet" or an
+    # object value naming comet matches nothing.
+    jq -n '{enabled:true, peers:["someone comet"], roles:["x orchestrator"], deliver_default_roles:[]}' > "$data/doorbell.json"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "a space-joined .peers entry must not enable comet: $out"
+    jq -n '{enabled:true, peers:{a:"comet"}, deliver_default_roles:[]}' > "$data/doorbell.json"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "an object .peers must not enable comet: $out"
 
     assert_not_contains "$(cat "$log")" "paste-buffer"
     assert_not_contains "$(cat "$log")" "load-buffer"
@@ -14583,7 +14616,8 @@ test_peer_claude_push_ready_fail_closed() {
     draft="$(printf '%s\n' '────────────────────' '❯ half typed reply' '────────────────────')"
     _ready_case() { # label status capture expected_status [extra env...]
         local label="$1" st="$2" cap="$3" want="$4"; shift 4
-        rm -rf "$sdir"; [[ "$st" == "-" ]] || write_claude_session_file "$sdir" 12345 "$st"
+        # st is a session status, optionally /TURN (write_claude_session_file).
+        rm -rf "$sdir"; [[ "$st" == "-" ]] || write_claude_session_file "$sdir" 12345 "${st%%/*}" "" "$([[ "$st" == */* ]] && printf '%s' "${st#*/}")"
         : > "$log"
         CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --json -- "ready $label" >/dev/null
         out="$(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$cap" \
@@ -14604,7 +14638,36 @@ test_peer_claude_push_ready_fail_closed() {
     _ready_case empty-capture idle "" deferred
     _ready_case no-session-file - "$idle" deferred
     _ready_case detectors-off idle "$modal" deferred CCTRL_STATE_DETECT_BLOCKED_DIALOG=0 CCTRL_STATE_DETECT_UNSENT_DRAFT=0
+    # The transcript is fail-closed too: waiting on a question, missing, or
+    # unreadable all defer.
+    _ready_case waiting-input idle/question "$idle" deferred
+    jq -e '.results[0].reason == "waiting for input"' <<< "$out" >/dev/null || fail "waiting-input: wrong reason: $out"
+    _ready_case no-transcript idle/none "$idle" deferred
+    jq -e '.results[0].reason == "transcript unreadable"' <<< "$out" >/dev/null || fail "no-transcript: wrong reason: $out"
+    local tfile
+    rm -rf "$sdir"; write_claude_session_file "$sdir" 12345 idle
+    tfile="$(ls "$CLAUDE_CONFIG_DIR"/projects/fixture/"$(jq -r .sessionId "$sdir/12345.json")".jsonl)"
+    chmod 000 "$tfile"
+    : > "$log"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --json -- "ready unreadable" >/dev/null
+    out="$(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$idle" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver cq --json)" || { chmod 600 "$tfile"; fail "unreadable: deliver must exit 0: $out"; }
+    chmod 600 "$tfile"
+    jq -e '.results[0].status == "deferred" and .results[0].reason == "transcript unreadable"' <<< "$out" >/dev/null || fail "unreadable transcript must defer: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
     _ready_case idle idle "$idle" nudged
+    # A bell-enabled recipient with no known agent takes the Claude check
+    # (fail closed): --force-busy cannot push into a pane that has no idle
+    # Claude session file.
+    mkdir -p "$TMPDIR/unknownready"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register unk --dir "$TMPDIR/unknownready" --session TMUX--unk >/dev/null
+    enable_delivery_bell "$data" comet orchestrator offline cq unk
+    rm -rf "$sdir"; mkdir -p "$sdir"; : > "$log"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send unk --from orchestrator --json -- "unknown agent" >/dev/null
+    out="$(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--unk" TMUX_FAKE_CAPTURE_PANE="$idle" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer deliver unk --force-busy --json)" || fail "unknown agent: deliver must exit 0: $out"
+    jq -e '.results[0].status == "deferred"' <<< "$out" >/dev/null || fail "unknown agent + --force-busy must defer: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
     # send --deliver to a bell-enabled but busy recipient: deferred, rc 0.
     rm -rf "$sdir"; write_claude_session_file "$sdir" 12345 busy
     out="$(env PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$idle" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
@@ -14724,10 +14787,16 @@ while time.time() < end:
     jq -e --arg s "$sock" '.results[0].status == "nudged" and .results[0].target == $s' <<< "$out" >/dev/null || { _rt110_cleanup; fail "idle enabled recipient must get the socket push: $out"; }
     # --no-submit never uses the socket (F7): it goes to the tmux pane.
     out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:01:00Z" "$ROOT/cctrl" peer deliver rtidle --no-submit --json)"
+    # --inline is unsubmitted too (submit=false): it must not take the socket,
+    # whose frame is always submitted.
+    local inline_id inline_out
+    inline_id="$(jq -r 'select(.to == "rtidle" and .status == "queued") | .id' "$data/messages.jsonl" | head -1)"
+    inline_out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:02:00Z" "$ROOT/cctrl" peer deliver rtidle --inline "$inline_id" --json)"
     sleep 0.5
     local nframes; nframes="$(wc -l < "$frames" | tr -d ' ')"
     _rt110_cleanup
     jq -e '.results[0].status == "nudged" and .results[0].target == "'"$s_idle"'"' <<< "$out" >/dev/null || fail "--no-submit must use tmux, not the socket: $out"
+    jq -e '.results[0].status != "socket" and .results[0].target == "'"$s_idle"'" and .results[0].submitted != true' <<< "$inline_out" >/dev/null || fail "--inline must use tmux unsubmitted, not the socket: $inline_out"
     [[ "$nframes" -eq 1 ]] || fail "expected exactly one socket frame, got $nframes"
     echo "ok: plan 110 real tmux + ps + unix socket + MCP bridge honour the push gate"
 }
