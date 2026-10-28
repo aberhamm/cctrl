@@ -8281,6 +8281,28 @@ setup_delivery_peers() {
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register comet --dir "$TMPDIR/comet" --agent codex --session TMUX--comet >/dev/null
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orchestrator --dir "$TMPDIR/orchestrator" --agent codex >/dev/null
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register offline --dir "$TMPDIR/offline" --agent codex >/dev/null
+    # Plan 110: cctrl pushes only to doorbell-enabled recipients, so the
+    # delivery fixtures enable the bell for the peers they deliver to. Tests
+    # of the gate itself remove or narrow it (enable_delivery_bell).
+    enable_delivery_bell "$data" comet orchestrator offline cq
+}
+
+# Plan 110 T0: write $data/doorbell.json enabling the bell for the named
+# peers. deliver_default_roles is empty, so plain sends keep their plan-108
+# behaviour (no implicit --deliver); only the push gate opens.
+enable_delivery_bell() {
+    local data="$1"; shift
+    mkdir -p "$data"
+    jq -n --args '{enabled:true, mode:"blocking", peers:$ARGS.positional, roles:[], deliver_default_roles:[], baseline_at:"2000-01-01T00:00:00Z"}' "$@" > "$data/doorbell.json"
+}
+
+# Plan 110 T0: a Claude Code session file for a fake pane pid in a scratch
+# sessions dir (never ~/.claude/sessions). Args: dir pid status [socket].
+write_claude_session_file() {
+    local dir="$1" pid="$2" status="$3" sock="${4:-}"
+    mkdir -p "$dir"
+    jq -n --arg st "$status" --arg sock "$sock" --arg pid "$pid" \
+        '{pid:($pid|tonumber), status:$st, name:"fixture"} + (if $sock != "" then {messagingSocketPath:$sock} else {} end)' > "$dir/$pid.json"
 }
 
 # Shared body for the per-agent modal-detector regression tests. Asserts that a
@@ -8841,21 +8863,22 @@ test_peer_send_deliver_outcomes() {
     [[ "$rc" -eq 0 ]] || fail "expected mailbox-only send-deliver to exit 0, got $rc"
     printf '%s\n' "$out" | jq -e '.ok == true and .outcome == "sent-and-queued" and .delivered == false and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-and-queued outcome"
 
-    # (3) busy/modal pane -> sent-but-deferred, exit non-zero, retry hint (deliver only).
+    # (3) busy/modal pane -> sent-but-deferred, exit 0 since plan 110 (the
+    # recipient is bell-enabled, so its Stop bell rings), do-not-resend hint.
     local codex_modal
     codex_modal="$(printf '%s\n' '● working' $'│ Allow Codex to run `npm test`? │' '│ No, and tell Codex what to do differently │')"
     rc=0
     out="$(PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_CAPTURE_PANE="$codex_modal" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "busy one")" || rc=$?
-    [[ "$rc" -ne 0 ]] || fail "expected sent-but-deferred to exit non-zero"
-    printf '%s\n' "$out" | jq -e '.ok == false and .outcome == "sent-but-deferred" and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-but-deferred outcome"
-    printf '%s\n' "$out" | jq -e '.hint | contains("cctrl peer deliver comet")' >/dev/null || fail "expected deferred hint to retry delivery only"
+    [[ "$rc" -eq 0 ]] || fail "expected sent-but-deferred to exit 0 (plan 110), got $rc"
+    printf '%s\n' "$out" | jq -e '.ok == true and .outcome == "sent-but-deferred" and .delivered == false and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-but-deferred outcome"
+    printf '%s\n' "$out" | jq -e '(.hint | contains("do not re-send")) and (.hint | contains("peer deliver") | not)' >/dev/null || fail "expected deferred hint to say queued, do not re-send: $out"
 
     # (4) paste failure -> sent-but-undelivered, message still queued, exit non-zero.
     rc=0
     out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_PASTE_FAIL=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "paste fail one")" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "expected sent-but-undelivered to exit non-zero"
     printf '%s\n' "$out" | jq -e '.ok == false and .outcome == "sent-but-undelivered" and (.message_id | startswith("msg_"))' >/dev/null || fail "expected sent-but-undelivered outcome"
-    printf '%s\n' "$out" | jq -e '.hint | contains("cctrl peer deliver comet")' >/dev/null || fail "expected undelivered hint to retry delivery only"
+    printf '%s\n' "$out" | jq -e '(.hint | contains("do not re-send")) and (.hint | contains("peer deliver") | not)' >/dev/null || fail "expected undelivered hint to say queued, do not re-send: $out"
     local pf_id; pf_id="$(printf '%s\n' "$out" | jq -r '.message_id')"
     jq -s -e --arg id "$pf_id" 'any(.[]; .id == $id and .status == "queued")' "$data/messages.jsonl" >/dev/null || fail "expected paste-failed reply to stay queued"
 
@@ -9202,6 +9225,7 @@ test_peer_mcp_send_deliver_outcomes() {
     local data="$TMPDIR/mcp-deliver-data"
     setup_delivery_peers "$data"   # comet(session TMUX--comet), orchestrator(none), offline(none)
     CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register deadsess --dir "$TMPDIR/comet" --agent codex --session TMUX--gone >/dev/null
+    enable_delivery_bell "$data" comet orchestrator offline deadsess
 
     local list_out send_req out
     # description no longer claims to only "Queue a message"; mentions delivery.
@@ -9626,9 +9650,16 @@ test_peer_deliver_claude_modal_detection() {
         '  1. First item' \
         '  2. Second item' \
         '' \
-        'Earlier you asked: Do you want to proceed with the old approach?')"
+        'Earlier you asked: Do you want to proceed with the old approach?' \
+        '────────────────────────────────' \
+        '❯ ' \
+        '────────────────────────────────')"
 
-    assert_modal_detection "$data" "$log" cq TMUX--cq "$modal_pane" "$benign_pane"
+    # Plan 110 S4: a Claude push needs the pane's pid to own an idle session
+    # file (fake list-panes reports pid 12345), in a scratch sessions dir.
+    local sdir="$TMPDIR/deliver-claude-modal-sessions"
+    write_claude_session_file "$sdir" 12345 idle
+    CCTRL_CLAUDE_SESSIONS_DIR="$sdir" assert_modal_detection "$data" "$log" cq TMUX--cq "$modal_pane" "$benign_pane"
 
     echo "ok: claude modal-detector anchors on ❯ 1. (no false-positive deferral)"
 }
