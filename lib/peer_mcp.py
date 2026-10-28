@@ -71,9 +71,10 @@ TOOLS = [
         "name": "say_peer",
         "description": (
             "Send a DIRECT live-tmux chat message to a peer running RIGHT NOW — the "
-            "tool-call form of `cctrl peer say`. DEFAULT RULE: use `say_peer` for a "
-            "live tmux agent you want to act immediately; use `send_message` for "
-            "durable async work that must survive the recipient being away/offline. "
+            "tool-call form of `cctrl peer say`. Only for a recipient that has the "
+            "doorbell enabled: any other tmux peer returns error code "
+            "recipient-not-doorbell-enabled (use send_message). Prefer "
+            "`send_message` for all peer messaging. "
             "For tmux peers this creates NO mailbox message: it types the "
             "body straight into the peer's tmux session. For a verified app-owned "
             "Codex peer, it queues durable mailbox mail and attempts app delivery; "
@@ -229,13 +230,14 @@ class Bridge:
             self._canonical = name
         return self._canonical
 
-    def cli(self, args: list[str], stdin: str | None = None, batch_report: bool = False) -> Any:
+    def cli(self, args: list[str], stdin: str | None = None, batch_report: bool = False,
+            extra_env: dict[str, str] | None = None) -> Any:
         proc = subprocess.run(
             [self.cctrl, *args],
             input=stdin,
             text=True,
             capture_output=True,
-            env=os.environ.copy(),
+            env={**os.environ, **(extra_env or {})},
             check=False,
         )
         stdout = proc.stdout.strip()
@@ -328,7 +330,8 @@ class Bridge:
                 cmd.append("--no-submit")
             if force_busy:
                 cmd.append("--force-busy")
-            return ok(self.cli(cmd, stdin=body))
+            # Plan 110 D1: refuse a tmux recipient the doorbell is not enabled for.
+            return ok(self.cli(cmd, stdin=body, extra_env={"CCTRL_SAY_REQUIRE_DOORBELL": "1"}))
         if name == "send_message":
             ensure_no_extra(args, {"to", "subject", "body"})
             to = require_string(args, "to")

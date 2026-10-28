@@ -6559,6 +6559,21 @@ _peer_cmd_say() {
         fi
         return $rc
     fi
+    # Plan 110 D1: the MCP say_peer tool sets CCTRL_SAY_REQUIRE_DOORBELL=1, so
+    # an agent's tool call cannot paste into a recipient the doorbell is not
+    # enabled for. CLI `peer say` (an operator/FM tool) stays ungated.
+    if [[ "${CCTRL_SAY_REQUIRE_DOORBELL:-}" == "1" ]]; then
+        local say_peer_json
+        say_peer_json="$(_peer_resolve_json "$identity" 2>/dev/null || printf '{}')"
+        if ! _peer_push_allowed "$say_peer_json" "[]"; then
+            if $json; then
+                _json_error recipient-not-doorbell-enabled "$identity is not doorbell-enabled, so say_peer cannot paste into it; use send_message (it queues, and $identity collects its own mail)"
+            else
+                echo -e "${RED}$identity is not doorbell-enabled; use peer send.${RESET}" >&2
+            fi
+            return 1
+        fi
+    fi
     _session_say "$PEER_DIRECT_TARGET" "$@"
 }
 

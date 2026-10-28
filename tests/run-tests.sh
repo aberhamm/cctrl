@@ -15021,6 +15021,21 @@ test_peer_mcp_say_peer() {
 
     local out say_req
 
+    # Plan 110 D1: with no doorbell.json, say_peer refuses a tmux recipient
+    # (error code recipient-not-doorbell-enabled) and pastes nothing.
+    : > "$log"
+    say_req="$(jq -cn '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"say_peer",arguments:{to:"comet",body:"gated"}}}')"
+    out="$(printf '%s\n' "$say_req" | PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    printf '%s\n' "$out" | jq -e '.result.isError == true and .result.structuredContent.error.code == "recipient-not-doorbell-enabled"' >/dev/null \
+        || fail "expected say_peer to refuse a non-doorbell recipient: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    # CLI peer say stays ungated (operator/FM tool): it still pastes.
+    : > "$log"
+    PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer say comet --json -- "cli say" >/dev/null \
+        || fail "expected CLI peer say to stay ungated"
+    assert_contains "$(cat "$log")" "paste-buffer"
+    enable_delivery_bell "$data" comet
+
     # (a) advertised in tools/list.
     out="$(
         {
