@@ -1300,9 +1300,11 @@ directories record their holder PID and are reclaimed automatically.
 A bare `peer send` only **queues**; the recipient collects its own mail
 (`peer recv`, or its doorbell at Stop). `--deliver` and `peer reply` also ask
 cctrl to push a nudge into the recipient's pane, but cctrl pushes (plan 110)
-only to a recipient the doorbell is enabled for, and only into a ready Claude
-pane: session file `idle`, not in copy-mode, no modal, no unsent draft, not
-waiting on a question. Every other recipient gets `sent-and-queued` with
+only to a recipient the doorbell is enabled for, and only when its pane is
+ready. A Claude pane (or one whose agent is unknown) is ready when its session
+file is `idle`, it is not in copy-mode, and it shows no modal and no unsent
+draft, and its transcript is readable and not waiting on a question. A Codex
+tmux pane only gets the modal check. Every other recipient gets `sent-and-queued` with
 `delivery_reason: recipient-not-doorbell-enabled`, exit 0. There is no
 override flag: to push to a peer, enable the bell for it.
 
