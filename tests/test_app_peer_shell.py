@@ -107,6 +107,8 @@ a="$(jq -r '.[0].app_delivery_attempt' "$MESSAGES_FILE")"
     def test_watch_retries_deferred_app_peer_and_reports_live(self):
         result=self.run_shell('''
 _peer_init
+# Plan 110 D2: app peers are pushed to only when the bell is enabled for them.
+printf '%s' '{"enabled":true,"peers":["a"],"roles":[],"deliver_default_roles":[]}' > "$PEER_DATA_DIR/doorbell.json"
 _peer_app_owned_verify() { return 0; }
 p='{"name":"a","provider_task_id":"thread-a","dir":"/tmp","capabilities":["mailbox","app-server"]}'
 _peer_resolve_json() { printf '%s' "$p"; }
@@ -124,6 +126,28 @@ _peer_app_owned_verify() { return 1; }
 [[ "$(_peer_reachability_class "$p")" == unreachable ]]
 ''')
         self.assertEqual(result.returncode,0,result.stderr)
+
+    def test_app_peer_not_doorbell_enabled_is_queued_only(self):
+        # Plan 110 D2: no doorbell.json (or a bell for someone else) means no
+        # app wake-up at all: the helper is never run, the mail stays queued.
+        result=self.run_shell('''
+_peer_init
+_peer_app_owned_verify() { return 0; }
+p='{"name":"a","provider_task_id":"thread-a","dir":"/tmp","capabilities":["mailbox","app-server"]}'
+_peer_resolve_json() { printf '%s' "$p"; }
+_mailbox_rewrite_json_locked() { printf '%s' "$1" > "$MESSAGES_FILE"; }
+_mailbox_read_json() { cat "$MESSAGES_FILE"; }
+python3() { echo CALLED >> "$PEER_DATA_DIR/helper.log"; printf '%s' '{"status":"accepted"}'; }
+m='[{"id":"msg-a","to":"a","status":"queued"}]'
+for bell in '' '{"enabled":true,"peers":["someone-else"],"roles":[]}'; do
+    rm -f "$PEER_DATA_DIR/doorbell.json"
+    [[ -n "$bell" ]] && printf '%s' "$bell" > "$PEER_DATA_DIR/doorbell.json"
+    _peer_orchestrate_recipients_locked "$m" '["a"]' false false true false 3 60 true
+    jq -e '.[0].status=="queued-only" and .[0].reason=="recipient-not-doorbell-enabled"' <<< "$PEER_ORCH_RESULTS"
+done
+[[ ! -e "$PEER_DATA_DIR/helper.log" ]]
+''')
+        self.assertEqual(result.returncode,0,result.stderr+result.stdout)
 
     def test_real_send_deliver_discovers_app_sender_without_as(self):
         result=self.run_shell('''

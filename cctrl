@@ -8628,7 +8628,9 @@ _peer_deliver_one_locked() {
     # collects it. No mailbox write (no history, no nudge_count), so watch's
     # backoff and stale accounting never see it. Before dry-run, so dry-run
     # reports the real outcome. --force-busy / --no-submit never override it.
-    if ! _peer_has_capability "$peer_json" app-server && ! _peer_push_allowed "$peer_json" "$messages"; then
+    # Codex app-server peers are gated too (decision D2): no app wake-up for
+    # a recipient the bell is not enabled for.
+    if ! _peer_push_allowed "$peer_json" "$messages"; then
         PEER_DELIVER_STATUS="queued-only"
         PEER_DELIVER_REASON="${PEER_PUSH_REASON:-recipient-not-doorbell-enabled}"
         PEER_DELIVER_NUDGE=""
