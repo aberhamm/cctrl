@@ -7,7 +7,7 @@ priority: 20
 allows-migrations: false
 review-required: eng
 created: 2026-10-28
-approval: pending (Matthew approved the recommendation in mdec-1027-orch-cctrl-mailbox-fix; plan review and rollout still need explicit OK)
+approval: pending (Matthew approved the recommendation in mdec-1028-cctrl-recommendations-1-7; plan review and rollout still need explicit OK)
 reviews: []
 related: 108, 111
 ---

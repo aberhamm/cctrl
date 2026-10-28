@@ -11590,7 +11590,7 @@ _session_require_tmux() {
     return 1
 }
 
-_proc_children() { # pid -> its direct child pids, one per line (ascending)
+_proc_children() { # pid -> its direct child pids, one per line
     # Not `pgrep -P`: macOS pgrep silently excludes the calling process and
     # all its ancestors unless -a is given (procps' -a means something else),
     # so a caller running inside a session (a Claude Bash tool or hook) could

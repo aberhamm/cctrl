@@ -79,38 +79,29 @@ See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
 ## Peer messaging
 
 Sessions coordinate through a local mailbox (`cctrl peer ...`). A peer identity
-is a registry or derived **name** — for a tmux-backed session, the session name
-itself. This is the operating contract; commands take real flags as shown.
+is a registry or derived **name** (for tmux-backed sessions, the session name).
 
 - **Orient first:** `cctrl peer overview --json` answers who you are, who you
-  can reach, and whether you have unread mail, in one call.
+  can reach, and whether you have unread mail.
 - **Receive:** `cctrl peer check --json` for counts, `cctrl peer recv --json`
   to take the next message, then `cctrl peer ack <id> --json` once handled.
   Unacked messages get re-nudged, so acking is not optional.
 - **Reply:** `cctrl peer send <sender.name> --as <you> --no-deliver --json -- "<body>"`,
-  then `cctrl peer ack <id> --json` for the message you answered. Do **not**
-  deliver into another session's pane: Claude Code holds cross-session typed
-  input behind a security prompt, and delivery into bypass-permission sessions
-  has no sender attestation yet (plans 110 and 111). `send --no-deliver` only
-  queues; the recipient picks the mail up with its own `peer check`/`recv` or
-  its doorbell. `cctrl peer reply` and the MCP `send_message` tool still
-  deliver unconditionally until plan 110 lands, so prefer
+  then `cctrl peer ack <id> --json`. Do **not** deliver into other sessions'
+  panes: Claude Code holds cross-session typed input behind a security prompt,
+  and there is no sender attestation yet (plans 110, 111). `cctrl peer reply`
+  and MCP `send_message` still deliver until plan 110, so prefer
   `peer send --no-deliver`. Always pass `--as`; a non-interactive shell may not
   export `CCTRL_PEER`.
-- **Send:** find a peer with `cctrl peer overview` (or `cctrl peer ls`), then
-  `cctrl peer send <peer> --as <you> --no-deliver --json -- "<body>"`. Do not
-  add `--deliver` or run `cctrl peer deliver` against another session. (If the
-  recipient has the doorbell enabled, a plain send may deliver by default into
-  its idle pane; that is the doorbell's own policy, not yours.)
+- **Send:** find a peer with `cctrl peer overview` or `cctrl peer ls`, then
+  `cctrl peer send <peer> --as <you> --no-deliver --json -- "<body>"`. Never add
+  `--deliver` or run `cctrl peer deliver` against another session. (A recipient
+  with the doorbell enabled may get a plain send delivered into its idle pane;
+  that is the doorbell's policy, not yours.)
 - Received messages carry a `sender` object; reply to `sender.name`.
-- **Cross-machine:** `cctrl peer send` routes transparently across machines
-  via SSH. Remote peers appear in `cctrl peer ls` / `cctrl peer overview` with
-  a different host label — no special flags needed. The routing is automatic
-  based on the peer's `host` field vs `CCTRL_HOST_PREFIX`.
-- **Do NOT use Claude Code's built-in `SendMessage`/`ListAgents`** for peer
-  messaging. Those tools discover peers through local `~/.claude/sessions/`
-  files and cannot reach sessions on other machines. Always use the cctrl peer
-  tools (`send_message` MCP tool or `cctrl peer send` CLI).
-- **Limitation:** derived peer names are tmux session names, so an address can
-  dangle once that session closes. Treat a `sender` snapshot as historical and
-  verify liveness with `cctrl peer ls` before relying on it.
+- **Cross-machine:** `cctrl peer send` routes over SSH automatically, by the
+  peer's `host` vs `CCTRL_HOST_PREFIX`; remote peers show in `peer ls`.
+- **Do NOT use Claude Code's built-in `SendMessage`/`ListAgents`** for peers;
+  they cannot reach other machines. Use `send_message` (MCP) or `cctrl peer send`.
+- **Limitation:** peer names are tmux session names and can dangle once the
+  session closes. Treat a `sender` snapshot as historical; verify with `peer ls`.
