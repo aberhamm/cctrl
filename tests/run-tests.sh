@@ -1249,6 +1249,8 @@ case "${1:-}" in
         fi
         if [[ "$*" == *session_name* ]]; then
             printf '%s\n' "${TMUX_FAKE_SESSION_NAME:-demo}"
+        elif [[ "$*" == *pane_in_mode* ]]; then
+            printf '%s\n' "${TMUX_FAKE_PANE_IN_MODE:-0}"
         else
             printf '0\n'
         fi
@@ -14482,6 +14484,244 @@ test_tmux_paste_buffer_names_unique_per_invocation() {
     [[ "$(printf '%s\n' "$names" | sort -u | wc -l | tr -d ' ')" == 4 ]] || fail "paste buffer names collided: $names"
 
     echo "ok: concurrent session say invocations use distinct tmux buffers"
+}
+
+test_peer_push_gate_blocks_every_path() {
+    # Plan 110 T1/T3/T4 (stubbed tmux): with no bell for the recipient, no
+    # delivery path pushes. Each returns rc 0, reports queued-only /
+    # sent-and-queued with delivery_reason recipient-not-doorbell-enabled,
+    # and leaves the mail queued with no nudge recorded.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/push-gate-data" log="$TMPDIR/push-gate-tmux.log" out err rc id
+    : > "$log"
+    setup_delivery_peers "$data"
+    rm -f "$data/doorbell.json"
+    local -a env=(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data")
+
+    rc=0; out="$(env "${env[@]}" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "gate send")" || rc=$?
+    [[ $rc -eq 0 ]] || fail "send --deliver to a non-bell peer must exit 0, got $rc"
+    jq -e '.ok == true and .outcome == "sent-and-queued" and .delivered == false
+        and .delivery_reason == "recipient-not-doorbell-enabled" and (.warning | contains("not doorbell-enabled"))
+        and (.outcome != "sent-and-nudged")' <<< "$out" >/dev/null || fail "send --deliver: expected queued-only outcome: $out"
+    err="$(env "${env[@]}" "$ROOT/cctrl" peer send comet --from orchestrator --deliver -- "gate send text" 2>&1 >/dev/null)"
+    assert_contains "$err" "not doorbell-enabled"
+
+    rc=0; out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "deliver to a non-bell peer must exit 0, got $rc"
+    jq -e '.results[0].status == "queued-only" and .results[0].reason == "recipient-not-doorbell-enabled"' <<< "$out" >/dev/null || fail "deliver: $out"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --dry-run --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "deliver --dry-run must show the gate: $out"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --force-busy --no-submit --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "--force-busy/--no-submit must not override the gate: $out"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver --all --json)"
+    jq -e '[.results[] | select(.peer == "comet")][0].status == "queued-only"' <<< "$out" >/dev/null || fail "deliver --all: $out"
+    id="$(jq -r 'select(.to == "comet") | .id' "$data/messages.jsonl" | head -1)"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --inline "$id" --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "deliver --inline: $out"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer nudge comet --json)"
+    jq -e '[.. | objects | select(.peer? == "comet") | .status][0] == "queued-only"' <<< "$out" >/dev/null || fail "nudge: $out"
+
+    # reply: default, --deliver and --no-deliver all queue; both flags is 64.
+    env "${env[@]}" "$ROOT/cctrl" peer send orchestrator --from comet --json -- "please reply" >/dev/null
+    env "${env[@]}" "$ROOT/cctrl" peer recv --all --as orchestrator --json >/dev/null
+    id="$(jq -r 'select(.to == "orchestrator") | .id' "$data/messages.jsonl" | tail -1)"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer reply "$id" --as orchestrator --no-ack --json -- "reply default")"
+    jq -e '.ok == true and .outcome == "sent-and-queued" and .delivery_reason == "recipient-not-doorbell-enabled"' <<< "$out" >/dev/null || fail "reply default: $out"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer reply "$id" --as orchestrator --no-ack --deliver --json -- "reply deliver")"
+    jq -e '.outcome == "sent-and-queued" and .delivery_reason == "recipient-not-doorbell-enabled"' <<< "$out" >/dev/null || fail "reply --deliver: $out"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer reply "$id" --as orchestrator --no-ack --no-deliver --json -- "reply queue")"
+    jq -e '.outcome == "sent-and-queued" and .delivery_reason == "no-deliver"' <<< "$out" >/dev/null || fail "reply --no-deliver: $out"
+    rc=0; env "${env[@]}" "$ROOT/cctrl" peer reply "$id" --as orchestrator --deliver --no-deliver --json -- "x" >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 64 ]] || fail "reply --deliver --no-deliver must exit 64, got $rc"
+
+    # MCP send_message: ok:true, outcome sent-and-queued.
+    out="$(jq -cn '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:"comet",body:"mcp gate"}}}' \
+        | env "${env[@]}" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.outcome == "sent-and-queued"
+        and .result.structuredContent.data.delivery_reason == "recipient-not-doorbell-enabled"' <<< "$out" >/dev/null || fail "MCP send_message: $out"
+
+    # A malformed doorbell.json and a bell for someone else also push nothing.
+    printf '{not json' > "$data/doorbell.json"
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "malformed doorbell.json must not push: $out"
+    enable_delivery_bell "$data" someone-else
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "a bell for another peer must not push: $out"
+
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    assert_not_contains "$(cat "$log")" "load-buffer"
+    jq -s -e 'map(select(.to == "comet")) | length > 0 and all(.[]; .status == "queued" and ((.nudge_count // 0) == 0) and ([.history[]? | select(.event == "nudge")] | length == 0))' \
+        "$data/messages.jsonl" >/dev/null || fail "gated mail must stay queued with no nudge recorded"
+
+    # Twin: the bell enabled for comet -> exactly one push.
+    enable_delivery_bell "$data" comet
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "an enabled recipient must be nudged: $out"
+    [[ "$(grep -c 'paste-buffer' "$log")" -eq 1 ]] || fail "expected exactly one paste for the enabled recipient"
+    echo "ok: plan 110 push gate holds every delivery path for a non-doorbell recipient"
+}
+
+test_peer_claude_push_ready_fail_closed() {
+    # Plan 110 T2 (stubbed tmux): a bell-enabled Claude recipient is pushed to
+    # only when every readiness check passes; any doubt defers (rc 0, no paste).
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/push-ready-data" log="$TMPDIR/push-ready-tmux.log" sdir="$TMPDIR/push-ready-sessions" out
+    setup_delivery_peers "$data"
+    mkdir -p "$TMPDIR/claudeready"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register cq --dir "$TMPDIR/claudeready" --agent claude --session TMUX--cq >/dev/null
+    local idle modal draft
+    idle="$(printf '%s\n' '● done.' '────────────────────' '❯ ' '────────────────────')"
+    modal="$(printf '%s\n' '│ Do you want to proceed?   │' '│ ❯ 1. Yes                  │' '│   2. No                   │')"
+    draft="$(printf '%s\n' '────────────────────' '❯ half typed reply' '────────────────────')"
+    _ready_case() { # label status capture expected_status [extra env...]
+        local label="$1" st="$2" cap="$3" want="$4"; shift 4
+        rm -rf "$sdir"; [[ "$st" == "-" ]] || write_claude_session_file "$sdir" 12345 "$st"
+        : > "$log"
+        CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --json -- "ready $label" >/dev/null
+        out="$(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$cap" \
+            CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" "$@" "$ROOT/cctrl" peer deliver cq --json)" \
+            || fail "$label: deliver must exit 0: $out"
+        jq -e --arg w "$want" '.results[0].status == $w' <<< "$out" >/dev/null || fail "$label: expected $want: $out"
+        if [[ "$want" == "deferred" ]]; then
+            assert_not_contains "$(cat "$log")" "paste-buffer"
+        else
+            [[ "$(grep -c 'paste-buffer' "$log")" -eq 1 ]] || fail "$label: expected one paste"
+        fi
+    }
+    _ready_case busy busy "$idle" deferred
+    _ready_case modal idle "$modal" deferred
+    _ready_case draft idle "$draft" deferred
+    _ready_case copy-mode idle "$idle" deferred TMUX_FAKE_PANE_IN_MODE=1
+    _ready_case capture-fail idle "$idle" deferred TMUX_FAKE_CAPTURE_FAIL=1
+    _ready_case empty-capture idle "" deferred
+    _ready_case no-session-file - "$idle" deferred
+    _ready_case detectors-off idle "$modal" deferred CCTRL_STATE_DETECT_BLOCKED_DIALOG=0 CCTRL_STATE_DETECT_UNSENT_DRAFT=0
+    _ready_case idle idle "$idle" nudged
+    # send --deliver to a bell-enabled but busy recipient: deferred, rc 0.
+    rm -rf "$sdir"; write_claude_session_file "$sdir" 12345 busy
+    out="$(env PATH="$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--cq" TMUX_FAKE_CAPTURE_PANE="$idle" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" \
+        CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --deliver --json -- "busy")" || fail "deferred send must exit 0"
+    jq -e '.ok == true and .outcome == "sent-but-deferred" and .delivered == false' <<< "$out" >/dev/null || fail "busy send: $out"
+    echo "ok: plan 110 Claude push readiness is fail-closed"
+}
+
+test_peer_socket_lookup_ignores_home_sessions() {
+    # Plan 110 F4/S5: the socket comes from the checked pid's file under
+    # CLAUDE_SESSIONS_DIR only; a matching-name session in $HOME/.claude is
+    # never read (it once could have been the live fleet's).
+    grep -q 'HOME/.claude/sessions' <(sed -n '/^_peer_claude_socket_for()/,/^}/p' "$ROOT/cctrl") \
+        && fail "_peer_claude_socket_for must not read \$HOME/.claude/sessions"
+    local fakehome="$TMPDIR/sockhome" sdir="$TMPDIR/sockhome-sessions" out
+    mkdir -p "$fakehome/.claude/sessions" "$sdir"
+    printf '{"name":"x (TMUX--cq)","messagingSocketPath":"/dev/null"}' > "$fakehome/.claude/sessions/1.json"
+    out="$(HOME="$fakehome" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_NO_MAIN=1 bash -c 'source "$1"; _peer_claude_socket_for 1 && echo FOUND || echo none' _ "$ROOT/cctrl")"
+    [[ "$out" == "none" ]] || fail "socket lookup must not fall back to HOME: $out"
+    echo "ok: socket lookup is bound to CLAUDE_SESSIONS_DIR"
+}
+
+test_peer_push_gate_real_tmux_socket_mcp() {
+    # Plan 110 T5 (REAL tools, AGENTS.md rule): real tmux on the suite's
+    # private -S shim, real ps (_proc_children), a real AF_UNIX listener under
+    # mktemp, and a real MCP bridge over stdio. Scratch HOME/sessions only.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    command -v socat >/dev/null || command -v node >/dev/null || { echo "skip: no socat/node"; return 0; }
+    local data="$TMPDIR/rt110-data" sdir="$TMPDIR/rt110-sessions" sockdir sock frames lpid out before after
+    local s_idle="TMUX--rt110-idle-$$" s_modal="TMUX--rt110-modal-$$" pane_pid sleep_pid i
+    sockdir="$(mktemp -d /tmp/cctrl-sock.XXXXXX)" || fail "mktemp failed"
+    sock="$sockdir/s"; frames="$sockdir/frames"; : > "$frames"
+    mkdir -p "$data" "$sdir" "$TMPDIR/rt110-home" "$TMPDIR/rt110-a" "$TMPDIR/rt110-b" "$TMPDIR/rt110-o"
+    python3 -I -c '
+import socket, sys, time
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sys.argv[1]); srv.listen(8); srv.settimeout(0.5)
+end = time.time() + 120
+while time.time() < end:
+    try: conn, _ = srv.accept()
+    except socket.timeout: continue
+    conn.settimeout(2); data = b""
+    try:
+        while True:
+            c = conn.recv(65536)
+            if not c: break
+            data += c
+            if data.endswith(b"\n"): break
+    except socket.timeout: pass
+    conn.close()
+    with open(sys.argv[2], "ab") as f: f.write(data if data.endswith(b"\n") else data + b"\n")
+' "$sock" "$frames" &
+    lpid=$!
+    for i in 1 2 3 4 5 6 7 8 9 10; do [[ -S "$sock" ]] && break; sleep 0.2; done
+    [[ -S "$sock" ]] || { kill "$lpid" 2>/dev/null; fail "listener did not start"; }
+    _rt110_cleanup() {
+        tmux kill-session -t "=$s_idle" 2>/dev/null || true
+        tmux kill-session -t "=$s_modal" 2>/dev/null || true
+        kill "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
+        rm -rf "$sockdir"
+    }
+    # Panes draw a composer (idle) or a modal, then wait on a child sleep, so
+    # the pane pid is bash and the Claude pid is found by walking real ps.
+    tmux new-session -d -s "$s_idle" -x 120 -y 30 "bash -c 'printf \"● ready\\n────────────────────────────────────────\\n❯ \\n────────────────────────────────────────\\n\"; sleep 600 & wait'" || { _rt110_cleanup; fail "tmux new-session failed"; }
+    tmux new-session -d -s "$s_modal" -x 120 -y 30 "bash -c 'printf \"│ Do you want to proceed? │\\n│ ❯ 1. Yes │\\n\"; sleep 600 & wait'" || { _rt110_cleanup; fail "tmux new-session failed"; }
+    _rt110_session_file() { # session -> writes the sleep pid's idle session file
+        local pp sp n
+        for n in 1 2 3 4 5 6 7 8 9 10; do
+            pp="$(tmux list-panes -t "=$1:" -F '#{pane_pid}' | head -1)"
+            sp="$(ps -A -o pid=,ppid=,comm= | awk -v p="$pp" '$2 == p && $3 ~ /sleep/ { print $1 }' | head -1)"
+            [[ -n "$sp" ]] && break; sleep 0.2
+        done
+        [[ -n "$sp" ]] || return 1
+        write_claude_session_file "$sdir" "$sp" idle "$sock"
+    }
+    _rt110_session_file "$s_idle" || { _rt110_cleanup; fail "no sleep child for $s_idle"; }
+    _rt110_session_file "$s_modal" || { _rt110_cleanup; fail "no sleep child for $s_modal"; }
+    sleep 0.3
+    local -a env=(HOME="$TMPDIR/rt110-home" CCTRL_DATA_DIR="$data" CCTRL_CLAUDE_SESSIONS_DIR="$sdir")
+    env "${env[@]}" "$ROOT/cctrl" peer register rtidle --dir "$TMPDIR/rt110-a" --agent claude --session "$s_idle" >/dev/null
+    env "${env[@]}" "$ROOT/cctrl" peer register rtmodal --dir "$TMPDIR/rt110-b" --agent claude --session "$s_modal" >/dev/null
+    env "${env[@]}" "$ROOT/cctrl" peer register rtorch --dir "$TMPDIR/rt110-o" --agent codex >/dev/null
+    # Verify the override took effect before trusting it: cctrl sees the
+    # scratch sessions dir and the real pane pid -> sleep pid walk.
+    out="$(env "${env[@]}" CCTRL_NO_MAIN=1 bash -c 'source "$1"; printf "%s|%s" "$CLAUDE_SESSIONS_DIR" "$(_session_claude_pid "$2")"' _ "$ROOT/cctrl" "$s_idle")"
+    [[ "${out%%|*}" == "$sdir" && -f "$sdir/${out#*|}.json" ]] || { _rt110_cleanup; fail "sessions-dir override / ps walk not in effect: $out"; }
+
+    # (i) not enabled: reply, send --deliver and deliver give zero frames and
+    # leave the pane byte-identical.
+    before="$(tmux capture-pane -p -t "=$s_idle:")"
+    env "${env[@]}" "$ROOT/cctrl" peer send rtorch --from rtidle --json -- "ask" >/dev/null
+    env "${env[@]}" "$ROOT/cctrl" peer recv --all --as rtorch --json >/dev/null
+    local ask_id; ask_id="$(jq -r 'select(.to == "rtorch") | .id' "$data/messages.jsonl" | tail -1)"
+    env "${env[@]}" "$ROOT/cctrl" peer reply "$ask_id" --as rtorch --json -- "r1" >/dev/null || { _rt110_cleanup; fail "reply failed"; }
+    env "${env[@]}" "$ROOT/cctrl" peer send rtidle --from rtorch --deliver --json -- "s1" >/dev/null || { _rt110_cleanup; fail "send --deliver failed"; }
+    env "${env[@]}" "$ROOT/cctrl" peer deliver rtidle --json >/dev/null || { _rt110_cleanup; fail "deliver failed"; }
+    # (iv) a real MCP bridge over stdio: send_message is gated the same way.
+    out="$(jq -cn '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:"rtidle",body:"m1"}}}' \
+        | env "${env[@]}" "$ROOT/cctrl" peer mcp --as rtorch)"
+    jq -e '.result.structuredContent.data.outcome == "sent-and-queued"' <<< "$out" >/dev/null || { _rt110_cleanup; fail "MCP send_message not queued-only: $out"; }
+    sleep 0.5
+    after="$(tmux capture-pane -p -t "=$s_idle:")"
+    [[ ! -s "$frames" ]] || { _rt110_cleanup; fail "non-enabled recipient got socket frames: $(cat "$frames")"; }
+    [[ "$before" == "$after" ]] || { _rt110_cleanup; fail "non-enabled recipient pane changed"; }
+
+    # (iii) enabled but a modal is visible: zero frames.
+    enable_delivery_bell "$data" rtidle rtmodal
+    env "${env[@]}" "$ROOT/cctrl" peer send rtmodal --from rtorch --json -- "modal one" >/dev/null
+    out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver rtmodal --json)"
+    jq -e '.results[0].status == "deferred"' <<< "$out" >/dev/null || { _rt110_cleanup; fail "modal pane must defer: $out"; }
+    sleep 0.3
+    [[ ! -s "$frames" ]] || { _rt110_cleanup; fail "modal delivery wrote a frame"; }
+
+    # (ii) enabled and idle: exactly one frame, through the pid-bound socket.
+    out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:00:00Z" "$ROOT/cctrl" peer deliver rtidle --json)"
+    for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$frames" ]] && break; sleep 0.2; done
+    jq -e --arg s "$sock" '.results[0].status == "nudged" and .results[0].target == $s' <<< "$out" >/dev/null || { _rt110_cleanup; fail "idle enabled recipient must get the socket push: $out"; }
+    # --no-submit never uses the socket (F7): it goes to the tmux pane.
+    out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:01:00Z" "$ROOT/cctrl" peer deliver rtidle --no-submit --json)"
+    sleep 0.5
+    local nframes; nframes="$(wc -l < "$frames" | tr -d ' ')"
+    _rt110_cleanup
+    jq -e '.results[0].status == "nudged" and .results[0].target == "'"$s_idle"'"' <<< "$out" >/dev/null || fail "--no-submit must use tmux, not the socket: $out"
+    [[ "$nframes" -eq 1 ]] || fail "expected exactly one socket frame, got $nframes"
+    echo "ok: plan 110 real tmux + ps + unix socket + MCP bridge honour the push gate"
 }
 
 test_peer_socket_deliver_payload_exact() {
