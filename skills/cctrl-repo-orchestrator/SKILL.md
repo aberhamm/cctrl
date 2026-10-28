@@ -42,12 +42,18 @@ or repo names. Pair it with your private environment brief and the repo's own
 
 - tmux name `TMUX--<host>--orch-<repo>` (a `--N` suffix on collision); default
   label `★ orchestrator: <repo>`. Workers keep their own names and labels.
+- For Codex app-owned chats, use the same default visible title
+  `★ orchestrator: <repo>`. On assuming this role or renaming the current chat,
+  use the native thread-title tool when available; honor an explicit user-chosen
+  title. Do not create a tmux session or invent a tmux identity to name an app
+  chat. A title does not establish ownership or execution authority.
 - Started with `cctrl start -d <dir> --orch-kind repo -n "<label>"` (or a
   shortcut that carries `--orch-kind repo`). Tag a session that is already live
   with `cctrl session set-role <session> orchestrator --orch-kind repo`.
   `set-role` changes the tag only: it never renames the tmux session, never
   restarts anything, and touches the label only with `--relabel`.
-- Relabel your own session with `cctrl rename --self "<label>"` (it works only
+- For tmux-owned sessions, relabel your own session with
+  `cctrl rename --self "<label>"` (it works only
   from inside a cctrl tmux session; exit 64 elsewhere). cctrl never rewrites an
   existing label on its own; a name you type inside the agent UI is pulled into
   cctrl's label only by `reconcile-names` (see below), so prefer `rename --self`.
