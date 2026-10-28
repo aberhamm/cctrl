@@ -86,18 +86,16 @@ is a registry or derived **name** (for tmux-backed sessions, the session name).
 - **Receive:** `cctrl peer check --json` for counts, `cctrl peer recv --json`
   to take the next message, then `cctrl peer ack <id> --json` once handled.
   Unacked messages get re-nudged, so acking is not optional.
-- **Reply:** `cctrl peer send <sender.name> --as <you> --no-deliver --json -- "<body>"`,
-  then `cctrl peer ack <id> --json`. Do **not** deliver into other sessions'
-  panes: Claude Code holds cross-session typed input behind a security prompt,
-  and there is no sender attestation yet (plans 110, 111). `cctrl peer reply`
-  and MCP `send_message` still deliver until plan 110, so prefer
-  `peer send --no-deliver`. Always pass `--as`; a non-interactive shell may not
-  export `CCTRL_PEER`.
+- **Reply:** `cctrl peer reply <id> --as <you> --json -- "<body>"` (it acks the
+  original). Always pass `--as`; a non-interactive shell may not export
+  `CCTRL_PEER`.
 - **Send:** find a peer with `cctrl peer overview` or `cctrl peer ls`, then
-  `cctrl peer send <peer> --as <you> --no-deliver --json -- "<body>"`. Never add
-  `--deliver` or run `cctrl peer deliver` against another session. (A recipient
-  with the doorbell enabled may get a plain send delivered into its idle pane;
-  that is the doorbell's policy, not yours.)
+  `cctrl peer send <peer> --as <you> --json -- "<body>"`.
+- Sends and replies are queue-first. Whether anything reaches the recipient's
+  pane is cctrl's decision (plan 110): only a doorbell-enabled recipient with
+  an idle pane is pushed to; everyone else collects their own mail (outcome
+  `sent-and-queued`). Never re-send, and never `peer say`/`session say` into
+  another session.
 - Received messages carry a `sender` object; reply to `sender.name`.
 - **Cross-machine:** `cctrl peer send` routes over SSH automatically, by the
   peer's `host` vs `CCTRL_HOST_PREFIX`; remote peers show in `peer ls`.
