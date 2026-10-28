@@ -1297,35 +1297,40 @@ directories record their holder PID and are reclaimed automatically.
 
 #### Sending and delivering in one step
 
-A bare `peer send` only **queues**. Nothing reaches the recipient until a
-delivery runs, and no watcher runs by default — so a send-only workflow silently
-goes nowhere. Two commands close that gap:
+A bare `peer send` only **queues**; the recipient collects its own mail
+(`peer recv`, or its doorbell at Stop). `--deliver` and `peer reply` also ask
+cctrl to push a nudge into the recipient's pane, but cctrl pushes (plan 110)
+only to a recipient the doorbell is enabled for, and only into a ready Claude
+pane: session file `idle`, not in copy-mode, no modal, no unsent draft, not
+waiting on a question. Every other recipient gets `sent-and-queued` with
+`delivery_reason: recipient-not-doorbell-enabled`, exit 0. There is no
+override flag: to push to a peer, enable the bell for it.
 
 ```bash
 cctrl peer send comet --as orchestrator --deliver --json -- "Please check XYZ"
 cctrl peer reply msg_20260608_070000_abc123 --as comet --json -- "Checked, all green"
 ```
 
-`--deliver` sends and then nudges in one command. `peer reply` goes further: it
-resolves the recipient from the referenced message itself (via its `sender`
-snapshot, falling back to a legacy bare `from`), sends, delivers, and acks the
-original — so a replying agent never needs to know the sender's address. Pass
-`--no-ack` to leave the original unacked. `--allow-unknown` cannot be combined
-with `--deliver`.
+`--deliver` sends and then tries a nudge in one command. `peer reply` goes
+further: it resolves the recipient from the referenced message itself (via its
+`sender` snapshot, falling back to a legacy bare `from`), sends, tries delivery,
+and acks the original — so a replying agent never needs to know the sender's
+address. `peer reply --no-deliver` only queues; `--deliver` (the default) and
+`--no-deliver` together is exit 64. Pass `--no-ack` to leave the original
+unacked. `--allow-unknown` cannot be combined with `--deliver`.
 
 Both report one of five named outcomes so a failure is never silent:
 
 | Outcome | Exit | Meaning |
 |---|---:|---|
 | `sent-and-nudged` | 0 | queued and the recipient was nudged |
-| `sent-and-queued` | 0 | queued; no delivery was requested |
+| `sent-and-queued` | 0 | queued; mailbox-only peer, `reply --no-deliver`, or not doorbell-enabled (`delivery_reason`) |
 | `send-failed` | ≠0 | nothing was written |
-| `sent-but-undelivered` | ≠0 | the message is queued; delivery failed |
-| `sent-but-deferred` | ≠0 | queued; delivery deferred (a modal was on screen) |
+| `sent-but-undelivered` | ≠0 | the message is queued; the push failed |
+| `sent-but-deferred` | 0 | queued; the pane was not ready (its Stop bell picks it up) |
 
-A delivery failure never rolls the send back. The message stays queued, and the
-hint tells you to retry **delivery only** (`cctrl peer deliver comet`) — re-running
-the whole command would send a duplicate.
+A delivery failure never rolls the send back. The message stays queued; do not
+re-send, which would duplicate it. MCP `send_message` reports the same outcome.
 
 Agents that do not have a tmux session can poll the mailbox directly:
 
@@ -1391,6 +1396,13 @@ cctrl peer deliver comet --no-submit     # paste without pressing Enter
 cctrl peer deliver --all --json          # nudge every queued tmux-capable peer
 ```
 
+`peer deliver`, `peer nudge` and `peer watch` go through the same push gate
+(plan 110): a recipient the doorbell is not enabled for reports
+`{status:"queued-only", reason:"recipient-not-doorbell-enabled"}`, exit 0, with
+no nudge recorded; `--dry-run`, `--force-busy`, `--no-submit` and `--inline`
+never bypass it. `--no-submit` never uses the Claude socket (a socket frame is
+always submitted).
+
 The nudge format is constant:
 
 ```text
@@ -1445,8 +1457,8 @@ rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell
   question/modal or holding an unsent draft also gets a plain send, but no Stop
   is pending, so the mail stays queued with no bell and no nudge until its next Stop. A default delivery that
   still cannot reach the pane exits 0 (`deliver_default: true`, a `warning`):
-  the message is queued; do not re-send. An explicit `--deliver` keeps its
-  old behaviour and exit codes; `--no-deliver` opts out. `peer watch` ignores
+  the message is queued; do not re-send. An explicit `--deliver` gets the same
+  push gate as every path (plan 110); `--no-deliver` opts out. `peer watch` ignores
   mail older than `baseline_at` (`--since ISO` overrides).
 - No settings change: `peer doctor` checks that Stop runs `cctrl hooks run
   stop` (remedy: `cctrl hooks install`) and reports `doorbell_enabled`.
