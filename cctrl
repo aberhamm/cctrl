@@ -10117,6 +10117,19 @@ DOORBELL_RING_MARK="__cctrl_doorbell_ring__"
 # Forced continuations in a row that a ring may cause (stop_hook_active=true
 # stops). Past this, new mail waits for the next ordinary Stop (fix SF2).
 DOORBELL_MAX_CHAIN="${DOORBELL_MAX_CHAIN:-3}"
+# Ring cap: rings per recipient per rolling hour, from doorbell.json
+# .max_rings_per_hour (default when absent or null). An invalid value (not an
+# integer >= 1, 0 included) fails closed: the bell never rings, mail stays
+# queued. The ring times live in the recipient's state file, as `rings`.
+DOORBELL_DEFAULT_MAX_RINGS=4
+DOORBELL_RING_WINDOW=3600
+# jq: doorbell.json object -> effective cap as a number, or "invalid".
+DOORBELL_MAX_RINGS_JQ='def max_rings: if (has("max_rings_per_hour") | not) or .max_rings_per_hour == null then '"$DOORBELL_DEFAULT_MAX_RINGS"'
+    elif (.max_rings_per_hour | type) == "number" and .max_rings_per_hour == (.max_rings_per_hour | floor)
+         and .max_rings_per_hour >= 1 and .max_rings_per_hour <= 1000000 then .max_rings_per_hour
+    else "invalid" end;
+def recent_rings($now; $win): (.rings // []) | if type == "array" then . else [] end
+    | map(select(type == "string") | (try fromdateiso8601 catch null) as $t | select($t != null and $t > ($now - $win) and $t <= $now) | .);'
 
 _peer_doorbell_file() { printf '%s/doorbell.json' "$PEER_DATA_DIR"; }
 _peer_doorbell_state_dir() { printf '%s/doorbell/state' "$PEER_DATA_DIR"; }
@@ -10160,7 +10173,7 @@ _peer_doorbell_eval_inner() {
     # field or bad JSON counts as false. It no longer skips the stop (fix
     # SF2): ring-once state plus the DOORBELL_MAX_CHAIN cap bound the loop,
     # and mail that arrives during a forced continuation still rings.
-    gates="$(jq -rRs --arg cfg "$(<"$cfg_file")" '
+    gates="$(jq -rRs --arg cfg "$(<"$cfg_file")" "$DOORBELL_MAX_RINGS_JQ"'
         (try fromjson catch {}) as $in
         | ($cfg | fromjson) as $c
         | if ($c | type) != "object" or $c.enabled != true then "off"
@@ -10168,12 +10181,16 @@ _peer_doorbell_eval_inner() {
                (($c.peers // []) | if type == "array" then map(select(type == "string" and . != "" and (test("\\s") | not))) else [] end | join(" ")),
                (($c.roles // []) | if type == "array" then map(select(type == "string" and . != "" and (test("\\s") | not))) else [] end | join(" ")),
                (if ($in | type) == "object" and $in.stop_hook_active == true then "loop" else "" end),
-               (if ($in | type) == "object" and ($in.session_id | type) == "string" then $in.session_id else "" end)
+               (if ($in | type) == "object" and ($in.session_id | type) == "string" then $in.session_id else "" end),
+               ($c | max_rings | if type == "number" then floor | tostring else . end)
           end
     ' <<< "$input")" || return 0
-    local state baseline bell_mode allow_peers allow_roles loop_flag stdin_sid
-    { IFS= read -r state; IFS= read -r baseline; IFS= read -r bell_mode; IFS= read -r allow_peers; IFS= read -r allow_roles; IFS= read -r loop_flag; IFS= read -r stdin_sid; } <<< "$gates"
+    local state baseline bell_mode allow_peers allow_roles loop_flag stdin_sid max_rings
+    { IFS= read -r state; IFS= read -r baseline; IFS= read -r bell_mode; IFS= read -r allow_peers; IFS= read -r allow_roles; IFS= read -r loop_flag; IFS= read -r stdin_sid; IFS= read -r max_rings; } <<< "$gates"
     [[ "$state" == "on" ]] || { _peer_doorbell_dbg "off: doorbell.json not enabled"; return 0; }
+    # Ring cap: an invalid max_rings_per_hour fails closed (no ring, mail stays
+    # queued), like a malformed doorbell.json.
+    [[ "$max_rings" =~ ^[1-9][0-9]*$ ]] || { _peer_doorbell_dbg "off: invalid max_rings_per_hour in doorbell.json (want an integer >= 1)"; return 0; }
     # 4. Live name from the hook's own pane. A %N pane id is exact: no prefix
     # match is possible (a bare -t NAME would resolve TMUX--x to TMUX--x--2).
     local display
@@ -10187,12 +10204,14 @@ _peer_doorbell_eval_inner() {
     # line makes jq fail, which is a silent no-op.
     state_dir="$(_peer_doorbell_state_dir)"
     state_file="$state_dir/$live_name.json"
-    local state_raw="{}" peers_raw="{}" pre
+    local state_raw="{}" peers_raw="{}" pre now
+    now="$(_peer_now_utc)"
     [[ -f "$state_file" ]] && state_raw="$(<"$state_file")"
     [[ -f "$PEERS_FILE" ]] && peers_raw="$(<"$PEERS_FILE")"
     [[ -s "$MESSAGES_FILE" ]] || return 0
     pre="$(jq -nc --arg live "$live_name" --arg env_peer "${CCTRL_PEER:-}" --arg base "$baseline" \
-        --arg st "$state_raw" --arg pr "$peers_raw" '
+        --arg st "$state_raw" --arg pr "$peers_raw" --arg now "$now" --argjson win "$DOORBELL_RING_WINDOW" \
+        "$DOORBELL_MAX_RINGS_JQ"'
         ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
         | ((try ($pr | fromjson) catch {}) | if type == "object" then . else {} end) as $peers
         | ($state.rung // {} | if type == "object" then . else {} end) as $rung
@@ -10210,10 +10229,25 @@ _peer_doorbell_eval_inner() {
           | map(select(. != "")) | unique) as $cands
         | [inputs | select(.status == "queued" and ((.to // "") as $t | $cands | index($t)) != null)] as $q
         | { cands: $cands,
+            rings: ($state | recent_rings($now | fromdateiso8601; $win) | length),
             queued: [$q[].id],
             new: [$q[] | select(((.created_at // "") > $base) and ($rung[.id] == null)) | {id, to, created_at}] }
-    ' "$MESSAGES_FILE")" || { _peer_doorbell_dbg "off: mailbox unreadable"; return 0; }
+    ' "$MESSAGES_FILE")" || { _peer_doorbell_dbg "off: mailbox or clock ($now) unreadable"; return 0; }
     [[ "$pre" == *'"new":[]}' ]] && { _peer_doorbell_dbg "quiet: no new mail for $live_name${loop_flag:+ (stop_hook_active)}"; return 0; }
+    # Ring cap: at most max_rings_per_hour rings per recipient (this session
+    # name) in a rolling hour. At the cap the Stop is a no-op: nothing is
+    # recorded as rung and no message status changes, so the mail stays
+    # queued and rings once the oldest ring ages out. The count comes from the
+    # same state read the write below replaces, and a pane runs one Stop at a
+    # time, so the check and the write cannot interleave (no lock, as before).
+    # Checked before the slow path, which it would only repeat.
+    local rings_recent
+    rings_recent="$(jq -r '.rings' <<< "$pre")" || return 0
+    [[ "$rings_recent" =~ ^[0-9]+$ ]] || return 0
+    if (( rings_recent >= max_rings )); then
+        _peer_doorbell_dbg "held: $live_name ring cap $max_rings/hour reached ($rings_recent in the last hour); mail stays queued"
+        return 0
+    fi
 
     # ---- slow path: only when new candidate mail exists ----
     # Managed + role/allowlist gate (6). Metadata may lack role (review F13):
@@ -10317,14 +10351,18 @@ _peer_doorbell_eval_inner() {
     fi
 
     # 10. Record what rang (and what the guard blocked, so it never costs a
-    # slow path again), pruned to still-queued ids; then ring.
-    local now new_state tmp
-    now="$(_peer_now_utc)"
+    # slow path again), pruned to still-queued ids; then ring. `rings` keeps
+    # the ring times of the last hour, plus this one; it is kept across a
+    # recycled name (the cap is per name).
+    local new_state tmp
     new_state="$(jq -nc --argjson rung "$rung_json" --argjson q "$(jq -c '.queued' <<< "$pre")" \
         --argjson ring "$ring_ids" --argjson blocked "$blocked_ids" --arg occ "$session_created" --arg now "$now" \
-        --argjson chain "$chain_new" '
-        { occupant_created: $occ,
+        --argjson chain "$chain_new" --arg st "$state_raw" --argjson win "$DOORBELL_RING_WINDOW" \
+        "$DOORBELL_MAX_RINGS_JQ"'
+        ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
+        | { occupant_created: $occ,
           chain: $chain,
+          rings: (($state | recent_rings($now | fromdateiso8601; $win)) + (if ($ring | length) > 0 then [$now] else [] end)),
           rung: (($rung | with_entries(select((.key as $k | $q | index($k)) != null)))
                  + ([$ring[] | {key: ., value: $now}] | from_entries)
                  + ([$blocked[] | {key: ., value: "blocked"}] | from_entries)) }
@@ -10424,13 +10462,16 @@ _peer_cmd_doorbell() {
         help|-h|--help)
             echo "Usage: cctrl peer doorbell <status|enable|disable>"
             echo "  status [--json] [--backlog]   Read-only: enable file, Stop registration, rung state"
-            echo "  enable [--peer NAME]... [--role ROLE]... [--blocking|--advisory] [--replace] [--keep-baseline] [--dry-run] [--json]"
+            echo "  enable [--peer NAME]... [--role ROLE]... [--blocking|--advisory] [--max-rings-per-hour N]"
+            echo "         [--replace] [--keep-baseline] [--dry-run] [--json]"
             echo "                                Write \$CCTRL_DATA_DIR/doorbell.json. baseline_at = now when the bell"
             echo "                                is off or new: older mail never rings. Enabling more peers/roles on a"
             echo "                                running bell keeps it; --keep-baseline keeps it on re-enable too."
             echo "                                Lists merge unless --replace. Sends default to --deliver only for"
             echo "                                recipients the bell is enabled for, and only into an idle Claude pane."
             echo "                                Roles: orchestrator, worker, fleet-manager (= orchestrator, kind fleet)."
+            echo "                                Ring cap: at most max_rings_per_hour (default $DOORBELL_DEFAULT_MAX_RINGS) rings per recipient"
+            echo "                                per rolling hour; past it mail stays queued. Invalid (not 1..1000000) = no ring."
             echo "  disable [--json]              Set enabled:false. Hard rollback: rm \$CCTRL_DATA_DIR/doorbell.json"
             echo "The bell runs inside 'cctrl hooks run stop'; no settings change is needed or made."
             echo "Debug: touch \$CCTRL_DATA_DIR/doorbell/debug (or CCTRL_DOORBELL_DEBUG=1) -> reasons in doorbell/debug.log." ;;
@@ -10543,7 +10584,7 @@ _peer_doorbell_write_locked() { # json -> atomic write, mode 600
 }
 
 _peer_doorbell_enable() {
-    local json=false dry_run=false replace=false keep_baseline=false mode="" peers="[]" roles="[]" r cur new now
+    local json=false dry_run=false replace=false keep_baseline=false mode="" peers="[]" roles="[]" r cur new now max_rings=""
     _arg_has_json "$@" && json=true
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -10558,6 +10599,9 @@ _peer_doorbell_enable() {
                 roles="$(jq -c --arg r "$2" '. + [$r]' <<< "$roles")"; shift 2 ;;
             --blocking) mode="blocking"; shift ;;
             --advisory) mode="advisory"; shift ;;
+            --max-rings-per-hour)
+                [[ $# -ge 2 && "$2" =~ ^[1-9][0-9]{0,5}$ || "${2:-}" == "1000000" ]] || { $json && _json_error "validation" "--max-rings-per-hour needs an integer from 1 to 1000000" || echo -e "${RED}--max-rings-per-hour needs an integer from 1 to 1000000${RESET}" >&2; return 64; }
+                max_rings="$2"; shift 2 ;;
             --replace) replace=true; shift ;;
             --keep-baseline) keep_baseline=true; shift ;;
             --dry-run) dry_run=true; shift ;;
@@ -10570,7 +10614,8 @@ _peer_doorbell_enable() {
     cur="$(_peer_doorbell_cfg_json)"
     now="$(_peer_now_utc)"
     new="$(jq -n --argjson cur "$cur" --argjson peers "$peers" --argjson roles "$roles" --arg mode "$mode" \
-        --argjson replace "$(_peer_json_bool "$replace")" --argjson keep "$(_peer_json_bool "$keep_baseline")" --arg now "$now" '
+        --argjson replace "$(_peer_json_bool "$replace")" --argjson keep "$(_peer_json_bool "$keep_baseline")" --arg now "$now" \
+        --arg max_rings "$max_rings" '
         ($cur // {}) as $c
         # Fix SF5: widening a running bell keeps its baseline; enabling from
         # disabled starts a new one (mail queued while it was off never
@@ -10582,6 +10627,12 @@ _peer_doorbell_enable() {
             deliver_default_roles: ($c.deliver_default_roles // ["orchestrator", "fleet-manager"]),
             mode: (if $mode != "" then $mode else ($c.mode // "blocking") end),
             updated_at: $now }
+        # Ring cap: the flag sets it; otherwise a value already in the file is
+        # kept as is (even an invalid one, which status reports); absent stays
+        # absent (= the default).
+        | if $max_rings != "" then .max_rings_per_hour = ($max_rings | tonumber)
+          elif ($c | has("max_rings_per_hour")) then .max_rings_per_hour = $c.max_rings_per_hour
+          else . end
     ')" || return 1
     if ! $dry_run; then
         _peer_doorbell_write_locked "$new" || { $json && _json_error "io" "Could not write $(_peer_doorbell_file)" || echo -e "${RED}Could not write $(_peer_doorbell_file)${RESET}" >&2; return 1; }
@@ -10623,10 +10674,15 @@ _peer_doorbell_status() {
     cfg="$(_peer_doorbell_cfg_json)"
     reg_reason="$(_peer_doorbell_registered_claude)" || reg_ok=false
     state_dir="$(_peer_doorbell_state_dir)"
+    local now_epoch
+    now_epoch="$(jq -rn --arg n "$(_peer_now_utc)" '$n | fromdateiso8601' 2>/dev/null)" || now_epoch=""
+    [[ "$now_epoch" =~ ^[0-9]+$ ]] || now_epoch=0
     if [[ -d "$state_dir" ]]; then
         for f in "$state_dir"/*.json; do
             [[ -f "$f" ]] || continue
-            states="$(jq -c --arg k "$(basename "$f" .json)" --slurpfile s "$f" '. + {($k): {occupant_created: ($s[0].occupant_created // null), rung: (($s[0].rung // {}) | length)}}' <<< "$states" 2>/dev/null)" || true
+            states="$(jq -c --arg k "$(basename "$f" .json)" --slurpfile s "$f" --argjson now "$now_epoch" --argjson win "$DOORBELL_RING_WINDOW" "$DOORBELL_MAX_RINGS_JQ"'
+                . + {($k): {occupant_created: ($s[0].occupant_created // null), rung: (($s[0].rung // {}) | length),
+                            rings_last_hour: ($s[0] | if type == "object" then recent_rings($now; $win) | length else 0 end)}}' <<< "$states" 2>/dev/null)" || true
         done
     fi
     if $backlog; then
@@ -10642,8 +10698,15 @@ _peer_doorbell_status() {
     fi
     local out
     out="$(jq -n --arg path "$(_peer_doorbell_file)" --argjson cfg "$cfg" --argjson reg "$(_peer_json_bool "$reg_ok")" \
-        --arg reason "$reg_reason" --arg settings "${CCTRL_CLAUDE_SETTINGS:-$SETTINGS}" --argjson states "$states" --argjson backlog "$backlog_json" '
+        --arg reason "$reg_reason" --arg settings "${CCTRL_CLAUDE_SETTINGS:-$SETTINGS}" --argjson states "$states" --argjson backlog "$backlog_json" \
+        "$DOORBELL_MAX_RINGS_JQ"'
         { path: $path, configured: ($cfg != null), enabled: (($cfg // {}).enabled == true), config: $cfg,
+          ring_cap: (if $cfg == null then null
+                     else ($cfg | max_rings) as $m
+                     | { max_rings_per_hour: (if $m == "invalid" then null else $m end),
+                         valid: ($m != "invalid"),
+                         source: (if $m == "invalid" then "invalid" elif ($cfg | has("max_rings_per_hour")) and $cfg.max_rings_per_hour != null then "config" else "default" end),
+                         window_seconds: '"$DOORBELL_RING_WINDOW"' } end),
           stop_registered: $reg, stop_registered_reason: (if $reg then null else $reason end), settings: $settings,
           state: $states }
         + (if $backlog != null then {backlog: $backlog} else {} end)
@@ -10654,8 +10717,9 @@ _peer_doorbell_status() {
         jq -r '
             "Doorbell: \(if .enabled then "ENABLED" elif .configured then "disabled" else "not configured" end) (\(.path))",
             (if .config then "  baseline_at: \(.config.baseline_at)  mode: \(.config.mode)\n  peers: \(.config.peers | join(", "))\n  roles: \(.config.roles | join(", "))" else empty end),
+            (if .ring_cap then "  ring cap: \(if .ring_cap.valid then "\(.ring_cap.max_rings_per_hour)/hour per recipient (\(.ring_cap.source))" else "INVALID max_rings_per_hour \(.config.max_rings_per_hour | tojson): the bell never rings (want an integer 1..1000000)" end)" else empty end),
             "Stop hook (cctrl hooks run stop): \(if .stop_registered then "registered" else "NOT registered - \(.stop_registered_reason); remedy: cctrl hooks install" end)",
-            (.state | to_entries[] | "  rung state \(.key): \(.value.rung) id(s)"),
+            (.ring_cap.max_rings_per_hour as $m | .state | to_entries[] | "  rung state \(.key): \(.value.rung) id(s), \(.value.rings_last_hour) ring(s) in the last hour\(if $m != null and .value.rings_last_hour >= $m then " (AT CAP: mail stays queued)" else "" end)"),
             (if .backlog then "Queued backlog (by recipient):", (.backlog[] | "  \(.queued)\t\(.to)\t\(if .known then "known" else "gone" end)\toldest \(.oldest)") else empty end)
         ' <<< "$out"
     fi
@@ -10843,12 +10907,14 @@ _peer_cmd_doctor() {
     # until `cctrl peer doorbell enable`.
     local bell_cfg
     bell_cfg="$(_peer_doorbell_cfg_json)"
-    check="$(jq -n --argjson cfg "$bell_cfg" --arg path "$(_peer_doorbell_file)" '{name:"doorbell_enabled", ok:true, enabled:(($cfg // {}).enabled == true), path:$path}')"
+    check="$(jq -n --argjson cfg "$bell_cfg" --arg path "$(_peer_doorbell_file)" "$DOORBELL_MAX_RINGS_JQ"'
+        {name:"doorbell_enabled", ok:true, enabled:(($cfg // {}).enabled == true), path:$path}
+        + (if $cfg == null then {} else ($cfg | max_rings) as $m | {max_rings_per_hour: (if $m == "invalid" then null else $m end), ring_cap_valid: ($m != "invalid")} end)')"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "doorbell_enabled" then (if .enabled then "enabled" else "off" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "doorbell_enabled" then (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 

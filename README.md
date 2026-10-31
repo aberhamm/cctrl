@@ -1424,6 +1424,7 @@ cctrl peer doorbell status [--json] [--backlog]   # read-only
 cctrl peer doorbell enable --peer TMUX--ms--orch-x --dry-run   # show the file
 cctrl peer doorbell enable --peer TMUX--ms--orch-x             # write it
 cctrl peer doorbell enable --role orchestrator --role fleet-manager   # widen
+cctrl peer doorbell enable --max-rings-per-hour 2  # ring cap (default 4)
 cctrl peer doorbell disable                       # enabled:false
 cctrl peer doorbell enable --keep-baseline        # re-enable without a new baseline
 rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell.json)
@@ -1447,6 +1448,18 @@ rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell
   end of a turn the bell forced) never re-rings mail, but rings for mail that
   arrived during that turn, at most 3 times in a row; past that the mail waits
   for the next ordinary Stop. Any error is a silent no-op.
+- Ring cap: at most `max_rings_per_hour` rings per recipient (session name)
+  in a rolling 60 minutes; default 4 when the key is absent or null. At the
+  cap the Stop is a silent no-op: the mail stays queued (no message status
+  changes) and rings once the oldest ring ages out. The ring times are kept
+  in the recipient's state file (`rings`, last hour only; kept when the name
+  is recycled). The value must be an integer from 1 to 1000000; anything
+  else (0, a negative, a fraction, a string) is invalid and fails closed: the
+  bell never rings until it is fixed. 0 does not mean "no cap". `peer
+  doorbell status` shows the cap (`ring_cap`) and each recipient's
+  `rings_last_hour` (text: "AT CAP"); `peer doctor` reports it on the
+  `doorbell_enabled` row. `enable` keeps a value already in the file. The cap
+  limits only the Stop bell, not `--deliver` pushes.
 - Debug: `touch data/doorbell/debug` (or `CCTRL_DOORBELL_DEBUG=1` in the
   hook's env) appends one reason line per Stop to `data/doorbell/debug.log`
   (names, pids, counts; no message text). It works inside `hooks run stop`.

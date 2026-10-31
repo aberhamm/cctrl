@@ -10419,7 +10419,9 @@ SH
 test_doorbell_stop_hook_active_guard() {
     _bell_fixture "$TMPDIR/bell-loop"
     _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
-    _bell_enable "$_bell_cfg_default"
+    # Five rings inside one real hour: lift the ring cap (default 4), which
+    # test_doorbell_ring_cap covers; this test is about the chain cap.
+    _bell_enable "$(jq -c '. + {max_rings_per_hour: 100}' <<< "$_bell_cfg_default")"
     _bell_stop
     [[ "$BELL_RC" -eq 2 ]] || fail "first stop must ring (rc=$BELL_RC)"
     # The forced continuation's own Stop: already-rung mail never rings again.
@@ -10648,6 +10650,112 @@ test_doorbell_fail_open() {
         >/dev/null 2>"$BELL_DIR/err" || BELL_RC=$?
     [[ "$BELL_RC" -ne 2 ]] || fail "jq missing must never ring"
     echo "ok: doorbell fails open on malformed config, torn mailbox, missing jq"
+}
+
+test_doorbell_ring_cap() {
+    # Ring cap: at most max_rings_per_hour (default 4) rings per recipient per
+    # rolling hour. Time is injected with CCTRL_NOW_UTC; nothing sleeps.
+    _bell_fixture "$TMPDIR/bell-cap"
+    _bell_enable "$_bell_cfg_default"   # no max_rings_per_hour: the default, 4
+    local st="$BELL_DATA/doorbell/state/TMUX--t-a.json" i before s5
+    for i in 1 2 3 4; do
+        _bell_send TMUX--t-a "s$i" "2026-02-01T10:0$i:00Z"
+        CCTRL_NOW_UTC="2026-02-01T10:0$i:30Z" _bell_stop
+        [[ "$BELL_RC" -eq 2 ]] || fail "ring $i of 4 is under the cap and must ring (rc=$BELL_RC)"
+    done
+    [[ "$(jq -r '.rings | length' "$st")" -eq 4 ]] || fail "state must hold 4 ring times: $(cat "$st")"
+    # The 5th within the hour is held: no block, no output, mail untouched.
+    _bell_send TMUX--t-a s5 2026-02-01T10:30:00Z
+    s5="$(jq -r 'select(.subject == "s5") | .id' "$BELL_DATA/messages.jsonl")"
+    before="$(shasum "$BELL_DATA/messages.jsonl")"
+    CCTRL_NOW_UTC=2026-02-01T10:30:30Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" && -z "$BELL_OUT" ]] || fail "5th ring in an hour must be suppressed (rc=$BELL_RC err=$BELL_ERR)"
+    [[ "$(shasum "$BELL_DATA/messages.jsonl")" == "$before" ]] || fail "the cap must never change the mailbox"
+    [[ "$(jq -r --arg i "$s5" 'select(.id == $i) | .status' "$BELL_DATA/messages.jsonl")" == "queued" ]] || fail "held mail must stay queued"
+    jq -e --arg i "$s5" '.rung[$i] == null and (.rings | length) == 4' "$st" >/dev/null || fail "held mail must not be recorded as rung: $(cat "$st")"
+    local out
+    out="$(CCTRL_NOW_UTC=2026-02-01T10:30:30Z "$BELL_DIR/cctrl" peer doorbell status --json)"
+    jq -e '.ring_cap == {max_rings_per_hour: 4, valid: true, source: "default", window_seconds: 3600}
+        and .state["TMUX--t-a"].rings_last_hour == 4' <<< "$out" >/dev/null || fail "status must report the cap and recent rings: $out"
+    assert_contains "$(CCTRL_NOW_UTC=2026-02-01T10:30:30Z "$BELL_DIR/cctrl" peer doorbell status)" "AT CAP"
+    # One second before the oldest ring (10:01:30) ages out: still held.
+    CCTRL_NOW_UTC=2026-02-01T11:01:29Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "still 4 rings in the last hour: must stay held (rc=$BELL_RC)"
+    # Once it ages out, the held mail rings.
+    CCTRL_NOW_UTC=2026-02-01T11:01:30Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "after the oldest ring ages out the held mail must ring (rc=$BELL_RC)"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    jq -e '.rings == ["2026-02-01T10:02:30Z","2026-02-01T10:03:30Z","2026-02-01T10:04:30Z","2026-02-01T11:01:30Z"]' "$st" >/dev/null \
+        || fail "rings must keep only the last hour plus the new ring: $(cat "$st")"
+    # An explicit cap applies too (1/hour), and a loop Stop counts like any other.
+    _bell_enable '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":[],"roles":["orchestrator"],"mode":"blocking","max_rings_per_hour":1}'
+    rm -f "$st"
+    _bell_send TMUX--t-a s6 2026-02-01T12:00:00Z
+    CCTRL_NOW_UTC=2026-02-01T12:00:10Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "max_rings_per_hour 1: first ring allowed (rc=$BELL_RC)"
+    _bell_send TMUX--t-a s7 2026-02-01T12:00:20Z
+    CCTRL_NOW_UTC=2026-02-01T12:00:30Z _bell_stop '{"stop_hook_active":true}'
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "max_rings_per_hour 1: second ring held, continuation or not (rc=$BELL_RC)"
+    echo "ok: ring cap: 4/hour default, 5th held with mail queued, rings again after the oldest ages out"
+}
+
+test_doorbell_ring_cap_invalid() {
+    # An invalid max_rings_per_hour fails closed: no ring, mail stays queued.
+    # null counts as absent (the default). 0 is invalid, not "no cap".
+    _bell_fixture "$TMPDIR/bell-cap-invalid"
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    local v out base='{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":[],"roles":["orchestrator"],"mode":"blocking"}'
+    for v in 0 -1 2.5 '"4"' true '[]' '{}' 1e9; do
+        _bell_enable "$(jq -c --argjson v "$v" '. + {max_rings_per_hour: $v}' <<< "$base")"
+        _bell_stop
+        [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "max_rings_per_hour $v must fail closed (rc=$BELL_RC err=$BELL_ERR)"
+        out="$("$BELL_DIR/cctrl" peer doorbell status --json)"
+        jq -e '.ring_cap.valid == false and .ring_cap.source == "invalid" and .ring_cap.max_rings_per_hour == null' <<< "$out" >/dev/null \
+            || fail "status must flag max_rings_per_hour $v as invalid: $out"
+    done
+    [[ "$(jq -r 'select(.subject == "s1") | .status' "$BELL_DATA/messages.jsonl")" == "queued" ]] || fail "mail must stay queued under an invalid cap"
+    [[ ! -f "$BELL_DATA/doorbell/state/TMUX--t-a.json" ]] || fail "an invalid cap must not ring or record anything"
+    assert_contains "$("$BELL_DIR/cctrl" peer doorbell status)" "INVALID max_rings_per_hour"
+    out="$("$BELL_DIR/cctrl" peer doctor --json)"
+    jq -e '.checks[] | select(.name == "doorbell_enabled") | .ring_cap_valid == false' <<< "$out" >/dev/null \
+        || fail "doctor must report the invalid cap: $out"
+    # null = absent = default 4; an integral float like 4.0 is the integer 4.
+    for v in null 4.0; do
+        rm -rf "$BELL_DATA/doorbell"
+        _bell_enable "$(jq -c --argjson v "$v" '. + {max_rings_per_hour: $v}' <<< "$base")"
+        _bell_stop
+        [[ "$BELL_RC" -eq 2 ]] || fail "max_rings_per_hour $v must ring (rc=$BELL_RC)"
+    done
+    out="$("$BELL_DIR/cctrl" peer doctor --json)"
+    jq -e '.checks[] | select(.name == "doorbell_enabled") | .ring_cap_valid == true and .max_rings_per_hour == 4' <<< "$out" >/dev/null \
+        || fail "doctor must report the effective cap: $out"
+    # The debug log says why.
+    mkdir -p "$BELL_DATA/doorbell"; : > "$BELL_DATA/doorbell/debug"
+    _bell_enable "$(jq -c '. + {max_rings_per_hour: 0}' <<< "$base")"
+    _bell_send TMUX--t-a s2 2026-02-02T00:00:00Z
+    _bell_stop
+    assert_contains "$(cat "$BELL_DATA/doorbell/debug.log")" "invalid max_rings_per_hour"
+    rm -f "$BELL_DATA/doorbell/debug"
+    echo "ok: invalid max_rings_per_hour fails closed (status/doctor flag it); null and absent mean 4"
+}
+
+test_doorbell_enable_max_rings_flag() {
+    local data="$TMPDIR/bell-cap-enable" rc out
+    mkdir -p "$data"
+    export CCTRL_DATA_DIR="$data"
+    rc=0; "$ROOT/cctrl" peer doorbell enable --peer a --max-rings-per-hour 0 >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 && ! -f "$data/doorbell.json" ]] || fail "--max-rings-per-hour 0 must be refused (rc=$rc)"
+    rc=0; "$ROOT/cctrl" peer doorbell enable --peer a --max-rings-per-hour x >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--max-rings-per-hour x must be refused (rc=$rc)"
+    "$ROOT/cctrl" peer doorbell enable --peer a >/dev/null
+    jq -e 'has("max_rings_per_hour") | not' "$data/doorbell.json" >/dev/null || fail "no flag: the key stays absent (default)"
+    "$ROOT/cctrl" peer doorbell enable --peer a --max-rings-per-hour 2 >/dev/null
+    jq -e '.max_rings_per_hour == 2' "$data/doorbell.json" >/dev/null || fail "flag must write the cap: $(cat "$data/doorbell.json")"
+    "$ROOT/cctrl" peer doorbell enable --role orchestrator >/dev/null
+    jq -e '.max_rings_per_hour == 2' "$data/doorbell.json" >/dev/null || fail "re-enable must keep the cap: $(cat "$data/doorbell.json")"
+    out="$("$ROOT/cctrl" peer doorbell status --json)"
+    jq -e '.ring_cap.max_rings_per_hour == 2 and .ring_cap.source == "config"' <<< "$out" >/dev/null || fail "status must show the configured cap: $out"
+    echo "ok: peer doorbell enable --max-rings-per-hour validates, writes and keeps the cap"
 }
 
 test_doorbell_fast_path_call_budget() {
@@ -10960,6 +11068,10 @@ test_doorbell_real_tmux_pane_identity() (
     [[ "$BELL_RC" -eq 2 ]] || fail "pane of $b must ring for its own mail (rc=$BELL_RC err=$(cat "$BELL_DIR/err"))"
     assert_contains "$(cat "$BELL_DIR/err")" "1 new peer message(s) for $b."
     assert_contains "$(cat "$BELL_DIR/err")" "recv --all --as $b --json"
+    # Ring cap with the real clock (no CCTRL_NOW_UTC): the ring is recorded
+    # with a real now, inside the rolling hour.
+    jq -e --argjson now "$(date -u +%s)" '(.rings | length) == 1 and ((.rings[0] | fromdateiso8601) > ($now - 120))' \
+        "$BELL_DATA/doorbell/state/$b.json" >/dev/null || fail "real clock: the ring must be recorded as recent: $(cat "$BELL_DATA/doorbell/state/$b.json")"
     echo "ok: real tmux: exact pane-id identity, derived peer rings, no prefix match"
 )
 
