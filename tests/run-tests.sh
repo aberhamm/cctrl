@@ -10809,6 +10809,7 @@ test_doorbell_move() {
     rc=0; out="$("$ROOT/cctrl" peer doorbell move --from A --to B --json)" || rc=$?
     [[ "$rc" -eq 65 && ! -f "$f" ]] || fail "move without doorbell.json must be refused 65 (rc=$rc): $out"
     jq -e '.ok == false and .error.code == "refused"' <<< "$out" >/dev/null || fail "move refusal must be a JSON error: $out"
+    assert_contains "$out" "Doorbell not configured"
     printf '%s\n' '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":["TMUX--ms--fm","TMUX--ms--orch-x"],"roles":["worker"],"mode":"advisory","deliver_default_roles":["orchestrator"],"max_rings_per_hour":2,"extra":{"k":1},"updated_at":"2026-01-01T00:00:00Z"}' > "$f"
     chmod 644 "$f"
     before="$(shasum "$f")"
@@ -10823,9 +10824,17 @@ test_doorbell_move() {
     rc=0; out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--fm 2>&1)" || rc=$?
     [[ "$rc" -eq 65 ]] || fail "NEW already in peers must be refused 65 (rc=$rc): $out"
     assert_contains "$out" "TMUX--ms--fm is already in the doorbell peers"
-    # A role is not a peer entry: OLD must be in .peers itself.
-    rc=0; "$ROOT/cctrl" peer doorbell move --from worker --to TMUX--w >/dev/null 2>&1 || rc=$?
-    [[ "$rc" -eq 65 ]] || fail "a role name is not a peers entry: must be refused 65 (rc=$rc)"
+    # A role name is never a peer name: refused as a usage error on either side.
+    local role
+    for role in orchestrator fleet-manager worker; do
+        rc=0; out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to "$role" 2>&1)" || rc=$?
+        [[ "$rc" -eq 64 ]] || fail "--to $role must be refused 64 (rc=$rc): $out"
+        assert_contains "$out" "is a role name, not a peer name"
+        rc=0; out="$("$ROOT/cctrl" peer doorbell move --from "$role" --to TMUX--w 2>&1)" || rc=$?
+        [[ "$rc" -eq 64 ]] || fail "--from $role must be refused 64 (rc=$rc): $out"
+        assert_contains "$out" "is a role name, not a peer name"
+    done
+    [[ "$(shasum "$f")" == "$before" ]] || fail "a role-name move must not write"
     # --dry-run shows the result and writes nothing.
     out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--orch-x--2 --dry-run --json)"
     jq -e '.dry_run == true and .written == false and .config.peers == ["TMUX--ms--fm","TMUX--ms--orch-x--2"]' <<< "$out" >/dev/null || fail "dry-run JSON: $out"

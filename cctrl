@@ -10600,9 +10600,9 @@ _peer_doorbell_enable() {
                 peers="$(jq -c --arg p "$2" '. + [$p]' <<< "$peers")"; shift 2 ;;
             --role)
                 [[ $# -ge 2 ]] || { $json && _json_error "validation" "--role needs a value" || echo -e "${RED}--role needs a value${RESET}" >&2; return 64; }
-                case "$2" in orchestrator|worker|fleet-manager) ;; *)
+                _peer_doorbell_is_role "$2" || {
                     $json && _json_error "validation" "Unknown role: $2 (orchestrator, worker, fleet-manager)" || echo -e "${RED}Unknown role: $2 (orchestrator, worker, fleet-manager)${RESET}" >&2
-                    return 64 ;; esac
+                    return 64; }
                 roles="$(jq -c --arg r "$2" '. + [$r]' <<< "$roles")"; shift 2 ;;
             --blocking) mode="blocking"; shift ;;
             --advisory) mode="advisory"; shift ;;
@@ -10655,6 +10655,10 @@ _peer_doorbell_enable() {
     fi
 }
 
+_peer_doorbell_is_role() { # name -> 0 when it is a doorbell role name (not a peer name)
+    case "$1" in orchestrator|worker|fleet-manager) return 0 ;; *) return 1 ;; esac
+}
+
 _peer_doorbell_move_err() { # json rc message -> prints the error, returns rc
     if [[ "$1" == true ]]; then
         _json_error "$([[ "$2" == 64 ]] && echo validation || echo refused)" "$3"
@@ -10677,6 +10681,7 @@ _peer_doorbell_move() {
         case "$1" in
             --from|--to)
                 [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { _peer_doorbell_move_err "$json" 64 "$1 needs a valid peer name"; return; }
+                ! _peer_doorbell_is_role "$2" || { _peer_doorbell_move_err "$json" 64 "$1 $2 is a role name, not a peer name"; return; }
                 [[ "$1" == --from ]] && from="$2" || to="$2"; shift 2 ;;
             --dry-run) dry_run=true; shift ;;
             --json) json=true; shift ;;
