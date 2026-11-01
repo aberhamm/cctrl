@@ -339,6 +339,14 @@ if [[ "${CCTRL_TEST_ONLY:-}" == "codex-ownership-matrix" ]]; then
 fi
 export CCTRL_DATA_DIR="$TMPDIR/data"
 export CCTRL_SESSION_METADATA_DIR="$TMPDIR/session-metadata"
+# The suite must never see the live install. self-install.sh runs this suite
+# from $CCTRL_HOME/releases/.tmp-$$ with the real CCTRL_HOME set, and `peer
+# mcp` (plan 110 S8) re-points its bridge at $CCTRL_HOME/current/cctrl from
+# under releases/, so the gate's MCP cases ran the previous release. Tests
+# that need an install set their own CCTRL_HOME. CCTRL_BIN stays unset: the
+# doorbell hook and the Codex observer treat a set CCTRL_BIN as "the cctrl to
+# run", so a scratch path would break their own-tree fallback.
+export CCTRL_HOME="$TMPDIR/cctrl-home"
 export CCTRL_HOST_ID_FILE="$CCTRL_DATA_DIR/host-id"
 # Keep discovery tests isolated from large, live Codex/Claude stores. Individual
 # persistence tests override these roots with their own fixtures.
@@ -14600,6 +14608,47 @@ test_peer_push_gate_blocks_every_path() {
     jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "an enabled recipient must be nudged: $out"
     [[ "$(grep -c 'paste-buffer' "$log")" -eq 1 ]] || fail "expected exactly one paste for the enabled recipient"
     echo "ok: plan 110 push gate holds every delivery path for a non-doorbell recipient"
+}
+
+test_peer_mcp_staging_release_runs_own_tree() {
+    # Self-install gate (110 install failure): self-install.sh tests the
+    # candidate in $CCTRL_HOME/releases/.tmp-$$ while `current` is still the
+    # previous release. `peer mcp` from that staging dir must run its own tree
+    # (here: the 110 push gate), not `current`. An installed release still
+    # re-points to `current` (plan 110 S8).
+    [[ "$CCTRL_HOME" == "$TMPDIR/"* ]] || fail "suite must export a scratch CCTRL_HOME, got $CCTRL_HOME"
+    make_fake_tmux "$TMPDIR/tmux"
+    local home data="$TMPDIR/mcp-staging-data" log="$TMPDIR/mcp-staging-tmux.log" marker="$TMPDIR/mcp-staging-current.called" out rel
+    mkdir -p "$TMPDIR/mcp-staging-home"
+    home="$(cd -P "$TMPDIR/mcp-staging-home" && pwd)"  # SCRIPT_DIR is physical
+    mkdir -p "$home/releases/old-rel"
+    printf '#!/bin/sh\necho "$*" >> "%s"\necho "{\\"ok\\":true,\\"data\\":{\\"outcome\\":\\"stub-current\\"}}"\n' "$marker" > "$home/releases/old-rel/cctrl"
+    chmod +x "$home/releases/old-rel/cctrl"
+    ln -s releases/old-rel "$home/current"
+    for rel in .tmp-4242 new-rel; do
+        mkdir -p "$home/releases/$rel"
+        cp "$ROOT/cctrl" "$home/releases/$rel/cctrl"; chmod +x "$home/releases/$rel/cctrl"
+        cp -R "$ROOT/lib" "$home/releases/$rel/lib"
+    done
+    : > "$log"
+    setup_delivery_peers "$data"
+    rm -f "$data/doorbell.json"
+    local -a env=(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_HOME="$home")
+    local req
+    req="$(jq -cn '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"send_message",arguments:{to:"comet",body:"staging gate"}}}')"
+
+    rm -f "$marker"
+    out="$(printf '%s\n' "$req" | env "${env[@]}" "$home/releases/.tmp-4242/cctrl" peer mcp --as orchestrator)"
+    [[ ! -e "$marker" ]] || fail "peer mcp from releases/.tmp-* ran current/cctrl: $(cat "$marker")"
+    jq -e '.result.structuredContent.ok == true and .result.structuredContent.data.outcome == "sent-and-queued"
+        and .result.structuredContent.data.delivery_reason == "recipient-not-doorbell-enabled"' <<< "$out" >/dev/null \
+        || fail "staging MCP send_message must get the tree-under-test's gate result: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+
+    rm -f "$marker"
+    out="$(printf '%s\n' "$req" | env "${env[@]}" "$home/releases/new-rel/cctrl" peer mcp --as orchestrator)"
+    [[ -s "$marker" ]] || fail "peer mcp from an installed release must still run current/cctrl (S8): $out"
+    echo "ok: peer mcp from a self-install staging dir runs its own tree; installed releases follow current"
 }
 
 test_peer_claude_push_ready_fail_closed() {

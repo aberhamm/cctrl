@@ -10879,9 +10879,12 @@ _peer_cmd_mcp() {
     # names that release, and a bridge would keep running it across installs
     # and rollbacks. Point the bridge's cctrl at the unresolved `current`
     # instead, so every tool call runs the installed release. A dev checkout
-    # (not under $CCTRL_HOME/releases) keeps its own cctrl.
+    # (not under $CCTRL_HOME/releases) keeps its own cctrl. So does a
+    # self-install staging dir (releases/.tmp-*): its suite gates the
+    # candidate, and `current` is still the previous release.
     local cctrl_home="${CCTRL_HOME:-$HOME/.local/lib/cctrl}" bridge_cctrl="$SCRIPT_DIR/cctrl"
-    if [[ "$SCRIPT_DIR/" == "$cctrl_home/releases/"* && -x "$cctrl_home/current/cctrl" ]]; then
+    if [[ "$SCRIPT_DIR/" == "$cctrl_home/releases/"* && "$SCRIPT_DIR/" != "$cctrl_home/releases/.tmp-"* \
+          && -x "$cctrl_home/current/cctrl" ]]; then
         bridge_cctrl="$cctrl_home/current/cctrl"
     fi
     exec python3 "$SCRIPT_DIR/lib/peer_mcp.py" --as "$identity" --cctrl "$bridge_cctrl"
