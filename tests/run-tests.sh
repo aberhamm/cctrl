@@ -10699,6 +10699,36 @@ test_doorbell_ring_cap() {
     echo "ok: ring cap: 4/hour default, 5th held with mail queued, rings again after the oldest ages out"
 }
 
+test_doorbell_ring_cap_future_and_recycled() {
+    # Verify N4. (a) A ring time in the future (the clock went backwards)
+    # does not count against the cap and is pruned at the next write.
+    # (b) `rings` survives a new occupant_created (a recycled name): the cap is
+    # per name, so a restart cannot reset it, unlike `rung`.
+    _bell_fixture "$TMPDIR/bell-cap-future"
+    _bell_enable "$_bell_cfg_default"   # default cap 4
+    local st="$BELL_DATA/doorbell/state/TMUX--t-a.json"
+    mkdir -p "$BELL_DATA/doorbell/state"
+    printf '%s\n' '{"occupant_created":"1700000000","chain":0,"rung":{},"rings":["2026-02-01T11:00:00Z","2026-02-01T11:10:00Z","2026-02-01T11:20:00Z","2026-02-01T11:30:00Z"]}' > "$st"
+    _bell_send TMUX--t-a f1 2026-02-01T10:00:00Z
+    CCTRL_NOW_UTC=2026-02-01T10:00:30Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "future-dated ring times must not count against the cap (rc=$BELL_RC)"
+    jq -e '.rings == ["2026-02-01T10:00:30Z"]' "$st" >/dev/null || fail "future ring times must be pruned at the next write: $(cat "$st")"
+    # (b) Three recent rings by the old occupant, then a new one takes the name.
+    printf '%s\n' '{"occupant_created":"1700000000","chain":0,"rung":{},"rings":["2026-02-01T12:00:00Z","2026-02-01T12:01:00Z","2026-02-01T12:02:00Z"]}' > "$st"
+    export BELL_DISPLAY="TMUX--t-a|1800000000|70001|1"
+    _bell_send TMUX--t-a r1 2026-02-01T12:10:00Z
+    CCTRL_NOW_UTC=2026-02-01T12:10:30Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "3 of 4 rings used: the new occupant's first mail must ring (rc=$BELL_RC)"
+    jq -e '.occupant_created == "1800000000"
+        and .rings == ["2026-02-01T12:00:00Z","2026-02-01T12:01:00Z","2026-02-01T12:02:00Z","2026-02-01T12:10:30Z"]' "$st" >/dev/null \
+        || fail "rings must be kept across a new occupant_created: $(cat "$st")"
+    _bell_send TMUX--t-a r2 2026-02-01T12:20:00Z
+    CCTRL_NOW_UTC=2026-02-01T12:20:30Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "the old occupant's rings count: the 5th ring in the hour must be held (rc=$BELL_RC err=$BELL_ERR)"
+    [[ "$(jq -r 'select(.subject == "r2") | .status' "$BELL_DATA/messages.jsonl")" == "queued" ]] || fail "held mail must stay queued"
+    echo "ok: ring cap ignores future ring times and keeps rings across a recycled name"
+}
+
 test_doorbell_ring_cap_invalid() {
     # An invalid max_rings_per_hour fails closed: no ring, mail stays queued.
     # null counts as absent (the default). 0 is invalid, not "no cap".
