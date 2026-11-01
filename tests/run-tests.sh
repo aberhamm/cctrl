@@ -10719,6 +10719,17 @@ test_doorbell_ring_cap_invalid() {
     out="$("$BELL_DIR/cctrl" peer doctor --json)"
     jq -e '.checks[] | select(.name == "doorbell_enabled") | .ring_cap_valid == false' <<< "$out" >/dev/null \
         || fail "doctor must report the invalid cap: $out"
+    # Fix N3: an enabled bell with an invalid cap is silently dead, so doctor
+    # fails the row (and the overall ok) and names the remedy, JSON and text.
+    jq -e '(.checks[] | select(.name == "doorbell_enabled") | .ok == false and (.remedy | contains("cctrl peer doorbell enable --max-rings-per-hour N")))
+        and .ok == false' <<< "$out" >/dev/null || fail "doctor must fail an enabled bell with an invalid cap, with a remedy: $out"
+    out="$("$BELL_DIR/cctrl" peer doctor 2>&1)" || true
+    assert_contains "$out" "doorbell_enabled: FAIL: enabled, INVALID max_rings_per_hour (never rings) (max_rings_per_hour "
+    # A disabled bell is off by design: the invalid cap is reported, not failed.
+    _bell_enable "$(jq -c '. + {enabled: false, max_rings_per_hour: 0}' <<< "$base")"
+    out="$("$BELL_DIR/cctrl" peer doctor --json)"
+    jq -e '.checks[] | select(.name == "doorbell_enabled") | .ok == true and .ring_cap_valid == false and (has("remedy") | not)' <<< "$out" >/dev/null \
+        || fail "doctor must not fail a disabled bell over its cap: $out"
     # null = absent = default 4; an integral float like 4.0 is the integer 4.
     for v in null 4.0; do
         rm -rf "$BELL_DATA/doorbell"
@@ -10727,7 +10738,7 @@ test_doorbell_ring_cap_invalid() {
         [[ "$BELL_RC" -eq 2 ]] || fail "max_rings_per_hour $v must ring (rc=$BELL_RC)"
     done
     out="$("$BELL_DIR/cctrl" peer doctor --json)"
-    jq -e '.checks[] | select(.name == "doorbell_enabled") | .ring_cap_valid == true and .max_rings_per_hour == 4' <<< "$out" >/dev/null \
+    jq -e '.checks[] | select(.name == "doorbell_enabled") | .ok == true and .ring_cap_valid == true and .max_rings_per_hour == 4 and (has("remedy") | not)' <<< "$out" >/dev/null \
         || fail "doctor must report the effective cap: $out"
     # The debug log says why.
     mkdir -p "$BELL_DATA/doorbell"; : > "$BELL_DATA/doorbell/debug"

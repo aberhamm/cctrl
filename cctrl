@@ -10903,18 +10903,22 @@ _peer_cmd_doctor() {
     fi
     check="$(jq -n --arg name doorbell_hook_registered --argjson ok "$ok" --arg agent "$target_agent" --arg remedy "$remedy" '{name:$name,ok:$ok,agent:(if $agent == "" then null else $agent end)} + (if $remedy != "" then {remedy:$remedy} else {} end)')"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
-    # Plan 108: informational, never a failure. The doorbell is off by design
-    # until `cctrl peer doorbell enable`.
+    # Plan 108: informational. The doorbell is off by design until `cctrl peer
+    # doorbell enable`, so off is not a failure. An ENABLED bell with an
+    # invalid max_rings_per_hour is: it never rings, silently (ok:false).
     local bell_cfg
     bell_cfg="$(_peer_doorbell_cfg_json)"
     check="$(jq -n --argjson cfg "$bell_cfg" --arg path "$(_peer_doorbell_file)" "$DOORBELL_MAX_RINGS_JQ"'
-        {name:"doorbell_enabled", ok:true, enabled:(($cfg // {}).enabled == true), path:$path}
-        + (if $cfg == null then {} else ($cfg | max_rings) as $m | {max_rings_per_hour: (if $m == "invalid" then null else $m end), ring_cap_valid: ($m != "invalid")} end)')"
+        (($cfg // {}).enabled == true) as $on
+        | (if $cfg == null then null else ($cfg | max_rings) end) as $m
+        | {name:"doorbell_enabled", ok:(($on and $m == "invalid") | not), enabled:$on, path:$path}
+        + (if $cfg == null then {} else {max_rings_per_hour: (if $m == "invalid" then null else $m end), ring_cap_valid: ($m != "invalid")} end)
+        + (if $on and $m == "invalid" then {remedy: "max_rings_per_hour \($cfg.max_rings_per_hour | tojson) is invalid, so the bell never rings; run: cctrl peer doorbell enable --max-rings-per-hour N (an integer 1..1000000)"} else {} end)')"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "doorbell_enabled" then (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 

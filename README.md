@@ -1458,7 +1458,9 @@ rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell
   bell never rings until it is fixed. 0 does not mean "no cap". `peer
   doorbell status` shows the cap (`ring_cap`) and each recipient's
   `rings_last_hour` (text: "AT CAP"); `peer doctor` reports it on the
-  `doorbell_enabled` row. `enable` keeps a value already in the file. The cap
+  `doorbell_enabled` row, and fails that row (`ok: false`, text `FAIL:`, with
+  a remedy) when an enabled bell has an invalid cap, since the bell is then
+  silently dead. `enable` keeps a value already in the file. The cap
   limits only the Stop bell, not `--deliver` pushes.
 - Debug: `touch data/doorbell/debug` (or `CCTRL_DOORBELL_DEBUG=1` in the
   hook's env) appends one reason line per Stop to `data/doorbell/debug.log`
