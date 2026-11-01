@@ -10799,6 +10799,70 @@ test_doorbell_enable_max_rings_flag() {
     echo "ok: peer doorbell enable --max-rings-per-hour validates, writes and keeps the cap"
 }
 
+test_doorbell_move() {
+    # Handover carries the bell: `peer doorbell move` swaps one .peers entry
+    # for the successor's name and changes nothing else. It never widens.
+    local data="$TMPDIR/bell-move" rc out f before
+    mkdir -p "$data"
+    export CCTRL_DATA_DIR="$data"
+    f="$data/doorbell.json"
+    rc=0; out="$("$ROOT/cctrl" peer doorbell move --from A --to B --json)" || rc=$?
+    [[ "$rc" -eq 65 && ! -f "$f" ]] || fail "move without doorbell.json must be refused 65 (rc=$rc): $out"
+    jq -e '.ok == false and .error.code == "refused"' <<< "$out" >/dev/null || fail "move refusal must be a JSON error: $out"
+    printf '%s\n' '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":["TMUX--ms--fm","TMUX--ms--orch-x"],"roles":["worker"],"mode":"advisory","deliver_default_roles":["orchestrator"],"max_rings_per_hour":2,"extra":{"k":1},"updated_at":"2026-01-01T00:00:00Z"}' > "$f"
+    chmod 644 "$f"
+    before="$(shasum "$f")"
+    # Refusals: usage (64) and state (65); none writes.
+    for args in "--from TMUX--ms--orch-x" "--to TMUX--ms--orch-x--2" "--from TMUX--ms--orch-x --to TMUX--ms--orch-x" "--from 'a b' --to c" "--from x --to y --bogus"; do
+        rc=0; eval "\"\$ROOT/cctrl\" peer doorbell move $args" >/dev/null 2>&1 || rc=$?
+        [[ "$rc" -eq 64 ]] || fail "move $args must be a usage error 64 (rc=$rc)"
+    done
+    rc=0; out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-y --to TMUX--ms--orch-y--2 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "OLD not in peers must be refused 65 (rc=$rc): $out"
+    assert_contains "$out" "TMUX--ms--orch-y is not in the doorbell peers"
+    rc=0; out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--fm 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "NEW already in peers must be refused 65 (rc=$rc): $out"
+    assert_contains "$out" "TMUX--ms--fm is already in the doorbell peers"
+    # A role is not a peer entry: OLD must be in .peers itself.
+    rc=0; "$ROOT/cctrl" peer doorbell move --from worker --to TMUX--w >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a role name is not a peers entry: must be refused 65 (rc=$rc)"
+    # --dry-run shows the result and writes nothing.
+    out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--orch-x--2 --dry-run --json)"
+    jq -e '.dry_run == true and .written == false and .config.peers == ["TMUX--ms--fm","TMUX--ms--orch-x--2"]' <<< "$out" >/dev/null || fail "dry-run JSON: $out"
+    [[ "$(shasum "$f")" == "$before" ]] || fail "--dry-run must not write"
+    # The real move: one entry replaced in place; every other key kept; mode 600.
+    out="$(CCTRL_NOW_UTC=2026-03-01T00:00:00Z "$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--orch-x--2 --json)"
+    jq -e '.written == true and .from == "TMUX--ms--orch-x" and .to == "TMUX--ms--orch-x--2"' <<< "$out" >/dev/null || fail "move JSON: $out"
+    jq -e '. == {"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":["TMUX--ms--fm","TMUX--ms--orch-x--2"],"roles":["worker"],"mode":"advisory","deliver_default_roles":["orchestrator"],"max_rings_per_hour":2,"extra":{"k":1},"updated_at":"2026-03-01T00:00:00Z"}' "$f" >/dev/null \
+        || fail "move must replace only the peer entry (and updated_at): $(cat "$f")"
+    [[ "$(stat -f %Lp "$f" 2>/dev/null || stat -c %a "$f")" == 600 ]] || fail "doorbell.json must stay mode 600 after a move"
+    # Not repeatable: OLD is gone now.
+    rc=0; "$ROOT/cctrl" peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--orch-x--3 >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a second move from the same OLD must be refused (rc=$rc)"
+    # A disabled bell moves too (no widening) and stays disabled.
+    "$ROOT/cctrl" peer doorbell disable >/dev/null
+    out="$("$ROOT/cctrl" peer doorbell move --from TMUX--ms--fm --to TMUX--ms--fm--2)"
+    assert_contains "$out" "The bell is disabled"
+    jq -e '.enabled == false and .peers == ["TMUX--ms--fm--2","TMUX--ms--orch-x--2"]' "$f" >/dev/null || fail "move on a disabled bell: $(cat "$f")"
+    echo "ok: peer doorbell move replaces one peers entry, keeps the rest, refuses to widen"
+}
+
+test_doorbell_move_rings_successor() {
+    # The live incident: doorbell.json named the predecessor, the successor
+    # never rang. After `move`, the successor's Stop rings; the predecessor's
+    # does not.
+    _bell_fixture "$TMPDIR/bell-move-ring"
+    printf '{"role":"worker","cctrl_managed":true}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--t-a.json"
+    _bell_enable '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":["TMUX--t-old"],"roles":[],"mode":"blocking"}'
+    _bell_send TMUX--t-a s1 2026-02-01T00:00:00Z
+    _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "before the move the successor is not enabled and must not ring (rc=$BELL_RC)"
+    "$BELL_DIR/cctrl" peer doorbell move --from TMUX--t-old --to TMUX--t-a >/dev/null || fail "move failed"
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "after the move the successor's Stop must ring (rc=$BELL_RC err=$BELL_ERR)"
+    echo "ok: after peer doorbell move the successor's Stop rings"
+}
+
 test_doorbell_fast_path_call_budget() {
     _bell_fixture "$TMPDIR/bell-budget"
     _bell_send TMUX--t-a s1 2025-12-01T00:00:00Z

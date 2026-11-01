@@ -10461,9 +10461,10 @@ _peer_cmd_doorbell() {
             return 0 ;;
         enable) _peer_doorbell_enable "$@" ;;
         disable) _peer_doorbell_disable "$@" ;;
+        move) _peer_doorbell_move "$@" ;;
         status) _peer_doorbell_status "$@" ;;
         help|-h|--help)
-            echo "Usage: cctrl peer doorbell <status|enable|disable>"
+            echo "Usage: cctrl peer doorbell <status|enable|disable|move>"
             echo "  status [--json] [--backlog]   Read-only: enable file, Stop registration, rung state"
             echo "  enable [--peer NAME]... [--role ROLE]... [--blocking|--advisory] [--max-rings-per-hour N]"
             echo "         [--replace] [--keep-baseline] [--dry-run] [--json]"
@@ -10476,6 +10477,9 @@ _peer_cmd_doorbell() {
             echo "                                Ring cap: at most max_rings_per_hour (default $DOORBELL_DEFAULT_MAX_RINGS) rings per recipient"
             echo "                                per rolling hour; past it mail stays queued. Invalid (not 1..1000000) = no ring."
             echo "  disable [--json]              Set enabled:false. Hard rollback: rm \$CCTRL_DATA_DIR/doorbell.json"
+            echo "  move --from OLD --to NEW [--dry-run] [--json]"
+            echo "                                Handover: replace the peers entry OLD with NEW, nothing else."
+            echo "                                Refused (65) unless OLD is in peers and NEW is not; never adds a peer."
             echo "The bell runs inside 'cctrl hooks run stop'; no settings change is needed or made."
             echo "Debug: touch \$CCTRL_DATA_DIR/doorbell/debug (or CCTRL_DOORBELL_DEBUG=1) -> reasons in doorbell/debug.log." ;;
         *)
@@ -10648,6 +10652,60 @@ _peer_doorbell_enable() {
         if [[ "$(jq -r '(.peers | length) + (.roles | length)' <<< "$new")" -eq 0 ]]; then
             echo -e "${YELLOW}No --peer or --role given: the bell rings for nobody yet.${RESET}"
         fi
+    fi
+}
+
+_peer_doorbell_move_err() { # json rc message -> prints the error, returns rc
+    if [[ "$1" == true ]]; then
+        _json_error "$([[ "$2" == 64 ]] && echo validation || echo refused)" "$3"
+    else
+        echo -e "${RED}$3${RESET}" >&2
+    fi
+    return "$2"
+}
+
+_peer_doorbell_move() {
+    # Handover carries the bell: replace the single `.peers` entry OLD with
+    # NEW, in place, and change nothing else (enabled, baseline_at, mode,
+    # roles, the ring cap, unknown keys). It never adds a peer that was not
+    # already there under another name: OLD must be in .peers, NEW must not
+    # be. NEW's ring state starts empty (state is per name); baseline_at still
+    # keeps older mail from ringing.
+    local json=false dry_run=false from="" to="" cur new now err
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --from|--to)
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { _peer_doorbell_move_err "$json" 64 "$1 needs a valid peer name"; return; }
+                [[ "$1" == --from ]] && from="$2" || to="$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            --json) json=true; shift ;;
+            *) _peer_doorbell_move_err "$json" 64 "Unknown peer doorbell move flag: $1"; return ;;
+        esac
+    done
+    [[ -n "$from" && -n "$to" ]] || { _peer_doorbell_move_err "$json" 64 "Usage: cctrl peer doorbell move --from OLD --to NEW [--dry-run] [--json]"; return; }
+    [[ "$from" != "$to" ]] || { _peer_doorbell_move_err "$json" 64 "--from and --to are the same name: $from"; return; }
+    cur="$(_peer_doorbell_cfg_json)"
+    [[ "$cur" != "null" ]] || { _peer_doorbell_move_err "$json" 65 "Doorbell not configured (no $(_peer_doorbell_file)): nothing to move"; return; }
+    err="$(jq -r --arg old "$from" --arg new "$to" '
+        if (.peers | type) != "array" then "doorbell.json .peers is not an array: nothing to move"
+        elif (.peers | index($old)) == null then "\($old) is not in the doorbell peers (\(.peers | map(tostring) | join(", "))): nothing to move"
+        elif (.peers | index($new)) != null then "\($new) is already in the doorbell peers: refusing (remove \($old) by hand if it is stale)"
+        else "" end' <<< "$cur")" || err="doorbell.json is unreadable"
+    [[ -z "$err" ]] || { _peer_doorbell_move_err "$json" 65 "$err"; return; }
+    now="$(_peer_now_utc)"
+    new="$(jq -c --arg old "$from" --arg new "$to" --arg now "$now" \
+        '.peers |= map(if . == $old then $new else . end) | .updated_at = $now' <<< "$cur")" || return 1
+    if ! $dry_run; then
+        _peer_doorbell_write_locked "$new" || { _peer_doorbell_move_err "$json" 1 "Could not write $(_peer_doorbell_file)"; return; }
+    fi
+    if $json; then
+        jq -n --arg path "$(_peer_doorbell_file)" --argjson dry "$(_peer_json_bool "$dry_run")" --arg from "$from" --arg to "$to" --argjson cfg "$new" \
+            '{path:$path, dry_run:$dry, written:($dry|not), from:$from, to:$to, config:$cfg}'
+    else
+        $dry_run && echo "Dry run: would move doorbell peer $from -> $to in $(_peer_doorbell_file):" || echo "Moved doorbell peer $from -> $to in $(_peer_doorbell_file):"
+        jq '.' <<< "$new"
+        [[ "$(jq -r '.enabled == true' <<< "$new")" == true ]] || echo -e "${YELLOW}The bell is disabled; the move takes effect when it is enabled again.${RESET}"
     fi
 }
 

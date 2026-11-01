@@ -70,6 +70,12 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
 - The successor's name is `fleet-<runtime>` if free, else the next free `--N`.
 - Close the old session only through the session-close gate, after the successor
   is verified up and has taken over the approvals file and status files.
+- **Move the doorbell.** If `cctrl peer doorbell status` lists the old session
+  in its peers, run `cctrl peer doorbell move --from <old-session> --to
+  <successor>` once the successor is up. The same applies to a repo
+  orchestrator's continuation. It swaps that one entry and nothing else, and
+  refuses if the old name is not listed or the new one already is; it never
+  adds a peer. Skip it and the successor gets no bell: its mail sits unread.
 - After a **power cycle** the new fleet manager comes up first; restore then
   brings the old sessions back under their recorded names (a restore never
   renames; the guard does not apply to it). If that leaves two live fleet

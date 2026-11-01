@@ -1425,6 +1425,7 @@ cctrl peer doorbell enable --peer TMUX--ms--orch-x --dry-run   # show the file
 cctrl peer doorbell enable --peer TMUX--ms--orch-x             # write it
 cctrl peer doorbell enable --role orchestrator --role fleet-manager   # widen
 cctrl peer doorbell enable --max-rings-per-hour 2  # ring cap (default 4)
+cctrl peer doorbell move --from TMUX--ms--orch-x --to TMUX--ms--orch-x--2   # handover
 cctrl peer doorbell disable                       # enabled:false
 cctrl peer doorbell enable --keep-baseline        # re-enable without a new baseline
 rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell.json)
@@ -1462,6 +1463,14 @@ rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell
   a remedy) when an enabled bell has an invalid cap, since the bell is then
   silently dead. `enable` keeps a value already in the file. The cap
   limits only the Stop bell, not `--deliver` pushes.
+- Handover: `peer doorbell move --from OLD --to NEW` replaces the `peers`
+  entry OLD with NEW in place and changes nothing else (`enabled`,
+  `baseline_at`, `roles`, `mode`, the cap; the file stays mode 600). It
+  refuses (exit 65) unless OLD is in `peers` and NEW is not, so it never adds
+  a peer; a role is not a `peers` entry. `--dry-run` shows the result. The
+  bell is per session name, so without the move a successor (often the old
+  name plus `--N`) gets no bell. NEW's ring state starts empty;
+  `baseline_at` still keeps older mail from ringing.
 - Debug: `touch data/doorbell/debug` (or `CCTRL_DOORBELL_DEBUG=1` in the
   hook's env) appends one reason line per Stop to `data/doorbell/debug.log`
   (names, pids, counts; no message text). It works inside `hooks run stop`.

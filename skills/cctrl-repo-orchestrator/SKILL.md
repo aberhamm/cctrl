@@ -260,7 +260,10 @@ current unit, make sure no worker is left orphaned (list what each is doing in
 the status file), run the wrap-up/harvest step, and write a handoff note that
 names what is running, what is verified, what is open, and the exact next step.
 Then ask the fleet manager/human to spawn the continuation with that note's path
-in its first prompt. Do not hand off mid-task, and do not close yourself without
+in its first prompt. If `cctrl peer doorbell status` lists your session name in
+its peers, add to that ask: once the successor is up, run `cctrl peer doorbell
+move --from <you> --to <successor>` (it swaps that one entry, never adds one);
+otherwise the successor gets no bell and its mail sits unread. Do not hand off mid-task, and do not close yourself without
 the word of the fleet manager or human (see `cctrl-session-end`).
 
 ## See also
