@@ -10803,12 +10803,24 @@ test_doorbell_fast_path_call_budget() {
     _bell_fixture "$TMPDIR/bell-budget"
     _bell_send TMUX--t-a s1 2025-12-01T00:00:00Z
     _bell_enable "$_bell_cfg_default"
+    # Verify N1: the bell takes its clock inside the prefilter jq, so the
+    # no-new-mail path forks no `date`. The stand-in logs every call.
+    printf '#!/usr/bin/env bash\necho "date $*" >> "%s/date.log"\nexec /bin/date "$@"\n' "$BELL_DIR" > "$BELL_DIR/bin/date"
+    chmod +x "$BELL_DIR/bin/date"; : > "$BELL_DIR/date.log"
     : > "$BELL_LOG"
     _bell_stop
     [[ "$BELL_RC" -eq 0 ]] || fail "no new mail must not ring"
     [[ "$(grep -c '^TMUX display-message -p -t %5 ' "$BELL_LOG")" -eq 1 ]] || fail "fast path must make exactly one display-message: $(cat "$BELL_LOG")"
     [[ "$(wc -l < "$BELL_LOG" | tr -d ' ')" -eq 1 ]] || fail "fast path must make no other tmux call: $(cat "$BELL_LOG")"
-    echo "ok: fast path = one exact display-message, no list-sessions/list-panes"
+    [[ ! -s "$BELL_DIR/date.log" ]] || fail "fast path must fork no date: $(cat "$BELL_DIR/date.log")"
+    # The slow path still gets the system clock (no CCTRL_NOW_UTC): a ring
+    # records a well-formed, current ring time.
+    _bell_send TMUX--t-a s2 2026-02-01T00:00:00Z
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "new mail must ring on the system clock (rc=$BELL_RC)"
+    jq -e '(.rings | length) == 1 and (.rings[0] | fromdateiso8601) > (now - 120) and (.rings[0] | fromdateiso8601) <= (now + 1)' \
+        "$BELL_DATA/doorbell/state/TMUX--t-a.json" >/dev/null || fail "ring time must be the system clock: $(cat "$BELL_DATA/doorbell/state/TMUX--t-a.json")"
+    echo "ok: fast path = one exact display-message, no list-sessions/list-panes, no date"
 }
 
 test_peer_send_default_deliver_gated() {

@@ -10204,15 +10204,17 @@ _peer_doorbell_eval_inner() {
     # line makes jq fail, which is a silent no-op.
     state_dir="$(_peer_doorbell_state_dir)"
     state_file="$state_dir/$live_name.json"
-    local state_raw="{}" peers_raw="{}" pre now
-    now="$(_peer_now_utc)"
+    local state_raw="{}" peers_raw="{}" pre now=""
     [[ -f "$state_file" ]] && state_raw="$(<"$state_file")"
     [[ -f "$PEERS_FILE" ]] && peers_raw="$(<"$PEERS_FILE")"
     [[ -s "$MESSAGES_FILE" ]] || return 0
     pre="$(jq -nc --arg live "$live_name" --arg env_peer "${CCTRL_PEER:-}" --arg base "$baseline" \
-        --arg st "$state_raw" --arg pr "$peers_raw" --arg now "$now" --argjson win "$DOORBELL_RING_WINDOW" \
+        --arg st "$state_raw" --arg pr "$peers_raw" --arg env_now "${CCTRL_NOW_UTC:-}" --argjson win "$DOORBELL_RING_WINDOW" \
         "$DOORBELL_MAX_RINGS_JQ"'
-        ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
+        # The clock as _peer_now_utc gives it, computed here so the no-mail
+        # fast path forks no `date` (verify N1).
+        (if $env_now != "" then $env_now else (now | floor | todate) end) as $now
+        | ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
         | ((try ($pr | fromjson) catch {}) | if type == "object" then . else {} end) as $peers
         | ($state.rung // {} | if type == "object" then . else {} end) as $rung
         # CCTRL_PEER counts only while it is not bound to ANOTHER session
@@ -10231,8 +10233,9 @@ _peer_doorbell_eval_inner() {
         | { cands: $cands,
             rings: ($state | recent_rings($now | fromdateiso8601; $win) | length),
             queued: [$q[].id],
+            now: $now,
             new: [$q[] | select(((.created_at // "") > $base) and ($rung[.id] == null)) | {id, to, created_at}] }
-    ' "$MESSAGES_FILE")" || { _peer_doorbell_dbg "off: mailbox or clock ($now) unreadable"; return 0; }
+    ' "$MESSAGES_FILE")" || { _peer_doorbell_dbg "off: mailbox or clock (${CCTRL_NOW_UTC:-system clock}) unreadable"; return 0; }
     [[ "$pre" == *'"new":[]}' ]] && { _peer_doorbell_dbg "quiet: no new mail for $live_name${loop_flag:+ (stop_hook_active)}"; return 0; }
     # Ring cap: at most max_rings_per_hour rings per recipient (this session
     # name) in a rolling hour. At the cap the Stop is a no-op: nothing is
@@ -10241,9 +10244,9 @@ _peer_doorbell_eval_inner() {
     # same state read the write below replaces, and a pane runs one Stop at a
     # time, so the check and the write cannot interleave (no lock, as before).
     # Checked before the slow path, which it would only repeat.
-    local rings_recent
-    rings_recent="$(jq -r '.rings' <<< "$pre")" || return 0
-    [[ "$rings_recent" =~ ^[0-9]+$ ]] || return 0
+    local rings_recent=""
+    { IFS= read -r rings_recent; IFS= read -r now; } < <(jq -r '.rings, .now' <<< "$pre" 2>/dev/null)
+    [[ "$rings_recent" =~ ^[0-9]+$ && -n "$now" ]] || return 0
     if (( rings_recent >= max_rings )); then
         _peer_doorbell_dbg "held: $live_name ring cap $max_rings/hour reached ($rings_recent in the last hour); mail stays queued"
         return 0
