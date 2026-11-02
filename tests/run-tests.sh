@@ -2820,6 +2820,22 @@ test_live_store_guard_diagnostics_and_churn() {
     echo "ok: live-store guard lists changed paths, tolerates registry churn, catches own writes"
 }
 
+test_no_ansi_c_unicode_escapes() {
+    # plan 110 follow-up: bash 3.2 (/bin/bash on macOS) does not support \u / \U
+    # inside $'...', so a fixture written that way silently loses its glyphs.
+    # Use the literal UTF-8 character instead. Pattern is built in pieces so
+    # this file does not match itself.
+    local bs=$'\\' pat hits
+    pat="[$]'[^']*${bs}${bs}[uU][0-9a-fA-F]"
+    hits="$(cd "$ROOT" 2>/dev/null && git ls-files tests cctrl lib install hooks 2>/dev/null \
+        | grep -v '\.py$' | while IFS= read -r f; do
+            [[ -f "$f" ]] && grep -nE -- "$pat" "$f" | sed "s|^|$f:|" || true
+        done)" || true
+    [[ -z "$hits" ]] || fail "bash 3.2-unsafe ANSI-C unicode escape(s) (use the literal character):
+$hits"
+    echo "ok: no ANSI-C unicode escapes in tracked shell files"
+}
+
 test_tmux_exact_target_lint() {
     # plan 080 (reworked after an Opus eng review found the first pass wrong):
     # tmux's `-t NAME` falls back to prefix matching when no session named
@@ -10672,7 +10688,7 @@ test_peer_send_default_deliver_gated() {
         # Plan 110 S4: readiness is fail-closed, so the idle pane must draw an
         # empty composer (an empty capture is "not ready"); envs can override.
         env HOME="$T/home" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--orch1 TMUX--orch2 TMUX--wkr" \
-            TMUX_FAKE_CAPTURE_PANE=$'\u25cf done.\n────────────────────\n\u276f \n────────────────────' \
+            TMUX_FAKE_CAPTURE_PANE=$'● done.\n────────────────────\n❯ \n────────────────────' \
             TMUX_FAKE_PANE_PID=12345 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$T/projects" CCTRL_DATA_DIR="$data" ${envs[@]+"${envs[@]}"} \
             "$ROOT/cctrl" peer send "$@"
     }
@@ -10697,7 +10713,7 @@ test_peer_send_default_deliver_gated() {
     # ...an unsent draft or a modal counts as busy too.
     echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
     : > "$log"
-    out="$(_sdd TMUX_FAKE_CAPTURE_PANE=$'Do you want to proceed?\n\u276f 1. Yes\n  2. No' -- orch1 --from carol --json -- five)"
+    out="$(_sdd TMUX_FAKE_CAPTURE_PANE=$'Do you want to proceed?\n❯ 1. Yes\n  2. No' -- orch1 --from carol --json -- five)"
     jq -e '.outcome == null' <<< "$out" >/dev/null || fail "a modal pane must get a plain send: $out"
     assert_not_contains "$(cat "$log")" "paste-buffer"
     # Plan 110 S4: an explicit --deliver into a busy pane is readiness-gated
