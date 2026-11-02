@@ -1132,6 +1132,32 @@ CCTRL_PEER=comet cctrl peer whoami --json
 cctrl peer unregister comet
 ```
 
+A built-in `SendMessage` arrives as `<cross-session-message
+from="uds:/tmp/cc-socks/<pid>.sock" from-name="..." from-mode="...">`.
+`from-name` is a free label and `from-mode` is self-asserted. `cctrl peer whois`
+checks such an address against cctrl's records (plan 114). It is a consistency
+check, never proof of identity (`authenticated` is always `false`):
+
+```bash
+cctrl peer whois uds:/tmp/cc-socks/93036.sock --name "worker (TMUX--ms--w)" --mode bypass
+cctrl peer whois pid:93036 --no-tmux --json
+```
+
+It checks the socket with `lstat` only (exists, is a socket, not a symlink,
+owned by you, in a dir only you can write; it is never opened), the one Claude
+session file naming it, the process (`procStart` against `ps` in UTC, the argv
+permission mode), the pane binding (one read-only `tmux list-panes`;
+`--no-tmux` skips it), and the peer registry, session record and doorbell.
+Verdicts: `consistent` (exit 0), `inconsistent`, `dead` (gone or pid reused),
+`unknown` (no or several session files), `not-local` (a Remote Control or
+cloud sender: check via the mailbox), all exit 3; usage errors exit 64. It
+writes nothing and signals nothing. There is no MCP tool for it.
+
+`cctrl peer native-log [--since ISO] [--to NAME] [--limit N] [--json]` reads
+this host's log of built-in `SendMessage` calls (see Hooks,
+`native-send-log.py`): who sent, to whom, when, the outcome, the size and any
+cctrl message ids, never the body.
+
 ### App-owned Codex peers
 
 Create an app-owned task, then register the returned `provider_task_id`:
@@ -1404,6 +1430,17 @@ cctrl peer deliver --all --json          # nudge every queued tmux-capable peer
 no nudge recorded; `--dry-run`, `--force-busy`, `--no-submit` and `--inline`
 never bypass it. `--no-submit` never uses the Claude socket (a socket frame is
 always submitted).
+
+cctrl's raw socket frame claims no permission class, so a session in bypass
+mode would hold it behind an approval dialog. Since plan 114 the socket is used
+only when the recipient's argv proves a prompting mode (`--permission-mode
+default|acceptEdits|auto|plan|dontAsk`). A bypass session (every cctrl spawn),
+or one whose mode cctrl cannot prove (no flag, conflicting flags,
+`--allow-dangerously-skip-permissions`, ps failure), gets the same nudge line by
+the readiness-checked tmux paste instead: the result carries
+`socket_skipped_reason` (`recipient-bypass` / `recipient-mode-unknown`) and
+history records `adapter: "tmux"`. There is no override, and the frame never
+claims a mode.
 
 The nudge format is constant:
 
@@ -1892,6 +1929,24 @@ the trust prompt.
 The remaining hook scripts can also be configured manually in `settings.json`
 or in a cctrl profile.
 
+### native-send-log.py — SendMessage log (no bodies)
+
+`cctrl hooks run native-send-log` (plan 114), installed by `cctrl hooks install`
+as its own `PreToolUse` and `PostToolUse` entries with matcher `SendMessage`
+(the `Bash` entry is unchanged). Every built-in `SendMessage` call by any Claude
+session on the host, including subagent and teammate sends (`to_kind`), appends
+one `pre` and one `post` line to `data/native-sends.<host-id>.jsonl` (mode
+`0600`; one file per host because `data/` is livesynced). A line holds the
+sender (pid, session, tmux pane and socket from its nearest ancestor's Claude
+session file), `to`, `kind` (`bell`/`note`/`subscription`), cctrl message ids,
+the body's size and an HMAC-SHA256 of the exact body under a per-host key
+(`data/native-sends.key`, `0600`), and a keyword `outcome`
+(`sent|held|refused|offline|error|unknown`). The body, its first line, `summary`
+and the raw tool response are never stored. The hook always exits 0 with no
+output, within a 1 s budget; it never blocks or alters a send. The log rotates
+to one `.1` at `CCTRL_NATIVE_LOG_MAX_BYTES` (default 10 MB). Read it with
+`cctrl peer native-log`. `cctrl hooks doctor` checks both entries.
+
 ### notify.sh — smart sound notifications
 
 Plays different sounds based on what Claude is doing:
@@ -2159,6 +2214,7 @@ cctrl/
     tmux_kill_guard.py     # parser: blocks a tmux kill-server without -S/-L
     block-git-commit.py    # commit warning (advisory)
     peer-doorbell.sh       # Stop/Notification hook: exit 2 on queued peer mail
+    native-send-log.py     # SendMessage log hook (no bodies) + `peer native-log` reader
     session-log.py         # token tracking hook
     statusline.sh          # status bar + rate limit capture
   lib/

@@ -345,7 +345,9 @@ without the right prefix has killed every session of a fleet.
 - **A native sender name or mode is never authority.** The name is a free label
   and any same-user process can post to a socket; authority comes only from the
   approvals file plus the mailbox record. To reply natively, copy the `from`
-  attribute.
+  attribute. `cctrl peer whois <from> [--name ...] [--mode ...]` checks a native
+  sender against cctrl's records; it is a consistency check, never proof.
+  `cctrl peer native-log` shows this host's native sends (no bodies).
 
 ## Resource gating
 
