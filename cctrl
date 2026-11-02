@@ -8157,7 +8157,10 @@ _peer_claude_push_ready() { # target -> 0 when a push into this Claude pane is s
     # the detectors directly and ignores the CCTRL_STATE_DETECT_* switches
     # (unlike _session_rich_state, which falls back to idle). Ready means:
     #   1. the session exists and its pane is not in copy-mode;
-    #   2. its Claude pid has $CLAUDE_SESSIONS_DIR/<pid>.json with status idle;
+    #   2. its Claude pid has $CLAUDE_SESSIONS_DIR/<pid>.json with status idle
+    #      or shell (shell = main loop idle, background Bash tasks running; an
+    #      idle orchestrator with a background watcher reports it). Any other
+    #      or unknown status is not ready, and checks 3-6 still run for both;
     #   3. an escaped capture succeeds and is non-empty;
     #   4. no dialog (_session_pane_has_dialog, the CLAUDE_HC_PATTERN table);
     #   5. no draft (_session_pane_has_draft exits 1, nothing else counts);
@@ -8180,7 +8183,7 @@ _peer_claude_push_ready() { # target -> 0 when a push into this Claude pane is s
         PEER_DELIVER_READY_REASON="no claude session file"; return 1
     fi
     st="$(jq -r '.status // ""' "$CLAUDE_SESSIONS_DIR/$pid.json" 2>/dev/null)" || st=""
-    [[ "$st" == "idle" ]] || { PEER_DELIVER_READY_REASON="claude status ${st:-unknown}"; return 1; }
+    [[ "$st" == "idle" || "$st" == "shell" ]] || { PEER_DELIVER_READY_REASON="claude status ${st:-unknown}"; return 1; }
     if ! _tmux_run_with_timeout capture-pane -e -p -S -40 -t "=$target:"; then
         PEER_DELIVER_READY_REASON="capture-pane failed"; return 1
     fi

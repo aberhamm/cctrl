@@ -14934,6 +14934,12 @@ test_peer_claude_push_ready_fail_closed() {
         fi
     }
     _ready_case busy busy "$idle" deferred
+    # status shell = idle main loop with background Bash tasks: ready only when
+    # every other check passes; an unknown status still defers (fail closed).
+    _ready_case shell-modal shell "$modal" deferred
+    _ready_case shell-draft shell "$draft" deferred
+    _ready_case unknown-status zzz "$idle" deferred
+    jq -e '.results[0].reason == "claude status zzz"' <<< "$out" >/dev/null || fail "unknown-status: wrong reason: $out"
     _ready_case modal idle "$modal" deferred
     _ready_case draft idle "$draft" deferred
     _ready_case copy-mode idle "$idle" deferred TMUX_FAKE_PANE_IN_MODE=1
@@ -14959,6 +14965,7 @@ test_peer_claude_push_ready_fail_closed() {
     jq -e '.results[0].status == "deferred" and .results[0].reason == "transcript unreadable"' <<< "$out" >/dev/null || fail "unreadable transcript must defer: $out"
     assert_not_contains "$(cat "$log")" "paste-buffer"
     _ready_case idle idle "$idle" nudged
+    _ready_case shell-idle shell "$idle" nudged
     # A bell-enabled recipient with no known agent takes the Claude check
     # (fail closed): --force-busy cannot push into a pane that has no idle
     # Claude session file.
