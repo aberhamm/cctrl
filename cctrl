@@ -6801,6 +6801,13 @@ _peer_record_for_pid() {
     return 0
 }
 
+# Plan 114 (b) reader: this host's native-send log, pre/post joined by
+# tool_use_id. Read-only; the hook script owns the format (--read mode).
+_peer_cmd_native_log() {
+    CCTRL_NSL_DATA_DIR="$PEER_DATA_DIR" CCTRL_NSL_HOST_ID_FILE="$CCTRL_HOST_ID_FILE" \
+        python3 "$SCRIPT_DIR/hooks/native-send-log.py" --read "$@"
+}
+
 _peer_whois_usage() {
     echo "Usage: cctrl peer whois <address> [--name \"<from-name>\"] [--mode <from-mode>] [--no-tmux] [--json]"
     echo "  <address>: uds:/abs/path.sock | /abs/path.sock | pid:<n> | <n>"
@@ -11480,6 +11487,7 @@ cmd_peer() {
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
         whois) _peer_cmd_whois "$@" ;;
+        native-log) _peer_cmd_native_log "$@" ;;
         help-agent) _peer_cmd_help_agent "$@" ;;
         overview) _peer_cmd_overview "$@" ;;
         send) _peer_cmd_send "$@" ;;
@@ -11512,6 +11520,8 @@ cmd_peer() {
             echo "  cctrl peer whoami [--as NAME] [--json]"
             echo "  cctrl peer whois <uds:/path.sock|pid:N> [--name NAME] [--mode MODE] [--no-tmux] [--json]"
             echo "                                     Read-only consistency check of a native sender (never proof of identity)"
+            echo "  cctrl peer native-log [--since ISO] [--to NAME] [--limit N] [--json]"
+            echo "                                     Read this host's built-in SendMessage log (no bodies; plan 114)"
             echo "  cctrl peer help-agent [--as NAME] [--json]"
             echo "                                     Agent contract: peer say (live) vs peer send (async); not auto-injected"
             echo "  cctrl peer overview [--as NAME] [--json]"
@@ -18582,7 +18592,7 @@ cmd_hooks() {
         -h|--help|help)
             echo "Usage: cctrl hooks <run|install|doctor>"
             echo ""
-            echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify, codex-observe)"
+            echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify, codex-observe, native-send-log)"
             echo "  install       Write portable hook configs for Claude Code and Codex"
             echo "  doctor        Validate hook configs point to working commands"
             return 0
@@ -18606,6 +18616,8 @@ _hooks_run() {
         echo "                 post-turn logging and notifications"
         echo "  notify         Push notification on agent events"
         echo "  codex-observe  Observe bounded Codex lifecycle payloads (fail-open registry write)"
+        echo "  native-send-log  Log built-in SendMessage calls (no bodies) to a host-local file;"
+        echo "                 always exits 0 with no output (plan 114)"
         return 0
     fi
 
@@ -18647,9 +18659,17 @@ _hooks_run() {
         codex-observe)
             CCTRL_BIN="$SCRIPT_DIR/cctrl" exec python3 "$SCRIPT_DIR/hooks/codex-session-observer.py"
             ;;
+        native-send-log)
+            # Plan 114 (b): fail open, always. No stdout/stderr may reach the
+            # model and the send is never blocked, whatever python does.
+            CCTRL_NSL_DATA_DIR="$PEER_DATA_DIR" CCTRL_NSL_SESSIONS_DIR="$CLAUDE_SESSIONS_DIR" \
+                CCTRL_NSL_HOST_ID_FILE="$CCTRL_HOST_ID_FILE" \
+                python3 "$SCRIPT_DIR/hooks/native-send-log.py" >/dev/null 2>&1 || true
+            exit 0
+            ;;
         *)
             echo -e "${RED}Unknown hook: $name${RESET}" >&2
-            echo -e "${DIM}Available: pre-tool-use, stop, notify, codex-observe${RESET}" >&2
+            echo -e "${DIM}Available: pre-tool-use, stop, notify, codex-observe, native-send-log${RESET}" >&2
             return 1
             ;;
     esac
@@ -18704,6 +18724,22 @@ new_ptu.append({
     'hooks': [{'type': 'command', 'command': 'cctrl hooks run pre-tool-use'}]
 })
 hooks['PreToolUse'] = new_ptu
+
+# Plan 114 (b): the SendMessage log, as its own PreToolUse (intent) and
+# PostToolUse (outcome) entries. Separate from the Bash entry above, so the
+# plan 107 Bash guard path is untouched. Replace cctrl's, keep others.
+for event in ('PreToolUse', 'PostToolUse'):
+    kept = []
+    for entry in hooks.get(event, []):
+        cmds = [h.get('command', '') for h in entry.get('hooks', [])]
+        if any('cctrl hooks run native-send-log' in c for c in cmds):
+            continue
+        kept.append(entry)
+    kept.append({
+        'matcher': 'SendMessage',
+        'hooks': [{'type': 'command', 'command': 'cctrl hooks run native-send-log'}]
+    })
+    hooks[event] = kept
 
 # Stop: replace cctrl-sourced entry, preserve others (e.g. gstack)
 new_stop = []
@@ -18862,7 +18898,7 @@ _hooks_doctor() {
     fi
 
     # Check hook scripts exist
-    for script in pre-tool-use.py tmux_kill_guard.py block-git-commit.py notify.sh session-log.py codex-session-observer.py codex-hook-config.py; do
+    for script in pre-tool-use.py tmux_kill_guard.py block-git-commit.py notify.sh session-log.py codex-session-observer.py codex-hook-config.py native-send-log.py; do
         if [[ -f "$SCRIPT_DIR/hooks/$script" ]]; then
             echo -e "${GREEN}✓${RESET} $script exists"
         else
@@ -18918,6 +18954,12 @@ for name in ['pre-tool-use', 'stop', 'notify']:
         print(f'OK {name}')
     else:
         print(f'MISSING {name}')
+# Plan 114 (b): the SendMessage log needs both phases, matcher SendMessage.
+for event in ['PreToolUse', 'PostToolUse']:
+    ok = any(entry.get('matcher') == 'SendMessage'
+             and any(h.get('command', '') == 'cctrl hooks run native-send-log' for h in entry.get('hooks', []))
+             for entry in hooks.get(event, []))
+    print(('OK' if ok else 'MISSING') + f' native-send-log {event}')
 " 2>/dev/null)"
         while IFS= read -r line; do
             if [[ "$line" == OK* ]]; then

@@ -11295,6 +11295,254 @@ test_peer_whois_registry() {
     echo "ok: plan 114 peer whois reads the registry, session record and doorbell without writing"
 }
 
+# Plan 114 (b) fixture: run the SendMessage log hook through cctrl with a
+# scratch data dir, sessions dir and host id. Args: data-dir json [env...].
+_nsl_run() {
+    local data="$1" json="$2"; shift 2
+    NSL_RC=0
+    NSL_OUT="$(printf '%s' "$json" | env CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+        CCTRL_CLAUDE_SESSIONS_DIR="${NSL_SDIR:-$data/no-sessions}" "$@" "$ROOT/cctrl" hooks run native-send-log 2>&1)" || NSL_RC=$?
+}
+_nsl_fixture() { # data-dir -> host id file written, log path in NSL_LOG
+    mkdir -p "$1"
+    printf '0123456789abcdef0123456789abcdef\n' > "$1/host-id"
+    NSL_LOG="$1/native-sends.0123456789abcdef0123456789abcdef.jsonl"
+}
+_nsl_pre() { # tool_use_id to message [summary] [notify]
+    jq -cn --arg id "$1" --arg to "$2" --arg m "$3" --arg s "${4:-}" --argjson n "${5:-false}" \
+        '{session_id:"sess-1",hook_event_name:"PreToolUse",tool_name:"SendMessage",tool_use_id:$id,
+          tool_input:({to:$to,message:$m,notify_when_idle:$n} + (if $s != "" then {summary:$s} else {} end))}'
+}
+_nsl_post() { # tool_use_id response-text
+    jq -cn --arg id "$1" --arg r "$2" \
+        '{session_id:"sess-1",hook_event_name:"PostToolUse",tool_name:"SendMessage",tool_use_id:$id,
+          tool_input:{to:"x",message:"POSTBODY-CANARY"},tool_response:{result:$r}}'
+}
+
+test_native_send_log_lines() {
+    # Plan 114 (b): one pre and one post line with the fields of the plan;
+    # cctrl ids are extracted and a "you have mail" body is a bell.
+    local data="$TMPDIR/nsl-lines"
+    _nsl_fixture "$data"
+    _nsl_run "$data" "$(_nsl_pre toolu_A 'worker [3fa9c1]' '[cctrl] 2 new peer message(s): msg_20261102_180000_ab12cd msg_20261102_180001_ff0011')"
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "pre: rc $NSL_RC, output '$NSL_OUT'"
+    _nsl_run "$data" "$(_nsl_post toolu_A 'Message sent to worker')"
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "post: rc $NSL_RC, output '$NSL_OUT'"
+    _nsl_run "$data" "$(_nsl_pre toolu_B main '' '' true)"
+    _nsl_run "$data" "$(_nsl_pre toolu_C 'a1b2c3-d4e5' 'plain note for a subagent')"
+    _nsl_run "$data" "$(_nsl_pre toolu_D 'researcher@team' 'note')"
+    [[ "$(wc -l < "$NSL_LOG" | tr -d ' ')" -eq 5 ]] || fail "expected 5 lines: $(cat "$NSL_LOG")"
+    jq -se '
+        .[0] as $p | .[1] as $q |
+        $p.v == 1 and $p.phase == "pre" and $p.tool_use_id == "toolu_A" and $p.host == "0123456789abcdef0123456789abcdef"
+        and ($p.ts | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$"))
+        and $p.to == "worker [3fa9c1]" and $p.to_kind == "session" and $p.notify_when_idle == false
+        and $p.kind == "bell" and $p.msg_ids == ["msg_20261102_180000_ab12cd","msg_20261102_180001_ff0011"]
+        and $p.body.chars > 0 and $p.body.lines == 1 and ($p.body.hmac | test("^[0-9a-f]{64}$"))
+        and ($p.sender | has("pid") and has("session_id") and has("tmux") and has("socket")) and $p.sender.session_id == "sess-1"
+        and ($p | has("body_text") | not)
+        and $q.phase == "post" and $q.tool_use_id == "toolu_A" and $q.outcome == "sent" and ($q | keys | index("tool_response") | not)
+        and .[2].kind == "subscription" and .[2].to_kind == "main" and .[2].notify_when_idle == true and .[2].body.chars == 0
+        and .[3].kind == "note" and .[3].to_kind == "agent-id"
+        and .[4].to_kind == "teammate"' "$NSL_LOG" >/dev/null || fail "native-send log lines wrong: $(cat "$NSL_LOG")"
+    # Every line fits in one 2 KB write.
+    awk 'length($0) > 2047 { exit 1 }' "$NSL_LOG" || fail "a log line is over 2 KB"
+    echo "ok: plan 114 native-send log writes pre/post lines with ids, kind and outcome"
+}
+
+test_native_send_log_never_stores_body() {
+    # Plan 114 (b): no substring of message, summary or tool_response is ever
+    # stored, in the log or its rotation. The HMAC is reproducible with the
+    # per-host key, and key and log are 0600.
+    local data="$TMPDIR/nsl-canary" body summary resp mode
+    _nsl_fixture "$data"
+    body="first line BODY-CANARY-7f3a
+second line token=sk-CANARY-SECRET"
+    summary="SUMMARY-CANARY-91c2"
+    resp="RESPONSE-CANARY-55aa delivered"
+    _nsl_run "$data" "$(_nsl_pre toolu_X 'worker [3fa9c1]' "$body" "$summary")" CCTRL_NATIVE_LOG_MAX_BYTES=1
+    _nsl_run "$data" "$(_nsl_post toolu_X "$resp")" CCTRL_NATIVE_LOG_MAX_BYTES=1
+    [[ -f "$NSL_LOG.1" ]] || fail "rotation did not happen with a 1-byte cap"
+    local all; all="$(cat "$NSL_LOG" "$NSL_LOG.1")"
+    for c in BODY-CANARY-7f3a sk-CANARY-SECRET SUMMARY-CANARY-91c2 RESPONSE-CANARY-55aa POSTBODY-CANARY "first line" "second line"; do
+        assert_not_contains "$all" "$c"
+    done
+    local hmac_logged hmac_recomputed
+    hmac_logged="$(cat "$NSL_LOG" "$NSL_LOG.1" | jq -r 'select(.phase == "pre") | .body.hmac')"
+    hmac_recomputed="$(python3 -I -c 'import hmac,hashlib,sys; k=open(sys.argv[1],"rb").read(); print(hmac.new(k, sys.argv[2].encode(), hashlib.sha256).hexdigest())' "$data/native-sends.key" "$body")"
+    [[ -n "$hmac_logged" && "$hmac_logged" == "$hmac_recomputed" ]] || fail "HMAC does not match a recomputation"
+    [[ "$(cat "$NSL_LOG" "$NSL_LOG.1" | jq -r 'select(.phase == "pre") | .body.chars')" -eq "${#body}" ]] || fail "body.chars wrong"
+    for f in "$data/native-sends.key" "$NSL_LOG" "$NSL_LOG.1"; do
+        mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+        [[ "$mode" == "600" ]] || fail "$f mode is $mode, want 600"
+    done
+    [[ "$(wc -c < "$data/native-sends.key" | tr -d ' ')" -eq 32 ]] || fail "key is not 32 bytes"
+    # Two hosts never share a file: the host id names it.
+    ls "$data" | grep -q '^native-sends\.0123456789abcdef0123456789abcdef\.jsonl$' || fail "log not named by host id"
+    echo "ok: plan 114 native-send log stores no body, summary or response; HMAC and 0600 hold"
+}
+
+test_native_send_log_fail_open() {
+    # Plan 114 (b): every failure exits 0 with empty stdout and stderr, and a
+    # non-SendMessage call writes nothing.
+    local data="$TMPDIR/nsl-failopen" fake="$TMPDIR/nsl-fake-mod" ro="$TMPDIR/nsl-ro"
+    _nsl_fixture "$data"
+    _nsl_run "$data" 'not json {'
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "malformed JSON: rc $NSL_RC out '$NSL_OUT'"
+    _nsl_run "$data" '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}'
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "Bash tool: rc $NSL_RC out '$NSL_OUT'"
+    [[ ! -e "$NSL_LOG" && ! -e "$data/native-sends.key" ]] || fail "a Bash call wrote to the native-send log"
+    _nsl_run "$data" ''
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "empty stdin: rc $NSL_RC"
+    # A read-only data dir.
+    _nsl_fixture "$ro"; chmod 500 "$ro"
+    _nsl_run "$ro" "$(_nsl_pre toolu_R worker 'hello')"
+    chmod 700 "$ro"
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "read-only dir: rc $NSL_RC out '$NSL_OUT'"
+    # A missing/broken python module (hmac shadowed to raise ImportError).
+    mkdir -p "$fake"; printf 'raise ImportError("no hmac here")\n' > "$fake/hmac.py"
+    _nsl_run "$data" "$(_nsl_pre toolu_M worker 'hello')" PYTHONPATH="$fake"
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "broken module: rc $NSL_RC out '$NSL_OUT'"
+    # No python3 at all on PATH.
+    local nopy="$TMPDIR/nsl-nopy" t
+    mkdir -p "$nopy"
+    for t in jq bash env cat date mktemp tr sed awk grep dirname basename readlink uname id ps head; do
+        [[ -n "$(command -v "$t" 2>/dev/null)" ]] && ln -sf "$(command -v "$t")" "$nopy/$t"
+    done
+    NSL_RC=0
+    NSL_OUT="$(printf '%s' "$(_nsl_pre toolu_P worker hi)" | env PATH="$nopy" CCTRL_DATA_DIR="$data" "$(command -v bash)" "$ROOT/cctrl" hooks run native-send-log 2>&1)" || NSL_RC=$?
+    [[ "$NSL_RC" -eq 0 && -z "$NSL_OUT" ]] || fail "no python3: rc $NSL_RC out '$NSL_OUT'"
+    # A wall-clock budget: a stalled stdin (writer never closes) does not
+    # hold the send; the hook gives up after ~1 s and exits 0.
+    local took="$TMPDIR/nsl-took"
+    sleep 6 | { s0=$SECONDS; env CCTRL_DATA_DIR="$data" "$ROOT/cctrl" hooks run native-send-log >/dev/null 2>&1; printf '%s %s' "$?" "$((SECONDS - s0))" > "$took"; }
+    [[ "$(cut -d' ' -f1 < "$took")" -eq 0 ]] || fail "stalled stdin: rc $(cat "$took")"
+    [[ "$(cut -d' ' -f2 < "$took")" -le 4 ]] || fail "stalled stdin held the hook for $(cut -d' ' -f2 < "$took") s"
+    # Launcher fail-open covers this hook name too (broken release).
+    local home="$TMPDIR/nsl-launcher" out rc=0
+    mkdir -p "$home/current"
+    printf '#!/nonexistent/interpreter-xyz\n' > "$home/current/cctrl"; chmod +x "$home/current/cctrl"
+    out="$(CCTRL_HOME="$home" bash "$ROOT/install/cctrl-launcher.sh" hooks run native-send-log < /dev/null 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "launcher must fail open for native-send-log, got $rc"
+    echo "ok: plan 114 native-send log fails open, silently, in every failure case"
+}
+
+test_native_send_log_rotation_and_lock() {
+    # Plan 114 (b): past the size cap the log rotates to exactly one .1; 20
+    # parallel writers give 20 whole lines.
+    local data="$TMPDIR/nsl-rot" i pids=""
+    _nsl_fixture "$data"
+    for i in 1 2 3; do
+        _nsl_run "$data" "$(_nsl_pre "toolu_r$i" worker "m$i")" CCTRL_NATIVE_LOG_MAX_BYTES=300
+    done
+    [[ -f "$NSL_LOG.1" && ! -e "$NSL_LOG.2" ]] || fail "expected exactly one rotation generation"
+    [[ "$(cat "$NSL_LOG" "$NSL_LOG.1" | wc -l | tr -d ' ')" -ge 2 ]] || fail "rotation lost lines"
+    rm -f "$NSL_LOG" "$NSL_LOG.1"
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+        _nsl_run "$data" "$(_nsl_pre "toolu_p$i" worker "parallel $i")" &
+        pids="$pids $!"
+    done
+    for i in $pids; do wait "$i" || true; done
+    [[ "$(wc -l < "$NSL_LOG" | tr -d ' ')" -eq 20 ]] || fail "expected 20 lines from 20 writers, got $(wc -l < "$NSL_LOG")"
+    jq -se 'length == 20 and ([.[].tool_use_id] | unique | length) == 20' "$NSL_LOG" >/dev/null || fail "parallel lines are not 20 whole records"
+    echo "ok: plan 114 native-send log rotates once and keeps parallel lines whole"
+}
+
+test_native_send_log_sender_walk() {
+    # Plan 114 (b): the sender is the first ancestor of the hook with a Claude
+    # session file (here: this harness's own pid). With none, sender.pid is
+    # null and the hook still exits 0.
+    local data="$TMPDIR/nsl-walk" sdir="$TMPDIR/nsl-walk-sessions"
+    _nsl_fixture "$data"
+    mkdir -p "$sdir"
+    jq -n --argjson p "$$" '{pid:$p, sessionId:"walk-sid", tmux:"TMUX--walk:@3.%9", messagingSocketPath:"/tmp/cc-socks-fixture/1.sock", bridgeSessionId:"BRIDGE-WALK-CANARY"}' > "$sdir/$$.json"
+    printf 'KEYFILE-CANARY' > "$sdir/$$.key"
+    NSL_SDIR="$sdir" _nsl_run "$data" "$(_nsl_pre toolu_W worker hi)"
+    [[ "$NSL_RC" -eq 0 ]] || fail "walk: rc $NSL_RC"
+    jq -e --argjson p "$$" '.sender.pid == $p and .sender.tmux == "TMUX--walk:@3.%9" and .sender.socket == "/tmp/cc-socks-fixture/1.sock" and .sender.session_id == "sess-1"' "$NSL_LOG" >/dev/null \
+        || fail "sender walk did not find the ancestor session file: $(cat "$NSL_LOG")"
+    assert_not_contains "$(cat "$NSL_LOG")" "BRIDGE-WALK-CANARY"
+    assert_not_contains "$(cat "$NSL_LOG")" "KEYFILE-CANARY"
+    rm -f "$NSL_LOG" "$sdir/$$.json"
+    NSL_SDIR="$sdir" _nsl_run "$data" "$(_nsl_pre toolu_W2 worker hi)"
+    [[ "$NSL_RC" -eq 0 ]] || fail "no-ancestor: rc $NSL_RC"
+    jq -e '.sender.pid == null and .sender.session_id == "sess-1"' "$NSL_LOG" >/dev/null || fail "no ancestor must give sender.pid null: $(cat "$NSL_LOG")"
+    echo "ok: plan 114 native-send log finds the sending session by its ancestor session file"
+}
+
+test_hooks_install_adds_sendmessage_entries() {
+    # Plan 114 (b): hooks install adds one PreToolUse and one PostToolUse
+    # SendMessage entry, idempotently, keeping foreign entries and the Bash
+    # pre-tool-use entry. Doctor reports them, and MISSING after a removal.
+    local root="$TMPDIR/nsl-install-claude" out rc
+    mkdir -p "$root"
+    cat > "$root/settings.json" <<'JSON'
+{"theme":"x","hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"foreign pre"}]}],
+ "PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"foreign post"}]}]}}
+JSON
+    CODEX_HOME="$TMPDIR/nsl-no-codex" CLAUDE_CONFIG_DIR="$root" "$ROOT/cctrl" hooks install >/dev/null || fail "install failed"
+    CODEX_HOME="$TMPDIR/nsl-no-codex" CLAUDE_CONFIG_DIR="$root" "$ROOT/cctrl" hooks install >/dev/null || fail "second install failed"
+    python3 -I - "$root/settings.json" <<'PY' || fail "settings after install are wrong: $(cat "$root/settings.json")"
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+h = cfg["hooks"]
+def count(event, matcher, cmd):
+    return sum(1 for e in h.get(event, []) if e.get("matcher") == matcher and {"type": "command", "command": cmd} in e.get("hooks", []))
+assert cfg["theme"] == "x"
+assert count("PreToolUse", "SendMessage", "cctrl hooks run native-send-log") == 1
+assert count("PostToolUse", "SendMessage", "cctrl hooks run native-send-log") == 1
+assert count("PreToolUse", "Bash", "cctrl hooks run pre-tool-use") == 1
+assert count("PreToolUse", "Read", "foreign pre") == 1
+assert count("PostToolUse", "Edit", "foreign post") == 1
+assert all("native-send-log" not in json.dumps(e) for e in h["PreToolUse"] if e.get("matcher") == "Bash")
+PY
+    out="$(CODEX_HOME="$TMPDIR/nsl-no-codex" CLAUDE_CONFIG_DIR="$root" "$ROOT/cctrl" hooks doctor 2>&1)" || true
+    assert_contains "$out" "native-send-log.py exists"
+    assert_contains "$out" "native-send-log PreToolUse"
+    assert_contains "$out" "native-send-log PostToolUse"
+    assert_not_contains "$out" "native-send-log PreToolUse — not installed"
+    python3 -I - "$root/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]; cfg = json.load(open(p))
+cfg["hooks"]["PostToolUse"] = [e for e in cfg["hooks"]["PostToolUse"] if e.get("matcher") != "SendMessage"]
+json.dump(cfg, open(p, "w"))
+PY
+    rc=0; out="$(CODEX_HOME="$TMPDIR/nsl-no-codex" CLAUDE_CONFIG_DIR="$root" "$ROOT/cctrl" hooks doctor 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "doctor must fail with a missing SendMessage entry"
+    assert_contains "$out" "native-send-log PostToolUse — not installed"
+    echo "ok: plan 114 hooks install adds the SendMessage log entries idempotently; doctor checks both"
+}
+
+test_peer_native_log_reader() {
+    # Plan 114 (b): the read-only reader joins pre/post by tool_use_id,
+    # filters, and never writes (the log, key and data dir are unchanged).
+    local data="$TMPDIR/nsl-reader" out before after
+    _nsl_fixture "$data"
+    _nsl_run "$data" "$(_nsl_pre toolu_1 alpha 'one msg_20261102_180000_ab12cd new mail')"
+    _nsl_run "$data" "$(_nsl_post toolu_1 'sent')"
+    _nsl_run "$data" "$(_nsl_pre toolu_2 beta 'two')"
+    _nsl_run "$data" "$(_nsl_post toolu_2 'error: refused by receiver')"
+    _nsl_run "$data" "$(_nsl_pre toolu_3 alpha 'three')"
+    before="$(ls -la "$data"; cksum "$NSL_LOG")"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" peer native-log --json)" || fail "reader failed"
+    jq -e '.ok and .count == 3 and .sends[0].outcome == "sent" and .sends[0].kind == "bell"
+        and .sends[1].outcome == "refused" and .sends[2].outcome == "pending" and (.sends[0] | has("body_text") | not)' <<< "$out" >/dev/null \
+        || fail "reader join wrong: $out"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" peer native-log --to alpha --limit 1 --json)"
+    jq -e '.count == 1 and .sends[0].tool_use_id == "toolu_3"' <<< "$out" >/dev/null || fail "reader --to/--limit wrong: $out"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" peer native-log --since 2999-01-01T00:00:00Z --json)"
+    jq -e '.count == 0' <<< "$out" >/dev/null || fail "reader --since wrong: $out"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" peer native-log)"
+    assert_contains "$out" "to=alpha"
+    assert_contains "$out" "msg_20261102_180000_ab12cd"
+    after="$(ls -la "$data"; cksum "$NSL_LOG")"
+    [[ "$before" == "$after" ]] || fail "the reader changed the data dir"
+    rm -f "$NSL_LOG"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" peer native-log)"
+    assert_contains "$out" "no native sends logged"
+    echo "ok: plan 114 peer native-log joins, filters and stays read-only"
+}
+
 test_doorbell_fast_path_call_budget() {
     _bell_fixture "$TMPDIR/bell-budget"
     _bell_send TMUX--t-a s1 2025-12-01T00:00:00Z

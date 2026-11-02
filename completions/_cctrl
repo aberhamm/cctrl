@@ -399,6 +399,7 @@ _cctrl() {
                     'rm:Remove a manual peer'
                     'whoami:Resolve peer identity'
                     'whois:Check a native sender address against cctrl records (not proof)'
+                    'native-log:Read this host'\''s SendMessage log (no bodies)'
                     'help-agent:Agent contract: peer say (live) vs peer send (async)'
                     'send:Queue a mailbox message'
                     'reply:Reply to a message: send, deliver, and ack the original'
@@ -475,6 +476,13 @@ _cctrl() {
                     whoami|identity)
                         _arguments \
                             '--as[Peer identity]:peer:_cctrl_peers' \
+                            '--json[Machine-readable output]'
+                        ;;
+                    native-log)
+                        _arguments \
+                            '--since[Only sends at or after this ISO time]:time:' \
+                            '--to[Only sends to this name]:name:' \
+                            '--limit[Show the last N sends]:count:' \
                             '--json[Machine-readable output]'
                         ;;
                     whois)
