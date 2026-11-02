@@ -9,7 +9,7 @@ review-required: eng
 created: 2026-10-28
 approval: pending (Matthew approved the recommendation in mdec-1028-cctrl-recommendations-1-7; plan review and rollout still need explicit OK)
 reviews: []
-related: 108, 110
+related: 108, 110, 114
 ---
 
 ## Problem
@@ -44,8 +44,14 @@ without prompts. Current state (investigation of 2026-10-28):
    options for stronger proof, decided in eng review: a per-session 0600 secret
    token under data/ checked at delivery, or a small broker reading unix-socket
    peer credentials (LOCAL_PEERPID) mapped to a pane.
-4. Claude Code's cross-session hold stays the last line of defence; nothing
-   here touches it (the fleet manager's exact-body-match grant relies on it).
+4. Claude Code's cross-session hold stays the last line of defence for native
+   and foreign writers to a session's messaging socket; nothing here touches
+   it (the fleet manager's exact-body-match grant relies on it). Since plan
+   114 (c) it no longer guards cctrl's own nudge to a bypass or unknown-mode
+   recipient: cctrl sends that fixed "[cctrl] N new peer message(s)" line by
+   the readiness-checked tmux paste instead of a raw socket frame, only to
+   doorbell-enabled recipients. The mail it points at is still gated by this
+   plan at read/deliver time.
 
 ## Acceptance criteria
 

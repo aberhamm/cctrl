@@ -8152,6 +8152,69 @@ _peer_claude_socket_for() {
     printf '%s' "$sock"
 }
 
+# Plan 114 (c): the permission mode a Claude process was STARTED with, from
+# its argv (a `ps -o command=` string). Prints bypassPermissions, one of the
+# prompting modes (default acceptEdits auto plan dontAsk) or unknown. A mode
+# changed later (settings defaultMode, shift-tab) is invisible, so no flag is
+# `unknown`, never a guess. ps joins argv with spaces, so a prompt can hold
+# flag-like text: two different --permission-mode values are `unknown`, and
+# --allow-dangerously-skip-permissions (bypass is one shift-tab away) is
+# `unknown` unless the mode is already bypass. Pure: no I/O.
+_peer_argv_permission_mode() { # command-string -> mode
+    local cmd="$1" tok want_value=false mode="" skip=false allow=false conflict=false v
+    local -a toks=()
+    local _restore_glob=false
+    case "$-" in *f*) ;; *) _restore_glob=true; set -f ;; esac
+    # shellcheck disable=SC2206 # word splitting is the point; globbing is off
+    toks=($cmd)
+    $_restore_glob && set +f
+    for tok in ${toks[@]+"${toks[@]}"}; do
+        if $want_value; then
+            want_value=false; v="$tok"
+        else
+            case "$tok" in
+                --dangerously-skip-permissions) skip=true; continue ;;
+                --allow-dangerously-skip-permissions) allow=true; continue ;;
+                --permission-mode) want_value=true; continue ;;
+                --permission-mode=*) v="${tok#--permission-mode=}" ;;
+                *) continue ;;
+            esac
+        fi
+        if [[ -n "$mode" && "$mode" != "$v" ]]; then conflict=true; fi
+        mode="$v"
+    done
+    if $skip; then printf 'bypassPermissions'; return 0; fi
+    if $conflict || $want_value; then printf 'unknown'; return 0; fi
+    case "$mode" in
+        bypassPermissions) printf 'bypassPermissions' ;;
+        default|acceptEdits|auto|plan|dontAsk)
+            if $allow; then printf 'unknown'; else printf '%s' "$mode"; fi ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+# Plan 114 (c): may cctrl write its raw frame into this Claude pid's socket?
+# The frame claims no permission class, so a bypass recipient (every cctrl
+# spawn) holds it behind an approval dialog. Only a recipient whose argv
+# proves a prompting mode gets the socket; bypass, a missing flag, ps failure
+# or an unparseable argv return 1 (fail closed) and set
+# PEER_SOCKET_SKIP_REASON (recipient-bypass / recipient-mode-unknown). The
+# caller then takes the readiness-checked tmux paste. No override exists.
+_peer_socket_push_allowed() { # pid -> 0 when the socket may be used
+    local pid="$1" cmd="" mode
+    PEER_SOCKET_SKIP_REASON=""
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+        cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || cmd=""
+    fi
+    mode="$(_peer_argv_permission_mode "$cmd")"
+    case "$mode" in
+        default|acceptEdits|auto|plan|dontAsk) return 0 ;;
+        bypassPermissions) PEER_SOCKET_SKIP_REASON="recipient-bypass" ;;
+        *) PEER_SOCKET_SKIP_REASON="recipient-mode-unknown" ;;
+    esac
+    return 1
+}
+
 _peer_claude_push_ready() { # target -> 0 when a push into this Claude pane is safe
     # Plan 110 S4, review (d). Fail-closed: any doubt is "not ready". It calls
     # the detectors directly and ignores the CCTRL_STATE_DETECT_* switches
@@ -8440,6 +8503,7 @@ _peer_delivery_result_json() {
       --argjson submitted "${PEER_DELIVER_SUBMITTED:-false}" \
       --argjson dry_run "${PEER_DELIVER_DRY_RUN:-false}" \
       --argjson inline "${PEER_DELIVER_INLINE:-false}" \
+      --arg socket_skipped "${PEER_SOCKET_SKIP_REASON:-}" \
       '{
         peer: $peer,
         status: $status,
@@ -8451,7 +8515,8 @@ _peer_delivery_result_json() {
       + (if $reason != "" then {reason: $reason} else {} end)
       + (if $target != "" then {target: $target} else {} end)
       + (if $nudge != "" then {nudge: $nudge} else {} end)
-      + (if $message_id != "" then {message_id: $message_id} else {} end)'
+      + (if $message_id != "" then {message_id: $message_id} else {} end)
+      + (if $socket_skipped != "" then {socket_skipped_reason: $socket_skipped} else {} end)'
 }
 
 _peer_print_delivery_human() {
@@ -8549,6 +8614,7 @@ _peer_deliver_one_locked() {
     PEER_DELIVER_DRY_RUN="$dry_run"
     PEER_DELIVER_INLINE=false
     PEER_DELIVER_SUBMITTED=false
+    PEER_SOCKET_SKIP_REASON=""
 
     if [[ -n "$inline_id" ]] && _peer_has_capability "$peer_json" app-server; then
         PEER_DELIVER_INLINE=true
@@ -8718,9 +8784,14 @@ _peer_deliver_one_locked() {
         # Socket adapter first, bound to the checked pid's own session file
         # (S5). Only when the push is meant to submit: a socket frame is
         # always submitted, so --no-submit and --inline (submit=false) take
-        # the tmux paste, which leaves the text unsent (F7).
+        # the tmux paste, which leaves the text unsent (F7). Plan 114 (c):
+        # and only when the recipient's argv proves a prompting mode; a
+        # bypass or unknown-mode recipient would hold the classless frame
+        # behind a dialog, so it takes the same checked tmux paste instead
+        # (socket_skipped_reason in the result, adapter tmux in history).
         local _sock_path
-        if [[ "$submit" == "true" ]] && _sock_path="$(_peer_claude_socket_for "$PEER_PUSH_PID")"; then
+        if [[ "$submit" == "true" ]] && _sock_path="$(_peer_claude_socket_for "$PEER_PUSH_PID")" \
+            && _peer_socket_push_allowed "$PEER_PUSH_PID"; then
             if _peer_socket_deliver "$_sock_path" "$payload"; then
                 now="$(_peer_now_utc)"
                 if [[ -n "$inline_id" ]]; then

@@ -10872,6 +10872,137 @@ test_doorbell_move_rings_successor() {
     echo "ok: after peer doorbell move the successor's Stop rings"
 }
 
+# ── Plan 114: native step 2 (socket mode gate, peer whois, native-send log) ──
+
+test_peer_socket_gate_argv_modes() {
+    # Plan 114 (c): the argv parser behind the socket gate, on this bash and on
+    # /bin/bash (3.2 on macOS) when it exists. Only a proven prompting mode
+    # passes; anything doubtful is unknown, and bypass is bypass.
+    local b out want
+    want="$(printf '%s\n' bypassPermissions default unknown unknown unknown bypassPermissions unknown unknown unknown acceptEdits plan)"
+    for b in "$BASH" /bin/bash; do
+        [[ -x "$b" ]] || continue
+        out="$(CCTRL_NO_MAIN=1 "$b" -c 'set -euo pipefail; source "$1"
+            for c in "claude --permission-mode bypassPermissions --model x" \
+                     "claude --permission-mode=default" \
+                     "claude" "" \
+                     "claude --permission-mode default x --permission-mode bypassPermissions" \
+                     "claude --dangerously-skip-permissions --permission-mode plan" \
+                     "claude --allow-dangerously-skip-permissions --permission-mode default" \
+                     "claude --permission-mode" \
+                     "claude --permission-mode weird" \
+                     "claude * --permission-mode acceptEdits" \
+                     "node /x/cli.js --permission-mode plan"; do
+                _peer_argv_permission_mode "$c"; echo
+            done' _ "$ROOT/cctrl" 2>/dev/null)" || fail "$b: argv parser failed"
+        [[ "$out" == "$want" ]] || fail "$b: argv modes differ:
+$out"
+    done
+    echo "ok: plan 114 argv permission-mode parser is fail-closed on bash 3.2 and 5"
+}
+
+test_peer_socket_gate_ps_failure() {
+    # Plan 114 (c): a ps that fails, a dead pid and a non-numeric pid all give
+    # "no socket" with recipient-mode-unknown; a proven prompting mode passes,
+    # a bypass argv is refused as recipient-bypass. Real ps for the live cases.
+    local bin="$TMPDIR/ps-fail-bin" out child
+    mkdir -p "$bin"
+    printf '#!/bin/sh\nexit 1\n' > "$bin/ps"; chmod +x "$bin/ps"
+    out="$(PATH="$bin:$PATH" CCTRL_NO_MAIN=1 bash -c 'source "$1"; if _peer_socket_push_allowed "$$"; then echo ALLOWED; else echo "no $PEER_SOCKET_SKIP_REASON"; fi' _ "$ROOT/cctrl" 2>/dev/null)"
+    [[ "$out" == "no recipient-mode-unknown" ]] || fail "ps failure must give no socket: $out"
+    out="$(CCTRL_NO_MAIN=1 bash -c 'source "$1"; _peer_socket_push_allowed abc || echo "no $PEER_SOCKET_SKIP_REASON"' _ "$ROOT/cctrl" 2>/dev/null)"
+    [[ "$out" == "no recipient-mode-unknown" ]] || fail "non-numeric pid must give no socket: $out"
+    _gate_for_argv() { # argv0 -> ALLOWED or "no <reason>"
+        (exec -a "$1" sleep 30) &
+        child=$!
+        sleep 0.2
+        CCTRL_NO_MAIN=1 bash -c 'source "$1"; if _peer_socket_push_allowed "$2"; then echo ALLOWED; else echo "no $PEER_SOCKET_SKIP_REASON"; fi' _ "$ROOT/cctrl" "$child" 2>/dev/null
+        kill "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true
+    }
+    out="$(_gate_for_argv 'claude --permission-mode default')"
+    [[ "$out" == "ALLOWED" ]] || fail "a proven default mode must allow the socket: $out"
+    out="$(_gate_for_argv 'claude --permission-mode bypassPermissions')"
+    [[ "$out" == "no recipient-bypass" ]] || fail "bypass argv must refuse the socket: $out"
+    out="$(_gate_for_argv 'claude --dangerously-skip-permissions')"
+    [[ "$out" == "no recipient-bypass" ]] || fail "--dangerously-skip-permissions must refuse the socket: $out"
+    out="$(_gate_for_argv 'claude')"
+    [[ "$out" == "no recipient-mode-unknown" ]] || fail "no flag must refuse the socket: $out"
+    # Dead pid: ps finds nothing.
+    (exit 0) & child=$!; wait "$child" 2>/dev/null || true
+    out="$(CCTRL_NO_MAIN=1 bash -c 'source "$1"; _peer_socket_push_allowed "$2" || echo "no $PEER_SOCKET_SKIP_REASON"' _ "$ROOT/cctrl" "$child" 2>/dev/null)"
+    [[ "$out" == "no recipient-mode-unknown" ]] || fail "dead pid must give no socket: $out"
+    # The gate adds nothing to the frame and has no override switch.
+    local body
+    body="$(sed -n '/^_peer_socket_push_allowed()/,/^}/p' "$ROOT/cctrl")"
+    assert_not_contains "$body" 'CCTRL_'
+    assert_not_contains "$(sed -n '/^_peer_socket_deliver()/,/^}/p' "$ROOT/cctrl")" 'from-mode'
+    echo "ok: plan 114 socket gate fails closed on ps failure, dead pid, bypass and unknown argv"
+}
+
+test_peer_socket_gate_stubbed_defer_and_paste() {
+    # Plan 114 (c), stubbed tmux (110 T2 style): a doorbell-enabled recipient
+    # with a live socket and a bypass argv. A busy, dialog or draft pane still
+    # defers (the paste path keeps its own fail-closed readiness check); an
+    # idle one gets exactly one tmux paste and zero socket frames.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/sgate-data" log="$TMPDIR/sgate-tmux.log" sdir="$TMPDIR/sgate-sessions" out
+    local sockdir sock frames lpid child i
+    setup_delivery_peers "$data"
+    mkdir -p "$TMPDIR/sgate-cq"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register sgq --dir "$TMPDIR/sgate-cq" --agent claude --session TMUX--sgq >/dev/null
+    enable_delivery_bell "$data" sgq
+    sockdir="$(mktemp -d /tmp/cctrl-sock.XXXXXX)" || fail "mktemp failed"
+    sock="$sockdir/s"; frames="$sockdir/frames"; : > "$frames"
+    python3 -I -c '
+import socket, sys, time
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sys.argv[1]); srv.listen(8); srv.settimeout(0.5)
+end = time.time() + 60
+while time.time() < end:
+    try: conn, _ = srv.accept()
+    except socket.timeout: continue
+    with open(sys.argv[2], "ab") as f: f.write(b"accept\n")
+    conn.close()
+' "$sock" "$frames" &
+    lpid=$!
+    (exec -a "claude --permission-mode bypassPermissions" sleep 120) &
+    child=$!
+    _sgate_cleanup() { kill "$lpid" "$child" 2>/dev/null || true; wait "$lpid" "$child" 2>/dev/null || true; rm -rf "$sockdir"; }
+    for i in 1 2 3 4 5 6 7 8 9 10; do [[ -S "$sock" ]] && break; sleep 0.2; done
+    [[ -S "$sock" ]] || { _sgate_cleanup; fail "listener did not start"; }
+    local idle modal draft
+    idle="$(printf '%s\n' '● done.' '────────────────────' '❯ ' '────────────────────')"
+    modal="$(printf '%s\n' '│ Do you want to proceed?   │' '│ ❯ 1. Yes                  │' '│   2. No                   │')"
+    draft="$(printf '%s\n' '────────────────────' '❯ half typed reply' '────────────────────')"
+    _sgate_case() { # label status capture expected
+        rm -rf "$sdir"; write_claude_session_file "$sdir" "$child" "$2" "$sock"
+        : > "$log"
+        CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send sgq --from orchestrator --json -- "gate $1" >/dev/null
+        out="$(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--sgq" TMUX_FAKE_CAPTURE_PANE="$3" \
+            TMUX_FAKE_PANE_PID="$child" CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_DATA_DIR="$data" \
+            CCTRL_NOW_UTC="2099-01-0$5T00:00:00Z" "$ROOT/cctrl" peer deliver sgq --json)" \
+            || { _sgate_cleanup; fail "$1: deliver must exit 0: $out"; }
+        jq -e --arg w "$4" '.results[0].status == $w' <<< "$out" >/dev/null || { _sgate_cleanup; fail "$1: expected $4: $out"; }
+        if [[ "$4" == deferred ]]; then
+            grep -q 'paste-buffer' "$log" && { _sgate_cleanup; fail "$1: a deferred pane got a paste"; }
+        else
+            [[ "$(grep -c 'paste-buffer' "$log")" -eq 1 ]] || { _sgate_cleanup; fail "$1: expected exactly one paste"; }
+        fi
+        return 0
+    }
+    _sgate_case busy busy "$idle" deferred 1
+    _sgate_case modal idle "$modal" deferred 2
+    _sgate_case draft idle "$draft" deferred 3
+    _sgate_case idle idle "$idle" nudged 4
+    jq -e '.results[0].socket_skipped_reason == "recipient-bypass" and .results[0].target == "TMUX--sgq"' <<< "$out" >/dev/null \
+        || { _sgate_cleanup; fail "idle bypass recipient: expected a tmux nudge with recipient-bypass: $out"; }
+    sleep 0.5
+    [[ ! -s "$frames" ]] || { _sgate_cleanup; fail "the socket was connected to: $(cat "$frames")"; }
+    _sgate_cleanup
+    echo "ok: plan 114 socket gate keeps busy/dialog/draft deferred and pastes to an idle bypass recipient"
+}
+
 test_doorbell_fast_path_call_budget() {
     _bell_fixture "$TMPDIR/bell-budget"
     _bell_send TMUX--t-a s1 2025-12-01T00:00:00Z
@@ -15008,6 +15139,9 @@ test_peer_push_gate_real_tmux_socket_mcp() {
     command -v socat >/dev/null || command -v node >/dev/null || { echo "skip: no socat/node"; return 0; }
     local data="$TMPDIR/rt110-data" sdir="$TMPDIR/rt110-sessions" sockdir sock frames lpid out before after
     local s_idle="TMUX--rt110-idle-$$" s_modal="TMUX--rt110-modal-$$" pane_pid sleep_pid i
+    # Plan 114 (c): two more idle panes whose Claude stand-in runs with a
+    # bypass argv and with no permission flag at all.
+    local s_byp="TMUX--rt110-byp-$$" s_unk="TMUX--rt110-unk-$$" pane_sh="$TMPDIR/rt110-pane.sh"
     sockdir="$(mktemp -d /tmp/cctrl-sock.XXXXXX)" || fail "mktemp failed"
     sock="$sockdir/s"; frames="$sockdir/frames"; : > "$frames"
     mkdir -p "$data" "$sdir" "$TMPDIR/rt110-home" "$TMPDIR/rt110-a" "$TMPDIR/rt110-b" "$TMPDIR/rt110-o"
@@ -15036,18 +15170,34 @@ while time.time() < end:
     _rt110_cleanup() {
         tmux kill-session -t "=$s_idle" 2>/dev/null || true
         tmux kill-session -t "=$s_modal" 2>/dev/null || true
+        tmux kill-session -t "=$s_byp" 2>/dev/null || true
+        tmux kill-session -t "=$s_unk" 2>/dev/null || true
         kill "$lpid" 2>/dev/null || true; wait "$lpid" 2>/dev/null || true
         rm -rf "$sockdir"
     }
     # Panes draw a composer (idle) or a modal, then wait on a child sleep, so
     # the pane pid is bash and the Claude pid is found by walking real ps.
-    tmux new-session -d -s "$s_idle" -x 120 -y 30 "bash -c 'printf \"● ready\\n────────────────────────────────────────\\n❯ \\n────────────────────────────────────────\\n\"; sleep 600 & wait'" || { _rt110_cleanup; fail "tmux new-session failed"; }
-    tmux new-session -d -s "$s_modal" -x 120 -y 30 "bash -c 'printf \"│ Do you want to proceed? │\\n│ ❯ 1. Yes │\\n\"; sleep 600 & wait'" || { _rt110_cleanup; fail "tmux new-session failed"; }
+    # The child's argv (exec -a) is the permission mode cctrl reads from ps
+    # (plan 114 (c)): only a proven prompting mode may take the socket.
+    cat > "$pane_sh" <<'PANE'
+kind="$1"; argv0="$2"
+if [[ "$kind" == modal ]]; then
+    printf '│ Do you want to proceed? │\n│ ❯ 1. Yes │\n'
+else
+    printf '● ready\n────────────────────────────────────────\n❯ \n────────────────────────────────────────\n'
+fi
+(exec -a "$argv0" sleep 600) &
+wait
+PANE
+    tmux new-session -d -s "$s_idle" -x 120 -y 30 "bash $pane_sh idle 'claude --permission-mode default'" || { _rt110_cleanup; fail "tmux new-session failed"; }
+    tmux new-session -d -s "$s_modal" -x 120 -y 30 "bash $pane_sh modal 'claude --permission-mode default'" || { _rt110_cleanup; fail "tmux new-session failed"; }
+    tmux new-session -d -s "$s_byp" -x 120 -y 30 "bash $pane_sh idle 'claude --permission-mode bypassPermissions'" || { _rt110_cleanup; fail "tmux new-session failed"; }
+    tmux new-session -d -s "$s_unk" -x 120 -y 30 "bash $pane_sh idle claude" || { _rt110_cleanup; fail "tmux new-session failed"; }
     _rt110_session_file() { # session -> writes the sleep pid's idle session file
         local pp sp n
         for n in 1 2 3 4 5 6 7 8 9 10; do
             pp="$(tmux list-panes -t "=$1:" -F '#{pane_pid}' | head -1)"
-            sp="$(ps -A -o pid=,ppid=,comm= | awk -v p="$pp" '$2 == p && $3 ~ /sleep/ { print $1 }' | head -1)"
+            sp="$(ps -A -o pid=,ppid= | awk -v p="$pp" '$2 == p { print $1 }' | head -1)"
             [[ -n "$sp" ]] && break; sleep 0.2
         done
         [[ -n "$sp" ]] || return 1
@@ -15055,11 +15205,16 @@ while time.time() < end:
     }
     _rt110_session_file "$s_idle" || { _rt110_cleanup; fail "no sleep child for $s_idle"; }
     _rt110_session_file "$s_modal" || { _rt110_cleanup; fail "no sleep child for $s_modal"; }
+    _rt110_session_file "$s_byp" || { _rt110_cleanup; fail "no sleep child for $s_byp"; }
+    _rt110_session_file "$s_unk" || { _rt110_cleanup; fail "no sleep child for $s_unk"; }
     sleep 0.3
     local -a env=(HOME="$TMPDIR/rt110-home" CCTRL_DATA_DIR="$data" CCTRL_CLAUDE_SESSIONS_DIR="$sdir")
     env "${env[@]}" "$ROOT/cctrl" peer register rtidle --dir "$TMPDIR/rt110-a" --agent claude --session "$s_idle" >/dev/null
     env "${env[@]}" "$ROOT/cctrl" peer register rtmodal --dir "$TMPDIR/rt110-b" --agent claude --session "$s_modal" >/dev/null
     env "${env[@]}" "$ROOT/cctrl" peer register rtorch --dir "$TMPDIR/rt110-o" --agent codex >/dev/null
+    mkdir -p "$TMPDIR/rt110-c" "$TMPDIR/rt110-d"
+    env "${env[@]}" "$ROOT/cctrl" peer register rtbyp --dir "$TMPDIR/rt110-c" --agent claude --session "$s_byp" >/dev/null
+    env "${env[@]}" "$ROOT/cctrl" peer register rtunk --dir "$TMPDIR/rt110-d" --agent claude --session "$s_unk" >/dev/null
     # Verify the override took effect before trusting it: cctrl sees the
     # scratch sessions dir and the real pane pid -> sleep pid walk.
     out="$(env "${env[@]}" CCTRL_NO_MAIN=1 bash -c 'source "$1"; printf "%s|%s" "$CLAUDE_SESSIONS_DIR" "$(_session_claude_pid "$2")"' _ "$ROOT/cctrl" "$s_idle")"
@@ -15084,7 +15239,7 @@ while time.time() < end:
     [[ "$before" == "$after" ]] || { _rt110_cleanup; fail "non-enabled recipient pane changed"; }
 
     # (iii) enabled but a modal is visible: zero frames.
-    enable_delivery_bell "$data" rtidle rtmodal
+    enable_delivery_bell "$data" rtidle rtmodal rtbyp rtunk
     env "${env[@]}" "$ROOT/cctrl" peer send rtmodal --from rtorch --json -- "modal one" >/dev/null
     out="$(env "${env[@]}" "$ROOT/cctrl" peer deliver rtmodal --json)"
     jq -e '.results[0].status == "deferred"' <<< "$out" >/dev/null || { _rt110_cleanup; fail "modal pane must defer: $out"; }
@@ -15094,7 +15249,29 @@ while time.time() < end:
     # (ii) enabled and idle: exactly one frame, through the pid-bound socket.
     out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:00:00Z" "$ROOT/cctrl" peer deliver rtidle --json)"
     for i in 1 2 3 4 5 6 7 8 9 10; do [[ -s "$frames" ]] && break; sleep 0.2; done
-    jq -e --arg s "$sock" '.results[0].status == "nudged" and .results[0].target == $s' <<< "$out" >/dev/null || { _rt110_cleanup; fail "idle enabled recipient must get the socket push: $out"; }
+    jq -e --arg s "$sock" '.results[0].status == "nudged" and .results[0].target == $s and (.results[0] | has("socket_skipped_reason") | not)' <<< "$out" >/dev/null || { _rt110_cleanup; fail "idle enabled recipient must get the socket push: $out"; }
+    # The frame is byte-identical in shape to before plan 114: exactly
+    # type/message.role/message.content, no mode, class or auth claim.
+    head -1 "$frames" | jq -e '(keys == ["message","type"]) and (.message | keys == ["content","role"]) and .type == "user" and .message.role == "user"' >/dev/null \
+        || { _rt110_cleanup; fail "socket frame shape changed: $(head -1 "$frames")"; }
+
+    # Plan 114 (c): a bypass argv and a missing flag both skip the socket and
+    # take the checked tmux paste of the same cctrl nudge line.
+    local gate_s gate_p gate_r gate_out
+    for gate_s in "rtbyp:$s_byp:recipient-bypass" "rtunk:$s_unk:recipient-mode-unknown"; do
+        gate_p="${gate_s%%:*}"; gate_r="${gate_s##*:}"; gate_s="${gate_s#*:}"; gate_s="${gate_s%:*}"
+        env "${env[@]}" "$ROOT/cctrl" peer send "$gate_p" --from rtorch --json -- "gate $gate_p" >/dev/null
+        gate_out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:00:30Z" "$ROOT/cctrl" peer deliver "$gate_p" --json)"
+        jq -e --arg t "$gate_s" --arg r "$gate_r" '.results[0].status == "nudged" and .results[0].target == $t
+            and .results[0].socket_skipped_reason == $r and .results[0].submitted == true' <<< "$gate_out" >/dev/null \
+            || { _rt110_cleanup; fail "$gate_p: expected a tmux nudge with socket_skipped_reason $gate_r: $gate_out"; }
+        jq -se --arg p "$gate_p" '[.[] | select(.to == $p) | .history[]? | select(.event == "nudge")] | length > 0 and all(.adapter == "tmux")' "$data/messages.jsonl" >/dev/null \
+            || { _rt110_cleanup; fail "$gate_p: history must record the nudge as adapter tmux"; }
+        for i in 1 2 3 4 5 6 7 8 9 10; do tmux capture-pane -p -t "=$gate_s:" | grep -q '\[cctrl\]' && break; sleep 0.2; done
+        tmux capture-pane -p -t "=$gate_s:" | grep -q '\[cctrl\]' || { _rt110_cleanup; fail "$gate_p: the nudge did not reach the pane"; }
+    done
+    sleep 0.3
+    [[ "$(wc -l < "$frames" | tr -d ' ')" -eq 1 ]] || { _rt110_cleanup; fail "bypass/unknown recipients got socket frames: $(cat "$frames")"; }
     # --no-submit never uses the socket (F7): it goes to the tmux pane.
     out="$(env "${env[@]}" CCTRL_NOW_UTC="2099-01-01T00:01:00Z" "$ROOT/cctrl" peer deliver rtidle --no-submit --json)"
     # --inline is unsubmitted too (submit=false): it must not take the socket,
@@ -15108,7 +15285,7 @@ while time.time() < end:
     jq -e '.results[0].status == "nudged" and .results[0].target == "'"$s_idle"'"' <<< "$out" >/dev/null || fail "--no-submit must use tmux, not the socket: $out"
     jq -e '.results[0].status != "socket" and .results[0].target == "'"$s_idle"'" and .results[0].submitted != true' <<< "$inline_out" >/dev/null || fail "--inline must use tmux unsubmitted, not the socket: $inline_out"
     [[ "$nframes" -eq 1 ]] || fail "expected exactly one socket frame, got $nframes"
-    echo "ok: plan 110 real tmux + ps + unix socket + MCP bridge honour the push gate"
+    echo "ok: plan 110/114 real tmux + ps + unix socket + MCP bridge honour the push gate and the socket mode gate"
 }
 
 test_peer_socket_deliver_payload_exact() {
