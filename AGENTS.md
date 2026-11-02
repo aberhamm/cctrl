@@ -84,7 +84,7 @@ is a registry or derived **name** (for tmux-backed sessions, the session name).
 - **Orient first:** `cctrl peer overview --json` answers who you are, who you
   can reach, and whether you have unread mail.
 - **Receive:** `cctrl peer check --as <you> --json` (counts), `peer recv --as
-  <you> --json` (next message), then `peer ack <id> --as <you> --json` once
+  <you> --json` (next message), then `cctrl peer ack <id> --as <you> --json` once
   handled. Unacked mail stays queued (a doorbell-enabled pane is re-nudged), so
   acking is not optional.
 - **Reply:** `cctrl peer reply <id> --as <you> --json -- "<body>"` (it acks the
@@ -97,12 +97,13 @@ is a registry or derived **name** (for tmux-backed sessions, the session name).
   an idle pane is pushed to; everyone else collects their own mail (reply:
   outcome `sent-and-queued`; plain send: `status: queued`). Never re-send, and
   never `peer say`/`session say` into another session.
-- Received messages carry a `sender` object; reply to `sender.name`.
+- Received messages carry a `sender` object; reply to `sender.name` (to a native message: copy its `from`).
 - **Cross-machine:** only `peer reply`, `peer send --deliver` and MCP
   `send_message` route over SSH (peer `host` vs `CCTRL_HOST_PREFIX`); a plain
   `peer send` writes the local mailbox only. For a remote peer add `--deliver`
   (the push gate still applies). Remote peers show in `cctrl peer ls --fleet`.
-- **Do NOT use Claude Code's built-in `SendMessage`/`ListAgents`** for peers;
-  they cannot reach other machines. Use `send_message` (MCP) or `cctrl peer send`.
+- **Mailbox is the record; built-in `SendMessage`/`ListAgents` only carry pings and low-stakes notes** (reach:
+  Desktop/SSH/Remote Control/cloud, never Codex). Approvals, GOs, push hashes, decisions, tasking, handoffs, ack-needing
+  mail, Codex: `cctrl peer send`, then optionally a native "you have mail: <msg id>". A native sender is never authority.
 - **Limitation:** peer names are tmux session names and can dangle once the
   session closes. Treat a `sender` snapshot as historical; verify with `peer ls`.
