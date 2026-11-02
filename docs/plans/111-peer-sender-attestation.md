@@ -43,7 +43,10 @@ without prompts. Current state (investigation of 2026-10-28):
    to match that record. Never trust `audit.caller_tmux_session` alone. Open
    options for stronger proof, decided in eng review: a per-session 0600 secret
    token under data/ checked at delivery, or a small broker reading unix-socket
-   peer credentials (LOCAL_PEERPID) mapped to a pane.
+   peer credentials (LOCAL_PEERPID) mapped to a pane. Plan 114 ships the
+   resolver as a pure read, `_peer_record_for_pid` (used by `cctrl peer
+   whois`); call it rather than duplicating the pid -> session file -> pane ->
+   peer walk. Its result is a consistency check, not proof.
 4. Claude Code's cross-session hold stays the last line of defence for native
    and foreign writers to a session's messaging socket; nothing here touches
    it (the fleet manager's exact-body-match grant relies on it). Since plan

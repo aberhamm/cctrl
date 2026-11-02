@@ -6642,6 +6642,372 @@ _peer_cmd_whoami() {
     fi
 }
 
+# ── Plan 114 (a): peer whois, a read-only consistency check ─────────
+# A native sender address (`uds:/tmp/cc-socks/<pid>.sock`) is checked
+# against what cctrl and Claude Code already record: the socket's own
+# inode, the session file naming it, the process (procStart, argv mode),
+# the tmux pane and the peer registry. The result is NEVER proof of
+# identity; `authenticated` is always false. Everything here is a read:
+# no socket is opened, no file is written, no process is signalled, and
+# the one tmux call is a single list-panes (none with --no-tmux).
+
+# pid ancestor -> 0 when pid is ancestor or one of its descendants within 8
+# levels (an upward `ps -o ppid=` walk).
+_peer_pid_descends_from() {
+    local p="$1" a="$2" i=0
+    [[ "$p" =~ ^[0-9]+$ && "$a" =~ ^[0-9]+$ ]] || return 1
+    while [[ $i -le 8 ]]; do
+        [[ "$p" == "$a" ]] && return 0
+        p="$(ps -o ppid= -p "$p" 2>/dev/null)" || return 1
+        p="${p//[[:space:]]/}"
+        [[ "$p" =~ ^[0-9]+$ && "$p" -gt 1 ]] || return 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# The whois pane listing: one bounded, read-only `tmux list-panes -a`. perl's
+# alarm bounds it without a temp file or a signal sent by cctrl
+# (_tmux_run_with_timeout uses both). Output: session<TAB>pane_id<TAB>pane_pid.
+_peer_whois_list_panes() {
+    local secs="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}"
+    command -v tmux >/dev/null 2>&1 || return 127
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm shift @ARGV; exec { $ARGV[0] } @ARGV or exit 127' "$secs" \
+            tmux list-panes -a -F '#{session_name}	#{pane_id}	#{pane_pid}' 2>/dev/null
+    else
+        tmux list-panes -a -F '#{session_name}	#{pane_id}	#{pane_pid}' 2>/dev/null
+    fi
+}
+
+# Resolve a Claude pid to cctrl's records: session file -> process -> pane ->
+# peer. A pure read; results go to PEER_REC_* globals (plan 111 Design 3
+# reuses this resolver). With --no-tmux the pane binding is not checked.
+# PEER_REC_REASONS lists each mismatch or unreadable input (one per line);
+# PEER_REC_NOTES lists what was not checked. Returns 1 when the session file
+# is missing or unreadable (PEER_REC_REASONS says why), else 0.
+_peer_record_for_pid() {
+    local pid="$1" no_tmux=false f fields line lstart want got cmd panes p_s p_id p_pid
+    [[ "${2:-}" == "--no-tmux" ]] && no_tmux=true
+    PEER_REC_FILE=""; PEER_REC_SESSION_ID=""; PEER_REC_NAME=""; PEER_REC_NAME_SOURCE=""
+    PEER_REC_ENTRYPOINT=""; PEER_REC_CLAUDE_KIND=""; PEER_REC_TMUX_CLAIM=""; PEER_REC_BRIDGE=false
+    PEER_REC_SOCKET=""; PEER_REC_FILE_PID=""
+    PEER_REC_ALIVE=false; PEER_REC_PROC_START_MATCH=null; PEER_REC_ARGV_MODE="unknown"
+    PEER_REC_TMUX_CHECKED=false; PEER_REC_TMUX_SESSION=""; PEER_REC_TMUX_PANE=""; PEER_REC_TMUX_PANE_PID=""
+    PEER_REC_TMUX_BOUND=null
+    PEER_REC_PEER_NAME=""; PEER_REC_PEER_ALIASES="[]"; PEER_REC_ROLE=""; PEER_REC_ORCH_KIND=""
+    PEER_REC_HOST=""; PEER_REC_PURPOSE=""; PEER_REC_DOORBELL=false
+    PEER_REC_REASONS=""; PEER_REC_NOTES=""
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        PEER_REC_REASONS="bad pid"; return 1
+    fi
+    f="$CLAUDE_SESSIONS_DIR/$pid.json"
+    if [[ ! -f "$f" || -L "$f" || ! -r "$f" ]]; then
+        PEER_REC_REASONS="no session file for pid $pid"; return 1
+    fi
+    PEER_REC_FILE="$f"
+    # One jq read; bridgeSessionId is reduced to a boolean and never printed.
+    fields="$(jq -r '[(.pid // "" | tostring), (.sessionId // ""), (.name // ""), (.nameSource // ""),
+        (.entrypoint // ""), (.kind // ""), (.tmux // ""), (.procStart // ""),
+        (.messagingSocketPath // ""), ((.bridgeSessionId // null) != null | tostring)]
+        | map(gsub("[\t\n\r\u001f]"; " ")) | join("\u001f")' "$f" 2>/dev/null)" || fields=""
+    if [[ -z "$fields" ]]; then
+        PEER_REC_FILE=""; PEER_REC_REASONS="session file unreadable"; return 1
+    fi
+    # \x1f, not a tab: tab is IFS whitespace, so an empty field would collapse.
+    IFS=$'\x1f' read -r PEER_REC_FILE_PID PEER_REC_SESSION_ID PEER_REC_NAME PEER_REC_NAME_SOURCE \
+        PEER_REC_ENTRYPOINT PEER_REC_CLAUDE_KIND PEER_REC_TMUX_CLAIM want PEER_REC_SOCKET PEER_REC_BRIDGE <<< "$fields"
+    [[ "$PEER_REC_BRIDGE" == "true" ]] || PEER_REC_BRIDGE=false
+    if [[ "$PEER_REC_FILE_PID" != "$pid" ]]; then
+        PEER_REC_REASONS+="session file pid ${PEER_REC_FILE_PID:-missing} is not $pid"$'\n'
+    fi
+
+    # Process: `ps`, never a signal. procStart is what Claude Code records:
+    # `ps -o lstart=` in the C locale and UTC (a pid-reuse guard).
+    if ps -o pid= -p "$pid" >/dev/null 2>&1; then
+        PEER_REC_ALIVE=true
+        lstart="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null)" || lstart=""
+        got="$(printf '%s' "$lstart" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+        want="$(printf '%s' "$want" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')"
+        if [[ -z "$want" ]]; then
+            PEER_REC_REASONS+="session file has no procStart"$'\n'
+        elif [[ -z "$got" ]]; then
+            PEER_REC_REASONS+="ps lstart unreadable"$'\n'
+        elif [[ "$got" == "$want" ]]; then
+            PEER_REC_PROC_START_MATCH=true
+        else
+            PEER_REC_PROC_START_MATCH=false
+        fi
+        cmd="$(ps -o command= -p "$pid" 2>/dev/null)" || cmd=""
+        PEER_REC_ARGV_MODE="$(_peer_argv_permission_mode "$cmd")"
+    fi
+
+    # Pane binding: the self-reported `S:@w.%p` against one list-panes.
+    if [[ "$PEER_REC_TMUX_CLAIM" =~ ^(.+):@[0-9]+\.(%[0-9]+)$ ]]; then
+        PEER_REC_TMUX_SESSION="${BASH_REMATCH[1]}"
+        PEER_REC_TMUX_PANE="${BASH_REMATCH[2]}"
+    fi
+    if $no_tmux; then
+        PEER_REC_NOTES+="pane binding not checked (--no-tmux)"$'\n'
+    elif [[ -z "$PEER_REC_TMUX_SESSION" ]]; then
+        PEER_REC_REASONS+="session file has no tmux pane claim"$'\n'
+    elif ! panes="$(_peer_whois_list_panes)"; then
+        PEER_REC_REASONS+="pane binding not checked: tmux list-panes failed"$'\n'
+    else
+        PEER_REC_TMUX_CHECKED=true
+        PEER_REC_TMUX_BOUND=false
+        while IFS=$'\t' read -r p_s p_id p_pid; do
+            [[ "$p_id" == "$PEER_REC_TMUX_PANE" ]] || continue
+            PEER_REC_TMUX_PANE_PID="$p_pid"
+            if [[ "$p_s" != "$PEER_REC_TMUX_SESSION" ]]; then
+                PEER_REC_REASONS+="pane $p_id is in session $p_s, not $PEER_REC_TMUX_SESSION"$'\n'
+            elif ! _peer_pid_descends_from "$pid" "$p_pid"; then
+                PEER_REC_REASONS+="pid $pid is not pane $p_id's process ($p_pid) or its descendant"$'\n'
+            else
+                PEER_REC_TMUX_BOUND=true
+            fi
+            break
+        done <<< "$panes"
+        if [[ -z "$PEER_REC_TMUX_PANE_PID" ]]; then
+            PEER_REC_REASONS+="pane $PEER_REC_TMUX_PANE not found"$'\n'
+        fi
+    fi
+
+    # Registry: peers.json entries backed by S, the session record, and the
+    # doorbell rule (pure jq). No mailbox lock, no backfill.
+    if [[ -n "$PEER_REC_TMUX_SESSION" ]]; then
+        local s="$PEER_REC_TMUX_SESSION" names meta="" peer_json
+        names="$(jq -c --arg s "$s" '
+            if type == "object" then
+              [keys[] as $k | select(((.[$k].tmux_target // .[$k].session // "") == $s)) | $k]
+            else [] end' "$PEERS_FILE" 2>/dev/null)" || names="[]"
+        [[ -n "$names" ]] || names="[]"
+        PEER_REC_PEER_NAME="$(jq -r --arg s "$s" 'if index($s) != null then $s elif length > 0 then .[0] else $s end' <<< "$names")"
+        PEER_REC_PEER_ALIASES="$(jq -c --arg n "$PEER_REC_PEER_NAME" --slurpfile p "$PEERS_FILE" '
+            (map(select(. != $n))) + ((($p[0] // {})[$n].aliases // []) | map(select(type == "string")))
+            | unique' <<< "$names" 2>/dev/null)" || PEER_REC_PEER_ALIASES="[]"
+        [[ -n "$PEER_REC_PEER_ALIASES" ]] || PEER_REC_PEER_ALIASES="[]"
+        meta="$(_session_metadata_file "$s" 2>/dev/null)" || meta=""
+        if [[ -n "$meta" && -f "$meta" && ! -L "$meta" ]]; then
+            line="$(jq -r '[(.role // ""), (.orch_kind // ""), (.host // ""), (.purpose // "")]
+                | map(tostring | gsub("[\t\n\r\u001f]"; " ")) | join("\u001f")' "$meta" 2>/dev/null)" || line=""
+            IFS=$'\x1f' read -r PEER_REC_ROLE PEER_REC_ORCH_KIND PEER_REC_HOST PEER_REC_PURPOSE <<< "$line"
+        fi
+        peer_json="$(jq -c --arg n "$PEER_REC_PEER_NAME" --arg s "$s" --slurpfile p "$PEERS_FILE" '
+            ((($p[0] // {})[$n]) // {}) + {name: $n, session: $s, tmux_target: $s}' -n 2>/dev/null)" \
+            || peer_json="$(jq -cn --arg n "$PEER_REC_PEER_NAME" --arg s "$s" '{name: $n, session: $s, tmux_target: $s}')"
+        _peer_doorbell_enabled_for "$peer_json" && PEER_REC_DOORBELL=true
+    fi
+    return 0
+}
+
+_peer_whois_usage() {
+    echo "Usage: cctrl peer whois <address> [--name \"<from-name>\"] [--mode <from-mode>] [--no-tmux] [--json]"
+    echo "  <address>: uds:/abs/path.sock | /abs/path.sock | pid:<n> | <n>"
+    echo "  A read-only consistency check of a native sender against cctrl's records."
+    echo "  It is never proof of identity (authenticated is always false)."
+    echo "  Exit: 0 consistent, 3 any other verdict, 64 usage."
+}
+
+_peer_cmd_whois() {
+    local address="" claim_name="" claim_mode="" have_name=false have_mode=false no_tmux=false json=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) [[ $# -ge 2 ]] || { _peer_whois_usage >&2; return 64; }; claim_name="$2"; have_name=true; shift 2 ;;
+            --mode) [[ $# -ge 2 ]] || { _peer_whois_usage >&2; return 64; }; claim_mode="$2"; have_mode=true; shift 2 ;;
+            --no-tmux) no_tmux=true; shift ;;
+            --json) json=true; shift ;;
+            -h|--help) _peer_whois_usage; return 0 ;;
+            -*) echo -e "${RED}Unknown peer whois flag: $1${RESET}" >&2; _peer_whois_usage >&2; return 64 ;;
+            *) [[ -z "$address" ]] || { _peer_whois_usage >&2; return 64; }; address="$1"; shift ;;
+        esac
+    done
+    [[ -n "$address" ]] || { _peer_whois_usage >&2; return 64; }
+
+    local path="" pid="" verdict="" reasons="" notes="" r
+    local s_exists=false s_is_socket=false s_symlink=false s_owner=false s_dir_private=false
+    case "$address" in
+        uds:/*) path="${address#uds:}" ;;
+        uds:*) _peer_whois_usage >&2; return 64 ;;
+        /*) path="$address" ;;
+        pid:*) pid="${address#pid:}" ;;
+        *)
+            if [[ "$address" =~ ^[0-9]+$ ]]; then
+                pid="$address"
+            elif [[ "$address" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]]; then
+                verdict="not-local"
+                notes="check via the mailbox; native cannot be verified cross-host"
+            else
+                _peer_whois_usage >&2; return 64
+            fi ;;
+    esac
+    if [[ -n "$path" ]]; then
+        case "/$path/" in */../*|*/./*) _peer_whois_usage >&2; return 64 ;; esac
+        [[ "$path" == /* ]] || { _peer_whois_usage >&2; return 64; }
+    fi
+    if [[ -z "$verdict" && -z "$path" ]]; then
+        [[ "$pid" =~ ^[0-9]+$ ]] || { _peer_whois_usage >&2; return 64; }
+        path="$(jq -r '.messagingSocketPath // ""' "$CLAUDE_SESSIONS_DIR/$pid.json" 2>/dev/null)" || path=""
+        [[ -n "$path" ]] || { verdict="unknown"; reasons+="no session file names a socket for pid $pid"$'\n'; }
+    fi
+
+    # Socket: lstat only (-L before any test that follows a link); it is
+    # never opened.
+    if [[ -n "$path" ]]; then
+        if [[ -L "$path" ]]; then
+            s_exists=true; s_symlink=true
+            reasons+="socket path is a symlink"$'\n'
+        elif [[ -e "$path" ]]; then
+            s_exists=true
+            if [[ -S "$path" ]]; then s_is_socket=true; else reasons+="socket path is not a socket"$'\n'; fi
+            if [[ -O "$path" ]]; then s_owner=true; else reasons+="socket is not owned by the caller"$'\n'; fi
+        else
+            reasons+="socket path does not exist"$'\n'
+        fi
+        local sdir="${path%/*}"
+        [[ -n "$sdir" ]] || sdir="/"
+        if [[ -d "$sdir" && ! -L "$sdir" && -O "$sdir" ]] \
+            && [[ -z "$(find "$sdir" -maxdepth 0 \( -perm -0020 -o -perm -0002 \) 2>/dev/null)" ]]; then
+            s_dir_private=true
+        else
+            reasons+="socket dir is not private to the caller"$'\n'
+        fi
+    fi
+
+    # Session files naming this socket (*.json only; never any other file).
+    local hits="" nhits=0 f sp
+    if [[ -n "$path" && -z "$verdict" ]]; then
+        if [[ ! -d "$CLAUDE_SESSIONS_DIR" || ! -r "$CLAUDE_SESSIONS_DIR" ]]; then
+            verdict="unknown"; reasons+="claude sessions dir unreadable"$'\n'
+        else
+            for f in "$CLAUDE_SESSIONS_DIR"/*.json; do
+                [[ -f "$f" && ! -L "$f" ]] || continue
+                sp="$(jq -r '.messagingSocketPath // ""' "$f" 2>/dev/null)" || continue
+                [[ "$sp" == "$path" ]] || continue
+                nhits=$((nhits + 1)); hits="$f"
+            done
+            if [[ "$nhits" -eq 0 ]]; then
+                verdict="unknown"; reasons+="no session file names this socket"$'\n'
+            elif [[ "$nhits" -gt 1 ]]; then
+                verdict="unknown"; reasons+="ambiguous: $nhits session files name this socket"$'\n'
+            else
+                local fpid="${hits##*/}"; fpid="${fpid%.json}"
+                if [[ -n "$pid" && "$fpid" != "$pid" ]]; then
+                    reasons+="socket belongs to pid $fpid, not $pid"$'\n'
+                fi
+                pid="$fpid"
+                local sname="${path##*/}"
+                if [[ "$sname" =~ ^([0-9]+)\.sock$ ]]; then
+                    [[ "${BASH_REMATCH[1]}" == "$pid" ]] || reasons+="socket name pid ${BASH_REMATCH[1]} is not session pid $pid"$'\n'
+                else
+                    notes+="socket name carries no pid"$'\n'
+                fi
+            fi
+        fi
+    fi
+
+    local rec_ok=false
+    if [[ -z "$verdict" ]]; then
+        if $no_tmux; then _peer_record_for_pid "$pid" --no-tmux && rec_ok=true
+        else _peer_record_for_pid "$pid" && rec_ok=true; fi
+        reasons+="$PEER_REC_REASONS"; notes+="$PEER_REC_NOTES"
+        if ! $rec_ok; then
+            verdict="unknown"
+        elif [[ "$PEER_REC_ALIVE" != "true" ]]; then
+            verdict="dead"; reasons+="pid $pid is not running"$'\n'
+        elif [[ "$PEER_REC_PROC_START_MATCH" == "false" ]]; then
+            verdict="dead"; reasons+="procStart differs: pid $pid was reused"$'\n'
+        fi
+    else
+        _peer_record_for_pid "" >/dev/null 2>&1 || true   # reset PEER_REC_* for the output
+    fi
+
+    # Claims, only when given.
+    local name_match=null name_has_tmux=null mode_consistent=null claimed_mode=""
+    if $have_name && $rec_ok; then
+        if [[ "$claim_name" == "$PEER_REC_NAME" ]]; then name_match=true; else name_match=false; reasons+="claimed name differs from the session file name"$'\n'; fi
+        if [[ -n "$PEER_REC_TMUX_SESSION" && "$claim_name" == *"($PEER_REC_TMUX_SESSION)"* ]]; then
+            name_has_tmux=true
+        else
+            name_has_tmux=false; reasons+="claimed name does not carry the pane's tmux id"$'\n'
+        fi
+    fi
+    if $have_mode && $rec_ok; then
+        case "$claim_mode" in
+            bypass|bypassPermissions) claimed_mode="bypassPermissions" ;;
+            *) claimed_mode="$claim_mode" ;;
+        esac
+        if [[ "$PEER_REC_ARGV_MODE" == "unknown" ]]; then
+            notes+="mode claim not checkable: argv has no definite permission mode"$'\n'
+        elif [[ "$claimed_mode" == "$PEER_REC_ARGV_MODE" ]]; then
+            mode_consistent=true
+        else
+            mode_consistent=false; reasons+="claimed mode $claim_mode, argv $PEER_REC_ARGV_MODE"$'\n'
+        fi
+    fi
+    if [[ -z "$verdict" ]]; then
+        if [[ -n "$reasons" ]]; then verdict="inconsistent"; else verdict="consistent"; fi
+    fi
+
+    local reasons_json notes_json out
+    reasons_json="$(printf '%s' "$reasons" | jq -Rsc 'split("\n") | map(select(. != ""))')"
+    notes_json="$(printf '%s' "$notes" | jq -Rsc 'split("\n") | map(select(. != ""))')"
+    out="$(jq -n \
+        --arg address "$address" --arg verdict "$verdict" --argjson reasons "$reasons_json" --argjson notes "$notes_json" \
+        --arg path "$path" --argjson s_exists "$s_exists" --argjson s_sock "$s_is_socket" --argjson s_link "$s_symlink" \
+        --argjson s_owner "$s_owner" --argjson s_dir "$s_dir_private" \
+        --arg pid "$pid" --argjson alive "$PEER_REC_ALIVE" --argjson psm "$PEER_REC_PROC_START_MATCH" --arg argv_mode "$PEER_REC_ARGV_MODE" \
+        --arg cfile "${PEER_REC_FILE##*/}" --arg sid "$PEER_REC_SESSION_ID" --arg cname "$PEER_REC_NAME" --arg nsrc "$PEER_REC_NAME_SOURCE" \
+        --arg entry "$PEER_REC_ENTRYPOINT" --arg ckind "$PEER_REC_CLAUDE_KIND" --arg tclaim "$PEER_REC_TMUX_CLAIM" --argjson bridge "$PEER_REC_BRIDGE" \
+        --argjson tchecked "$PEER_REC_TMUX_CHECKED" --arg tsess "$PEER_REC_TMUX_SESSION" --arg tpane "$PEER_REC_TMUX_PANE" \
+        --arg tpid "$PEER_REC_TMUX_PANE_PID" --argjson tbound "$PEER_REC_TMUX_BOUND" \
+        --arg pname "$PEER_REC_PEER_NAME" --argjson paliases "$PEER_REC_PEER_ALIASES" --arg role "$PEER_REC_ROLE" \
+        --arg okind "$PEER_REC_ORCH_KIND" --arg host "$PEER_REC_HOST" --argjson bell "$PEER_REC_DOORBELL" \
+        --argjson have_name "$have_name" --arg cn "$claim_name" --argjson nm "$name_match" --argjson nt "$name_has_tmux" \
+        --argjson have_mode "$have_mode" --arg cm "$claim_mode" --argjson mc "$mode_consistent" '
+        def nz: if . == "" then null else . end;
+        def num: if . == "" then null else tonumber end;
+        {ok: true, address: $address, verdict: $verdict, authenticated: false, reasons: $reasons, notes: $notes,
+         socket: {path: ($path | nz), exists: $s_exists, is_socket: $s_sock, symlink: $s_link, owner_is_me: $s_owner, dir_private: $s_dir},
+         process: {pid: ($pid | num), alive: $alive, proc_start_match: $psm, argv_mode: $argv_mode},
+         claude_session: (if $cfile == "" then null else
+           {file: $cfile, session_id: ($sid | nz), name: ($cname | nz), name_source: ($nsrc | nz), entrypoint: ($entry | nz),
+            kind: ($ckind | nz), tmux_claim: ($tclaim | nz), bridge_connected: $bridge} end),
+         tmux: {checked: $tchecked, session: ($tsess | nz), pane: ($tpane | nz), pane_pid: ($tpid | num), bound: $tbound},
+         peer: (if $pname == "" then null else
+           {name: $pname, aliases: $paliases, role: ($role | nz), kind: ($okind | nz), host: ($host | nz), doorbell_enabled: $bell} end),
+         claims: {name: (if $have_name then {given: $cn, matches: $nm, tmux_id_in_name: $nt} else null end),
+                  mode: (if $have_mode then {given: $cm, consistent: $mc} else null end)}}')" || return 3
+
+    if $json; then
+        printf '%s\n' "$out"
+    else
+        jq -r '
+            def v: if . == null then "-" else tostring end;
+            "ADDRESS   \(.address)",
+            "VERDICT   \(.verdict)          (consistency check, not authentication)",
+            "PROCESS   " + (if .process.pid == null then "-" else
+                "pid \(.process.pid) \(if .process.alive then "live" else "not running" end), procStart \(
+                  if .process.proc_start_match == true then "matches session file" elif .process.proc_start_match == false then "DIFFERS" else "unchecked" end
+                ), argv mode \(.process.argv_mode)" end),
+            "SESSION   " + (if .tmux.session == null then "-" else
+                "\(.tmux.session) pane \(.tmux.pane | v) (pane pid \(.tmux.pane_pid | v)) \(
+                  if .tmux.bound == true then "bound" elif .tmux.bound == false then "NOT bound" else "binding unchecked" end)" end),
+            "PEER      " + (if .peer == null then "-" else
+                "\(.peer.name) role \(.peer.role | v) kind \(.peer.kind | v) host \(.peer.host | v) doorbell \(if .peer.doorbell_enabled then "on" else "off" end)" end),
+            "NAME      " + (if .claims.name == null then "not claimed" else
+                "claimed \(if .claims.name.matches then "matches" else "DIFFERS from" end) session file name; tmux id in name \(
+                  if .claims.name.tmux_id_in_name then "matches pane session" else "MISSING or wrong" end)" end),
+            "MODE      " + (if .claims.mode == null then "not claimed (argv \(.process.argv_mode))" else
+                "claimed \(.claims.mode.given), argv \(.process.argv_mode): \(
+                  if .claims.mode.consistent == true then "consistent" elif .claims.mode.consistent == false then "INCONSISTENT" else "not checkable" end)" end),
+            "REASONS   " + (if (.reasons | length) == 0 then "-" else (.reasons | join("; ")) end),
+            "NOTES     " + (if (.notes | length) == 0 then "-" else (.notes | join("; ")) end)' <<< "$out"
+    fi
+    [[ "$verdict" == "consistent" ]] && return 0
+    return 3
+}
+
 # Agent-facing operating contract (plan 011). Tells an agent WHEN to direct-chat a
 # live tmux peer (`peer say`), when to queue durable async work (`peer send`), and
 # how to drain the mailbox (`peer recv` / `peer ack`). A bare call prints GENERIC
@@ -11113,6 +11479,7 @@ cmd_peer() {
         alias) _peer_cmd_alias "$@" ;;
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
+        whois) _peer_cmd_whois "$@" ;;
         help-agent) _peer_cmd_help_agent "$@" ;;
         overview) _peer_cmd_overview "$@" ;;
         send) _peer_cmd_send "$@" ;;
@@ -11143,6 +11510,8 @@ cmd_peer() {
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer whoami [--as NAME] [--json]"
+            echo "  cctrl peer whois <uds:/path.sock|pid:N> [--name NAME] [--mode MODE] [--no-tmux] [--json]"
+            echo "                                     Read-only consistency check of a native sender (never proof of identity)"
             echo "  cctrl peer help-agent [--as NAME] [--json]"
             echo "                                     Agent contract: peer say (live) vs peer send (async); not auto-injected"
             echo "  cctrl peer overview [--as NAME] [--json]"

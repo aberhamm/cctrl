@@ -11003,6 +11003,298 @@ while time.time() < end:
     echo "ok: plan 114 socket gate keeps busy/dialog/draft deferred and pastes to an idle bypass recipient"
 }
 
+# Plan 114 (a) fixture: a real child process (argv set with exec -a), a real
+# AF_UNIX listener bound under a private mktemp dir that counts accepts, and
+# the child's Claude session file in a scratch sessions dir. Never
+# ~/.claude or /tmp/cc-socks. Sets WH_PID WH_SOCK WH_DIR WH_SDIR WH_ACCEPTS WH_LPID.
+_whois_fixture() { # sessions-dir argv0 [tmux-claim] [name]
+    WH_SDIR="$1"
+    local argv0="$2" claim="${3:-}" name="${4:-fixture worker (TMUX--wh-a)}" i lstart
+    mkdir -p "$WH_SDIR"
+    WH_DIR="$(mktemp -d /tmp/cctrl-sock.XXXXXX)" || fail "mktemp failed"
+    (exec -a "$argv0" sleep 300) &
+    WH_PID=$!
+    WH_SOCK="$WH_DIR/$WH_PID.sock"; WH_ACCEPTS="$WH_DIR/accepts"; : > "$WH_ACCEPTS"
+    python3 -I -c '
+import socket, sys, time
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sys.argv[1]); srv.listen(8); srv.settimeout(0.3)
+end = time.time() + 120
+while time.time() < end:
+    try: conn, _ = srv.accept()
+    except socket.timeout: continue
+    with open(sys.argv[2], "ab") as f: f.write(b"accept\n")
+    conn.close()
+' "$WH_SOCK" "$WH_ACCEPTS" &
+    WH_LPID=$!
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do [[ -S "$WH_SOCK" ]] && break; sleep 0.2; done
+    [[ -S "$WH_SOCK" ]] || { _whois_cleanup; fail "whois listener did not start"; }
+    lstart="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$WH_PID")"
+    jq -n --arg pid "$WH_PID" --arg ps "$lstart" --arg sock "$WH_SOCK" --arg tmux "$claim" --arg name "$name" \
+        '{pid:($pid|tonumber), sessionId:"wh-sid", name:$name, nameSource:"user", entrypoint:"cli",
+          kind:"interactive", procStart:$ps, messagingSocketPath:$sock, status:"idle",
+          bridgeSessionId:"BRIDGE-CANARY-1"} + (if $tmux != "" then {tmux:$tmux} else {} end)' > "$WH_SDIR/$WH_PID.json"
+}
+_whois_cleanup() {
+    kill "${WH_PID:-}" "${WH_LPID:-}" 2>/dev/null || true
+    wait "${WH_PID:-}" "${WH_LPID:-}" 2>/dev/null || true
+    [[ -n "${WH_DIR:-}" ]] && rm -rf -- "$WH_DIR"
+    return 0
+}
+_whois() { # args... -> WH_OUT, WH_RC (sessions dir from WH_SDIR)
+    WH_RC=0
+    WH_OUT="$(CCTRL_CLAUDE_SESSIONS_DIR="$WH_SDIR" "$ROOT/cctrl" peer whois "$@" 2>&1)" || WH_RC=$?
+}
+
+test_peer_whois_usage() {
+    # Plan 114 (a): usage errors exit 64; a non-local address is not-local (3).
+    WH_SDIR="$TMPDIR/whois-usage-sessions"; mkdir -p "$WH_SDIR"
+    local a
+    _whois; [[ "$WH_RC" -eq 64 ]] || fail "no address must exit 64, got $WH_RC"
+    for a in "relative/x.sock" "uds:relative.sock" "pid:abc" "/tmp/../etc/x.sock" "uds:/tmp/a/./b.sock" "--bogus"; do
+        _whois "$a"; [[ "$WH_RC" -eq 64 ]] || fail "'$a' must exit 64, got $WH_RC: $WH_OUT"
+    done
+    _whois /tmp/a.sock /tmp/b.sock; [[ "$WH_RC" -eq 64 ]] || fail "two addresses must exit 64"
+    _whois bridge:x --json
+    [[ "$WH_RC" -eq 3 ]] || fail "bridge:x must exit 3, got $WH_RC"
+    jq -e '.verdict == "not-local" and .authenticated == false and (.notes | index("check via the mailbox; native cannot be verified cross-host")) != null' <<< "$WH_OUT" >/dev/null \
+        || fail "bridge:x must be not-local with the mailbox hint: $WH_OUT"
+    _whois --help; [[ "$WH_RC" -eq 0 ]] || fail "--help must exit 0"
+    assert_contains "$WH_OUT" "never proof of identity"
+    echo "ok: plan 114 peer whois usage and not-local verdicts"
+}
+
+test_peer_whois_consistent_no_tmux() {
+    # Plan 114 (a): every check agrees -> consistent, exit 0, and the socket
+    # was never connected to. Also on /bin/bash (3.2 on macOS).
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _whois_fixture "$TMPDIR/whois-ok-sessions" "claude --permission-mode bypassPermissions" "TMUX--wh-a:@1.%7"
+    _whois "uds:$WH_SOCK" --no-tmux --json --name "fixture worker (TMUX--wh-a)" --mode bypass
+    local out="$WH_OUT" rc="$WH_RC" out_pid out32="" rc32=0
+    _whois "pid:$WH_PID" --no-tmux
+    out_pid="$WH_OUT"
+    if [[ -x /bin/bash ]]; then
+        out32="$(CCTRL_CLAUDE_SESSIONS_DIR="$WH_SDIR" /bin/bash "$ROOT/cctrl" peer whois "$WH_SOCK" --no-tmux --json 2>&1)" || rc32=$?
+    fi
+    sleep 0.5
+    local accepts; accepts="$(wc -l < "$WH_ACCEPTS" | tr -d ' ')"
+    _whois_cleanup
+    [[ "$rc" -eq 0 ]] || fail "consistent fixture must exit 0, got $rc: $out"
+    jq -e '.verdict == "consistent" and .authenticated == false and .reasons == []
+        and .socket.exists and .socket.is_socket and (.socket.symlink | not) and .socket.owner_is_me and .socket.dir_private
+        and .process.alive and .process.proc_start_match == true and .process.argv_mode == "bypassPermissions"
+        and .claude_session.session_id == "wh-sid" and .claude_session.bridge_connected == true
+        and .tmux.checked == false and .tmux.session == "TMUX--wh-a" and .tmux.pane == "%7"
+        and .claims.name.matches == true and .claims.name.tmux_id_in_name == true and .claims.mode.consistent == true
+        and .peer.name == "TMUX--wh-a" and .peer.doorbell_enabled == false' <<< "$out" >/dev/null \
+        || fail "consistent whois JSON wrong: $out"
+    assert_not_contains "$out" "BRIDGE-CANARY-1"
+    assert_contains "$out_pid" "VERDICT   consistent"
+    assert_contains "$out_pid" "not authentication"
+    assert_not_contains "$out_pid" "BRIDGE-CANARY-1"
+    if [[ -x /bin/bash ]]; then
+        [[ "$rc32" -eq 0 ]] || fail "/bin/bash whois must exit 0, got $rc32: $out32"
+        jq -e '.verdict == "consistent"' <<< "$out32" >/dev/null || fail "/bin/bash whois differs: $out32"
+    fi
+    [[ "$accepts" -eq 0 ]] || fail "whois connected to the socket ($accepts accepts)"
+    echo "ok: plan 114 peer whois is consistent for a matching fixture and never opens the socket"
+}
+
+test_peer_whois_dead_and_reused() {
+    # Plan 114 (a): a gone pid is dead; a procStart off by one second (pid
+    # reuse) is dead too.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _whois_fixture "$TMPDIR/whois-dead-sessions" "claude --permission-mode bypassPermissions" "TMUX--wh-a:@1.%7"
+    local f="$WH_SDIR/$WH_PID.json" want shifted
+    want="$(jq -r .procStart "$f")"
+    shifted="$(python3 -I -c 'import sys,datetime; d=datetime.datetime.strptime(" ".join(sys.argv[1].split()), "%a %b %d %H:%M:%S %Y")+datetime.timedelta(seconds=1); print(d.strftime("%a %b ") + str(d.day).rjust(2) + d.strftime(" %H:%M:%S %Y"))' "$want")"
+    jq --arg p "$shifted" '.procStart = $p' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    _whois "uds:$WH_SOCK" --no-tmux --json
+    local reused="$WH_OUT" reused_rc="$WH_RC"
+    kill "$WH_PID" 2>/dev/null; wait "$WH_PID" 2>/dev/null || true
+    _whois "uds:$WH_SOCK" --no-tmux --json
+    local dead="$WH_OUT" dead_rc="$WH_RC"
+    _whois_cleanup
+    [[ "$reused_rc" -eq 3 ]] || fail "pid reuse must exit 3"
+    jq -e '.verdict == "dead" and .process.proc_start_match == false' <<< "$reused" >/dev/null || fail "procStart off by 1s must be dead: $reused"
+    [[ "$dead_rc" -eq 3 ]] || fail "dead pid must exit 3"
+    jq -e '.verdict == "dead" and .process.alive == false' <<< "$dead" >/dev/null || fail "killed pid must be dead: $dead"
+    echo "ok: plan 114 peer whois reports dead pids and pid reuse"
+}
+
+test_peer_whois_unknown_ambiguous() {
+    # Plan 114 (a): no session file names the socket -> unknown; two do ->
+    # unknown, ambiguous. *.key files are never read.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _whois_fixture "$TMPDIR/whois-unk-sessions" "claude --permission-mode default" "TMUX--wh-a:@1.%7"
+    jq '.pid = 1' "$WH_SDIR/$WH_PID.json" > "$WH_SDIR/1.json"
+    _whois "uds:$WH_SOCK" --no-tmux --json
+    local amb="$WH_OUT" amb_rc="$WH_RC"
+    rm -f "$WH_SDIR/1.json" "$WH_SDIR/$WH_PID.json"
+    printf 'not json' > "$WH_SDIR/$WH_PID.key"; chmod 000 "$WH_SDIR/$WH_PID.key"
+    _whois "uds:$WH_SOCK" --no-tmux --json
+    local none="$WH_OUT" none_rc="$WH_RC"
+    _whois "pid:$WH_PID" --no-tmux --json
+    local bypid="$WH_OUT"
+    chmod 600 "$WH_SDIR/$WH_PID.key"
+    _whois_cleanup
+    [[ "$amb_rc" -eq 3 ]] || fail "ambiguous must exit 3"
+    jq -e '.verdict == "unknown" and any(.reasons[]; test("ambiguous"))' <<< "$amb" >/dev/null || fail "two files must be unknown/ambiguous: $amb"
+    [[ "$none_rc" -eq 3 ]] || fail "unknown must exit 3"
+    jq -e '.verdict == "unknown" and any(.reasons[]; test("no session file names this socket"))' <<< "$none" >/dev/null || fail "no file must be unknown: $none"
+    jq -e '.verdict == "unknown"' <<< "$bypid" >/dev/null || fail "pid with no session file must be unknown: $bypid"
+    echo "ok: plan 114 peer whois is unknown for no or several session files"
+}
+
+test_peer_whois_socket_shape() {
+    # Plan 114 (a): a symlink to the socket, a regular file, and a socket in
+    # a group/other-writable dir are each inconsistent with a reason.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _whois_fixture "$TMPDIR/whois-shape-sessions" "claude --permission-mode default" "TMUX--wh-a:@1.%7"
+    local f="$WH_SDIR/$WH_PID.json" link="$WH_DIR/link.sock" reg="$WH_DIR/$WH_PID.reg" o1 o2 o3
+    ln -s "$WH_SOCK" "$link"
+    jq --arg s "$link" '.messagingSocketPath = $s' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    _whois "uds:$link" --no-tmux --json; o1="$WH_OUT"
+    : > "$reg"
+    jq --arg s "$reg" '.messagingSocketPath = $s' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    _whois "uds:$reg" --no-tmux --json; o2="$WH_OUT"
+    jq --arg s "$WH_SOCK" '.messagingSocketPath = $s' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+    chmod 0777 "$WH_DIR"
+    _whois "uds:$WH_SOCK" --no-tmux --json; o3="$WH_OUT"
+    chmod 0700 "$WH_DIR"
+    sleep 0.3
+    local accepts; accepts="$(wc -l < "$WH_ACCEPTS" | tr -d ' ')"
+    _whois_cleanup
+    jq -e '.verdict == "inconsistent" and .socket.symlink == true and any(.reasons[]; test("symlink"))' <<< "$o1" >/dev/null || fail "symlink: $o1"
+    jq -e '.verdict == "inconsistent" and .socket.is_socket == false and any(.reasons[]; test("not a socket"))' <<< "$o2" >/dev/null || fail "regular file: $o2"
+    jq -e '.verdict == "inconsistent" and .socket.dir_private == false and any(.reasons[]; test("not private"))' <<< "$o3" >/dev/null || fail "0777 dir: $o3"
+    [[ "$accepts" -eq 0 ]] || fail "whois followed a link into the socket ($accepts accepts)"
+    echo "ok: plan 114 peer whois rejects symlinked, non-socket and shared-dir sockets"
+}
+
+test_peer_whois_claims() {
+    # Plan 114 (a): claims are checked against the real ps argv. A bypass
+    # claim against a default argv, or a wrong name, is inconsistent; an argv
+    # with no flag cannot check the mode (consistent: null), which is never
+    # a pass.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _whois_fixture "$TMPDIR/whois-claims-sessions" "claude --permission-mode default" "TMUX--wh-a:@1.%7"
+    _whois "uds:$WH_SOCK" --no-tmux --json --mode bypass; local m1="$WH_OUT" m1rc="$WH_RC"
+    _whois "uds:$WH_SOCK" --no-tmux --json --name "someone else (TMUX--wh-a)"; local n1="$WH_OUT"
+    _whois "uds:$WH_SOCK" --no-tmux --json --name "fixture worker"; local n2="$WH_OUT"
+    _whois "uds:$WH_SOCK" --no-tmux --mode bypass; local txt="$WH_OUT"
+    _whois_cleanup
+    _whois_fixture "$TMPDIR/whois-claims2-sessions" "claude" "TMUX--wh-a:@1.%7"
+    _whois "uds:$WH_SOCK" --no-tmux --json --mode bypass; local m2="$WH_OUT"
+    _whois_cleanup
+    [[ "$m1rc" -eq 3 ]] || fail "bypass claim vs default argv must exit 3"
+    jq -e '.verdict == "inconsistent" and .claims.mode.consistent == false and .process.argv_mode == "default"' <<< "$m1" >/dev/null || fail "mode mismatch: $m1"
+    jq -e '.verdict == "inconsistent" and .claims.name.matches == false' <<< "$n1" >/dev/null || fail "name mismatch: $n1"
+    jq -e '.verdict == "inconsistent" and .claims.name.tmux_id_in_name == false' <<< "$n2" >/dev/null || fail "name without tmux id: $n2"
+    assert_contains "$txt" "INCONSISTENT"
+    jq -e '.claims.mode.consistent == null and .process.argv_mode == "unknown" and any(.notes[]; test("not checkable"))' <<< "$m2" >/dev/null || fail "no-flag argv must give consistent:null: $m2"
+    echo "ok: plan 114 peer whois checks name and mode claims against the session file and argv"
+}
+
+test_peer_whois_pane_binding_real_tmux() {
+    # Plan 114 (a), REAL tmux on the suite's private shim: the session file's
+    # pane claim must name the pane whose process is (an ancestor of) the pid.
+    # A counting wrapper in front of the shim proves exactly one list-panes
+    # per whois, and none with --no-tmux.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] || { echo "skip: no tmux"; return 0; }
+    local s="TMUX--wh-bind-$$" bin="$TMPDIR/whois-tmux-count" calls="$TMPDIR/whois-tmux-calls" pane pane_pid sp n i
+    mkdir -p "$bin"
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "%s"\nexec "%s" "$@"\n' "$calls" "$CCTRL_TEST_TMUX_SHIM" > "$bin/tmux"
+    chmod +x "$bin/tmux"
+    tmux new-session -d -s "$s" -x 80 -y 20 "bash -c '(exec -a \"claude --permission-mode bypassPermissions\" sleep 300) & wait'" || fail "tmux new-session failed"
+    _wh_bind_cleanup() { tmux kill-session -t "=$s" 2>/dev/null || true; _whois_cleanup; }
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+        IFS=' ' read -r pane pane_pid < <(tmux list-panes -t "=$s:" -F '#{pane_id} #{pane_pid}' | head -1)
+        sp="$(ps -A -o pid=,ppid= | awk -v p="$pane_pid" '$2 == p { print $1 }' | head -1)"
+        [[ -n "$sp" ]] && break; sleep 0.2
+    done
+    [[ -n "$sp" ]] || { tmux kill-session -t "=$s" 2>/dev/null || true; fail "no pane child"; }
+    # Bind the fixture's socket/session file to the pane's real child.
+    _whois_fixture "$TMPDIR/whois-bind-sessions" "claude --permission-mode default" "$s:@1.$pane" "x ($s)"
+    local f="$WH_SDIR/$WH_PID.json" lstart
+    lstart="$(LC_ALL=C TZ=UTC ps -o lstart= -p "$sp")"
+    jq --argjson p "$sp" --arg ps "$lstart" '.pid = $p | .procStart = $ps' "$f" > "$WH_SDIR/$sp.json"
+    rm -f "$f"
+    local -a e=(PATH="$bin:$PATH" CCTRL_CLAUDE_SESSIONS_DIR="$WH_SDIR")
+    # The socket name carries the fixture pid, not the pane child's: use a
+    # pid-free name so only the session file binds it.
+    mv "$WH_SOCK" "$WH_DIR/s"; WH_SOCK="$WH_DIR/s"
+    jq --arg s "$WH_SOCK" '.messagingSocketPath = $s' "$WH_SDIR/$sp.json" > "$WH_SDIR/x.tmp" && mv "$WH_SDIR/x.tmp" "$WH_SDIR/$sp.json"
+    local ok wrong_pane nondesc rc_ok=0 nt
+    : > "$calls"
+    ok="$(env "${e[@]}" "$ROOT/cctrl" peer whois "uds:$WH_SOCK" --json)" || rc_ok=$?
+    local calls_ok; calls_ok="$(grep -c '^list-panes' "$calls" || true)"
+    : > "$calls"
+    nt="$(env "${e[@]}" "$ROOT/cctrl" peer whois "uds:$WH_SOCK" --no-tmux --json)" || true
+    local calls_nt; calls_nt="$(grep -c . "$calls" || true)"
+    jq '.tmux = ($s + ":@1.%999999")' --arg s "$s" "$WH_SDIR/$sp.json" > "$WH_SDIR/x.tmp" && mv "$WH_SDIR/x.tmp" "$WH_SDIR/$sp.json"
+    wrong_pane="$(env "${e[@]}" "$ROOT/cctrl" peer whois "uds:$WH_SOCK" --json)" || true
+    # A pid that is not the pane's process or its descendant: the fixture's
+    # own sleep, which runs outside the pane.
+    jq --argjson p "$WH_PID" --arg t "$s:@1.$pane" --arg ps "$(LC_ALL=C TZ=UTC ps -o lstart= -p "$WH_PID")" \
+        '.pid = $p | .tmux = $t | .procStart = $ps' "$WH_SDIR/$sp.json" > "$WH_SDIR/$WH_PID.json"
+    rm -f "$WH_SDIR/$sp.json"
+    nondesc="$(env "${e[@]}" "$ROOT/cctrl" peer whois "uds:$WH_SOCK" --json)" || true
+    _wh_bind_cleanup
+    [[ "$rc_ok" -eq 0 ]] || fail "bound pane must be consistent (rc $rc_ok): $ok"
+    jq -e --arg s "$s" --arg p "$pane" '.verdict == "consistent" and .tmux.checked and .tmux.bound == true and .tmux.session == $s and .tmux.pane == $p' <<< "$ok" >/dev/null || fail "bound: $ok"
+    [[ "$calls_ok" -eq 1 ]] || fail "whois must run exactly one list-panes, ran $calls_ok: $(cat "$calls")"
+    [[ "$calls_nt" -eq 0 ]] || fail "--no-tmux must run no tmux command, ran $calls_nt"
+    jq -e '.tmux.checked == false and .verdict == "consistent"' <<< "$nt" >/dev/null || fail "--no-tmux: $nt"
+    jq -e '.verdict == "inconsistent" and any(.reasons[]; test("not found"))' <<< "$wrong_pane" >/dev/null || fail "wrong pane: $wrong_pane"
+    jq -e '.verdict == "inconsistent" and .tmux.bound == false and any(.reasons[]; test("descendant"))' <<< "$nondesc" >/dev/null || fail "non-descendant: $nondesc"
+    echo "ok: plan 114 peer whois binds the socket to its pane with one read-only list-panes"
+}
+
+test_peer_whois_static_readonly() {
+    # Plan 114 (a) lint: whois and its resolver never touch a socket, signal,
+    # write, lock the mailbox or read *.key files. The pattern is split so
+    # this test does not match itself.
+    local fn body hits="" pat
+    pat='socat|createConnection|nc -U|socket[.]socket|send-keys|paste-buffer|kil''l|mktemp|>>|_mailbox_lock|[.]key'
+    for fn in _peer_cmd_whois _peer_record_for_pid _peer_pid_descends_from _peer_whois_list_panes _peer_argv_permission_mode; do
+        body="$(sed -n "/^$fn() {/,/^}/p" "$ROOT/cctrl")"
+        [[ -n "$body" ]] || fail "$fn not found"
+        hits+="$(printf '%s\n' "$body" | grep -nE -- "$pat" | sed "s|^|$fn:|" || true)"
+    done
+    [[ -z "$hits" ]] || fail "whois read-only lint:
+$hits"
+    # The only tmux subcommand whois runs is list-panes.
+    hits="$(sed -n '/^_peer_whois_list_panes() {/,/^}/p' "$ROOT/cctrl" | grep -oE 'tmux [a-z-]+' | sort -u | grep -v '^tmux list-panes$' || true)"
+    [[ -z "$hits" ]] || fail "whois runs a tmux command other than list-panes: $hits"
+    echo "ok: plan 114 whois code is read-only by construction"
+}
+
+test_peer_whois_registry() {
+    # Plan 114 (a): the PEER line comes from peers.json entries bound to the
+    # pane's session, its session record (role/kind/host) and the doorbell
+    # rule. Reads only: peers.json, the record and doorbell.json are unchanged.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local data="$TMPDIR/whois-reg-data" meta="$TMPDIR/whois-reg-meta" before after out
+    mkdir -p "$data" "$meta" "$TMPDIR/whois-reg-dir"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register wh-fm --dir "$TMPDIR/whois-reg-dir" --agent claude --session TMUX--wh-a --alias fleet-boss >/dev/null
+    printf '{"role":"orchestrator","orch_kind":"fleet","host":"studio","purpose":"fleet"}\n' > "$meta/TMUX--wh-a.json"
+    enable_delivery_bell "$data" wh-fm
+    _whois_fixture "$TMPDIR/whois-reg-sessions" "claude --permission-mode bypassPermissions" "TMUX--wh-a:@1.%7"
+    before="$(cd "$data" && cksum peers.json doorbell.json; cksum "$meta/TMUX--wh-a.json")"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" CCTRL_CLAUDE_SESSIONS_DIR="$WH_SDIR" "$ROOT/cctrl" peer whois "uds:$WH_SOCK" --no-tmux --json)" || true
+    after="$(cd "$data" && cksum peers.json doorbell.json; cksum "$meta/TMUX--wh-a.json")"
+    local files_after; files_after="$(ls -A "$data" | tr '\n' ' ')"
+    _whois_cleanup
+    jq -e '.verdict == "consistent" and .peer.name == "wh-fm" and (.peer.aliases | index("fleet-boss")) != null
+        and .peer.role == "orchestrator" and .peer.kind == "fleet" and .peer.host == "studio" and .peer.doorbell_enabled == true' <<< "$out" >/dev/null \
+        || fail "whois registry fields wrong: $out"
+    [[ "$before" == "$after" ]] || fail "whois changed a registry file"
+    [[ "$files_after" != *lock* ]] || fail "whois left a lock in the data dir: $files_after"
+    echo "ok: plan 114 peer whois reads the registry, session record and doorbell without writing"
+}
+
 test_doorbell_fast_path_call_budget() {
     _bell_fixture "$TMPDIR/bell-budget"
     _bell_send TMUX--t-a s1 2025-12-01T00:00:00Z

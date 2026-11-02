@@ -398,6 +398,7 @@ _cctrl() {
                     'unregister:Remove a manual peer'
                     'rm:Remove a manual peer'
                     'whoami:Resolve peer identity'
+                    'whois:Check a native sender address against cctrl records (not proof)'
                     'help-agent:Agent contract: peer say (live) vs peer send (async)'
                     'send:Queue a mailbox message'
                     'reply:Reply to a message: send, deliver, and ack the original'
@@ -474,6 +475,13 @@ _cctrl() {
                     whoami|identity)
                         _arguments \
                             '--as[Peer identity]:peer:_cctrl_peers' \
+                            '--json[Machine-readable output]'
+                        ;;
+                    whois)
+                        _arguments \
+                            '--name[Claimed from-name]:name:' \
+                            '--mode[Claimed from-mode]:mode:(bypass default acceptEdits auto plan dontAsk)' \
+                            '--no-tmux[Skip the tmux pane binding check]' \
                             '--json[Machine-readable output]'
                         ;;
                     help-agent)
