@@ -11513,6 +11513,74 @@ PY
     echo "ok: plan 114 hooks install adds the SendMessage log entries idempotently; doctor checks both"
 }
 
+test_hooks_install_default_leaves_codex_untouched() {
+    # mdec-1103: a default `hooks install` writes Claude Code only; Codex
+    # hooks.json is written only on --agent codex|all. Temp HOME, with
+    # CODEX_HOME / CLAUDE_CONFIG_DIR unset, so the default paths are used.
+    local home="$TMPDIR/hooks-scope-home" out rc before after
+    mkdir -p "$home/.claude" "$home/.codex"
+    printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"sentinel codex"}]}]}}\n' > "$home/.codex/hooks.json"
+    chmod 644 "$home/.codex/hooks.json"
+    local real_codex_before real_codex_after
+    real_codex_before="$(shasum -a 256 "$HOME/.codex/hooks.json" 2>/dev/null || echo absent)"
+    _hs_install() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks install "$@"; }
+    _hs_codex_state() { ls -la "$home/.codex" | awk 'NR>1{print $1, $5, $NF}'; shasum -a 256 "$home/.codex/hooks.json" 2>/dev/null || echo absent; }
+
+    # 1. Default: Claude settings get the hooks; ~/.codex is byte-identical.
+    before="$(_hs_codex_state)"
+    out="$(_hs_install 2>&1)" || fail "default install failed: $out"
+    after="$(_hs_codex_state)"
+    [[ "$before" == "$after" ]] || fail "default install changed ~/.codex: before=$before after=$after"
+    assert_contains "$out" "Codex hooks not touched"
+    assert_contains "$out" "--agent codex"
+    python3 -I - "$home/.claude/settings.json" <<'PY' || fail "default install did not write Claude hooks: $(cat "$home/.claude/settings.json")"
+import json, sys
+h = json.load(open(sys.argv[1]))["hooks"]
+cmds = {c["command"] for ev in h.values() for e in ev for c in e.get("hooks", [])}
+for want in ("cctrl hooks run pre-tool-use", "cctrl hooks run stop", "cctrl hooks run notify", "cctrl hooks run native-send-log"):
+    assert want in cmds, want
+PY
+    out="$(_hs_install --agent claude 2>&1)" || fail "--agent claude install failed: $out"
+    [[ "$before" == "$(_hs_codex_state)" ]] || fail "--agent claude changed ~/.codex"
+
+    # 2. Default never creates a Codex hooks file in an empty ~/.codex.
+    rm -f "$home/.codex/hooks.json"
+    _hs_install >/dev/null 2>&1 || fail "default install (empty codex dir) failed"
+    [[ -z "$(ls -A "$home/.codex")" ]] || fail "default install created files in ~/.codex: $(ls -A "$home/.codex")"
+
+    # 3. Bad values and unknown options refuse with 64 and write nothing.
+    rm -f "$home/.claude/settings.json"
+    rc=0; out="$(_hs_install --agent bogus 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--agent bogus: rc $rc, want 64"
+    rc=0; out="$(_hs_install --codex 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "unknown option: rc $rc, want 64"
+    rc=0; out="$(_hs_install --agent 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--agent without value: rc $rc, want 64"
+    [[ ! -e "$home/.claude/settings.json" && -z "$(ls -A "$home/.codex")" ]] || fail "a refused install wrote a file"
+
+    # 4. --agent codex writes Codex only.
+    out="$(_hs_install --agent codex 2>&1)" || fail "--agent codex install failed: $out"
+    [[ -f "$home/.codex/hooks.json" ]] || fail "--agent codex did not write hooks.json"
+    jq -e '[.hooks[][] | .hooks[] | .command] | index("cctrl hooks run codex-observe")' "$home/.codex/hooks.json" >/dev/null \
+        || fail "--agent codex hooks.json lacks codex-observe: $(cat "$home/.codex/hooks.json")"
+    [[ ! -e "$home/.claude/settings.json" ]] || fail "--agent codex wrote Claude settings"
+
+    # 5. --agent all (and --agent=ALL) writes both.
+    rm -f "$home/.codex/hooks.json"
+    out="$(_hs_install --agent=ALL 2>&1)" || fail "--agent=ALL install failed: $out"
+    [[ -f "$home/.codex/hooks.json" && -f "$home/.claude/settings.json" ]] || fail "--agent all did not write both"
+
+    # 6. Help names the flag; doctor hints that Codex is managed separately.
+    assert_contains "$(_hs_install --help)" "--agent claude|codex|all"
+    out="$(env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks doctor 2>&1)" || true
+    assert_contains "$out" "managed separately: cctrl hooks install --agent codex"
+
+    real_codex_after="$(shasum -a 256 "$HOME/.codex/hooks.json" 2>/dev/null || echo absent)"
+    [[ "$real_codex_before" == "$real_codex_after" ]] || fail "test changed the real ~/.codex/hooks.json"
+    unset -f _hs_install _hs_codex_state
+    echo "ok: hooks install leaves Codex hooks untouched by default; --agent codex|all opts in"
+}
+
 test_peer_native_log_reader() {
     # Plan 114 (b): the read-only reader joins pre/post by tool_use_id,
     # filters, and never writes (the log, key and data dir are unchanged).
@@ -19972,7 +20040,7 @@ JSON
 {"hooks":{"PreToolUse":[{"matcher":"Read","hooks":[{"type":"command","command":"other claude pre"}]}],"Stop":[{"_gstack_source":true,"hooks":[{"type":"command","command":"other claude stop"}]}]}}
 JSON
 
-    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install)"
+    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install --agent all)"
     assert_contains "$out" "Exact pre-replace backup:"
     python3 - "$config" <<'PY'
 import json
@@ -20016,7 +20084,7 @@ PY
     [[ "$(stat -f '%Lp' "$backup")" == "600" ]] || fail "Codex hook backup mode is not 0600"
 
     digest_once="$(file_digest "$config")"
-    CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install >/dev/null
+    CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install --agent all >/dev/null
     digest_twice="$(file_digest "$config")"
     [[ "$digest_once" == "$digest_twice" ]] || fail "Codex hook installation is not idempotent"
     [[ "$(find "$codex_root" -maxdepth 1 -type f -name 'hooks.json.cctrl-backup-*' | wc -l | tr -d ' ')" == "1" ]] \
@@ -20025,7 +20093,7 @@ PY
     printf '{invalid' > "$config"
     digest_once="$(file_digest "$config")"
     rc=0
-    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install 2>&1)" || rc=$?
+    out="$(CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install --agent all 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "invalid Codex JSON did not fail closed"
     assert_contains "$out" "left it untouched"
     [[ "$digest_once" == "$(file_digest "$config")" ]] || fail "invalid Codex JSON was modified"
@@ -20036,7 +20104,7 @@ PY
     ln -s "$symlink_target" "$symlink_root/hooks.json"
     digest_once="$(file_digest "$symlink_target")"
     rc=0
-    out="$(CODEX_HOME="$symlink_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install 2>&1)" || rc=$?
+    out="$(CODEX_HOME="$symlink_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install --agent codex 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "symlinked Codex destination was accepted"
     assert_contains "$out" "refusing to read"
     [[ "$digest_once" == "$(file_digest "$symlink_target")" ]] || fail "symlink target was modified"
@@ -20078,8 +20146,8 @@ PY
     # Cooperative lock: two installers converge without duplicate leaves.
     local concurrent_root="$TMPDIR/hooks-061-concurrent" p1 p2
     mkdir -p "$concurrent_root"
-    CODEX_HOME="$concurrent_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install >"$TMPDIR/hooks-061-p1.log" 2>&1 & p1=$!
-    CODEX_HOME="$concurrent_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install >"$TMPDIR/hooks-061-p2.log" 2>&1 & p2=$!
+    CODEX_HOME="$concurrent_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install --agent codex >"$TMPDIR/hooks-061-p1.log" 2>&1 & p1=$!
+    CODEX_HOME="$concurrent_root" CLAUDE_CONFIG_DIR="$TMPDIR/no-claude-hooks" "$ROOT/cctrl" hooks install --agent codex >"$TMPDIR/hooks-061-p2.log" 2>&1 & p2=$!
     wait "$p1" || fail "first concurrent Codex hook install failed"
     wait "$p2" || fail "second concurrent Codex hook install failed"
     python3 - "$concurrent_root/hooks.json" <<'PY'
@@ -20095,7 +20163,7 @@ PY
 
     # Restore a valid isolated config for doctor checks.
     rm -f "$config"
-    CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install >/dev/null
+    CODEX_HOME="$codex_root" CLAUDE_CONFIG_DIR="$claude_root" "$ROOT/cctrl" hooks install --agent all >/dev/null
     local doctor_bin="$TMPDIR/hooks-061-bin" trust_fixture="$TMPDIR/hooks-061-trust.json"
     mkdir -p "$doctor_bin"
     ln -s "$ROOT/cctrl" "$doctor_bin/cctrl"

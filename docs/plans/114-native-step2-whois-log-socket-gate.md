@@ -424,6 +424,12 @@ different subagent verifies each. Ship as three commits on one branch, in the or
   reinstalling the previous release's `hooks install`. They fail open even if left
   behind.
 
+- R6. Install scoping fix (2026-11-03, mdec-1103-cctrl-codex-hooks-restore). The (b)
+  install ran `cctrl hooks install`, which also rewrote `~/.codex/hooks.json` (added
+  codex-observe; Codex then marked its hooks untrusted). `hooks install` now writes
+  Claude Code only by default; Codex hooks are written only with `--agent codex` or
+  `--agent all`. Test: `test_hooks_install_default_leaves_codex_untouched`.
+
 ## Out of scope
 
 Receiver-side native logging; sending native messages from cctrl (cctrl cannot call

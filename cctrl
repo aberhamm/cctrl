@@ -18593,7 +18593,7 @@ cmd_hooks() {
             echo "Usage: cctrl hooks <run|install|doctor>"
             echo ""
             echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify, codex-observe, native-send-log)"
-            echo "  install       Write portable hook configs for Claude Code and Codex"
+            echo "  install       Write portable hook configs (Claude Code; Codex only with --agent codex|all)"
             echo "  doctor        Validate hook configs point to working commands"
             return 0
             ;;
@@ -18676,14 +18676,47 @@ _hooks_run() {
 }
 
 _hooks_install() {
-    if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-        echo "Usage: cctrl hooks install"
-        echo ""
-        echo "  Write portable hook configs for Claude Code and Codex."
-        echo "  Uses 'cctrl hooks run <name>' so hooks survive cctrl moves."
-        echo "  Idempotent — safe to run repeatedly."
-        return 0
-    fi
+    # Scope (mdec-1103): the default writes Claude Code only. Codex hooks
+    # (~/.codex/hooks.json) change their trust state when rewritten, so they
+    # are written only on an explicit --agent codex|all.
+    local install_agent="claude"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: cctrl hooks install [--agent claude|codex|all]"
+                echo ""
+                echo "  Write portable hook configs. Uses 'cctrl hooks run <name>' so hooks"
+                echo "  survive cctrl moves. Idempotent — safe to run repeatedly."
+                echo ""
+                echo "  --agent claude  Claude Code settings.json only (the default)"
+                echo "  --agent codex   Codex hooks.json only"
+                echo "  --agent all     both"
+                echo ""
+                echo "  Codex hooks are never written without --agent codex|all: a rewrite"
+                echo "  makes Codex treat them as modified (untrusted) until reviewed."
+                return 0
+                ;;
+            --agent|--agent=*)
+                local agent_value
+                if [[ "$1" == --agent=* ]]; then
+                    agent_value="${1#--agent=}"; shift
+                else
+                    [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value (claude, codex or all)${RESET}" >&2; return 64; }
+                    agent_value="$2"; shift 2
+                fi
+                if [[ "$(printf '%s' "$agent_value" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
+                    install_agent="all"
+                else
+                    install_agent="$(_normalize_agent "$agent_value")" || return 64
+                fi
+                ;;
+            *)
+                echo -e "${RED}Unknown hooks install option: $1${RESET}" >&2
+                echo -e "${DIM}Usage: cctrl hooks install [--agent claude|codex|all]${RESET}" >&2
+                return 64
+                ;;
+        esac
+    done
 
     local cctrl_bin
     cctrl_bin="$(command -v cctrl 2>/dev/null || true)"
@@ -18699,7 +18732,9 @@ _hooks_install() {
     # --- Claude Code ---
     local claude_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
     local claude_settings="$claude_dir/settings.json"
-    if [[ -d "$claude_dir" ]]; then
+    if [[ "$install_agent" == "codex" ]]; then
+        echo -e "${DIM}Skipping Claude Code — --agent codex${RESET}"
+    elif [[ -d "$claude_dir" ]]; then
         if python3 -c "
 import json, sys, os
 
@@ -18782,7 +18817,9 @@ with open(path, 'w') as f:
     # --- Codex ---
     local codex_dir="${CODEX_HOME:-$HOME/.codex}"
     local codex_hooks="$codex_dir/hooks.json"
-    if [[ -d "$codex_dir" ]]; then
+    if [[ "$install_agent" == "claude" ]]; then
+        echo -e "${DIM}Codex hooks not touched ($codex_hooks) — opt in with: cctrl hooks install --agent codex${RESET}"
+    elif [[ -d "$codex_dir" ]]; then
         local codex_result codex_backup
         if codex_result="$(python3 "$SCRIPT_DIR/hooks/codex-hook-config.py" "$codex_hooks" 2>&1)"; then
             echo -e "${GREEN}✓${RESET} Codex hooks installed → $codex_hooks"
@@ -18978,6 +19015,7 @@ for event in ['PreToolUse', 'PostToolUse']:
     # --- Codex ---
     local codex_hooks="${CODEX_HOME:-$HOME/.codex}/hooks.json"
     echo "Codex ($codex_hooks):"
+    echo -e "  ${DIM}managed separately: cctrl hooks install --agent codex${RESET}"
     if [[ -f "$codex_hooks" ]]; then
         local codex_analysis
         if codex_analysis="$(python3 - "$codex_hooks" <<'PY'

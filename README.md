@@ -1899,8 +1899,13 @@ stale list entry or a test the discovery pattern cannot see.
 
 ## Hooks
 
-`cctrl hooks install` configures both Claude Code and Codex with portable
-`cctrl hooks run ...` commands. For Codex, installation is additive: cctrl
+`cctrl hooks install` configures Claude Code (`~/.claude/settings.json`) with
+portable `cctrl hooks run ...` commands. It leaves Codex hooks
+(`~/.codex/hooks.json`) untouched unless you opt in with
+`cctrl hooks install --agent codex` (Codex only) or `--agent all` (both);
+`--agent claude` is the default. A rewrite makes Codex treat its hooks as
+modified (untrusted) until reviewed, so Codex hooks are managed separately.
+For Codex, installation is additive: cctrl
 removes only its exact owned command leaves and preserves unrelated top-level
 keys, event wrappers, wrapper attributes, and hook leaves. It installs the
 existing `PreToolUse`, `Stop`, and permission-notification commands plus a
