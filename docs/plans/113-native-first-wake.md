@@ -2,12 +2,14 @@
 id: 113
 title: Native-first, per-agent opt-in wake (zero tokens while idle; mailbox stays the source of truth)
 status: skipped
+skipped: 2026-11-03
+skipped-reason: "remaining asyncRewake wake-on-mail experiment moot: plan 114 gated push nudges an idle session in about 1 s; decision mdec-1103-cctrl-113-experiment-dropped"
 blocked-by: []
 priority: 30
 allows-migrations: false
 review-required: eng
 created: 2026-10-30
-approval: pending (write-up under mdec-1030-cctrl-writeup-handoff; no build, install or experiment approved; the next experiment needs Matthew's click). Remaining experiment SKIPPED 2026-11-03 as moot (mdec-1103-cctrl-113-experiment-dropped); see Outcome.
+approval: mdec-1103-cctrl-113-experiment-dropped (2026-11-03: remaining experiment dropped as moot; nothing run or rolled back). Earlier: write-up under mdec-1030-cctrl-writeup-handoff, no build, install or experiment approved
 reviews: []
 related: 108, 110, 111
 ---
@@ -16,9 +18,9 @@ related: 108, 110, 111
 
 The remaining asyncRewake wake-on-mail experiment (mdec-1030-cctrl-110-install-cap-113
 item 5; "Next experiment" below) was SKIPPED on 2026-11-03 as moot. Plan 114's gated
-push (option D, tmux paste through the plan 110 readiness checks) now wakes an idle
-session in about 1 s: STEP2 DELIVER PASS, msg_20261103_000037_989991,
-2026-11-03T00:00:38Z, adapter tmux. Nothing was run or rolled back for this plan; the
+push (option D, tmux paste through the plan 110 readiness checks) now reaches an idle
+session: it was nudged in about 1 s (delivered ~13 s after queueing). STEP2 DELIVER
+PASS, msg_20261103_000037_989991, 2026-11-03T00:00:38Z, adapter tmux. Nothing was run or rolled back for this plan; the
 113 rewake hook is not installed. Option A is not built. The text below is kept as
 the record of the write-up.
 
