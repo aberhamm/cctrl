@@ -18704,6 +18704,7 @@ _hooks_install() {
                     [[ $# -ge 2 ]] || { echo -e "${RED}--agent needs a value (claude, codex or all)${RESET}" >&2; return 64; }
                     agent_value="$2"; shift 2
                 fi
+                [[ -n "$agent_value" ]] || { echo -e "${RED}--agent needs a value (claude, codex or all)${RESET}" >&2; return 64; }
                 if [[ "$(printf '%s' "$agent_value" | tr '[:upper:]' '[:lower:]')" == "all" ]]; then
                     install_agent="all"
                 else
@@ -18916,7 +18917,7 @@ _hooks_doctor() {
         return 0
     fi
 
-    local issues=0
+    local issues=0 claude_issues=0 codex_issues=0 codex_untrusted=0
 
     echo "Hook doctor"
     echo "═══════════"
@@ -18970,7 +18971,7 @@ if stale:
             echo -e "${YELLOW}⚠${RESET}  Stale absolute paths found:"
             echo "$stale"
             echo -e "${DIM}  Fix with: cctrl hooks install${RESET}"
-            issues=1
+            issues=1; claude_issues=1
         fi
 
         local portable
@@ -19003,7 +19004,7 @@ for event in ['PreToolUse', 'PostToolUse']:
                 echo -e "  ${GREEN}✓${RESET} ${line#OK }"
             else
                 echo -e "  ${RED}✗${RESET} ${line#MISSING } — not installed"
-                issues=1
+                issues=1; claude_issues=1
             fi
         done <<< "$portable"
     else
@@ -19078,7 +19079,7 @@ PY
                     OK) echo -e "  ${GREEN}✓${RESET} $detail" ;;
                     MISSING)
                         echo -e "  ${RED}✗${RESET} $detail — not installed"
-                        issues=1
+                        issues=1; codex_issues=1
                         ;;
                     STALE)
                         echo -e "  ${YELLOW}⚠${RESET} unrelated stale absolute path preserved: $detail"
@@ -19090,7 +19091,7 @@ PY
             done <<< "$codex_analysis"
         else
             echo -e "  ${RED}✗${RESET} invalid or unreadable Codex hook configuration"
-            issues=1
+            issues=1; codex_issues=1
         fi
 
         local trust_report
@@ -19103,7 +19104,7 @@ PY
                         ;;
                     untrusted)
                         echo -e "  ${RED}✗${RESET} trust/hash: untrusted — $command"
-                        issues=1
+                        issues=1; codex_untrusted=1
                         ;;
                     *)
                         echo -e "  ${YELLOW}⚠${RESET} trust/hash: unknown — $command"
@@ -19121,7 +19122,22 @@ PY
     if [[ $issues -eq 0 ]]; then
         echo -e "${GREEN}All OK${RESET}"
     else
-        echo -e "${YELLOW}$issues issue(s) found.${RESET} Fix with: ${DIM}cctrl hooks install${RESET}"
+        # mdec-1103: plain install no longer touches Codex, so name the
+        # command for the side that has the issue.
+        local fix_cmd="cctrl hooks install"
+        if [[ $claude_issues -eq 1 && $codex_issues -eq 1 ]]; then
+            fix_cmd="cctrl hooks install --agent all"
+        elif [[ $codex_issues -eq 1 ]]; then
+            fix_cmd="cctrl hooks install --agent codex"
+        fi
+        if [[ $codex_untrusted -eq 1 && $claude_issues -eq 0 && $codex_issues -eq 0 ]]; then
+            echo -e "${YELLOW}$issues issue(s) found.${RESET} Review the Codex hooks in Codex (its trust prompt); install does not change trust."
+        else
+            echo -e "${YELLOW}$issues issue(s) found.${RESET} Fix with: ${DIM}$fix_cmd${RESET}"
+            if [[ $codex_untrusted -eq 1 ]]; then
+                echo -e "${DIM}Then review the Codex hooks in Codex (its trust prompt); install does not change trust.${RESET}"
+            fi
+        fi
     fi
     return $issues
 }

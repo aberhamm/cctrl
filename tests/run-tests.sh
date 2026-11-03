@@ -11556,6 +11556,10 @@ PY
     [[ "$rc" -eq 64 ]] || fail "unknown option: rc $rc, want 64"
     rc=0; out="$(_hs_install --agent 2>&1)" || rc=$?
     [[ "$rc" -eq 64 ]] || fail "--agent without value: rc $rc, want 64"
+    rc=0; out="$(_hs_install --agent= 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--agent= (empty): rc $rc, want 64"
+    rc=0; out="$(_hs_install --agent '' 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--agent '' (empty): rc $rc, want 64"
     [[ ! -e "$home/.claude/settings.json" && -z "$(ls -A "$home/.codex")" ]] || fail "a refused install wrote a file"
 
     # 4. --agent codex writes Codex only.
@@ -11572,13 +11576,96 @@ PY
 
     # 6. Help names the flag; doctor hints that Codex is managed separately.
     assert_contains "$(_hs_install --help)" "--agent claude|codex|all"
-    out="$(env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks doctor 2>&1)" || true
+    printf '{"data":[{"cwd":"/tmp","errors":[],"warnings":[],"hooks":[]}]}' > "$TMPDIR/hooks-scope-trust.json"
+    out="$(CCTRL_CODEX_HOOKS_LIST_JSON="$TMPDIR/hooks-scope-trust.json" env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks doctor 2>&1)" || true
     assert_contains "$out" "managed separately: cctrl hooks install --agent codex"
 
     real_codex_after="$(shasum -a 256 "$HOME/.codex/hooks.json" 2>/dev/null || echo absent)"
     [[ "$real_codex_before" == "$real_codex_after" ]] || fail "test changed the real ~/.codex/hooks.json"
     unset -f _hs_install _hs_codex_state
     echo "ok: hooks install leaves Codex hooks untouched by default; --agent codex|all opts in"
+}
+
+test_hooks_doctor_fix_hint_names_the_side() {
+    # mdec-1103 verify: plain `hooks install` no longer touches Codex, so the
+    # doctor's final hint must name the command for the side with the issue.
+    # Temp HOME; a trust fixture and a GUI PATH keep doctor off real Codex.
+    local home="$TMPDIR/hooks-hint-home" bin="$TMPDIR/hooks-hint-bin" fx="$TMPDIR/hooks-hint-trust.json" out rc
+    mkdir -p "$home/.claude" "$home/.codex" "$bin"
+    ln -sf "$ROOT/cctrl" "$bin/cctrl"
+    _hh() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks "$@"; }
+    _hh_trust() { # $1 = trusted|untrusted: fixture listing every cctrl leaf in Codex hooks.json
+        python3 -I - "$home/.codex/hooks.json" "$fx" "$1" <<'PY'
+import json, os, sys
+path, out, state = sys.argv[1:]
+hooks = []
+if os.path.exists(path):
+    for wrappers in json.load(open(path)).get("hooks", {}).values():
+        for w in wrappers:
+            for leaf in w.get("hooks", []):
+                c = leaf.get("command", "")
+                if c.startswith("cctrl hooks run "):
+                    hooks.append({"command": c, "sourcePath": path, "trustStatus": state})
+json.dump({"data": [{"cwd": "/tmp", "errors": [], "warnings": [], "hooks": hooks}]}, open(out, "w"))
+PY
+    }
+    _hh_doctor() {
+        rc=0
+        out="$(CCTRL_HOOK_GUI_PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_HOOKS_LIST_JSON="$fx" _hh doctor 2>&1)" || rc=$?
+        out="$(printf '%s' "$out" | sed $'s/\033\\[[0-9;]*m//g')"
+        [[ "$out" == *"issue(s) found."* || "$out" == *"All OK"* ]] || fail "doctor gave no summary: $out"
+    }
+    _hh_break_claude() {
+        python3 -I - "$home/.claude/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]; cfg = json.load(open(p))
+cfg["hooks"]["PostToolUse"] = [e for e in cfg["hooks"]["PostToolUse"] if e.get("matcher") != "SendMessage"]
+json.dump(cfg, open(p, "w"))
+PY
+    }
+
+    # Baseline: both sides installed and trusted -> All OK.
+    _hh install --agent all >/dev/null 2>&1 || fail "install --agent all failed"
+    _hh_trust trusted
+    _hh_doctor
+    assert_contains "$out" "All OK"
+
+    # Claude-only issue -> plain install.
+    _hh_break_claude
+    _hh_doctor
+    [[ "$out" == *"Fix with: cctrl hooks install" ]] || fail "Claude-only hint is not plain install: $out"
+
+    # Codex-only issue -> --agent codex; following it clears the issue.
+    _hh install >/dev/null 2>&1 || fail "plain install failed"
+    printf '{"hooks":{}}\n' > "$home/.codex/hooks.json"
+    _hh_trust trusted
+    _hh_doctor
+    [[ "$out" == *"Fix with: cctrl hooks install --agent codex" ]] || fail "Codex-only hint wrong: $out"
+    _hh install >/dev/null 2>&1
+    _hh_doctor
+    [[ "$out" == *"Fix with: cctrl hooks install --agent codex" ]] || fail "plain install must not clear a Codex issue: $out"
+    _hh install --agent codex >/dev/null 2>&1 || fail "install --agent codex failed"
+    _hh_trust trusted
+    _hh_doctor
+    assert_contains "$out" "All OK"
+
+    # Both sides -> --agent all.
+    _hh_break_claude
+    printf '{"hooks":{}}\n' > "$home/.codex/hooks.json"
+    _hh_trust trusted
+    _hh_doctor
+    [[ "$out" == *"Fix with: cctrl hooks install --agent all" ]] || fail "both-sides hint wrong: $out"
+
+    # Untrusted only -> review in Codex, no install command.
+    _hh install --agent all >/dev/null 2>&1 || fail "install --agent all failed"
+    _hh_trust untrusted
+    _hh_doctor
+    [[ "$rc" -ne 0 ]] || fail "untrusted Codex hooks must fail doctor"
+    assert_contains "$out" "Review the Codex hooks in Codex"
+    assert_not_contains "$out" "Fix with:"
+
+    unset -f _hh _hh_trust _hh_doctor _hh_break_claude
+    echo "ok: hooks doctor names the fix command for the side with the issue"
 }
 
 test_peer_native_log_reader() {
