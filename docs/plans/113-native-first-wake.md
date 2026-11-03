@@ -9,7 +9,7 @@ priority: 30
 allows-migrations: false
 review-required: eng
 created: 2026-10-30
-approval: mdec-1103-cctrl-113-experiment-dropped (2026-11-03: remaining experiment dropped as moot; nothing run or rolled back). Earlier: write-up under mdec-1030-cctrl-writeup-handoff, no build, install or experiment approved
+approval: "mdec-1103-cctrl-113-experiment-dropped (2026-11-03, remaining experiment dropped as moot; nothing run or rolled back). Earlier: write-up under mdec-1030-cctrl-writeup-handoff, no build, install or experiment approved"
 reviews: []
 related: 108, 110, 111
 ---

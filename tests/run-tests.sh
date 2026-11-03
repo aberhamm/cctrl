@@ -11590,9 +11590,9 @@ test_hooks_doctor_fix_hint_names_the_side() {
     # mdec-1103 verify: plain `hooks install` no longer touches Codex, so the
     # doctor's final hint must name the command for the side with the issue.
     # Temp HOME; a trust fixture and a GUI PATH keep doctor off real Codex.
-    local home="$TMPDIR/hooks-hint-home" bin="$TMPDIR/hooks-hint-bin" fx="$TMPDIR/hooks-hint-trust.json" out rc
-    mkdir -p "$home/.claude" "$home/.codex" "$bin"
-    ln -sf "$ROOT/cctrl" "$bin/cctrl"
+    local home="$TMPDIR/hooks-hint-home" doctor_bin="$TMPDIR/hooks-hint-bin" fx="$TMPDIR/hooks-hint-trust.json" out rc
+    mkdir -p "$home/.claude" "$home/.codex" "$doctor_bin"
+    ln -sf "$ROOT/cctrl" "$doctor_bin/cctrl"
     _hh() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks "$@"; }
     _hh_trust() { # $1 = trusted|untrusted: fixture listing every cctrl leaf in Codex hooks.json
         python3 -I - "$home/.codex/hooks.json" "$fx" "$1" <<'PY'
@@ -11611,7 +11611,7 @@ PY
     }
     _hh_doctor() {
         rc=0
-        out="$(CCTRL_HOOK_GUI_PATH="$bin:/usr/bin:/bin" CCTRL_CODEX_HOOKS_LIST_JSON="$fx" _hh doctor 2>&1)" || rc=$?
+        out="$(CCTRL_HOOK_GUI_PATH="$doctor_bin:/usr/bin:/bin" CCTRL_CODEX_HOOKS_LIST_JSON="$fx" _hh doctor 2>&1)" || rc=$?
         out="$(printf '%s' "$out" | sed $'s/\033\\[[0-9;]*m//g')"
         [[ "$out" == *"issue(s) found."* || "$out" == *"All OK"* ]] || fail "doctor gave no summary: $out"
     }
