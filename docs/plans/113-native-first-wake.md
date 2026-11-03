@@ -1,16 +1,26 @@
 ---
 id: 113
 title: Native-first, per-agent opt-in wake (zero tokens while idle; mailbox stays the source of truth)
-status: draft
+status: skipped
 blocked-by: []
 priority: 30
 allows-migrations: false
 review-required: eng
 created: 2026-10-30
-approval: pending (write-up under mdec-1030-cctrl-writeup-handoff; no build, install or experiment approved; the next experiment needs Matthew's click)
+approval: pending (write-up under mdec-1030-cctrl-writeup-handoff; no build, install or experiment approved; the next experiment needs Matthew's click). Remaining experiment SKIPPED 2026-11-03 as moot (mdec-1103-cctrl-113-experiment-dropped); see Outcome.
 reviews: []
 related: 108, 110, 111
 ---
+
+## Outcome (2026-11-03, mdec-1103-cctrl-113-experiment-dropped)
+
+The remaining asyncRewake wake-on-mail experiment (mdec-1030-cctrl-110-install-cap-113
+item 5; "Next experiment" below) was SKIPPED on 2026-11-03 as moot. Plan 114's gated
+push (option D, tmux paste through the plan 110 readiness checks) now wakes an idle
+session in about 1 s: STEP2 DELIVER PASS, msg_20261103_000037_989991,
+2026-11-03T00:00:38Z, adapter tmux. Nothing was run or rolled back for this plan; the
+113 rewake hook is not installed. Option A is not built. The text below is kept as
+the record of the write-up.
 
 ## Goal
 
@@ -102,7 +112,7 @@ shows wake-on-mail works and the re-arm story holds.
 - Hourly ring cap (proposal in 108-pilot-summary.md: 4 per rolling hour per recipient)
   applies to wake rings as well.
 
-## Next experiment (needs Matthew's click; do not run without it)
+## Next experiment (SKIPPED 2026-11-03 as moot; see Outcome)
 
 Wake-on-mail inside an armed window. Re-create the 113 hook for one named agent, arm it
 with one prompt, then within the 9-minute window send exactly one test message to that
