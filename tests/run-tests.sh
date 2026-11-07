@@ -15925,16 +15925,48 @@ test_peer_push_shares_ring_cap_with_bell() {
     [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "the pushed s7 must never ring (rc=$BELL_RC err=$BELL_ERR)"
     # A push that lands while a Stop is running (after the bell read the
     # state, before it writes) keeps its ring and rung mark: the bell re-reads.
-    local side="$BELL_DIR/side.sh"
-    printf 'f=%q; jq -c %q "$f" > "$f.tmp" && mv "$f.tmp" "$f"\n' "$st" \
-        '.rings += ["2026-02-01T12:03:40Z"] | .rung["msg_side"] = "2026-02-01T12:03:40Z"' > "$side"
+    # The side push announces s10, a real queued id the bell itself never
+    # rings (older than baseline_at), so only the merge can keep its mark.
+    local side="$BELL_DIR/side.sh" s10
+    _bell_send TMUX--t-a s10 2025-12-01T00:00:00Z
+    s10="$(jq -r 'select(.subject == "s10") | .id' "$BELL_DATA/messages.jsonl")"
+    printf 'f=%q; jq -c --arg i %q %q "$f" > "$f.tmp" && mv "$f.tmp" "$f"\n' "$st" "$s10" \
+        '.rings += ["2026-02-01T12:03:40Z"] | .rung[$i] = "2026-02-01T12:03:40Z"' > "$side"
     _bell_send TMUX--t-a s9 2026-02-01T12:03:30Z
     BELL_PS_SIDE="$side" CCTRL_NOW_UTC=2026-02-01T12:04:00Z _bell_stop
     [[ -e "$side.done" ]] || fail "side write did not run (no slow path?)"
     [[ "$BELL_RC" -eq 2 ]] || fail "s9 must ring (rc=$BELL_RC)"
     jq -e '(.rings | index("2026-02-01T12:03:40Z")) != null and (.rings | length) == 4' "$st" >/dev/null \
         || fail "the bell's write must keep a concurrent push's ring: $(cat "$st")"
+    jq -e --arg i "$s10" '.rung[$i] == "2026-02-01T12:03:40Z"' "$st" >/dev/null \
+        || fail "the bell's write must keep a concurrent push's rung mark: $(cat "$st")"
     echo "ok: direct pushes spend the bell's ring budget, are deferred at the cap, and never double-ring"
+}
+
+test_peer_push_inline_rings_only_its_id() {
+    # An inline push announces one message, so only that id is marked rung;
+    # other queued mail still rings at the next Stop.
+    _bell_fixture "$TMPDIR/push-inline"
+    _bell_enable "$_bell_cfg_default"
+    make_fake_tmux "$TMPDIR/tmux"
+    local st="$BELL_DATA/doorbell/state/TMUX--t-a.json" log="$TMPDIR/push-inline-tmux.log" out idle i1 i2
+    idle="$(printf '%s\n' '● done.' '────────────────────' '❯ ' '────────────────────')"
+    write_claude_session_file "$BELL_DIR/sessions" 12345 idle
+    : > "$log"
+    _bell_send TMUX--t-a i1 2026-02-01T10:00:00Z
+    _bell_send TMUX--t-a i2 2026-02-01T10:00:10Z
+    i1="$(jq -r 'select(.subject == "i1") | .id' "$BELL_DATA/messages.jsonl")"
+    i2="$(jq -r 'select(.subject == "i2") | .id' "$BELL_DATA/messages.jsonl")"
+    out="$(CCTRL_NOW_UTC=2026-02-01T10:00:30Z env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--t-a" \
+        TMUX_FAKE_CAPTURE_PANE="$idle" TMUX_FAKE_SESSION_CREATED=1700000000 "$ROOT/cctrl" peer deliver TMUX--t-a --inline "$i1" --json)" \
+        || fail "inline deliver must exit 0: $out"
+    jq -e '.results[0].status == "inline"' <<< "$out" >/dev/null || fail "inline push: $out"
+    jq -e --arg a "$i1" --arg b "$i2" '.rung[$a] == "2026-02-01T10:00:30Z" and .rung[$b] == null and (.rings | length) == 1' "$st" >/dev/null \
+        || fail "inline push must mark only its own id rung: $(cat "$st")"
+    CCTRL_NOW_UTC=2026-02-01T10:01:00Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "the other queued mail must still ring (rc=$BELL_RC)"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    echo "ok: an inline push marks only its own id rung"
 }
 
 test_peer_push_ring_cap_codex_and_non_bell() {
@@ -15957,6 +15989,14 @@ test_peer_push_ring_cap_codex_and_non_bell() {
     out="$(CCTRL_NOW_UTC=2026-03-01T09:10:30Z "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
     jq -e '.results[0].status == "deferred" and .results[0].reason == "ring-cap"' <<< "$out" >/dev/null || fail "5th codex push must be deferred: $out"
     [[ "$(grep -c 'paste-buffer' "$log")" -eq 4 ]] || fail "expected exactly 4 pastes"
+    # At the cap a dead session still reports its real failure (and exit 1,
+    # as without the cap), not a ring-cap deferral.
+    local rc=0
+    out="$(CCTRL_NOW_UTC=2026-03-01T09:10:40Z "${env[@]}" TMUX_FAKE_HAS_SESSION="" "$ROOT/cctrl" peer deliver comet --json)" || rc=$?
+    [[ $rc -eq 1 ]] || fail "dead session at the cap must keep exit 1, got $rc: $out"
+    jq -e '.results[0].status == "failed" and (.results[0].reason | test("ring-cap") | not)' <<< "$out" >/dev/null \
+        || fail "dead session at the cap must report its real failure: $out"
+    [[ "$(grep -c 'paste-buffer' "$log")" -eq 4 ]] || fail "a dead session must get no paste"
     # Not bell-enabled: the full budget does not matter and nothing is written.
     enable_delivery_bell "$data" someone-else
     before="$(shasum "$st")"
@@ -16107,6 +16147,15 @@ PANE
     # type/message.role/message.content, no mode, class or auth claim.
     head -1 "$frames" | jq -e '(keys == ["message","type"]) and (.message | keys == ["content","role"]) and .type == "user" and .message.role == "user"' >/dev/null \
         || { _rt110_cleanup; fail "socket frame shape changed: $(head -1 "$frames")"; }
+    # Ring cap: the socket push spends one ring and marks rtidle's queued mail
+    # rung, with the real #{session_created} as the occupant.
+    jq -e --slurpfile m "$data/messages.jsonl" '
+        . as $st
+        | ([$m[] | select(.to == "rtidle" and .status == "queued") | .id]) as $q
+        | $st.rings == ["2099-01-01T00:00:00Z"] and ($q | length) > 0
+          and all($q[]; $st.rung[.] == "2099-01-01T00:00:00Z")
+          and ($st.occupant_created | test("^[0-9]+$"))' "$data/doorbell/state/$s_idle.json" >/dev/null \
+        || { _rt110_cleanup; fail "socket push must record its ring and rung marks: $(cat "$data/doorbell/state/$s_idle.json" 2>&1)"; }
 
     # Plan 114 (c): a bypass argv and a missing flag both skip the socket and
     # take the checked tmux paste of the same cctrl nudge line.

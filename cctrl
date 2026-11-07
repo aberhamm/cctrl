@@ -8983,6 +8983,15 @@ _peer_app_deliver_locked() {
     [[ "$status" == deferred ]]
 }
 
+_peer_deliver_ring_capped() { # reason rings max -> the ring-cap deferral result (no paste, no mailbox write)
+    PEER_DELIVER_STATUS="deferred"
+    PEER_DELIVER_REASON="$1"
+    PEER_DELIVER_RING_RINGS="$2"
+    PEER_DELIVER_RING_MAX="$3"
+    _peer_delivery_result_json
+    PEER_DELIVER_RING_RINGS=""; PEER_DELIVER_RING_MAX=""
+}
+
 _peer_deliver_one_locked() {
     local peer_json="$1" messages="$2" dry_run="$3" json="$4" no_submit="$5" force_busy="$6" inline_id="$7"
     local peer agent target queued now nudge buffer submit payload result message_body message_to updated recent
@@ -9121,18 +9130,22 @@ _peer_deliver_one_locked() {
     # queued and the bell (or the next push) takes it once the oldest ring
     # ages out. Before dry-run, so dry-run reports it. Codex app-server peers
     # have no tmux session and no bell state, so they are not counted.
-    local ring_key="" ring_ids="[]"
+    # A recipient that is not reachable by tmux (dead session, no tmux
+    # capability) keeps its real outcome at the cap: the cap defers only a
+    # push that could otherwise happen. Its verdict is held in ring_capped
+    # and applied once the target resolves below.
+    local ring_key="" ring_ids="[]" ring_capped=false ring_cap_reason="" ring_cap_rings="" ring_cap_max=""
     if ! jq -e '(.capabilities // []) | index("app-server") != null' <<< "$peer_json" >/dev/null; then
         ring_key="$PEER_PUSH_TARGET"
     fi
     if [[ -n "$ring_key" ]] && ! _peer_doorbell_push_cap_ok "$ring_key"; then
-        PEER_DELIVER_STATUS="deferred"
-        PEER_DELIVER_REASON="$PEER_PUSH_REASON"
-        PEER_DELIVER_RING_RINGS="$PEER_RING_CAP_RINGS"
-        PEER_DELIVER_RING_MAX="$PEER_RING_CAP_MAX"
-        _peer_delivery_result_json
-        PEER_DELIVER_RING_RINGS=""; PEER_DELIVER_RING_MAX=""
-        return 0
+        ring_capped=true; ring_cap_reason="$PEER_PUSH_REASON"
+        ring_cap_rings="$PEER_RING_CAP_RINGS"; ring_cap_max="$PEER_RING_CAP_MAX"
+        if _peer_tmux_target_for_delivery "$peer_json"; then
+            _peer_deliver_ring_capped "$ring_cap_reason" "$ring_cap_rings" "$ring_cap_max"
+            return 0
+        fi
+        PEER_DELIVER_TARGET=""
     fi
     if [[ -n "$inline_id" ]]; then
         ring_ids="$(jq -cn --arg id "$inline_id" '[$id]')"
@@ -9172,6 +9185,11 @@ _peer_deliver_one_locked() {
         return 1
     fi
     target="$PEER_DELIVER_TARGET"
+    # Capped above while the target did not resolve, and it resolves now.
+    if $ring_capped; then
+        _peer_deliver_ring_capped "$ring_cap_reason" "$ring_cap_rings" "$ring_cap_max"
+        return 0
+    fi
 
     # Plan 110 S4: a Claude pane is pushed to only when it is ready, checked
     # fail-closed once, before the socket AND the tmux fallback. A pane that
@@ -10817,7 +10835,10 @@ _peer_doorbell_eval_inner() {
     # time, so two Stops cannot interleave (no lock, as before). A direct
     # push (`_peer_doorbell_record_push`) writes the same file; the write below
     # re-reads it and keeps the push's ring times and rung ids, so only a push
-    # landing between that re-read and the rename can be lost (one ring).
+    # landing between that re-read and the rename is lost. A push during the
+    # rest of the slow path (after the read above) is kept but not seen by
+    # this ring: the pushed mail can ring once more, and the cap can be
+    # exceeded by one. Each collision costs at most one extra ring, never mail.
     # Checked before the slow path, which it would only repeat.
     local rings_recent=""
     { IFS= read -r rings_recent; IFS= read -r now; } < <(jq -r '.rings, .now' <<< "$pre" 2>/dev/null)
