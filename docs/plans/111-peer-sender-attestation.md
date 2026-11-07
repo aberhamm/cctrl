@@ -372,6 +372,18 @@ phase ships alone.
 | 7 | Optional PreToolUse guard: deny agent Bash that reads the seal key, appends to messages.jsonl, or uses `--impersonate` | 2.0 | 1.5 | 0.5 | 4.0 |
 | | total | | | | ~43 (~5.5 agent-days) |
 
+Phase status:
+
+- Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (not pushed, not
+  installed; warn only). `_peer_caller_attest` stamps `attest` v1 on every
+  sent message; `peer doctor` shows `sender_attest`. Build choices: attest
+  adds `detail` (why a level is not session: no-pane, ps-failed,
+  panes-unreadable, no-record, anchor-mismatch, anchor-missing,
+  started-unreadable, started-mismatch, name-mismatch, name-unbound, user)
+  and `walk_077` (agree | disagree | skipped), and `origin_host` on level
+  remote; the read-time reason strings stay phase 2. Report:
+  orch-cctrl-reports/plan-111-p1-impl.md.
+
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.
 - Two-worker rule: worker A builds 1+2, worker B builds 3+4; 5, 6 and 7 are
