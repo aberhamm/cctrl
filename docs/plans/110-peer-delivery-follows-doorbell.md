@@ -70,11 +70,17 @@ Doctrine is stopgapped in AGENTS.md (send `--no-deliver`); this plan is the code
    | send failed | send-failed | - | 64/66/1 (unchanged) |
    | not bell-enabled | sent-and-queued (`delivery_reason: recipient-not-doorbell-enabled`) | false | 0 |
    | bell-enabled, pane not ready | sent-but-deferred | false | 0 (was 1) |
+   | bell-enabled, at its ring cap (later change) | sent-but-deferred (`delivery_reason: ring-cap`) | false | 0 |
    | bell-enabled, ready, pushed | sent-and-nudged | true | 0 |
    | bell-enabled, push failed | sent-but-undelivered | false | 1 |
    | mailbox-only peer | sent-and-queued | false | 0 |
 
    Deferred for a bell-enabled recipient is rc 0: its Stop bell rings.
+   Later change (ring cap for pushes, mdec-1107 item 4): a push spends the
+   recipient's doorbell `max_rings_per_hour` budget, shared with the Stop
+   bell in the same state file. At the cap it is deferred (`ring-cap`, rc 0,
+   no paste, no mailbox write); a successful push records a ring and marks
+   the announced ids rung, so the next Stop does not ring them again.
    Remote recipients: the remote host's cctrl decides.
 6. FM: no exemption. FM pane nudges (raw tmux, `session say`) are outside the
    gate. Caller identity is self-reported until 111, which extends

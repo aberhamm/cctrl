@@ -1498,8 +1498,13 @@ rm "$CCTRL_DATA_DIR/doorbell.json"                # hard rollback (data/doorbell
   `rings_last_hour` (text: "AT CAP"); `peer doctor` reports it on the
   `doorbell_enabled` row, and fails that row (`ok: false`, text `FAIL:`, with
   a remedy) when an enabled bell has an invalid cap, since the bell is then
-  silently dead. `enable` keeps a value already in the file. The cap
-  limits only the Stop bell, not `--deliver` pushes.
+  silently dead. `enable` keeps a value already in the file. Direct
+  pushes (`send`/`reply --deliver`, `deliver`, `nudge`, `watch`, MCP
+  `send_message`) spend the same budget: a successful push records a ring
+  and marks the mail it announced as rung (the next Stop does not ring it
+  again), and at the cap the push is deferred (`reason: ring-cap`, exit 0,
+  mail stays queued; send/reply: `sent-but-deferred`). An invalid cap
+  defers every push too. Codex app-server peers are not counted.
 - Handover: `peer doorbell move --from OLD --to NEW` replaces the `peers`
   entry OLD with NEW in place and changes nothing else (`enabled`,
   `baseline_at`, `roles`, `mode`, the cap; the file stays mode 600). It

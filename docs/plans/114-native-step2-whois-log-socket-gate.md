@@ -306,7 +306,9 @@ widen pushes to non-doorbell recipients, add an override flag or env switch, or 
   first, branch 114 from that main, append new tests after the ring-cap tests, and
   leave doorbell.json and the doorbell functions alone. The ring cap applies to Stop
   rings only. (c) does not change push frequency (same deliver calls, different
-  transport), so no cap interaction.
+  transport), so no cap interaction. (Later change, after 114: direct pushes,
+  socket or tmux paste alike, now spend the same ring budget; see plan 110
+  Design 5.)
 - Plan 112 (peer CLI polish, `--as` consistency): whois takes no `--as`, so no
   overlap.
 

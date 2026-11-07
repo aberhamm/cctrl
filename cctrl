@@ -8603,16 +8603,20 @@ _peer_claude_push_ready() { # target -> 0 when a push into this Claude pane is s
     #   6. the transcript is readable and its last turn is not an assistant
     #      question (a missing or unreadable transcript is not ready).
     # Sets PEER_DELIVER_READY_REASON on a non-zero return, PEER_PUSH_PID on 0.
-    local target="$1" mode pid st capture plain draft_rc=0 turn tpath
+    # PEER_PUSH_CREATED is the session's #{session_created} (empty when tmux
+    # does not give a number): a push records it with its ring (ring cap).
+    local target="$1" mode pid st capture plain draft_rc=0 turn tpath created
     PEER_DELIVER_READY_REASON=""
     PEER_PUSH_PID=""
+    PEER_PUSH_CREATED=""
     if ! _tmux_run_with_timeout has-session -t "=$target"; then
         PEER_DELIVER_READY_REASON="session not found"; return 1
     fi
-    if ! _tmux_run_with_timeout display-message -p -t "=$target:" '#{pane_in_mode}'; then
+    if ! _tmux_run_with_timeout display-message -p -t "=$target:" '#{pane_in_mode} #{session_created}'; then
         PEER_DELIVER_READY_REASON="pane mode unknown"; return 1
     fi
-    mode="${TMUX_RUN_OUTPUT//[[:space:]]/}"
+    read -r mode created _ <<< "$TMUX_RUN_OUTPUT"
+    [[ "$created" =~ ^[0-9]+$ ]] && PEER_PUSH_CREATED="$created"
     [[ "$mode" == "0" ]] || { PEER_DELIVER_READY_REASON="pane in copy-mode"; return 1; }
     pid="$(_session_claude_pid "$target" 2>/dev/null)" || pid=""
     if [[ ! "$pid" =~ ^[0-9]+$ || ! -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]]; then
@@ -8877,6 +8881,8 @@ _peer_delivery_result_json() {
       --argjson dry_run "${PEER_DELIVER_DRY_RUN:-false}" \
       --argjson inline "${PEER_DELIVER_INLINE:-false}" \
       --arg socket_skipped "${PEER_SOCKET_SKIP_REASON:-}" \
+      --arg ring_rings "${PEER_DELIVER_RING_RINGS:-}" \
+      --arg ring_max "${PEER_DELIVER_RING_MAX:-}" \
       '{
         peer: $peer,
         status: $status,
@@ -8889,7 +8895,8 @@ _peer_delivery_result_json() {
       + (if $target != "" then {target: $target} else {} end)
       + (if $nudge != "" then {nudge: $nudge} else {} end)
       + (if $message_id != "" then {message_id: $message_id} else {} end)
-      + (if $socket_skipped != "" then {socket_skipped_reason: $socket_skipped} else {} end)'
+      + (if $socket_skipped != "" then {socket_skipped_reason: $socket_skipped} else {} end)
+      + (if $ring_max != "" then {ring_cap: {rings_last_hour: ($ring_rings | tonumber), max_rings_per_hour: ($ring_max | tonumber)}} else {} end)'
 }
 
 _peer_print_delivery_human() {
@@ -8903,7 +8910,12 @@ _peer_print_delivery_human() {
         dry-run)
             echo "$(jq -r '.nudge' <<< "$result")"
             ;;
-        deferred) echo -e "${YELLOW}Deferred $peer${RESET}: $reason" ;;
+        deferred)
+            case "$reason" in
+                ring-cap) echo -e "${YELLOW}Deferred $peer${RESET}: doorbell ring cap reached ($(jq -r '"\(.ring_cap.rings_last_hour)/\(.ring_cap.max_rings_per_hour)"' <<< "$result") rings in the last hour); nothing pushed, mail stays queued" ;;
+                ring-cap-invalid) echo -e "${YELLOW}Deferred $peer${RESET}: doorbell.json max_rings_per_hour is invalid, so nothing is pushed (run: cctrl peer doorbell enable --max-rings-per-hour N)" ;;
+                *) echo -e "${YELLOW}Deferred $peer${RESET}: $reason" ;;
+            esac ;;
         queued-only) echo -e "${DIM}Queued only for $peer: $reason (cctrl does not push to it; it collects its own mail)${RESET}" ;;
         skipped) echo -e "${DIM}Skipped $peer: $reason${RESET}" ;;
         no_messages) echo -e "${DIM}No queued messages for $peer.${RESET}" ;;
@@ -9103,6 +9115,31 @@ _peer_deliver_one_locked() {
         return 0
     fi
 
+    # Ring cap: a push spends the recipient's doorbell ring budget (shared
+    # with its Stop bell, per session name). At the cap it is deferred like a
+    # pane that is not ready: no paste, no mailbox write, rc 0; the mail stays
+    # queued and the bell (or the next push) takes it once the oldest ring
+    # ages out. Before dry-run, so dry-run reports it. Codex app-server peers
+    # have no tmux session and no bell state, so they are not counted.
+    local ring_key="" ring_ids="[]"
+    if ! jq -e '(.capabilities // []) | index("app-server") != null' <<< "$peer_json" >/dev/null; then
+        ring_key="$PEER_PUSH_TARGET"
+    fi
+    if [[ -n "$ring_key" ]] && ! _peer_doorbell_push_cap_ok "$ring_key"; then
+        PEER_DELIVER_STATUS="deferred"
+        PEER_DELIVER_REASON="$PEER_PUSH_REASON"
+        PEER_DELIVER_RING_RINGS="$PEER_RING_CAP_RINGS"
+        PEER_DELIVER_RING_MAX="$PEER_RING_CAP_MAX"
+        _peer_delivery_result_json
+        PEER_DELIVER_RING_RINGS=""; PEER_DELIVER_RING_MAX=""
+        return 0
+    fi
+    if [[ -n "$inline_id" ]]; then
+        ring_ids="$(jq -cn --arg id "$inline_id" '[$id]')"
+    else
+        ring_ids="$(jq -c --arg p "$peer" '[.[] | select(.to == $p and .status == "queued") | .id]' <<< "$messages")"
+    fi
+
     if [[ "$dry_run" == "true" ]]; then
         PEER_DELIVER_STATUS="dry-run"
         PEER_DELIVER_SUBMITTED="$submit"
@@ -9177,6 +9214,7 @@ _peer_deliver_one_locked() {
                 fi
                 PEER_DELIVER_TARGET="$_sock_path"
                 _mailbox_rewrite_json_locked "$updated"
+                _peer_doorbell_record_push "$ring_key" "$PEER_PUSH_CREATED" "$ring_ids"
                 _peer_delivery_result_json
                 return 0
             fi
@@ -9249,6 +9287,10 @@ _peer_deliver_one_locked() {
         PEER_DELIVER_SUBMITTED="$submit"
     fi
     _mailbox_rewrite_json_locked "$updated"
+    # A Codex pane has no Stop bell `rung` to share, only the ring budget.
+    local ring_created=""
+    $claude_agent && ring_created="$PEER_PUSH_CREATED"
+    _peer_doorbell_record_push "$ring_key" "$ring_created" "$ring_ids"
     _peer_delivery_result_json
 }
 
@@ -9657,7 +9699,17 @@ _peer_send_deliver_emit() {
         sent-but-undelivered)
             hint="Message $PEER_SD_MESSAGE_ID is queued but delivery failed (${PEER_SD_DELIVER_REASON:-unknown}). It stays queued; do not re-send (that would duplicate it)." ;;
         sent-but-deferred)
-            hint="Message $PEER_SD_MESSAGE_ID is queued; $to's pane is not ready (${PEER_SD_DELIVER_REASON:-busy}) so nothing was pasted. $to's Stop bell picks it up; do not re-send (that would duplicate it)." ;;
+            case "$PEER_SD_DELIVER_REASON" in
+                ring-cap)
+                    local cap_n
+                    cap_n="$(jq -r '.results[0].ring_cap | "\(.rings_last_hour) of \(.max_rings_per_hour)"' <<< "${PEER_SD_DELIVER_JSON:-null}" 2>/dev/null)" || cap_n=""
+                    [[ "$cap_n" == *" of "* && "$cap_n" != *null* ]] || cap_n="all"
+                    hint="Message $PEER_SD_MESSAGE_ID is queued; $to is at its doorbell ring cap ($cap_n rings used in the last hour), so nothing was pushed. It rings once the oldest ring ages out, or $to collects it; do not re-send (that would duplicate it)." ;;
+                ring-cap-invalid|ring-cap-unverifiable)
+                    hint="Message $PEER_SD_MESSAGE_ID is queued; nothing was pushed because the doorbell ring cap cannot be checked ($PEER_SD_DELIVER_REASON; see cctrl peer doctor). $to collects it; do not re-send (that would duplicate it)." ;;
+                *)
+                    hint="Message $PEER_SD_MESSAGE_ID is queued; $to's pane is not ready (${PEER_SD_DELIVER_REASON:-busy}) so nothing was pasted. $to's Stop bell picks it up; do not re-send (that would duplicate it)." ;;
+            esac ;;
         sent-and-queued)
             # Plan 110 S3: the push gate held it.
             if [[ "$PEER_SD_DELIVER_REASON" == "recipient-not-doorbell-enabled" ]]; then
@@ -10581,6 +10633,79 @@ def recent_rings($now; $win): (.rings // []) | if type == "array" then . else []
 _peer_doorbell_file() { printf '%s/doorbell.json' "$PEER_DATA_DIR"; }
 _peer_doorbell_state_dir() { printf '%s/doorbell/state' "$PEER_DATA_DIR"; }
 
+# Direct pushes share the ring cap. A push that passes the plan 110 gate
+# (send/reply --deliver, deliver, nudge, watch, MCP send_message) into a tmux
+# recipient spends the same per-session budget as the Stop bell: the same
+# state file, the same `rings` list. At the cap the push is deferred (no
+# paste, no mailbox write; the mail stays queued). A successful push appends
+# one ring time and marks the ids it announced as rung, so the recipient's
+# next Stop does not ring (or count) the same mail again. Both run under the
+# mailbox lock on the push side only; the bell stays lock-free, so a push and
+# a Stop landing in the same instant can lose one ring time (at most one extra
+# ring), never mail.
+_peer_doorbell_push_key_ok() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+
+_peer_doorbell_push_cap_ok() { # session -> 0 when a push may spend a ring
+    # Non-zero sets PEER_PUSH_REASON: ring-cap (PEER_RING_CAP_RINGS /
+    # PEER_RING_CAP_MAX), ring-cap-invalid (max_rings_per_hour invalid: the
+    # bell never rings, so no push either) or ring-cap-unverifiable (clock or
+    # config unreadable). Fail closed, like the bell. A name that cannot be a
+    # state file (the bell can never ring it either) is not counted.
+    local session="$1" cfg st_file st_raw="{}" out rings max
+    PEER_RING_CAP_RINGS=""; PEER_RING_CAP_MAX=""
+    _peer_doorbell_push_key_ok "$session" || return 0
+    cfg="$(_peer_doorbell_cfg_json)"
+    st_file="$(_peer_doorbell_state_dir)/$session.json"
+    [[ -f "$st_file" ]] && st_raw="$(<"$st_file")"
+    out="$(jq -rn --argjson c "$cfg" --arg st "$st_raw" --arg now "$(_peer_now_utc)" --argjson win "$DOORBELL_RING_WINDOW" \
+        "$DOORBELL_MAX_RINGS_JQ"'
+        ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
+        | if ($c | type) != "object" then "invalid"
+          else ($c | max_rings) as $m
+          | if $m == "invalid" then "invalid"
+            else "\($state | recent_rings($now | fromdateiso8601; $win) | length) \($m | floor)" end
+          end' 2>/dev/null)" || out=""
+    if [[ "$out" == "invalid" ]]; then
+        PEER_PUSH_REASON="ring-cap-invalid"; return 1
+    fi
+    read -r rings max <<< "$out"
+    if [[ ! "$rings" =~ ^[0-9]+$ || ! "$max" =~ ^[1-9][0-9]*$ ]]; then
+        PEER_PUSH_REASON="ring-cap-unverifiable"; return 1
+    fi
+    PEER_RING_CAP_RINGS="$rings"; PEER_RING_CAP_MAX="$max"
+    if (( rings >= max )); then
+        PEER_PUSH_REASON="ring-cap"; return 1
+    fi
+    return 0
+}
+
+_peer_doorbell_record_push() { # session created ids_json -> record one ring; never fails the push
+    # created: the session's #{session_created}, or empty when unknown (the
+    # stored occupant is kept). A different occupant resets `rung` as the bell
+    # does; `rings` is per name and always kept. Atomic write, mode 600.
+    local session="$1" created="$2" ids_json="$3" dir file raw="{}" new tmp
+    _peer_doorbell_push_key_ok "$session" || return 0
+    dir="$(_peer_doorbell_state_dir)"; file="$dir/$session.json"
+    [[ -f "$file" ]] && raw="$(<"$file")"
+    new="$(jq -nc --arg st "$raw" --arg occ "$created" --arg now "$(_peer_now_utc)" --argjson ids "$ids_json" \
+        --argjson win "$DOORBELL_RING_WINDOW" "$DOORBELL_MAX_RINGS_JQ"'
+        ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
+        | ($state.occupant_created // "" | tostring) as $prev
+        | (if $occ == "" then $prev else $occ end) as $o
+        | (if $o == $prev then ($state.rung // {} | if type == "object" then . else {} end) else {} end) as $rung
+        | $state + {
+            occupant_created: $o,
+            chain: (if $o == $prev then ($state.chain // 0) else 0 end),
+            rings: (($state | recent_rings($now | fromdateiso8601; $win)) + [$now]),
+            rung: ($rung + ([$ids[] | select(type == "string") | {key: ., value: $now}] | from_entries)) }' 2>/dev/null)" || return 0
+    [[ -n "$new" ]] || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    tmp="$(mktemp "$dir/.state.XXXXXX" 2>/dev/null)" || return 0
+    if printf '%s\n' "$new" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file"; then return 0; fi
+    rm -f "$tmp"
+    return 0
+}
+
 _peer_doorbell_eval() {
     # Prints the bell text (and returns 2) only when it rings. Runs the real
     # work in a subshell and trusts only a marker line, so an internal error,
@@ -10689,7 +10814,10 @@ _peer_doorbell_eval_inner() {
     # recorded as rung and no message status changes, so the mail stays
     # queued and rings once the oldest ring ages out. The count comes from the
     # same state read the write below replaces, and a pane runs one Stop at a
-    # time, so the check and the write cannot interleave (no lock, as before).
+    # time, so two Stops cannot interleave (no lock, as before). A direct
+    # push (`_peer_doorbell_record_push`) writes the same file; the write below
+    # re-reads it and keeps the push's ring times and rung ids, so only a push
+    # landing between that re-read and the rename can be lost (one ring).
     # Checked before the slow path, which it would only repeat.
     local rings_recent=""
     { IFS= read -r rings_recent; IFS= read -r now; } < <(jq -r '.rings, .now' <<< "$pre" 2>/dev/null)
@@ -10804,16 +10932,25 @@ _peer_doorbell_eval_inner() {
     # slow path again), pruned to still-queued ids; then ring. `rings` keeps
     # the ring times of the last hour, plus this one; it is kept across a
     # recycled name (the cap is per name).
-    local new_state tmp
+    local new_state tmp fresh_raw="{}"
+    # Re-read: a direct push may have recorded a ring since the read above.
+    [[ -f "$state_file" ]] && fresh_raw="$(<"$state_file")"
     new_state="$(jq -nc --argjson rung "$rung_json" --argjson q "$(jq -c '.queued' <<< "$pre")" \
         --argjson ring "$ring_ids" --argjson blocked "$blocked_ids" --arg occ "$session_created" --arg now "$now" \
-        --argjson chain "$chain_new" --arg st "$state_raw" --argjson win "$DOORBELL_RING_WINDOW" \
+        --argjson chain "$chain_new" --arg st "$state_raw" --arg st2 "$fresh_raw" --argjson win "$DOORBELL_RING_WINDOW" \
         "$DOORBELL_MAX_RINGS_JQ"'
         ((try ($st | fromjson) catch {}) | if type == "object" then . else {} end) as $state
+        | ((try ($st2 | fromjson) catch {}) | if type == "object" then . else {} end) as $fresh
+        | (if (($fresh.occupant_created // "") | tostring) == $occ
+           then ($fresh.rung // {} | if type == "object" then . else {} end) else {} end) as $fresh_rung
         | { occupant_created: $occ,
           chain: $chain,
-          rings: (($state | recent_rings($now | fromdateiso8601; $win)) + (if ($ring | length) > 0 then [$now] else [] end)),
-          rung: (($rung | with_entries(select((.key as $k | $q | index($k)) != null)))
+          # The re-read file holds every ring the first read did (writers only
+          # append and age out), plus any push since: count from it.
+          rings: (((if ($fresh.rings | type) == "array" then $fresh else $state end)
+                   | recent_rings($now | fromdateiso8601; $win))
+                  + (if ($ring | length) > 0 then [$now] else [] end)),
+          rung: ((($fresh_rung + $rung) | with_entries(select((.key as $k | $q | index($k)) != null)))
                  + ([$ring[] | {key: ., value: $now}] | from_entries)
                  + ([$blocked[] | {key: ., value: "blocked"}] | from_entries)) }
     ')" || return 0
@@ -11232,7 +11369,7 @@ _peer_doorbell_status() {
             (if .config then "  baseline_at: \(.config.baseline_at)  mode: \(.config.mode)\n  peers: \(.config.peers | join(", "))\n  roles: \(.config.roles | join(", "))" else empty end),
             (if .ring_cap then "  ring cap: \(if .ring_cap.valid then "\(.ring_cap.max_rings_per_hour)/hour per recipient (\(.ring_cap.source))" else "INVALID max_rings_per_hour \(.config.max_rings_per_hour | tojson): the bell never rings (want an integer 1..1000000)" end)" else empty end),
             "Stop hook (cctrl hooks run stop): \(if .stop_registered then "registered" else "NOT registered - \(.stop_registered_reason); remedy: cctrl hooks install" end)",
-            (.ring_cap.max_rings_per_hour as $m | .state | to_entries[] | "  rung state \(.key): \(.value.rung) id(s), \(.value.rings_last_hour) ring(s) in the last hour\(if $m != null and .value.rings_last_hour >= $m then " (AT CAP: mail stays queued)" else "" end)"),
+            (.ring_cap.max_rings_per_hour as $m | .state | to_entries[] | "  rung state \(.key): \(.value.rung) id(s), \(.value.rings_last_hour) ring(s) in the last hour (bell and pushes)\(if $m != null and .value.rings_last_hour >= $m then " (AT CAP: mail stays queued)" else "" end)"),
             (if .backlog then "Queued backlog (by recipient):", (.backlog[] | "  \(.queued)\t\(.to)\t\(if .known then "known" else "gone" end)\toldest \(.oldest)") else empty end)
         ' <<< "$out"
     fi

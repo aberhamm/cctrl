@@ -1257,6 +1257,8 @@ case "${1:-}" in
         fi
         if [[ "$*" == *session_name* ]]; then
             printf '%s\n' "${TMUX_FAKE_SESSION_NAME:-demo}"
+        elif [[ "$*" == *pane_in_mode* && "$*" == *session_created* ]]; then
+            printf '%s %s\n' "${TMUX_FAKE_PANE_IN_MODE:-0}" "${TMUX_FAKE_SESSION_CREATED:-}"
         elif [[ "$*" == *pane_in_mode* ]]; then
             printf '%s\n' "${TMUX_FAKE_PANE_IN_MODE:-0}"
         else
@@ -10178,6 +10180,10 @@ esac
 SH
     cat > "$t/bin/ps" <<'SH'
 #!/usr/bin/env bash
+# BELL_PS_SIDE: a script run once, at the first ps call (the slow path's
+# ancestry walk, after the bell read its state): stands in for a concurrent
+# direct push writing the state file.
+if [[ -n "${BELL_PS_SIDE:-}" && ! -e "$BELL_PS_SIDE.done" ]]; then : > "$BELL_PS_SIDE.done"; bash "$BELL_PS_SIDE"; fi
 if [[ "${1:-}" == "-o" && "${2:-}" == "ppid=" && "${3:-}" == "-p" ]]; then
     want="$4"
     if [[ -f "${BELL_PS_MAP:-/dev/null}" ]]; then
@@ -15810,6 +15816,158 @@ test_peer_claude_push_ready_fail_closed() {
         CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send cq --from orchestrator --deliver --json -- "busy")" || fail "deferred send must exit 0"
     jq -e '.ok == true and .outcome == "sent-but-deferred" and .delivered == false' <<< "$out" >/dev/null || fail "busy send: $out"
     echo "ok: plan 110 Claude push readiness is fail-closed"
+}
+
+test_peer_push_shares_ring_cap_with_bell() {
+    # Direct pushes count against the doorbell ring cap (default 4 per rolling
+    # hour per session name), in the same state file as the Stop bell. A push
+    # marks what it announced as rung, so the next Stop neither rings nor
+    # counts the same mail. At the cap a push is deferred (rc 0, no paste,
+    # mailbox untouched, mail queued). Time is injected with CCTRL_NOW_UTC.
+    _bell_fixture "$TMPDIR/push-cap"
+    _bell_enable "$_bell_cfg_default"   # roles [orchestrator], no cap key: 4/hour
+    make_fake_tmux "$TMPDIR/tmux"
+    local st="$BELL_DATA/doorbell/state/TMUX--t-a.json" log="$TMPDIR/push-cap-tmux.log" out err rc before s5 idle
+    idle="$(printf '%s\n' '● done.' '────────────────────' '❯ ' '────────────────────')"
+    write_claude_session_file "$BELL_DIR/sessions" 12345 idle
+    : > "$log"
+    # The push side: the repo's cctrl (the bell fixture's copy has no lib/),
+    # the suite's fake tmux ahead of the bell's stub; the same
+    # session_created as the bell sees (BELL_DISPLAY), so `rung` carries over.
+    local -a push=(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--t-a"
+        TMUX_FAKE_CAPTURE_PANE="$idle" TMUX_FAKE_SESSION_CREATED=1700000000)
+    _push_at() { # time -> peer deliver TMUX--t-a --json into $out
+        out="$(CCTRL_NOW_UTC="$1" "${push[@]}" "$ROOT/cctrl" peer deliver TMUX--t-a --json)" || fail "deliver at $1 must exit 0: $out"
+    }
+    # 1: the bell rings for s1.
+    _bell_send TMUX--t-a s1 2026-02-01T10:00:00Z
+    CCTRL_NOW_UTC=2026-02-01T10:00:30Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "bell ring 1 must ring (rc=$BELL_RC)"
+    # 2: a push for s2 spends a ring and marks s2 rung.
+    _bell_send TMUX--t-a s2 2026-02-01T10:05:00Z
+    _push_at 2026-02-01T10:05:30Z
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "push under the cap must be nudged: $out"
+    [[ "$(grep -c 'paste-buffer' "$log")" -eq 1 ]] || fail "expected one paste for the push"
+    jq -e --arg s2 "$(jq -r 'select(.subject == "s2") | .id' "$BELL_DATA/messages.jsonl")" '
+        .rings == ["2026-02-01T10:00:30Z","2026-02-01T10:05:30Z"] and .rung[$s2] == "2026-02-01T10:05:30Z"
+        and .occupant_created == "1700000000"' "$st" >/dev/null || fail "push must record one ring and rung s2: $(cat "$st")"
+    # The next Stop: s2 was pushed, so no ring and no second count.
+    CCTRL_NOW_UTC=2026-02-01T10:06:00Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_OUT" && -z "$BELL_ERR" ]] || fail "Stop after a push must not ring the pushed mail again (rc=$BELL_RC err=$BELL_ERR)"
+    [[ "$(jq -r '.rings | length' "$st")" -eq 2 ]] || fail "Stop after a push must not count again: $(cat "$st")"
+    # 3: push; 4: bell (rings for s4 only, s3 was pushed). Budget now spent.
+    _bell_send TMUX--t-a s3 2026-02-01T10:10:00Z
+    _push_at 2026-02-01T10:10:30Z
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "push 3 must be nudged: $out"
+    _bell_send TMUX--t-a s4 2026-02-01T10:15:00Z
+    CCTRL_NOW_UTC=2026-02-01T10:15:30Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "bell ring 4 must ring (rc=$BELL_RC)"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    [[ "$(jq -r '.rings | length' "$st")" -eq 4 ]] || fail "bell + pushes must share one list: $(cat "$st")"
+    # 5: at the cap the push is deferred: no paste, mailbox untouched.
+    _bell_send TMUX--t-a s5 2026-02-01T10:20:00Z
+    s5="$(jq -r 'select(.subject == "s5") | .id' "$BELL_DATA/messages.jsonl")"
+    before="$(shasum "$BELL_DATA/messages.jsonl")"
+    : > "$log"
+    _push_at 2026-02-01T10:20:30Z
+    jq -e '.results[0].status == "deferred" and .results[0].reason == "ring-cap"
+        and .results[0].ring_cap == {rings_last_hour: 4, max_rings_per_hour: 4}' <<< "$out" >/dev/null || fail "push at the cap must be deferred: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    [[ "$(shasum "$BELL_DATA/messages.jsonl")" == "$before" ]] || fail "a capped push must not write the mailbox"
+    [[ "$(jq -r --arg i "$s5" 'select(.id == $i) | .status' "$BELL_DATA/messages.jsonl")" == "queued" ]] || fail "capped mail must stay queued"
+    jq -e --arg i "$s5" '.rung[$i] == null and (.rings | length) == 4' "$st" >/dev/null || fail "a capped push records nothing: $(cat "$st")"
+    out="$(CCTRL_NOW_UTC=2026-02-01T10:20:40Z "${push[@]}" "$ROOT/cctrl" peer deliver TMUX--t-a --dry-run --json)"
+    jq -e '.results[0].status == "deferred" and .results[0].reason == "ring-cap"' <<< "$out" >/dev/null || fail "dry-run must report the cap: $out"
+    assert_contains "$(CCTRL_NOW_UTC=2026-02-01T10:20:40Z "${push[@]}" "$ROOT/cctrl" peer deliver TMUX--t-a)" "ring cap reached (4/4"
+    # send --deliver and reply at the cap: queued, sent-but-deferred, rc 0 (as a busy pane).
+    rc=0; out="$(CCTRL_NOW_UTC=2026-02-01T10:21:00Z "${push[@]}" "$ROOT/cctrl" peer send TMUX--t-a --from carol --deliver --json -- "capped")" || rc=$?
+    [[ $rc -eq 0 ]] || fail "send --deliver at the cap must exit 0, got $rc"
+    jq -e '.ok == true and .outcome == "sent-but-deferred" and .delivered == false and .delivery_reason == "ring-cap"
+        and (.hint | contains("ring cap (4 of 4 rings")) and (.hint | contains("do not re-send"))' <<< "$out" >/dev/null || fail "send --deliver at the cap: $out"
+    err="$(CCTRL_NOW_UTC=2026-02-01T10:21:10Z "${push[@]}" "$ROOT/cctrl" peer send TMUX--t-a --from carol --deliver -- "capped text" 2>&1 >/dev/null)" || true
+    assert_contains "$err" "Sent but deferred"
+    assert_contains "$err" "ring cap"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    # Status shows the shared count; the bell is held too.
+    out="$(CCTRL_NOW_UTC=2026-02-01T10:21:30Z "$BELL_DIR/cctrl" peer doorbell status --json)"
+    jq -e '.state["TMUX--t-a"].rings_last_hour == 4' <<< "$out" >/dev/null || fail "status must count pushes: $out"
+    assert_contains "$(CCTRL_NOW_UTC=2026-02-01T10:21:30Z "$BELL_DIR/cctrl" peer doorbell status)" "AT CAP"
+    CCTRL_NOW_UTC=2026-02-01T10:22:00Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "the bell must be held once pushes spent the budget (rc=$BELL_RC)"
+    # Once the oldest ring (the bell's, 10:00:30) ages out, a push goes again.
+    _push_at 2026-02-01T11:00:31Z
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "push after the oldest ring ages out: $out"
+    jq -e '.rings == ["2026-02-01T10:05:30Z","2026-02-01T10:10:30Z","2026-02-01T10:15:30Z","2026-02-01T11:00:31Z"]' "$st" >/dev/null \
+        || fail "rings must age out and take the push: $(cat "$st")"
+    # An invalid cap fails closed for pushes as for the bell.
+    _bell_enable '{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":[],"roles":["orchestrator"],"mode":"blocking","max_rings_per_hour":0}'
+    : > "$log"
+    _push_at 2026-02-01T11:30:00Z
+    jq -e '.results[0].status == "deferred" and .results[0].reason == "ring-cap-invalid"' <<< "$out" >/dev/null || fail "invalid cap must defer pushes: $out"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    # A push into a session with no ring state yet records the occupant
+    # (session_created), so the bell keeps its rung marks and stays quiet.
+    _bell_enable "$_bell_cfg_default"
+    rm -f "$st"
+    _bell_send TMUX--t-a s7 2026-02-01T12:00:00Z
+    _push_at 2026-02-01T12:00:30Z
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "push with no ring state: $out"
+    jq -e '.occupant_created == "1700000000" and (.rings | length) == 1' "$st" >/dev/null || fail "first push must record the occupant: $(cat "$st")"
+    CCTRL_NOW_UTC=2026-02-01T12:01:00Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "Stop after a first push must not ring it again (rc=$BELL_RC err=$BELL_ERR)"
+    # New mail rings alone, and s7 stays rung after that write (an unknown
+    # occupant would make the bell drop s7's mark and ring it later).
+    _bell_send TMUX--t-a s8 2026-02-01T12:02:00Z
+    CCTRL_NOW_UTC=2026-02-01T12:02:30Z _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "s8 must ring (rc=$BELL_RC)"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    CCTRL_NOW_UTC=2026-02-01T12:03:00Z _bell_stop
+    [[ "$BELL_RC" -eq 0 && -z "$BELL_ERR" ]] || fail "the pushed s7 must never ring (rc=$BELL_RC err=$BELL_ERR)"
+    # A push that lands while a Stop is running (after the bell read the
+    # state, before it writes) keeps its ring and rung mark: the bell re-reads.
+    local side="$BELL_DIR/side.sh"
+    printf 'f=%q; jq -c %q "$f" > "$f.tmp" && mv "$f.tmp" "$f"\n' "$st" \
+        '.rings += ["2026-02-01T12:03:40Z"] | .rung["msg_side"] = "2026-02-01T12:03:40Z"' > "$side"
+    _bell_send TMUX--t-a s9 2026-02-01T12:03:30Z
+    BELL_PS_SIDE="$side" CCTRL_NOW_UTC=2026-02-01T12:04:00Z _bell_stop
+    [[ -e "$side.done" ]] || fail "side write did not run (no slow path?)"
+    [[ "$BELL_RC" -eq 2 ]] || fail "s9 must ring (rc=$BELL_RC)"
+    jq -e '(.rings | index("2026-02-01T12:03:40Z")) != null and (.rings | length) == 4' "$st" >/dev/null \
+        || fail "the bell's write must keep a concurrent push's ring: $(cat "$st")"
+    echo "ok: direct pushes spend the bell's ring budget, are deferred at the cap, and never double-ring"
+}
+
+test_peer_push_ring_cap_codex_and_non_bell() {
+    # A Codex tmux recipient's pushes count too (no Stop bell, same budget
+    # file). A recipient the bell is not enabled for is unaffected: queued-only
+    # as before, no ring state read or written.
+    make_fake_tmux "$TMPDIR/tmux"
+    local data="$TMPDIR/push-cap-codex" log="$TMPDIR/push-cap-codex.log" out i st before
+    setup_delivery_peers "$data"
+    st="$data/doorbell/state/TMUX--comet.json"
+    : > "$log"
+    local -a env=(env PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--comet" CCTRL_DATA_DIR="$data")
+    for i in 1 2 3 4; do
+        CCTRL_NOW_UTC="2026-03-01T09:0$i:00Z" "${env[@]}" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "c$i" >/dev/null
+        out="$(CCTRL_NOW_UTC="2026-03-01T09:0$i:30Z" "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+        jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "codex push $i must be nudged: $out"
+    done
+    [[ "$(jq -r '.rings | length' "$st")" -eq 4 ]] || fail "codex pushes must be counted: $(cat "$st" 2>/dev/null)"
+    CCTRL_NOW_UTC=2026-03-01T09:10:00Z "${env[@]}" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "c5" >/dev/null
+    out="$(CCTRL_NOW_UTC=2026-03-01T09:10:30Z "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "deferred" and .results[0].reason == "ring-cap"' <<< "$out" >/dev/null || fail "5th codex push must be deferred: $out"
+    [[ "$(grep -c 'paste-buffer' "$log")" -eq 4 ]] || fail "expected exactly 4 pastes"
+    # Not bell-enabled: the full budget does not matter and nothing is written.
+    enable_delivery_bell "$data" someone-else
+    before="$(shasum "$st")"
+    out="$(CCTRL_NOW_UTC=2026-03-01T09:11:00Z "${env[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only" and .results[0].reason == "recipient-not-doorbell-enabled"' <<< "$out" >/dev/null \
+        || fail "a non-bell recipient must stay queued-only, not ring-capped: $out"
+    [[ "$(shasum "$st")" == "$before" ]] || fail "a non-bell recipient's ring state must not change"
+    rm -f "$st"
+    CCTRL_NOW_UTC=2026-03-01T09:12:00Z "${env[@]}" "$ROOT/cctrl" peer deliver comet --json >/dev/null
+    [[ ! -e "$st" ]] || fail "a non-bell recipient must get no ring state"
+    echo "ok: codex pushes count against the cap; non-bell recipients are unaffected"
 }
 
 test_peer_socket_lookup_ignores_home_sessions() {
