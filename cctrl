@@ -6089,9 +6089,30 @@ _peer_print_human() {
           elif type == "object" then tojson
           else tostring
           end;
-        to_entries[]
+        # Plan 111 phase 2: a message with `verification` (recv/show) gets one
+        # sender line from sealed fields only; an unverified one shows the
+        # bare `from` and no label. Informational (warn): no directive.
+        def verified_sender($m):
+          ($m.verification) as $v
+          | if $m.from == "user" then
+              "  sender: user (not an agent session; cctrl cannot confirm it is the operator)"
+            elif $v.verified == true then
+              ($m.sender // {}) as $s
+              | "  sender: " + (($s.label // $s.name // $m.from) | tostring)
+                + " (verified: session " + (($v.session // "?") | tostring)
+                + ", pane started " + (($m.attest.pane_started // "?") | tostring) + ")"
+            else
+              "  sender: " + (($m.from // "?") | tostring) + " unverified (" + (($v.reason // "unknown") | tostring) + ", warn mode)"
+            end;
+        . as $msg
+        | (($msg | type) == "object" and ($msg.verification | type) == "object") as $has_v
+        | to_entries[]
         | select(.value != null)
-        | if .key == "sender" and (.value | type) == "object" then
+        | if $has_v and .key == "sender" then
+            verified_sender($msg)
+          elif $has_v and .key == "verification" then
+            if ($msg | has("sender")) and $msg.sender != null then empty else verified_sender($msg) end
+          elif .key == "sender" and (.value | type) == "object" then
             .value as $s
             | ($s.label // $s.name) as $lbl
             | ([$s.tmux_target, $s.agent] | map(select(. != null))) as $extra
@@ -7370,9 +7391,15 @@ _mailbox_print_messages_human() {
     # Fixed template (inbox/outbox). Show the human sender label when the durable
     # snapshot carries one (plan 023), falling back to the bare `from` address for
     # legacy messages that predate the `sender` field.
+    # Plan 111 phase 2: with `verification` (inbox), the label shows only on
+    # verified mail; unverified mail shows the bare `from` and the reason.
     jq -r '
         .[]
-        | "\(.id)  \(.status)  \(.sender.label // .from) -> \(.to)  \(.subject // "")"
+        | (if (.verification | type) == "object" then
+             (if .verification.verified == true then (.sender.label // .from)
+              else "\(.from) unverified (\(.verification.reason // "unknown"), warn mode)" end)
+           else (.sender.label // .from) end) as $who
+        | "\(.id)  \(.status)  \($who) -> \(.to)  \(.subject // "")"
     '
 }
 
@@ -7582,6 +7609,58 @@ _peer_sender_binding_mismatch() {
 # still queues. A same-uid misuse barrier, not authentication.
 #   $1 from  $2 from peer json  $3 impersonate  $4 --sender-host
 #   $5 077 caller session  $6 077 ran (true when $TMUX was set)
+# Plan 111 phase 2: per-host HMAC seal. lib/peer_seal.py reads the key file
+# itself (never argv/env/stdout) and prints only MACs and verification facts.
+# Key: $CCTRL_PEER_SEAL_KEY_FILE, else a pinned path under $HOME/.local/state.
+_peer_seal_helper() {
+    python3 -I -S "$SCRIPT_DIR/lib/peer_seal.py" "$@"
+}
+
+# <message line> <host id> -> the line with `seal: {v, host_id, mac}`, or the
+# line unchanged on any failure: a seal failure never blocks a send (it then
+# reads legacy-unsealed).
+_peer_seal_message() {
+    local message="$1" host_id="$2" mac=""
+    if [[ "$host_id" =~ ^[0-9a-f]{32}$ && "$message" == "{"*"}" ]]; then
+        mac="$(printf '%s' "$message" | _peer_seal_helper seal "$host_id" 2>/dev/null)" || mac=""
+    fi
+    if [[ "$mac" =~ ^[0-9a-f]{64}$ ]]; then
+        # Both values are hex, so splicing into jq's compact object is exact.
+        printf '%s,"seal":{"v":1,"host_id":"%s","mac":"%s"}}' "${message%\}}" "$host_id" "$mac"
+    else
+        printf '%s' "$message"
+    fi
+}
+
+# A JSON array of messages on stdin -> the same array with `verification:
+# {verified, level, reason, session, host}` on each, computed now (read time
+# only; nothing is written back). Never creates the key or the host id. If the
+# helper fails, every line reads unverified.
+_peer_verify_annotate() {
+    local messages ver host_id=""
+    messages="$(cat)"
+    host_id="$(_cctrl_host_id_read 2>/dev/null)" || host_id=""
+    ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" 2>/dev/null)" || ver=""
+    [[ "$ver" == "["* ]] || ver="null"
+    local out=""
+    out="$({ printf '%s\n' "$messages"; printf '%s\n' "$ver"; } | jq -c -s '
+        .[0] as $m | .[1] as $v
+        | [ $m | to_entries[]
+            | .value + {verification: (($v // [])[.key]
+                // {verified: false, level: null,
+                    reason: (if (.value.seal | type) == "object" then "seal-mismatch" else "legacy-unsealed" end),
+                    session: null, host: null})} ]' 2>/dev/null)" || out=""
+    # Never lose the listing over a verification failure.
+    if [[ -n "$out" ]]; then printf '%s\n' "$out"; else printf '%s\n' "$messages"; fi
+}
+
+# One message object -> the same object with `verification`.
+_peer_verify_annotate_one() {
+    local message="$1"
+    [[ -n "$message" && "$message" != "null" ]] || { printf '%s' "$message"; return 0; }
+    printf '[%s]' "$message" | _peer_verify_annotate | jq -c '.[0]'
+}
+
 _peer_caller_attest() {
     local from="$1" from_peer_json="$2" impersonate="$3" sender_host="$4" caller_077="$5" ran_077="$6"
     local level=none method="" detail="" session="" pane_id="" pane_pid="" pane_started=""
@@ -7650,9 +7729,13 @@ _peer_caller_attest() {
             else
                 read -r -a words <<< "$a_started"
                 a_started="${words[*]}"
+                # Bounded (whole seconds): a wedged tmux server must not hang
+                # the send; a timeout reads started-unreadable.
+                local run_bound="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}"
+                [[ "$run_bound" =~ ^[1-9][0-9]*$ ]] || run_bound=5
                 # The tmux server's own ps, as the launch anchor was written:
                 # never the caller's locale.
-                live_started="$(unset TMUX TMUX_PANE; _session_tmux_host_process_started "$session" "$pane_pid" 2>/dev/null)" || live_started=""
+                live_started="$(unset TMUX TMUX_PANE; _session_tmux_host_process_started "$session" "$pane_pid" "$run_bound" 2>/dev/null)" || live_started=""
                 if [[ -z "$live_started" ]]; then
                     detail="started-unreadable"
                 elif [[ "$live_started" != "$a_started" ]]; then
@@ -8004,6 +8087,11 @@ _peer_cmd_send_impl() {
         sender_json="$(jq -c --arg h "$sender_host_override" '. + {host: $h}' <<< "$sender_json")"
     fi
 
+    # Plan 111 phase 2: the per-host seal binds every send-time field. The
+    # host id is read before the lock; a seal failure never blocks the send.
+    local seal_host_id=""
+    seal_host_id="$(_cctrl_host_id 2>/dev/null)" || seal_host_id=""
+
     _mailbox_lock_acquire || return 1
     local now id message rc=0
     if ! {
@@ -8054,6 +8142,7 @@ _peer_cmd_send_impl() {
               attest: $attest,
               history: [{at: $now, status: "queued", by: $from}]
             } + (if $unknown then {unknown_peer: true} else {} end)')"
+        message="$(_peer_seal_message "$message" "$seal_host_id")"
         printf '%s\n' "$message" >> "$MESSAGES_FILE"
     }; then
         rc=1
@@ -8098,6 +8187,7 @@ _peer_cmd_inbox() {
     messages="$(jq --arg who "$identity" --arg peer "$peer_created" --arg provider "${MAILBOX_RESOLVED_PROVIDER_ID:-}" --argjson statuses "$statuses" "$guard"'
         [ .[] | .status as $status | select(.to == $who and ($statuses | index($status)) and deliverable_provider($peer;$provider)) ]
     ' <<< "$messages")"
+    messages="$(printf '%s' "$messages" | _peer_verify_annotate)"
     if $json; then
         jq '.' <<< "$messages"
     else
@@ -8159,6 +8249,7 @@ _peer_cmd_show() {
         echo -e "${RED}Unknown message: '$id'${RESET}" >&2
         return 1
     fi
+    message="$(_peer_verify_annotate_one "$message")"
     if $json; then
         jq '.' <<< "$message"
     else
@@ -8470,6 +8561,13 @@ _peer_cmd_recv() {
     _mailbox_lock_release
     [[ $rc -eq 0 ]] || return $rc
 
+    # Plan 111 phase 2: verification is computed on read, after the lock;
+    # it is never written back.
+    if [[ -n "$batch" ]]; then
+        selected="$(printf '%s' "$selected" | _peer_verify_annotate)"
+    elif [[ "$selected" != "null" ]]; then
+        selected="$(_peer_verify_annotate_one "$selected")"
+    fi
     if [[ -n "$batch" ]]; then
         local count
         count="$(jq -r 'length' <<< "$selected")"
@@ -8525,22 +8623,35 @@ _peer_nudge_line() {
 # verbatim after the trailing `---` line.
 _peer_inline_envelope() {
     local msg_json="$1" recipient="$2" reach="$3"
-    local id label name subject
+    local id label name subject from verified reason
+    # Plan 111 phase 2: the caller passes the message with `verification`.
+    # The header prints only sealed fields: label and name on verified mail,
+    # the bare `from` and no label otherwise. Off/warn: an informational
+    # marker only, never a directive.
     id="$(jq -r '.id // ""' <<< "$msg_json")"
     subject="$(jq -r '.subject // ""' <<< "$msg_json")"
+    IFS=$'\x1f' read -r verified reason from < <(jq -r '[(if .verification.verified == true then "true" else "false" end),
+        (.verification.reason // (if (.seal | type) == "object" then "seal-mismatch" else "legacy-unsealed" end)),
+        (.from // "")] | map(tostring | gsub("[\t\n\r\u001f]"; " ")) | join("\u001f")' <<< "$msg_json" 2>/dev/null) || true
+    [[ "$verified" == "true" ]] || verified=false
     # jq `//` treats "" as present, so fall through empty strings explicitly to
     # avoid a blank label when a legacy message carries sender:{label:""}.
     label="$(jq -r '(.sender.label // "") as $l | (.from // "") as $f | if $l != "" then $l else $f end' <<< "$msg_json")"
     name="$(jq -r '(.sender.name // "") as $n | (.from // "") as $f | if $n != "" then $n else $f end' <<< "$msg_json")"
 
-    printf '[cctrl peer message] from: %s (%s) · id: %s\n' "$label" "$name" "$id"
+    if [[ "$verified" == "true" ]]; then
+        printf '[cctrl peer message] from: %s (%s) · id: %s · verified\n' "$label" "$name" "$id"
+    else
+        printf '[cctrl peer message] from: %s · id: %s · verification: unverified (%s, warn mode)\n' "$from" "$id" "$reason"
+    fi
     [[ -n "$subject" ]] && printf 'Subject: %s\n' "$subject"
     case "$reach" in
         user)
-            # from == "user": the human operator sent this, not a peer. A
+            # from == "user": not an agent session, and cctrl cannot confirm
+            # the operator sent it (plan 111), so no "human operator" claim. A
             # `cctrl peer send/reply user` command fails recipient resolution, so
             # direct the reply into the conversation instead.
-            printf 'Sender is the human operator — reply in this conversation, not via cctrl.\n' ;;
+            printf 'sender: user (not an agent session; cctrl cannot confirm it is the operator) - reply in this conversation, not via cctrl\n' ;;
         unreachable)
             printf 'SENDER IS NO LONGER LIVE — do not reply to this peer.\n' ;;
         *)
@@ -9237,6 +9348,7 @@ _peer_deliver_one_locked() {
         else
             inline_reach="unreachable"
         fi
+        inline_msg_json="$(_peer_verify_annotate_one "$inline_msg_json")"
         inline_envelope="$(_peer_inline_envelope "$inline_msg_json" "$peer" "$inline_reach")"
         payload="${inline_envelope}"$'\n'"${message_body}"
         submit=false
@@ -11690,6 +11802,29 @@ PYNULL
         || printf '%s\n' '{"name":"sender_attest","ok":true,"summary":"mailbox unreadable (informational, warn only)"}'
 }
 
+# Plan 111 phase 2: informational (never fails doctor). Whether the seal key
+# exists and its mode (never the key), and how the mailbox verifies now. A
+# missing key with sealed mail is said loudly: that mail reads seal-mismatch.
+_peer_doctor_seal_check() {
+    local messages="$1" host_id="" out
+    host_id="$(_cctrl_host_id_read 2>/dev/null)" || host_id=""
+    out="$(printf '%s' "$messages" | _peer_seal_helper doctor "$host_id" 2>/dev/null)" || out=""
+    jq -cn --argjson d "${out:-null}" '
+        if $d == null then {name: "sender_seal", ok: true, summary: "seal check unavailable (python3 or mailbox) (informational, warn only)"}
+        else
+          ($d.reasons // {}) as $r
+          | {name: "sender_seal", ok: true, key: $d.key, sealed: $d.sealed, total: $d.total, reasons: $r,
+             summary: ((if $d.key.exists != true then
+                          (if $d.sealed > 0 then "KEY MISSING: \($d.sealed) sealed message(s) read seal-mismatch; " else "key not created yet (first send creates it); " end)
+                        elif $d.key.usable != true then "KEY UNUSABLE (mode \($d.key.mode // "?")): sealed mail reads seal-mismatch; "
+                        else "key ok (mode \($d.key.mode))" + (if $d.key.private == false then ", NOT PRIVATE" else "" end) + "; " end)
+               + "verified \($r.verified // 0) of \($d.total)"
+               + ([$r | to_entries[] | select(.key != "verified") | "\(.key) \(.value)"] | if length > 0 then "; " + join(", ") else "" end)
+               + " (informational, warn only)")}
+        end' 2>/dev/null \
+        || printf '%s\n' '{"name":"sender_seal","ok":true,"summary":"seal check unreadable (informational, warn only)"}'
+}
+
 _peer_cmd_doctor() {
     local target="" json=false peers_doc messages peer_json checks="[]" check ok target_session target_agent="" hook_path
     _arg_has_json "$@" && json=true
@@ -11704,6 +11839,9 @@ _peer_cmd_doctor() {
                 echo "  (session, impersonated, app-claimed, remote, none, unstamped), why mail"
                 echo "  is not level session, walk/077 disagreements, and tmux session records"
                 echo "  with no pane_started anchor (those senders attest none)."
+                echo "  sender_seal (plan 111, informational): whether the per-host seal key exists"
+                echo "  and its mode (never the key), and how mailbox lines verify now"
+                echo "  (verified, legacy-unsealed, seal-mismatch, other-host-seal, no-session, ...)."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;
@@ -11790,10 +11928,12 @@ _peer_cmd_doctor() {
     # Plan 111 phase 1: informational (warn only, never fails doctor).
     check="$(_peer_doctor_attest_check "${messages:-[]}")"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    check="$(_peer_doctor_seal_check "${messages:-[]}")"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "sender_attest" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 
@@ -12769,9 +12909,18 @@ _session_tmux_host_command() {
     # Codex MCP subprocesses may be denied process inspection even though they
     # can contact tmux. Run the narrow read-only probe through the verified tmux
     # server instead; its output is returned through a private temporary file.
-    local session="$1" command="$2" tmp
+    # Optional 3rd arg: a bound in whole seconds (plan 111: the send path
+    # must not hang on a wedged tmux server). macOS has no `timeout`; perl's
+    # alarm survives exec, as in _peer_whois_list_panes. Unbounded without it.
+    local session="$1" command="$2" bound="${3:-}" tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-attest.XXXXXX")" || return 1
-    if ! tmux run-shell "$command > $tmp 2>/dev/null" >/dev/null 2>&1; then
+    if [[ "$bound" =~ ^[1-9][0-9]*$ ]] && command -v perl >/dev/null 2>&1; then
+        if ! perl -e 'alarm shift @ARGV; exec { $ARGV[0] } @ARGV or exit 127' "$bound" \
+            tmux run-shell "$command > $tmp 2>/dev/null" >/dev/null 2>&1; then
+            rm -f "$tmp"
+            return 1
+        fi
+    elif ! tmux run-shell "$command > $tmp 2>/dev/null" >/dev/null 2>&1; then
         rm -f "$tmp"
         return 1
     fi
@@ -12785,9 +12934,9 @@ _session_tmux_host_process_table() {
 }
 
 _session_tmux_host_process_started() {
-    local session="$1" pid="$2"
+    local session="$1" pid="$2" bound="${3:-}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-    _session_tmux_host_command "$session" "ps -o lstart= -p $pid" | awk '{$1=$1; print}'
+    _session_tmux_host_command "$session" "ps -o lstart= -p $pid" "$bound" | awk '{$1=$1; print}'
 }
 
 _session_find_agent_descendant() {
