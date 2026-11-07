@@ -8480,12 +8480,20 @@ SH
     # (6) `sender` renders on ONE readable line in human `peer show` (not a blob).
     local sid
     sid="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer send comet --from orchestrator --json -- "render me" | jq -r '.id')"
+    # Plan 111 phase 2: recv/show/inbox carry `verification`; this sender is
+    # outside any pane (unverified), so the line shows the bare `from` and no
+    # label. The label line is still the renderer for mail without
+    # `verification` (outbox, below).
     out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer show "$sid")"
-    assert_contains "$out" "sender: fleet orchestration (codex)"
+    assert_contains "$out" "  sender: orchestrator unverified (no-session, warn mode)"
+    assert_not_contains "$out" "fleet orchestration"
     assert_not_contains "$out" '"tmux_target"'
 
-    # inbox/outbox human template shows the sender label, falling back to bare from.
+    # inbox shows the label only on verified mail; outbox (no verification)
+    # keeps the label, falling back to bare from.
     out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer inbox --as comet)"
+    assert_contains "$out" "orchestrator unverified (no-session, warn mode) -> comet"
+    out="$(PATH="$quiet:$PATH" CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer outbox --as orchestrator)"
     assert_contains "$out" "fleet orchestration -> comet"
 
     # (8a) renderer edits do not reshape whoami / resolve output.
