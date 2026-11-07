@@ -383,6 +383,16 @@ Phase status:
   and `walk_077` (agree | disagree | skipped), and `origin_host` on level
   remote; the read-time reason strings stay phase 2. Report:
   orch-cctrl-reports/plan-111-p1-impl.md.
+- Phase 2: built 2026-11-07 on branch feat/peer-attest-p2 (not pushed, not
+  installed; warn only). lib/peer_seal.py seals every send; recv/show/inbox
+  gain `verification`; envelope/text markers and the user wording; `peer
+  doctor` gains `sender_seal`. Build choices: no `attestation` mode key yet
+  (phase 3), so the wording is always the off/warn informational one and the
+  enforce directive is not built; a seal failure writes no seal (reads
+  legacy-unsealed); `verification.level` is set only when the seal verifies;
+  inbox text also shows the marker; the seal also binds `host_id` and which
+  covered fields are present. Also bounds the attest `tmux run-shell` check
+  (perl alarm). Report: orch-cctrl-reports/plan-111-p2-impl.md.
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.
