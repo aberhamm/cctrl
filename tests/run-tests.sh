@@ -9131,6 +9131,269 @@ JSON
     echo "ok: peer send's sender-binding check also applies before a cross-machine SSH hop"
 }
 
+# Plan 111 phase 1 fixture: a REAL pane on the suite's private tmux server
+# that runs request scripts on demand, so `cctrl peer send` runs inside the
+# pane's process tree. The session record carries the launch anchor exactly as
+# _session_capture_tmux_attestation_anchor writes it (server-side lstart).
+# Sets ATT_DIR ATT_S ATT_PANE ATT_PID ATT_STARTED ATT_META. Arg: tag.
+_attest_pane_start() {
+    local tag="$1" n line
+    ATT_DIR="$TMPDIR/attest-$tag"; ATT_S="TMUX--att-$tag-$$"
+    rm -rf "$ATT_DIR"; mkdir -p "$ATT_DIR/data" "$ATT_DIR/meta" "$ATT_DIR/csess" "$ATT_DIR/run" "$ATT_DIR/run2"
+    {
+        printf 'unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_PEER CCTRL_AGENT CODEX_THREAD_ID CODEX_SESSION_ID\n'
+        printf 'export PATH=%q HOME=%q TMPDIR=%q TMUX_TMPDIR=%q LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8\n' "$PATH" "$HOME" "$TMPDIR" "$TMUX_TMPDIR"
+        printf 'export CCTRL_DATA_DIR=%q CCTRL_SESSION_METADATA_DIR=%q CCTRL_CLAUDE_SESSIONS_DIR=%q CCTRL_HOST_ID_FILE=%q\n' \
+            "$ATT_DIR/data" "$ATT_DIR/meta" "$ATT_DIR/csess" "$ATT_DIR/data/host-id"
+        printf 'export CCTRL_HOME=%q CODEX_HOME=%q CLAUDE_CONFIG_DIR=%q CCTRL_RUNTIME_DIR=%q CCTRL_HELPERS_FOOTER=off\n' \
+            "$CCTRL_HOME" "$CODEX_HOME" "$CLAUDE_CONFIG_DIR" "$CCTRL_RUNTIME_DIR"
+        printf 'd="$1"; i=0\n'
+        printf 'while :; do if [ -e "$d/req.$i" ]; then %q "$d/req.$i" > "$d/out.$i" 2>"$d/err.$i"; echo $? > "$d/rc.$i.t"; mv "$d/rc.$i.t" "$d/rc.$i"; i=$((i+1)); fi; sleep 0.05; done\n' "$BASH"
+    } > "$ATT_DIR/loop.sh"
+    tmux new-session -d -s "$ATT_S" -x 80 -y 20 "exec $(printf '%q' "$BASH") $(printf '%q' "$ATT_DIR/loop.sh") $(printf '%q' "$ATT_DIR/run")" \
+        || fail "tmux new-session failed"
+    for n in 1 2 3 4 5 6 7 8 9 10; do
+        line="$(tmux list-panes -t "=$ATT_S:" -F '#{pane_id} #{pane_pid}' 2>/dev/null | head -1)" || line=""
+        [[ -n "$line" ]] && break; sleep 0.1
+    done
+    IFS=' ' read -r ATT_PANE ATT_PID <<< "$line"
+    [[ "$ATT_PANE" =~ ^%[0-9]+$ && "$ATT_PID" =~ ^[0-9]+$ ]] || { _attest_pane_stop; fail "no pane for $ATT_S: $line"; }
+    # shellcheck disable=SC2016 # positional arguments belong to the sourced shell
+    ATT_STARTED="$(cctrl_source_eval '_session_tmux_host_process_started "$1" "$2"' "$ATT_S" "$ATT_PID")"
+    [[ -n "$ATT_STARTED" ]] || { _attest_pane_stop; fail "no server-side pane start time"; }
+    ATT_META="$ATT_DIR/meta/$ATT_S.json"
+    jq -n --arg s "$ATT_S" --arg p "$ATT_PANE" --arg pid "$ATT_PID" --arg st "$ATT_STARTED" \
+        '{name:$s,agent:"claude",cctrl_managed:true,tmux_session:$s,control_surface:"tmux",pane_id:$p,pane_pid:$pid,
+          wrapper_pid:$pid,pane_started:$st,role:"orchestrator",orch_kind:"fleet"}' > "$ATT_META"
+    _attest_cctrl peer register att-fm --dir "$ATT_DIR" --agent claude --session "$ATT_S" >/dev/null
+    _attest_cctrl peer register att-other --dir "$ATT_DIR" --agent claude --session "TMUX--att-other-$tag-$$" >/dev/null
+    _attest_cctrl peer register att-rcpt --dir "$ATT_DIR" --agent codex >/dev/null
+}
+_attest_cctrl() { # cctrl with the fixture's data, records and Claude sessions dir, outside any pane
+    env -u TMUX -u TMUX_PANE CCTRL_DATA_DIR="$ATT_DIR/data" CCTRL_SESSION_METADATA_DIR="$ATT_DIR/meta" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$ATT_DIR/csess" CCTRL_HOST_ID_FILE="$ATT_DIR/data/host-id" "$ROOT/cctrl" "$@"
+}
+_attest_pane_stop() { tmux kill-session -t "=$ATT_S" 2>/dev/null || true; }
+_attest_pane_run() { # <run dir> <script text> -> ATT_OUT ATT_RC (stdout only), waits up to 30 s
+    local d="$1" n i=0
+    n="$(find "$d" -name 'req.*' | wc -l | tr -d ' ')"
+    printf '%s\n' "$2" > "$d/.req.$n" && mv "$d/.req.$n" "$d/req.$n"
+    while [[ ! -e "$d/rc.$n" ]]; do
+        i=$((i + 1))
+        [[ $i -lt 600 ]] || { _attest_pane_stop; fail "pane request $n timed out: $2"; }
+        sleep 0.05
+    done
+    ATT_OUT="$(cat "$d/out.$n")"; ATT_RC="$(cat "$d/rc.$n")"
+}
+_attest_lines() { if [[ -f "$ATT_DIR/data/messages.jsonl" ]]; then wc -l < "$ATT_DIR/data/messages.jsonl" | tr -d ' '; else echo 0; fi; }
+
+test_peer_attest_pane_session_levels() {
+    # Plan 111 phase 1, REAL tmux: a send from inside the anchored pane attests
+    # level session with role/orch_kind from the record, whether or not $TMUX
+    # is set and whatever the caller's locale; a Claude session file below the
+    # pane gives method claude-file; outside every pane is level none and
+    # still queues; --impersonate is impersonated.
+    [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] || { echo "skip: no tmux"; return 0; }
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _attest_pane_start lv
+    local cc r="$ATT_DIR/run" plain plain_rc notmux notmux_rc de de_rc gb gb_rc cf cf_rc imp imp_rc outside out_rc=0
+    cc="$(printf '%q' "$ROOT/cctrl")"
+    _attest_pane_run "$r" "$cc peer send att-rcpt --as att-fm --json -- plain"; plain="$ATT_OUT"; plain_rc="$ATT_RC"
+    _attest_pane_run "$r" "env -u TMUX -u TMUX_PANE $cc peer send att-rcpt --as att-fm --json -- no-tmux"; notmux="$ATT_OUT"; notmux_rc="$ATT_RC"
+    _attest_pane_run "$r" "LC_ALL=de_DE.UTF-8 LANG=de_DE.UTF-8 $cc peer send att-rcpt --as att-fm --json -- de"; de="$ATT_OUT"; de_rc="$ATT_RC"
+    _attest_pane_run "$r" "LC_ALL=en_GB.UTF-8 LANG=en_GB.UTF-8 env -u TMUX $cc peer send att-rcpt --as att-fm --json -- gb"; gb="$ATT_OUT"; gb_rc="$ATT_RC"
+    # A Claude session file for this request shell (an ancestor of cctrl,
+    # below the pane), with Claude's own C/UTC procStart and pane claim.
+    _attest_pane_run "$r" "jq -n --argjson p \$\$ --arg ps \"\$(LC_ALL=C TZ=UTC ps -o lstart= -p \$\$)\" --arg t $(printf '%q' "$ATT_S:@1.$ATT_PANE") '{pid:\$p,sessionId:\"s-1\",procStart:\$ps,tmux:\$t}' > \"\$CCTRL_CLAUDE_SESSIONS_DIR/\$\$.json\" && $cc peer send att-rcpt --as att-fm --json -- claude-file"
+    cf="$ATT_OUT"; cf_rc="$ATT_RC"
+    _attest_pane_run "$r" "$cc peer send att-rcpt --as att-other --impersonate --json -- imp"; imp="$ATT_OUT"; imp_rc="$ATT_RC"
+    outside="$(_attest_cctrl peer send att-rcpt --as att-fm --json -- outside 2>&1)" || out_rc=$?
+    local de_ps gb_ps
+    de_ps="$(LC_ALL=de_DE.UTF-8 ps -o lstart= -p "$ATT_PID" 2>/dev/null | awk '{$1=$1; print}')" || de_ps=""
+    gb_ps="$(LC_ALL=en_GB.UTF-8 ps -o lstart= -p "$ATT_PID" 2>/dev/null | awk '{$1=$1; print}')" || gb_ps=""
+    _attest_pane_stop
+    local s="$ATT_S" p="$ATT_PANE" pid="$ATT_PID" st="$ATT_STARTED" want
+    want='.attest.v == 1 and .attest.level == "session" and .attest.session == $s and .attest.pane_id == $p
+        and .attest.pane_pid == $pid and .attest.pane_started == $st and .attest.role == "orchestrator"
+        and .attest.orch_kind == "fleet" and .attest.detail == null and (.attest.host_id | test("^[0-9a-f]{32}$"))'
+    [[ "$plain_rc" -eq 0 ]] || fail "in-pane send failed (rc $plain_rc): $plain"
+    jq -e --arg s "$s" --arg p "$p" --arg pid "$pid" --arg st "$st" "$want"' and .attest.method == "pane-walk" and .attest.walk_077 == "agree"' <<< "$plain" >/dev/null \
+        || fail "in-pane send must attest session: $plain"
+    [[ "$notmux_rc" -eq 0 ]] || fail "env -u TMUX send failed (rc $notmux_rc): $notmux"
+    jq -e --arg s "$s" --arg p "$p" --arg pid "$pid" --arg st "$st" "$want"' and .attest.walk_077 == "skipped"' <<< "$notmux" >/dev/null \
+        || fail "env -u TMUX inside the pane must still attest session: $notmux"
+    [[ "$de_rc" -eq 0 && "$gb_rc" -eq 0 ]] || fail "locale sends failed: $de / $gb"
+    jq -e --arg s "$s" --arg p "$p" --arg pid "$pid" --arg st "$st" "$want" <<< "$de" >/dev/null || fail "de_DE caller must still attest session: $de"
+    jq -e --arg s "$s" --arg p "$p" --arg pid "$pid" --arg st "$st" "$want" <<< "$gb" >/dev/null || fail "en_GB caller must still attest session: $gb"
+    if [[ "$de_ps" == "$st" || "$gb_ps" == "$st" ]]; then
+        echo "note: a caller-locale lstart equals the anchor on this host (de_DE '$de_ps', en_GB '$gb_ps'); the mixed-LANG case proves less here"
+    fi
+    [[ "$cf_rc" -eq 0 ]] || fail "claude-file send failed (rc $cf_rc): $cf"
+    jq -e --arg s "$s" --arg p "$p" --arg pid "$pid" --arg st "$st" "$want"' and .attest.method == "claude-file"' <<< "$cf" >/dev/null \
+        || fail "a Claude session file below the pane must give method claude-file: $cf"
+    [[ "$imp_rc" -eq 0 ]] || fail "--impersonate send failed (rc $imp_rc): $imp"
+    jq -e '.attest.level == "impersonated" and .attest.walk_077 == "skipped" and .audit.impersonated == true' <<< "$imp" >/dev/null \
+        || fail "--impersonate must attest impersonated, never session: $imp"
+    [[ "$out_rc" -eq 0 ]] || fail "a send from outside every pane must still queue in warn (rc $out_rc): $outside"
+    jq -e '.attest.level == "none" and .attest.detail == "no-pane" and .attest.method == null and .attest.session == null and .status == "queued"' <<< "$outside" >/dev/null \
+        || fail "outside every pane must attest none: $outside"
+    echo "ok: plan 111 attest: anchored pane -> session (TMUX unset, de_DE, en_GB too), claude-file, impersonated; outside -> none"
+}
+
+test_peer_attest_pane_binding_mismatches() {
+    # Plan 111 phase 1, REAL tmux, warn only: today's 077 refusal is unchanged;
+    # what 077 cannot see (TMUX unset) is stamped none, never refused; a second
+    # pane of the session (077 accepts it) is a walk/077 disagreement, stamped and counted,
+    # not refused; pid reuse (pane_started off by 1 s) and a null anchor are
+    # none, and doctor lists the null anchor.
+    [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] || { echo "skip: no tmux"; return 0; }
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _attest_pane_start mm
+    local cc r="$ATT_DIR/run" before after ref ref_rc mis mis_rc win win_rc reuse reuse_rc nul nul_rc doctor doctor_txt bumped
+    cc="$(printf '%q' "$ROOT/cctrl")"
+    before="$(_attest_lines)"
+    _attest_pane_run "$r" "$cc peer send att-rcpt --as att-other --json -- refused"; ref="$ATT_OUT"; ref_rc="$ATT_RC"
+    after="$(_attest_lines)"
+    _attest_pane_run "$r" "env -u TMUX -u TMUX_PANE $cc peer send att-rcpt --as att-other --json -- name-mismatch"; mis="$ATT_OUT"; mis_rc="$ATT_RC"
+    tmux split-window -d -t "=$ATT_S:" "exec $(printf '%q' "$BASH") $(printf '%q' "$ATT_DIR/loop.sh") $(printf '%q' "$ATT_DIR/run2")" \
+        || { _attest_pane_stop; fail "tmux split-window failed"; }
+    _attest_pane_run "$ATT_DIR/run2" "$cc peer send att-rcpt --as att-fm --json -- second-pane"; win="$ATT_OUT"; win_rc="$ATT_RC"
+    # pid reuse: the recorded start is one second off the live one.
+    bumped="$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/) { split($i, t, ":"); $i = sprintf("%s:%s:%02d", t[1], t[2], (t[3] + 1) % 60) } print }' <<< "$ATT_STARTED")"
+    [[ -n "$bumped" && "$bumped" != "$ATT_STARTED" ]] || { _attest_pane_stop; fail "could not shift the start time: $ATT_STARTED"; }
+    jq --arg b "$bumped" '.pane_started = $b' "$ATT_META" > "$ATT_META.t" && mv "$ATT_META.t" "$ATT_META"
+    _attest_pane_run "$r" "$cc peer send att-rcpt --as att-fm --json -- reuse"; reuse="$ATT_OUT"; reuse_rc="$ATT_RC"
+    jq '.pane_started = null' "$ATT_META" > "$ATT_META.t" && mv "$ATT_META.t" "$ATT_META"
+    _attest_pane_run "$r" "$cc peer send att-rcpt --as att-fm --json -- null-anchor"; nul="$ATT_OUT"; nul_rc="$ATT_RC"
+    _attest_pane_stop
+    doctor="$(_attest_cctrl peer doctor --json 2>/dev/null)" || true
+    doctor_txt="$(_attest_cctrl peer doctor 2>/dev/null)" || true
+    [[ "$ref_rc" -eq 66 ]] || fail "077 must still refuse a sender that is not the caller's session (rc $ref_rc): $ref"
+    jq -e '.error.code == "sender-mismatch"' <<< "$ref" >/dev/null || fail "077 refusal code changed: $ref"
+    [[ "$before" == "$after" ]] || fail "a refused send wrote a message ($before -> $after)"
+    [[ "$mis_rc" -eq 0 ]] || fail "warn must not add a refusal for a TMUX-unset name mismatch (rc $mis_rc): $mis"
+    jq -e --arg s "$ATT_S" '.attest.level == "none" and .attest.detail == "name-mismatch" and .attest.session == $s and .attest.walk_077 == "skipped"' <<< "$mis" >/dev/null \
+        || fail "TMUX-unset name mismatch must attest none: $mis"
+    [[ "$win_rc" -eq 0 ]] || fail "a walk/077 disagreement must not be refused (rc $win_rc): $win"
+    jq -e --arg s "$ATT_S" --arg p "$ATT_PANE" '.attest.level == "none" and .attest.detail == "anchor-mismatch" and .attest.session == $s
+        and .attest.pane_id != $p and .attest.walk_077 == "disagree" and .audit.caller_tmux_session == $s' <<< "$win" >/dev/null \
+        || fail "a second pane must attest none and record the walk/077 disagreement: $win"
+    [[ "$reuse_rc" -eq 0 ]] || fail "pid-reuse send must still queue (rc $reuse_rc): $reuse"
+    jq -e '.attest.level == "none" and .attest.detail == "started-mismatch" and .attest.pane_started == null and .attest.walk_077 == "disagree"' <<< "$reuse" >/dev/null \
+        || fail "pane_started off by 1 s must attest none: $reuse"
+    [[ "$nul_rc" -eq 0 ]] || fail "null-anchor send must still queue (rc $nul_rc): $nul"
+    jq -e '.attest.level == "none" and .attest.detail == "anchor-missing"' <<< "$nul" >/dev/null || fail "null pane_started must attest none: $nul"
+    jq -e --arg s "$ATT_S" '(.checks[] | select(.name == "sender_attest")
+        | .ok == true and .levels.none == 4 and .walk_077_disagree == 3 and (.null_anchor_sessions | index($s)) != null
+        and .not_session_detail["name-mismatch"] == 1 and .not_session_detail["anchor-missing"] == 1)' <<< "$doctor" >/dev/null \
+        || fail "doctor must show the attest distribution, disagreements and the null anchor: $doctor"
+    assert_contains "$doctor_txt" "sender_attest: levels none 4; walk/077 disagreements 3; null anchors 1 ($ATT_S)"
+    echo "ok: plan 111 attest is warn only: 077 refusals unchanged, mismatches/pid reuse/null anchors stamped none, doctor counts them"
+}
+
+test_peer_attest_stubbed_levels() {
+    # Plan 111 phase 1, stubbed: a ps failure stamps none and the send still
+    # queues; CODEX_THREAD_ID outside a pane is app-claimed; --impersonate is
+    # impersonated; a non-local --sender-host with a name that is not a local
+    # tmux-bound peer is remote (method ssh); env/flag claims never give session.
+    local data="$TMPDIR/attest-stub-data" bin="$TMPDIR/attest-stub-bin" out rc before after
+    rm -rf "$data"; mkdir -p "$data" "$bin"
+    printf '#!/bin/sh\nexit 1\n' > "$bin/ps"; chmod +x "$bin/ps"
+    local -a e=(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id")
+    "${e[@]}" "$ROOT/cctrl" peer register at-rcpt --dir "$data" --agent codex >/dev/null
+    "${e[@]}" "$ROOT/cctrl" peer register at-mo --dir "$data" --agent codex >/dev/null
+    "${e[@]}" "$ROOT/cctrl" peer register at-tb --dir "$data" --agent claude --session TMUX--at-tb-$$ >/dev/null
+    rc=0; before=0; [[ -f "$data/messages.jsonl" ]] && before="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    out="$(PATH="$bin:$PATH" "${e[@]}" "$ROOT/cctrl" peer send at-rcpt --as at-mo --json -- ps-fails 2>&1)" || rc=$?
+    after="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    [[ "$rc" -eq 0 ]] || fail "a ps failure must not fail the send (rc $rc): $out"
+    [[ "$after" -eq $(( ${before:-0} + 1 )) ]] || fail "a ps failure must still queue the message ($before -> $after)"
+    jq -e '.attest.level == "none" and .attest.detail == "ps-failed" and .status == "queued"' <<< "$out" >/dev/null || fail "ps failure: $out"
+    out="$("${e[@]}" CODEX_THREAD_ID=thread-attest-1 "$ROOT/cctrl" peer send at-rcpt --as at-mo --json -- app)"
+    # Outside any pane the walk finds no pane (no-pane, or panes-unreadable
+    # when the suite's private server is not running).
+    jq -e '.attest.level == "app-claimed" and .attest.method == "codex-env" and (.attest.detail | IN("no-pane", "panes-unreadable"))' <<< "$out" >/dev/null || fail "CODEX_THREAD_ID: $out"
+    out="$("${e[@]}" "$ROOT/cctrl" peer send at-rcpt --as at-tb --impersonate --json -- imp)"
+    jq -e '.attest.level == "impersonated"' <<< "$out" >/dev/null || fail "--impersonate: $out"
+    out="$("${e[@]}" "$ROOT/cctrl" peer send at-rcpt --as at-mo --sender-host far-host --json -- remote)"
+    jq -e '.attest.level == "remote" and .attest.method == "ssh" and .attest.origin_host == "far-host" and .sender.host == "far-host"' <<< "$out" >/dev/null \
+        || fail "a non-local --sender-host must attest remote: $out"
+    out="$("${e[@]}" "$ROOT/cctrl" peer send at-rcpt --as at-tb --sender-host far-host --json -- remote-local-name)"
+    jq -e '.attest.level == "none" and .attest.method == null' <<< "$out" >/dev/null \
+        || fail "a local tmux-bound name with --sender-host must stay none: $out"
+    out="$("${e[@]}" CCTRL_HOST_PREFIX=studio-x "$ROOT/cctrl" peer send at-rcpt --as at-mo --sender-host studio-x --json -- remote-self)"
+    jq -e '.attest.level == "none"' <<< "$out" >/dev/null || fail "--sender-host naming this host must stay none: $out"
+    out="$("${e[@]}" CODEX_THREAD_ID=thread-attest-2 "$ROOT/cctrl" peer send at-rcpt --from user --json -- from-user)"
+    jq -e '.attest.level == "none"' <<< "$out" >/dev/null || fail "from=user must stay none even with CODEX_THREAD_ID: $out"
+    out="$("${e[@]}" "$ROOT/cctrl" peer send at-rcpt --from user --json -- from-user)"
+    jq -e '.attest.level == "none" and .attest.session == null' <<< "$out" >/dev/null || fail "from=user must attest none: $out"
+    # No attest field is ever level session without a pane: check every line.
+    jq -e -s 'all(.[]; .attest.level != "session")' "$data/messages.jsonl" >/dev/null || fail "an env/flag claim produced level session"
+    echo "ok: plan 111 attest levels: ps failure -> none (queued), app-claimed, impersonated, remote; env never gives session"
+}
+
+test_peer_doctor_attest_check() {
+    # Plan 111 phase 1: doctor's sender_attest check is informational (ok
+    # true, so doctor's verdict is unchanged) and reads the stamps and the
+    # tmux records only; `peer doctor --help` names the same-uid limit.
+    local data="$TMPDIR/attest-doctor-data" meta="$TMPDIR/attest-doctor-meta" out txt help
+    rm -rf "$data" "$meta"; mkdir -p "$data" "$meta"
+    {
+        printf '%s\n' '{"id":"m1","from":"a","to":"b","status":"queued","attest":{"v":1,"level":"session","walk_077":"agree"}}'
+        printf '%s\n' '{"id":"m2","from":"a","to":"b","status":"queued","attest":{"v":1,"level":"none","detail":"no-pane","walk_077":"skipped"}}'
+        printf '%s\n' '{"id":"m3","from":"a","to":"b","status":"queued","attest":{"v":1,"level":"none","detail":"anchor-mismatch","walk_077":"disagree"}}'
+        printf '%s\n' '{"id":"m4","from":"a","to":"b","status":"acked"}'
+    } > "$data/messages.jsonl"
+    printf '%s\n' '{"name":"TMUX--dr-null","tmux_session":"TMUX--dr-null","control_surface":"tmux","pane_started":null}' > "$meta/TMUX--dr-null.json"
+    printf '%s\n' '{"schema_version":2,"name":"TMUX--dr-closed","execution_runtime":"tmux","lifecycle_state":"closed","pane_started":null}' > "$meta/task-closed.json"
+    printf '%s\n' '{"schema_version":2,"name":"TMUX--dr-app","execution_runtime":"app-server","lifecycle_state":"active","pane_started":null}' > "$meta/task-app.json"
+    printf '%s\n' '{"name":"TMUX--dr-ok","control_surface":"tmux","pane_started":"Sat Nov 7 19:23:29 2026"}' > "$meta/TMUX--dr-ok.json"
+    printf 'not json\n' > "$meta/TMUX--dr-bad.json"
+    local sum_before; sum_before="$(cksum "$data/messages.jsonl")"
+    out="$(env -u TMUX CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+    txt="$(env -u TMUX CCTRL_DATA_DIR="$data" CCTRL_SESSION_METADATA_DIR="$meta" "$ROOT/cctrl" peer doctor 2>/dev/null)" || true
+    help="$("$ROOT/cctrl" peer doctor --help)"
+    [[ "$(cksum "$data/messages.jsonl")" == "$sum_before" ]] || fail "doctor changed the mailbox"
+    jq -e '.checks[] | select(.name == "sender_attest") | .ok == true and .levels == {"none":2,"session":1,"unstamped":1}
+        and .not_session_detail == {"anchor-mismatch":1,"no-pane":1} and .walk_077_disagree == 1
+        and .null_anchor_sessions == ["TMUX--dr-null"]' <<< "$out" >/dev/null || fail "doctor sender_attest: $out"
+    assert_contains "$txt" "sender_attest: levels none 2, session 1, unstamped 1; walk/077 disagreements 1; null anchors 1 (TMUX--dr-null) (informational, warn only)"
+    assert_contains "$help" "same-uid misuse barrier, not authentication"
+    echo "ok: plan 111 peer doctor shows the attest distribution, disagreements and null anchors (informational)"
+}
+
+test_peer_attest_static_contract() {
+    # Plan 111 phase 1 lint: the walk never trusts $TMUX (it only unsets it for
+    # its own tmux reads), never compares a caller-side or caller-locale lstart
+    # (the pane start goes through _session_tmux_host_process_started), and
+    # stays bounded (12 levels). `session restore` relaunches through
+    # _launch_detached, which writes a fresh launch anchor.
+    local body hits
+    body="$(sed -n '/^_peer_caller_attest() {/,/^}/p' "$ROOT/cctrl")"
+    [[ -n "$body" ]] || fail "_peer_caller_attest not found"
+    hits="$(printf '%s\n' "$body" | grep -v '^ *#' | grep -nE '\$\{?TMUX' || true)"
+    [[ -z "$hits" ]] || fail "the walk reads \$TMUX:
+$hits"
+    hits="$(printf '%s\n' "$body" | grep -v '^ *#' | grep -nE 'lstart|LC_ALL|_session_process_started' || true)"
+    [[ -z "$hits" ]] || fail "the walk compares a caller-side start time:
+$hits"
+    assert_contains "$body" "_session_tmux_host_process_started"
+    assert_contains "$body" "unset TMUX TMUX_PANE; _session_tmux_host_process_started"
+    assert_contains "$body" "unset TMUX TMUX_PANE; _peer_whois_list_panes"
+    assert_contains "$body" "i < 12"
+    # Bodies into variables, not `sed | grep -q` (SIGPIPE under pipefail).
+    body="$(sed -n '/^_session_restore() {/,/^}/p' "$ROOT/cctrl")"
+    assert_contains "$body" '_launch_detached "${launch_argv[@]}"'
+    body="$(sed -n '/^_launch_detached() {/,/^}/p' "$ROOT/cctrl")"
+    assert_contains "$body" '_session_capture_tmux_attestation_anchor "$session_name"'
+
+    # The send path stamps every message and never refuses on the attest.
+    body="$(sed -n '/^_peer_cmd_send_impl() {/,/^}/p' "$ROOT/cctrl")"
+    assert_contains "$body" '_peer_caller_attest "$from" "$from_peer_json" "$impersonate" "$sender_host_override" "$caller_tmux_session" "$ran_077" || true'
+    assert_contains "$body" "attest: \$attest,"
+    echo "ok: plan 111 attest walk ignores \$TMUX and caller locale; restore re-anchors through _launch_detached"
+}
+
 test_peer_reply_core() {
     # plan 027: reply-by-message-id (happy, legacy, unauthorized, user, dead sender,
     # delivery failure keeps queued) plus plain `peer send` byte-identical guard.

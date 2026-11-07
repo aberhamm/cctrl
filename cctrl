@@ -7571,6 +7571,142 @@ _peer_sender_binding_mismatch() {
     return 1
 }
 
+# Plan 111 phase 1: who really sent this, from the process tree, never $TMUX.
+# Sets PEER_ATTEST_JSON (attest v1): level session | impersonated |
+# app-claimed | remote | none, method claude-file | pane-walk | codex-env | ssh
+# (null for none), the pane facts, host_id, role and orch_kind from the
+# sender's session record, a `detail` token saying why a level is not session,
+# and walk_077 (agree | disagree | skipped) against the plan-077 result.
+# Warn only: the stamp is recorded and counted by `peer doctor`; nothing is
+# refused on it. Fail open: any unreadable input gives level none and the send
+# still queues. A same-uid misuse barrier, not authentication.
+#   $1 from  $2 from peer json  $3 impersonate  $4 --sender-host
+#   $5 077 caller session  $6 077 ran (true when $TMUX was set)
+_peer_caller_attest() {
+    local from="$1" from_peer_json="$2" impersonate="$3" sender_host="$4" caller_077="$5" ran_077="$6"
+    local level=none method="" detail="" session="" pane_id="" pane_pid="" pane_started=""
+    local role="" orch_kind="" host_id="" origin_host="" walk_077=skipped walk_bound=false
+    local table chain="" panes="" pid line found=false claude_pid="" claude_s="" claude_p=""
+    local bind_target="" bind_host="" meta rec a_pane_id="" a_pane_pid="" a_started="" live_started=""
+    local local_label="${CCTRL_HOST_PREFIX:-local}"
+    local -a words=()
+    PEER_ATTEST_JSON=""
+    host_id="$(_cctrl_host_id 2>/dev/null)" || host_id=""
+    if [[ "$from" != "user" && -n "$from_peer_json" ]]; then
+        IFS=$'\x1f' read -r bind_target bind_host < <(jq -r '[(.tmux_target // .session // ""), (.host // "")]
+            | map(tostring | gsub("[\t\n\r\u001f]"; " ")) | join("\u001f")' <<< "$from_peer_json" 2>/dev/null) || true
+    fi
+    # One ps snapshot: the ppid walk only, never the pane_started compare.
+    if table="$(ps -axo pid=,ppid= 2>/dev/null)" && [[ -n "$table" ]]; then
+        chain="$(awk -v start="$$" '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ { parent[$1] = $2 }
+            END { pid = start; for (i = 0; i < 12 && pid > 1; i++) { print pid; if (!(pid in parent)) break; pid = parent[pid] } }' <<< "$table")" || chain=""
+    fi
+    if [[ -z "$chain" ]]; then
+        detail="ps-failed"
+    elif ! panes="$(unset TMUX TMUX_PANE; _peer_whois_list_panes)"; then
+        detail="panes-unreadable"
+    else
+        while IFS= read -r pid; do
+            [[ "$pid" =~ ^[0-9]+$ ]] || continue
+            while IFS= read -r line; do
+                # tmux prints the tab separators as `_` under a non-UTF-8
+                # locale (seen with tmux 3.8, LC_ALL=C): parse from the right,
+                # since pane_id and pane_pid never contain either.
+                [[ "$line" =~ ^(.+)[$'\t'_](%[0-9]+)[$'\t'_]([0-9]+)$ ]] || continue
+                [[ "${BASH_REMATCH[3]}" == "$pid" ]] || continue
+                session="${BASH_REMATCH[1]}"; pane_id="${BASH_REMATCH[2]}"; pane_pid="${BASH_REMATCH[3]}"; found=true
+                break
+            done <<< "$panes"
+            $found && break
+            # The first Claude session file below the pane: its own pid-reuse
+            # guard (procStart), then its pane claim must name the pane found.
+            if [[ -z "$claude_pid" && -f "$CLAUDE_SESSIONS_DIR/$pid.json" ]]; then
+                claude_pid="$pid"
+                if _peer_record_for_pid "$pid" --no-tmux >/dev/null 2>&1 \
+                    && [[ "$PEER_REC_PROC_START_MATCH" == "true" && "$PEER_REC_FILE_PID" == "$pid" ]]; then
+                    claude_s="$PEER_REC_TMUX_SESSION"; claude_p="$PEER_REC_TMUX_PANE"
+                fi
+            fi
+        done <<< "$chain"
+        $found || detail="no-pane"
+    fi
+    if $found; then
+        method="pane-walk"
+        [[ -n "$claude_s" && "$claude_s" == "$session" && "$claude_p" == "$pane_id" ]] && method="claude-file"
+        meta="$(_session_metadata_file "$session" 2>/dev/null)" || meta=""
+        rec=""
+        if [[ -n "$meta" && -f "$meta" && ! -L "$meta" ]]; then
+            rec="$(jq -r '[(.pane_id // ""), (.pane_pid // ""), (.pane_started // ""), (.role // ""), (.orch_kind // "")]
+                | map(tostring | gsub("[\t\n\r\u001f]"; " ")) | join("\u001f")' "$meta" 2>/dev/null)" || rec=""
+        fi
+        if [[ -z "$rec" ]]; then
+            detail="no-record"
+        else
+            IFS=$'\x1f' read -r a_pane_id a_pane_pid a_started role orch_kind <<< "$rec"
+            if [[ "$a_pane_id" != "$pane_id" || "$a_pane_pid" != "$pane_pid" ]]; then
+                detail="anchor-mismatch"
+            elif [[ -z "${a_started// /}" ]]; then
+                detail="anchor-missing"
+            else
+                read -r -a words <<< "$a_started"
+                a_started="${words[*]}"
+                # The tmux server's own ps, as the launch anchor was written:
+                # never the caller's locale.
+                live_started="$(unset TMUX TMUX_PANE; _session_tmux_host_process_started "$session" "$pane_pid" 2>/dev/null)" || live_started=""
+                if [[ -z "$live_started" ]]; then
+                    detail="started-unreadable"
+                elif [[ "$live_started" != "$a_started" ]]; then
+                    detail="started-mismatch"
+                else
+                    pane_started="$a_started"
+                    if [[ "$from" == "user" ]]; then
+                        detail="user"
+                    elif [[ -z "$bind_target" ]]; then
+                        detail="name-unbound"
+                    elif [[ "$bind_target" != "$session" ]]; then
+                        detail="name-mismatch"
+                    else
+                        level=session; walk_bound=true
+                    fi
+                fi
+            fi
+        fi
+    else
+        # No pane: env and flag claims may only give a level below session.
+        # `user` is never an agent session: always none.
+        if [[ "$from" == "user" ]]; then
+            :
+        elif [[ -n "$sender_host" && "$sender_host" != "$local_label" && "$sender_host" != "local" ]] \
+            && ! [[ -n "$bind_target" && ( -z "$bind_host" || "$bind_host" == "local" || "$bind_host" == "$local_label" ) ]]; then
+            level=remote; method=ssh; origin_host="$sender_host"
+        elif [[ -n "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" ]]; then
+            level=app-claimed; method=codex-env
+        fi
+    fi
+    if [[ "$impersonate" == "true" ]]; then
+        level=impersonated
+    elif [[ "$ran_077" == "true" ]]; then
+        local verified_077=false
+        [[ -n "$bind_target" && "$caller_077" == "$bind_target" ]] && verified_077=true
+        if [[ "$caller_077" == "$session" && "$verified_077" == "$walk_bound" ]]; then
+            walk_077=agree
+        else
+            walk_077=disagree
+        fi
+    fi
+    [[ "$level" == "session" ]] && detail=""
+    PEER_ATTEST_JSON="$(jq -cn --arg level "$level" --arg method "$method" --arg session "$session" \
+        --arg pane_id "$pane_id" --arg pane_pid "$pane_pid" --arg pane_started "$pane_started" \
+        --arg host_id "$host_id" --arg role "$role" --arg orch_kind "$orch_kind" --arg detail "$detail" \
+        --arg walk_077 "$walk_077" --arg origin_host "$origin_host" '
+        def n: if . == "" then null else . end;
+        {v: 1, level: $level, method: ($method | n), session: ($session | n), pane_id: ($pane_id | n),
+         pane_pid: ($pane_pid | n), pane_started: ($pane_started | n), host_id: ($host_id | n),
+         role: ($role | n), orch_kind: ($orch_kind | n), detail: ($detail | n), walk_077: $walk_077}
+        + (if $origin_host != "" then {origin_host: $origin_host} else {} end)' 2>/dev/null)" || PEER_ATTEST_JSON=""
+    return 0
+}
+
 # One `peer send` resolves the sender identity, the recipient and the --as
 # binding: build the peer document once for all of them (it lists every tmux
 # session). A nested call (the --deliver path's inner send) reuses the caller's.
@@ -7827,6 +7963,14 @@ _peer_cmd_send_impl() {
         return 66
     fi
 
+    # Plan 111 phase 1: stamp the process-tree attest next to the 077 result.
+    # Warn only: it refuses nothing and changes no delivery; fail open.
+    local attest_json="" ran_077=false
+    [[ -n "${TMUX:-}" ]] && ran_077=true
+    _peer_caller_attest "$from" "$from_peer_json" "$impersonate" "$sender_host_override" "$caller_tmux_session" "$ran_077" || true
+    attest_json="${PEER_ATTEST_JSON:-}"
+    [[ -n "$attest_json" ]] || attest_json='{"v":1,"level":"none","method":null,"detail":"attest-failed","walk_077":"skipped"}'
+
     # Durable sender snapshot (plan 023): capture who sent this at send time so a
     # receiver keeps unambiguous identity even after the sender's ephemeral tmux
     # session closes. Purely additive — `from` above is untouched. Field presence
@@ -7882,6 +8026,7 @@ _peer_cmd_send_impl() {
             --arg recipient_provider_task_id "$recipient_provider_task_id" \
             --argjson impersonated "$impersonate" \
             --argjson caller_unresolved "$caller_unresolved" \
+            --argjson attest "$attest_json" \
             '{
               id: $id,
               from: $from,
@@ -7906,6 +8051,7 @@ _peer_cmd_send_impl() {
                 impersonated: (if $impersonated then true else null end),
                 caller_unresolved: (if $caller_unresolved then true else null end)
               } | with_entries(select(.key == "requested_to" or .value != null))),
+              attest: $attest,
               history: [{at: $now, status: "queued", by: $from}]
             } + (if $unknown then {unknown_peer: true} else {} end)')"
         printf '%s\n' "$message" >> "$MESSAGES_FILE"
@@ -11499,6 +11645,51 @@ _peer_doorbell_registered() {
     return 1
 }
 
+# Plan 111 phase 1 doctor check (informational, ok is always true): the attest
+# level distribution of the mailbox, the `detail` of non-session mail, the
+# walk/077 disagreements, and live tmux records with no pane_started anchor.
+# $1 = the mailbox as one JSON array.
+_peer_doctor_attest_check() {
+    local messages="$1" null_anchors
+    null_anchors="$(python3 -I - "$SESSION_METADATA_DIR" 2>/dev/null <<'PYNULL'
+import glob, json, os, sys
+names = set()
+for path in glob.glob(os.path.join(sys.argv[1], "*.json")):
+    if os.path.islink(path):
+        continue
+    try:
+        with open(path, encoding="utf-8") as handle:
+            rec = json.load(handle)
+    except (OSError, ValueError):
+        continue
+    if not isinstance(rec, dict):
+        continue
+    runtime = rec.get("execution_runtime") or rec.get("control_surface")
+    if runtime != "tmux" or rec.get("lifecycle_state") in ("closed", "archived"):
+        continue
+    if rec.get("pane_started") in (None, ""):
+        names.add(str(rec.get("tmux_session") or rec.get("name") or os.path.basename(path)))
+print(json.dumps(sorted(names)))
+PYNULL
+)" || null_anchors=""
+    [[ -n "$null_anchors" ]] || null_anchors='null'
+    # The mailbox on stdin, never argv (it can exceed ARG_MAX).
+    printf '%s' "$messages" | jq -c --argjson nulls "$null_anchors" '
+        (if type == "array" then . else [] end) as $m
+        | ([$m[] | (.attest.level // "unstamped") | tostring] | group_by(.) | map({key: .[0], value: length}) | from_entries) as $levels
+        | ([$m[] | select((.attest.level // "session") != "session") | (.attest.detail // "none") | tostring]
+            | group_by(.) | map({key: .[0], value: length}) | from_entries) as $details
+        | ([$m[] | select(.attest.walk_077 == "disagree")] | length) as $dis
+        | {name: "sender_attest", ok: true, levels: $levels, not_session_detail: $details,
+           walk_077_disagree: $dis, null_anchor_sessions: $nulls,
+           summary: ("levels " + (if ($levels | length) == 0 then "none yet" else ($levels | to_entries | map("\(.key) \(.value)") | join(", ")) end)
+             + "; walk/077 disagreements \($dis)"
+             + (if $nulls == null then "; null anchors unreadable"
+                else "; null anchors \($nulls | length)" + (if ($nulls | length) > 0 then " (" + ($nulls[:10] | join(", ")) + (if ($nulls | length) > 10 then ", ..." else "" end) + ")" else "" end) end)
+             + " (informational, warn only)")}' 2>/dev/null \
+        || printf '%s\n' '{"name":"sender_attest","ok":true,"summary":"mailbox unreadable (informational, warn only)"}'
+}
+
 _peer_cmd_doctor() {
     local target="" json=false peers_doc messages peer_json checks="[]" check ok target_session target_agent="" hook_path
     _arg_has_json "$@" && json=true
@@ -11506,6 +11697,16 @@ _peer_cmd_doctor() {
         case "$1" in
             --json)
                 json=true; shift ;;
+            -h|--help)
+                echo "Usage: cctrl peer doctor [peer] [--json]"
+                echo "  Checks the mailbox, tmux, the doorbell hook and the bridge."
+                echo "  sender_attest (plan 111, informational): the attest level of sent mail"
+                echo "  (session, impersonated, app-claimed, remote, none, unstamped), why mail"
+                echo "  is not level session, walk/077 disagreements, and tmux session records"
+                echo "  with no pane_started anchor (those senders attest none)."
+                echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
+                echo "  running as this user can edit the mailbox, the session records or a pane."
+                return 0 ;;
             -*)
                 $json && _json_error "validation" "Unknown peer doctor flag: $1" || echo -e "${RED}Unknown peer doctor flag: $1${RESET}" >&2
                 return 64 ;;
@@ -11586,10 +11787,13 @@ _peer_cmd_doctor() {
         + (if $cfg == null then {} else {max_rings_per_hour: (if $m == "invalid" then null else $m end), ring_cap_valid: ($m != "invalid")} end)
         + (if $on and $m == "invalid" then {remedy: "max_rings_per_hour \($cfg.max_rings_per_hour | tojson) is invalid, so the bell never rings; run: cctrl peer doorbell enable --max-rings-per-hour N (an integer 1..1000000)"} else {} end)')"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    # Plan 111 phase 1: informational (warn only, never fails doctor).
+    check="$(_peer_doctor_attest_check "${messages:-[]}")"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "sender_attest" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 
