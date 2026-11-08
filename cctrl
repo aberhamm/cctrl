@@ -6653,7 +6653,7 @@ _peer_say_caller_allowed() {
     _peer_attestation_cfg
     [[ "$PEER_ATTEST_MODE" == off ]] && return 0
     _peer_caller_attest "" "" false "" "" false no-claim >/dev/null 2>&1 || PEER_ATTEST_JSON=""
-    { IFS= read -r level; IFS= read -r role; IFS= read -r detail; } < <(jq -r '(.level // "none"), (.role // ""), (.detail // "")' <<< "${PEER_ATTEST_JSON:-null}" 2>/dev/null)
+    { IFS= read -r level; IFS= read -r role; IFS= read -r detail; } < <(jq -r '(.level // "none"), (.role // ""), (.detail // ""), "."' <<< "${PEER_ATTEST_JSON:-null}" 2>/dev/null) || true
     [[ -n "$level" ]] || level=none
     if [[ "$level" != "session" ]]; then
         PEER_SAY_REASON="sender-unattested"; PEER_SAY_DETAIL="level $level${detail:+ ($detail)}"
@@ -11217,7 +11217,7 @@ _peer_doorbell_eval_inner() {
                (if ($in | type) == "object" and $in.stop_hook_active == true then "loop" else "" end),
                (if ($in | type) == "object" and ($in.session_id | type) == "string" then $in.session_id else "" end),
                ($c | max_rings | if type == "number" then floor | tostring else . end),
-               ($c | attest_mode), ($c | attest_since)
+               ($c | attest_mode), ($c | attest_since), "."
           end
     ' <<< "$input")" || return 0
     local state baseline bell_mode allow_peers allow_roles loop_flag stdin_sid max_rings attest_mode attest_since
@@ -11660,7 +11660,7 @@ _peer_attestation_cfg() {
     [[ -n "$cfg" ]] || cfg="$(_peer_doorbell_cfg_json 2>/dev/null)" || cfg="null"
     out="$(jq -r "$PEER_ATTEST_CFG_JQ"'
         (attest_mode), (attest_mode_valid | tostring), attest_since,
-        (if type == "object" then (.attestation_since // "" | tostring | gsub("[\n\r]"; " ")) else "" end)' <<< "${cfg:-null}" 2>/dev/null)" || return 0
+        (if type == "object" then (.attestation_since // "" | tostring | gsub("[\n\r]"; " ")) else "" end), "."' <<< "${cfg:-null}" 2>/dev/null)" || return 0
     { IFS= read -r PEER_ATTEST_MODE; IFS= read -r PEER_ATTEST_MODE_VALID; IFS= read -r PEER_ATTEST_SINCE; IFS= read -r PEER_ATTEST_SINCE_RAW; } <<< "$out"
     case "$PEER_ATTEST_MODE" in off|warn|enforce) ;; *) PEER_ATTEST_MODE=warn ;; esac
     return 0
@@ -11728,7 +11728,8 @@ _peer_push_eligibility() { # peer_json messages inline_id
            ineligible: [$q[] | select(.e.push != true) | {id, from, reason: .e.reason, detail: .e.detail}]}' <<< "${list:-null}" 2>/dev/null)" \
         || summary='{"eligible":[],"ineligible":[{"reason":"sender-unattested","detail":"verify-failed"}]}'
     { IFS= read -r n_el; IFS= read -r n_inel; IFS= read -r reason; } < <(jq -r '(.eligible | length), (.ineligible | length),
-        (if (.ineligible | length) > 0 and all(.ineligible[]; .reason == "sender-not-allowed") then "sender-not-allowed" else "sender-unattested" end)' <<< "$summary" 2>/dev/null)
+        (if (.ineligible | length) > 0 and all(.ineligible[]; .reason == "sender-not-allowed") then "sender-not-allowed" else "sender-unattested" end)' <<< "$summary" 2>/dev/null) || true
+    [[ "$reason" == sender-not-allowed ]] || reason=sender-unattested
     [[ "$n_el" =~ ^[0-9]+$ ]] || n_el=0
     [[ "$n_inel" =~ ^[0-9]+$ ]] || n_inel=1
     if (( n_inel > 0 )); then
@@ -12230,6 +12231,13 @@ _peer_cmd_doctor() {
                 echo "  sender_seal (plan 111, informational): whether the per-host seal key exists"
                 echo "  and its mode (never the key), and how mailbox lines verify now"
                 echo "  (verified, legacy-unsealed, seal-mismatch, other-host-seal, no-host-id, no-session, ...)."
+                echo "  The key dir must be a real 0700 dir and the key 0600, owned by you (never"
+                echo "  chmod'ed): a hand-made 0755 ~/.local/state/cctrl turns sealing off."
+                echo "  sender_eligibility (plan 111, informational): the attestation mode of"
+                echo "  doorbell.json (off | warn | enforce; absent = warn, which only logs), and"
+                echo "  over the last 7 days how much mail could push, ring only the Stop bell, or"
+                echo "  neither, with the senders enforce would block (data/doorbell/attestation.log"
+                echo "  holds the logged decisions)."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;

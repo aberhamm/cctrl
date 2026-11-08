@@ -2,13 +2,13 @@
 id: 112
 title: Peer CLI polish (ls escape, consistent --as, housekeeping)
 status: in-progress
-status-note: "2026-11-08 tasks 1-2 built on feat/peer-cli-polish (on top of plan 111 phases 1-2), not pushed or installed; task 3 is an orchestrator action: fix/mailbox-delivery is already absent locally and on the remote, nothing to delete"
+status-note: "2026-11-08 tasks 1-2 built on feat/peer-cli-polish (on top of plan 111 phases 1-2), verified and pushed to main (77f9a86), not installed; task 3 is an orchestrator action: fix/mailbox-delivery is already absent locally and on the remote, nothing to delete"
 blocked-by: []
 priority: 40
 allows-migrations: false
 review-required: none
 created: 2026-10-28
-approval: pending
+approval: "mdec-1107-orchestrator-autonomy (orchestrator build+push after independent verify)"
 reviews: []
 related: 108
 ---

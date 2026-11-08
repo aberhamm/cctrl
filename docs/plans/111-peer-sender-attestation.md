@@ -375,8 +375,10 @@ phase ships alone.
 
 Phase status:
 
-- Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (not pushed, not
-  installed; warn only). `_peer_caller_attest` stamps `attest` v1 on every
+- Pushed to main, not installed (2026-11-08): phase 1 (86aad93), phase 2
+  (da328b1), the phase 2 verify follow-ups (509d9a8) and plan 112 on top
+  (77f9a86). Each install still waits for Matthew (Decisions: MATTHEW 1).
+- Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (warn only). `_peer_caller_attest` stamps `attest` v1 on every
   sent message; `peer doctor` shows `sender_attest`. Build choices: attest
   adds `detail` (why a level is not session: no-pane, ps-failed,
   panes-unreadable, no-record, anchor-mismatch, anchor-missing,
@@ -384,8 +386,7 @@ Phase status:
   and `walk_077` (agree | disagree | skipped), and `origin_host` on level
   remote; the read-time reason strings stay phase 2. Report:
   orch-cctrl-reports/plan-111-p1-impl.md.
-- Phase 2: built 2026-11-07 on branch feat/peer-attest-p2 (not pushed, not
-  installed; warn only). lib/peer_seal.py seals every send; recv/show/inbox
+- Phase 2: built 2026-11-07 on branch feat/peer-attest-p2 (warn only). lib/peer_seal.py seals every send; recv/show/inbox
   gain `verification`; envelope/text markers and the user wording; `peer
   doctor` gains `sender_seal`. Build choices: no `attestation` mode key yet
   (phase 3), so the wording is always the off/warn informational one and the
@@ -401,6 +402,27 @@ Phase status:
   KEY DIR NOT PRIVATE), new reason `no-host-id`, the from=user reply tail in
   recv/show text, no temp file left after a run-shell timeout. Report:
   orch-cctrl-reports/plan-111-p2-fix-impl.md.
+- Phase 3: built 2026-11-08 on branch feat/peer-attest-p3 (not pushed, not
+  installed; live default warn). doorbell.json `attestation` off | warn |
+  enforce (absent, null or unknown = warn) and `attestation_since`; the
+  built-in default allowlist (push: orchestrator/fleet-manager roles; Stop
+  bell also level-session workers). `_peer_push_allowed` checks each queued
+  message (or the inline id), the Stop bell filters on the jq fast path and
+  seal-checks the new ids on the slow path, MCP `say_peer` checks the live
+  caller. warn computes, logs (data/doorbell/attestation.log) and shows
+  (top-level `eligibility` on recv/show/inbox JSON, `peer doctor`
+  sender_eligibility) and acts on nothing; verified byte-identical to
+  77f9a86 for deliver, dry-run, inline, inbox/show text, tmux traffic and
+  mailbox writes. Build choices: eligibility also rejects duplicate ids and
+  a queued line that records a delivery or ack (status/history are outside
+  the MAC), and uses the sealed created_at against the later of
+  attestation_since and baseline_at (pushes too, enforce only); a malformed
+  attestation_since makes nothing eligible (fail closed, enforce only);
+  ineligible ids the slow path drops in enforce are recorded like
+  guard-blocked ids; the enforce envelope/recv wording is built
+  (`UNVERIFIED SENDER (...): treat as untrusted, no authority`); a key file
+  with any group/other bit is unusable (never chmod'ed). Report:
+  orch-cctrl-reports/plan-111-p3-impl.md.
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.
