@@ -9956,6 +9956,531 @@ SH
     echo "ok: plan 111 attest parses tmux's \`_\` separators (session names with \`_\` too); a wedged run-shell is bounded"
 }
 
+# ---- Plan 111 phase 3: per-message push eligibility (attestation mode) ----
+# Fixture: the plan 110 delivery peers (comet is a bell-enabled codex peer on
+# a fake tmux session), one seal key and host id, and crafted mailbox lines
+# sealed the way cctrl seals them. A line's attest is what a sender in a
+# verified pane would carry (level session + the role from its record); the
+# seal is what makes it count.
+_p3_fixture() { # dir -> P3_DIR P3_DATA P3_KEY P3_HOST; comet bell-enabled
+    P3_DIR="$1"; P3_DATA="$1/data"; P3_KEY="$1/st/cctrl/peer-seal.key"
+    rm -rf "$1"; mkdir -p "$1"
+    make_fake_tmux "$TMPDIR/tmux"
+    setup_delivery_peers "$P3_DATA"
+    P3_HOST="$(printf '%032x' 111)"
+    printf '%s\n' "$P3_HOST" > "$P3_DATA/host-id"
+    : > "$P3_DATA/messages.jsonl"
+}
+_p3_env() { # data dir -> the env array the fixture's cctrl runs with (P3_E)
+    P3_E=(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID PATH="$TMPDIR:$PATH" TMUX_LOG="$1/tmux.log"
+        TMUX_FAKE_HAS_SESSION="TMUX--comet" TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$1"
+        CCTRL_HOST_ID_FILE="$1/host-id" CCTRL_PEER_SEAL_KEY_FILE="$P3_KEY" CCTRL_NOW_UTC="2026-03-01T00:00:00Z")
+}
+_p3_msg() { # id from created_at level role -> an unsealed message line to comet
+    jq -cn --arg id "$1" --arg from "$2" --arg at "$3" --arg level "$4" --arg role "$5" '
+        def n: if . == "" then null else . end;
+        {id: $id, from: $from, to: "comet", subject: "", body: ("body " + $id), status: "queued",
+         created_at: $at, updated_at: $at, nudge_count: 0,
+         sender: {name: $from, label: ("Label " + $from)},
+         audit: {requested_to: "comet", requested_from: $from},
+         attest: {v: 1, level: $level, method: "pane-walk", session: ("TMUX--" + $from), pane_id: "%9", pane_pid: "4242",
+                  pane_started: "Sun Mar  1 00:00:00 2026", host_id: null, role: ($role | n), orch_kind: null, detail: null, walk_077: "skipped"},
+         history: [{at: $at, status: "queued", by: $from}]}'
+}
+_p3_add() { # id from created_at level role [jq edit applied AFTER sealing] -> appends to the fixture mailbox
+    local line
+    line="$(_seal_line "$P3_KEY" "$P3_HOST" "$(_p3_msg "$1" "$2" "$3" "$4" "$5")")" || fail "p3 fixture: seal failed"
+    [[ -n "${6:-}" ]] && line="$(jq -c "$6" <<< "$line")"
+    printf '%s\n' "$line" >> "$P3_DATA/messages.jsonl"
+}
+_p3_mode() { # data dir mode(absent|off|warn|enforce) [attestation_since]
+    local f="$1/doorbell.json"
+    jq --arg m "$2" --arg s "${3:-}" '(if $m == "absent" then del(.attestation) else .attestation = $m end)
+        | (if $s == "" then del(.attestation_since) else .attestation_since = $s end)' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+}
+_p3_copy() { # name mode -> a fresh copy of the fixture data dir (P3_C)
+    P3_C="$P3_DIR/run-$1"
+    rm -rf "$P3_C"; cp -R "$P3_DATA" "$P3_C"; : > "$P3_C/tmux.log"
+    _p3_mode "$P3_C" "$2"
+}
+_p3_norm_log() { sed -E 's/cctrl-(nudge|inline|say)-[^ ]*/cctrl-\1-BUF/g' "$1"; }
+
+# Scenario mailboxes: eligible orchestrator mail E, a forged role (sealed as
+# a no-role session, then the role edited: seal-mismatch), a legacy unsealed
+# line, a level-session worker and a sealed from=user line.
+_p3_build_mixed() {
+    _p3_add msg_20260201_000000_e00001 orch1 2026-02-01T00:00:00Z session orchestrator
+    _p3_add msg_20260201_000001_f00001 mallory 2026-02-01T00:00:01Z session "" '.attest.role = "orchestrator"'
+    _p3_add msg_20260201_000002_l00001 legacy 2026-02-01T00:00:02Z session orchestrator 'del(.seal)'
+    _p3_add msg_20260201_000003_w00001 work1 2026-02-01T00:00:03Z session worker
+    _p3_add msg_20260201_000004_u00001 user 2026-02-01T00:00:04Z none ""
+}
+
+test_peer_attest_p3_warn_delivery_identical() {
+    # Plan 111 phase 3: warn (the live default, also when the key is absent)
+    # computes and logs eligibility but changes no delivery: deliver, inline
+    # and dry-run give byte-identical results, tmux traffic and mailbox
+    # writes to off (plan 110 behaviour), for eligible and forged senders
+    # alike. Only warn writes attestation.log, and only for would-be blocks.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local scen mode out first_out first_log first_box box inl
+    for scen in mixed eligible forged; do
+        _p3_fixture "$TMPDIR/p3-warn-$scen"
+        case "$scen" in
+            mixed) _p3_build_mixed ;;
+            eligible) _p3_add msg_20260201_000000_e00001 orch1 2026-02-01T00:00:00Z session orchestrator ;;
+            forged)
+                _p3_add msg_20260201_000001_f00001 mallory 2026-02-01T00:00:01Z session "" '.attest.role = "orchestrator"'
+                _p3_add msg_20260201_000002_l00001 legacy 2026-02-01T00:00:02Z session orchestrator 'del(.seal)' ;;
+        esac
+        first_out=""; first_log=""; first_box=""
+        for mode in off absent warn; do
+            _p3_copy "$scen-$mode" "$mode"; _p3_env "$P3_C"
+            out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --dry-run --json)"
+            out+=$'\n'"$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+            jq -e -s '.[1].results[0].status == "nudged"' <<< "$out" >/dev/null || fail "$scen/$mode: comet must be nudged as in plan 110: $out"
+            box="$(jq -S -c . "$P3_C/messages.jsonl")"
+            if [[ -z "$first_out" ]]; then
+                first_out="$out"; first_log="$(_p3_norm_log "$P3_C/tmux.log")"; first_box="$box"
+            else
+                [[ "$out" == "$first_out" ]] || fail "$scen: $mode deliver result differs from off:
+$out
+---
+$first_out"
+                [[ "$(_p3_norm_log "$P3_C/tmux.log")" == "$first_log" ]] || fail "$scen: $mode tmux traffic differs from off"
+                [[ "$box" == "$first_box" ]] || fail "$scen: $mode mailbox writes differ from off"
+            fi
+            case "$scen/$mode" in
+                */off|eligible/*) [[ ! -e "$P3_C/doorbell/attestation.log" ]] || fail "$scen/$mode must log nothing: $(cat "$P3_C/doorbell/attestation.log")" ;;
+                *)
+                    jq -e -s 'length >= 1 and all(.[]; .mode == "warn" and .acted == false and .recipient == "comet" and .path == "push")
+                        and (.[0].messages | map(.id) | index("msg_20260201_000001_f00001")) != null' "$P3_C/doorbell/attestation.log" >/dev/null \
+                        || fail "$scen/$mode: warn must log the would-be block: $(cat "$P3_C/doorbell/attestation.log" 2>&1)"
+                    [[ "$(_seal_mode "$P3_C/doorbell/attestation.log")" == 600 ]] || fail "attestation.log must be 0600" ;;
+            esac
+        done
+        # The nudge counts every queued line in warn, as in plan 110.
+        [[ "$scen" == mixed ]] && { jq -e -s '.[1].results[0].queued == 5' <<< "$first_out" >/dev/null || fail "mixed: warn must nudge all 5: $first_out"; }
+    done
+
+    # Inline delivery of a forged line: pasted in warn exactly as in off.
+    _p3_fixture "$TMPDIR/p3-warn-inline"; _p3_build_mixed
+    first_out=""
+    for mode in off warn; do
+        _p3_copy "inline-$mode" "$mode"; _p3_env "$P3_C"
+        inl="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --inline msg_20260201_000001_f00001 --json)"
+        jq -e '.results[0].status == "inline"' <<< "$inl" >/dev/null || fail "warn/off: a forged line must still be pasted inline: $inl"
+        if [[ -z "$first_out" ]]; then first_out="$inl"; first_log="$(_p3_norm_log "$P3_C/tmux.log")"
+        else
+            [[ "$inl" == "$first_out" ]] || fail "inline: warn result differs from off: $inl / $first_out"
+            [[ "$(_p3_norm_log "$P3_C/tmux.log")" == "$first_log" ]] || fail "inline: warn paste differs from off"
+        fi
+    done
+    jq -e -s '.[0].path == "inline" and .[0].messages[0].detail == "seal-mismatch"' "$P3_C/doorbell/attestation.log" >/dev/null \
+        || fail "inline warn log: $(cat "$P3_C/doorbell/attestation.log")"
+    # warn wording on the pasted envelope: informational only.
+    assert_contains "$(cat "$P3_C/tmux.log")" "warn mode"
+    assert_not_contains "$(cat "$P3_C/tmux.log")" "no authority"
+
+    # Shown: inbox/recv JSON carry eligibility; verification is unchanged
+    # (no mode key) in warn; text output shows no eligibility line.
+    _p3_copy show warn; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)"
+    jq -e 'map({key: .id, value: .eligibility}) | from_entries
+        | .msg_20260201_000000_e00001 == {push: true, bell: true, reason: null, detail: null}
+          and .msg_20260201_000001_f00001 == {push: false, bell: false, reason: "sender-unattested", detail: "seal-mismatch"}
+          and .msg_20260201_000002_l00001.detail == "legacy-unsealed"
+          and .msg_20260201_000003_w00001 == {push: false, bell: true, reason: "sender-not-allowed", detail: "role:worker"}
+          and .msg_20260201_000004_u00001.detail == "no-session"' <<< "$out" >/dev/null || fail "inbox eligibility: $out"
+    jq -e 'all(.[]; (.verification | has("mode") | not))' <<< "$out" >/dev/null || fail "warn verification must be the phase 2 shape: $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer show msg_20260201_000003_w00001)"
+    assert_not_contains "$out" "eligibility"
+    [[ -z "$(grep -l eligibility "$P3_C/messages.jsonl")" ]] || fail "eligibility must never be written to the mailbox"
+    # off: nothing computed, no eligibility key.
+    _p3_copy show-off off; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)"
+    jq -e 'all(.[]; has("eligibility") | not)' <<< "$out" >/dev/null || fail "off must not compute eligibility: $out"
+
+    # doctor: mode and the would-be-blocked senders.
+    _p3_copy doctor warn; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" CCTRL_NOW_UTC=2026-02-03T00:00:00Z "$ROOT/cctrl" peer doctor --json)"
+    jq -e '.checks[] | select(.name == "sender_eligibility") | .ok == true and .mode == "warn" and .mode_valid == true
+        and .total == 5 and .push_eligible == 1 and .bell_only == 1 and .not_eligible == 3
+        and ([.would_block_senders[].from] | sort) == ["legacy", "mallory", "user", "work1"]' <<< "$out" >/dev/null \
+        || fail "doctor sender_eligibility: $out"
+    out="$("${P3_E[@]}" CCTRL_NOW_UTC=2026-02-03T00:00:00Z "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" "sender_eligibility: mode warn (logs only, delivery unchanged)"
+    assert_contains "$out" "mallory 1 (seal-mismatch 1)"
+    jq '.attestation = "enforced"' "$P3_C/doorbell.json" > "$P3_C/db.tmp" && mv "$P3_C/db.tmp" "$P3_C/doorbell.json"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" 'mode INVALID "enforced" (reads warn)'
+    # An unknown mode reads warn: delivery as plan 110.
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "an invalid mode must read warn: $out"
+    # doorbell enable keeps the attestation keys.
+    _p3_mode "$P3_C" enforce 2026-01-15T00:00:00Z
+    "${P3_E[@]}" "$ROOT/cctrl" peer doorbell enable --peer extra >/dev/null
+    jq -e '.attestation == "enforce" and .attestation_since == "2026-01-15T00:00:00Z"' "$P3_C/doorbell.json" >/dev/null \
+        || fail "doorbell enable must keep attestation and attestation_since: $(cat "$P3_C/doorbell.json")"
+    echo "ok: plan 111 p3 warn changes no delivery (deliver/inline/dry-run identical to off), logs would-be blocks, shows eligibility"
+}
+
+test_peer_attest_p3_enforce_push_gate() {
+    # Plan 111 phase 3, enforce (set only in this test's doorbell.json): per
+    # message, only sealed level-session orchestrator mail pushes; the nudge
+    # counts and records eligible mail only; a forged/legacy/worker/user-only
+    # queue is queued-only rc 0 (sender-unattested / sender-not-allowed); a
+    # forged inline id is queued-only rc 0; a missing key, mail before
+    # attestation_since, an edited status or a duplicated line never push.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local out rc st
+    _p3_fixture "$TMPDIR/p3-enf"; _p3_build_mixed
+
+    _p3_copy mixed enforce; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "nudged" and .results[0].queued == 1' <<< "$out" >/dev/null || fail "enforce mixed: one eligible push: $out"
+    assert_contains "$(cat "$P3_C/tmux.log")" "1 new peer message"
+    [[ "$(grep -c 'paste-buffer' "$P3_C/tmux.log")" -eq 1 ]] || fail "enforce mixed: exactly one paste"
+    jq -e -s 'map({key: .id, value: (.nudge_count // 0)}) | from_entries
+        | .msg_20260201_000000_e00001 == 1 and ([to_entries[] | select(.key != "msg_20260201_000000_e00001") | .value] | all(. == 0))' \
+        "$P3_C/messages.jsonl" >/dev/null || fail "enforce: the nudge must be recorded on eligible mail only: $(jq -c '{id, nudge_count}' "$P3_C/messages.jsonl")"
+    st="$P3_C/doorbell/state/TMUX--comet.json"
+    if [[ -f "$st" ]]; then
+        jq -e '.rung | keys == ["msg_20260201_000000_e00001"]' "$st" >/dev/null || fail "enforce: ring ids must be eligible only: $(cat "$st")"
+    fi
+    jq -e -s '.[-1].acted == true and .[-1].outcome == "partial" and .[-1].ineligible == 4' "$P3_C/doorbell/attestation.log" >/dev/null \
+        || fail "enforce log: $(cat "$P3_C/doorbell/attestation.log")"
+
+    # Only forged/legacy/user lines: queued-only, sender-unattested, no paste.
+    _p3_fixture "$TMPDIR/p3-enf-forged"
+    _p3_add msg_20260201_000001_f00001 mallory 2026-02-01T00:00:01Z session "" '.attest.role = "orchestrator"'
+    _p3_add msg_20260201_000002_l00001 legacy 2026-02-01T00:00:02Z session orchestrator 'del(.seal)'
+    _p3_add msg_20260201_000004_u00001 user 2026-02-01T00:00:04Z none ""
+    _p3_copy forged enforce; _p3_env "$P3_C"
+    rc=0; out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "enforce forged-only deliver must exit 0, got $rc"
+    jq -e '.results[0].status == "queued-only" and .results[0].reason == "sender-unattested"' <<< "$out" >/dev/null || fail "enforce forged-only: $out"
+    assert_not_contains "$(cat "$P3_C/tmux.log")" "paste-buffer"
+    jq -e -s 'all(.[]; .status == "queued" and (.nudge_count // 0) == 0)' "$P3_C/messages.jsonl" >/dev/null || fail "forged mail must stay queued, no nudge"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet)"
+    assert_contains "$out" "Queued only for comet: sender-unattested (attestation enforce"
+    # Inline of a forged line: queued-only rc 0, nothing pasted.
+    rc=0; out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --inline msg_20260201_000001_f00001 --json)" || rc=$?
+    [[ $rc -eq 0 ]] || fail "enforce forged inline must exit 0, got $rc"
+    jq -e '.results[0].status == "queued-only" and .results[0].reason == "sender-unattested"' <<< "$out" >/dev/null || fail "enforce forged inline: $out"
+    assert_not_contains "$(cat "$P3_C/tmux.log")" "paste-buffer"
+    # enforce wording in recv/inbox text.
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet)"
+    assert_contains "$out" "mallory UNVERIFIED (seal-mismatch)"
+    assert_not_contains "$out" "warn mode"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer show msg_20260201_000002_l00001)"
+    assert_contains "$out" "  sender: legacy UNVERIFIED (legacy-unsealed)"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer show msg_20260201_000002_l00001 --json)"
+    jq -e '.verification.mode == "enforce"' <<< "$out" >/dev/null || fail "enforce verification carries mode: $out"
+
+    # Worker-only queue: the bell may ring, but no push (sender-not-allowed).
+    _p3_fixture "$TMPDIR/p3-enf-worker"
+    _p3_add msg_20260201_000003_w00001 work1 2026-02-01T00:00:03Z session worker
+    _p3_copy worker enforce; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only" and .results[0].reason == "sender-not-allowed"' <<< "$out" >/dev/null || fail "enforce worker push: $out"
+    assert_not_contains "$(cat "$P3_C/tmux.log")" "paste-buffer"
+
+    # Eligible inline: pasted with the verified envelope.
+    _p3_fixture "$TMPDIR/p3-enf-inline"; _p3_build_mixed
+    _p3_copy inline enforce; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --inline msg_20260201_000000_e00001 --json)"
+    jq -e '.results[0].status == "inline"' <<< "$out" >/dev/null || fail "enforce eligible inline: $out"
+    assert_contains "$(cat "$P3_C/tmux.log")" "verified"
+
+    # Missing key: every seal reads seal-mismatch -> no push, rc 0.
+    _p3_copy nokey enforce; _p3_env "$P3_C"
+    mv "$P3_KEY" "$P3_KEY.away"
+    rc=0; out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)" || rc=$?
+    mv "$P3_KEY.away" "$P3_KEY"
+    [[ $rc -eq 0 ]] && jq -e '.results[0].status == "queued-only" and .results[0].reason == "sender-unattested"' <<< "$out" >/dev/null \
+        || fail "enforce with no key must not push (rc $rc): $out"
+    assert_not_contains "$(cat "$P3_C/tmux.log")" "paste-buffer"
+
+    # attestation_since after the eligible line: nothing older pushes; an
+    # invalid attestation_since fails closed.
+    _p3_copy since enforce; _p3_env "$P3_C"; _p3_mode "$P3_C" enforce 2026-02-15T00:00:00Z
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "mail before attestation_since must not push: $out"
+    jq -e -s '.[-1].messages | any(.detail == "before-attestation-since")' "$P3_C/doorbell/attestation.log" >/dev/null || fail "since log: $(cat "$P3_C/doorbell/attestation.log")"
+    _p3_copy since-bad enforce; _p3_env "$P3_C"; _p3_mode "$P3_C" enforce "yesterday"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "an invalid attestation_since must fail closed: $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" 'attestation_since INVALID "yesterday"'
+
+    # Replays of verified mail: status/history are outside the MAC.
+    # (a) acked -> queued edit; (b) a verbatim duplicate line (same id).
+    _p3_fixture "$TMPDIR/p3-enf-replay"
+    _p3_add msg_20260201_000000_e00001 orch1 2026-02-01T00:00:00Z session orchestrator \
+        '.acked_at = "2026-02-02T00:00:00Z" | .history += [{at: "2026-02-02T00:00:00Z", status: "acked", by: "comet"}]'
+    _p3_copy replay-status enforce; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "an acked line edited back to queued must not push: $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)"
+    jq -e '.[0].verification.verified == true and .[0].eligibility.detail == "status-edited"' <<< "$out" >/dev/null || fail "status-edited: $out"
+    _p3_fixture "$TMPDIR/p3-enf-dup"
+    _p3_add msg_20260201_000000_e00001 orch1 2026-02-01T00:00:00Z session orchestrator
+    head -1 "$P3_DATA/messages.jsonl" >> "$P3_DATA/messages.jsonl"
+    _p3_copy replay-dup enforce; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)"
+    jq -e 'length == 2 and all(.[]; .verification.verified == true and .eligibility.detail == "duplicate-id")' <<< "$out" >/dev/null || fail "duplicate ids: $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "a duplicated line must not push: $out"
+    # (c) one planted bad line does not suppress eligible mail (no DoS).
+    _p3_fixture "$TMPDIR/p3-enf-dos"; _p3_build_mixed
+    _p3_add msg_20260201_000009_e00009 orch1 2026-02-01T00:00:09Z session orchestrator
+    head -1 "$P3_DATA/messages.jsonl" >> "$P3_DATA/messages.jsonl"
+    _p3_copy dos enforce; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "nudged" and .results[0].queued == 1' <<< "$out" >/dev/null || fail "planted lines must not block the eligible one: $out"
+
+    # The enforce sender notice on send --deliver (a sender is present).
+    _p3_copy notice enforce; _p3_env "$P3_C"
+    : > "$P3_C/messages.jsonl"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer send comet --from orchestrator --deliver --json -- "from outside a pane")"
+    jq -e '.ok == true and .delivered == false and .delivery_reason == "sender-unattested"' <<< "$out" >/dev/null || fail "enforce send --deliver: $out"
+    echo "ok: plan 111 p3 enforce pushes eligible mail only, per message; forged/legacy/worker/user/replayed/old mail stays queued (rc 0)"
+}
+
+test_peer_attest_p3_stop_bell() {
+    # Plan 111 phase 3, Stop bell: warn and off ring exactly as before for
+    # forged and legacy mail (warn logs the would-be block); enforce rings
+    # only for sealed level-session orchestrator or worker mail, never for
+    # from=user, forged roles or mail before attestation_since.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local mode host key="$TMPDIR/p3-bell-key/cctrl/peer-seal.key" off_err=""
+    _p3_bell_line() { # to id from created level role [post-seal jq]
+        local line
+        line="$(jq -cn --arg id "$2" --arg from "$3" --arg at "$4" --arg level "$5" --arg role "$6" --arg to "$1" '
+            {id: $id, from: $from, to: $to, subject: $id, body: "b", status: "queued", created_at: $at, updated_at: $at, nudge_count: 0,
+             sender: {name: $from}, audit: {requested_to: $to, requested_from: $from},
+             attest: {v: 1, level: $level, session: ("TMUX--" + $from), role: (if $role == "" then null else $role end)},
+             history: [{at: $at, status: "queued", by: $from}]}')"
+        line="$(_seal_line "$key" "$host" "$line")" || fail "bell seal failed"
+        [[ -n "${7:-}" ]] && line="$(jq -c "$7" <<< "$line")"
+        printf '%s\n' "$line" >> "$BELL_DATA/messages.jsonl"
+    }
+    for mode in off warn enforce; do
+        _bell_fixture "$TMPDIR/p3-bell-$mode"
+        # The fixture runs a copy of cctrl; the seal check needs its lib.
+        cp -R "$ROOT/lib" "$BELL_DIR/lib"
+        export CCTRL_HOST_ID_FILE="$BELL_DATA/host-id" CCTRL_PEER_SEAL_KEY_FILE="$key"
+        host="$(printf '%032x' 112)"; printf '%s\n' "$host" > "$BELL_DATA/host-id"
+        _bell_enable "$(jq -c --arg m "$mode" '. + {attestation: $m}' <<< "$_bell_cfg_default")"
+        # forged role + legacy line: rings in off/warn, silent in enforce.
+        _p3_bell_line TMUX--t-a msg_20260201_000001_f00001 mallory 2026-02-01T00:00:01Z session "" '.attest.role = "orchestrator"'
+        _p3_bell_line TMUX--t-a msg_20260201_000002_l00001 legacy 2026-02-01T00:00:02Z session orchestrator 'del(.seal)'
+        _bell_stop
+        case "$mode" in
+            off|warn)
+                [[ "$BELL_RC" -eq 2 ]] || fail "$mode: forged mail must still ring (rc $BELL_RC)"
+                assert_contains "$BELL_ERR" "2 new peer message(s)"
+                if [[ "$mode" == off ]]; then off_err="$BELL_ERR"; [[ ! -e "$BELL_DATA/doorbell/attestation.log" ]] || fail "off must not log"
+                else
+                    [[ "$BELL_ERR" == "$off_err" ]] || fail "warn bell text differs from off: $BELL_ERR / $off_err"
+                    jq -e -s '.[0].path == "bell" and .[0].acted == false and .[0].ineligible == 2' "$BELL_DATA/doorbell/attestation.log" >/dev/null \
+                        || fail "warn bell log: $(cat "$BELL_DATA/doorbell/attestation.log" 2>&1)"
+                fi ;;
+            enforce)
+                [[ "$BELL_RC" -eq 0 ]] || fail "enforce: forged/legacy mail must not ring: $BELL_ERR"
+                # The forged role passed the jq fast path and failed the seal
+                # check: recorded, so it never costs a slow path again.
+                jq -e '.rung["msg_20260201_000001_f00001"] == "blocked"' "$BELL_DATA/doorbell/state/TMUX--t-a.json" >/dev/null \
+                    || fail "enforce: a forged id must be recorded: $(cat "$BELL_DATA/doorbell/state/TMUX--t-a.json" 2>&1)"
+                # user mail never rings.
+                _p3_bell_line TMUX--t-a msg_20260201_000003_u00001 user 2026-02-01T00:00:03Z none ""
+                _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "enforce: from=user must not ring"
+                # a level-session worker rings the bell.
+                _p3_bell_line TMUX--t-a msg_20260201_000004_w00001 work1 2026-02-01T00:00:04Z session worker
+                _bell_stop; [[ "$BELL_RC" -eq 2 ]] || fail "enforce: a level-session worker must ring the bell: $(cat "$BELL_DATA/doorbell/attestation.log" 2>&1)"
+                assert_contains "$BELL_ERR" "1 new peer message(s)"
+                # an orchestrator rings; mail before attestation_since does not.
+                _p3_bell_line TMUX--t-a msg_20260201_000005_e00001 orch1 2026-02-01T00:00:05Z session orchestrator
+                _bell_enable "$(jq -c '. + {attestation: "enforce", attestation_since: "2026-02-10T00:00:00Z"}' <<< "$_bell_cfg_default")"
+                _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "enforce: mail before attestation_since must not ring"
+                _bell_enable "$(jq -c '. + {attestation: "enforce"}' <<< "$_bell_cfg_default")"
+                _bell_stop; [[ "$BELL_RC" -eq 2 ]] || fail "enforce: orchestrator mail must ring"
+                _bell_enable "$(jq -c '. + {attestation: "enforce", attestation_since: "garbage"}' <<< "$_bell_cfg_default")"
+                _p3_bell_line TMUX--t-a msg_20260201_000006_e00002 orch1 2026-02-01T00:00:06Z session orchestrator
+                _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "enforce: an invalid attestation_since must fail closed"
+                # missing key: the slow path cannot verify -> silent.
+                _bell_enable "$(jq -c '. + {attestation: "enforce"}' <<< "$_bell_cfg_default")"
+                mv "$key" "$key.away"; _bell_stop; mv "$key.away" "$key"
+                [[ "$BELL_RC" -eq 0 ]] || fail "enforce with no key must not ring" ;;
+        esac
+        unset CCTRL_HOST_ID_FILE CCTRL_PEER_SEAL_KEY_FILE
+    done
+    echo "ok: plan 111 p3 Stop bell: off/warn ring as before (warn logs), enforce rings only for eligible senders"
+}
+
+test_peer_attest_p3_say_peer() {
+    # Plan 111 phase 3: MCP say_peer (CCTRL_SAY_REQUIRE_DOORBELL=1) checks
+    # the live caller. warn: refused callers are logged, the paste happens
+    # exactly as in off. enforce: level none is refused (no paste); an
+    # orchestrator pane at level session passes. CLI `peer say` stays ungated.
+    command -v perl >/dev/null || { echo "skip: no perl"; return 0; }
+    local t="$TMPDIR/p3-say" data out mode rc off_log="" sess="TMUX--p3orch"
+    rm -rf "$t"; mkdir -p "$t/bin" "$t/meta"
+    make_fake_tmux "$TMPDIR/tmux"
+    make_fake_ps "$TMPDIR/ps"
+    data="$t/data"; setup_delivery_peers "$data"
+    # list-panes in the attest format and run-shell are answered here; all
+    # other tmux calls go to the shared fake.
+    cat > "$t/bin/tmux" <<SH
+#!/usr/bin/env bash
+if [[ "\${1:-}" == list-panes && "\$*" == *'#{session_name}	#{pane_id}	#{pane_pid}'* ]]; then
+    [[ -f "\${STUB_PID_FILE:-/nonexistent}" ]] || exit 1
+    printf '%s\t%%7\t%s\n' "$sess" "\$(cat "\$STUB_PID_FILE")"; exit 0
+fi
+if [[ "\${1:-}" == run-shell ]]; then exec sh -c "\$2"; fi
+exec "$TMPDIR/tmux" "\$@"
+SH
+    chmod +x "$t/bin/tmux"
+    cat > "$t/pre.sh" <<'SH'
+printf '%s' "$$" > "$1"
+started="$(ps -o lstart= -p $$ | awk '{$1=$1; print}')"
+jq -n --arg s "$2" --arg pid "$$" --arg st "$started" --arg role "$4" \
+    '{name: $s, tmux_session: $s, control_surface: "tmux", pane_id: "%7", pane_pid: $pid, pane_started: $st, role: $role}' > "$3/$2.json"
+shift 4
+exec "$@"
+SH
+    local -a e=(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID PATH="$t/bin:$TMPDIR:$PATH" TMUX_FAKE_HAS_SESSION="TMUX--comet"
+        TMUX_FAKE_SESSIONS="TMUX--comet" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SESSION_METADATA_DIR="$t/meta"
+        CCTRL_CLAUDE_SESSIONS_DIR="$t/csess" CCTRL_TMUX_TIMEOUT_SECONDS=5)
+    for mode in off warn enforce; do
+        jq --arg m "$mode" '.attestation = $m' "$data/doorbell.json" > "$data/db.tmp" && mv "$data/db.tmp" "$data/doorbell.json"
+        rm -f "$data/doorbell/attestation.log" "$t/pid"
+        # Outside any pane (level none).
+        : > "$t/tmux.log"; rc=0
+        out="$("${e[@]}" TMUX_LOG="$t/tmux.log" CCTRL_SAY_REQUIRE_DOORBELL=1 "$ROOT/cctrl" peer say comet --json -- "say $mode" 2>&1)" || rc=$?
+        case "$mode" in
+            off|warn)
+                [[ $rc -eq 0 ]] || fail "$mode: say_peer from level none must still paste (rc $rc): $out"
+                assert_contains "$(cat "$t/tmux.log")" "paste-buffer"
+                if [[ "$mode" == off ]]; then off_log="$(_p3_norm_log "$t/tmux.log" | grep -E 'load-buffer|set-buffer|paste-buffer|send-keys|delete-buffer')"
+                    [[ ! -e "$data/doorbell/attestation.log" ]] || fail "off must not log say"
+                else
+                    # warn adds only the attest walk's reads; the writes are identical.
+                    [[ "$(_p3_norm_log "$t/tmux.log" | grep -E 'load-buffer|set-buffer|paste-buffer|send-keys|delete-buffer')" == "$off_log" && -n "$off_log" ]] \
+                        || fail "warn say tmux writes differ from off: $(_p3_norm_log "$t/tmux.log") /// $off_log"
+                    jq -e -s '.[0].path == "say" and .[0].acted == false and .[0].outcome == "sender-unattested"' "$data/doorbell/attestation.log" >/dev/null \
+                        || fail "warn say log: $(cat "$data/doorbell/attestation.log" 2>&1)"
+                fi ;;
+            enforce)
+                [[ $rc -ne 0 ]] || fail "enforce: say_peer from level none must be refused: $out"
+                jq -e '.ok == false and .error.code == "sender-unattested" and (.error.message | contains("send_message"))' <<< "$out" >/dev/null \
+                    || fail "enforce say refusal: $out"
+                assert_not_contains "$(cat "$t/tmux.log")" "paste-buffer"
+                # CLI peer say (no CCTRL_SAY_REQUIRE_DOORBELL) stays ungated.
+                : > "$t/tmux.log"
+                "${e[@]}" TMUX_LOG="$t/tmux.log" "$ROOT/cctrl" peer say comet --json -- "cli say" >/dev/null || fail "CLI peer say must stay ungated"
+                assert_contains "$(cat "$t/tmux.log")" "paste-buffer"
+                # A worker pane at level session: not allowed to say_peer.
+                : > "$t/tmux.log"; rc=0
+                out="$("${e[@]}" TMUX_LOG="$t/tmux.log" STUB_PID_FILE="$t/pid" CCTRL_SAY_REQUIRE_DOORBELL=1 \
+                    bash "$t/pre.sh" "$t/pid" "$sess" "$t/meta" worker "$ROOT/cctrl" peer say comet --json -- "worker say" 2>&1)" || rc=$?
+                [[ $rc -ne 0 ]] && jq -e '.error.code == "sender-not-allowed"' <<< "$out" >/dev/null || fail "enforce: a worker say_peer must be refused: $out"
+                # An orchestrator pane at level session passes.
+                : > "$t/tmux.log"; rc=0
+                out="$("${e[@]}" TMUX_LOG="$t/tmux.log" STUB_PID_FILE="$t/pid" CCTRL_SAY_REQUIRE_DOORBELL=1 \
+                    bash "$t/pre.sh" "$t/pid" "$sess" "$t/meta" orchestrator "$ROOT/cctrl" peer say comet --json -- "orch say" 2>&1)" || rc=$?
+                [[ $rc -eq 0 ]] || fail "enforce: an orchestrator say_peer must pass (rc $rc): $out"
+                assert_contains "$(cat "$t/tmux.log")" "paste-buffer" ;;
+        esac
+    done
+    # The MCP tool surfaces the refusal code.
+    out="$(jq -cn '{jsonrpc:"2.0",id:3,method:"tools/call",params:{name:"say_peer",arguments:{to:"comet",body:"mcp"}}}' \
+        | "${e[@]}" TMUX_LOG="$t/tmux.log" "$ROOT/cctrl" peer mcp --as orchestrator)"
+    jq -e '.result.isError == true and .result.structuredContent.error.code == "sender-unattested"' <<< "$out" >/dev/null || fail "MCP say_peer enforce: $out"
+    echo "ok: plan 111 p3 say_peer: warn logs only (paste as off), enforce refuses non-orchestrator callers"
+}
+
+test_peer_seal_p3_carry_items() {
+    # Plan 111 phase 3 carry list: a key FILE with any 0o077 bit is refused
+    # (never chmod'ed; doctor KEY NOT PRIVATE); a symlinked key dir says so;
+    # stale `.peer-seal.*.tmp` files are swept; a huge seal timeout keeps the
+    # bound; an ignored SIGALRM in the parent cannot disable it; the late
+    # run-shell redirect is silent; the --as/--from conflict prints values
+    # without escape interpretation.
+    command -v python3 >/dev/null && command -v perl >/dev/null || { echo "skip: no python3/perl"; return 0; }
+    local t="$TMPDIR/p3-carry" data out rc t0 t1 key
+    rm -rf "$t"; mkdir -p "$t/data" "$t/bin"
+    data="$t/data"
+    local -a e=(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id")
+    "${e[@]}" "$ROOT/cctrl" peer register cr-rcpt --dir "$t" --agent codex >/dev/null
+    "${e[@]}" "$ROOT/cctrl" peer register cr-mo --dir "$t" --agent codex >/dev/null
+
+    # 1. key file mode 0644 in a 0700 dir: unusable, mode kept, doctor says so.
+    key="$t/k1/peer-seal.key"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- first)"
+    jq -e '.seal.mac' <<< "$out" >/dev/null || fail "positive control: the first send must seal: $out"
+    chmod 644 "$key"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- second)" || fail "a wide key must not block a send"
+    jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "a 0644 key must not seal: $out"
+    [[ "$(_seal_mode "$key")" == 644 ]] || fail "the key mode must never be changed: $(_seal_mode "$key")"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer inbox --as cr-rcpt --json)"
+    jq -e 'all(.[]; .verification.verified == false and (.verification.reason == "seal-mismatch" or .verification.reason == "legacy-unsealed"))' <<< "$out" >/dev/null \
+        || fail "mail must not verify with a wide key: $out"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" "KEY NOT PRIVATE (mode 0644, needs 0600"
+    chmod 600 "$key"
+
+    # 2. symlinked key dir.
+    mkdir -p "$t/realdir"; chmod 700 "$t/realdir"; ln -s "$t/realdir" "$t/linkdir"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/linkdir/peer-seal.key" "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" "the key dir is a symlink"
+    [[ ! -e "$t/realdir/peer-seal.key" ]] || fail "no key may be created through a symlinked dir"
+
+    # 3. stale temp files: a dead pid's temp is swept by the next seal; a
+    # live creator's fresh temp is kept; doctor counts the stale ones.
+    printf 'x' > "$t/k1/.peer-seal.99999999.deadbeef.tmp"; chmod 600 "$t/k1/.peer-seal.99999999.deadbeef.tmp"
+    printf 'y' > "$t/k1/.peer-seal.$$.cafe0001.tmp"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" "1 stale key temp file(s)"
+    "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- third >/dev/null
+    [[ ! -e "$t/k1/.peer-seal.99999999.deadbeef.tmp" ]] || fail "a dead creator's temp must be swept"
+    [[ -e "$t/k1/.peer-seal.$$.cafe0001.tmp" ]] || fail "a live creator's fresh temp must be kept"
+    rm -f "$t/k1/.peer-seal.$$.cafe0001.tmp"
+    # The link..unlink window holds SIGALRM (static: the mask is there).
+    grep -q 'pthread_sigmask' "$ROOT/lib/peer_seal.py" || fail "ensure_key must hold SIGALRM across link/unlink"
+
+    # 4. huge CCTRL_PEER_SEAL_TIMEOUT_SECONDS falls back to 5 s; an ignored
+    # SIGALRM in the parent does not disable the bound.
+    printf '#!/bin/sh\nexec sleep 30\n' > "$t/bin/python3"; chmod +x "$t/bin/python3"
+    t0="$(date +%s)"
+    out="$(PATH="$t/bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/k2/k" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=99999999999999999999 \
+        "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- huge 2>&1)" || fail "huge bound send failed: $out"
+    t1="$(date +%s)"
+    [[ $(( t1 - t0 )) -lt 15 ]] || fail "a huge seal timeout disabled the bound ($(( t1 - t0 )) s)"
+    t0="$(date +%s)"
+    out="$(PATH="$t/bin:$PATH" bash -c 'trap "" ALRM; exec "$@"' _ "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/k2/k" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 \
+        "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- ignored 2>&1)" || fail "ignored-ALRM send failed: $out"
+    t1="$(date +%s)"
+    [[ $(( t1 - t0 )) -lt 10 ]] || fail "an ignored SIGALRM in the parent disabled the bound ($(( t1 - t0 )) s)"
+    local n
+    n="$(grep -c "perl -e '\$SIG{ALRM}=\"DEFAULT\"; alarm shift @ARGV;" "$ROOT/cctrl")"
+    [[ "$n" -ge 3 && "$(grep -c "perl -e 'alarm shift" "$ROOT/cctrl")" -eq 0 ]] || fail "every perl alarm bound must reset SIGALRM first ($n)"
+    grep -q '\[1-9\]\[0-9\]{0,3}\$' "$ROOT/cctrl" || fail "the seal timeout regex must be capped"
+
+    # 5. the run-shell redirect: stderr is silenced before the output file
+    # opens, so a late run with the dir gone prints nothing.
+    grep -q 'tmux run-shell "$command 2>/dev/null > $tmp"' "$ROOT/cctrl" || fail "run-shell must redirect stderr before the output file"
+    out="$(sh -c 'true 2>/dev/null > /nonexistent-p3-dir/out' 2>&1)" || true
+    [[ -z "$out" ]] || fail "the redirect order must be silent: $out"
+
+    # 6. the --as/--from conflict prints the values as given.
+    rc=0; out="$("${e[@]}" "$ROOT/cctrl" peer send cr-rcpt --as 'a\tb' --from 'c\n' -- x 2>&1)" || rc=$?
+    [[ $rc -eq 64 ]] || fail "conflict must be 64, got $rc"
+    assert_contains "$out" "--as 'a\\tb' and --from 'c\\n'"
+    echo "ok: plan 111 p3 carry items (wide key file, symlinked dir, stale temps, seal bound, SIGALRM, run-shell redirect, conflict text)"
+}
+
 test_peer_reply_core() {
     # plan 027: reply-by-message-id (happy, legacy, unauthorized, user, dead sender,
     # delivery failure keeps queued) plus plain `peer send` byte-identical guard.

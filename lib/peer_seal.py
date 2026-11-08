@@ -7,9 +7,14 @@ ever prints MACs (which are not secret) and verification facts.
 Modes:
   seal <host_id>    stdin: one message object. stdout: the hex MAC.
                     Creates the key on first use (atomic, create-once).
-  verify <host_id>  stdin: a JSON array of messages. stdout: a JSON array of
+  verify <host_id> [--eligibility <since>]
+                    stdin: a JSON array of messages. stdout: a JSON array of
                     verification objects, one per message, same order.
-                    Never creates the key.
+                    Never creates the key. With --eligibility (plan 111
+                    phase 3) each object also carries `eligibility`: whether
+                    the message may push or ring the Stop bell under the
+                    built-in default allowlist. <since> is the effective
+                    attestation_since (ISO UTC), "" for none, or "invalid".
   doctor <host_id>  stdin: a JSON array of messages. stdout: one JSON object
                     with the key status (path, exists, mode; never the key)
                     and verification counts. Never creates the key.
@@ -20,12 +25,14 @@ this user can read the key file.
 Key file: $CCTRL_PEER_SEAL_KEY_FILE, else $HOME/.local/state/cctrl/peer-seal.key
 (pinned, not XDG_STATE_HOME, so every caller on the host resolves one file).
 32 random bytes, file 0600, dir 0700. A key dir that is not 0700 and owned
-by this user makes the key unusable (never chmod'ed): sends go unsealed.
+by this user, or a key file with any group/other bit, makes the key unusable
+(never chmod'ed): sends go unsealed, sealed mail reads seal-mismatch.
 """
 import hashlib
 import hmac
 import json
 import os
+import signal
 import stat
 import sys
 import time
@@ -42,6 +49,15 @@ SEALED_FIELDS = (
     "recipient_provider_task_id", "unknown_peer",
 )
 HASHED_FIELDS = ("body", "subject")
+# Plan 111 phase 3: the built-in default allowlist (no config key; phase 4
+# makes it configurable). Push: orchestrators (fleet-manager is role
+# orchestrator with orch_kind fleet). The Stop bell also admits workers: it
+# carries fixed nudge text.
+PUSH_ROLES = ("orchestrator", "fleet-manager")
+BELL_ONLY_ROLES = ("worker",)
+TMP_PREFIX = ".peer-seal."
+TMP_SUFFIX = ".tmp"
+TMP_STALE_SECONDS = 60
 LEVEL_REASON = {
     "impersonated": "impersonated",
     "app-claimed": "app-claimed",
@@ -90,6 +106,10 @@ def read_key(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
             raise SealKeyError("not-a-private-file")
+        # A key file with any group/other bit may have been exposed (copied or
+        # restored from a wider place): it stops verifying. Never chmod'ed.
+        if info.st_mode & 0o077:
+            raise SealKeyError("key-not-private")
         if not _dir_private(os.path.dirname(path) or "."):
             raise SealKeyError("dir-not-private")
         data = b""
@@ -125,7 +145,7 @@ def ensure_key(path):
     # link(2): link never replaces an existing name, so two first senders
     # cannot end up with different keys, and the final name never holds a
     # partial key.
-    tmp = os.path.join(directory, ".peer-seal.%d.%s.tmp" % (os.getpid(), os.urandom(4).hex()))
+    tmp = os.path.join(directory, "%s%d.%s%s" % (TMP_PREFIX, os.getpid(), os.urandom(4).hex(), TMP_SUFFIX))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     try:
         try:
@@ -138,6 +158,10 @@ def ensure_key(path):
             os.fsync(fd)
         finally:
             os.close(fd)
+        # The caller's time bound is a SIGALRM: held off between link and
+        # unlink, so a kill can never leave the temp as a second hard link to
+        # the live key (a pending alarm fires right after the unlink).
+        _hold_alarm(True)
         try:
             os.link(tmp, path)
         except FileExistsError:
@@ -147,6 +171,7 @@ def ensure_key(path):
             os.unlink(tmp)
         except OSError:
             pass
+        _hold_alarm(False)
     last = None
     for _ in range(5):
         try:
@@ -155,6 +180,55 @@ def ensure_key(path):
             last = exc
             time.sleep(0.01)
     raise SealKeyError(str(last) or "unreadable")
+
+
+def _hold_alarm(hold):
+    try:
+        signal.pthread_sigmask(signal.SIG_BLOCK if hold else signal.SIG_UNBLOCK, {signal.SIGALRM})
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _stale_tmps(directory, sweep):
+    """Temp files a killed first-key create left in the key dir: the pid in
+    the name is gone, or the file is older than TMP_STALE_SECONDS. A live
+    creator's fresh temp is never touched. With sweep, they are removed."""
+    found = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    now = time.time()
+    for name in names:
+        if not (name.startswith(TMP_PREFIX) and name.endswith(TMP_SUFFIX)):
+            continue
+        full = os.path.join(directory, name)
+        try:
+            info = os.lstat(full)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+            continue
+        alive = False
+        try:
+            pid = int(name[len(TMP_PREFIX):].split(".", 1)[0])
+            os.kill(pid, 0)
+            alive = True
+        except (ValueError, ProcessLookupError):
+            alive = False
+        except PermissionError:
+            alive = True
+        except OSError:
+            alive = False
+        if alive and now - info.st_mtime < TMP_STALE_SECONDS:
+            continue
+        found += 1
+        if sweep:
+            try:
+                os.unlink(full)
+            except OSError:
+                pass
+    return found
 
 
 def _text_digest(value):
@@ -239,6 +313,69 @@ def verify_one(message, host_id, key):
     return out
 
 
+def _status_edited(message):
+    """status and history are outside the MAC. cctrl never moves a message
+    back to queued, so a queued line that records a delivery or an ack was
+    edited (a replay of acked mail)."""
+    if message.get("status") != "queued":
+        return False
+    if message.get("delivered_at") or message.get("acked_at"):
+        return True
+    history = message.get("history")
+    if isinstance(history, list):
+        for entry in history:
+            if isinstance(entry, dict) and entry.get("status") in ("delivered", "acked", "blocked"):
+                return True
+    return False
+
+
+def eligibility_one(message, ver, dup_ids, since):
+    """Plan 111 phase 3, per message: push needs a verified seal, level
+    session, no replay sign, sealed created_at after `since`, and a push role;
+    the Stop bell also admits workers. Only sealed fields decide, except the
+    replay checks, which can only take eligibility away."""
+    out = {"push": False, "bell": False, "reason": "sender-unattested", "detail": None}
+    if not isinstance(message, dict) or not ver.get("verified"):
+        out["detail"] = ver.get("reason") or "legacy-unsealed"
+        return out
+    mid = message.get("id")
+    if not isinstance(mid, str) or mid in dup_ids:
+        out["detail"] = "duplicate-id"
+        return out
+    if _status_edited(message):
+        out["detail"] = "status-edited"
+        return out
+    if since == "invalid":
+        out["detail"] = "attestation-since-invalid"
+        return out
+    created = message.get("created_at")
+    if since and not (isinstance(created, str) and created > since):
+        out["detail"] = "before-attestation-since"
+        return out
+    attest = message.get("attest") if isinstance(message.get("attest"), dict) else {}
+    role = attest.get("role") if isinstance(attest.get("role"), str) else ""
+    if role in PUSH_ROLES:
+        out.update(push=True, bell=True, reason=None)
+        return out
+    out["reason"] = "sender-not-allowed"
+    out["detail"] = "role:" + (role or "none")
+    if role in BELL_ONLY_ROLES:
+        out["bell"] = True
+    return out
+
+
+def _dup_ids(messages):
+    seen, dups = set(), set()
+    for m in messages:
+        if isinstance(m, dict):
+            mid = m.get("id")
+            if isinstance(mid, str):
+                if mid in seen:
+                    dups.add(mid)
+                seen.add(mid)
+    return dups
+
+
 def _load_key_or_none():
     try:
         return read_key(key_path())
@@ -261,15 +398,30 @@ def cmd_seal(host_id):
     message = json.loads(sys.stdin.read())
     if not isinstance(message, dict):
         return 2
-    key = ensure_key(key_path())
+    path = key_path()
+    key = ensure_key(path)
     sys.stdout.write(mac_for(message, host_id, key) + "\n")
+    sys.stdout.flush()
+    # Leftovers of a first-key create killed by the time bound.
+    _stale_tmps(os.path.dirname(path) or ".", True)
     return 0
 
 
-def cmd_verify(host_id):
+def cmd_verify(host_id, opts):
+    eligibility = False
+    since = ""
+    if opts:
+        if len(opts) != 2 or opts[0] != "--eligibility":
+            return 64
+        eligibility, since = True, opts[1]
     messages = _read_messages()
     key = _load_key_or_none()
-    sys.stdout.write(json.dumps([verify_one(m, host_id, key) for m in messages], separators=(",", ":")) + "\n")
+    results = [verify_one(m, host_id, key) for m in messages]
+    if eligibility:
+        dups = _dup_ids(messages)
+        for m, ver in zip(messages, results):
+            ver["eligibility"] = eligibility_one(m, ver, dups, since)
+    sys.stdout.write(json.dumps(results, separators=(",", ":")) + "\n")
     return 0
 
 
@@ -293,8 +445,10 @@ def cmd_doctor(host_id):
             dinfo = os.lstat(directory)
             status["dir_mode"] = "%04o" % stat.S_IMODE(dinfo.st_mode)
             status["dir_private"] = _dir_private(directory)
+            status["dir_symlink"] = stat.S_ISLNK(dinfo.st_mode)
         except OSError:
             pass
+        status["stale_tmp"] = _stale_tmps(directory, False)
     except SealKeyError as exc:
         status["error"] = str(exc)
     key = _load_key_or_none()
@@ -323,7 +477,7 @@ def main(argv):
         if mode == "seal":
             return cmd_seal(host_id)
         if mode == "verify":
-            return cmd_verify(host_id)
+            return cmd_verify(host_id, argv[3:])
         if mode == "doctor":
             return cmd_doctor(host_id)
     except (OSError, ValueError, SealKeyError) as exc:
