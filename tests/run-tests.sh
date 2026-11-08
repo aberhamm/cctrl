@@ -17724,6 +17724,136 @@ JSON
     echo "ok: peer ls human output shows SESSION + live/offline while --json keeps all fields"
 }
 
+test_peer_ls_no_literal_escape() {
+    # Plan 112 T1: `peer ls` printed a literal `\033[0;32mlive` (the colour
+    # string reached a %s slot) and an empty SESSION field shifted every later
+    # column (@tsv + IFS tab merged it). REAL tmux on the suite's private
+    # server: one live session-backed peer, one offline one, one with no
+    # session. Checked without a tty and under script(1) with a pty.
+    local data="$TMPDIR/p112-ls-data" home="$TMPDIR/p112-ls-home" s="TMUX--p112-ls-$$" gone="TMUX--p112-gone-$$" out plain line
+    mkdir -p "$home"
+    CCTRL_DATA_DIR="$data" HOME="$home" "$ROOT/cctrl" peer register p112-live --dir /p112/live --agent claude --session "$s" --purpose "live purpose" >/dev/null
+    CCTRL_DATA_DIR="$data" HOME="$home" "$ROOT/cctrl" peer register p112-off --dir /p112/off --agent claude --session "$gone" >/dev/null
+    CCTRL_DATA_DIR="$data" HOME="$home" "$ROOT/cctrl" peer register p112-none --dir /p112/none --agent codex >/dev/null
+    tmux new-session -d -s "$s" -x 80 -y 20 "sleep 300" || fail "tmux new-session failed"
+    out="$(CCTRL_DATA_DIR="$data" HOME="$home" CCTRL_SESSION_METADATA_DIR="$TMPDIR/p112-ls-meta" "$ROOT/cctrl" peer ls 2>&1)" || { tmux kill-session -t "=$s" 2>/dev/null || true; fail "peer ls failed: $out"; }
+    local tty_out=""
+    if script -q /dev/null true >/dev/null 2>&1; then
+        tty_out="$(CCTRL_DATA_DIR="$data" HOME="$home" CCTRL_SESSION_METADATA_DIR="$TMPDIR/p112-ls-meta" script -q /dev/null "$ROOT/cctrl" peer ls 2>&1 </dev/null)" || true
+    fi
+    tmux kill-session -t "=$s" 2>/dev/null || true
+    # shellcheck disable=SC1003 # the literal four characters backslash-0-3-3
+    assert_not_contains "$out" '\033'
+    assert_not_contains "$out" '\e['
+    if [[ -n "$tty_out" ]]; then
+        assert_not_contains "$tty_out" '\033'
+        assert_contains "$tty_out" "p112-live"
+    fi
+    # Real ESC bytes are still there (colour kept), and the visible text lines up.
+    assert_contains "$out" $'\033[0;32mlive'
+    plain="$(printf '%s\n' "$out" | perl -pe 's/\e\[[0-9;]*m//g; s/\r//g')"
+    line="$(printf '%s\n' "$plain" | grep ' p112-live ')" || fail "no p112-live row: $plain"
+    [[ "$line" =~ ^\ \ p112-live\ +manual\ +claude\ +$s\ +live\ +/p112/live\ +[a-z,]*\ live\ purpose$ ]] || fail "live row misaligned: [$line]"
+    line="$(printf '%s\n' "$plain" | grep ' p112-off ')" || fail "no p112-off row"
+    [[ "$line" =~ ^\ \ p112-off\ +manual\ +claude\ +$gone\ +offline\ +/p112/off\ + ]] || fail "offline row misaligned: [$line]"
+    # No session: SESSION shows '-' and DIR stays in its own column (no shift).
+    line="$(printf '%s\n' "$plain" | grep ' p112-none ')" || fail "no p112-none row"
+    [[ "$line" =~ ^\ \ p112-none\ +manual\ +codex\ +-\ +offline\ +/p112/none\ + ]] || fail "sessionless row shifted: [$line]"
+    echo "ok: peer ls prints real colour escapes only, no literal \\033, columns aligned (with and without a tty)"
+}
+
+test_peer_as_flag_on_every_subcommand() {
+    # Plan 112 T2: --as NAME on send, reply, show, recv, check, ack, ls,
+    # overview, deliver (and inbox/outbox); --from kept as an alias on send and
+    # reply; --as and --from with different values is a usage error (rc 64)
+    # that writes nothing.
+    local data="$TMPDIR/p112-as-data" home="$TMPDIR/p112-as-home" out rc id id2 lines
+    mkdir -p "$home"
+    setup_mailbox_peers "$data"
+    _p112() { CCTRL_DATA_DIR="$data" HOME="$home" "$ROOT/cctrl" "$@"; }
+
+    # send: --as, --from, both equal
+    out="$(_p112 peer send comet --as orchestrator --json -- one)"; jq -e '.from == "orchestrator"' <<< "$out" >/dev/null || fail "send --as: $out"
+    id="$(jq -r '.id' <<< "$out")"
+    out="$(_p112 peer send comet --from orchestrator --json -- two)"; jq -e '.from == "orchestrator"' <<< "$out" >/dev/null || fail "send --from: $out"
+    out="$(_p112 peer send comet --as orchestrator --from orchestrator --json -- three)"; jq -e '.from == "orchestrator"' <<< "$out" >/dev/null || fail "send --as = --from: $out"
+    lines="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    # send: conflict, JSON and text, nothing written
+    rc=0; out="$(_p112 peer send comet --as orchestrator --from wrong-peer --json -- bad 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "send --as/--from conflict: expected 64, got $rc"
+    jq -e '.ok == false and .error.code == "validation" and (.error.message | test("--from is an alias"))' <<< "$out" >/dev/null || fail "send conflict json: $out"
+    rc=0; out="$(_p112 peer send comet --from wrong-peer --as orchestrator -- bad 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "send conflict text: expected 64, got $rc"
+    assert_contains "$out" "name different senders"
+    rc=0; out="$(_p112 peer send comet --as orchestrator --from wrong-peer --deliver --json -- bad 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "send --deliver conflict: expected 64, got $rc"
+    [[ "$(wc -l < "$data/messages.jsonl" | tr -d ' ')" == "$lines" ]] || fail "a conflicting send wrote a message"
+
+    # check / recv / ack --as
+    out="$(_p112 peer check --as comet --json)"; jq -e '.peer == "comet" and .queued == 3' <<< "$out" >/dev/null || fail "check --as: $out"
+    out="$(_p112 peer recv --as comet --all --json)"; jq -e '.count == 3' <<< "$out" >/dev/null || fail "recv --as: $out"
+
+    # show --as: scoped to mail NAME sent or received; unscoped without it
+    out="$(_p112 peer show "$id" --as comet --json)"; jq -e --arg id "$id" '.id == $id and .to == "comet" and has("verification")' <<< "$out" >/dev/null || fail "show --as recipient: $out"
+    out="$(_p112 peer show "$id" --as orchestrator --json)"; jq -e --arg id "$id" '.id == $id' <<< "$out" >/dev/null || fail "show --as sender: $out"
+    out="$(_p112 peer show "$id" --json)"; jq -e --arg id "$id" '.id == $id' <<< "$out" >/dev/null || fail "show without --as: $out"
+    rc=0; out="$(_p112 peer show "$id" --as wrong-peer --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "show --as a third peer must not return the message"
+    assert_contains "$out" "Unknown message"
+    rc=0; out="$(_p112 peer show "$id" --as no-such-peer --json 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "show --as an unknown peer must fail"
+    rc=0; _p112 peer show "$id" --as >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "show --as without a value: expected 64, got $rc"
+
+    # reply: --from alias, conflict
+    rc=0; out="$(_p112 peer reply "$id" --as comet --from orchestrator --json -- bad 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "reply --as/--from conflict: expected 64, got $rc"
+    jq -e '.error.code == "validation"' <<< "$out" >/dev/null || fail "reply conflict json: $out"
+    lines="$(wc -l < "$data/messages.jsonl" | tr -d ' ')"
+    out="$(_p112 peer reply "$id" --from comet --json -- "reply via from")" || fail "reply --from failed: $out"
+    [[ "$(wc -l < "$data/messages.jsonl" | tr -d ' ')" -eq $((lines + 1)) ]] || fail "reply --from wrote no message"
+    tail -n 1 "$data/messages.jsonl" | jq -e '.from == "comet" and .to == "orchestrator" and .body == "reply via from"' >/dev/null \
+        || fail "reply --from: wrong message $(tail -n 1 "$data/messages.jsonl")"
+    jq -e --arg id "$id" 'select(.id == $id) | .status == "acked"' "$data/messages.jsonl" >/dev/null || fail "reply --from did not ack the original"
+    id2="$(jq -r '.id' <<< "$(_p112 peer show "$(tail -n 1 "$data/messages.jsonl" | jq -r .id)" --as orchestrator --json)")"
+    _p112 peer recv --as orchestrator --json >/dev/null
+    out="$(_p112 peer ack "$id2" --as orchestrator --json)"; jq -e '.status == "acked"' <<< "$out" >/dev/null || fail "ack --as: $out"
+
+    # ls --as: validated, named in JSON and the text header; listing unchanged
+    out="$(_p112 peer ls --as comet --json)"; jq -e '.as == "comet" and (.peers | length) == 3' <<< "$out" >/dev/null || fail "ls --as json: $out"
+    out="$(_p112 peer ls --json)"; jq -e 'has("as") | not' <<< "$out" >/dev/null || fail "ls without --as gained an as field"
+    out="$(_p112 peer ls --as comet)"; assert_contains "$out" "(as comet)"
+    rc=0; _p112 peer ls --as no-such-peer >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "ls --as an unknown peer must fail"
+
+    # overview --as (existing) still works
+    out="$(_p112 peer overview --as comet --json)"; jq -e '.identity.name == "comet"' <<< "$out" >/dev/null || fail "overview --as: $out"
+
+    # deliver --as: stands in for the target; a different target or --all is 64
+    _p112 peer send comet --as orchestrator --json -- "for deliver" >/dev/null
+    out="$(_p112 peer deliver --as comet --dry-run --json)"; jq -e '.results[0].peer == "comet" and .results[0].dry_run == true' <<< "$out" >/dev/null || fail "deliver --as: $out"
+    out="$(_p112 peer deliver comet --as comet --dry-run --json)"; jq -e '.results[0].peer == "comet"' <<< "$out" >/dev/null || fail "deliver target + same --as: $out"
+    rc=0; out="$(_p112 peer deliver orchestrator --as comet --dry-run --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "deliver target/--as mismatch: expected 64, got $rc"
+    rc=0; out="$(_p112 peer deliver --all --as comet --dry-run --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "deliver --all --as: expected 64, got $rc"
+
+    # inbox / outbox keep --as
+    out="$(_p112 peer outbox --as orchestrator --json)"; jq -e 'length >= 4' <<< "$out" >/dev/null || fail "outbox --as: $out"
+    out="$(_p112 peer inbox --as comet --json)"; jq -e 'type == "array"' <<< "$out" >/dev/null || fail "inbox --as: $out"
+
+    # Help names --as on every mailbox subcommand and the --from alias.
+    out="$(_p112 peer help)"
+    assert_contains "$out" "peer show <message-id> [--as NAME]"
+    assert_contains "$out" "peer ls [--as NAME]"
+    assert_contains "$out" "peer deliver <peer|--as NAME|--all>"
+    assert_contains "$out" "peer send <to> [--as NAME|--from NAME]"
+    assert_contains "$out" "peer reply <message-id> [--as NAME|--from NAME]"
+    assert_contains "$out" "--from is an alias on send and reply"
+    unset -f _p112
+    echo "ok: --as on every mailbox subcommand, --from alias on send/reply, conflicting --as/--from is rc 64 and writes nothing"
+}
+
 test_peer_contract_docs() {
     # Plan 026: the peer operating contract must live where agents actually read
     # (AGENTS.md + CLAUDE.md routing), and the README must document the sender
@@ -17736,6 +17866,9 @@ test_peer_contract_docs() {
     grep -qi 'peer' "$claude" || fail "CLAUDE.md missing a peer routing entry"
     grep -q 'peer_overview' "$readme" || fail "README.md missing peer_overview documentation"
     grep -qi 'an address can dangle' "$readme" || fail "README.md missing the dangling-address limitation"
+    # Plan 112: --as on every mailbox subcommand, --from an alias on send/reply.
+    grep -q 'every mailbox subcommand takes it; `--from` is' "$agents" || fail "AGENTS.md peer contract missing the --as/--from alias rule"
+    grep -q '`--as NAME` names you on every mailbox subcommand' "$readme" || fail "README.md missing the consistent --as rule"
     # Contract stays compact: <=30 lines between the heading and the next '## ' (or EOF).
     local n
     n="$(awk '/^## Peer messaging/{f=1;next}/^## /{if(f)exit}f' "$agents" | wc -l | tr -d ' ')"
