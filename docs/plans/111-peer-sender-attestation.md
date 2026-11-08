@@ -227,8 +227,9 @@ State it plainly: **this is a same-uid misuse barrier, not authentication.**
   the operator) - reply in this conversation, not via cctrl". Only the
   "Sender is the human operator" claim is dropped; the reply-routing hint
   stays.
-- Reasons: legacy-unsealed, seal-mismatch, other-host-seal, impersonated,
-  no-session, app-claimed, remote-unverified.
+- Reasons: legacy-unsealed, seal-mismatch, other-host-seal, no-host-id,
+  impersonated, no-session, app-claimed, remote-unverified. `no-host-id`: the
+  reader has no data/host-id, so it cannot tell which host sealed the line.
 - Mail is never rejected at read; it is always readable, marked unverified.
 
 ### 4. Per-message push eligibility
@@ -393,6 +394,13 @@ Phase status:
   inbox text also shows the marker; the seal also binds `host_id` and which
   covered fields are present. Also bounds the attest `tmux run-shell` check
   (perl alarm). Report: orch-cctrl-reports/plan-111-p2-impl.md.
+  Verify follow-ups (branch fix/peer-seal-followups): the key opens
+  O_NONBLOCK (a FIFO cannot block), the seal helper is bounded
+  (CCTRL_PEER_SEAL_TIMEOUT_SECONDS, default 5), a key dir that is not 0700
+  and owned by the user makes the key unusable (never chmod'ed; doctor says
+  KEY DIR NOT PRIVATE), new reason `no-host-id`, the from=user reply tail in
+  recv/show text, no temp file left after a run-shell timeout. Report:
+  orch-cctrl-reports/plan-111-p2-fix-impl.md.
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.

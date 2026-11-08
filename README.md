@@ -1542,12 +1542,17 @@ message history without changing message status.
 `--inline <message-id>` is explicit paste-only delivery for a full message
 body. It never presses Enter and should not be used for unattended sessions,
 because it pastes arbitrary message content into the target pane. The pasted
-text is prefixed with a compact envelope carrying the sender's label and
-canonical name, the message id, and ready-to-run `cctrl peer reply` and
-`cctrl peer ack` commands; the original body follows verbatim. Inline delivery
-also transitions the message to `delivered`, so it can then be acked. Messages
-queued before the `sender` field existed carry only a bare `from` string, and
-the envelope falls back to that.
+text is prefixed with a compact envelope carrying the sender, the message id,
+a verification marker, and ready-to-run `cctrl peer reply` and `cctrl peer ack`
+commands; the original body follows verbatim. Inline delivery also transitions
+the message to `delivered`, so it can then be acked. The envelope prints only
+sealed fields (plan 111): verified mail shows the sender's label and canonical
+name with `· verified`; any other message (legacy or unsealed lines, a seal
+mismatch, a sender not attested to a session pane) shows the bare `from` name,
+no label, and `· verification: unverified (<reason>, warn mode)`. In warn mode
+the marker is informational only; it carries no instruction. Mail from `user`
+reads `sender: user (not an agent session; cctrl cannot confirm it is the
+operator) - reply in this conversation, not via cctrl`.
 
 ### Peer Orchestrator Workflow
 
