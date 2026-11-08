@@ -88,8 +88,8 @@ is a registry or derived **name** (for tmux-backed sessions, the session name).
   handled. Unacked mail stays queued (a doorbell-enabled pane is re-nudged), so
   acking is not optional.
 - **Reply:** `cctrl peer reply <id> --as <you> --json -- "<body>"` (it acks the
-  original). Always pass `--as`; a non-interactive shell may not export
-  `CCTRL_PEER`.
+  original). Always pass `--as` (every mailbox subcommand takes it; `--from` is
+  an alias on send/reply); a non-interactive shell may not export `CCTRL_PEER`.
 - **Send:** find a peer with `cctrl peer overview` or `cctrl peer ls`, then
   `cctrl peer send <peer> --as <you> --json -- "<body>"`.
 - Sends and replies are queue-first. Whether anything reaches the recipient's

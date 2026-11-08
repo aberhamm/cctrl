@@ -1303,6 +1303,7 @@ cctrl peer recv --limit 5 --as comet --json # at most 5, oldest first
 cctrl peer recv --as comet --json           # just the next queued message
 cctrl peer outbox --as orchestrator --json  # messages sent by orchestrator
 cctrl peer show msg_20260608_070000_abc123 --json
+cctrl peer show msg_20260608_070000_abc123 --as comet --json   # only if comet sent or received it
 cctrl peer ack msg_20260608_070000_abc123 --as comet --json
 cctrl peer ack --all --as comet --json      # ack every delivered message
 cctrl peer ack ID1 ID2 --as comet --json    # per-id {acked, noop, errors}
@@ -1317,7 +1318,17 @@ can return (the addressee guard applies) and reports the rest as
 Senders and recipients must resolve to known peers unless `peer send` is given
 `--allow-unknown`, which marks the message with `unknown_peer: true`. `--from`
 can be omitted when `--as` or `CCTRL_PEER` identifies the sender; JSON sends
-without an identity fail instead of silently defaulting. Mailbox writes use an
+without an identity fail instead of silently defaulting.
+
+`--as NAME` names you on every mailbox subcommand: `send`, `reply`, `show`,
+`recv`, `check`, `ack`, `inbox`, `outbox`, `ls`, `overview` and `deliver`.
+`--from NAME` stays an alias on `send` and `reply` for existing scripts;
+passing both with different values is a usage error (exit 64, nothing is
+written). On `show`, `--as` returns the message only if NAME sent or received
+it (without `--as`, `show` is unscoped as before). On `ls`, `--as` is validated
+and echoed (`"as"` in the JSON, `(as NAME)` in the header); the listing is the
+same. On `deliver`, `--as NAME` delivers NAME's own queued mail, standing in
+for the peer target; a different target, or `--all`, is exit 64. Mailbox writes use an
 exclusive lock and atomic rewrites for state transitions; stale fallback lock
 directories record their holder PID and are reclaimed automatically.
 
