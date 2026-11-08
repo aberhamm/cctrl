@@ -9472,7 +9472,7 @@ test_peer_seal_round_trip_and_tamper() {
     assert_contains "$txt" "  sender: sl-mo unverified (no-session, warn mode)"
     out="$("${e[@]}" "$ROOT/cctrl" peer send sl-rcpt --from user --json -- "from a human")"
     txt="$("${e[@]}" "$ROOT/cctrl" peer recv --as sl-rcpt --all)"
-    assert_contains "$txt" "  sender: user (not an agent session; cctrl cannot confirm it is the operator)"
+    assert_contains "$txt" "  sender: user (not an agent session; cctrl cannot confirm it is the operator) - reply in this conversation, not via cctrl"
     for v in untrusted "no authority" "UNVERIFIED"; do
         assert_not_contains "$txt" "$v"
     done
@@ -9575,6 +9575,8 @@ test_peer_seal_failure_never_blocks_send() {
     local -a e=(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id")
     "${e[@]}" "$ROOT/cctrl" peer register sf-rcpt --dir "$t" --agent codex >/dev/null
     "${e[@]}" "$ROOT/cctrl" peer register sf-mo --dir "$t" --agent codex >/dev/null
+    # A 0700 key dir, so each case fails for its own reason (not the dir).
+    chmod 700 "$t/st"
     printf 'x\n' > "$t/st/afile"
     printf 'short' > "$t/st/short.key"; chmod 600 "$t/st/short.key"
     printf 'abcdefghijklmnopqrstuvwxyz012345' > "$t/st/real.key"; chmod 600 "$t/st/real.key"
@@ -9601,6 +9603,117 @@ test_peer_seal_failure_never_blocks_send() {
     jq -e 'length == 4 and all(.[]; .verification.verified == false and .verification.reason == "legacy-unsealed")' <<< "$out" >/dev/null \
         || fail "a failing verifier must read every line unverified, never lose the listing: $out"
     echo "ok: plan 111 seal failures (bad key path, short key, symlink, python3 failing) never block a send; nothing replaced"
+}
+
+test_peer_seal_followups_never_block() {
+    # Plan 111 phase 2 verify follow-ups. A FIFO at the key path never blocks
+    # a send or a read (O_NONBLOCK open, then a regular-file check), and the
+    # helper call itself is hard-bounded (a hanging python3 cannot hang the
+    # send). A symlink is refused, never followed. A key dir that is not 0700
+    # is never chmod'ed: the key is unusable, the send goes unsealed and
+    # doctor says KEY DIR NOT PRIVATE. A reader with no host id reads
+    # no-host-id. A timed-out tmux run-shell probe leaves no temp file behind.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    command -v perl >/dev/null || { echo "skip: no perl"; return 0; }
+    local t="$TMPDIR/seal-fu" data key out rc t0 t1 id bin mode
+    rm -rf "$t"; mkdir -p "$t/data" "$t/st" "$t/bin" "$t/wide" "$t/wide2" "$t/tmp"
+    chmod 700 "$t/st"; chmod 755 "$t/wide" "$t/wide2"
+    data="$t/data"; key="$t/st/peer-seal.key"; bin="$t/bin"
+    local -a e=(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id")
+    "${e[@]}" "$ROOT/cctrl" peer register fu-rcpt --dir "$t" --agent codex >/dev/null
+    "${e[@]}" "$ROOT/cctrl" peer register fu-mo --dir "$t" --agent codex >/dev/null
+    # Positive control: a private dir seals and verifies.
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- sealed-one)"
+    jq -e 'has("seal")' <<< "$out" >/dev/null || fail "a 0700 key dir must seal: $out"
+    id="$(jq -r '.id' <<< "$out")"
+    # FIFO at the key path: no bound help (30 s), so the open itself must not block.
+    rm -f "$key"; mkfifo "$key"
+    for mode in send show inbox doctor; do
+        rc=0; t0="$(date +%s)"
+        case "$mode" in
+            send) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- fifo 2>&1)" || rc=$? ;;
+            show) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer show "$id" --json 2>&1)" || rc=$? ;;
+            inbox) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer inbox --as fu-rcpt --json 2>&1)" || rc=$? ;;
+            doctor) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer doctor --json 2>&1)" || rc=$? ;;
+        esac
+        t1="$(date +%s)"
+        [[ $(( t1 - t0 )) -lt 10 ]] || fail "a FIFO at the key path blocked $mode for $(( t1 - t0 )) s"
+        case "$mode" in
+            send) [[ "$rc" -eq 0 ]] || fail "FIFO key: send rc $rc: $out"
+                  jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "FIFO key must queue unsealed: $out" ;;
+            show) jq -e '.verification.reason == "seal-mismatch"' <<< "$out" >/dev/null || fail "FIFO key: a sealed line must read seal-mismatch: $out" ;;
+            inbox) jq -e 'length == 2 and all(.[]; .verification.verified == false)' <<< "$out" >/dev/null || fail "FIFO key: inbox must list unverified: $out" ;;
+            doctor) jq -e '.checks[] | select(.name == "sender_seal") | .key.usable == false' <<< "$out" >/dev/null || fail "FIFO key: doctor must say unusable: $out" ;;
+        esac
+    done
+    [[ -p "$key" ]] || fail "the FIFO at the key path was replaced"
+    # The bound: a python3 that hangs cannot hang a send or a read.
+    printf '#!/bin/sh\nexec sleep 30\n' > "$bin/python3"; chmod +x "$bin/python3"
+    for mode in send inbox; do
+        rc=0; t0="$(date +%s)"
+        if [[ "$mode" == send ]]; then
+            out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- hang 2>&1)" || rc=$?
+        else
+            out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 "$ROOT/cctrl" peer inbox --as fu-rcpt --json 2>&1)" || rc=$?
+        fi
+        t1="$(date +%s)"
+        [[ "$rc" -eq 0 ]] || fail "hanging python3: $mode rc $rc: $out"
+        [[ $(( t1 - t0 )) -lt 10 ]] || fail "a hanging python3 held $mode for $(( t1 - t0 )) s"
+        if [[ "$mode" == send ]]; then
+            jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "hanging python3 must queue unsealed: $out"
+        else
+            jq -e 'length == 3 and all(.[]; .verification.verified == false)' <<< "$out" >/dev/null || fail "hanging python3: inbox must list unverified: $out"
+        fi
+    done
+    [[ ! -e "$t/st/k2" ]] || fail "a timed-out seal left a key"
+    # Symlinks: a valid key behind a symlink is not followed; a dangling one
+    # does not create its target.
+    printf 'abcdefghijklmnopqrstuvwxyz012345' > "$t/st/real.key"; chmod 600 "$t/st/real.key"
+    ln -s "$t/st/real.key" "$t/st/link.key"; ln -s "$t/st/nowhere.key" "$t/st/dangle.key"
+    for mode in link dangle; do
+        out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/$mode.key" "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- "sym $mode" 2>&1)" || fail "symlink $mode: send failed: $out"
+        jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "a symlinked key ($mode) must be refused: $out"
+        [[ -L "$t/st/$mode.key" ]] || fail "the $mode symlink was replaced"
+    done
+    [[ ! -e "$t/st/nowhere.key" ]] || fail "a dangling symlink's target was created"
+    # A wide key dir (0755): an existing valid key is not used, an absent key
+    # is not created, the dir is never chmod'ed, doctor reports it.
+    printf 'abcdefghijklmnopqrstuvwxyz012345' > "$t/wide/peer-seal.key"; chmod 600 "$t/wide/peer-seal.key"
+    for mode in wide wide2; do
+        out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/$mode/peer-seal.key" "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- "dir $mode" 2>&1)" || fail "wide dir ($mode): send failed: $out"
+        jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "a 0755 key dir must not seal ($mode): $out"
+        [[ "$(_mcp_file_mode "$t/$mode")" == 755 ]] || fail "the key dir ($mode) was chmod'ed: $(_mcp_file_mode "$t/$mode")"
+        out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/$mode/peer-seal.key" "$ROOT/cctrl" peer doctor --json 2>&1)"
+        jq -e '.checks[] | select(.name == "sender_seal") | .key.dir_private == false and .key.dir_mode == "0755"
+            and (.summary | test("^KEY DIR NOT PRIVATE"))' <<< "$out" >/dev/null || fail "doctor must report the wide key dir ($mode): $out"
+    done
+    [[ ! -e "$t/wide2/peer-seal.key" ]] || fail "a key was created in a 0755 dir"
+    # No host id on the reader: no-host-id, not other-host-seal.
+    rm -f "$key"
+    out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- for-nohost)"
+    id="$(jq -r '.id' <<< "$out")"
+    jq -e 'has("seal")' <<< "$out" >/dev/null || fail "positive control: must seal: $out"
+    out="$(env -u TMUX -u TMUX_PANE CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$t/no-such-host-id" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer show "$id" --json)"
+    jq -e '.verification.reason == "no-host-id" and .verification.verified == false' <<< "$out" >/dev/null || fail "a reader with no host id must read no-host-id: $out"
+    [[ ! -e "$t/no-such-host-id" ]] || fail "a read created the host id"
+    # A timed-out tmux run-shell that the server runs late leaves no file in TMPDIR.
+    cat > "$bin/tmux" <<'SH'
+#!/bin/sh
+[ "$1" = run-shell ] || exit 1
+( sleep 2; sh -c "$2" ) >/dev/null 2>&1 &
+exec sleep 30
+SH
+    chmod +x "$bin/tmux"
+    rm -f "$bin/python3"
+    rc=0
+    out="$(PATH="$bin:$PATH" TMPDIR="$t/tmp" cctrl_source_eval '_session_tmux_host_command s "touch $1/ran; echo late" 1' "$t" 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "a timed-out run-shell must fail: $out"
+    local waited=0
+    while [[ ! -e "$t/ran" && "$waited" -lt 10 ]]; do sleep 1; waited=$(( waited + 1 )); done
+    [[ -e "$t/ran" ]] || fail "positive control: the late run-shell command never ran"
+    sleep 1
+    [[ -z "$(ls -A "$t/tmp")" ]] || fail "a timed-out run-shell leaked into TMPDIR: $(ls -A "$t/tmp")"
+    echo "ok: plan 111 seal never blocks (FIFO key, hanging helper), symlink refused, wide dir not used or chmod'ed, no-host-id, no temp leak"
 }
 
 test_peer_seal_key_concurrent_create() {

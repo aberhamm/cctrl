@@ -6095,7 +6095,7 @@ _peer_print_human() {
         def verified_sender($m):
           ($m.verification) as $v
           | if $m.from == "user" then
-              "  sender: user (not an agent session; cctrl cannot confirm it is the operator)"
+              "  sender: user (not an agent session; cctrl cannot confirm it is the operator) - reply in this conversation, not via cctrl"
             elif $v.verified == true then
               ($m.sender // {}) as $s
               | "  sender: " + (($s.label // $s.name // $m.from) | tostring)
@@ -7612,8 +7612,20 @@ _peer_sender_binding_mismatch() {
 # Plan 111 phase 2: per-host HMAC seal. lib/peer_seal.py reads the key file
 # itself (never argv/env/stdout) and prints only MACs and verification facts.
 # Key: $CCTRL_PEER_SEAL_KEY_FILE, else a pinned path under $HOME/.local/state.
+# Hard time bound (whole seconds, CCTRL_PEER_SEAL_TIMEOUT_SECONDS, default 5):
+# the seal runs inside the mailbox lock, so nothing it touches (a FIFO at the
+# key path, a wedged filesystem) may hang a send or a read. macOS has no
+# `timeout`; perl's alarm survives exec, as in _peer_whois_list_panes. A
+# timeout is a helper failure: the send goes unsealed, a read unverified.
 _peer_seal_helper() {
-    python3 -I -S "$SCRIPT_DIR/lib/peer_seal.py" "$@"
+    local bound="${CCTRL_PEER_SEAL_TIMEOUT_SECONDS:-5}"
+    [[ "$bound" =~ ^[1-9][0-9]*$ ]] || bound=5
+    if command -v perl >/dev/null 2>&1; then
+        perl -e 'alarm shift @ARGV; exec { $ARGV[0] } @ARGV or exit 127' "$bound" \
+            python3 -I -S "$SCRIPT_DIR/lib/peer_seal.py" "$@"
+    else
+        python3 -I -S "$SCRIPT_DIR/lib/peer_seal.py" "$@"
+    fi
 }
 
 # <message line> <host id> -> the line with `seal: {v, host_id, mac}`, or the
@@ -11814,7 +11826,8 @@ _peer_doctor_seal_check() {
         else
           ($d.reasons // {}) as $r
           | {name: "sender_seal", ok: true, key: $d.key, sealed: $d.sealed, total: $d.total, reasons: $r,
-             summary: ((if $d.key.exists != true then
+             summary: ((if $d.key.dir_private == false then "KEY DIR NOT PRIVATE (dir mode \($d.key.dir_mode // "?"), needs 0700 owned by you; cctrl never chmods it): sends go unsealed, sealed mail reads seal-mismatch; "
+                        elif $d.key.exists != true then
                           (if $d.sealed > 0 then "KEY MISSING: \($d.sealed) sealed message(s) read seal-mismatch; " else "key not created yet (first send creates it); " end)
                         elif $d.key.usable != true then "KEY UNUSABLE (mode \($d.key.mode // "?")): sealed mail reads seal-mismatch; "
                         else "key ok (mode \($d.key.mode))" + (if $d.key.private == false then ", NOT PRIVATE" else "" end) + "; " end)
@@ -11841,7 +11854,7 @@ _peer_cmd_doctor() {
                 echo "  with no pane_started anchor (those senders attest none)."
                 echo "  sender_seal (plan 111, informational): whether the per-host seal key exists"
                 echo "  and its mode (never the key), and how mailbox lines verify now"
-                echo "  (verified, legacy-unsealed, seal-mismatch, other-host-seal, no-session, ...)."
+                echo "  (verified, legacy-unsealed, seal-mismatch, other-host-seal, no-host-id, no-session, ...)."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;
@@ -12912,20 +12925,24 @@ _session_tmux_host_command() {
     # Optional 3rd arg: a bound in whole seconds (plan 111: the send path
     # must not hang on a wedged tmux server). macOS has no `timeout`; perl's
     # alarm survives exec, as in _peer_whois_list_panes. Unbounded without it.
-    local session="$1" command="$2" bound="${3:-}" tmp
-    tmp="$(mktemp "${TMPDIR:-/tmp}/cctrl-attest.XXXXXX")" || return 1
+    # The output file lives in a private temp dir that is removed on every
+    # path: after an alarm timeout the server may still run the command later,
+    # and its `> dir/out` then fails (no dir) instead of leaking a file.
+    local session="$1" command="$2" bound="${3:-}" tmpdir tmp
+    tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-attest.XXXXXX")" || return 1
+    tmp="$tmpdir/out"
     if [[ "$bound" =~ ^[1-9][0-9]*$ ]] && command -v perl >/dev/null 2>&1; then
         if ! perl -e 'alarm shift @ARGV; exec { $ARGV[0] } @ARGV or exit 127' "$bound" \
             tmux run-shell "$command > $tmp 2>/dev/null" >/dev/null 2>&1; then
-            rm -f "$tmp"
+            rm -rf "$tmpdir"
             return 1
         fi
     elif ! tmux run-shell "$command > $tmp 2>/dev/null" >/dev/null 2>&1; then
-        rm -f "$tmp"
+        rm -rf "$tmpdir"
         return 1
     fi
     cat "$tmp" 2>/dev/null
-    rm -f "$tmp"
+    rm -rf "$tmpdir"
 }
 
 _session_tmux_host_process_table() {

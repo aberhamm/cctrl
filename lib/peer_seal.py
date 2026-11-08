@@ -19,7 +19,8 @@ this user can read the key file.
 
 Key file: $CCTRL_PEER_SEAL_KEY_FILE, else $HOME/.local/state/cctrl/peer-seal.key
 (pinned, not XDG_STATE_HOME, so every caller on the host resolves one file).
-32 random bytes, file 0600, dir 0700.
+32 random bytes, file 0600, dir 0700. A key dir that is not 0700 and owned
+by this user makes the key unusable (never chmod'ed): sends go unsealed.
 """
 import hashlib
 import hmac
@@ -62,9 +63,25 @@ def key_path():
     return os.path.join(home, ".local", "state", "cctrl", "peer-seal.key")
 
 
-def read_key(path):
+def _dir_private(directory):
+    """The key dir must be a real directory owned by euid with no group or
+    other bits (0700). A wide or foreign dir is never chmod'ed (the override
+    can point anywhere, e.g. $HOME); the key is just treated as unusable, so
+    sends go unsealed and `peer doctor` reports it."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        info = os.lstat(directory)
+    except OSError:
+        return False
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+            and (info.st_mode & 0o077) == 0)
+
+
+def read_key(path):
+    # O_NONBLOCK: a FIFO (or other special file) at the key path must not
+    # block the open; the fstat check below then refuses it. O_NOFOLLOW: a
+    # symlink is refused (ELOOP), never followed.
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         raise
     except OSError:
@@ -73,6 +90,8 @@ def read_key(path):
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
             raise SealKeyError("not-a-private-file")
+        if not _dir_private(os.path.dirname(path) or "."):
+            raise SealKeyError("dir-not-private")
         data = b""
         while len(data) <= KEY_LEN:
             chunk = os.read(fd, KEY_LEN + 1 - len(data))
@@ -99,6 +118,8 @@ def ensure_key(path):
             os.chmod(directory, 0o700)
         except FileExistsError:
             pass
+    if not _dir_private(directory):
+        raise SealKeyError("dir-not-private")
     # O_EXCL temp file in the key dir, mode 0600 from creation (never
     # readable by others), fully written and synced, then published with
     # link(2): link never replaces an existing name, so two first senders
@@ -186,7 +207,12 @@ def verify_one(message, host_id, key):
     if seal.get("v") != SEAL_VERSION or not isinstance(mac, str) or not isinstance(seal_host, str):
         out["reason"] = "seal-mismatch"
         return out
-    if not host_id or seal_host != host_id:
+    if not host_id:
+        # This reader has no data/host-id, so it cannot tell which host
+        # sealed the line: not evidence of another host.
+        out["reason"] = "no-host-id"
+        return out
+    if seal_host != host_id:
         out["reason"] = "other-host-seal"
         return out
     if key is None:
@@ -258,15 +284,17 @@ def cmd_doctor(host_id):
             status["exists"] = True
             status["mode"] = "%04o" % stat.S_IMODE(info.st_mode)
             status["private"] = stat.S_ISREG(info.st_mode) and (info.st_mode & 0o077) == 0
-            try:
-                dinfo = os.stat(os.path.dirname(path) or ".")
-                status["dir_mode"] = "%04o" % stat.S_IMODE(dinfo.st_mode)
-            except OSError:
-                pass
         except FileNotFoundError:
             pass
         except OSError:
             status["exists"] = None
+        directory = os.path.dirname(path) or "."
+        try:
+            dinfo = os.lstat(directory)
+            status["dir_mode"] = "%04o" % stat.S_IMODE(dinfo.st_mode)
+            status["dir_private"] = _dir_private(directory)
+        except OSError:
+            pass
     except SealKeyError as exc:
         status["error"] = str(exc)
     key = _load_key_or_none()
