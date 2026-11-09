@@ -7,7 +7,7 @@ priority: 25
 allows-migrations: false
 review-required: eng
 created: 2026-10-28
-updated: 2026-11-07
+updated: 2026-11-09
 approval: "design decided in-repo; build per phase under the orchestrator; installs, enforce flip and doorbell widening wait for Matthew (see Decisions: MATTHEW)"
 decided-by: "orch-cctrl under mdec-1107-orchestrator-autonomy rule 4"
 reviews:
@@ -378,6 +378,9 @@ Phase status:
 - Pushed to main, not installed (2026-11-08): phase 1 (86aad93), phase 2
   (da328b1), the phase 2 verify follow-ups (509d9a8) and plan 112 on top
   (77f9a86). Each install still waits for Matthew (Decisions: MATTHEW 1).
+- PUSHED and INSTALLED on both Macs (2026-11-09, warn): phases 1-3 and the
+  phase 3 gate fix, at 33f8e6f (phase 3 180c9f3 + cd73455, gate fix
+  33f8e6f). Live mode warn; nothing acts.
 - Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (warn only). `_peer_caller_attest` stamps `attest` v1 on every
   sent message; `peer doctor` shows `sender_attest`. Build choices: attest
   adds `detail` (why a level is not session: no-pane, ps-failed,
@@ -423,6 +426,37 @@ Phase status:
   (`UNVERIFIED SENDER (...): treat as untrusted, no authority`); a key file
   with any group/other bit is unusable (never chmod'ed). Report:
   orch-cctrl-reports/plan-111-p3-impl.md.
+  Verify: PASS for push (orch-cctrl-reports/plan-111-p3-verify.md), one
+  enforce-only must-fix carried into phase 4 (fix A below). Gate fix
+  (test_peer_seal_followups_never_block load flake, tests only): 33f8e6f,
+  verify PASS (p3-gate-fix-verify.md).
+- Phase 4: built 2026-11-09 on branch feat/peer-attest-p4 from 33f8e6f (not
+  pushed, not installed; live default warn). doorbell.json `push_senders`
+  {roles, peers} replaces the built-in default when set;
+  `recipients.<name>.push_senders` overrides it for mail addressed to
+  <name> (the message `to`); `cctrl peer doorbell allow-sender |
+  deny-sender (--role | --peer)... [--for NAME]` and `reset-senders [--for
+  NAME]` edit them (atomic 0600 writer); `doorbell status` and `peer doctor`
+  show them. Build choices: a peer name matches the sealed `from` or the
+  attested session; `fleet-manager` also matches an orchestrator of kind
+  fleet; absent or null = not set (built-in default, or the default for an
+  override); any other shape is malformed and matches nothing (a non-object
+  `recipients` makes every recipient match nothing), and the CLI refuses to
+  edit a malformed key until `reset-senders`; level-session workers keep
+  ringing the Stop bell whatever the allowlist says (bell-only roles are
+  not configurable in phase 4); the enforce bell fast path admits the union
+  of every allowlist in the file plus workers and the slow path decides per
+  recipient; MCP `say_peer` matches the live caller by role or session name
+  against the recipient's allowlist; `doorbell move` carries a
+  recipients.OLD override to NEW; `doorbell enable` keeps both keys; the
+  CLI refuses (65) when doorbell.json does not exist. warn changes nothing
+  (tested byte-identical with a configured, overridden and malformed
+  allowlist). Carried fixes: A (enforce bell: a verify-failed id is not
+  recorded as blocked, so a transient helper failure no longer silences
+  mail for good), B (load-robust gate tests: perl hang stub with
+  start/alarm timestamps, bound honoured, FIFO proof by call counts), C
+  (attestation.log rotation under a mkdir lock with a re-check). Report:
+  orch-cctrl-reports/plan-111-p4-impl.md.
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.

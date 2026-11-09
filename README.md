@@ -1570,10 +1570,19 @@ Attestation mode (plan 111 phase 3) is `attestation` in `data/doorbell.json`:
 default. A message is eligible when its seal verifies, its sender attested
 level session, it is not a replay (a duplicate id, or a queued line that
 records a delivery or ack), it was created after `attestation_since` and
-`baseline_at`, and its sender's role is on the built-in allowlist: pushes
+`baseline_at`, and its sender is on the recipient's push allowlist: pushes
 (`--deliver`, `deliver`, `nudge`, `watch`, `deliver --inline`, MCP
-`say_peer`) take orchestrator and fleet-manager senders; the Stop bell also
-takes level-session workers. `warn` changes no delivery: it computes
+`say_peer`) take orchestrator and fleet-manager senders by default; the Stop
+bell also takes level-session workers. The allowlist (plan 111 phase 4) is
+`push_senders: {roles: [...], peers: [...]}` in `data/doorbell.json`, with a
+per-recipient override in `recipients.<name>.push_senders` (`<name>` is the
+address the mail is sent to). A role matches the sender's sealed role
+(`fleet-manager` also matches an orchestrator of kind fleet); a peer name
+matches the sealed sender name or its attested session. Prefer roles: a name
+goes stale at a handover. A key of any other shape matches nothing. Edit it
+with `cctrl peer doorbell allow-sender|deny-sender (--role R | --peer NAME)...
+[--for RECIPIENT]` and `reset-senders [--for RECIPIENT]`; `peer doorbell
+status` and `peer doctor` show what is in effect. `warn` changes no delivery: it computes
 eligibility, shows it (`eligibility` in `recv`/`show`/`inbox` JSON, the
 `sender_eligibility` row of `peer doctor`) and logs would-be blocks to
 `data/doorbell/attestation.log`. Only `enforce` acts: ineligible mail stays
