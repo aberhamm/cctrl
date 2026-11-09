@@ -1606,8 +1606,11 @@ unreadable archive stops every push and Stop ring in `enforce` until fixed
 (`peer doctor` row `sender_replay_archive`). Cross-host sends (plan 111 phase
 6): the origin attests its caller and passes the result as
 `CCTRL_ORIGIN_ATTEST` in the SSH remote command, and always sends its real host
-label as `--sender-host` (CCTRL_HOST_PREFIX, else the `hosts.json` alias whose
-hostname is this machine); the receiver records it as `attest.origin_claims`
+label as `--sender-host` (CCTRL_HOST_PREFIX if it is a valid label, else the
+`hosts.json` alias whose hostname is this machine, preferring its real hostname
+over a `localhost` tunnel entry); the receiver keeps `--sender-host` only as a
+valid label (anything else is recorded as `invalid:...` and is never level
+remote) and records it as `attest.origin_claims`
 with the SSH client address on level remote only (shown as "claims not verified
 here"), unsets the variable once read, and never raises a level for it. Hosts
 on different versions keep working: an old receiver ignores the variable, and
@@ -1667,6 +1670,17 @@ Retention is explicit. `peer gc` only archives statuses you name, defaults to
 before removing them from the active mailbox. Use `--dry-run` first for
 retention jobs. If the archive append fails, GC leaves the active mailbox
 unchanged and exits non-zero.
+
+The archive is also the `enforce` replay check (plan 111): a queued id found
+in it is never eligible. `peer gc` never prunes it, and nothing prunes it
+automatically. The check reads it in full under a 5 s limit and fails closed
+(every push and Stop ring stops) if it runs out; `peer doctor` row
+`sender_replay_archive` warns `ARCHIVE LARGE` at 500k lines or 512 MiB (about
+1 s on the Studio). To prune: first set `attestation_since` in
+`data/doorbell.json` to a time after the newest `created_at` you will remove
+(older mail is then never eligible, so a replay of it cannot push), then move
+`messages-archive.jsonl`, or its older lines, out of `data/`. Do it while no
+`peer gc` runs.
 
 Trust model and limitations: cctrl authenticates peers by local registry name,
 not cryptographic identity. The mailbox is local filesystem state protected by

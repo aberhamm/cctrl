@@ -367,6 +367,11 @@ today (section 6).
   messages-archive.jsonl): in enforce every push, inline paste and Stop ring
   stops (fail closed) until it is fixed; `peer doctor`
   (`sender_replay_archive`) says ARCHIVE UNREADABLE.
+- Replay archive too large: `seen` runs under the 5 s helper alarm and fails
+  closed like an unreadable archive. `peer doctor` says ARCHIVE LARGE at 500k
+  lines or 512 MiB (about 1 s worst case). Prune by hand: raise
+  `attestation_since` past the newest `created_at` you remove first, then
+  move the archive (or its old lines) out of data/ (README).
 
 ### 8. Constraints
 
@@ -406,6 +411,14 @@ Phase status:
 - PUSHED, not installed (2026-11-09): phase 5 at 4a350e9 (verify PASS,
   orch-cctrl-reports/plan-111-p5-verify.md; F1 and F2 gated the enforce flip,
   F3 and F4 were should-fix; all four are fixed in phase 6).
+- PUSHED, not installed (2026-11-09): phase 6 at e391c6e (verify PASS for
+  push in warn, orch-cctrl-reports/plan-111-p6-verify.md; must-fix M1 gated
+  the enforce flip and is fixed in the pre-flip branch below).
+- Pre-flip fixes: built 2026-11-09 on branch fix/peer-attest-preflip from
+  e391c6e (not pushed, not installed; live mode stays warn). M1, N1, N2, N3,
+  N6 of the p6 verify and the dangling-symlink should-fix of the
+  notify-sounds verify. N4, N5, N7 left as noted there. Report:
+  orch-cctrl-reports/plan-111-preflip-impl.md.
 - Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (warn only). `_peer_caller_attest` stamps `attest` v1 on every
   sent message; `peer doctor` shows `sender_attest`. Build choices: attest
   adds `detail` (why a level is not session: no-pane, ps-failed,
@@ -551,6 +564,22 @@ Phase status:
   are folded into .1 under the lock; `recipients.<name>: null` now reads as
   not set (the README rule), like a null push_senders. Report:
   orch-cctrl-reports/plan-111-p6-impl.md.
+- Pre-flip (p6 verify): M1 the enforce refusal reads the attest's own
+  detail before the app-claimed override, so a CODEX_THREAD_ID caller with a
+  transient walk failure is retried once and gets the transient hint (a
+  non-transient app-claimed detail still reads app-claimed). N1 the receiver
+  takes `--sender-host` only as a valid label (`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`);
+  anything else is recorded as `invalid:<label chars>` in sender.host and is
+  never level remote (no origin_host, no claims), so no control chars or
+  forged "sender:" line reach the mailbox or the text. N2 the origin sends
+  CCTRL_HOST_PREFIX only if it is a valid label and not the remote alias,
+  else the derived label; `peer doctor` row `sender_host_label` names a
+  rejected prefix. N3 the hosts.json self alias prefers a hostname that is
+  this machine's real name over loopback (tunnel) entries, in alias order.
+  N6 `sender_replay_archive` adds the line count and warns ARCHIVE LARGE at
+  500k lines or 512 MiB; `seen` measured 1.2M lines / 1.1 GB at 0.40 s
+  (id first, as gc writes) and 2.3 s (full parse), so the 5 s bound is about
+  2.6M lines worst case. Pruning stays manual (README).
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.

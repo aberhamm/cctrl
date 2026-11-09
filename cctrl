@@ -379,16 +379,40 @@ _notify_sounds_state() {
     printf 'on\tdefault\n'
 }
 
-# Atomic jq write of one top-level key into the user config file. Writes
-# through realpath so a dotfiles symlink at CONFIG_USER_FILE survives.
+# Prints the file a write to $1 should land on: $1 itself, or, for a
+# symlink, the end of its link chain resolved one hop at a time with plain
+# `readlink` (portable; macOS `readlink -f` prints a partial path for a
+# dangling link). A dangling link resolves to its target path, so a dotfiles
+# link whose target does not exist yet is created there, never beside it.
+# Relative targets resolve against the link's own directory. Fails on a
+# loop (more than 40 hops) or an unreadable link.
+_config_user_write_target() {
+    local target="$1" next hops=0
+    while [[ -L "$target" ]]; do
+        hops=$((hops + 1))
+        [[ "$hops" -le 40 ]] || return 1
+        next="$(readlink "$target" 2>/dev/null)" || return 1
+        [[ -n "$next" ]] || return 1
+        if [[ "$next" != /* ]]; then
+            next="$(dirname "$target")/$next"
+        fi
+        target="$next"
+    done
+    printf '%s\n' "$target"
+}
+
+# Atomic jq write of one top-level key into the user config file. The ONLY
+# user-config writer (defaultProfile goes through it too). Writes through the
+# symlink chain (_config_user_write_target) so a dotfiles symlink at
+# CONFIG_USER_FILE survives: a temp file + mv lands on the link's target,
+# never replacing the link itself. The temp file is removed on any failure.
 # $1 = key, $2 = JSON value.
 _config_user_set_json() {
     local key="$1" value="$2" target dir tmp
-    target="$CONFIG_USER_FILE"
-    [[ -n "$target" ]] || return 1
-    if [[ -L "$target" ]]; then
-        target="$(realpath "$target" 2>/dev/null || readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
-    fi
+    [[ -n "$CONFIG_USER_FILE" ]] || return 1
+    target="$(_config_user_write_target "$CONFIG_USER_FILE")" || return 1
+    # A directory (or other non-file) there would swallow the mv: refuse.
+    [[ ! -e "$target" || -f "$target" ]] || return 1
     dir="$(dirname "$target")"
     ( umask 077 && mkdir -p "$dir" ) || return 1
     tmp="$(mktemp "$dir/.cctrl-config.XXXXXX")" || return 1
@@ -398,7 +422,7 @@ _config_user_set_json() {
         jq -n --arg k "$key" --argjson v "$value" '{($k): $v}' > "$tmp" || { rm -f "$tmp"; return 1; }
     fi
     chmod 600 "$tmp" 2>/dev/null || true
-    mv "$tmp" "$target"
+    mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
 }
 
 # Five-step profile resolution for a launch: explicit --profile wins, then a
@@ -2098,27 +2122,13 @@ cmd_edit() {
     _profile_secure_perms "$edit_pf"
 }
 
-# Atomic jq write of defaultProfile into the user config file. Writes through
-# realpath so a dotfiles symlink at CONFIG_USER_FILE survives (a temp file +
-# mv lands on the link's target, never replacing the link itself). The ONLY
-# writer of this field — shared by `cctrl profile migrate` and (phase 3)
-# `cctrl use`.
+# Writes defaultProfile into the user config file through the one generic
+# writer (_config_user_set_json: dotfiles symlinks, dangling or not, are
+# written through). Shared by `cctrl profile migrate` and `cctrl use`.
 _config_user_set_default_profile() {
-    local name="$1" target dir tmp
-    target="$CONFIG_USER_FILE"
-    if [[ -L "$target" ]]; then
-        target="$(realpath "$target" 2>/dev/null || readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
-    fi
-    dir="$(dirname "$target")"
-    ( umask 077 && mkdir -p "$dir" )
-    tmp="$(mktemp "$dir/.cctrl-config.XXXXXX")"
-    if [[ -f "$target" ]]; then
-        jq --arg p "$name" '.defaultProfile = $p' "$target" > "$tmp"
-    else
-        jq -n --arg p "$name" '{defaultProfile: $p}' > "$tmp"
-    fi
-    chmod 600 "$tmp" 2>/dev/null || true
-    mv "$tmp" "$target"
+    local json
+    json="$(jq -n --arg p "$1" '$p')" || return 1
+    _config_user_set_json defaultProfile "$json"
 }
 
 # Legacy data/.active-profile -> defaultProfile in the user config, exactly
@@ -6166,7 +6176,7 @@ _peer_print_human() {
         def remote_claims($m; $v):
           if $v.level == "remote" and ($m.attest.origin_claims | type) == "object" then
             ($m.attest.origin_claims) as $c
-            | " (remote from " + (($m.attest.origin_host // "?") | tostring) + ", claims not verified here: level "
+            | " (remote from " + (($m.attest.origin_host // "?") | tostring | gsub("[^A-Za-z0-9._:-]"; "_") | .[0:72]) + ", claims not verified here: level "
               + (($c.level // "?") | tostring)
               + (if $c.session then ", session " + ($c.session | tostring) else "" end)
               + (if $c.role then ", role " + ($c.role | tostring) else "" end) + ")"
@@ -7915,23 +7925,68 @@ _peer_origin_attest_b64() {
         | tojson | @base64' <<< "$PEER_ATTEST_JSON" 2>/dev/null || true
 }
 
+# Plan 111 pre-flip (p6 verify N1/N2): the one host-label rule, shared by
+# the origin (_peer_origin_host_label) and the receiver (--sender-host).
+_peer_host_label_valid() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]
+}
+
+# Receiver side (N1): --sender-host as it may be recorded. A valid label
+# (or empty) passes unchanged. Anything else becomes the flagged value
+# `invalid:<label chars only, max 64>`: never raw control chars, newlines or
+# spaces in sender.host, and the `:` keeps it from ever passing the label
+# rule, so it can never make a send level remote. Idempotent (the --deliver
+# path hands the value to an inner send).
+_peer_sender_host_sanitize() {
+    local raw="${1:-}" clean
+    if [[ -z "$raw" ]] || _peer_host_label_valid "$raw"; then
+        printf '%s' "$raw"; return 0
+    fi
+    if [[ "$raw" =~ ^invalid:[A-Za-z0-9._-]{0,64}$ ]]; then
+        printf '%s' "$raw"; return 0
+    fi
+    clean="$(printf '%s' "$raw" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' 2>/dev/null | LC_ALL=C cut -c1-64)" || clean=""
+    clean="${clean//[^A-Za-z0-9._-]/}"
+    printf 'invalid:%s' "$clean"
+}
+
 # Plan 111 phase 6 (p5 verify): the label the origin sends as --sender-host.
 # An origin with no CCTRL_HOST_PREFIX used to send `local`, so a genuine
-# arrival was not stamped remote. Order: CCTRL_HOST_PREFIX; else the
-# hosts.json alias whose hostname is this machine; else the device tag (ms,
-# mbp); else the short hostname; `local` only when none exists. Never the
-# remote host's own alias ($1), which the receiver would read as itself.
+# arrival was not stamped remote. Order: CCTRL_HOST_PREFIX (if it is a
+# valid label, N2); else the hosts.json alias whose hostname is this
+# machine's real name, then one whose hostname is loopback (N3); else the
+# device tag (ms, mbp); else the short hostname; `local` only when none
+# exists. Never the remote host's own alias ($1), which the receiver would
+# read as itself.
 _peer_origin_host_label() {
-    local remote="${1:-}" label="" alias host
+    local remote="${1:-}" label="" alias host loopback_alias=""
     if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
-        printf '%s' "$CCTRL_HOST_PREFIX"; return 0
+        # N2: the prefix passes the same label rule and is never the remote
+        # host's alias; otherwise fall back to the derived label (doctor
+        # names a rejected prefix: sender_host_label).
+        if _peer_host_label_valid "$CCTRL_HOST_PREFIX" && [[ "$CCTRL_HOST_PREFIX" != "$remote" ]]; then
+            printf '%s' "$CCTRL_HOST_PREFIX"; return 0
+        fi
     fi
     if [[ -f "$HOSTS_FILE" ]]; then
+        # N3: an alias whose hostname is this machine's own name wins over a
+        # loopback entry (an SSH tunnel such as {"hostname": "localhost"}),
+        # each in alias order, so the pick is deterministic.
+        # _host_is_local matches loopback names and this machine's hostname
+        # (hostname, hostname -s, minus .local); anything local that is not
+        # loopback is the real hostname.
         while IFS=$'\t' read -r alias host; do
             [[ -n "$alias" && "$alias" != "$remote" && "$alias" != local && "$alias" != self ]] || continue
-            if _host_is_local "$host"; then label="$alias"; break; fi
+            _peer_host_label_valid "$alias" || continue
+            _host_is_local "$host" || continue
+            case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
+                localhost|localhost.local|localhost.localdomain|127.*|::1|0:0:0:0:0:0:0:1)
+                    [[ -n "$loopback_alias" ]] || loopback_alias="$alias" ;;
+                *) label="$alias"; break ;;
+            esac
         done < <(jq -r 'to_entries | sort_by(.key)[] | select((.value | type) == "object")
             | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
+        [[ -n "$label" ]] || label="$loopback_alias"
     fi
     [[ -n "$label" ]] || label="$(_device_tag 2>/dev/null)" || label=""
     [[ "$label" != "$remote" ]] || label=""
@@ -7939,7 +7994,7 @@ _peer_origin_host_label() {
         label="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/-*$//')" || label=""
         [[ "$label" != "$remote" ]] || label=""
     fi
-    [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || label=local
+    _peer_host_label_valid "$label" || label=local
     printf '%s' "$label"
 }
 
@@ -8047,6 +8102,7 @@ _peer_caller_attest() {
         if [[ "$from" == "user" ]]; then
             :
         elif [[ -n "$sender_host" && "$sender_host" != "$local_label" && "$sender_host" != "local" ]] \
+            && _peer_host_label_valid "$sender_host" \
             && ! [[ -n "$bind_target" && ( -z "$bind_host" || "$bind_host" == "local" || "$bind_host" == "$local_label" ) ]]; then
             level=remote; method=ssh; origin_host="$sender_host"
             # Phase 6: the origin's claims (CCTRL_ORIGIN_ATTEST) and the SSH
@@ -8100,7 +8156,8 @@ _peer_caller_attest() {
 # process can set CODEX_THREAD_ID, and a real Codex app peer is never
 # tmux-bound (it has a provider_task_id). The doorbell config is read only
 # once the rest holds, so off and warn cost nothing new on a normal send.
-# Sets PEER_SEND_REFUSE_DETAIL (the attest detail) on refusal. $6 = quiet:
+# Sets PEER_SEND_REFUSE_DETAIL (the attest detail; app-claimed for a
+# non-transient app-claimed level) on refusal. $6 = quiet:
 # decide only, log nothing (the caller retries a transient walk first).
 #   $1 from  $2 from peer json  $3 impersonate  $4 attest json  $5 recipient
 _peer_send_enforce_refuses() {
@@ -8116,12 +8173,15 @@ _peer_send_enforce_refuses() {
     [[ "$bound" == "true" ]] || return 1
     mode="$(_peer_attestation_cfg >/dev/null 2>&1; printf '%s' "${PEER_ATTEST_MODE:-warn}")"
     [[ "$mode" == "enforce" ]] || return 1
-    if [[ "$level" == "app-claimed" ]]; then
-        PEER_SEND_REFUSE_DETAIL=app-claimed
-    else
-        PEER_SEND_REFUSE_DETAIL="$(jq -r '.detail // "none"' <<< "$attest" 2>/dev/null)" || PEER_SEND_REFUSE_DETAIL=""
-    fi
+    # The attest's own detail decides first (p6 verify M1): a transient read
+    # failure keeps its transient detail at level app-claimed too, so the
+    # caller's F4 retry and the transient hint apply to a CODEX_THREAD_ID
+    # sender. Only a non-transient app-claimed detail becomes app-claimed.
+    PEER_SEND_REFUSE_DETAIL="$(jq -r '.detail // "none"' <<< "$attest" 2>/dev/null)" || PEER_SEND_REFUSE_DETAIL=""
     [[ -n "$PEER_SEND_REFUSE_DETAIL" ]] || PEER_SEND_REFUSE_DETAIL=none
+    if [[ "$level" == "app-claimed" ]] && ! _peer_attest_detail_transient "$PEER_SEND_REFUSE_DETAIL"; then
+        PEER_SEND_REFUSE_DETAIL=app-claimed
+    fi
     [[ "$quiet" == "quiet" ]] && return 0
     PEER_ATTEST_MODE=enforce _peer_attest_log send "$to" \
         "$(jq -cn --arg from "$from" --arg l "$level" --arg d "$PEER_SEND_REFUSE_DETAIL" '{outcome: "sender-unresolved", from: $from, level: $l, detail: $d}')"
@@ -8176,7 +8236,7 @@ _peer_cmd_send_impl() {
                 body_file="$2"; shift 2 ;;
             --sender-host)
                 [[ $# -ge 2 ]] || { $json && _json_error "validation" "--sender-host needs a value" || echo -e "${RED}--sender-host needs a value${RESET}" >&2; return 64; }
-                sender_host_override="$2"; shift 2 ;;
+                sender_host_override="$(_peer_sender_host_sanitize "$2")"; shift 2 ;;
             --allow-unknown)
                 allow_unknown=true; shift ;;
             --deliver)
@@ -12788,25 +12848,84 @@ _peer_doctor_seal_check() {
 # replay archive (messages-archive.jsonl, written by `peer gc`) that enforce
 # checks queued ids against. Unreadable (not a readable regular file: a
 # chmod, a directory, a FIFO) fails closed: in enforce every push, inline
-# paste and Stop ring stops until it is fixed. Never reads the content.
+# paste and Stop ring stops until it is fixed. Only its size and line count
+# are read, never its content.
+# Pre-flip (p6 verify N6/F3): `peer_seal.py seen` is linear and runs under
+# the helper's 5 s alarm; a timeout fails closed like an unreadable archive.
+# Measured on the Studio (warm cache, ~950-byte lines): 1.2M lines / 1.1 GB
+# take 0.40 s when `id` is the first key (how `peer gc` writes it) and 2.3 s
+# when every line needs a full parse, so 5 s is ~2.6M lines worst case. The
+# warning fires at 500k lines or 512 MiB (about 1 s worst case: headroom for a
+# cold cache and a loaded host). Pruning is manual; there is no automatic
+# pruning (see README: replay archive). Overrides for tests:
+# CCTRL_PEER_ARCHIVE_WARN_LINES, CCTRL_PEER_ARCHIVE_WARN_BYTES.
 _peer_doctor_archive_check() {
-    local archive="$PEER_DATA_DIR/messages-archive.jsonl" state=absent bytes=0
+    local archive="$PEER_DATA_DIR/messages-archive.jsonl" state=absent bytes=0 lines=0
+    local warn_lines="${CCTRL_PEER_ARCHIVE_WARN_LINES:-500000}" warn_bytes="${CCTRL_PEER_ARCHIVE_WARN_BYTES:-536870912}"
+    [[ "$warn_lines" =~ ^[0-9]+$ ]] || warn_lines=500000
+    [[ "$warn_bytes" =~ ^[0-9]+$ ]] || warn_bytes=536870912
     if [[ -e "$archive" || -L "$archive" ]]; then
         if [[ -f "$archive" && -r "$archive" ]]; then
             state=ok
             bytes="$(wc -c < "$archive" 2>/dev/null | tr -d ' ')"
             [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+            lines="$(wc -l < "$archive" 2>/dev/null | tr -d ' ')"
+            [[ "$lines" =~ ^[0-9]+$ ]] || lines=0
+            if (( lines >= warn_lines || bytes >= warn_bytes )); then
+                state=large
+            fi
         else
             state=unreadable
         fi
     fi
-    jq -cn --arg path "$archive" --arg state "$state" --argjson bytes "$bytes" '
-        {name: "sender_replay_archive", ok: true, path: $path, state: $state, bytes: (if $state == "ok" then $bytes else null end),
+    jq -cn --arg path "$archive" --arg state "$state" --argjson bytes "$bytes" --argjson lines "$lines" \
+        --argjson wl "$warn_lines" --argjson wb "$warn_bytes" '
+        {name: "sender_replay_archive", ok: true, path: $path, state: $state,
+         bytes: (if $state == "ok" or $state == "large" then $bytes else null end),
+         lines: (if $state == "ok" or $state == "large" then $lines else null end),
+         warn_lines: $wl, warn_bytes: $wb,
          summary: ((if $state == "absent" then "no archive yet (peer gc writes it); nothing to check"
-                    elif $state == "ok" then "archive readable (\($bytes) bytes); enforce rejects queued ids found in it"
+                    elif $state == "ok" then "archive readable (\($bytes) bytes, \($lines) lines); enforce rejects queued ids found in it"
+                    elif $state == "large" then "ARCHIVE LARGE (\($bytes) bytes, \($lines) lines; warns at \($wl) lines or \($wb) bytes): the enforce replay check reads it in full under a 5 s limit and fails closed (every push and Stop ring stops) if it runs out; prune it by hand (README: replay archive)"
                     else "ARCHIVE UNREADABLE (not a readable regular file): in enforce every push, inline paste and Stop ring stops (fails closed) until it is fixed" end)
                    + " (informational, warn only)")}' 2>/dev/null \
         || printf '%s\n' '{"name":"sender_replay_archive","ok":true,"summary":"archive check unreadable (informational, warn only)"}'
+}
+
+# Plan 111 pre-flip (p6 verify N2): informational (never fails doctor). The
+# label this host's cross-host sends carry as --sender-host
+# (_peer_origin_host_label). A CCTRL_HOST_PREFIX that is not a valid label is
+# not sent (the derived label is), and one equal to a remote hosts.json alias
+# is not sent to that host; both are named here.
+_peer_doctor_host_label_check() {
+    local prefix="${CCTRL_HOST_PREFIX:-}" label derived state=derived clash=""
+    label="$(_peer_origin_host_label "")"
+    derived="$(CCTRL_HOST_PREFIX='' _peer_origin_host_label "")"
+    if [[ -n "$prefix" ]]; then
+        if ! _peer_host_label_valid "$prefix"; then
+            state="prefix-invalid"
+        else
+            state=prefix
+            if [[ -f "$HOSTS_FILE" ]]; then
+                local alias host
+                while IFS=$'\t' read -r alias host; do
+                    [[ "$alias" == "$prefix" ]] || continue
+                    _host_is_local "$host" || clash="$alias"
+                done < <(jq -r 'to_entries[] | select((.value | type) == "object")
+                    | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
+            fi
+            [[ -z "$clash" ]] || state="prefix-remote-alias"
+        fi
+    fi
+    jq -cn --arg state "$state" --arg prefix "$prefix" --arg label "$label" --arg derived "$derived" '
+        ($prefix | gsub("[^A-Za-z0-9._-]"; "?") | .[0:64]) as $p
+        | {name: "sender_host_label", ok: true, state: $state, label: $label, derived: $derived,
+           summary: ((if $state == "prefix-invalid" then "CCTRL_HOST_PREFIX \"\($p)\" is NOT A VALID LABEL (needs [A-Za-z0-9][A-Za-z0-9._-]{0,63}); cross-host sends use the derived label \($derived) instead"
+                      elif $state == "prefix-remote-alias" then "CCTRL_HOST_PREFIX \($p) is a REMOTE hosts.json alias; sends to that host use the derived label \($derived), others use \($p)"
+                      elif $state == "prefix" then "cross-host sends carry \($label) (CCTRL_HOST_PREFIX)"
+                      else "cross-host sends carry \($label) (derived: hosts.json self alias, device tag or hostname)" end)
+                     + " (informational)")}' 2>/dev/null \
+        || printf '%s\n' '{"name":"sender_host_label","ok":true,"summary":"host label check unreadable (informational)"}'
 }
 
 # Plan 111 phase 3: informational (never fails doctor). The attestation mode
@@ -12886,8 +13005,11 @@ _peer_cmd_doctor() {
                 echo "  holds the logged decisions), and the push allowlist in effect (push_senders,"
                 echo "  per-recipient overrides; see cctrl peer doorbell allow-sender)."
                 echo "  sender_replay_archive (plan 111, informational): whether messages-archive.jsonl"
-                echo "  (peer gc) is readable and its size; unreadable = in enforce every push and"
-                echo "  Stop ring stops. sender_seal also flags a missing or replaced data/host-id."
+                echo "  (peer gc) is readable, its size and line count; unreadable = in enforce every"
+                echo "  push and Stop ring stops; LARGE (500k lines or 512 MiB) = prune it by hand."
+                echo "  sender_seal also flags a missing or replaced data/host-id."
+                echo "  sender_host_label (plan 111): the label cross-host sends carry as"
+                echo "  --sender-host; flags a CCTRL_HOST_PREFIX that is not a valid label."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;
@@ -12980,10 +13102,12 @@ _peer_cmd_doctor() {
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     check="$(_peer_doctor_archive_check)"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    check="$(_peer_doctor_host_label_check)"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" or .name == "sender_eligibility" or .name == "sender_replay_archive" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" or .name == "sender_eligibility" or .name == "sender_replay_archive" or .name == "sender_host_label" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 
