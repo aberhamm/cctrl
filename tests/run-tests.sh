@@ -11960,6 +11960,41 @@ test_peer_attest_preflip_origin_label_prefix_and_self_alias() {
     echo "ok: plan 111 pre-flip N2/N3: CCTRL_HOST_PREFIX is label-checked (doctor names a rejected one); the real-hostname self alias beats tunnel entries"
 }
 
+test_peer_attest_p7_v1_doctor_label_matches_sent_without_self_alias() {
+    # Pre-flip verify V1: with no hosts.json self alias, a rejected
+    # CCTRL_HOST_PREFIX used to fall back to `_device_tag`, which returns the
+    # slugified prefix, so the label sent (st-x) differed from the derived
+    # label doctor reported (pf-tag). Now both are the device tag.
+    local d="$TMPDIR/p7-v1" h out data p sent derived
+    rm -rf "$d"; mkdir -p "$d/bin" "$d/data"
+    h="$d/hosts.json"
+    # shellcheck disable=SC2016 # $1 belongs to the stub
+    printf '#!/bin/sh\nif [ "$1" = "-s" ]; then echo ms-128g-bln; else echo ms-128g-bln.local; fi\n' > "$d/bin/hostname"
+    chmod +x "$d/bin/hostname"
+    printf '{"mbp":{"hostname":"mbp.invalid"}}\n' > "$h"
+    data="$d/data"
+    printf '%032x\n' 9 > "$data/host-id"; : > "$data/messages.jsonl"
+    _p7v1() { # prefix cmd... with the stub hostname, a hosts.json without a self alias and a device tag
+        local p="$1"; shift
+        local -x PATH="$d/bin:$PATH" CCTRL_HOSTS_FILE="$h" CCTRL_DEVICE_TAG=pf-tag
+        ( export CCTRL_HOST_PREFIX="$p"; "$@" )
+    }
+    for p in 'St X' $'st\nx' mbp '-dash'; do
+        # shellcheck disable=SC2016 # evaluated in the sourced shell
+        sent="$(_p7v1 "$p" cctrl_source_eval '_peer_origin_host_label mbp')"
+        [[ "$sent" == pf-tag ]] || fail "p7 V1: prefix $(printf '%q' "$p") sends the device tag, not the slugified prefix: $sent"
+        out="$(_p7v1 "$p" env CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_PEER_SEAL_KEY_FILE="$d/st/k" env -u TMUX -u TMUX_PANE "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+        derived="$(jq -r '.checks[] | select(.name == "sender_host_label") | .derived' <<< "$out")"
+        [[ "$derived" == "$sent" ]] || fail "p7 V1: prefix $(printf '%q' "$p"): doctor derived ($derived) == sent ($sent)"
+    done
+    # A valid prefix is still sent as is; to another host than its own alias.
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    sent="$(_p7v1 studio cctrl_source_eval '_peer_origin_host_label mbp')"
+    [[ "$sent" == studio ]] || fail "p7 V1: a valid prefix is sent: $sent"
+    unset -f _p7v1
+    echo "ok: plan 111 p7 V1: without a self alias, doctor's derived label is the label actually sent for a rejected prefix"
+}
+
 test_peer_attest_preflip_doctor_archive_large() {
     # Plan 111 pre-flip (p6 verify N6/F3): peer doctor reports the replay
     # archive's line count and warns (ARCHIVE LARGE, informational) at 500k
@@ -12034,6 +12069,44 @@ test_config_user_writers_dangling_symlink() {
     out="$(PATH="$t/stub:$PATH" CCTRL_USER_CONFIG="$t/mvfail/config.json" cctrl_source_eval '_config_user_set_json k true && echo wrote || echo failed')"
     [[ "$out" == failed && -z "$(ls -A "$t/mvfail")" ]] || fail "dangling: a failed mv leaves no temp file: $out $(ls -A "$t/mvfail")"
     echo "ok: user config writers write through a dangling (absolute or relative-chain) symlink to its target; no junk dir, temp file cleaned on mv failure"
+}
+
+test_config_user_writer_newline_target_and_use_errors() {
+    # Pre-flip verify V2: a link whose target ends in a newline used to lose
+    # it to $(readlink) and write the same path without the newline. Now the
+    # write fails cleanly and nothing is created. V3: `cctrl use` on a
+    # refused target (a directory, a loop, that newline target) prints a
+    # clear error instead of exiting 1 silently.
+    local t="$TMPDIR/cfg-v2v3" out rc
+    rm -rf "$t"; mkdir -p "$t/dots" "$t/profiles" "$t/data"
+    cp "$ROOT/cctrl" "$t/cctrl"; chmod +x "$t/cctrl"
+    printf '{"model":"x","env":{}}\n' > "$t/profiles/work.json"
+    ln -s "$t/dots/config.json"$'\n' "$t/nl.json"
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    out="$(CCTRL_USER_CONFIG="$t/nl.json" cctrl_source_eval '_config_user_set_json k true && echo wrote || echo failed')"
+    [[ "$out" == failed ]] || fail "p7 V2: a newline-ending link target must fail: $out"
+    [[ ! -e "$t/dots/config.json" && -z "$(ls -A "$t/dots")" ]] || fail "p7 V2: nothing written beside the newline target: $(ls -A "$t/dots")"
+    # The resolver itself refuses it (no path printed).
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    out="$(cctrl_source_eval '_config_user_write_target "$1" && echo ok || echo refused' "$t/nl.json")"
+    [[ "$out" == refused ]] || fail "p7 V2: the write target resolver refuses it: $out"
+    # A normal relative link still resolves.
+    ln -s "dots/ok.json" "$t/ok.json"
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    out="$(cctrl_source_eval '_config_user_write_target "$1"' "$t/ok.json")"
+    [[ "$out" == "$t/dots/ok.json" ]] || fail "p7 V2: a normal link resolves: $out"
+    # V3: cctrl use names the failure, for each refused target.
+    mkdir -p "$t/dirtarget"
+    ln -s "$t/loop-b" "$t/loop-a"; ln -s "$t/loop-a" "$t/loop-b"
+    local target
+    for target in "$t/dirtarget" "$t/loop-a" "$t/nl.json"; do
+        rc=0
+        out="$(CCTRL_USER_CONFIG="$target" CCTRL_ROOT="$t" "$t/cctrl" use work 2>&1)" || rc=$?
+        [[ "$rc" -eq 1 ]] || fail "p7 V3: use on a refused target exits 1 ($target): rc $rc"
+        assert_contains "$out" "Could not write defaultProfile to"
+        assert_not_contains "$out" "Default profile is now"
+    done
+    echo "ok: plan 111 p7 V2/V3: a newline-ending link target fails cleanly; cctrl use prints a clear error on a refused config target"
 }
 
 test_peer_reply_core() {

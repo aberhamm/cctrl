@@ -391,7 +391,18 @@ _config_user_write_target() {
     while [[ -L "$target" ]]; do
         hops=$((hops + 1))
         [[ "$hops" -le 40 ]] || return 1
-        next="$(readlink "$target" 2>/dev/null)" || return 1
+        # Pre-flip verify V2: a target with a newline is refused, never
+        # rewritten to the same path without it. $(readlink) strips a
+        # trailing newline and macOS readlink prints one either way, so
+        # the raw target is read with python3 (readlink only without it).
+        if command -v python3 >/dev/null 2>&1; then
+            next="$(python3 -I -S -c 'import os, sys
+t = os.readlink(sys.argv[1])
+if not t or "\n" in t: sys.exit(1)
+sys.stdout.write(t)' "$target" 2>/dev/null)" || return 1
+        else
+            next="$(readlink "$target" 2>/dev/null)" || return 1
+        fi
         [[ -n "$next" ]] || return 1
         if [[ "$next" != /* ]]; then
             next="$(dirname "$target")/$next"
@@ -423,6 +434,14 @@ _config_user_set_json() {
     fi
     chmod 600 "$tmp" 2>/dev/null || true
     mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
+# Pre-flip verify V3: the one message for a refused user-config write, so
+# `cctrl use` and profile rename never exit 1 silently. $1 = the key.
+_config_user_write_failed() {
+    echo -e "${RED}Could not write $1 to $(_display_path "$CONFIG_USER_FILE")${RESET}" >&2
+    echo -e "${DIM}The path or the end of its symlink chain is a directory or other non-file, a symlink loop, a link target ending in a newline, or not writable. Fix the path and retry.${RESET}" >&2
+    return 1
 }
 
 # Five-step profile resolution for a launch: explicit --profile wins, then a
@@ -1893,7 +1912,7 @@ cmd_use() {
     # explicit/shortcut profile; it never touches ~/.claude/settings.json or
     # any already-running session. For a clean one-off switch, prefer
     # `cctrl start --profile`.
-    _config_user_set_default_profile "$name"
+    _config_user_set_default_profile "$name" || { _config_user_write_failed defaultProfile; return 1; }
     _log_switch "${prev:-none}" "$name"
 
     echo -e "${GREEN}Default profile is now: ${BOLD}$name${RESET}"
@@ -2143,7 +2162,7 @@ _legacy_active_profile_migrate() {
     if [[ -n "$legacy" ]] && _profile_name_valid "$legacy" && command -v jq >/dev/null 2>&1; then
         current="$(jq -r '.defaultProfile // empty' "$CONFIG_USER_FILE" 2>/dev/null || true)"
         if [[ -z "$current" ]]; then
-            _config_user_set_default_profile "$legacy"
+            _config_user_set_default_profile "$legacy" || { _config_user_write_failed defaultProfile; return 1; }
             echo -e "${DIM}Migrated legacy active profile '$legacy' to defaultProfile in $(_display_path "$CONFIG_USER_FILE").${RESET}" >&2
         fi
     fi
@@ -2342,7 +2361,7 @@ _profile_rename() {
         local configured
         configured="$(_config_default_profile 2>/dev/null || true)"
         if [[ "$configured" == "$old" ]]; then
-            _config_user_set_default_profile "$new"
+            _config_user_set_default_profile "$new" || { _config_user_write_failed defaultProfile; return 1; }
         fi
     else
         echo -e "${YELLOW}Profile '$old' not found on disk; updating log references only.${RESET}"
@@ -7988,7 +8007,10 @@ _peer_origin_host_label() {
             | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
         [[ -n "$label" ]] || label="$loopback_alias"
     fi
-    [[ -n "$label" ]] || label="$(_device_tag 2>/dev/null)" || label=""
+    # Pre-flip verify V1: with the prefix rejected above, _device_tag must
+    # not fall back to the slugified prefix, or the label sent differs from
+    # the derived label `peer doctor` reports.
+    [[ -n "$label" ]] || label="$(CCTRL_HOST_PREFIX='' _device_tag 2>/dev/null)" || label=""
     [[ "$label" != "$remote" ]] || label=""
     if [[ -z "$label" ]]; then
         label="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/-*$//')" || label=""
