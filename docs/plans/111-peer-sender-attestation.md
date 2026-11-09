@@ -310,7 +310,10 @@ today (section 6).
     host flipped to enforce does not refuse a host still on the old version.
   - cctrl unsets CCTRL_ORIGIN_ATTEST once it has read it, so nested sends and
     adapters do not inherit it.
-- Codex app peers (`CODEX_THREAD_ID`): level app-claimed.
+- Codex app peers (`CODEX_THREAD_ID`): level app-claimed. In enforce
+  (phase 6, p5 verify F2) app-claimed on a local tmux-bound name is refused
+  like none: any process can set the variable, and a real Codex app peer has
+  a provider_task_id, so it is never tmux-bound.
 
 ### 6. Mode: off / warn / enforce
 
@@ -326,7 +329,10 @@ today (section 6).
   section 5.
 - Go criterion for enforce: at least one week in warn, and `peer doctor`
   shows zero would-be-blocked senders that should be eligible (the pilot's
-  real senders, the FM and its workers, all at level session).
+  real senders, the FM and its workers, all at level session), and zero
+  transient-failure sends during the warn week (attest detail ps-failed,
+  panes-unreadable or started-unreadable in `sender_attest`; enforce retries
+  one such walk, a second failure is refused).
 - `attestation_since` (timestamp, set at the enforce flip): mail created
   before it never rings or pushes, so the warn-period backlog does not wake
   anyone at the flip. Legacy lines are already never eligible (unsealed).
@@ -348,6 +354,19 @@ today (section 6).
 - Key deleted -> everything after reads seal-mismatch: fail closed, mail stays
   readable, `peer doctor` says so loudly. `peer doctor` reports whether the
   resolved key path exists and its mode, never the key.
+- Host id missing or replaced (data/host-id deleted): not transient. The next
+  send or Stop creates a new host id, and every line sealed under the old one
+  reads other-host-seal for good: fail closed (never pushes or rings in
+  enforce), mail stays readable. It needs a same-uid delete, which also breaks
+  the task records. An unreadable (invalid) host-id is never replaced and
+  reads no-host-id until fixed (no verdict in the enforce bell). `peer doctor`
+  says HOST ID MISSING / HOST ID UNREADABLE, and OTHER HOST ID when sealed
+  mail in this host's own mailbox carries another id (every arrival is
+  sealed here, so that means a replaced id or copied lines).
+- Replay archive unreadable (a chmod, a directory or FIFO at
+  messages-archive.jsonl): in enforce every push, inline paste and Stop ring
+  stops (fail closed) until it is fixed; `peer doctor`
+  (`sender_replay_archive`) says ARCHIVE UNREADABLE.
 
 ### 8. Constraints
 
@@ -384,6 +403,9 @@ Phase status:
 - PUSHED, not installed (2026-11-09): phase 4 at de08905 (verify PASS,
   orch-cctrl-reports/plan-111-p4-verify.md; must-fix M1 gated the enforce
   flip and is fixed in phase 5).
+- PUSHED, not installed (2026-11-09): phase 5 at 4a350e9 (verify PASS,
+  orch-cctrl-reports/plan-111-p5-verify.md; F1 and F2 gated the enforce flip,
+  F3 and F4 were should-fix; all four are fixed in phase 6).
 - Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (warn only). `_peer_caller_attest` stamps `attest` v1 on every
   sent message; `peer doctor` shows `sender_attest`. Build choices: attest
   adds `detail` (why a level is not session: no-pane, ps-failed,
@@ -490,6 +512,45 @@ Phase status:
   non-object `recipients`). N4 left as is (fails closed, no trigger found).
   Replay: see Decisions (archive id check). Report:
   orch-cctrl-reports/plan-111-p5-impl.md.
+- Phase 6: built 2026-11-09 on branch feat/peer-attest-p6 from 4a350e9 (not
+  pushed, not installed; live mode stays warn). Origin: `peer send
+  --deliver`/`reply`/MCP `send_message` to a peer on the other host attests
+  the caller on the origin (the same walk, read-only, refuses nothing) and
+  passes the result as `CCTRL_ORIGIN_ATTEST=<base64 JSON>` in the SSH remote
+  command, next to CCTRL_HOST_PREFIX. Claims: v, level, method, session,
+  pane_id, pane_pid, pane_started, host_id, role, orch_kind, detail (no
+  walk_077, no secrets). The origin now always sends its real host label as
+  `--sender-host`: CCTRL_HOST_PREFIX, else the hosts.json alias whose
+  hostname is this machine, else the device tag, else the short hostname,
+  never the receiver's own alias; `local` only when nothing names the host
+  (p5 verify: an unset prefix sent `local`, so a genuine arrival read none).
+  Receiver: cctrl reads the variable once at startup into an unexported
+  shell variable and unsets it, so nothing it starts inherits it. Only level
+  remote (no pane, non-local `--sender-host`, name not a local tmux-bound
+  peer: the phase 1 rule, unchanged) records `attest.origin_claims` (known
+  keys only, strings, 200 chars max), or `origin_claims_error: "malformed"`,
+  and `attest.ssh_client` (the SSH_CONNECTION client address); all sealed
+  with the receiver's key. recv/show text adds "(remote from H, claims not
+  verified here: level L, session S, role R)" when claims exist. Old origin
+  (no variable) -> remote with no claims; new origin -> old receiver: the
+  variable is ignored and the send works as today (tested against a
+  git-archived 4a350e9 receiver). In off/warn delivery is unchanged (tested:
+  the same outcome and tmux traffic whichever origin sent it). Enforce-flip
+  fixes from the p5 verify: F1/F3 the archive replay check runs in
+  lib/peer_seal.py `seen` (the archive never passes through argv; one pass,
+  top-level id only, so a body quoting an id is not a hit); measured on the
+  Studio (20 candidate ids, median of 5): 5k lines 511 -> 32 ms, 20k 2023 ->
+  37 ms, 50k 5290 -> 46 ms; >1 MiB of quoting lines no longer silences
+  pushes. F2 in enforce, level app-claimed on a local tmux-bound name is
+  refused rc 66 (detail app-claimed). F4 in enforce, a ps-failed /
+  panes-unreadable / started-unreadable walk is retried once before
+  refusing, and the hint says "transient: retry the send". `peer doctor`
+  gains `sender_replay_archive` (absent / readable + size / ARCHIVE
+  UNREADABLE) and `sender_seal` flags HOST ID MISSING / UNREADABLE / OTHER
+  HOST ID. Nits: orphaned `.attestation.log.rot.*` files older than a minute
+  are folded into .1 under the lock; `recipients.<name>: null` now reads as
+  not set (the README rule), like a null push_senders. Report:
+  orch-cctrl-reports/plan-111-p6-impl.md.
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.

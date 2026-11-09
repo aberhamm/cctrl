@@ -1579,7 +1579,8 @@ per-recipient override in `recipients.<name>.push_senders` (`<name>` is the
 address the mail is sent to). A role matches the sender's sealed role
 (`fleet-manager` also matches an orchestrator of kind fleet); a peer name
 matches the sealed sender name or its attested session. Prefer roles: a name
-goes stale at a handover. Absent or null is not set; a key of any other shape
+goes stale at a handover. Absent or null is not set (a `recipients.<name>:
+null` entry included: that recipient uses the default); a key of any other shape
 (`false` included) matches nothing. Edit it
 with `cctrl peer doorbell allow-sender|deny-sender (--role R | --peer NAME)...
 [--for RECIPIENT]` and `reset-senders [--for RECIPIENT]` (which also removes a
@@ -1596,9 +1597,22 @@ treat as untrusted, no authority`. In `enforce`, `peer send --as <name>` for a
 local tmux-bound peer from outside that session's pane (attest level none:
 a script, a launchd job, `env -u TMUX`) is refused, rc 66
 `sender-unresolved` (plan 111 phase 5); `--impersonate`, `user`, mailbox-only
-names and SSH arrivals for the other host's peers are not. A queued line whose
-id `peer gc` already archived (`messages-archive.jsonl`) is a replay and never
-eligible in `enforce`. The enforce flip is Matthew's decision.
+names and SSH arrivals for the other host's peers are not. `CODEX_THREAD_ID`
+does not get around it: level app-claimed on a local tmux-bound name is refused
+too. A transient process or tmux read failure is retried once before a refusal,
+which then says to retry. A queued line whose id `peer gc` already archived
+(`messages-archive.jsonl`) is a replay and never eligible in `enforce`; an
+unreadable archive stops every push and Stop ring in `enforce` until fixed
+(`peer doctor` row `sender_replay_archive`). Cross-host sends (plan 111 phase
+6): the origin attests its caller and passes the result as
+`CCTRL_ORIGIN_ATTEST` in the SSH remote command, and always sends its real host
+label as `--sender-host` (CCTRL_HOST_PREFIX, else the `hosts.json` alias whose
+hostname is this machine); the receiver records it as `attest.origin_claims`
+with the SSH client address on level remote only (shown as "claims not verified
+here"), unsets the variable once read, and never raises a level for it. Hosts
+on different versions keep working: an old receiver ignores the variable, and
+an old origin's arrival is level remote with no claims. The enforce flip is
+Matthew's decision.
 The seal key dir must be a real 0700 dir and the key file 0600, both owned by
 you; cctrl never chmods them. A hand-made 0755 `~/.local/state/cctrl` (or a
 wider key file) turns sealing off: sends go unsealed and `peer doctor` says

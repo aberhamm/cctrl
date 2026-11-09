@@ -10769,6 +10769,7 @@ override@["$N"]@.push_senders = {roles: ["orchestrator"]} | .recipients = {comet
 override-other@["$E","$M"]@.recipients = {other: {push_senders: {roles: ["worker"]}}}
 override-empty-obj@["$E","$M"]@.recipients = {comet: {note: "x"}}
 override-null@["$E","$M"]@.recipients = {comet: {push_senders: null}}
+override-null-entry@["$E","$M"]@.recipients = {comet: null}
 malformed-type@[]@.push_senders = {roles: "orchestrator"}
 malformed-key@[]@.push_senders = {roles: ["orchestrator"], hosts: ["a"]}
 malformed-item@[]@.push_senders = {roles: ["orchestrator", 5]}
@@ -11335,6 +11336,460 @@ SH
     ls "$data/doorbell" | grep -q '\.rot\.' && fail "N2: no private rotation file may be left: $(ls -a "$data/doorbell")"
     [[ ! -e "$data/doorbell/.attestation.log.rotate" ]] || fail "N2: the rotation lock must be released"
     echo "ok: plan 111 p4 attestation.log rotation is safe under concurrent writers (mkdir lock + re-check); stale locks clear"
+}
+
+# Plan 111 phase 6 fixtures: a cross-host send with the SSH hop simulated.
+# The receiver is a copy of the p3 fixture (comet, bell-enabled, fake tmux);
+# the origin is its own data dir whose hosts.json names this machine `ms`
+# (hostname localhost, as on the Studio) and the receiver `mbp`. The ssh stub
+# records the remote command and runs it in an SSH-like shell: `env -i`, a
+# scratch HOME and TMUX_TMPDIR (never the default tmux server), an
+# SSH_CONNECTION, and a `cctrl` on PATH that is the receiver (new or old).
+_p6_old_tree() { # -> P6_OLD (a cctrl tree without phase 6) and P6_OLD_KIND (git|stripped)
+    P6_OLD="$TMPDIR/p6-old-tree"
+    if [[ -x "$P6_OLD/cctrl" ]]; then return 0; fi
+    rm -rf "$P6_OLD"; mkdir -p "$P6_OLD"
+    if git -C "$ROOT" cat-file -e 4a350e9^{commit} 2>/dev/null && git -C "$ROOT" archive 4a350e9 > "$TMPDIR/p6-old.tar" 2>/dev/null \
+        && tar -xf "$TMPDIR/p6-old.tar" -C "$P6_OLD" 2>/dev/null && [[ -x "$P6_OLD/cctrl" ]]; then
+        P6_OLD_KIND=git
+    else
+        # No git history here (an exported tree): the current tree with the
+        # phase 6 read taken out, i.e. a receiver that ignores the variable.
+        rm -rf "$P6_OLD"; mkdir -p "$P6_OLD"
+        local f
+        for f in "$ROOT"/*; do [[ "$(basename "$f")" == cctrl ]] || ln -s "$f" "$P6_OLD/$(basename "$f")"; done
+        sed 's/^\[\[ -n "\${CCTRL_ORIGIN_ATTEST+x}" \]\] && _PEER_ORIGIN_ATTEST_SET=true$/:/' "$ROOT/cctrl" > "$P6_OLD/cctrl"
+        chmod +x "$P6_OLD/cctrl"
+        grep -q '^\[\[ -n "\${CCTRL_ORIGIN_ATTEST+x}" \]\]' "$P6_OLD/cctrl" && fail "p6: could not strip the phase 6 read"
+        P6_OLD_KIND=stripped
+    fi
+}
+_p6_setup() { # tag [receiver cctrl] -> P6_D (dir) P6_R (receiver data) P6_O (origin data) P6_BIN, receiver from the p3 fixture
+    local tag="$1" rcctrl="${2:-$ROOT/cctrl}"
+    P6_D="$TMPDIR/p6-$tag"; rm -rf "$P6_D"; mkdir -p "$P6_D/bin" "$P6_D/rbin" "$P6_D/rhome/tt" "$P6_D/o"
+    _p3_fixture "$P6_D/r"; P6_R="$P3_DATA"; P6_O="$P6_D/o/data"; P6_BIN="$P6_D/bin"
+    CCTRL_DATA_DIR="$P6_R" "$ROOT/cctrl" peer register orig --host ms --agent codex >/dev/null
+    CCTRL_DATA_DIR="$P6_R" "$ROOT/cctrl" peer register fm-ms --host ms --session TMUX--ms--fm --agent claude >/dev/null
+    printf '{"ms":{"hostname":"localhost"},"mbp":{"hostname":"mbp.invalid","user":"tester"}}\n' > "$P6_D/o/hosts.json"
+    mkdir -p "$P6_O"
+    CCTRL_DATA_DIR="$P6_O" "$ROOT/cctrl" peer register orig --agent codex >/dev/null
+    CCTRL_DATA_DIR="$P6_O" "$ROOT/cctrl" peer register comet --host mbp --session TMUX--comet --agent codex >/dev/null
+    printf '%032x\n' 222 > "$P6_O/host-id"
+    # The receiver's cctrl and two subprocess spies: any process the
+    # receiver starts after reading the variable must not inherit it.
+    {
+        printf '#!/bin/sh\n'
+        printf 'exec env CCTRL_DATA_DIR=%q CCTRL_HOST_ID_FILE=%q CCTRL_PEER_SEAL_KEY_FILE=%q TMUX_LOG=%q TMUX_FAKE_HAS_SESSION=TMUX--comet TMUX_FAKE_SESSIONS=TMUX--comet CCTRL_NOW_UTC=2026-03-01T00:00:00Z %q "$@"\n' \
+            "$P6_R" "$P6_R/host-id" "$P3_KEY" "$P6_R/tmux.log" "$rcctrl"
+    } > "$P6_D/rbin/cctrl"
+    printf '#!/bin/sh\n[ -n "${CCTRL_ORIGIN_ATTEST+x}" ] && echo "ps $CCTRL_ORIGIN_ATTEST" >> %q\nexec /bin/ps "$@"\n' "$P6_D/leak" > "$P6_D/rbin/ps"
+    printf '#!/bin/sh\n[ -n "${CCTRL_ORIGIN_ATTEST+x}" ] && echo "tmux $CCTRL_ORIGIN_ATTEST" >> %q\nexec %q "$@"\n' "$P6_D/leak" "$TMPDIR/tmux" > "$P6_D/rbin/tmux"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'cmd="${!#}"\nprintf "%%s\\n" "$cmd" >> %q\n' "$P6_D/ssh.log"
+        printf 'exec env -i HOME=%q TMUX_TMPDIR=%q PATH=%q SSH_CONNECTION="100.64.0.9 50000 100.64.0.1 22" /bin/bash -c "$cmd"\n' \
+            "$P6_D/rhome" "$P6_D/rhome/tt" "$P6_D/rbin:$PATH"
+    } > "$P6_BIN/ssh"
+    chmod +x "$P6_D/rbin/cctrl" "$P6_D/rbin/ps" "$P6_D/rbin/tmux" "$P6_BIN/ssh"
+    : > "$P6_D/ssh.log"
+}
+_p6_origin() { # args... -> P6_RC P6_OUT, run on the origin (outside any pane, TMUX unset)
+    P6_RC=0
+    P6_OUT="$(env -u TMUX -u TMUX_PANE -u CODEX_THREAD_ID -u CODEX_SESSION_ID -u CCTRL_HOST_PREFIX -u CCTRL_ORIGIN_ATTEST \
+        PATH="$P6_BIN:$TMPDIR:$PATH" CCTRL_DATA_DIR="$P6_O" CCTRL_HOST_ID_FILE="$P6_O/host-id" CCTRL_HOSTS_FILE="$P6_D/o/hosts.json" \
+        CCTRL_PEER_SEAL_KEY_FILE="$P6_D/o/seal/peer-seal.key" "$@" 2>&1)" || P6_RC=$?
+}
+_p6_hop() { # remote command (what an origin sends) -> P6_RC P6_OUT, through the ssh stub
+    P6_RC=0
+    P6_OUT="$(printf 'hi' | "$P6_BIN/ssh" -o BatchMode=yes tester@mbp.invalid "$1" 2>/dev/null)" || P6_RC=$?
+}
+_p6_last() { tail -n 1 "$P6_R/messages.jsonl"; }
+_p6_delivery() { # the receiver's delivery facts, ids normalized: mailbox status/nudges + tmux traffic
+    jq -c '{status, nudge_count, delivered: (.delivered_at != null)}' "$P6_R/messages.jsonl" | tr '\n' ' '
+    _p3_norm_log "$P6_R/tmux.log" | sed -E 's/msg_[0-9]{8}_[0-9]{6}_[0-9a-f]+/MSG/g'
+}
+
+test_peer_attest_p6_cross_host_claims() {
+    # Plan 111 phase 6: a cross-host send carries the origin's attest claims
+    # as CCTRL_ORIGIN_ATTEST in the SSH remote command, next to
+    # CCTRL_HOST_PREFIX; the receiver stamps level remote with origin_host,
+    # the claims (known keys only), the SSH client address, and seals it with
+    # its own key. The variable is unset once read: no process the receiver
+    # starts sees it. An origin with no CCTRL_HOST_PREFIX now sends its
+    # real label (here the hosts.json alias of this machine), never `local`.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local line cmd b64 claims out
+    _p6_setup claims
+    _p6_origin env CODEX_THREAD_ID=th-p6 "$ROOT/cctrl" peer send comet --as orig --deliver --json -- "hello across"
+    [[ "$P6_RC" -eq 0 ]] || fail "p6: the cross-host send must succeed (rc $P6_RC): $P6_OUT"
+    cmd="$(cat "$P6_D/ssh.log")"
+    assert_contains "$cmd" "CCTRL_HOST_PREFIX=mbp CCTRL_ORIGIN_ATTEST="
+    assert_contains "$cmd" "--sender-host ms "
+    assert_not_contains "$cmd" "--sender-host local"
+    b64="$(sed -E 's/.*CCTRL_ORIGIN_ATTEST=([A-Za-z0-9+\/=]+) .*/\1/' <<< "$cmd")"
+    claims="$(jq -rn --arg b "$b64" '$b | @base64d')"
+    jq -e '.level == "app-claimed" and .method == "codex-env" and .v == 1 and .host_id == "000000000000000000000000000000de"
+        and (has("walk_077") | not)' <<< "$claims" >/dev/null || fail "p6: origin claims: $claims"
+    line="$(_p6_last)"
+    jq -e '.from == "orig" and .sender.host == "ms" and .attest.level == "remote" and .attest.method == "ssh"
+        and .attest.origin_host == "ms" and .attest.ssh_client == "100.64.0.9"
+        and .attest.origin_claims.level == "app-claimed" and .attest.origin_claims.method == "codex-env"
+        and .attest.origin_claims.host_id == "000000000000000000000000000000de" and (.seal.mac | test("^[0-9a-f]{64}$"))' <<< "$line" >/dev/null \
+        || fail "p6: the receiver must stamp remote with the claims: $line"
+    [[ ! -s "$P6_D/leak" ]] || fail "p6: a receiver subprocess inherited CCTRL_ORIGIN_ATTEST: $(cat "$P6_D/leak")"
+    # Sealed by the receiver: show verifies the seal (level remote) and says
+    # the claims are not verified here; editing a claim breaks the seal.
+    _p3_env "$P6_R"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer show "$(jq -r .id <<< "$line")" --as comet --json)"
+    jq -e '.verification.level == "remote" and .verification.reason == "remote-unverified" and .verification.verified == false' <<< "$out" >/dev/null \
+        || fail "p6: verification of a remote arrival: $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer show "$(jq -r .id <<< "$line")" --as comet)"
+    assert_contains "$out" "sender: orig unverified (remote-unverified, warn mode) (remote from ms, claims not verified here: level app-claimed)"
+    assert_not_contains "$out" "untrusted"
+    jq -c '.attest.origin_claims.level = "session"' <<< "$line" > "$P6_D/tampered.jsonl"
+    out="$(jq -s . "$P6_D/tampered.jsonl" | CCTRL_PEER_SEAL_KEY_FILE="$P3_KEY" python3 -I -S "$ROOT/lib/peer_seal.py" verify "$P3_HOST")"
+    jq -e '.[0].reason == "seal-mismatch"' <<< "$out" >/dev/null || fail "p6: an edited claim must break the seal: $out"
+    # A session-bound peer of the other host (fm-ms) is remote too.
+    b64="$(printf '%s' '{"v":"1","level":"session","session":"TMUX--ms--fm","role":"orchestrator","orch_kind":"fleet","bogus":"x"}' | base64 | tr -d '\n')"
+    _p6_hop "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=mbp CCTRL_ORIGIN_ATTEST=$b64 cctrl peer send comet --as fm-ms --sender-host ms --deliver --json --body-file -"
+    [[ "$P6_RC" -eq 0 ]] || fail "p6: fm-ms arrival rc $P6_RC: $P6_OUT"
+    jq -e '.attest.level == "remote" and .attest.origin_claims == {v: "1", level: "session", session: "TMUX--ms--fm", role: "orchestrator", orch_kind: "fleet"}' <<< "$(_p6_last)" >/dev/null \
+        || fail "p6: only the known claim keys are kept: $(_p6_last)"
+    # Malformed claims: recorded as such, never a level change.
+    _p6_hop "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=mbp CCTRL_ORIGIN_ATTEST=bm90LWpzb24= cctrl peer send comet --as orig --sender-host ms --deliver --json --body-file -"
+    jq -e '.attest.level == "remote" and .attest.origin_claims_error == "malformed" and (.attest | has("origin_claims") | not)' <<< "$(_p6_last)" >/dev/null \
+        || fail "p6: malformed claims: $(_p6_last)"
+    [[ ! -s "$P6_D/leak" ]] || fail "p6: a receiver subprocess inherited CCTRL_ORIGIN_ATTEST: $(cat "$P6_D/leak")"
+    # In-process: read once, unset at once, never exported to a child.
+    out="$(CCTRL_ORIGIN_ATTEST=abc cctrl_source_eval '[[ -z "${CCTRL_ORIGIN_ATTEST+x}" ]] || echo still-set; [[ "$_PEER_ORIGIN_ATTEST_IN" == abc && "$_PEER_ORIGIN_ATTEST_SET" == true ]] || echo not-read; /bin/sh -c "[ -z \"\${CCTRL_ORIGIN_ATTEST+x}\" ] && [ -z \"\${_PEER_ORIGIN_ATTEST_IN+x}\" ] || echo child-sees-it"; echo done')"
+    [[ "$out" == done ]] || fail "p6: CCTRL_ORIGIN_ATTEST must be read once and unset: $out"
+    echo "ok: plan 111 p6 cross-host send carries origin claims (CCTRL_ORIGIN_ATTEST); receiver stamps remote + claims + ssh client, sealed; env unset after read; origin sends its real host label"
+}
+
+test_peer_attest_p6_remote_level_rules() {
+    # Plan 111 phase 6 trust rule: remote only when the walk finds no pane,
+    # --sender-host is non-local, and the name is not a local tmux-bound peer.
+    # CCTRL_ORIGIN_ATTEST never raises a level: set by a local process it
+    # gives no claims and no remote for a local tmux-bound name (enforce
+    # still refuses it), never session for anyone; without a non-local
+    # --sender-host it is ignored.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local fake mode
+    _p3_fixture "$TMPDIR/p6-rules"
+    fake="$(printf '%s' '{"v":"1","level":"session","session":"TMUX--comet","role":"orchestrator"}' | base64 | tr -d '\n')"
+    for mode in warn enforce; do
+        # A local tmux-bound name, spoofed claims and a foreign --sender-host.
+        _p5_send "$mode" env CCTRL_ORIGIN_ATTEST="$fake" SSH_CONNECTION="10.0.0.1 1 10.0.0.2 22" "$ROOT/cctrl" peer send orchestrator --as comet --sender-host mbp --json -- spoof
+        if [[ "$mode" == enforce ]]; then
+            [[ "$P5_RC" -eq 66 ]] || fail "p6 enforce: spoofed claims must not turn the refusal into a send (rc $P5_RC): $P5_OUT"
+            [[ ! -s "$P3_C/messages.jsonl" ]] || fail "p6 enforce: nothing queued"
+        else
+            [[ "$P5_RC" -eq 0 ]] || fail "p6 warn: spoof send queues as today (rc $P5_RC): $P5_OUT"
+            jq -e '.attest.level == "none" and (.attest | has("origin_claims") or has("origin_claims_error") or has("ssh_client") | not)' <<< "$P5_OUT" >/dev/null \
+                || fail "p6 warn: a local tmux-bound name gets no remote and no claims: $P5_OUT"
+        fi
+        # No --sender-host: the variable is ignored.
+        _p5_send "$mode" env CCTRL_ORIGIN_ATTEST="$fake" "$ROOT/cctrl" peer send comet --as orchestrator --json -- no-host
+        [[ "$P5_RC" -eq 0 ]] || fail "p6 $mode: mailbox-only sender queues (rc $P5_RC)"
+        jq -e '.attest.level == "none" and (.attest | has("origin_claims") | not)' <<< "$P5_OUT" >/dev/null \
+            || fail "p6 $mode: without a non-local --sender-host the claims are ignored: $P5_OUT"
+        # --sender-host naming this host: ignored too.
+        _p5_send "$mode" env CCTRL_HOST_PREFIX=mbp CCTRL_ORIGIN_ATTEST="$fake" "$ROOT/cctrl" peer send comet --as orchestrator --sender-host mbp --json -- self-host
+        jq -e '.attest.level == "none" and (.attest | has("origin_claims") | not)' <<< "$P5_OUT" >/dev/null \
+            || fail "p6 $mode: --sender-host naming this host is not remote: $P5_OUT"
+        # A non-tmux-bound name with a foreign --sender-host: remote with the
+        # claims recorded, never session, never eligible.
+        _p5_send "$mode" env CCTRL_ORIGIN_ATTEST="$fake" "$ROOT/cctrl" peer send comet --as orchestrator --sender-host mbp --json -- far
+        [[ "$P5_RC" -eq 0 ]] || fail "p6 $mode: remote arrival queues (rc $P5_RC): $P5_OUT"
+        jq -e '.attest.level == "remote" and .attest.origin_claims.level == "session" and .attest.session == null' <<< "$P5_OUT" >/dev/null \
+            || fail "p6 $mode: remote with claims, never session: $P5_OUT"
+    done
+    _p3_env "$P3_C"
+    jq -e '.[0].eligibility.push == false and .[0].eligibility.bell == false and .[0].verification.level == "remote"' \
+        <<< "$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)" >/dev/null || fail "p6: a remote arrival with session claims is never eligible"
+    echo "ok: plan 111 p6 remote level only with no pane + non-local --sender-host + non-local name; spoofed CCTRL_ORIGIN_ATTEST never raises a level"
+}
+
+test_peer_attest_p6_pane_caller_ignores_origin_env() {
+    # Plan 111 phase 6, REAL tmux: inside its own pane a caller's walk level
+    # wins: with CCTRL_ORIGIN_ATTEST and a foreign --sender-host it is still
+    # level session, never remote, and no claims are recorded. As an origin,
+    # the pane caller's claims carry its real session level and role.
+    [[ -n "${CCTRL_TEST_TMUX_SHIM:-}" ]] || { echo "skip: no tmux"; return 0; }
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    _attest_pane_start p6
+    local cc r="$ATT_DIR/run" fake inpane inpane_rc origin_rc cmd b64 claims bin="$ATT_DIR/bin"
+    cc="$(printf '%q' "$ROOT/cctrl")"
+    fake="$(printf '%s' '{"v":"1","level":"session","session":"TMUX--other"}' | base64 | tr -d '\n')"
+    _attest_pane_run "$r" "env -u TMUX CCTRL_ORIGIN_ATTEST=$fake $cc peer send att-rcpt --as att-fm --sender-host far --json -- in-pane"
+    inpane="$ATT_OUT"; inpane_rc="$ATT_RC"
+    # As an origin: a peer on another host, ssh records the command only.
+    mkdir -p "$bin"; printf '{"far":{"hostname":"far.invalid"}}\n' > "$ATT_DIR/hosts.json"
+    printf '#!/bin/sh\nfor a; do last="$a"; done\nprintf "%%s\\n" "$last" > %q\nprintf "%%s\\n" "{\\"ok\\":true,\\"outcome\\":\\"sent-and-queued\\"}"\n' "$ATT_DIR/ssh.cmd" > "$bin/ssh"
+    chmod +x "$bin/ssh"
+    _attest_cctrl peer register att-far --host far --session TMUX--far --agent claude >/dev/null
+    _attest_pane_run "$r" "env -u TMUX PATH=$(printf '%q' "$bin"):\"\$PATH\" CCTRL_HOSTS_FILE=$(printf '%q' "$ATT_DIR/hosts.json") $cc peer send att-far --as att-fm --deliver --json -- to-far"
+    origin_rc="$ATT_RC"
+    # F4 in a genuine pane, enforce: ps fails once, the retry attests session.
+    local psbin="$ATT_DIR/psbin" f4 f4_rc
+    mkdir -p "$psbin"
+    printf '#!/bin/sh\ncase "$*" in *-axo*) if [ ! -e %q ]; then : > %q; exit 1; fi ;; esac\nexec /bin/ps "$@"\n' "$psbin/failed" "$psbin/failed" > "$psbin/ps"
+    chmod +x "$psbin/ps"
+    printf '%s\n' '{"attestation":"enforce"}' > "$ATT_DIR/data/doorbell.json"
+    _attest_pane_run "$r" "env -u TMUX PATH=$(printf '%q' "$psbin"):\"\$PATH\" $cc peer send att-rcpt --as att-fm --json -- f4-in-pane"
+    f4="$ATT_OUT"; f4_rc="$ATT_RC"
+    _attest_pane_stop
+    [[ -e "$psbin/failed" ]] || fail "p6 F4 pane: the ps stub never failed (fixture)"
+    [[ "$f4_rc" -eq 0 ]] && jq -e --arg s "$ATT_S" '.attest.level == "session" and .attest.session == $s' <<< "$f4" >/dev/null \
+        || fail "p6 F4: a transient ps failure inside the real pane must be retried, not refused (rc $f4_rc): $f4"
+    [[ "$inpane_rc" -eq 0 ]] || fail "p6 in-pane send failed (rc $inpane_rc): $inpane"
+    jq -e --arg s "$ATT_S" '.attest.level == "session" and .attest.session == $s and (.attest | has("origin_claims") or has("origin_host") or has("ssh_client") | not)' <<< "$inpane" >/dev/null \
+        || fail "p6: a pane caller keeps its walk level and gets no claims: $inpane"
+    [[ "$origin_rc" -eq 0 ]] || fail "p6 origin send from the pane failed (rc $origin_rc)"
+    cmd="$(cat "$ATT_DIR/ssh.cmd" 2>/dev/null)"
+    b64="$(sed -E 's/.*CCTRL_ORIGIN_ATTEST=([A-Za-z0-9+\/=]+) .*/\1/' <<< "$cmd")"
+    claims="$(jq -rn --arg b "$b64" '$b | @base64d' 2>/dev/null)"
+    jq -e --arg s "$ATT_S" '.level == "session" and .session == $s and .role == "orchestrator" and .orch_kind == "fleet" and (.pane_started | length > 0)' <<< "$claims" >/dev/null \
+        || fail "p6: a pane origin sends its session claims: $cmd"
+    echo "ok: plan 111 p6 a pane caller's walk level wins over CCTRL_ORIGIN_ATTEST; as an origin it sends its session claims; enforce retries a transient ps failure in the pane"
+}
+
+test_peer_attest_p6_version_skew() {
+    # Plan 111 phase 6 version skew. New origin -> old receiver (no phase 6):
+    # the send works as today (the receiver ignores the variable). Old origin
+    # (no variable) -> new receiver in enforce: queued, level remote with no
+    # claims, not refused. Old origin with no CCTRL_HOST_PREFIX (`--sender-
+    # host local`): level none as today, queued (not a local tmux-bound
+    # name). off/warn: the delivery outcome and the receiver's tmux traffic
+    # are the same whichever origin sent it.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local mode ref out
+    _p6_old_tree
+    # New origin -> old receiver.
+    _p6_setup skew-oldrecv "$P6_OLD/cctrl"
+    _p6_origin "$ROOT/cctrl" peer send comet --as orig --deliver --json -- "to an old receiver"
+    [[ "$P6_RC" -eq 0 ]] || fail "p6 skew ($P6_OLD_KIND): new origin -> old receiver must work (rc $P6_RC): $P6_OUT"
+    jq -e '.outcome == "sent-and-nudged"' <<< "$P6_OUT" >/dev/null || fail "p6 skew: old receiver outcome: $P6_OUT"
+    assert_contains "$(cat "$P6_D/ssh.log")" "CCTRL_ORIGIN_ATTEST="
+    jq -e '.status != null and .attest.level == "remote" and (.attest | has("origin_claims") | not)' <<< "$(_p6_last)" >/dev/null \
+        || fail "p6 skew: the old receiver queues it as today: $(_p6_last)"
+    # Old origin (the remote command as 4a350e9 builds it) -> new receiver.
+    for mode in off warn enforce; do
+        _p6_setup "skew-$mode"; _p3_mode "$P6_R" "$mode"
+        _p6_hop "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=mbp cctrl peer send comet --as orig --sender-host ms --deliver --json --body-file -"
+        [[ "$P6_RC" -eq 0 ]] || fail "p6 skew $mode: old origin -> new receiver must queue (rc $P6_RC): $P6_OUT"
+        jq -e '.attest.level == "remote" and .attest.origin_host == "ms" and (.attest | has("origin_claims") or has("origin_claims_error") | not)
+            and .attest.ssh_client == "100.64.0.9"' <<< "$(_p6_last)" >/dev/null || fail "p6 skew $mode: remote with no claims: $(_p6_last)"
+        out="$(jq -r .outcome <<< "$P6_OUT")|$(_p6_delivery)"
+        if [[ "$mode" == enforce ]]; then
+            jq -e '.outcome == "sent-and-queued"' <<< "$P6_OUT" >/dev/null || fail "p6 skew enforce: a remote arrival never pushes: $P6_OUT"
+        else
+            [[ "$(jq -r .outcome <<< "$P6_OUT")" == sent-and-nudged ]] || fail "p6 skew $mode: delivered as today: $P6_OUT"
+            # The same arrival from a new origin: identical delivery.
+            ref="$out"
+            _p6_setup "skew-$mode-new"; _p3_mode "$P6_R" "$mode"
+            _p6_origin "$ROOT/cctrl" peer send comet --as orig --deliver --json -- "hi"
+            [[ "$P6_RC" -eq 0 ]] || fail "p6 skew $mode new origin rc $P6_RC: $P6_OUT"
+            out="$(jq -r .outcome <<< "$P6_OUT")|$(_p6_delivery)"
+            [[ "$out" == "$ref" ]] || fail "p6 skew $mode: delivery must not depend on the claims:
+$out
+---
+$ref"
+        fi
+        # Old origin without CCTRL_HOST_PREFIX: `--sender-host local`.
+        _p6_hop "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=mbp cctrl peer send comet --as orig --sender-host local --deliver --json --body-file -"
+        [[ "$P6_RC" -eq 0 ]] || fail "p6 skew $mode: --sender-host local still queues (rc $P6_RC): $P6_OUT"
+        jq -e '.attest.level == "none"' <<< "$(_p6_last)" >/dev/null || fail "p6 skew $mode: --sender-host local reads none as today: $(_p6_last)"
+    done
+    echo "ok: plan 111 p6 version skew ($P6_OLD_KIND old tree): new origin -> old receiver works; old origin -> new receiver is remote, no claims, never refused; delivery unchanged in off/warn"
+}
+
+test_peer_attest_p6_origin_host_label() {
+    # Plan 111 phase 6 (p5 verify): the origin's --sender-host. CCTRL_HOST_PREFIX
+    # wins; else the hosts.json alias whose hostname is this machine; never
+    # the receiver's own alias; `local` only when nothing names this host.
+    local h="$TMPDIR/p6-label-hosts.json" out
+    printf '{"mbp":{"hostname":"mbp.invalid"},"ms":{"hostname":"localhost"}}\n' > "$h"
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    out="$(unset CCTRL_HOST_PREFIX; CCTRL_HOSTS_FILE="$h" cctrl_source_eval '_peer_origin_host_label mbp')"
+    [[ "$out" == ms ]] || fail "p6 label: hosts.json self alias, got '$out'"
+    out="$(CCTRL_HOST_PREFIX=studio CCTRL_HOSTS_FILE="$h" cctrl_source_eval '_peer_origin_host_label mbp')"
+    [[ "$out" == studio ]] || fail "p6 label: CCTRL_HOST_PREFIX wins, got '$out'"
+    out="$(unset CCTRL_HOST_PREFIX; CCTRL_HOSTS_FILE="$h" cctrl_source_eval '_peer_origin_host_label ms')"
+    [[ "$out" != ms && "$out" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "p6 label: never the receiver's own alias, got '$out'"
+    printf '{"mbp":{"hostname":"mbp.invalid"}}\n' > "$h"
+    out="$(unset CCTRL_HOST_PREFIX; CCTRL_DEVICE_TAG=studio-t CCTRL_HOSTS_FILE="$h" cctrl_source_eval '_peer_origin_host_label mbp')"
+    [[ "$out" == studio-t ]] || fail "p6 label: device tag fallback, got '$out'"
+    echo "ok: plan 111 p6 origin --sender-host label: prefix, hosts.json self alias, device tag; never the receiver's alias"
+}
+
+test_peer_attest_p6_archive_check_big_and_cheap() {
+    # Plan 111 phase 6 (p5 verify F1/F3): the enforce replay check reads
+    # messages-archive.jsonl in lib/peer_seal.py and matches each line's
+    # top-level id only. Over 1 MiB of archive lines that quote a queued id
+    # in their body (ordinary replies) used to pass through jq's argv and fail
+    # closed for every push; now the mail still pushes. A line whose id is the
+    # queued id (in any key order) is still a replay.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local E=msg_20260201_000000_e00001 out rc size
+    _p3_fixture "$TMPDIR/p6-arch"
+    _p3_add "$E" orch1 2026-02-01T00:00:00Z session orchestrator
+    awk -v e="$E" 'BEGIN { pad = sprintf("%900s", ""); gsub(/ /, "x", pad)
+        for (i = 0; i < 1500; i++) printf "{\"id\":\"msg_20250101_000000_q%05d\",\"from\":\"a\",\"to\":\"comet\",\"status\":\"acked\",\"body\":\"re %s %s\"}\n", i, e, pad }' \
+        > "$P3_DATA/messages-archive.jsonl"
+    size="$(wc -c < "$P3_DATA/messages-archive.jsonl" | tr -d ' ')"
+    [[ "$size" -gt 1048576 ]] || fail "p6 F1 fixture must exceed 1 MiB ($size)"
+    _p3_copy big enforce; _p3_env "$P3_C"
+    rc=0; out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)" || rc=$?
+    [[ $rc -eq 0 ]] && jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null \
+        || fail "p6 F1: >1 MiB of archive lines quoting the id must not silence the push (rc $rc): $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)"
+    jq -e '.[0].eligibility.push == true' <<< "$out" >/dev/null || fail "p6 F1: inbox eligibility: $out"
+    # The real id, written with another key order: still a replay.
+    _p3_copy reorder enforce; _p3_env "$P3_C"
+    jq -c '{from, status: "acked", id}' "$P3_DATA/messages.jsonl" >> "$P3_C/messages-archive.jsonl"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    jq -e '.results[0].status == "queued-only"' <<< "$out" >/dev/null || fail "p6 F1: an archived id (any key order) is a replay: $out"
+    jq -e '.[0].eligibility.detail == "duplicate-id"' <<< "$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)" >/dev/null \
+        || fail "p6 F1: duplicate-id detail"
+    # The helper itself: id field only, missing archive = [], FIFO/dir = rc 1.
+    out="$(printf '["%s","msg_x"]' "$E" | python3 -I -S "$ROOT/lib/peer_seal.py" seen "$P3_DATA/messages-archive.jsonl")"
+    [[ "$out" == "[]" ]] || fail "p6 F1: a body quoting an id is not a hit: $out"
+    out="$(printf '["%s"]' "$E" | python3 -I -S "$ROOT/lib/peer_seal.py" seen "$P3_C/messages-archive.jsonl")"
+    [[ "$out" == "[\"$E\"]" ]] || fail "p6 F1: the id hit: $out"
+    out="$(printf '["%s"]' "$E" | python3 -I -S "$ROOT/lib/peer_seal.py" seen "$P3_C/none.jsonl")"
+    [[ "$out" == "[]" ]] || fail "p6 F1: a missing archive is []: $out"
+    mkdir "$P3_C/adir"; rc=0
+    printf '["%s"]' "$E" | python3 -I -S "$ROOT/lib/peer_seal.py" seen "$P3_C/adir" >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 1 ]] || fail "p6 F1: a directory at the archive path is rc 1 (fail closed), got $rc"
+    mkfifo "$P3_C/afifo"; rc=0
+    printf '["%s"]' "$E" | python3 -I -S "$ROOT/lib/peer_seal.py" seen "$P3_C/afifo" >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 1 ]] || fail "p6 F1: a FIFO at the archive path is rc 1 without blocking, got $rc"
+    # warn still reads no archive: the same delivery with an unreadable one.
+    _p3_copy warn-unreadable warn; _p3_env "$P3_C"; chmod 000 "$P3_C/messages-archive.jsonl"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+    chmod 600 "$P3_C/messages-archive.jsonl"
+    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "p6 F1: warn ignores the archive: $out"
+    echo "ok: plan 111 p6 F1/F3 archive replay check: >1 MiB of quoting lines no longer silences pushes; id field only; fails closed on FIFO/dir"
+}
+
+test_peer_attest_p6_app_claimed_and_transient() {
+    # Plan 111 phase 6, enforce only. F2: CODEX_THREAD_ID outside any pane
+    # with --as a local tmux-bound name is app-claimed and now refused rc 66
+    # (a real Codex app peer has a provider_task_id and is never tmux-bound).
+    # F4: a transient walk failure (ps-failed) is retried once before
+    # refusing; a second failure is refused with a "transient: retry" hint.
+    # warn: none of this changes anything (queued, no retry, no output).
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local stub="$TMPDIR/p6-ps-stub" calls
+    _p3_fixture "$TMPDIR/p6-f2f4"
+    _p5_send enforce env CODEX_THREAD_ID=th-f2 "$ROOT/cctrl" peer send orchestrator --as comet --json -- f2
+    [[ "$P5_RC" -eq 66 ]] || fail "p6 F2: app-claimed on a tmux-bound name must be refused in enforce (rc $P5_RC): $P5_OUT"
+    jq -e '.error.code == "sender-unresolved" and (.error.message | contains("attestation enforce: app-claimed") and contains("CODEX_THREAD_ID does not attest"))' <<< "$P5_OUT" >/dev/null \
+        || fail "p6 F2: refusal wording: $P5_OUT"
+    [[ ! -s "$P3_C/messages.jsonl" ]] || fail "p6 F2: nothing queued"
+    jq -e -s 'any(.[]; .path == "send" and .level == "app-claimed" and .detail == "app-claimed")' "$P3_C/doorbell/attestation.log" >/dev/null || fail "p6 F2: logged"
+    _p5_send warn env CODEX_THREAD_ID=th-f2 "$ROOT/cctrl" peer send orchestrator --as comet --json -- f2
+    [[ "$P5_RC" -eq 0 && -z "$P5_ERR" ]] && jq -e '.attest.level == "app-claimed" and .status == "queued"' <<< "$P5_OUT" >/dev/null \
+        || fail "p6 F2 warn: queues as today (rc $P5_RC): $P5_OUT $P5_ERR"
+    _p5_send enforce env CODEX_THREAD_ID=th-f2 "$ROOT/cctrl" peer send comet --as orchestrator --json -- app-mailbox
+    [[ "$P5_RC" -eq 0 ]] || fail "p6 F2: app-claimed on a mailbox-only name is not refused (rc $P5_RC)"
+    _p3_copy f2-unit enforce
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    calls="$(CCTRL_DATA_DIR="$P3_C" cctrl_source_eval 'for p in "$1" "$2"; do _peer_send_enforce_refuses x "$p" false "{\"level\":\"app-claimed\"}" comet quiet && echo refused || echo pass; done' \
+        '{"name":"app1","session":"TMUX--app1","provider_task_id":"task-1"}' '{"name":"tb1","session":"TMUX--tb1"}' | tr '\n' ' ')"
+    [[ "$calls" == "pass refused " ]] || fail "p6 F2: a Codex app peer (provider_task_id) is never refused; a tmux-bound one is: $calls"
+    # F4: ps fails on its first -axo call only -> retried -> the walk runs.
+    mkdir -p "$stub"
+    cat > "$stub/ps" <<SH
+#!/bin/sh
+case "\$*" in *-axo*) echo x >> "$stub/calls"; if [ "\$(wc -l < "$stub/calls")" -le "\${P6_PS_FAILS:-1}" ]; then exit 1; fi ;; esac
+exec /bin/ps "\$@"
+SH
+    chmod +x "$stub/ps"
+    rm -f "$stub/calls"
+    _p5_send enforce env PATH="$stub:$TMPDIR:$PATH" P6_PS_FAILS=1 "$ROOT/cctrl" peer send orchestrator --as comet --json -- f4-once
+    calls="$(wc -l < "$stub/calls" | tr -d ' ')"
+    [[ "$calls" -eq 2 ]] || fail "p6 F4: a ps-failed walk must be retried once in enforce ($calls ps calls)"
+    [[ "$P5_RC" -eq 66 ]] && jq -e '(.error.message | contains("attestation enforce: no-pane") or contains("attestation enforce: panes-unreadable")) and (.error.message | contains("transient") | not)' <<< "$P5_OUT" >/dev/null \
+        || fail "p6 F4: after a good retry the real (non-transient) reason decides (rc $P5_RC): $P5_OUT"
+    rm -f "$stub/calls"
+    _p5_send enforce env PATH="$stub:$TMPDIR:$PATH" P6_PS_FAILS=9 "$ROOT/cctrl" peer send orchestrator --as comet --json -- f4-twice
+    calls="$(wc -l < "$stub/calls" | tr -d ' ')"
+    [[ "$P5_RC" -eq 66 && "$calls" -eq 2 ]] || fail "p6 F4: two failures refuse (rc $P5_RC, $calls ps calls): $P5_OUT"
+    jq -e '.error.message | contains("attestation enforce: ps-failed") and contains("transient: retry the send") and (contains("send from inside") | not)' <<< "$P5_OUT" >/dev/null \
+        || fail "p6 F4: the transient hint: $P5_OUT"
+    _p5_send enforce env PATH="$stub:$TMPDIR:$PATH" P6_PS_FAILS=99 "$ROOT/cctrl" peer send orchestrator --as comet -- f4-text
+    assert_contains "$P5_ERR" "transient: retry the send"
+    rm -f "$stub/calls"
+    _p5_send warn env PATH="$stub:$TMPDIR:$PATH" P6_PS_FAILS=9 "$ROOT/cctrl" peer send orchestrator --as comet --json -- f4-warn
+    calls="$(wc -l < "$stub/calls" | tr -d ' ')"
+    [[ "$P5_RC" -eq 0 && -z "$P5_ERR" && "$calls" -eq 1 ]] && jq -e '.attest.detail == "ps-failed" and .status == "queued"' <<< "$P5_OUT" >/dev/null \
+        || fail "p6 F4 warn: no retry, queued as today (rc $P5_RC, $calls ps calls): $P5_OUT $P5_ERR"
+    echo "ok: plan 111 p6 enforce: app-claimed on a tmux-bound name refused (F2); a transient walk failure is retried once with a retry hint (F4); warn unchanged"
+}
+
+test_peer_attest_p6_doctor_archive_and_host_id() {
+    # Plan 111 phase 6 (p5 verify): peer doctor reports the replay archive
+    # (absent / readable + size / UNREADABLE: every enforce push stops) and a
+    # missing, unreadable or replaced data/host-id (old seals then read
+    # other-host-seal for good). Informational: the doctor verdict is unchanged.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local data="$TMPDIR/p6-doctor" out txt e
+    rm -rf "$data"; mkdir -p "$data"
+    printf '%032x\n' 7 > "$data/host-id"
+    printf '%s\n' "{\"id\":\"m1\",\"from\":\"a\",\"to\":\"b\",\"status\":\"queued\",\"seal\":{\"v\":1,\"host_id\":\"$(printf '%032x' 8)\",\"mac\":\"$(printf '%064x' 1)\"}}" > "$data/messages.jsonl"
+    e=(env -u TMUX -u TMUX_PANE CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_PEER_SEAL_KEY_FILE="$data/st/k")
+    out="$("${e[@]}" "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "sender_replay_archive") | .ok == true and .state == "absent"' <<< "$out" >/dev/null || fail "p6 doctor: absent archive: $out"
+    jq -e '.checks[] | select(.name == "sender_seal") | .host_id_state == "ok" and (.summary | startswith("OTHER HOST ID: 1 sealed message(s)"))' <<< "$out" >/dev/null \
+        || fail "p6 doctor: a replaced host id is flagged: $(jq -c '.checks[] | select(.name == "sender_seal")' <<< "$out")"
+    printf '%s\n' '{"id":"a1"}' > "$data/messages-archive.jsonl"
+    txt="$("${e[@]}" "$ROOT/cctrl" peer doctor 2>/dev/null)" || true
+    assert_contains "$txt" "sender_replay_archive: archive readable (12 bytes); enforce rejects queued ids found in it (informational, warn only)"
+    chmod 000 "$data/messages-archive.jsonl"
+    txt="$("${e[@]}" "$ROOT/cctrl" peer doctor 2>/dev/null)" || true
+    chmod 600 "$data/messages-archive.jsonl"
+    assert_contains "$txt" "sender_replay_archive: ARCHIVE UNREADABLE (not a readable regular file): in enforce every push, inline paste and Stop ring stops"
+    rm -f "$data/messages-archive.jsonl"; mkdir "$data/messages-archive.jsonl"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "sender_replay_archive") | .state == "unreadable"' <<< "$out" >/dev/null || fail "p6 doctor: a directory is unreadable"
+    printf 'not-an-id\n' > "$data/host-id"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "sender_seal") | .host_id_state == "invalid" and (.summary | startswith("HOST ID UNREADABLE"))' <<< "$out" >/dev/null \
+        || fail "p6 doctor: invalid host id: $(jq -c '.checks[] | select(.name == "sender_seal")' <<< "$out")"
+    [[ "$(cat "$data/host-id")" == not-an-id ]] || fail "p6 doctor must never replace an invalid host id"
+    rm -f "$data/host-id"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+    if [[ -f "$data/host-id" ]]; then
+        echo "note: peer doctor created data/host-id itself; the missing case is checked through the helper only"
+    else
+        jq -e '.checks[] | select(.name == "sender_seal") | .host_id_state == "missing" and (.summary | startswith("HOST ID MISSING"))' <<< "$out" >/dev/null \
+            || fail "p6 doctor: missing host id: $(jq -c '.checks[] | select(.name == "sender_seal")' <<< "$out")"
+    fi
+    assert_contains "$("$ROOT/cctrl" peer doctor --help)" "sender_replay_archive"
+    echo "ok: plan 111 p6 peer doctor: replay archive state, missing/invalid/replaced host id (informational)"
+}
+
+test_peer_attest_p6_rot_orphan_sweep() {
+    # Plan 111 phase 6 (p5 verify nit): a private .attestation.log.rot.* left
+    # by a killed writer is folded into .1 once it is over a minute old (no
+    # line lost, .1 never replaced); a young one (a live writer) is left.
+    local data="$TMPDIR/p6-sweep" dir
+    dir="$data/doorbell"; rm -rf "$data"; mkdir -p "$dir"
+    printf '%s\n' '{"rotated":1}' > "$dir/attestation.log.1"
+    printf '%s\n' '{"orphan":1}' '{"orphan":2}' > "$dir/.attestation.log.rot.111.1"
+    touch -t 202001010000 "$dir/.attestation.log.rot.111.1"
+    printf '%s\n' '{"young":1}' > "$dir/.attestation.log.rot.222.2"
+    CCTRL_DATA_DIR="$data" cctrl_source_eval '_peer_attest_log push r "{\"writer\":\"sweep\"}"'
+    [[ ! -e "$dir/.attestation.log.rot.111.1" ]] || fail "p6 sweep: the old orphan must be swept"
+    [[ -e "$dir/.attestation.log.rot.222.2" ]] || fail "p6 sweep: a young private file belongs to a live writer"
+    [[ "$(grep -c '"orphan":' "$dir/attestation.log.1")" -eq 2 && "$(grep -c '"rotated":' "$dir/attestation.log.1")" -eq 1 ]] \
+        || fail "p6 sweep: the orphan's lines go to .1, which is kept: $(cat "$dir/attestation.log.1")"
+    grep -q '"writer":"sweep"' "$dir/attestation.log" || fail "p6 sweep: the new line is written"
+    [[ ! -e "$dir/.attestation.log.rotate" ]] || fail "p6 sweep: the lock is released"
+    ls "$dir"/.attestation.log.rot.sweep.* >/dev/null 2>&1 && fail "p6 sweep: no claim file left"
+    echo "ok: plan 111 p6 attestation.log: orphaned rotation files are folded into .1"
 }
 
 test_peer_reply_core() {

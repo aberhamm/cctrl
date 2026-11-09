@@ -53,6 +53,17 @@ _session_refresh_paths() {
     CCTRL_HOST_ID_FILE="${CCTRL_HOST_ID_FILE:-${CCTRL_DATA_DIR:-$SCRIPT_DIR/data}/host-id}"
 }
 _session_refresh_paths
+# Plan 111 phase 6: the origin host's attest claims for a cross-host send
+# (CCTRL_ORIGIN_ATTEST=<base64 JSON>, set by the origin in the SSH remote
+# command). Read once here and unset at once, so nothing this process starts
+# (nested sends, adapters, hooks) inherits it. Kept in a plain shell variable
+# (never exported). Only _peer_caller_attest reads it, and only for level
+# remote: it never raises a level (plan 111 section 5).
+unset _PEER_ORIGIN_ATTEST_IN _PEER_ORIGIN_ATTEST_SET
+_PEER_ORIGIN_ATTEST_IN="${CCTRL_ORIGIN_ATTEST-}"
+_PEER_ORIGIN_ATTEST_SET=false
+[[ -n "${CCTRL_ORIGIN_ATTEST+x}" ]] && _PEER_ORIGIN_ATTEST_SET=true
+unset CCTRL_ORIGIN_ATTEST
 TASK_RECORD_SCHEMA_VERSION=2
 TASK_RECORD_MAX_EVIDENCE=32
 TASK_REGISTRY_MAX_EVENT_IDS=64
@@ -6150,6 +6161,16 @@ _peer_print_human() {
         # Plan 111 phase 2: a message with `verification` (recv/show) gets one
         # sender line from sealed fields only; an unverified one shows the
         # bare `from` and no label. Informational (warn): no directive.
+        # Plan 111 phase 6: an SSH arrival from a new origin carries the
+        # attest claims of the origin host (sealed here, checked there only).
+        def remote_claims($m; $v):
+          if $v.level == "remote" and ($m.attest.origin_claims | type) == "object" then
+            ($m.attest.origin_claims) as $c
+            | " (remote from " + (($m.attest.origin_host // "?") | tostring) + ", claims not verified here: level "
+              + (($c.level // "?") | tostring)
+              + (if $c.session then ", session " + ($c.session | tostring) else "" end)
+              + (if $c.role then ", role " + ($c.role | tostring) else "" end) + ")"
+          else "" end;
         def verified_sender($m):
           ($m.verification) as $v
           | if $m.from == "user" then
@@ -6160,9 +6181,9 @@ _peer_print_human() {
                 + " (verified: session " + (($v.session // "?") | tostring)
                 + ", pane started " + (($m.attest.pane_started // "?") | tostring) + ")"
             elif $v.mode == "enforce" then
-              "  sender: " + (($m.from // "?") | tostring) + " UNVERIFIED (" + (($v.reason // "unknown") | tostring) + ")"
+              "  sender: " + (($m.from // "?") | tostring) + " UNVERIFIED (" + (($v.reason // "unknown") | tostring) + ")" + remote_claims($m; $v)
             else
-              "  sender: " + (($m.from // "?") | tostring) + " unverified (" + (($v.reason // "unknown") | tostring) + ", warn mode)"
+              "  sender: " + (($m.from // "?") | tostring) + " unverified (" + (($v.reason // "unknown") | tostring) + ", warn mode)" + remote_claims($m; $v)
             end;
         . as $msg
         | (($msg | type) == "object" and ($msg.verification | type) == "object") as $has_v
@@ -7856,12 +7877,79 @@ _peer_verify_annotate_one() {
     printf '[%s]' "$message" | _peer_verify_annotate | jq -c '.[0]'
 }
 
+# Plan 111 phase 6: the attest claims the origin host sends over the SSH hop
+# (_peer_origin_attest_b64), from _PEER_ORIGIN_ATTEST_IN. Sets
+# PEER_ORIGIN_CLAIMS_STATUS (absent | ok | malformed) and, when ok,
+# PEER_ORIGIN_CLAIMS_JSON: only the known keys, string values (at most 200
+# chars, control chars replaced). Claims are recorded, never trusted: they
+# were attested on the other host and cannot be checked here.
+PEER_ORIGIN_CLAIM_KEYS='["v","level","method","session","pane_id","pane_pid","pane_started","host_id","role","orch_kind","detail"]'
+_peer_origin_claims() {
+    local raw="${_PEER_ORIGIN_ATTEST_IN:-}" out=""
+    PEER_ORIGIN_CLAIMS_STATUS=absent; PEER_ORIGIN_CLAIMS_JSON=""
+    [[ "${_PEER_ORIGIN_ATTEST_SET:-false}" == "true" ]] || return 0
+    PEER_ORIGIN_CLAIMS_STATUS=malformed
+    (( ${#raw} > 0 && ${#raw} <= 4096 )) || return 0
+    [[ "$raw" =~ ^[A-Za-z0-9+/]+=*$ ]] || return 0
+    out="$(jq -cn --arg raw "$raw" --argjson keys "$PEER_ORIGIN_CLAIM_KEYS" '
+        ($raw | try (@base64d | fromjson) catch null) as $c
+        | if ($c | type) != "object" then empty
+          else [$c | to_entries[] | select(.key as $k | $keys | index($k))
+                | select(.value != null and ((.value | type) == "string" or (.value | type) == "number"))
+                | .value = (.value | tostring | gsub("[[:cntrl:]]"; " ") | .[0:200])]
+               | from_entries
+               | if length == 0 then empty else . end end' 2>/dev/null)" || out=""
+    [[ "$out" == "{"*"}" ]] || return 0
+    PEER_ORIGIN_CLAIMS_STATUS=ok; PEER_ORIGIN_CLAIMS_JSON="$out"
+    return 0
+}
+
+# Plan 111 phase 6, origin side: the claims (base64 of compact JSON) for
+# CCTRL_ORIGIN_ATTEST, from this host's own walk (PEER_ATTEST_JSON, set by
+# _peer_caller_attest). Facts only, no secrets; empty on any failure (the
+# receiver then records level remote with no claims, as for an old origin).
+_peer_origin_attest_b64() {
+    [[ -n "${PEER_ATTEST_JSON:-}" ]] || return 0
+    jq -r --argjson keys "$PEER_ORIGIN_CLAIM_KEYS" '
+        with_entries(select(.key as $k | $keys | index($k)) | select(.value != null))
+        | tojson | @base64' <<< "$PEER_ATTEST_JSON" 2>/dev/null || true
+}
+
+# Plan 111 phase 6 (p5 verify): the label the origin sends as --sender-host.
+# An origin with no CCTRL_HOST_PREFIX used to send `local`, so a genuine
+# arrival was not stamped remote. Order: CCTRL_HOST_PREFIX; else the
+# hosts.json alias whose hostname is this machine; else the device tag (ms,
+# mbp); else the short hostname; `local` only when none exists. Never the
+# remote host's own alias ($1), which the receiver would read as itself.
+_peer_origin_host_label() {
+    local remote="${1:-}" label="" alias host
+    if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
+        printf '%s' "$CCTRL_HOST_PREFIX"; return 0
+    fi
+    if [[ -f "$HOSTS_FILE" ]]; then
+        while IFS=$'\t' read -r alias host; do
+            [[ -n "$alias" && "$alias" != "$remote" && "$alias" != local && "$alias" != self ]] || continue
+            if _host_is_local "$host"; then label="$alias"; break; fi
+        done < <(jq -r 'to_entries | sort_by(.key)[] | select((.value | type) == "object")
+            | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
+    fi
+    [[ -n "$label" ]] || label="$(_device_tag 2>/dev/null)" || label=""
+    [[ "$label" != "$remote" ]] || label=""
+    if [[ -z "$label" ]]; then
+        label="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/-*$//')" || label=""
+        [[ "$label" != "$remote" ]] || label=""
+    fi
+    [[ "$label" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || label=local
+    printf '%s' "$label"
+}
+
 _peer_caller_attest() {
     # $7 no-claim (plan 111 phase 3, MCP say_peer): no sender name is claimed,
     # so a pane whose launch anchor matches is level session by itself.
     local from="$1" from_peer_json="$2" impersonate="$3" sender_host="$4" caller_077="$5" ran_077="$6" no_claim="${7:-}"
     local level=none method="" detail="" session="" pane_id="" pane_pid="" pane_started=""
     local role="" orch_kind="" host_id="" origin_host="" walk_077=skipped walk_bound=false
+    local origin_status="" origin_claims="" ssh_client=""
     local table chain="" panes="" pid line found=false claude_pid="" claude_s="" claude_p=""
     local bind_target="" bind_host="" meta rec a_pane_id="" a_pane_pid="" a_started="" live_started=""
     local local_label="${CCTRL_HOST_PREFIX:-local}"
@@ -7961,6 +8049,13 @@ _peer_caller_attest() {
         elif [[ -n "$sender_host" && "$sender_host" != "$local_label" && "$sender_host" != "local" ]] \
             && ! [[ -n "$bind_target" && ( -z "$bind_host" || "$bind_host" == "local" || "$bind_host" == "$local_label" ) ]]; then
             level=remote; method=ssh; origin_host="$sender_host"
+            # Phase 6: the origin's claims (CCTRL_ORIGIN_ATTEST) and the SSH
+            # client address, recorded only on level remote and never trusted.
+            _peer_origin_claims
+            origin_status="$PEER_ORIGIN_CLAIMS_STATUS"; origin_claims="$PEER_ORIGIN_CLAIMS_JSON"
+            if [[ "${SSH_CONNECTION:-}" =~ ^([0-9A-Fa-f:.%]{1,64})[[:space:]] ]]; then
+                ssh_client="${BASH_REMATCH[1]}"
+            fi
         elif [[ -n "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" ]]; then
             level=app-claimed; method=codex-env
         fi
@@ -7980,12 +8075,16 @@ _peer_caller_attest() {
     PEER_ATTEST_JSON="$(jq -cn --arg level "$level" --arg method "$method" --arg session "$session" \
         --arg pane_id "$pane_id" --arg pane_pid "$pane_pid" --arg pane_started "$pane_started" \
         --arg host_id "$host_id" --arg role "$role" --arg orch_kind "$orch_kind" --arg detail "$detail" \
-        --arg walk_077 "$walk_077" --arg origin_host "$origin_host" '
+        --arg walk_077 "$walk_077" --arg origin_host "$origin_host" \
+        --arg origin_status "$origin_status" --arg origin_claims "${origin_claims:-null}" --arg ssh_client "$ssh_client" '
         def n: if . == "" then null else . end;
         {v: 1, level: $level, method: ($method | n), session: ($session | n), pane_id: ($pane_id | n),
          pane_pid: ($pane_pid | n), pane_started: ($pane_started | n), host_id: ($host_id | n),
          role: ($role | n), orch_kind: ($orch_kind | n), detail: ($detail | n), walk_077: $walk_077}
-        + (if $origin_host != "" then {origin_host: $origin_host} else {} end)' 2>/dev/null)" || PEER_ATTEST_JSON=""
+        + (if $origin_host != "" then {origin_host: $origin_host} else {} end)
+        + (if $origin_status == "ok" then {origin_claims: ($origin_claims | fromjson)}
+           elif $origin_status == "malformed" then {origin_claims_error: "malformed"} else {} end)
+        + (if $ssh_client != "" then {ssh_client: $ssh_client} else {} end)' 2>/dev/null)" || PEER_ATTEST_JSON=""
     return 0
 }
 
@@ -7995,16 +8094,21 @@ _peer_caller_attest() {
 # thread (those bind by thread, plan 077) and a local host (as the remote
 # level's rule in _peer_caller_attest). Never refused: `user`, mailbox-only
 # and unresolved (--allow-unknown) names, --impersonate (level impersonated),
-# and every level other than none (session; remote: a genuine SSH arrival
-# names a peer that is not local; app-claimed). The doorbell config is read
-# only once the rest holds, so off and warn cost nothing new on a normal
-# send. Sets PEER_SEND_REFUSE_DETAIL (the attest detail) on refusal.
+# and every level other than none and app-claimed (session; remote: a genuine
+# SSH arrival names a peer that is not local). Phase 6 (p5 verify F2): level
+# app-claimed on a tmux-bound name is refused too (detail app-claimed): any
+# process can set CODEX_THREAD_ID, and a real Codex app peer is never
+# tmux-bound (it has a provider_task_id). The doorbell config is read only
+# once the rest holds, so off and warn cost nothing new on a normal send.
+# Sets PEER_SEND_REFUSE_DETAIL (the attest detail) on refusal. $6 = quiet:
+# decide only, log nothing (the caller retries a transient walk first).
 #   $1 from  $2 from peer json  $3 impersonate  $4 attest json  $5 recipient
 _peer_send_enforce_refuses() {
-    local from="$1" peer_json="$2" impersonate="$3" attest="$4" to="${5:-}" bound mode
+    local from="$1" peer_json="$2" impersonate="$3" attest="$4" to="${5:-}" quiet="${6:-}" bound mode level
     PEER_SEND_REFUSE_DETAIL=""
     [[ "$impersonate" != "true" && "$from" != "user" && -n "$peer_json" ]] || return 1
-    [[ "$(jq -r '.level // "none"' <<< "$attest" 2>/dev/null)" == "none" ]] || return 1
+    level="$(jq -r '.level // "none"' <<< "$attest" 2>/dev/null)" || level=none
+    [[ "$level" == "none" || "$level" == "app-claimed" ]] || return 1
     bound="$(jq -r --arg local "${CCTRL_HOST_PREFIX:-local}" '
         ((.tmux_target // .session // "") | tostring) != ""
         and ((.provider_task_id // "") | tostring) == ""
@@ -8012,11 +8116,24 @@ _peer_send_enforce_refuses() {
     [[ "$bound" == "true" ]] || return 1
     mode="$(_peer_attestation_cfg >/dev/null 2>&1; printf '%s' "${PEER_ATTEST_MODE:-warn}")"
     [[ "$mode" == "enforce" ]] || return 1
-    PEER_SEND_REFUSE_DETAIL="$(jq -r '.detail // "none"' <<< "$attest" 2>/dev/null)" || PEER_SEND_REFUSE_DETAIL=""
+    if [[ "$level" == "app-claimed" ]]; then
+        PEER_SEND_REFUSE_DETAIL=app-claimed
+    else
+        PEER_SEND_REFUSE_DETAIL="$(jq -r '.detail // "none"' <<< "$attest" 2>/dev/null)" || PEER_SEND_REFUSE_DETAIL=""
+    fi
     [[ -n "$PEER_SEND_REFUSE_DETAIL" ]] || PEER_SEND_REFUSE_DETAIL=none
+    [[ "$quiet" == "quiet" ]] && return 0
     PEER_ATTEST_MODE=enforce _peer_attest_log send "$to" \
-        "$(jq -cn --arg from "$from" --arg d "$PEER_SEND_REFUSE_DETAIL" '{outcome: "sender-unresolved", from: $from, level: "none", detail: $d}')"
+        "$(jq -cn --arg from "$from" --arg l "$level" --arg d "$PEER_SEND_REFUSE_DETAIL" '{outcome: "sender-unresolved", from: $from, level: $l, detail: $d}')"
     return 0
+}
+
+# Plan 111 phase 6 (p5 verify F4): attest details that come from a failed
+# read (ps, tmux list-panes, the tmux run-shell start-time check), not from
+# what the process tree shows. A sender inside its own pane can hit one.
+_peer_attest_detail_transient() {
+    case "${1:-}" in ps-failed|panes-unreadable|started-unreadable) return 0 ;; esac
+    return 1
 }
 
 # One `peer send` resolves the sender identity, the recipient and the --as
@@ -8287,14 +8404,33 @@ _peer_cmd_send_impl() {
     # Plan 111 phase 5, enforce only: a local tmux-bound name claimed at
     # level none (no pane of that session found in this process's ancestry)
     # is refused rc 66 sender-unresolved, whether or not CCTRL_ORIGIN_ATTEST
-    # is set (never read here). off and warn: nothing new (no refusal, no
-    # output; the mode is read only in this case).
+    # is set (it never yields more than remote, and never for a local
+    # tmux-bound name). Phase 6: also level app-claimed on such a name (F2);
+    # a transient read failure (ps, list-panes, run-shell) is retried once
+    # before refusing (F4), and the hint says to retry. off and warn: nothing
+    # new (no refusal, no retry, no output; the mode is read only in this
+    # case).
+    if _peer_send_enforce_refuses "$from" "$from_peer_json" "$impersonate" "$attest_json" "$to" quiet \
+        && _peer_attest_detail_transient "$PEER_SEND_REFUSE_DETAIL"; then
+        _peer_caller_attest "$from" "$from_peer_json" "$impersonate" "$sender_host_override" "$caller_tmux_session" "$ran_077" || true
+        attest_json="${PEER_ATTEST_JSON:-}"
+        [[ -n "$attest_json" ]] || attest_json='{"v":1,"level":"none","method":null,"detail":"attest-failed","walk_077":"skipped"}'
+    fi
     if _peer_send_enforce_refuses "$from" "$from_peer_json" "$impersonate" "$attest_json" "$to"; then
+        local refuse_hint="send from inside that session's tmux pane, run 'cctrl peer doctor' to diagnose, or pass --impersonate"
+        local refuse_text="Send from inside that session's tmux pane, run 'cctrl peer doctor' to diagnose, or pass --impersonate to send as another identity on purpose"
+        if _peer_attest_detail_transient "$PEER_SEND_REFUSE_DETAIL"; then
+            refuse_hint="a process or tmux read failed twice (transient: retry the send); run 'cctrl peer doctor' if it persists"
+            refuse_text="A process or tmux read failed twice (transient: retry the send); run 'cctrl peer doctor' if it persists"
+        elif [[ "$PEER_SEND_REFUSE_DETAIL" == "app-claimed" ]]; then
+            refuse_hint="CODEX_THREAD_ID does not attest a tmux session; send from inside that session's tmux pane, or pass --impersonate"
+            refuse_text="CODEX_THREAD_ID does not attest a tmux session; send from inside that session's tmux pane, or pass --impersonate"
+        fi
         if $json; then
-            _json_error "sender-unresolved" "Cannot attest your session to send as '$from' (attestation enforce: $PEER_SEND_REFUSE_DETAIL); send from inside that session's tmux pane, run 'cctrl peer doctor' to diagnose, or pass --impersonate."
+            _json_error "sender-unresolved" "Cannot attest your session to send as '$from' (attestation enforce: $PEER_SEND_REFUSE_DETAIL); $refuse_hint."
         else
             echo -e "${RED}Cannot attest your session to send as '$from' (attestation enforce: $PEER_SEND_REFUSE_DETAIL).${RESET}" >&2
-            echo -e "${DIM}Send from inside that session's tmux pane, run 'cctrl peer doctor' to diagnose, or pass --impersonate to send as another identity on purpose.${RESET}" >&2
+            echo -e "${DIM}${refuse_text}.${RESET}" >&2
         fi
         return 66
     fi
@@ -10028,7 +10164,7 @@ _peer_send_and_deliver_remote() {
         i=$((i + 1))
     done
     [[ -z "$sender_as" ]] && sender_as="${CCTRL_PEER:-user}"
-    sender_host="${CCTRL_HOST_PREFIX:-local}"
+    sender_host="$(_peer_origin_host_label "$remote_host")"
 
     local quoted_args=""
     quoted_args+=" $(printf '%q' "$to")"
@@ -10048,8 +10184,15 @@ _peer_send_and_deliver_remote() {
         j=$((j + 1))
     done
 
+    # Plan 111 phase 6: the origin's attest claims ride as an env assignment
+    # in the remote command, next to CCTRL_HOST_PREFIX. An older receiver
+    # ignores an unknown env var (a new flag would fail rc 64 and break every
+    # cross-host send during version skew); a new one records them on level
+    # remote only and unsets the var once read. base64 is shell-safe.
+    local origin_env=""
+    [[ "${PEER_SD_ORIGIN_ATTEST_B64:-}" =~ ^[A-Za-z0-9+/]+=*$ ]] && origin_env=" CCTRL_ORIGIN_ATTEST=$PEER_SD_ORIGIN_ATTEST_B64"
     result="$(printf '%s' "$body" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
-        "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=$(printf '%q' "$remote_host") cctrl peer send${quoted_args}" 2>/dev/null)" || rc=$?
+        "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=$(printf '%q' "$remote_host")${origin_env} cctrl peer send${quoted_args}" 2>/dev/null)" || rc=$?
 
     if [[ $rc -ne 0 && -z "$result" ]]; then
         PEER_SD_OUTCOME="send-failed"
@@ -10136,6 +10279,16 @@ _peer_send_and_deliver_remote_checked() {
             fi
             return 66
         fi
+    fi
+    # Plan 111 phase 6: attest this caller here, where its process tree is
+    # (the remote side only sees an SSH shell), and send the result as claims.
+    # Read-only and fail open: no claims if the walk fails; refuses nothing.
+    PEER_SD_ORIGIN_ATTEST_B64=""
+    local _origin_ran=false _origin_peer_json=""
+    [[ -n "${TMUX:-}" ]] && _origin_ran=true
+    [[ -n "$_bind_identity" && "$_bind_identity" != "user" ]] && _origin_peer_json="${_bind_peer_json:-}"
+    if _peer_caller_attest "${_bind_identity:-user}" "$_origin_peer_json" "$_bind_impersonate" "" "${_bind_caller:-}" "$_origin_ran" >/dev/null 2>&1; then
+        PEER_SD_ORIGIN_ATTEST_B64="$(_peer_origin_attest_b64)"
     fi
     _peer_send_and_deliver_remote "$to" "$body" "$host" ${flags[@]+"${flags[@]}"}
 }
@@ -11823,7 +11976,8 @@ def attest_since: if type != "object" then ""
 # [...], peers: [...]}` replaces the built-in default (roles orchestrator,
 # fleet-manager); `recipients.<name>.push_senders` overrides it for mail
 # addressed to <name> (the message `to`). Absent or null = not set (built-in
-# default, or the default for an override); `false` is not null (phase 5, p4
+# default, or the default for an override; phase 6: a `recipients.<name>:
+# null` entry too, as the README says); `false` is not null (phase 5, p4
 # verify N3: jq `//` used to read it as unset). A key of any other shape (not an
 # object, a key other than roles/peers, a list item that is not a one-word
 # string) is malformed and matches nothing (fail closed; acted on only in
@@ -11843,7 +11997,7 @@ def attest_allow: if type != "object" then {default: attest_builtin_senders, sou
          recipients: (.recipients as $r
            | if $r == null then {}
              elif ($r | type) != "object" then "malformed"
-             else $r | with_entries(select((.value | type) != "object" or .value.push_senders != null)
+             else $r | with_entries(select(.value != null and ((.value | type) != "object" or .value.push_senders != null))
                        | .value = (if (.value | type) != "object" then null else (.value.push_senders | attest_senders_norm) end)) end)})
     end;
 def attest_senders_for($to): if .recipients == "malformed" then null
@@ -11891,20 +12045,19 @@ _peer_elig_args() {
 # archived, never eligible (duplicate-id). off/warn: nothing is read (warn
 # changes nothing). Returns 1 when the archive exists but cannot be read, so
 # the caller fails closed (verify-failed: no verdict, never recorded).
+# Phase 6 (p5 verify F1/F3): lib/peer_seal.py `seen` reads the archive itself
+# and matches each line's top-level id only, in one pass: no archive content
+# on argv (a >1 MiB set of matching lines used to fail jq exec and silence
+# every enforce push), and no multi-pattern grep over the whole file.
 _peer_elig_seen_args() {
-    local messages="$1" archive="$PEER_DATA_DIR/messages-archive.jsonl" ids hits rc=0 seen
+    local messages="$1" archive="$PEER_DATA_DIR/messages-archive.jsonl" ids seen
     [[ "${PEER_ATTEST_MODE:-warn}" == enforce ]] || return 0
     [[ -e "$archive" ]] || return 0
     [[ -f "$archive" && -r "$archive" ]] || return 1
-    ids="$(jq -r 'if type == "array" then .[] | .id? | strings | select(. != "" and (test("\\n") | not)) else empty end' <<< "$messages" 2>/dev/null)" || return 1
-    [[ -n "$ids" ]] || return 0
-    # A fixed-string prefilter (ids are plain tokens); jq then keeps exact
-    # `id` matches only.
-    hits="$(LC_ALL=C grep -F -- "$ids" "$archive" 2>/dev/null)" || rc=$?
-    (( rc <= 1 )) || return 1
-    seen="$(jq -cn --arg ids "$ids" --arg hits "$hits" '($ids | split("\n")) as $want
-        | [$hits | split("\n")[] | select(. != "") | (try fromjson catch null) | objects | .id | strings
-           | select(. as $i | $want | index($i))] | unique' 2>/dev/null)" || return 1
+    ids="$(jq -c 'if type == "array" then [.[] | .id? | strings | select(. != "" and (test("\\n") | not))] | unique else [] end' <<< "$messages" 2>/dev/null)" || return 1
+    [[ "$ids" == "["* ]] || return 1
+    [[ "$ids" != "[]" ]] || return 0
+    seen="$(printf '%s' "$ids" | _peer_seal_helper seen "$archive" 2>/dev/null)" || return 1
     [[ "$seen" == "["* ]] || return 1
     [[ "$seen" == "[]" ]] || PEER_ELIG_ARGS+=(--seen "$seen")
     return 0
@@ -11984,6 +12137,25 @@ _peer_attest_log() {
             fi
         fi
         printf '%s\n' "$line" >> "$f"
+        # Phase 6 (p5 verify nit): a writer killed between its two moves
+        # leaves its private .attestation.log.rot.* behind. Once one is over a
+        # minute old (no live writer holds it that long), fold it into .1
+        # under the lock: rename it first (one sweeper wins), then append, so
+        # no line is lost and .1 is never replaced. No fork unless one exists.
+        local orphan swept=false
+        for orphan in "$dir"/.attestation.log.rot.*; do
+            [[ -f "$orphan" ]] || continue
+            [[ -n "$(find "$orphan" -maxdepth 0 -mmin +1 2>/dev/null)" ]] || continue
+            if ! $swept; then
+                mkdir "$dir/.attestation.log.rotate" 2>/dev/null || break
+                swept=true
+            fi
+            local claim="$dir/.attestation.log.rot.sweep.$$.$RANDOM"
+            mv "$orphan" "$claim" 2>/dev/null || continue
+            cat "$claim" >> "$f.1" && rm -f "$claim"
+        done
+        $swept && rmdir "$dir/.attestation.log.rotate" 2>/dev/null
+        true
     ) 2>/dev/null || true
     return 0
 }
@@ -12575,16 +12747,29 @@ PYNULL
 # Plan 111 phase 2: informational (never fails doctor). Whether the seal key
 # exists and its mode (never the key), and how the mailbox verifies now. A
 # missing key with sealed mail is said loudly: that mail reads seal-mismatch.
+# Phase 6 (p5 verify): the host id state too. A missing data/host-id is not
+# transient: the next send or Stop creates a NEW id, and every older seal then
+# reads other-host-seal for good (mail stays readable; in enforce it never
+# pushes or rings). Sealed mail with another host id in this host's own
+# mailbox (every arrival is sealed here) means the id was replaced, or a line
+# was copied in.
 _peer_doctor_seal_check() {
-    local messages="$1" host_id="" out
+    local messages="$1" host_id="" out hid_state=ok
     host_id="$(_cctrl_host_id_read 2>/dev/null)" || host_id=""
+    if [[ -z "$host_id" ]]; then
+        if [[ -e "$CCTRL_HOST_ID_FILE" || -L "$CCTRL_HOST_ID_FILE" ]]; then hid_state=invalid; else hid_state=missing; fi
+    fi
     out="$(printf '%s' "$messages" | _peer_seal_helper doctor "$host_id" 2>/dev/null)" || out=""
-    jq -cn --argjson d "${out:-null}" '
-        if $d == null then {name: "sender_seal", ok: true, summary: "seal check unavailable (python3 or mailbox) (informational, warn only)"}
+    jq -cn --argjson d "${out:-null}" --arg hid "$hid_state" '
+        if $d == null then {name: "sender_seal", ok: true, host_id_state: $hid, summary: "seal check unavailable (python3 or mailbox) (informational, warn only)"}
         else
           ($d.reasons // {}) as $r
-          | {name: "sender_seal", ok: true, key: $d.key, sealed: $d.sealed, total: $d.total, reasons: $r,
-             summary: ((if $d.key.dir_symlink == true then "KEY DIR NOT PRIVATE (the key dir is a symlink; it must be a real 0700 dir owned by you; cctrl never changes it): sends go unsealed, sealed mail reads seal-mismatch; "
+          | {name: "sender_seal", ok: true, key: $d.key, sealed: $d.sealed, total: $d.total, reasons: $r, host_id_state: $hid,
+             summary: ((if $hid == "missing" then "HOST ID MISSING (data/host-id): sealed mail reads no-host-id; the next send or Stop creates a new id, and every older seal then reads other-host-seal for good; "
+                        elif $hid == "invalid" then "HOST ID UNREADABLE (data/host-id is not a valid id file): sealed mail reads no-host-id until it is fixed (never replaced while it exists); "
+                        elif ($r["other-host-seal"] // 0) > 0 then "OTHER HOST ID: \($r["other-host-seal"]) sealed message(s) carry another host id (data/host-id replaced, or lines copied in; they read other-host-seal for good); "
+                        else "" end)
+               + (if $d.key.dir_symlink == true then "KEY DIR NOT PRIVATE (the key dir is a symlink; it must be a real 0700 dir owned by you; cctrl never changes it): sends go unsealed, sealed mail reads seal-mismatch; "
                         elif $d.key.dir_private == false then "KEY DIR NOT PRIVATE (dir mode \($d.key.dir_mode // "?"), needs 0700 owned by you; cctrl never chmods it): sends go unsealed, sealed mail reads seal-mismatch; "
                         elif $d.key.exists != true then
                           (if $d.sealed > 0 then "KEY MISSING: \($d.sealed) sealed message(s) read seal-mismatch; " else "key not created yet (first send creates it); " end)
@@ -12597,6 +12782,31 @@ _peer_doctor_seal_check() {
                + " (informational, warn only)")}
         end' 2>/dev/null \
         || printf '%s\n' '{"name":"sender_seal","ok":true,"summary":"seal check unreadable (informational, warn only)"}'
+}
+
+# Plan 111 phase 6 (p5 verify): informational (never fails doctor). The
+# replay archive (messages-archive.jsonl, written by `peer gc`) that enforce
+# checks queued ids against. Unreadable (not a readable regular file: a
+# chmod, a directory, a FIFO) fails closed: in enforce every push, inline
+# paste and Stop ring stops until it is fixed. Never reads the content.
+_peer_doctor_archive_check() {
+    local archive="$PEER_DATA_DIR/messages-archive.jsonl" state=absent bytes=0
+    if [[ -e "$archive" || -L "$archive" ]]; then
+        if [[ -f "$archive" && -r "$archive" ]]; then
+            state=ok
+            bytes="$(wc -c < "$archive" 2>/dev/null | tr -d ' ')"
+            [[ "$bytes" =~ ^[0-9]+$ ]] || bytes=0
+        else
+            state=unreadable
+        fi
+    fi
+    jq -cn --arg path "$archive" --arg state "$state" --argjson bytes "$bytes" '
+        {name: "sender_replay_archive", ok: true, path: $path, state: $state, bytes: (if $state == "ok" then $bytes else null end),
+         summary: ((if $state == "absent" then "no archive yet (peer gc writes it); nothing to check"
+                    elif $state == "ok" then "archive readable (\($bytes) bytes); enforce rejects queued ids found in it"
+                    else "ARCHIVE UNREADABLE (not a readable regular file): in enforce every push, inline paste and Stop ring stops (fails closed) until it is fixed" end)
+                   + " (informational, warn only)")}' 2>/dev/null \
+        || printf '%s\n' '{"name":"sender_replay_archive","ok":true,"summary":"archive check unreadable (informational, warn only)"}'
 }
 
 # Plan 111 phase 3: informational (never fails doctor). The attestation mode
@@ -12675,6 +12885,9 @@ _peer_cmd_doctor() {
                 echo "  neither, with the senders enforce would block (data/doorbell/attestation.log"
                 echo "  holds the logged decisions), and the push allowlist in effect (push_senders,"
                 echo "  per-recipient overrides; see cctrl peer doorbell allow-sender)."
+                echo "  sender_replay_archive (plan 111, informational): whether messages-archive.jsonl"
+                echo "  (peer gc) is readable and its size; unreadable = in enforce every push and"
+                echo "  Stop ring stops. sender_seal also flags a missing or replaced data/host-id."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;
@@ -12765,10 +12978,12 @@ _peer_cmd_doctor() {
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     check="$(_peer_doctor_eligibility_check "${messages:-[]}" "$bell_cfg")"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    check="$(_peer_doctor_archive_check)"
+    checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" or .name == "sender_eligibility" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" or .name == "sender_eligibility" or .name == "sender_replay_archive" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 

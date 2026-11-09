@@ -26,6 +26,14 @@ Modes:
   doctor <host_id>  stdin: a JSON array of messages. stdout: one JSON object
                     with the key status (path, exists, mode; never the key)
                     and verification counts. Never creates the key.
+  seen <archive>    stdin: a JSON array of candidate ids. stdout: the JSON
+                    array (sorted) of those ids that are the top-level `id`
+                    of a line of <archive> (messages-archive.jsonl). Plan 111
+                    phase 6 (p5 verify F1/F3): the archive never travels
+                    through argv, and a line is matched on its id field only
+                    (a body quoting an id is not a hit), in one pass. Exit 1
+                    when the archive exists but is not a readable regular
+                    file (the caller fails closed); a missing one is [].
 
 This is a same-uid misuse barrier, not authentication: any process running as
 this user can read the key file.
@@ -559,9 +567,60 @@ def cmd_doctor(host_id):
     return 0
 
 
+ID_PREFIX = b'{"id":"'
+
+
+def _line_id(line):
+    """The top-level `id` of one archive line, or None. `peer gc` writes
+    lines with `jq -c`, which keeps the message's key order, so `id` comes
+    first: read it without parsing the line. Any other shape (another key
+    order, an escaped id) is parsed in full, so no archived id is missed."""
+    if line.startswith(ID_PREFIX):
+        end = line.find(b'"', len(ID_PREFIX))
+        if end > 0:
+            raw = line[len(ID_PREFIX):end]
+            if b"\\" not in raw:
+                return raw
+    elif b'"id"' not in line:
+        return None
+    try:
+        doc = json.loads(line.decode("utf-8", errors="surrogatepass"))
+    except ValueError:
+        return None
+    mid = doc.get("id") if isinstance(doc, dict) else None
+    if not isinstance(mid, str):
+        return None
+    return mid.encode("utf-8", errors="surrogatepass")
+
+
+def cmd_seen(archive):
+    wanted = json.loads(sys.stdin.read() or "[]")
+    if not isinstance(wanted, list):
+        raise ValueError("expected a JSON array")
+    want = set(i.encode("utf-8", errors="surrogatepass") for i in wanted if isinstance(i, str) and i)
+    hits = set()
+    if want:
+        try:
+            # O_NONBLOCK: a FIFO at the path must not block; fstat refuses it.
+            fd = os.open(archive, os.O_RDONLY | os.O_NONBLOCK)
+        except FileNotFoundError:
+            fd = None
+        if fd is not None:
+            with os.fdopen(fd, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise ValueError("archive is not a regular file")
+                for line in handle:
+                    mid = _line_id(line)
+                    if mid is not None and mid in want:
+                        hits.add(mid)
+    out = sorted(h.decode("utf-8", errors="surrogatepass") for h in hits)
+    sys.stdout.write(json.dumps(out, separators=(",", ":")) + "\n")
+    return 0
+
+
 def main(argv):
     if len(argv) < 2:
-        sys.stderr.write("usage: peer_seal.py seal|verify|doctor <host_id>\n")
+        sys.stderr.write("usage: peer_seal.py seal|verify|doctor <host_id> | seen <archive>\n")
         return 64
     mode, host_id = argv[1], (argv[2] if len(argv) > 2 else "")
     try:
@@ -571,6 +630,8 @@ def main(argv):
             return cmd_verify(host_id, argv[3:])
         if mode == "doctor":
             return cmd_doctor(host_id)
+        if mode == "seen":
+            return cmd_seen(host_id)
     except (OSError, ValueError, SealKeyError) as exc:
         # Never echo key material: only the exception class.
         sys.stderr.write("peer_seal: %s failed (%s)\n" % (mode, type(exc).__name__))
