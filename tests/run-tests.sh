@@ -9605,6 +9605,58 @@ test_peer_seal_failure_never_blocks_send() {
     echo "ok: plan 111 seal failures (bad key path, short key, symlink, python3 failing) never block a send; nothing replaced"
 }
 
+# A stand-in for python3 (or any helper) that hangs for 60 s and logs, with
+# sub-second timestamps, when it started and the SIGALRM that ends it (plan
+# 111 phase 4, gate hardening). perl, not sh: the handler is in place before
+# anything else runs and there is no background child, so the alarm cannot
+# land before a trap or orphan a sleep that holds the caller's pipe. Tests
+# assert on the log (one start, ended by the alarm, alarm - start within the
+# bound) instead of a tight wall clock, which flaked on a loaded host.
+_hang_stub() { # path log
+    cat > "$1" <<STUB
+#!/usr/bin/env perl
+use Time::HiRes qw(time);
+my \$log = '$2';
+sub logl { open(my \$f, '>>', \$log) or return; printf \$f "%s\n", \$_[0]; close \$f; }
+# An ALRM ignored by an ancestor and not reset by the bound stays ignored:
+# then the stub runs out its hang, as a real python3 would.
+if (defined \$SIG{ALRM} && \$SIG{ALRM} eq 'IGNORE') { logl("alrm-ignored-at-start"); }
+else { \$SIG{ALRM} = sub { logl(sprintf("alarm %.3f", time)); exit 142; }; }
+logl(sprintf("start %.3f", time));
+select(undef, undef, undef, 60);
+logl("done");
+exit 0;
+STUB
+    chmod +x "$1"
+}
+# <log> <bound seconds> -> fails unless exactly one call started, it was ended
+# by the alarm (none ran out), and the alarm came within bound + 1.5 s of the
+# start (the start is logged after exec, so it is later than the alarm was
+# set: a bound that ignored its value would show here).
+_hang_stub_assert() { # log bound what
+    local n_start n_alarm n_done gap
+    n_start="$(grep -c '^start ' "$1" || true)"; n_alarm="$(grep -c '^alarm ' "$1" || true)"; n_done="$(grep -c '^done$' "$1" || true)"
+    [[ "$n_start" -eq 1 ]] || fail "$3: must make exactly one (bounded) call, made $n_start"
+    [[ "$n_alarm" -eq 1 && "$n_done" -eq 0 ]] || fail "$3: the call must end by the alarm ($n_start started, $n_alarm alarmed, $n_done ran out)"
+    gap="$(awk '/^start /{s=$2} /^alarm /{a=$2} END{printf "%.3f", a - s}' "$1")"
+    awk -v g="$gap" -v b="$2" 'BEGIN{exit !(g <= b + 1.5)}' || fail "$3: the alarm came $gap s after the start; the bound is $2 s"
+}
+# python3 wrapper that runs the real python3 and logs each start and each
+# end; a call killed by the seal alarm logs no end (perl's system does not
+# shield SIGALRM, so the wrapper dies with it).
+_py_end_wrapper() { # path log real-python3
+    cat > "$1" <<STUB
+#!/usr/bin/env perl
+my \$log = '$2';
+sub logl { open(my \$f, '>>', \$log) or return; printf \$f "%s\n", \$_[0]; close \$f; }
+logl("start");
+my \$rc = system('$3', @ARGV);
+logl("end");
+exit(\$rc == -1 ? 127 : (\$rc >> 8));
+STUB
+    chmod +x "$1"
+}
+
 test_peer_seal_followups_never_block() {
     # Plan 111 phase 2 verify follow-ups. A FIFO at the key path never blocks
     # a send or a read (O_NONBLOCK open, then a regular-file check), and the
@@ -9626,18 +9678,26 @@ test_peer_seal_followups_never_block() {
     out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- sealed-one)"
     jq -e 'has("seal")' <<< "$out" >/dev/null || fail "a 0700 key dir must seal: $out"
     id="$(jq -r '.id' <<< "$out")"
-    # FIFO at the key path: no bound help (30 s), so the open itself must not block.
+    # FIFO at the key path: no bound help (60 s), so the open itself must not
+    # block. Proved by the wrapper's log, not a tight wall clock (load-robust,
+    # phase 4): every helper call ends on its own; one the alarm had to kill
+    # logs no end. The ceiling only proves nothing waited for the alarm.
+    local real_py pylog="$t/python3.log" n_start n_end
+    real_py="$(command -v python3)"
+    _py_end_wrapper "$bin/python3" "$pylog" "$real_py"
     rm -f "$key"; mkfifo "$key"
     for mode in send show inbox doctor; do
-        rc=0; t0="$(date +%s)"
+        rc=0; : > "$pylog"; t0="$(date +%s)"
         case "$mode" in
-            send) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- fifo 2>&1)" || rc=$? ;;
-            show) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer show "$id" --json 2>&1)" || rc=$? ;;
-            inbox) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer inbox --as fu-rcpt --json 2>&1)" || rc=$? ;;
-            doctor) out="$("${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=30 "$ROOT/cctrl" peer doctor --json 2>&1)" || rc=$? ;;
+            send) out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=60 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- fifo 2>&1)" || rc=$? ;;
+            show) out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=60 "$ROOT/cctrl" peer show "$id" --json 2>&1)" || rc=$? ;;
+            inbox) out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=60 "$ROOT/cctrl" peer inbox --as fu-rcpt --json 2>&1)" || rc=$? ;;
+            doctor) out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$key" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=60 "$ROOT/cctrl" peer doctor --json 2>&1)" || rc=$? ;;
         esac
         t1="$(date +%s)"
-        [[ $(( t1 - t0 )) -lt 10 ]] || fail "a FIFO at the key path blocked $mode for $(( t1 - t0 )) s"
+        n_start="$(grep -c '^start$' "$pylog" || true)"; n_end="$(grep -c '^end$' "$pylog" || true)"
+        [[ "$n_start" -ge 1 && "$n_end" -eq "$n_start" ]] || fail "a FIFO at the key path blocked a $mode helper call ($n_start started, $n_end ended on their own)"
+        [[ $(( t1 - t0 )) -lt 55 ]] || fail "a FIFO at the key path blocked $mode for $(( t1 - t0 )) s"
         case "$mode" in
             send) [[ "$rc" -eq 0 ]] || fail "FIFO key: send rc $rc: $out"
                   jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "FIFO key must queue unsealed: $out" ;;
@@ -9650,32 +9710,22 @@ test_peer_seal_followups_never_block() {
     # The bound: a python3 that hangs cannot hang a send or a read. Proved by
     # counting, not by a tight wall clock (a 10 s ceiling flaked on a loaded
     # host, where a plain send alone takes ~3 s): the stub logs each start and
-    # the SIGALRM that ends it, so the check is "exactly one python3 call, and
-    # it was ended by the CCTRL_PEER_SEAL_TIMEOUT_SECONDS alarm". The wall
-    # ceiling only proves nothing waited out the 60 s hang, so it is half of it.
-    local pylog="$t/python3.log" n_start n_alarm n_done
-    cat > "$bin/python3" <<STUB
-#!/bin/sh
-trap 'kill \$p 2>/dev/null; printf "alarm\\n" >> "$pylog"; exit 142' ALRM
-printf 'start\n' >> '$pylog'
-sleep 60 & p=\$!
-wait \$p
-printf 'done\n' >> '$pylog'
-STUB
-    chmod +x "$bin/python3"
+    # the SIGALRM that ends it, so the check is "exactly one python3 call,
+    # ended by the CCTRL_PEER_SEAL_TIMEOUT_SECONDS alarm, within that bound"
+    # (the bound is 2 s here, not the default 5: an ignored value shows up as
+    # a late alarm). The wall ceiling only proves nothing waited out the 60 s
+    # hang, so it is half of it.
+    _hang_stub "$bin/python3" "$pylog"
     for mode in send inbox; do
         rc=0; : > "$pylog"; t0="$(date +%s)"
         if [[ "$mode" == send ]]; then
-            out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- hang 2>&1)" || rc=$?
+            out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=2 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- hang 2>&1)" || rc=$?
         else
-            out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 "$ROOT/cctrl" peer inbox --as fu-rcpt --json 2>&1)" || rc=$?
+            out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=2 "$ROOT/cctrl" peer inbox --as fu-rcpt --json 2>&1)" || rc=$?
         fi
         t1="$(date +%s)"
         [[ "$rc" -eq 0 ]] || fail "hanging python3: $mode rc $rc: $out"
-        n_start="$(grep -c '^start$' "$pylog" || true)"; n_alarm="$(grep -c '^alarm$' "$pylog" || true)"; n_done="$(grep -c '^done$' "$pylog" || true)"
-        [[ "$n_start" -eq 1 ]] || fail "hanging python3: $mode must make exactly one (bounded) python3 call, made $n_start"
-        [[ "$n_alarm" -eq "$n_start" && "$n_done" -eq 0 ]] \
-            || fail "hanging python3: every $mode python3 call must end by the seal alarm ($n_start started, $n_alarm alarmed, $n_done ran out)"
+        _hang_stub_assert "$pylog" 2 "hanging python3 ($mode)"
         [[ $(( t1 - t0 )) -lt 30 ]] || fail "a hanging python3 held $mode for $(( t1 - t0 )) s"
         if [[ "$mode" == send ]]; then
             jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "hanging python3 must queue unsealed: $out"
@@ -9931,12 +9981,13 @@ case "$1" in
         if [ "$STUB_SEP" = us ]; then printf '%s_%%7_%s\n' "$STUB_SESSION" "$pid"
         else printf '%s\t%%7\t%s\n' "$STUB_SESSION" "$pid"; fi ;;
     run-shell)
-        if [ -n "${STUB_HANG:-}" ]; then exec sleep 30; fi
+        if [ -n "${STUB_HANG:-}" ]; then exec "$STUB_HANG"; fi
         exec sh -c "$2" ;;
     *) exit 1 ;;
 esac
 SH
     chmod +x "$bin/tmux"
+    _hang_stub "$t/hang" "$t/hang.log"
     # Records this shell's pid and real start time as the "pane", then execs
     # cctrl in the same process.
     cat > "$t/pre.sh" <<'SH'
@@ -9957,7 +10008,8 @@ SH
         # exec keeps the pid: cctrl's own $$ is the "pane" pid in the stub, so
         # the record can carry its real start time (written by the pre-exec
         # shell, which is the same process).
-        out="$(PATH="$bin:$PATH" "${e[@]}" STUB_SEP="$mode" STUB_HANG="$([[ "$mode" == hang ]] && echo 1)" CCTRL_TMUX_TIMEOUT_SECONDS=1 \
+        : > "$t/hang.log"
+        out="$(PATH="$bin:$PATH" "${e[@]}" STUB_SEP="$mode" STUB_HANG="$([[ "$mode" == hang ]] && echo "$t/hang")" CCTRL_TMUX_TIMEOUT_SECONDS=2 \
             bash "$t/pre.sh" "$t/pid" "$sess" "$meta" "$ROOT/cctrl" peer send st-rcpt --as st-fm --json -- "stub $mode" 2>&1)" || rc=$?
         t1="$(date +%s)"
         [[ "$rc" -eq 0 ]] || fail "stub $mode send failed (rc $rc): $out"
@@ -9968,7 +10020,11 @@ SH
             hang)
                 jq -e --arg s "$sess" '.attest.level == "none" and .attest.detail == "started-unreadable" and .attest.session == $s and .status == "queued"' <<< "$out" >/dev/null \
                     || fail "a wedged run-shell must read started-unreadable and still queue: $out"
-                [[ $(( t1 - t0 )) -lt 10 ]] || fail "a wedged run-shell hung the send for $(( t1 - t0 )) s" ;;
+                # Load-robust (phase 4): the hanging run-shell was ended by the
+                # CCTRL_TMUX_TIMEOUT_SECONDS alarm, within that bound; the
+                # ceiling only proves nothing waited out the 60 s hang.
+                _hang_stub_assert "$t/hang.log" 2 "wedged run-shell"
+                [[ $(( t1 - t0 )) -lt 45 ]] || fail "a wedged run-shell hung the send for $(( t1 - t0 )) s" ;;
         esac
     done
     echo "ok: plan 111 attest parses tmux's \`_\` separators (session names with \`_\` too); a wedged run-shell is bounded"
@@ -10419,7 +10475,34 @@ SH
                 out="$("${e[@]}" TMUX_LOG="$t/tmux.log" STUB_PID_FILE="$t/pid" CCTRL_SAY_REQUIRE_DOORBELL=1 \
                     bash "$t/pre.sh" "$t/pid" "$sess" "$t/meta" orchestrator "$ROOT/cctrl" peer say comet --json -- "orch say" 2>&1)" || rc=$?
                 [[ $rc -eq 0 ]] || fail "enforce: an orchestrator say_peer must pass (rc $rc): $out"
-                assert_contains "$(cat "$t/tmux.log")" "paste-buffer" ;;
+                assert_contains "$(cat "$t/tmux.log")" "paste-buffer"
+                # Plan 111 phase 4: the recipient's push allowlist decides.
+                # push_senders roles [worker]: the worker passes, the
+                # orchestrator is refused; an override for comet naming the
+                # caller's session admits it by name; malformed = nobody.
+                local p4cfg p4role p4want
+                while IFS='@' read -r p4role p4want p4cfg; do
+                    jq "$p4cfg" "$data/doorbell.json" > "$data/db.tmp" && mv "$data/db.tmp" "$data/doorbell.json"
+                    : > "$t/tmux.log"; rc=0
+                    out="$("${e[@]}" TMUX_LOG="$t/tmux.log" STUB_PID_FILE="$t/pid" CCTRL_SAY_REQUIRE_DOORBELL=1 \
+                        bash "$t/pre.sh" "$t/pid" "$sess" "$t/meta" "$p4role" "$ROOT/cctrl" peer say comet --json -- "p4 say" 2>&1)" || rc=$?
+                    if [[ "$p4want" == pass ]]; then
+                        [[ $rc -eq 0 ]] && assert_contains "$(cat "$t/tmux.log")" "paste-buffer" || fail "p4 say [$p4cfg] $p4role must pass (rc $rc): $out"
+                    else
+                        [[ $rc -ne 0 ]] && jq -e --arg d "$p4want" '.error.code == "sender-not-allowed" and (.error.message | contains($d))' <<< "$out" >/dev/null \
+                            || fail "p4 say [$p4cfg] $p4role must be refused ($p4want): $out"
+                        assert_not_contains "$(cat "$t/tmux.log")" "paste-buffer"
+                    fi
+                done <<EOF
+worker@pass@.push_senders = {roles: ["worker"]}
+orchestrator@role orchestrator@.push_senders = {roles: ["worker"]}
+orchestrator@pass@.recipients = {comet: {push_senders: {peers: ["$sess"]}}}
+worker@pass@.recipients = {comet: {push_senders: {peers: ["$sess"]}}}
+orchestrator@role orchestrator@.recipients = {comet: {push_senders: {peers: ["someone-else"]}}}
+orchestrator@allowlist-malformed@del(.recipients) | .push_senders = {roles: "orchestrator"}
+orchestrator@pass@del(.push_senders)
+EOF
+                ;;
         esac
     done
     # The MCP tool surfaces the refusal code.
@@ -10479,18 +10562,23 @@ test_peer_seal_p3_carry_items() {
     grep -q 'pthread_sigmask' "$ROOT/lib/peer_seal.py" || fail "ensure_key must hold SIGALRM across link/unlink"
 
     # 4. huge CCTRL_PEER_SEAL_TIMEOUT_SECONDS falls back to 5 s; an ignored
-    # SIGALRM in the parent does not disable the bound.
-    printf '#!/bin/sh\nexec sleep 30\n' > "$t/bin/python3"; chmod +x "$t/bin/python3"
-    t0="$(date +%s)"
+    # SIGALRM in the parent does not disable the bound. Load-robust (phase
+    # 4): the hanging stub logs its start and the alarm that ends it; the
+    # alarm must come within the bound, and the wall ceiling only proves
+    # nothing waited out the 60 s hang.
+    _hang_stub "$t/bin/python3" "$t/py.log"
+    : > "$t/py.log"; t0="$(date +%s)"
     out="$(PATH="$t/bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/k2/k" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=99999999999999999999 \
         "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- huge 2>&1)" || fail "huge bound send failed: $out"
     t1="$(date +%s)"
-    [[ $(( t1 - t0 )) -lt 15 ]] || fail "a huge seal timeout disabled the bound ($(( t1 - t0 )) s)"
-    t0="$(date +%s)"
-    out="$(PATH="$t/bin:$PATH" bash -c 'trap "" ALRM; exec "$@"' _ "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/k2/k" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 \
+    _hang_stub_assert "$t/py.log" 5 "a huge seal timeout (falls back to 5 s)"
+    [[ $(( t1 - t0 )) -lt 45 ]] || fail "a huge seal timeout disabled the bound ($(( t1 - t0 )) s)"
+    : > "$t/py.log"; t0="$(date +%s)"
+    out="$(PATH="$t/bin:$PATH" bash -c 'trap "" ALRM; exec "$@"' _ "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/k2/k" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=2 \
         "$ROOT/cctrl" peer send cr-rcpt --as cr-mo --json -- ignored 2>&1)" || fail "ignored-ALRM send failed: $out"
     t1="$(date +%s)"
-    [[ $(( t1 - t0 )) -lt 10 ]] || fail "an ignored SIGALRM in the parent disabled the bound ($(( t1 - t0 )) s)"
+    _hang_stub_assert "$t/py.log" 2 "an ignored SIGALRM in the parent"
+    [[ $(( t1 - t0 )) -lt 45 ]] || fail "an ignored SIGALRM in the parent disabled the bound ($(( t1 - t0 )) s)"
     local n
     n="$(grep -c "perl -e '\$SIG{ALRM}=\"DEFAULT\"; alarm shift @ARGV;" "$ROOT/cctrl")"
     [[ "$n" -ge 3 && "$(grep -c "perl -e 'alarm shift" "$ROOT/cctrl")" -eq 0 ]] || fail "every perl alarm bound must reset SIGALRM first ($n)"
@@ -10507,6 +10595,355 @@ test_peer_seal_p3_carry_items() {
     [[ $rc -eq 64 ]] || fail "conflict must be 64, got $rc"
     assert_contains "$out" "--as 'a\\tb' and --from 'c\\n'"
     echo "ok: plan 111 p3 carry items (wide key file, symlinked dir, stale temps, seal bound, SIGALRM, run-shell redirect, conflict text)"
+}
+
+# ---- Plan 111 phase 4: configurable push allowlist (push_senders) ----
+_p4_add() { # id from created_at role orch_kind -> a sealed level-session line to comet
+    local msg line
+    msg="$(_p3_msg "$1" "$2" "$3" session "$4" | jq -c --arg k "$5" '.attest.orch_kind = (if $k == "" then null else $k end)')"
+    line="$(_seal_line "$P3_KEY" "$P3_HOST" "$msg")" || fail "p4 fixture: seal failed"
+    printf '%s\n' "$line" >> "$P3_DATA/messages.jsonl"
+}
+_p4_cfg() { # data dir jq-edit -> edits doorbell.json in place
+    jq "$2" "$1/doorbell.json" > "$1/db.tmp" && mv "$1/db.tmp" "$1/doorbell.json"
+}
+# A repo orchestrator, a fleet orchestrator, a worker and a no-role session,
+# all sealed at level session.
+_p4_build() {
+    _p4_add msg_20260201_000000_e00001 orch1 2026-02-01T00:00:00Z orchestrator repo
+    _p4_add msg_20260201_000001_m00001 fm1 2026-02-01T00:00:01Z orchestrator fleet
+    _p4_add msg_20260201_000002_w00001 work1 2026-02-01T00:00:02Z worker ""
+    _p4_add msg_20260201_000003_n00001 nora 2026-02-01T00:00:03Z "" ""
+}
+
+test_peer_attest_p4_allowlist_push() {
+    # Plan 111 phase 4, enforce (set only in this test's doorbell.json): the
+    # push allowlist is doorbell.json push_senders {roles, peers}, overridden
+    # per recipient by recipients.<to>.push_senders; unset = the built-in
+    # default (orchestrator, fleet-manager). Hit and miss by role and by name
+    # (the sealed sender name or its attested session); fleet-manager matches
+    # an orchestrator of kind fleet; a malformed key matches nothing.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local out rc got case_name edit want
+    _p3_fixture "$TMPDIR/p4-push"; _p4_build
+    local E=msg_20260201_000000_e00001 M=msg_20260201_000001_m00001 W=msg_20260201_000002_w00001 N=msg_20260201_000003_n00001
+    while IFS='@' read -r case_name want edit; do
+        [[ -n "$case_name" ]] || continue
+        _p3_copy "$case_name" enforce; _p4_cfg "$P3_C" "$edit"; _p3_env "$P3_C"
+        rc=0; out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)" || rc=$?
+        [[ $rc -eq 0 ]] || fail "p4 $case_name: deliver rc $rc: $out"
+        got="$(jq -c -s '[.[] | select((.nudge_count // 0) > 0) | .id] | sort' "$P3_C/messages.jsonl")"
+        [[ "$got" == "$want" ]] || fail "p4 $case_name: pushed for $got, want $want: $out"
+        if [[ "$want" == "[]" ]]; then
+            jq -e '.results[0].status == "queued-only" and .results[0].reason == "sender-not-allowed"' <<< "$out" >/dev/null \
+                || fail "p4 $case_name: no allowlisted sender must be queued-only sender-not-allowed: $out"
+            assert_not_contains "$(cat "$P3_C/tmux.log")" "paste-buffer"
+        else
+            jq -e --argjson w "$want" '.results[0].status == "nudged" and .results[0].queued == ($w | length)' <<< "$out" >/dev/null \
+                || fail "p4 $case_name: must nudge for the allowlisted mail only: $out"
+        fi
+    done <<EOF
+builtin@["$E","$M"]@del(.push_senders)
+null@["$E","$M"]@.push_senders = null
+role-worker@["$W"]@.push_senders = {roles: ["worker"]}
+role-fm@["$M"]@.push_senders = {roles: ["fleet-manager"]}
+role-orch@["$E","$M"]@.push_senders = {roles: ["orchestrator"], peers: []}
+name-from@["$N"]@.push_senders = {peers: ["nora"]}
+name-session@["$W"]@.push_senders = {peers: ["TMUX--work1"]}
+both@["$M","$N"]@.push_senders = {roles: ["fleet-manager"], peers: ["nora"]}
+miss@[]@.push_senders = {roles: [], peers: ["nobody"]}
+empty@[]@.push_senders = {}
+override@["$N"]@.push_senders = {roles: ["orchestrator"]} | .recipients = {comet: {push_senders: {peers: ["nora"]}}}
+override-other@["$E","$M"]@.recipients = {other: {push_senders: {roles: ["worker"]}}}
+override-empty-obj@["$E","$M"]@.recipients = {comet: {note: "x"}}
+override-null@["$E","$M"]@.recipients = {comet: {push_senders: null}}
+malformed-type@[]@.push_senders = {roles: "orchestrator"}
+malformed-key@[]@.push_senders = {roles: ["orchestrator"], hosts: ["a"]}
+malformed-item@[]@.push_senders = {roles: ["orchestrator", 5]}
+malformed-word@[]@.push_senders = {peers: ["orch1 nora"]}
+malformed-array@[]@.push_senders = ["orchestrator"]
+malformed-override@[]@.recipients = {comet: {push_senders: {roles: "worker"}}}
+malformed-override-entry@[]@.recipients = {comet: 5}
+malformed-recipients@[]@.recipients = ["comet"]
+override-ok-default-bad@["$W"]@.push_senders = 7 | .recipients = {comet: {push_senders: {roles: ["worker"]}}}
+EOF
+    # Shown: inbox eligibility and doctor name the allowlist; a malformed key
+    # reads allowlist-malformed and doctor says so.
+    _p3_copy show-bad enforce; _p4_cfg "$P3_C" '.push_senders = {roles: "orchestrator"}'; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer inbox --as comet --json)"
+    jq -e --arg e "$E" --arg w "$W" 'map({key: .id, value: .eligibility}) | from_entries
+        | .[$e] == {push: false, bell: false, reason: "sender-not-allowed", detail: "allowlist-malformed"}
+          and .[$w] == {push: false, bell: true, reason: "sender-not-allowed", detail: "allowlist-malformed"}' <<< "$out" >/dev/null \
+        || fail "p4 malformed: inbox eligibility (workers still ring the bell): $out"
+    out="$("${P3_E[@]}" CCTRL_NOW_UTC=2026-02-03T00:00:00Z "$ROOT/cctrl" peer doctor)"
+    assert_contains "$out" "push senders: push_senders MALFORMED (matches nothing)"
+    _p3_copy show-cfg enforce; _p4_cfg "$P3_C" '.push_senders = {roles: ["worker"], peers: ["nora"]} | .recipients = {comet: {push_senders: {roles: []}}, x: 5}'; _p3_env "$P3_C"
+    out="$("${P3_E[@]}" CCTRL_NOW_UTC=2026-02-03T00:00:00Z "$ROOT/cctrl" peer doctor --json)"
+    jq -e '.checks[] | select(.name == "sender_eligibility") | .push_senders.source == "config"
+        and .push_senders.default == {roles: ["worker"], peers: ["nora"]} and .push_senders.recipients == {comet: {roles: [], peers: []}, x: null}
+        and (.summary | contains("per-recipient overrides: comet, x MALFORMED"))' <<< "$out" >/dev/null || fail "p4 doctor allowlist: $out"
+    # Inline: the inline id is judged against the allowlist too.
+    _p3_copy inline enforce; _p4_cfg "$P3_C" '.push_senders = {roles: ["worker"]}'; _p3_env "$P3_C"
+    rc=0; out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --inline "$E" --json)" || rc=$?
+    [[ $rc -eq 0 ]] && jq -e '.results[0].status == "queued-only" and .results[0].reason == "sender-not-allowed"' <<< "$out" >/dev/null \
+        || fail "p4 inline of a non-allowlisted sender must be queued-only (rc $rc): $out"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --inline "$W" --json)"
+    jq -e '.results[0].status == "inline"' <<< "$out" >/dev/null || fail "p4 inline of an allowlisted worker: $out"
+    echo "ok: plan 111 p4 push_senders: role/name hit and miss, fleet-manager kind, per-recipient override, malformed matches nothing"
+}
+
+test_peer_attest_p4_warn_unchanged() {
+    # Plan 111 phase 4: in warn (the live default) a configured allowlist,
+    # an override or a malformed key changes no delivery: deliver, dry-run
+    # and inline give byte-identical results, tmux traffic and mailbox
+    # writes to warn with no allowlist (itself identical to off, p3 test);
+    # the allowlist decisions are logged only.
+    command -v python3 >/dev/null || { echo "skip: no python3"; return 0; }
+    local cfg out first_out first_log first_box box inl first_inl first_inl_log n=0
+    _p3_fixture "$TMPDIR/p4-warn"; _p4_build
+    _p3_add msg_20260201_000011_f00001 mallory 2026-02-01T00:00:11Z session "" '.attest.role = "orchestrator"'
+    _p3_add msg_20260201_000012_l00001 legacy 2026-02-01T00:00:12Z session orchestrator 'del(.seal)'
+    for cfg in 'del(.push_senders)' '.push_senders = {roles: [], peers: ["nobody"]}' \
+               '.push_senders = {roles: ["worker"]} | .recipients = {comet: {push_senders: {peers: ["nora"]}}}' \
+               '.push_senders = {roles: "bad"}' '.recipients = 5'; do
+        n=$((n + 1))
+        _p3_copy "warn-$n" warn; _p4_cfg "$P3_C" "$cfg"; _p3_env "$P3_C"
+        out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --dry-run --json)"
+        out+=$'\n'"$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+        jq -e -s '.[1].results[0].status == "nudged" and .[1].results[0].queued == 6' <<< "$out" >/dev/null || fail "warn p4 [$cfg]: comet must be nudged for all 6 as in plan 110: $out"
+        box="$(jq -S -c . "$P3_C/messages.jsonl")"
+        if [[ $n -eq 1 ]]; then
+            first_out="$out"; first_log="$(_p3_norm_log "$P3_C/tmux.log")"; first_box="$box"
+        else
+            [[ "$out" == "$first_out" ]] || fail "warn p4 [$cfg]: deliver result differs from no allowlist:
+$out
+---
+$first_out"
+            [[ "$(_p3_norm_log "$P3_C/tmux.log")" == "$first_log" ]] || fail "warn p4 [$cfg]: tmux traffic differs"
+            [[ "$box" == "$first_box" ]] || fail "warn p4 [$cfg]: mailbox writes differ"
+            jq -e -s 'all(.[]; .mode == "warn" and .acted == false)' "$P3_C/doorbell/attestation.log" >/dev/null \
+                || fail "warn p4 [$cfg]: decisions must be logged, never acted on: $(cat "$P3_C/doorbell/attestation.log")"
+        fi
+        # Inline of an id the allowlist rejects (in some configs) is pasted as before.
+        _p3_copy "warn-inl-$n" warn; _p4_cfg "$P3_C" "$cfg"; _p3_env "$P3_C"
+        inl="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --inline msg_20260201_000000_e00001 --json)"
+        jq -e '.results[0].status == "inline"' <<< "$inl" >/dev/null || fail "warn p4 [$cfg]: inline must paste as before: $inl"
+        if [[ $n -eq 1 ]]; then first_inl="$inl"; first_inl_log="$(_p3_norm_log "$P3_C/tmux.log")"
+        else
+            [[ "$inl" == "$first_inl" ]] || fail "warn p4 [$cfg]: inline result differs: $inl / $first_inl"
+            [[ "$(_p3_norm_log "$P3_C/tmux.log")" == "$first_inl_log" ]] || fail "warn p4 [$cfg]: inline paste differs"
+        fi
+    done
+    # The last runs logged the allowlist decision (orch1 not allowed under
+    # `.recipients = 5`), never acted on.
+    jq -e -s 'any(.[]; .path == "inline" and .acted == false and (.messages[0].detail == "allowlist-malformed"))' "$P3_C/doorbell/attestation.log" >/dev/null \
+        || fail "warn p4: the malformed allowlist must be logged: $(cat "$P3_C/doorbell/attestation.log")"
+    echo "ok: plan 111 p4 warn: a configured, overridden or malformed allowlist changes no delivery (logged only)"
+}
+
+test_peer_attest_p4_stop_bell() {
+    # Plan 111 phase 4, Stop bell in enforce: the jq fast path admits the
+    # configured roles and names (union of every allowlist in the file, plus
+    # workers); the slow path decides per recipient. Workers ring whatever
+    # the allowlist says. Fix A (p3 verify must-fix): a seal-helper failure
+    # (helper gone, python3 timed out) for one Stop records nothing as
+    # blocked, so the mail rings at the next Stop.
+    command -v python3 >/dev/null && command -v perl >/dev/null || { echo "skip: no python3/perl"; return 0; }
+    local host key="$TMPDIR/p4-bell-key/cctrl/peer-seal.key" st
+    _p4_bell_line() { # id from created role [kind]
+        local line
+        line="$(jq -cn --arg id "$1" --arg from "$2" --arg at "$3" --arg role "$4" --arg kind "${5:-}" '
+            {id: $id, from: $from, to: "TMUX--t-a", subject: $id, body: "b", status: "queued", created_at: $at, updated_at: $at, nudge_count: 0,
+             sender: {name: $from}, audit: {requested_to: "TMUX--t-a", requested_from: $from},
+             attest: {v: 1, level: "session", session: ("TMUX--" + $from), role: (if $role == "" then null else $role end),
+                      orch_kind: (if $kind == "" then null else $kind end)},
+             history: [{at: $at, status: "queued", by: $from}]}')"
+        line="$(_seal_line "$key" "$host" "$line")" || fail "bell seal failed"
+        printf '%s\n' "$line" >> "$BELL_DATA/messages.jsonl"
+    }
+    _bell_fixture "$TMPDIR/p4-bell"
+    cp -R "$ROOT/lib" "$BELL_DIR/lib"
+    export CCTRL_HOST_ID_FILE="$BELL_DATA/host-id" CCTRL_PEER_SEAL_KEY_FILE="$key"
+    host="$(printf '%032x' 113)"; printf '%s\n' "$host" > "$BELL_DATA/host-id"
+    st="$BELL_DATA/doorbell/state/TMUX--t-a.json"
+    local _bell_cfg_default
+    _bell_cfg_default='{"enabled":true,"baseline_at":"2026-01-01T00:00:00Z","peers":[],"roles":["orchestrator"],"mode":"blocking","max_rings_per_hour":100}'
+    # A no-role sender: silent by default (dropped by the fast path, never
+    # recorded); rings once named in push_senders.
+    _bell_enable "$(jq -c '. + {attestation: "enforce"}' <<< "$_bell_cfg_default")"
+    _p4_bell_line msg_20260201_000001_n00001 nora 2026-02-01T00:00:01Z ""
+    _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "p4 bell: a no-role sender must not ring by default"
+    [[ ! -f "$st" ]] || jq -e '.rung["msg_20260201_000001_n00001"] == null' "$st" >/dev/null || fail "p4 bell: fast-path drops are not recorded: $(cat "$st")"
+    _bell_enable "$(jq -c '. + {attestation: "enforce", push_senders: {peers: ["nora"]}}' <<< "$_bell_cfg_default")"
+    _bell_stop; [[ "$BELL_RC" -eq 2 ]] || fail "p4 bell: a sender named in push_senders must ring: $(cat "$BELL_DATA/doorbell/attestation.log" 2>&1)"
+    # A name allowed only for another recipient passes the fast path (union)
+    # and fails the slow path: recorded as blocked (a definite verdict).
+    _bell_enable "$(jq -c '. + {attestation: "enforce", recipients: {other: {push_senders: {peers: ["olga"]}}}}' <<< "$_bell_cfg_default")"
+    _p4_bell_line msg_20260201_000002_o00001 olga 2026-02-01T00:00:02Z ""
+    _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "p4 bell: a name allowed for another recipient only must not ring here"
+    jq -e '.rung["msg_20260201_000002_o00001"] == "blocked"' "$st" >/dev/null || fail "p4 bell: a definite slow-path drop is recorded: $(cat "$st")"
+    # fleet-manager role: an orchestrator of kind fleet rings, kind repo not.
+    _bell_enable "$(jq -c '. + {attestation: "enforce", push_senders: {roles: ["fleet-manager"]}}' <<< "$_bell_cfg_default")"
+    _p4_bell_line msg_20260201_000003_r00001 orch1 2026-02-01T00:00:03Z orchestrator repo
+    _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "p4 bell: a repo orchestrator is not a fleet-manager"
+    _p4_bell_line msg_20260201_000004_m00001 fm1 2026-02-01T00:00:04Z orchestrator fleet
+    _bell_stop; [[ "$BELL_RC" -eq 2 ]] || fail "p4 bell: an orchestrator of kind fleet matches fleet-manager"
+    assert_contains "$BELL_ERR" "1 new peer message(s)"
+    # Malformed push_senders: orchestrators fall silent, workers still ring.
+    _bell_enable "$(jq -c '. + {attestation: "enforce", push_senders: {roles: "orchestrator"}}' <<< "$_bell_cfg_default")"
+    _p4_bell_line msg_20260201_000005_e00001 orch2 2026-02-01T00:00:05Z orchestrator repo
+    _bell_stop; [[ "$BELL_RC" -eq 0 ]] || fail "p4 bell: a malformed allowlist matches no orchestrator"
+    _p4_bell_line msg_20260201_000006_w00001 work1 2026-02-01T00:00:06Z worker
+    _bell_stop; [[ "$BELL_RC" -eq 2 ]] || fail "p4 bell: workers ring whatever the allowlist says"
+
+    # Fix A: the helper fails for one Stop (lib gone, then python3 timing
+    # out); nothing is recorded, and the mail rings once the helper is back.
+    _bell_enable "$(jq -c '. + {attestation: "enforce"}' <<< "$_bell_cfg_default")"
+    _p4_bell_line msg_20260201_000007_e00002 orch3 2026-02-01T00:00:07Z orchestrator repo
+    mv "$BELL_DIR/lib/peer_seal.py" "$BELL_DIR/lib/peer_seal.py.away"
+    _bell_stop
+    mv "$BELL_DIR/lib/peer_seal.py.away" "$BELL_DIR/lib/peer_seal.py"
+    [[ "$BELL_RC" -eq 0 ]] || fail "p4 bell: with the helper gone enforce must not ring (fail closed)"
+    jq -e '.rung["msg_20260201_000007_e00002"] == null' "$st" >/dev/null || fail "fix A: a verify-failed id must not be recorded: $(cat "$st")"
+    # Only the seal helper hangs; the Stop's other python3 (session-log) runs.
+    _hang_stub "$BELL_DIR/hang" "$BELL_DIR/py.log"
+    printf '#!/bin/sh\ncase "$*" in *peer_seal.py*) exec "%s" "$@" ;; esac\nexec "%s" "$@"\n' "$BELL_DIR/hang" "$(command -v python3)" > "$BELL_DIR/bin/python3"
+    chmod +x "$BELL_DIR/bin/python3"
+    CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 _bell_stop
+    rm -f "$BELL_DIR/bin/python3"
+    grep -q '^alarm ' "$BELL_DIR/py.log" || fail "fix A: the stub helper must have been timed out: $(cat "$BELL_DIR/py.log" 2>&1)"
+    [[ "$BELL_RC" -eq 0 ]] || fail "p4 bell: with python3 timing out enforce must not ring"
+    jq -e '.rung["msg_20260201_000007_e00002"] == null' "$st" >/dev/null || fail "fix A: a timed-out id must not be recorded: $(cat "$st")"
+    _bell_stop
+    [[ "$BELL_RC" -eq 2 ]] || fail "fix A: the mail must ring once the helper is back"
+    # orch1/orch2 were dropped by earlier configs' fast paths (never
+    # recorded), so they ring with it under the default allowlist.
+    assert_contains "$BELL_ERR" "3 new peer message(s)"
+    jq -e '.rung["msg_20260201_000007_e00002"] != null and .rung["msg_20260201_000007_e00002"] != "blocked"' "$st" >/dev/null || fail "fix A: rung after: $(cat "$st")"
+    unset CCTRL_HOST_ID_FILE CCTRL_PEER_SEAL_KEY_FILE
+    echo "ok: plan 111 p4 Stop bell: configured roles/names ring in enforce, override per recipient, workers always; a helper failure never silences mail for good"
+}
+
+test_peer_doorbell_allow_deny_senders() {
+    # Plan 111 phase 4: cctrl peer doorbell allow-sender / deny-sender /
+    # reset-senders edit push_senders (or recipients.NAME.push_senders with
+    # --for) with the atomic 0600 writer, starting from the list in effect;
+    # status shows the allowlist; enable keeps it; move carries an override;
+    # a malformed key is refused until reset; nothing else changes.
+    local data="$TMPDIR/p4-cli" out rc before
+    rm -rf "$data"; mkdir -p "$data"
+    local -a e=(env -u TMUX -u TMUX_PANE CCTRL_DATA_DIR="$data" CCTRL_CLAUDE_SETTINGS="$data/none.json")
+    rc=0; out="$("${e[@]}" "$ROOT/cctrl" peer doorbell allow-sender --role worker --json 2>&1)" || rc=$?
+    [[ $rc -eq 65 ]] && jq -e '.error.message | contains("not configured")' <<< "$out" >/dev/null || fail "allow-sender with no doorbell.json must be refused 65 ($rc): $out"
+    [[ ! -e "$data/doorbell.json" ]] || fail "a refused allow-sender must not create doorbell.json"
+    "${e[@]}" "$ROOT/cctrl" peer doorbell enable --peer comet --max-rings-per-hour 7 >/dev/null || fail "enable failed"
+    jq '. + {attestation: "warn", custom: 1}' "$data/doorbell.json" > "$data/x" && mv "$data/x" "$data/doorbell.json"
+    # Usage errors.
+    for args in "" "--role bogus" "--peer worker" "--peer 'a b'" "--for orchestrator --role worker" "--frob"; do
+        rc=0; eval "\"\${e[@]}\" \"\$ROOT/cctrl\" peer doorbell allow-sender $args >/dev/null 2>&1" || rc=$?
+        [[ $rc -eq 64 ]] || fail "allow-sender $args must be a usage error (64), got $rc"
+    done
+    rc=0; "${e[@]}" "$ROOT/cctrl" peer doorbell reset-senders --role worker >/dev/null 2>&1 || rc=$?
+    [[ $rc -eq 64 ]] || fail "reset-senders takes no --role (64), got $rc"
+    # Dry run writes nothing.
+    before="$(cat "$data/doorbell.json")"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell allow-sender --role worker --dry-run --json)"
+    jq -e '.dry_run == true and .written == false and .push_senders == {roles: ["fleet-manager", "orchestrator", "worker"], peers: []}' <<< "$out" >/dev/null || fail "dry run: $out"
+    [[ "$(cat "$data/doorbell.json")" == "$before" ]] || fail "a dry run must not write"
+    # allow from the built-in default; deny; per-recipient override from the default in effect.
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell allow-sender --role worker --peer fm-x --json)"
+    jq -e '.written == true and .key == "push_senders" and .attestation == "warn"' <<< "$out" >/dev/null || fail "allow-sender json: $out"
+    jq -e '.push_senders == {roles: ["fleet-manager", "orchestrator", "worker"], peers: ["fm-x"]}
+        and .custom == 1 and .max_rings_per_hour == 7 and .peers == ["comet"] and .attestation == "warn"' "$data/doorbell.json" >/dev/null \
+        || fail "allow-sender must add to the default and change nothing else: $(cat "$data/doorbell.json")"
+    [[ "$(_seal_mode "$data/doorbell.json")" == 600 ]] || fail "doorbell.json must stay 0600"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell deny-sender --role orchestrator --peer nobody)"
+    assert_contains "$out" "now in effect: roles fleet-manager, worker; peers fm-x"
+    assert_contains "$out" "note: nobody was not in the list"
+    assert_contains "$out" "attestation is warn: the allowlist is logged and shown only; delivery is unchanged."
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell allow-sender --for comet --peer TMUX--boss --json)"
+    jq -e '.key == "recipients.comet.push_senders" and .recipient == "comet"
+        and .push_senders == {roles: ["fleet-manager", "worker"], peers: ["TMUX--boss", "fm-x"]}' <<< "$out" >/dev/null || fail "override json: $out"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell status)"
+    assert_contains "$out" "  attestation: warn (allowlist logged and shown only; delivery unchanged)"
+    assert_contains "$out" "  push senders: roles fleet-manager, worker; peers fm-x (push_senders)"
+    assert_contains "$out" "  push senders for comet: roles fleet-manager, worker; peers TMUX--boss, fm-x (override)"
+    assert_contains "$out" "  Stop bell also rings for: level-session workers (built-in)"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell status --json)"
+    jq -e '.push_senders.default == {roles: ["fleet-manager", "worker"], peers: ["fm-x"], source: "config"}
+        and .push_senders.recipients.comet.source == "override" and .attestation == "warn"' <<< "$out" >/dev/null || fail "status json: $out"
+    # enable keeps the allowlist; move carries the override.
+    "${e[@]}" "$ROOT/cctrl" peer doorbell enable --peer extra >/dev/null
+    jq -e '.push_senders.peers == ["fm-x"] and .recipients.comet.push_senders.peers == ["TMUX--boss", "fm-x"]' "$data/doorbell.json" >/dev/null \
+        || fail "enable must keep push_senders and recipients: $(cat "$data/doorbell.json")"
+    "${e[@]}" "$ROOT/cctrl" peer doorbell move --from comet --to comet2 >/dev/null || fail "move failed"
+    jq -e '(.recipients | keys) == ["comet2"] and .recipients.comet2.push_senders.peers == ["TMUX--boss", "fm-x"]' "$data/doorbell.json" >/dev/null \
+        || fail "move must carry the override: $(cat "$data/doorbell.json")"
+    # reset: the override, then the default.
+    "${e[@]}" "$ROOT/cctrl" peer doorbell reset-senders --for comet2 >/dev/null
+    jq -e 'has("recipients") | not' "$data/doorbell.json" >/dev/null || fail "reset --for must drop the emptied override: $(cat "$data/doorbell.json")"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell reset-senders)"
+    assert_contains "$out" "now in effect: roles orchestrator, fleet-manager; peers (none)"
+    jq -e '(has("push_senders") | not) and .max_rings_per_hour == 7 and .attestation == "warn" and .peers == ["comet2", "extra"]' "$data/doorbell.json" >/dev/null \
+        || fail "reset must drop push_senders only: $(cat "$data/doorbell.json")"
+    # A malformed key is refused until reset (or fixed by hand).
+    jq '.push_senders = {roles: "x"}' "$data/doorbell.json" > "$data/x" && mv "$data/x" "$data/doorbell.json"
+    before="$(cat "$data/doorbell.json")"
+    rc=0; out="$("${e[@]}" "$ROOT/cctrl" peer doorbell allow-sender --role worker 2>&1)" || rc=$?
+    [[ $rc -eq 65 ]] || fail "a malformed push_senders must be refused (65), got $rc: $out"
+    assert_contains "$out" "reset-senders"
+    rc=0; out="$("${e[@]}" "$ROOT/cctrl" peer doorbell deny-sender --for comet --role worker 2>&1)" || rc=$?
+    [[ $rc -eq 65 ]] || fail "an override starting from a malformed default must be refused (65), got $rc: $out"
+    [[ "$(cat "$data/doorbell.json")" == "$before" ]] || fail "a refused edit must not write"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell status)"
+    assert_contains "$out" "push senders: MALFORMED (matches nothing)"
+    "${e[@]}" "$ROOT/cctrl" peer doorbell reset-senders >/dev/null || fail "reset of a malformed key failed"
+    jq -e 'has("push_senders") | not' "$data/doorbell.json" >/dev/null || fail "reset must clear a malformed key"
+    jq '.recipients = [1]' "$data/doorbell.json" > "$data/x" && mv "$data/x" "$data/doorbell.json"
+    rc=0; out="$("${e[@]}" "$ROOT/cctrl" peer doorbell allow-sender --for comet --role worker 2>&1)" || rc=$?
+    [[ $rc -eq 65 ]] && assert_contains "$out" "fix it by hand" || fail "a non-object recipients must be refused (65), got $rc: $out"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell status)"
+    assert_contains "$out" "MALFORMED recipients (every recipient matches nothing)"
+    out="$("${e[@]}" "$ROOT/cctrl" peer doorbell help)"
+    assert_contains "$out" "allow-sender (--role ROLE | --peer NAME)... [--for RECIPIENT]"
+    echo "ok: plan 111 p4 doorbell allow-sender/deny-sender/reset-senders: atomic edits, status, enable/move keep it, malformed refused"
+}
+
+test_peer_attest_log_rotation_concurrent() {
+    # Plan 111 phase 4 fix C (p3 verify N1): concurrent writers that all see
+    # a log over 1 MiB rotate it once, under a mkdir lock with a re-check;
+    # no rotated line or new line is lost. A lock left behind by a killed
+    # writer is cleared after a minute.
+    local data="$TMPDIR/p4-rot" f i n_old n_new pids=""
+    rm -rf "$data"; mkdir -p "$data/doorbell"
+    f="$data/doorbell/attestation.log"
+    awk 'BEGIN{for (i = 0; i < 11000; i++) printf "{\"old\":%d,\"pad\":\"%s\"}\n", i, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}' > "$f"
+    [[ "$(wc -c < "$f" | tr -d ' ')" -gt 1048576 ]] || fail "rotation fixture must exceed 1 MiB"
+    for i in $(seq 1 16); do
+        CCTRL_DATA_DIR="$data" cctrl_source_eval '_peer_attest_log push "rcpt$1" "{\"writer\":$1}"' "$i" &
+        pids+=" $!"
+    done
+    for i in $pids; do wait "$i" || true; done
+    [[ -f "$f.1" ]] || fail "the log must have been rotated"
+    n_old="$(cat "$f.1" "$f" | grep -c '"old":' || true)"
+    [[ "$n_old" -eq 11000 ]] || fail "rotation lost old lines: $n_old of 11000 kept"
+    n_new="$(cat "$f" "$f.1" | grep -c '"writer":' || true)"
+    [[ "$n_new" -eq 16 ]] || fail "rotation lost new lines: $n_new of 16 kept"
+    [[ ! -e "$data/doorbell/.attestation.log.rotate" ]] || fail "the rotation lock must be released"
+    [[ "$(_seal_mode "$f")" == 600 ]] || fail "attestation.log must be 0600"
+    # A stale lock (older than a minute) does not stop rotation for good.
+    mv "$f.1" "$f"; mkdir "$data/doorbell/.attestation.log.rotate"
+    touch -t 202001010000 "$data/doorbell/.attestation.log.rotate"
+    CCTRL_DATA_DIR="$data" cctrl_source_eval '_peer_attest_log push r "{\"writer\":\"after-stale\"}"'
+    [[ -f "$f.1" ]] && grep -q 'after-stale' "$f" || fail "a stale rotation lock must be cleared"
+    # A fresh lock (another writer rotating) is respected: the line is
+    # appended, nothing is rotated.
+    rm -f "$f.1"; cp "$f" "$f.big"; cat "$f.big" "$f.big" > "$f"; rm -f "$f.big"
+    mkdir "$data/doorbell/.attestation.log.rotate"
+    CCTRL_DATA_DIR="$data" cctrl_source_eval '_peer_attest_log push r "{\"writer\":\"fresh-lock\"}"'
+    [[ ! -e "$f.1" ]] && grep -q 'fresh-lock' "$f" || fail "a held rotation lock must be respected"
+    rmdir "$data/doorbell/.attestation.log.rotate"
+    echo "ok: plan 111 p4 attestation.log rotation is safe under concurrent writers (mkdir lock + re-check); stale locks clear"
 }
 
 test_peer_reply_core() {

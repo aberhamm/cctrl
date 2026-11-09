@@ -7,14 +7,19 @@ ever prints MACs (which are not secret) and verification facts.
 Modes:
   seal <host_id>    stdin: one message object. stdout: the hex MAC.
                     Creates the key on first use (atomic, create-once).
-  verify <host_id> [--eligibility <since>]
+  verify <host_id> [--eligibility <since> [--allow <json>]]
                     stdin: a JSON array of messages. stdout: a JSON array of
                     verification objects, one per message, same order.
                     Never creates the key. With --eligibility (plan 111
                     phase 3) each object also carries `eligibility`: whether
-                    the message may push or ring the Stop bell under the
-                    built-in default allowlist. <since> is the effective
-                    attestation_since (ISO UTC), "" for none, or "invalid".
+                    the message may push or ring the Stop bell. <since> is
+                    the effective attestation_since (ISO UTC), "" for none,
+                    or "invalid". --allow (phase 4) is the resolved push
+                    allowlist cctrl reads from doorbell.json (push_senders
+                    and recipients.<to>.push_senders): {"default": A,
+                    "recipients": {name: A} | "malformed"}, A = {"roles":
+                    [...], "peers": [...]} or null (malformed: matches
+                    nothing). Without it, the built-in default applies.
   doctor <host_id>  stdin: a JSON array of messages. stdout: one JSON object
                     with the key status (path, exists, mode; never the key)
                     and verification counts. Never creates the key.
@@ -49,11 +54,13 @@ SEALED_FIELDS = (
     "recipient_provider_task_id", "unknown_peer",
 )
 HASHED_FIELDS = ("body", "subject")
-# Plan 111 phase 3: the built-in default allowlist (no config key; phase 4
-# makes it configurable). Push: orchestrators (fleet-manager is role
-# orchestrator with orch_kind fleet). The Stop bell also admits workers: it
-# carries fixed nudge text.
+# Plan 111 phase 3: the built-in default push allowlist, used while
+# doorbell.json has no push_senders (phase 4 makes it configurable). Push:
+# orchestrators (fleet-manager is role orchestrator with orch_kind fleet). The
+# Stop bell also admits level-session workers whatever the allowlist says: it
+# carries fixed nudge text (BELL_ONLY_ROLES is not configurable).
 PUSH_ROLES = ("orchestrator", "fleet-manager")
+BUILTIN_SENDERS = {"roles": list(PUSH_ROLES), "peers": []}
 BELL_ONLY_ROLES = ("worker",)
 TMP_PREFIX = ".peer-seal."
 TMP_SUFFIX = ".tmp"
@@ -329,10 +336,55 @@ def _status_edited(message):
     return False
 
 
-def eligibility_one(message, ver, dup_ids, since):
+def _word_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) and v and not any(c.isspace() for c in v) for v in value)
+
+
+def senders_for(allow, to):
+    """The push allowlist that applies to mail addressed to `to`: a
+    recipients.<to> override, else the default. None = malformed (matches
+    nothing). No --allow at all = the built-in default."""
+    if allow is None:
+        return BUILTIN_SENDERS
+    if not isinstance(allow, dict):
+        return None
+    recipients = allow.get("recipients")
+    if recipients == "malformed":
+        return None
+    if isinstance(recipients, dict) and isinstance(to, str) and to in recipients:
+        chosen = recipients[to]
+    else:
+        chosen = allow.get("default")
+    if not isinstance(chosen, dict):
+        return None
+    roles, peers = chosen.get("roles", []), chosen.get("peers", [])
+    if not (_word_list(roles) and _word_list(peers)):
+        return None
+    return {"roles": roles, "peers": peers}
+
+
+def sender_allowed(senders, sender, attest):
+    """By role (fleet-manager also matches role orchestrator with orch_kind
+    fleet) or by name (the sealed `from`, or the attested session)."""
+    if not isinstance(senders, dict):
+        return False
+    role = attest.get("role") if isinstance(attest.get("role"), str) else ""
+    kind = attest.get("orch_kind") if isinstance(attest.get("orch_kind"), str) else ""
+    roles, peers = senders["roles"], senders["peers"]
+    if role and (role in roles or ("fleet-manager" in roles and role == "orchestrator" and kind == "fleet")):
+        return True
+    session = attest.get("session") if isinstance(attest.get("session"), str) else ""
+    for name in (sender if isinstance(sender, str) else "", session):
+        if name and name in peers:
+            return True
+    return False
+
+
+def eligibility_one(message, ver, dup_ids, since, allow=None):
     """Plan 111 phase 3, per message: push needs a verified seal, level
-    session, no replay sign, sealed created_at after `since`, and a push role;
-    the Stop bell also admits workers. Only sealed fields decide, except the
+    session, no replay sign, sealed created_at after `since`, and a sender on
+    the recipient's push allowlist (phase 4: `allow`, see senders_for); the
+    Stop bell also admits workers. Only sealed fields decide, except the
     replay checks, which can only take eligibility away."""
     out = {"push": False, "bell": False, "reason": "sender-unattested", "detail": None}
     if not isinstance(message, dict) or not ver.get("verified"):
@@ -354,11 +406,12 @@ def eligibility_one(message, ver, dup_ids, since):
         return out
     attest = message.get("attest") if isinstance(message.get("attest"), dict) else {}
     role = attest.get("role") if isinstance(attest.get("role"), str) else ""
-    if role in PUSH_ROLES:
+    senders = senders_for(allow, message.get("to"))
+    if sender_allowed(senders, message.get("from"), attest):
         out.update(push=True, bell=True, reason=None)
         return out
     out["reason"] = "sender-not-allowed"
-    out["detail"] = "role:" + (role or "none")
+    out["detail"] = "allowlist-malformed" if senders is None else "role:" + (role or "none")
     if role in BELL_ONLY_ROLES:
         out["bell"] = True
     return out
@@ -410,17 +463,27 @@ def cmd_seal(host_id):
 def cmd_verify(host_id, opts):
     eligibility = False
     since = ""
+    allow = None
     if opts:
-        if len(opts) != 2 or opts[0] != "--eligibility":
+        if len(opts) not in (2, 4) or opts[0] != "--eligibility":
             return 64
         eligibility, since = True, opts[1]
+        if len(opts) == 4:
+            if opts[2] != "--allow":
+                return 64
+            try:
+                allow = json.loads(opts[3])
+            except ValueError:
+                allow = "malformed"
+            if allow is None:
+                allow = "malformed"
     messages = _read_messages()
     key = _load_key_or_none()
     results = [verify_one(m, host_id, key) for m in messages]
     if eligibility:
         dups = _dup_ids(messages)
         for m, ver in zip(messages, results):
-            ver["eligibility"] = eligibility_one(m, ver, dups, since)
+            ver["eligibility"] = eligibility_one(m, ver, dups, since, allow)
     sys.stdout.write(json.dumps(results, separators=(",", ":")) + "\n")
     return 0
 

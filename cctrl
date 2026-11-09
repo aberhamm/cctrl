@@ -6630,9 +6630,9 @@ _peer_cmd_say() {
         # Plan 111 phase 3: say_peer pastes sender-written text, so it has its
         # own check of the live caller (no message to inspect): level session
         # and a push role. warn (the default) logs only; enforce refuses.
-        if ! _peer_say_caller_allowed "$identity"; then
+        if ! _peer_say_caller_allowed "$(jq -r '.name // empty' <<< "$say_peer_json" 2>/dev/null || true)" "$identity"; then
             if $json; then
-                _json_error "$PEER_SAY_REASON" "say_peer needs a push-eligible caller (an orchestrator or fleet-manager session in its own pane; this caller: $PEER_SAY_DETAIL); use send_message instead (it queues, and $identity reads it)"
+                _json_error "$PEER_SAY_REASON" "say_peer needs a push-eligible caller (a session in its own pane on $identity's push allowlist, by default an orchestrator or fleet-manager; this caller: $PEER_SAY_DETAIL); use send_message instead (it queues, and $identity reads it)"
             else
                 printf '%bsay_peer refused (%s: %s); use peer send.%b\n' "$RED" "$PEER_SAY_REASON" "$PEER_SAY_DETAIL" "$RESET" >&2
             fi
@@ -6644,23 +6644,37 @@ _peer_cmd_say() {
 
 # MCP say_peer caller check (plan 111 phase 3). off: not run. warn: run and
 # logged when the caller would be refused; always 0. enforce: 1 unless the
-# live caller attests level session with a push role (the built-in default
-# allowlist: orchestrator, fleet-manager). Sets PEER_SAY_REASON
-# (sender-unattested | sender-not-allowed) and PEER_SAY_DETAIL.
+# live caller attests level session and is on the recipient's push allowlist
+# (phase 4: push_senders / recipients.<name>.push_senders, by role or by its
+# session name; unset = the built-in default, orchestrator and fleet-manager;
+# malformed = nobody). Sets PEER_SAY_REASON (sender-unattested |
+# sender-not-allowed) and PEER_SAY_DETAIL. $1 recipient name (the override
+# key), $2 the name as given (fallback, and the log).
 _peer_say_caller_allowed() {
-    local recipient="$1" level="" role="" detail=""
+    local recipient="${1:-${2:-}}" level="" role="" detail="" verdict=""
     PEER_SAY_REASON=""; PEER_SAY_DETAIL=""
     _peer_attestation_cfg
     [[ "$PEER_ATTEST_MODE" == off ]] && return 0
     _peer_caller_attest "" "" false "" "" false no-claim >/dev/null 2>&1 || PEER_ATTEST_JSON=""
     { IFS= read -r level; IFS= read -r role; IFS= read -r detail; } < <(jq -r '(.level // "none"), (.role // ""), (.detail // ""), "."' <<< "${PEER_ATTEST_JSON:-null}" 2>/dev/null) || true
     [[ -n "$level" ]] || level=none
+    if [[ "$level" == "session" ]]; then
+        verdict="$(jq -rn --argjson allow "${PEER_ATTEST_ALLOW:-null}" --arg to "$recipient" --argjson a "${PEER_ATTEST_JSON:-null}" "$PEER_ATTEST_CFG_JQ"'
+            def str: if type == "string" then . else "" end;
+            (if $allow == null then (null | attest_allow) else $allow end | attest_senders_for($to)) as $s
+            | ($a | if type == "object" then . else {} end) as $c
+            | if $s == null then "malformed"
+            elif attest_sender_ok($s; ""; ($c.session | str); ($c.role | str); ($c.orch_kind | str)) then "ok"
+            else "no" end' 2>/dev/null)" || verdict=""
+    fi
     if [[ "$level" != "session" ]]; then
         PEER_SAY_REASON="sender-unattested"; PEER_SAY_DETAIL="level $level${detail:+ ($detail)}"
-    elif [[ "$role" != "orchestrator" && "$role" != "fleet-manager" ]]; then
-        PEER_SAY_REASON="sender-not-allowed"; PEER_SAY_DETAIL="role ${role:-none}"
-    else
+    elif [[ "$verdict" == ok ]]; then
         return 0
+    elif [[ "$verdict" == malformed ]]; then
+        PEER_SAY_REASON="sender-not-allowed"; PEER_SAY_DETAIL="allowlist-malformed"
+    else
+        PEER_SAY_REASON="sender-not-allowed"; PEER_SAY_DETAIL="role ${role:-none}"
     fi
     _peer_attest_log say "$recipient" "$(jq -cn --arg r "$PEER_SAY_REASON" --arg d "$PEER_SAY_DETAIL" --argjson a "${PEER_ATTEST_JSON:-null}" \
         '{outcome: $r, detail: $d, caller: (if ($a | type) == "object" then {level: $a.level, session: $a.session, role: $a.role} else null end)}' 2>/dev/null)"
@@ -7750,7 +7764,8 @@ _peer_verify_annotate() {
     # carries `mode: "enforce"`, which picks the enforce wording; in off and
     # warn `verification` is exactly as in phase 2.
     _peer_attestation_cfg
-    [[ "$PEER_ATTEST_MODE" != off ]] && elig=(--eligibility "$PEER_ATTEST_SINCE")
+    local -a PEER_ELIG_ARGS=()
+    if [[ "$PEER_ATTEST_MODE" != off ]]; then _peer_elig_args; elig=("${PEER_ELIG_ARGS[@]}"); fi
     ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" ${elig[@]+"${elig[@]}"} 2>/dev/null)" || ver=""
     [[ "$ver" == "["* ]] || ver="null"
     local out=""
@@ -11217,11 +11232,22 @@ _peer_doorbell_eval_inner() {
                (if ($in | type) == "object" and $in.stop_hook_active == true then "loop" else "" end),
                (if ($in | type) == "object" and ($in.session_id | type) == "string" then $in.session_id else "" end),
                ($c | max_rings | if type == "number" then floor | tostring else . end),
-               ($c | attest_mode), ($c | attest_since), "."
+               ($c | attest_mode), ($c | attest_since),
+               # Phase 4: the resolved allowlist (slow path), and for the
+               # enforce fast path the union of every allowlist in the file
+               # plus the bell-only worker role (a superset: the slow path
+               # decides per recipient).
+               ($c | attest_allow | tojson),
+               ($c | attest_allow | [.default, (.recipients | if type == "object" then .[] else empty end)]
+                   | map(select(type == "object"))
+                   | {roles: ((map(.roles[]) + ["worker"]) | unique), peers: (map(.peers[]) | unique)} | tojson),
+               "."
           end
     ' <<< "$input")" || return 0
-    local state baseline bell_mode allow_peers allow_roles loop_flag stdin_sid max_rings attest_mode attest_since
-    { IFS= read -r state; IFS= read -r baseline; IFS= read -r bell_mode; IFS= read -r allow_peers; IFS= read -r allow_roles; IFS= read -r loop_flag; IFS= read -r stdin_sid; IFS= read -r max_rings; IFS= read -r attest_mode; IFS= read -r attest_since; } <<< "$gates"
+    local state baseline bell_mode allow_peers allow_roles loop_flag stdin_sid max_rings attest_mode attest_since attest_allow attest_fast_allow
+    { IFS= read -r state; IFS= read -r baseline; IFS= read -r bell_mode; IFS= read -r allow_peers; IFS= read -r allow_roles; IFS= read -r loop_flag; IFS= read -r stdin_sid; IFS= read -r max_rings; IFS= read -r attest_mode; IFS= read -r attest_since; IFS= read -r attest_allow; IFS= read -r attest_fast_allow; } <<< "$gates"
+    [[ "$attest_allow" == "{"*"}" ]] || attest_allow=""
+    [[ "$attest_fast_allow" == "{"*"}" ]] || attest_fast_allow='{"roles":[],"peers":[]}'
     [[ "$state" == "on" ]] || { _peer_doorbell_dbg "off: doorbell.json not enabled"; return 0; }
     # Plan 111 phase 3. warn (the default) and off: the bell rings exactly as
     # before; warn checks the new ids on the slow path and logs only.
@@ -11256,7 +11282,7 @@ _peer_doorbell_eval_inner() {
     [[ -s "$MESSAGES_FILE" ]] || return 0
     pre="$(jq -nc --arg live "$live_name" --arg env_peer "${CCTRL_PEER:-}" --arg base "$baseline" \
         --arg st "$state_raw" --arg pr "$peers_raw" --arg env_now "${CCTRL_NOW_UTC:-}" --argjson win "$DOORBELL_RING_WINDOW" \
-        --arg enf "$attest_fast" \
+        --arg enf "$attest_fast" --argjson fa "$attest_fast_allow" \
         "$DOORBELL_MAX_RINGS_JQ"'
         # The clock as _peer_now_utc gives it, computed here so the no-mail
         # fast path forks no `date` (verify N1).
@@ -11283,7 +11309,10 @@ _peer_doorbell_eval_inner() {
             now: $now,
             new: [$q[] | select(((.created_at // "") > $base) and ($rung[.id] == null))
                   | select($enf == "" or ((.attest | type) == "object" and .attest.level == "session"
-                      and ((.attest.role // "") as $r | ["orchestrator", "fleet-manager", "worker"] | index($r)) != null))
+                      and (((.attest.role // "") as $r | $r != "" and (($fa.roles | index($r)) != null
+                              or (($fa.roles | index("fleet-manager")) != null and $r == "orchestrator" and .attest.orch_kind == "fleet")))
+                           or ((.from // "") as $f | $f != "" and ($fa.peers | index($f)) != null)
+                           or ((.attest.session // "") as $s | $s != "" and ($fa.peers | index($s)) != null))))
                   | {id, to, created_at}] }
     ' "$MESSAGES_FILE")" || { _peer_doorbell_dbg "off: mailbox or clock (${CCTRL_NOW_UTC:-system clock}) unreadable"; return 0; }
     [[ "$pre" == *'"new":[]}' ]] && { _peer_doorbell_dbg "quiet: no new mail for $live_name${loop_flag:+ (stop_hook_active)}"; return 0; }
@@ -11360,7 +11389,7 @@ _peer_doorbell_eval_inner() {
     # holds the name, then check each recipient with the same addressee guard
     # recv applies. A recipient counts only when `recv --as <to>` would return
     # the mail (the address IS its canonical name).
-    local occupant_prev rung_json guard to ok_ids blocked_ids="[]" ring_ids="[]" lines="" n chain_prev=0 chain_new=0
+    local occupant_prev rung_json guard to ok_ids guard_ok_ids blocked_ids="[]" ring_ids="[]" lines="" n chain_prev=0 chain_new=0
     occupant_prev="$(jq -r '.occupant_created // "" | tostring' <<< "$state_raw" 2>/dev/null)" || occupant_prev=""
     chain_prev="$(jq -r '.chain // 0 | tostring' <<< "$state_raw" 2>/dev/null)" || chain_prev=0
     [[ "$chain_prev" =~ ^[0-9]+$ ]] || chain_prev=0
@@ -11373,10 +11402,14 @@ _peer_doorbell_eval_inner() {
     # Plan 111 phase 3: seal + allowlist check of the new ids only (one
     # python3 call; duplicate ids are seen because every line with a new id
     # is passed). warn logs; enforce rings only for bell-eligible ids, and the
-    # rest are recorded like guard-blocked ids (never a slow path again).
-    local bell_ok_ids="" attest_elig attest_bad
+    # rest are recorded like guard-blocked ids (never a slow path again) -
+    # but only ids with a definite verdict: an id the helper could not judge
+    # (python3 missing or timed out: detail verify-failed, or no result at
+    # all) is not recorded, so the next Stop judges it again (phase 4 fix A;
+    # recording it would silence that mail for good while it stays queued).
+    local bell_ok_ids="" attest_elig attest_bad attest_unsure="[]"
     if [[ "$attest_mode" != off ]]; then
-        PEER_ATTEST_MODE="$attest_mode"; PEER_ATTEST_SINCE="$attest_since"
+        PEER_ATTEST_MODE="$attest_mode"; PEER_ATTEST_SINCE="$attest_since"; PEER_ATTEST_ALLOW="$attest_allow"
         attest_elig="$(jq -c --argjson ids "$(jq -c '[.new[].id]' <<< "$pre")" '[.[] | select((.id as $i | $ids | index($i)) != null)]' <<< "$messages_all" 2>/dev/null \
             | _peer_eligibility_list)" || attest_elig=""
         bell_ok_ids="$(jq -c '[.[] | select(.status == "queued" and .e.bell == true) | .id] | unique' <<< "${attest_elig:-null}" 2>/dev/null)" || bell_ok_ids="[]"
@@ -11387,7 +11420,15 @@ _peer_doorbell_eval_inner() {
             _peer_doorbell_dbg "attest ($attest_mode): $(jq -r 'length' <<< "${attest_bad:-[]}" 2>/dev/null || echo "?") new id(s) not bell-eligible${attest_fast:+, not rung}"
             _peer_attest_log bell "$live_name" "$(jq -c '{ineligible: length, messages: .[:20]}' <<< "${attest_bad:-[]}" 2>/dev/null || printf '{"ineligible":"?"}')"
         fi
-        [[ "$attest_mode" == enforce ]] || bell_ok_ids=""
+        if [[ "$attest_mode" == enforce ]]; then
+            attest_unsure="$(jq -c --argjson ids "$(jq -c '[.new[].id]' <<< "$pre")" '
+                . as $l | [$ids[] as $i | select(([$l[] | select(.id == $i and .e.detail != "verify-failed")] | length) == 0) | $i]
+            ' <<< "${attest_elig:-null}" 2>/dev/null)" || attest_unsure=""
+            [[ "$attest_unsure" == "["* ]] || attest_unsure="$(jq -c '[.new[].id]' <<< "$pre")"
+            [[ "$attest_unsure" == "[]" ]] || _peer_doorbell_dbg "attest (enforce): $(jq -r 'length' <<< "$attest_unsure") new id(s) could not be verified (helper failed); not rung, not recorded"
+        else
+            bell_ok_ids=""
+        fi
     fi
     _peer_all_json_cache_begin >/dev/null 2>&1 || true
     for to in $(jq -r '[.new[].to] | unique | .[]' <<< "$pre"); do
@@ -11398,13 +11439,16 @@ _peer_doorbell_eval_inner() {
             ok_ids="$(jq -c --argjson ids "$ids_for" --arg who "$to" --arg peer "${MAILBOX_RESOLVED_PEER_CREATED:-}" --arg provider "${MAILBOX_RESOLVED_PROVIDER_ID:-}" "$guard"'
                 [.[] | select(.to == $who and .status == "queued" and ((.id as $i | $ids | index($i)) != null) and deliverable_provider($peer;$provider)) | .id]
             ' <<< "$messages_all")" || ok_ids="[]"
+            guard_ok_ids="$ok_ids"
             if [[ -n "$bell_ok_ids" ]]; then
                 ok_ids="$(jq -c --argjson e "$bell_ok_ids" '[.[] | select(. as $i | ($e | index($i)) != null)]' <<< "$ok_ids" 2>/dev/null)" || ok_ids="[]"
             fi
         else
-            ok_ids="[]"
+            ok_ids="[]"; guard_ok_ids="[]"
         fi
-        blocked_ids="$(jq -c --argjson all "$ids_for" --argjson ok "$ok_ids" --argjson b "$blocked_ids" '$b + ($all - $ok)' <<< 'null')"
+        # Guard-blocked ids, plus attest-dropped ids with a definite verdict.
+        blocked_ids="$(jq -c --argjson all "$ids_for" --argjson gok "$guard_ok_ids" --argjson ok "$ok_ids" --argjson b "$blocked_ids" \
+            --argjson unsure "${attest_unsure:-[]}" '$b + ($all - $gok) + (($gok - $ok) - $unsure)' <<< 'null')"
         ring_ids="$(jq -c --argjson ok "$ok_ids" --argjson r "$ring_ids" '$r + $ok' <<< 'null')"
         n="$(jq -r 'length' <<< "$ok_ids")"
         if [[ "$n" -gt 0 ]]; then
@@ -11549,9 +11593,12 @@ _peer_cmd_doorbell() {
         enable) _peer_doorbell_enable "$@" ;;
         disable) _peer_doorbell_disable "$@" ;;
         move) _peer_doorbell_move "$@" ;;
+        allow-sender) _peer_doorbell_senders allow "$@" ;;
+        deny-sender) _peer_doorbell_senders deny "$@" ;;
+        reset-senders) _peer_doorbell_senders reset "$@" ;;
         status) _peer_doorbell_status "$@" ;;
         help|-h|--help)
-            echo "Usage: cctrl peer doorbell <status|enable|disable|move>"
+            echo "Usage: cctrl peer doorbell <status|enable|disable|move|allow-sender|deny-sender|reset-senders>"
             echo "  status [--json] [--backlog]   Read-only: enable file, Stop registration, rung state"
             echo "  enable [--peer NAME]... [--role ROLE]... [--blocking|--advisory] [--max-rings-per-hour N]"
             echo "         [--replace] [--keep-baseline] [--dry-run] [--json]"
@@ -11567,6 +11614,17 @@ _peer_cmd_doorbell() {
             echo "  move --from OLD --to NEW [--dry-run] [--json]"
             echo "                                Handover: replace the peers entry OLD with NEW, nothing else."
             echo "                                Refused (65) unless OLD is in peers and NEW is not; never adds a peer."
+            echo "                                A recipients.OLD push allowlist override moves to NEW."
+            echo "  allow-sender (--role ROLE | --peer NAME)... [--for RECIPIENT] [--dry-run] [--json]"
+            echo "  deny-sender  (--role ROLE | --peer NAME)... [--for RECIPIENT] [--dry-run] [--json]"
+            echo "  reset-senders [--for RECIPIENT] [--dry-run] [--json]"
+            echo "                                Plan 111: who may push (and say_peer) into a doorbell recipient."
+            echo "                                push_senders {roles, peers}; unset = roles orchestrator, fleet-manager."
+            echo "                                --for edits recipients.RECIPIENT.push_senders (mail addressed to it)."
+            echo "                                A peer NAME matches the sealed sender name or its session; prefer"
+            echo "                                roles (a name goes stale at handover). Level-session workers always"
+            echo "                                ring the Stop bell. Malformed = matches nothing. Acted on only with"
+            echo "                                attestation enforce; warn (the default) logs and shows it only."
             echo "The bell runs inside 'cctrl hooks run stop'; no settings change is needed or made."
             echo "Debug: touch \$CCTRL_DATA_DIR/doorbell/debug (or CCTRL_DOORBELL_DEBUG=1) -> reasons in doorbell/debug.log." ;;
         *)
@@ -11648,21 +11706,67 @@ def attest_mode: if type == "object" and (.attestation as $a | ["off", "warn", "
     then .attestation else "warn" end;
 def attest_since: if type != "object" then ""
     elif (.attestation_since // null) != null and (.attestation_since | attest_iso_ok | not) then "invalid"
-    else ([.attestation_since, .baseline_at] | map(select(attest_iso_ok)) | max // "") end;'
+    else ([.attestation_since, .baseline_at] | map(select(attest_iso_ok)) | max // "") end;
+# Plan 111 phase 4: the push allowlist. doorbell.json `push_senders: {roles:
+# [...], peers: [...]}` replaces the built-in default (roles orchestrator,
+# fleet-manager); `recipients.<name>.push_senders` overrides it for mail
+# addressed to <name> (the message `to`). Absent or null = not set (built-in
+# default, or the default for an override). A key of any other shape (not an
+# object, a key other than roles/peers, a list item that is not a one-word
+# string) is malformed and matches nothing (fail closed; acted on only in
+# enforce). attest_allow -> {default: A|null, source: builtin|config|malformed,
+# recipients: {name: A|null} | "malformed"}, A = {roles, peers}; this is what
+# lib/peer_seal.py verify --allow takes.
+def attest_builtin_senders: {roles: ["orchestrator", "fleet-manager"], peers: []};
+def attest_word_list: type == "array" and all(.[]; type == "string" and . != "" and (test("\\s") | not));
+def attest_senders_norm: if type == "object" and ((keys - ["roles", "peers"]) | length) == 0
+        and ((.roles // []) | attest_word_list) and ((.peers // []) | attest_word_list)
+    then {roles: (.roles // []), peers: (.peers // [])} else null end;
+def attest_allow: if type != "object" then {default: attest_builtin_senders, source: "builtin", recipients: {}}
+    else ((.push_senders // null) as $p
+      | {default: (if $p == null then attest_builtin_senders else ($p | attest_senders_norm) end),
+         source: (if $p == null then "builtin" elif ($p | attest_senders_norm) == null then "malformed" else "config" end),
+         recipients: ((.recipients // null) as $r
+           | if $r == null then {}
+             elif ($r | type) != "object" then "malformed"
+             else $r | with_entries(select((.value | type) != "object" or (.value.push_senders // null) != null)
+                       | .value = (if (.value | type) != "object" then null else (.value.push_senders | attest_senders_norm) end)) end)})
+    end;
+def attest_senders_for($to): if .recipients == "malformed" then null
+    elif (.recipients | type) == "object" and (.recipients | has($to)) then .recipients[$to]
+    else .default end;
+def attest_sender_ok($s; $from; $session; $role; $kind):
+    ($s | type) == "object"
+    and (($role != "" and (($s.roles | index($role)) != null
+                           or (($s.roles | index("fleet-manager")) != null and $role == "orchestrator" and $kind == "fleet")))
+         or ($from != "" and ($s.peers | index($from)) != null)
+         or ($session != "" and ($s.peers | index($session)) != null));'
 
 # Sets PEER_ATTEST_MODE (off|warn|enforce), PEER_ATTEST_MODE_VALID (true|
-# false), PEER_ATTEST_SINCE (effective: "", ISO UTC or "invalid") and
-# PEER_ATTEST_SINCE_RAW. Optional $1: the doorbell.json document already read.
-# Unreadable config -> warn, which acts on nothing.
+# false), PEER_ATTEST_SINCE (effective: "", ISO UTC or "invalid"),
+# PEER_ATTEST_SINCE_RAW and PEER_ATTEST_ALLOW (phase 4: the resolved push
+# allowlist, attest_allow as compact JSON; "" = the built-in default).
+# Optional $1: the doorbell.json document already read. Unreadable config ->
+# warn, which acts on nothing.
 _peer_attestation_cfg() {
     local cfg="${1:-}" out=""
-    PEER_ATTEST_MODE=warn; PEER_ATTEST_MODE_VALID=true; PEER_ATTEST_SINCE=""; PEER_ATTEST_SINCE_RAW=""
+    PEER_ATTEST_MODE=warn; PEER_ATTEST_MODE_VALID=true; PEER_ATTEST_SINCE=""; PEER_ATTEST_SINCE_RAW=""; PEER_ATTEST_ALLOW=""
     [[ -n "$cfg" ]] || cfg="$(_peer_doorbell_cfg_json 2>/dev/null)" || cfg="null"
     out="$(jq -r "$PEER_ATTEST_CFG_JQ"'
         (attest_mode), (attest_mode_valid | tostring), attest_since,
-        (if type == "object" then (.attestation_since // "" | tostring | gsub("[\n\r]"; " ")) else "" end), "."' <<< "${cfg:-null}" 2>/dev/null)" || return 0
-    { IFS= read -r PEER_ATTEST_MODE; IFS= read -r PEER_ATTEST_MODE_VALID; IFS= read -r PEER_ATTEST_SINCE; IFS= read -r PEER_ATTEST_SINCE_RAW; } <<< "$out"
+        (if type == "object" then (.attestation_since // "" | tostring | gsub("[\n\r]"; " ")) else "" end),
+        (attest_allow | tojson), "."' <<< "${cfg:-null}" 2>/dev/null)" || return 0
+    { IFS= read -r PEER_ATTEST_MODE; IFS= read -r PEER_ATTEST_MODE_VALID; IFS= read -r PEER_ATTEST_SINCE; IFS= read -r PEER_ATTEST_SINCE_RAW; IFS= read -r PEER_ATTEST_ALLOW; } <<< "$out"
     case "$PEER_ATTEST_MODE" in off|warn|enforce) ;; *) PEER_ATTEST_MODE=warn ;; esac
+    [[ "$PEER_ATTEST_ALLOW" == "{"*"}" ]] || PEER_ATTEST_ALLOW=""
+    return 0
+}
+
+# The --eligibility arguments of lib/peer_seal.py verify (PEER_ELIG_ARGS):
+# the effective since and, when one was read, the resolved allowlist.
+_peer_elig_args() {
+    PEER_ELIG_ARGS=(--eligibility "${PEER_ATTEST_SINCE:-}")
+    [[ -n "${PEER_ATTEST_ALLOW:-}" ]] && PEER_ELIG_ARGS+=(--allow "$PEER_ATTEST_ALLOW")
     return 0
 }
 
@@ -11676,7 +11780,9 @@ _peer_eligibility_list() {
     local messages ver host_id=""
     messages="$(cat)"
     host_id="$(_cctrl_host_id_read 2>/dev/null)" || host_id=""
-    ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" --eligibility "${PEER_ATTEST_SINCE:-}" 2>/dev/null)" || ver=""
+    local -a PEER_ELIG_ARGS=()
+    _peer_elig_args
+    ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" "${PEER_ELIG_ARGS[@]}" 2>/dev/null)" || ver=""
     [[ "$ver" == "["* ]] || ver="null"
     { printf '%s\n' "$messages"; printf '%s\n' "$ver"; } | jq -c -s '
         .[0] as $m | .[1] as $v
@@ -11702,7 +11808,23 @@ _peer_attest_log() {
         mkdir -p "$dir" || exit 0
         if [[ -f "$f" ]]; then
             size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
-            [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )) && mv -f "$f" "$f.1"
+            if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )); then
+                # Rotate under a mkdir lock, re-checking the size once held:
+                # concurrent writers that all saw the old size would each
+                # move the log to .1, the later moves clobbering the rotated
+                # file and fresh lines (p3 verify N1). A loser skips the
+                # rotation and just appends; a lock left by a killed writer
+                # is cleared after a minute.
+                local lock="$dir/.attestation.log.rotate"
+                if [[ -d "$lock" ]] && [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+                    rmdir "$lock" 2>/dev/null || true
+                fi
+                if mkdir "$lock" 2>/dev/null; then
+                    size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
+                    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )); then mv -f "$f" "$f.1"; fi
+                    rmdir "$lock" 2>/dev/null || true
+                fi
+            fi
         fi
         printf '%s\n' "$line" >> "$f"
     ) 2>/dev/null || true
@@ -11847,6 +11969,10 @@ _peer_doorbell_enable() {
         # kept as they are (enable never flips or clears them).
         | if ($c | has("attestation")) then .attestation = $c.attestation else . end
         | if ($c | has("attestation_since")) then .attestation_since = $c.attestation_since else . end
+        # Phase 4: the push allowlist and per-recipient overrides are kept
+        # as they are (set with allow-sender / deny-sender / reset-senders).
+        | if ($c | has("push_senders")) then .push_senders = $c.push_senders else . end
+        | if ($c | has("recipients")) then .recipients = $c.recipients else . end
     ')" || return 1
     if ! $dry_run; then
         _peer_doorbell_write_locked "$new" || { $json && _json_error "io" "Could not write $(_peer_doorbell_file)" || echo -e "${RED}Could not write $(_peer_doorbell_file)${RESET}" >&2; return 1; }
@@ -11878,7 +12004,8 @@ _peer_doorbell_move_err() { # json rc message -> prints the error, returns rc
 _peer_doorbell_move() {
     # Handover carries the bell: replace the single `.peers` entry OLD with
     # NEW, in place, and change nothing else (enabled, baseline_at, mode,
-    # roles, the ring cap, unknown keys). It never adds a peer that was not
+    # roles, the ring cap, unknown keys) except a recipients.OLD push
+    # allowlist override, which becomes recipients.NEW (plan 111 phase 4). It never adds a peer that was not
     # already there under another name: OLD must be in .peers, NEW must not
     # be. NEW's ring state starts empty (state is per name); baseline_at still
     # keeps older mail from ringing.
@@ -11906,8 +12033,12 @@ _peer_doorbell_move() {
         else "" end' <<< "$cur")" || err="doorbell.json is unreadable"
     [[ -z "$err" ]] || { _peer_doorbell_move_err "$json" 65 "$err"; return; }
     now="$(_peer_now_utc)"
+    # Plan 111 phase 4: a per-recipient push allowlist override keyed by OLD
+    # moves with it (unless NEW already has one, which is kept).
     new="$(jq -c --arg old "$from" --arg new "$to" --arg now "$now" \
-        '.peers |= map(if . == $old then $new else . end) | .updated_at = $now' <<< "$cur")" || return 1
+        '.peers |= map(if . == $old then $new else . end) | .updated_at = $now
+         | if (.recipients | type) == "object" and (.recipients | has($old)) and (.recipients | has($new) | not)
+           then .recipients |= (.[$new] = .[$old] | del(.[$old])) else . end' <<< "$cur")" || return 1
     if ! $dry_run; then
         _peer_doorbell_write_locked "$new" || { _peer_doorbell_move_err "$json" 1 "Could not write $(_peer_doorbell_file)"; return; }
     fi
@@ -11918,6 +12049,116 @@ _peer_doorbell_move() {
         $dry_run && echo "Dry run: would move doorbell peer $from -> $to in $(_peer_doorbell_file):" || echo "Moved doorbell peer $from -> $to in $(_peer_doorbell_file):"
         jq '.' <<< "$new"
         [[ "$(jq -r '.enabled == true' <<< "$new")" == true ]] || echo -e "${YELLOW}The bell is disabled; the move takes effect when it is enabled again.${RESET}"
+    fi
+}
+
+# Plan 111 phase 4: edit the push allowlist. allow-sender / deny-sender add or
+# remove --role / --peer entries in doorbell.json push_senders, or with --for
+# NAME in recipients.NAME.push_senders (the override for mail addressed to
+# NAME). The starting list is the one in effect: an absent push_senders starts
+# from the built-in default, an absent override from the default in effect.
+# reset-senders removes the key (back to the built-in default, or for --for
+# back to the default). A malformed key is refused until reset. Written with
+# the atomic 0600 writer; nothing else in the file changes. The allowlist is
+# acted on only with attestation enforce; in warn it is logged and shown.
+_peer_doorbell_senders() { # allow|deny|reset args...
+    local action="$1" json=false dry_run=false for="" roles="[]" peers="[]" cur new now res err usage
+    shift
+    _arg_has_json "$@" && json=true
+    case "$action" in
+        allow) usage="Usage: cctrl peer doorbell allow-sender (--role ROLE | --peer NAME)... [--for RECIPIENT] [--dry-run] [--json]" ;;
+        deny) usage="Usage: cctrl peer doorbell deny-sender (--role ROLE | --peer NAME)... [--for RECIPIENT] [--dry-run] [--json]" ;;
+        *) usage="Usage: cctrl peer doorbell reset-senders [--for RECIPIENT] [--dry-run] [--json]" ;;
+    esac
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --role)
+                [[ "$action" != reset ]] || { _peer_doorbell_move_err "$json" 64 "$usage"; return; }
+                [[ $# -ge 2 ]] || { _peer_doorbell_move_err "$json" 64 "--role needs a value"; return; }
+                _peer_doorbell_is_role "$2" || { _peer_doorbell_move_err "$json" 64 "Unknown role: $2 (orchestrator, worker, fleet-manager)"; return; }
+                roles="$(jq -c --arg r "$2" '. + [$r]' <<< "$roles")"; shift 2 ;;
+            --peer|--for)
+                [[ "$1" == --for || "$action" != reset ]] || { _peer_doorbell_move_err "$json" 64 "$usage"; return; }
+                [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { _peer_doorbell_move_err "$json" 64 "$1 needs a valid peer name"; return; }
+                ! _peer_doorbell_is_role "$2" || { _peer_doorbell_move_err "$json" 64 "$1 $2 is a role name, not a peer name (use --role)"; return; }
+                if [[ "$1" == --for ]]; then for="$2"; else peers="$(jq -c --arg p "$2" '. + [$p]' <<< "$peers")"; fi
+                shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            --json) json=true; shift ;;
+            *) _peer_doorbell_move_err "$json" 64 "Unknown peer doorbell $([[ "$action" == reset ]] && echo reset-senders || echo "$action-sender") flag: $1"; return ;;
+        esac
+    done
+    if [[ "$action" != reset && "$roles" == "[]" && "$peers" == "[]" ]]; then
+        _peer_doorbell_move_err "$json" 64 "$usage"; return
+    fi
+    cur="$(_peer_doorbell_cfg_json)"
+    [[ "$cur" != "null" ]] || { _peer_doorbell_move_err "$json" 65 "Doorbell not configured (no $(_peer_doorbell_file)): run cctrl peer doorbell enable first"; return; }
+    now="$(_peer_now_utc)"
+    res="$(jq -c --arg action "$action" --arg for "$for" --argjson roles "$roles" --argjson peers "$peers" --arg now "$now" "$PEER_ATTEST_CFG_JQ"'
+        . as $c | ($c | attest_allow) as $a
+        | (if $for == "" then "push_senders" else "recipients.\($for).push_senders" end) as $key
+        | if $action == "reset" and $for != "" and has("recipients") and .recipients != null and (.recipients | type) != "object" then
+            {err: "doorbell.json .recipients is not an object (every recipient matches nothing): fix it by hand"}
+          elif $action == "reset" then
+            {cfg: ((if $for == "" then del(.push_senders)
+                   elif (.recipients | type) == "object" and ((.recipients[$for] | type) == "object") then
+                     (.recipients[$for] |= del(.push_senders))
+                     | (if (.recipients[$for] | length) == 0 then .recipients |= del(.[$for]) else . end)
+                     | (if (.recipients | length) == 0 then del(.recipients) else . end)
+                   elif (.recipients | type) == "object" and (.recipients | has($for)) then .recipients |= del(.[$for])
+                   else . end) | .updated_at = $now),
+             key: $key}
+          else
+            (if $for == "" then {base: $a.default, bad: ($a.source == "malformed")}
+             elif $a.recipients == "malformed" then {base: null, bad: true, hand: true, why: "doorbell.json .recipients is not an object (every recipient matches nothing)"}
+             elif ($a.recipients | has($for)) then {base: $a.recipients[$for], bad: ($a.recipients[$for] == null)}
+             elif $a.default == null then {base: null, bad: true, why: "doorbell.json push_senders is malformed (the default an override starts from)", fix: ""}
+             else {base: $a.default, bad: false} end) as $b
+            | if $b.bad and $b.hand == true then {err: ($b.why + ": fix it by hand")}
+              elif $b.bad then {err: (($b.why // "doorbell.json \($key) is malformed (it matches nothing)") + ": fix it by hand or run cctrl peer doorbell reset-senders"
+                                    + (($b.fix // $for) | if . == "" then "" else " --for \(.)" end))}
+              else
+                (if $action == "allow" then {roles: (($b.base.roles + $roles) | unique), peers: (($b.base.peers + $peers) | unique)}
+                 else {roles: ($b.base.roles - $roles), peers: ($b.base.peers - $peers)} end) as $list
+                | {cfg: ((if $for == "" then .push_senders = $list
+                          else .recipients = ((if (.recipients | type) == "object" then .recipients else {} end)
+                                              | .[$for] = ((if (.[$for] | type) == "object" then .[$for] else {} end) + {push_senders: $list})) end)
+                         | .updated_at = $now),
+                   key: $key, list: $list,
+                   unchanged: [($roles - $b.base.roles | if $action == "deny" then . else [] end)[], ($peers - $b.base.peers | if $action == "deny" then . else [] end)[]]}
+              end
+          end' <<< "$cur" 2>/dev/null)" || res=""
+    [[ -n "$res" ]] || { _peer_doorbell_move_err "$json" 65 "doorbell.json is unreadable"; return; }
+    err="$(jq -r '.err // empty' <<< "$res")"
+    [[ -z "$err" ]] || { _peer_doorbell_move_err "$json" 65 "$err"; return; }
+    new="$(jq -c '.cfg' <<< "$res")"
+    if ! $dry_run; then
+        _peer_doorbell_write_locked "$new" || { _peer_doorbell_move_err "$json" 1 "Could not write $(_peer_doorbell_file)"; return; }
+    fi
+    _peer_attestation_cfg "$new"
+    if $json; then
+        jq -n --arg path "$(_peer_doorbell_file)" --argjson dry "$(_peer_json_bool "$dry_run")" --arg action "$action" --arg for "$for" \
+            --argjson res "$res" --arg mode "$PEER_ATTEST_MODE" --argjson cfg "$new" "$PEER_ATTEST_CFG_JQ"'
+            {path: $path, dry_run: $dry, written: ($dry | not), action: $action, recipient: (if $for == "" then null else $for end),
+             key: $res.key, push_senders: ($cfg | attest_allow | if $for == "" then .default else attest_senders_for($for) end),
+             not_present: ($res.unchanged // []), attestation: $mode, config: $cfg}'
+    else
+        local scope="the default push allowlist"
+        [[ -n "$for" ]] && scope="the push allowlist for $for"
+        if [[ "$action" == reset ]]; then
+            $dry_run && echo "Dry run: would reset $scope in $(_peer_doorbell_file)." || echo "Reset $scope in $(_peer_doorbell_file)."
+        else
+            $dry_run && echo "Dry run: would write $scope in $(_peer_doorbell_file):" || echo "Wrote $scope in $(_peer_doorbell_file):"
+        fi
+        jq -r --arg for "$for" "$PEER_ATTEST_CFG_JQ"'
+            attest_allow | (if $for == "" then .default else attest_senders_for($for) end) as $s
+            | "  now in effect\(if $for == "" then "" else " for \($for)" end): "
+              + (if $s == null then "MALFORMED (matches nothing)"
+                 else "roles \($s.roles | if length == 0 then "(none)" else join(", ") end); peers \($s.peers | if length == 0 then "(none)" else join(", ") end)" end)' <<< "$new"
+        jq -r '(.unchanged // [])[] | "  note: \(.) was not in the list"' <<< "$res"
+        if [[ "$PEER_ATTEST_MODE" != enforce ]]; then
+            echo "  attestation is $PEER_ATTEST_MODE: the allowlist is $([[ "$PEER_ATTEST_MODE" == off ]] && echo "not used" || echo "logged and shown only"); delivery is unchanged."
+        fi
     fi
 }
 
@@ -11972,8 +12213,17 @@ _peer_doorbell_status() {
     local out
     out="$(jq -n --arg path "$(_peer_doorbell_file)" --argjson cfg "$cfg" --argjson reg "$(_peer_json_bool "$reg_ok")" \
         --arg reason "$reg_reason" --arg settings "${CCTRL_CLAUDE_SETTINGS:-$SETTINGS}" --argjson states "$states" --argjson backlog "$backlog_json" \
-        "$DOORBELL_MAX_RINGS_JQ"'
+        "$DOORBELL_MAX_RINGS_JQ$PEER_ATTEST_CFG_JQ"'
         { path: $path, configured: ($cfg != null), enabled: (($cfg // {}).enabled == true), config: $cfg,
+          # Plan 111 phase 4: the push allowlist in effect (who may push and
+          # say_peer into a recipient; acted on only with attestation enforce).
+          attestation: ($cfg | attest_mode),
+          push_senders: (if $cfg == null then null
+                         else ($cfg | attest_allow) as $a
+                         | { default: ($a.default + {source: $a.source}),
+                             recipients: (if $a.recipients == "malformed" then "malformed"
+                                          else ($a.recipients | with_entries(.value = (if .value == null then {source: "malformed"} else .value + {source: "override"} end))) end),
+                             bell_only_roles: ["worker"] } end),
           ring_cap: (if $cfg == null then null
                      else ($cfg | max_rings) as $m
                      | { max_rings_per_hour: (if $m == "invalid" then null else $m end),
@@ -11991,6 +12241,15 @@ _peer_doorbell_status() {
             "Doorbell: \(if .enabled then "ENABLED" elif .configured then "disabled" else "not configured" end) (\(.path))",
             (if .config then "  baseline_at: \(.config.baseline_at)  mode: \(.config.mode)\n  peers: \(.config.peers | join(", "))\n  roles: \(.config.roles | join(", "))" else empty end),
             (if .ring_cap then "  ring cap: \(if .ring_cap.valid then "\(.ring_cap.max_rings_per_hour)/hour per recipient (\(.ring_cap.source))" else "INVALID max_rings_per_hour \(.config.max_rings_per_hour | tojson): the bell never rings (want an integer 1..1000000)" end)" else empty end),
+            (if .push_senders then
+               def senders: if .source == "malformed" then "MALFORMED (matches nothing)"
+                   else "roles \(.roles | if length == 0 then "(none)" else join(", ") end); peers \(.peers | if length == 0 then "(none)" else join(", ") end)" end;
+               "  attestation: \(.attestation)\(if .attestation == "enforce" then " (gating on)" elif .attestation == "warn" then " (allowlist logged and shown only; delivery unchanged)" else " (allowlist not used)" end)",
+               "  push senders: \(.push_senders.default | senders) (\(.push_senders.default.source | if . == "builtin" then "built-in default" elif . == "config" then "push_senders" else "push_senders" end))",
+               (if .push_senders.recipients == "malformed" then "  push senders per recipient: MALFORMED recipients (every recipient matches nothing)"
+                else (.push_senders.recipients | to_entries[] | "  push senders for \(.key): \(.value | senders) (override)") end),
+               "  Stop bell also rings for: level-session workers (built-in)"
+             else empty end),
             "Stop hook (cctrl hooks run stop): \(if .stop_registered then "registered" else "NOT registered - \(.stop_registered_reason); remedy: cctrl hooks install" end)",
             (.ring_cap.max_rings_per_hour as $m | .state | to_entries[] | "  rung state \(.key): \(.value.rung) id(s), \(.value.rings_last_hour) ring(s) in the last hour (bell and pushes)\(if $m != null and .value.rings_last_hour >= $m then " (AT CAP: mail stays queued)" else "" end)"),
             (if .backlog then "Queued backlog (by recipient):", (.backlog[] | "  \(.queued)\t\(.to)\t\(if .known then "known" else "gone" end)\toldest \(.oldest)") else empty end)
@@ -12189,8 +12448,16 @@ _peer_doctor_eligibility_check() {
     [[ "$log_lines" =~ ^[0-9]+$ ]] || log_lines=0
     jq -cn --argjson l "${list:-null}" --arg mode "$PEER_ATTEST_MODE" --arg valid "$PEER_ATTEST_MODE_VALID" \
         --arg since "$PEER_ATTEST_SINCE" --arg raw "$PEER_ATTEST_SINCE_RAW" --argjson log "$log_lines" \
-        --argjson cfg "${cfg:-null}" '
-        if ($l | type) != "array" then {name: "sender_eligibility", ok: true, mode: $mode, summary: "eligibility check unavailable (informational)"}
+        --argjson cfg "${cfg:-null}" --argjson allow "${PEER_ATTEST_ALLOW:-null}" '
+        # Plan 111 phase 4: which push allowlist is in effect.
+        (if $allow == null then {default: {roles: ["orchestrator", "fleet-manager"], peers: []}, source: "builtin", recipients: {}} else $allow end) as $al
+        | (($al.source | if . == "builtin" then "push senders: built-in default (orchestrator, fleet-manager)"
+               elif . == "config" then "push senders: push_senders (roles \($al.default.roles | join(",") | if . == "" then "none" else . end); peers \($al.default.peers | join(",") | if . == "" then "none" else . end))"
+               else "push senders: push_senders MALFORMED (matches nothing)" end)
+           + (if $al.recipients == "malformed" then "; recipients MALFORMED (every recipient matches nothing)"
+              elif ($al.recipients | length) > 0 then "; per-recipient overrides: " + ($al.recipients | to_entries | map(.key + (if .value == null then " MALFORMED" else "" end)) | join(", "))
+              else "" end)) as $allow_text
+        | if ($l | type) != "array" then {name: "sender_eligibility", ok: true, mode: $mode, summary: "eligibility check unavailable (informational)"}
         else
           ([$l[] | select(.e.push == true)] | length) as $push
           | ([$l[] | select(.e.push != true and .e.bell == true)] | length) as $bell
@@ -12202,9 +12469,11 @@ _peer_doctor_eligibility_check() {
              attestation_since: (if $raw == "" then null else $raw end), effective_since: (if $since == "" then null else $since end),
              window_days: 7, total: ($l | length), push_eligible: $push, bell_only: $bell, not_eligible: $none,
              would_block_senders: $blocked, log_lines: $log,
+             push_senders: {source: $al.source, default: $al.default, recipients: $al.recipients},
              summary: ("mode " + (if $valid == "true" then $mode else "INVALID \(($cfg // {}).attestation | tojson) (reads warn)" end)
                + (if $mode == "enforce" then " (gating on)" elif $mode == "warn" then " (logs only, delivery unchanged)" else " (no eligibility logging)" end)
                + (if $since == "invalid" then "; attestation_since INVALID \($raw | tojson): nothing is eligible" elif $raw != "" then "; attestation_since \($raw)" else "" end)
+               + "; " + $allow_text
                + "; last 7 days: \($l | length) message(s), push-eligible \($push), bell-only \($bell), neither \($none)"
                + (if ($blocked | length) == 0 then "; would-be-blocked senders: none"
                   else "; would-be-blocked senders: " + ($blocked[:10] | map("\(.from) \(.count) (" + (.details | to_entries | map("\(.key) \(.value)") | join(", ")) + ")") | join("; "))
@@ -12237,7 +12506,8 @@ _peer_cmd_doctor() {
                 echo "  doorbell.json (off | warn | enforce; absent = warn, which only logs), and"
                 echo "  over the last 7 days how much mail could push, ring only the Stop bell, or"
                 echo "  neither, with the senders enforce would block (data/doorbell/attestation.log"
-                echo "  holds the logged decisions)."
+                echo "  holds the logged decisions), and the push allowlist in effect (push_senders,"
+                echo "  per-recipient overrides; see cctrl peer doorbell allow-sender)."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;
