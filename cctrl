@@ -11237,10 +11237,10 @@ _peer_doorbell_eval_inner() {
                # enforce fast path the union of every allowlist in the file
                # plus the bell-only worker role (a superset: the slow path
                # decides per recipient).
-               ($c | attest_allow | tojson),
-               ($c | attest_allow | [.default, (.recipients | if type == "object" then .[] else empty end)]
+               (try ($c | attest_allow | tojson) catch ""),
+               (try ($c | attest_allow | [.default, (.recipients | if type == "object" then .[] else empty end)]
                    | map(select(type == "object"))
-                   | {roles: ((map(.roles[]) + ["worker"]) | unique), peers: (map(.peers[]) | unique)} | tojson),
+                   | {roles: ((map(.roles[]) + ["worker"]) | unique), peers: (map(.peers[]) | unique)} | tojson) catch ""),
                "."
           end
     ' <<< "$input")" || return 0
@@ -11755,7 +11755,7 @@ _peer_attestation_cfg() {
     out="$(jq -r "$PEER_ATTEST_CFG_JQ"'
         (attest_mode), (attest_mode_valid | tostring), attest_since,
         (if type == "object" then (.attestation_since // "" | tostring | gsub("[\n\r]"; " ")) else "" end),
-        (attest_allow | tojson), "."' <<< "${cfg:-null}" 2>/dev/null)" || return 0
+        (try (attest_allow | tojson) catch ""), "."' <<< "${cfg:-null}" 2>/dev/null)" || return 0
     { IFS= read -r PEER_ATTEST_MODE; IFS= read -r PEER_ATTEST_MODE_VALID; IFS= read -r PEER_ATTEST_SINCE; IFS= read -r PEER_ATTEST_SINCE_RAW; IFS= read -r PEER_ATTEST_ALLOW; } <<< "$out"
     case "$PEER_ATTEST_MODE" in off|warn|enforce) ;; *) PEER_ATTEST_MODE=warn ;; esac
     [[ "$PEER_ATTEST_ALLOW" == "{"*"}" ]] || PEER_ATTEST_ALLOW=""
