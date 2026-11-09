@@ -381,6 +381,9 @@ Phase status:
 - PUSHED and INSTALLED on both Macs (2026-11-09, warn): phases 1-3 and the
   phase 3 gate fix, at 33f8e6f (phase 3 180c9f3 + cd73455, gate fix
   33f8e6f). Live mode warn; nothing acts.
+- PUSHED, not installed (2026-11-09): phase 4 at de08905 (verify PASS,
+  orch-cctrl-reports/plan-111-p4-verify.md; must-fix M1 gated the enforce
+  flip and is fixed in phase 5).
 - Phase 1: built 2026-11-07 on branch feat/peer-attest-p1 (warn only). `_peer_caller_attest` stamps `attest` v1 on every
   sent message; `peer doctor` shows `sender_attest`. Build choices: attest
   adds `detail` (why a level is not session: no-pane, ps-failed,
@@ -457,6 +460,36 @@ Phase status:
   start/alarm timestamps, bound honoured, FIFO proof by call counts), C
   (attestation.log rotation under a mkdir lock with a re-check). Report:
   orch-cctrl-reports/plan-111-p4-impl.md.
+- Phase 5: built 2026-11-09 on branch feat/peer-attest-p5 from de08905 (not
+  pushed, not installed; live mode stays warn). In enforce only, `peer send`
+  claiming a local tmux-bound name at attest level none is refused rc 66
+  `sender-unresolved` (logged, path `send`). Tmux-bound: the resolved sender
+  peer has a session (tmux_target or session), no Codex app thread and a
+  local host. Never refused: `--impersonate`, `user`, mailbox-only and
+  unresolved `--allow-unknown` names, and any level other than none
+  (session; remote, which phase 1 already stamps for an SSH arrival naming
+  a peer of the other host; app-claimed). CCTRL_ORIGIN_ATTEST is never read
+  (phase 6). off and warn: no refusal, no output; the doorbell config is
+  read only when the rest of the rule holds. Build choices, left open on
+  purpose (recorded, not refused): (1) a tmux-bound name claimed with
+  CODEX_THREAD_ID set and no pane is level app-claimed, not none, so it
+  queues (never eligible); decide at the flip whether app-claimed on a
+  tmux-bound name should refuse too. (2) No origin-side enforce refusal
+  before the SSH hop (`send --deliver` to a remote peer): the receiver
+  stores level remote, which phase 6 covers with the origin claims. (3) A
+  transient ps/tmux failure in a genuine pane reads level none and is
+  refused in enforce (fail closed, as the plan's section 7). Carried fixes:
+  M1 (p4 verify: an unreadable key, eligibility detail `key-unavailable`,
+  read-time reason still seal-mismatch; or an unreadable host-id,
+  `no-host-id`, is no verdict in the enforce bell: never recorded blocked);
+  N1 (gate tests: 3 s bounds); N2 (attestation.log: rename to a private name,
+  then move to .1 only if still over 1 MiB, so a double lock holder cannot
+  clobber .1); N3 (`false` push_senders/recipients read malformed); N5
+  (`doorbell move` merges an identical override, refuses a different one;
+  `--for` was already format-checked); N6 (`reset-senders` removes a
+  non-object `recipients`). N4 left as is (fails closed, no trigger found).
+  Replay: see Decisions (archive id check). Report:
+  orch-cctrl-reports/plan-111-p5-impl.md.
 
 - Phase 3 ships alone: it carries the built-in default allowlist (section 4),
   so it needs nothing from phase 4. Phase 4 only makes it configurable.
@@ -585,6 +618,15 @@ the default tmux server, ~/.claude or the real ~/.local/state. Both bash legs
 - Leave native SendMessage, `whois` and the native log unchanged.
 - Ship order with plan 112: 111 phases 1-2 first, then rebase 112.
 - Rewrite plan 111 in place (id 111 kept).
+- Replay of archived mail (p3 verify ruling 2), decided in phase 5: in
+  enforce, eligibility also rejects a queued line whose id is already in
+  messages-archive.jsonl (`peer gc` archives, never prunes), as
+  `duplicate-id`; an unreadable archive fails closed. A grep -F prefilter on
+  the candidate ids keeps it cheap; off and warn read no archive. No sealed
+  age bound: the archive check covers every replay of archived mail, and a
+  replay of mail still in messages.jsonl is already a duplicate id. Residual:
+  a same-uid writer that also edits the archive, inside the documented
+  same-uid limit (Risks).
 
 ### MATTHEW (pending)
 
@@ -654,6 +696,9 @@ the default tmux server, ~/.claude or the real ~/.local/state. Both bash legs
 - Version skew between hosts: handled by the env channel in phase 6 and its
   old-receiver test.
 - Codex app peers stay weak until Codex exposes a verifiable caller.
+- Replay: a verbatim replay is rejected by id against messages.jsonl and
+  messages-archive.jsonl (phase 5). Deleting or editing the archive is a
+  same-uid action, like reading the key.
 - Plan 112 collision on peer arg parsing: handled by the ship order above;
   rebase 112 after phase 2 rather than merging the plans.
 - A future sync of data/ or ~/.local/state would change the threat model

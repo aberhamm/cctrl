@@ -7765,9 +7765,10 @@ _peer_sender_binding_mismatch() {
 # (null for none), the pane facts, host_id, role and orch_kind from the
 # sender's session record, a `detail` token saying why a level is not session,
 # and walk_077 (agree | disagree | skipped) against the plan-077 result.
-# Warn only: the stamp is recorded and counted by `peer doctor`; nothing is
+# off/warn: the stamp is recorded and counted by `peer doctor`; nothing is
 # refused on it. Fail open: any unreadable input gives level none and the send
-# still queues. A same-uid misuse barrier, not authentication.
+# still queues. enforce (phase 5): level none on a local tmux-bound name is
+# refused (_peer_send_enforce_refuses). A same-uid misuse barrier, not authentication.
 #   $1 from  $2 from peer json  $3 impersonate  $4 --sender-host
 #   $5 077 caller session  $6 077 ran (true when $TMUX was set)
 # Plan 111 phase 2: per-host HMAC seal. lib/peer_seal.py reads the key file
@@ -7823,7 +7824,13 @@ _peer_verify_annotate() {
     # warn `verification` is exactly as in phase 2.
     _peer_attestation_cfg
     local -a PEER_ELIG_ARGS=()
-    if [[ "$PEER_ATTEST_MODE" != off ]]; then _peer_elig_args; elig=("${PEER_ELIG_ARGS[@]}"); fi
+    if [[ "$PEER_ATTEST_MODE" != off ]]; then
+        _peer_elig_args
+        # An unreadable archive only loses the replay check here: the
+        # listing is shown either way; the gates fail closed on their own.
+        _peer_elig_seen_args "$messages" || true
+        elig=("${PEER_ELIG_ARGS[@]}")
+    fi
     ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" ${elig[@]+"${elig[@]}"} 2>/dev/null)" || ver=""
     [[ "$ver" == "["* ]] || ver="null"
     local out=""
@@ -7979,6 +7986,36 @@ _peer_caller_attest() {
          pane_pid: ($pane_pid | n), pane_started: ($pane_started | n), host_id: ($host_id | n),
          role: ($role | n), orch_kind: ($orch_kind | n), detail: ($detail | n), walk_077: $walk_077}
         + (if $origin_host != "" then {origin_host: $origin_host} else {} end)' 2>/dev/null)" || PEER_ATTEST_JSON=""
+    return 0
+}
+
+# Plan 111 phase 5: 0 (refuse) when attestation is enforce and the send
+# claims a local tmux-bound name at attest level none. Tmux-bound: the
+# resolved sender peer has a session (tmux_target // session), no Codex app
+# thread (those bind by thread, plan 077) and a local host (as the remote
+# level's rule in _peer_caller_attest). Never refused: `user`, mailbox-only
+# and unresolved (--allow-unknown) names, --impersonate (level impersonated),
+# and every level other than none (session; remote: a genuine SSH arrival
+# names a peer that is not local; app-claimed). The doorbell config is read
+# only once the rest holds, so off and warn cost nothing new on a normal
+# send. Sets PEER_SEND_REFUSE_DETAIL (the attest detail) on refusal.
+#   $1 from  $2 from peer json  $3 impersonate  $4 attest json  $5 recipient
+_peer_send_enforce_refuses() {
+    local from="$1" peer_json="$2" impersonate="$3" attest="$4" to="${5:-}" bound mode
+    PEER_SEND_REFUSE_DETAIL=""
+    [[ "$impersonate" != "true" && "$from" != "user" && -n "$peer_json" ]] || return 1
+    [[ "$(jq -r '.level // "none"' <<< "$attest" 2>/dev/null)" == "none" ]] || return 1
+    bound="$(jq -r --arg local "${CCTRL_HOST_PREFIX:-local}" '
+        ((.tmux_target // .session // "") | tostring) != ""
+        and ((.provider_task_id // "") | tostring) == ""
+        and ((.host // "") as $h | $h == "" or $h == "local" or $h == $local)' <<< "$peer_json" 2>/dev/null)" || bound=false
+    [[ "$bound" == "true" ]] || return 1
+    mode="$(_peer_attestation_cfg >/dev/null 2>&1; printf '%s' "${PEER_ATTEST_MODE:-warn}")"
+    [[ "$mode" == "enforce" ]] || return 1
+    PEER_SEND_REFUSE_DETAIL="$(jq -r '.detail // "none"' <<< "$attest" 2>/dev/null)" || PEER_SEND_REFUSE_DETAIL=""
+    [[ -n "$PEER_SEND_REFUSE_DETAIL" ]] || PEER_SEND_REFUSE_DETAIL=none
+    PEER_ATTEST_MODE=enforce _peer_attest_log send "$to" \
+        "$(jq -cn --arg from "$from" --arg d "$PEER_SEND_REFUSE_DETAIL" '{outcome: "sender-unresolved", from: $from, level: "none", detail: $d}')"
     return 0
 }
 
@@ -8240,12 +8277,27 @@ _peer_cmd_send_impl() {
     fi
 
     # Plan 111 phase 1: stamp the process-tree attest next to the 077 result.
-    # Warn only: it refuses nothing and changes no delivery; fail open.
+    # off/warn: it refuses nothing and changes no delivery; fail open.
     local attest_json="" ran_077=false
     [[ -n "${TMUX:-}" ]] && ran_077=true
     _peer_caller_attest "$from" "$from_peer_json" "$impersonate" "$sender_host_override" "$caller_tmux_session" "$ran_077" || true
     attest_json="${PEER_ATTEST_JSON:-}"
     [[ -n "$attest_json" ]] || attest_json='{"v":1,"level":"none","method":null,"detail":"attest-failed","walk_077":"skipped"}'
+
+    # Plan 111 phase 5, enforce only: a local tmux-bound name claimed at
+    # level none (no pane of that session found in this process's ancestry)
+    # is refused rc 66 sender-unresolved, whether or not CCTRL_ORIGIN_ATTEST
+    # is set (never read here). off and warn: nothing new (no refusal, no
+    # output; the mode is read only in this case).
+    if _peer_send_enforce_refuses "$from" "$from_peer_json" "$impersonate" "$attest_json" "$to"; then
+        if $json; then
+            _json_error "sender-unresolved" "Cannot attest your session to send as '$from' (attestation enforce: $PEER_SEND_REFUSE_DETAIL); send from inside that session's tmux pane, run 'cctrl peer doctor' to diagnose, or pass --impersonate."
+        else
+            echo -e "${RED}Cannot attest your session to send as '$from' (attestation enforce: $PEER_SEND_REFUSE_DETAIL).${RESET}" >&2
+            echo -e "${DIM}Send from inside that session's tmux pane, run 'cctrl peer doctor' to diagnose, or pass --impersonate to send as another identity on purpose.${RESET}" >&2
+        fi
+        return 66
+    fi
 
     # Durable sender snapshot (plan 023): capture who sent this at send time so a
     # receiver keeps unambiguous identity even after the sender's ephemeral tmux
@@ -11463,8 +11515,10 @@ _peer_doorbell_eval_inner() {
     # rest are recorded like guard-blocked ids (never a slow path again) -
     # but only ids with a definite verdict: an id the helper could not judge
     # (python3 missing or timed out: detail verify-failed, or no result at
-    # all) is not recorded, so the next Stop judges it again (phase 4 fix A;
-    # recording it would silence that mail for good while it stays queued).
+    # all; the seal key unreadable: key-unavailable; this host's host-id
+    # unreadable: no-host-id) is not recorded, so the next Stop judges it
+    # again (phase 4 fix A, phase 5 M1; recording it would silence that mail
+    # for good while it stays queued).
     local bell_ok_ids="" attest_elig attest_bad attest_unsure="[]"
     if [[ "$attest_mode" != off ]]; then
         PEER_ATTEST_MODE="$attest_mode"; PEER_ATTEST_SINCE="$attest_since"; PEER_ATTEST_ALLOW="$attest_allow"
@@ -11480,10 +11534,10 @@ _peer_doorbell_eval_inner() {
         fi
         if [[ "$attest_mode" == enforce ]]; then
             attest_unsure="$(jq -c --argjson ids "$(jq -c '[.new[].id]' <<< "$pre")" '
-                . as $l | [$ids[] as $i | select(([$l[] | select(.id == $i and .e.detail != "verify-failed")] | length) == 0) | $i]
+                . as $l | [$ids[] as $i | select(([$l[] | select(.id == $i and (.e.detail as $d | (["verify-failed", "key-unavailable", "no-host-id"] | index($d)) == null))] | length) == 0) | $i]
             ' <<< "${attest_elig:-null}" 2>/dev/null)" || attest_unsure=""
             [[ "$attest_unsure" == "["* ]] || attest_unsure="$(jq -c '[.new[].id]' <<< "$pre")"
-            [[ "$attest_unsure" == "[]" ]] || _peer_doorbell_dbg "attest (enforce): $(jq -r 'length' <<< "$attest_unsure") new id(s) could not be verified (helper failed); not rung, not recorded"
+            [[ "$attest_unsure" == "[]" ]] || _peer_doorbell_dbg "attest (enforce): $(jq -r 'length' <<< "$attest_unsure") new id(s) could not be verified (helper, key or host-id unavailable); not rung, not recorded"
         else
             bell_ok_ids=""
         fi
@@ -11769,7 +11823,8 @@ def attest_since: if type != "object" then ""
 # [...], peers: [...]}` replaces the built-in default (roles orchestrator,
 # fleet-manager); `recipients.<name>.push_senders` overrides it for mail
 # addressed to <name> (the message `to`). Absent or null = not set (built-in
-# default, or the default for an override). A key of any other shape (not an
+# default, or the default for an override); `false` is not null (phase 5, p4
+# verify N3: jq `//` used to read it as unset). A key of any other shape (not an
 # object, a key other than roles/peers, a list item that is not a one-word
 # string) is malformed and matches nothing (fail closed; acted on only in
 # enforce). attest_allow -> {default: A|null, source: builtin|config|malformed,
@@ -11777,17 +11832,18 @@ def attest_since: if type != "object" then ""
 # lib/peer_seal.py verify --allow takes.
 def attest_builtin_senders: {roles: ["orchestrator", "fleet-manager"], peers: []};
 def attest_word_list: type == "array" and all(.[]; type == "string" and . != "" and (test("\\s") | not));
+def attest_nn: if . == null then [] else . end;
 def attest_senders_norm: if type == "object" and ((keys - ["roles", "peers"]) | length) == 0
-        and ((.roles // []) | attest_word_list) and ((.peers // []) | attest_word_list)
-    then {roles: (.roles // []), peers: (.peers // [])} else null end;
+        and ((.roles | attest_nn) | attest_word_list) and ((.peers | attest_nn) | attest_word_list)
+    then {roles: (.roles | attest_nn), peers: (.peers | attest_nn)} else null end;
 def attest_allow: if type != "object" then {default: attest_builtin_senders, source: "builtin", recipients: {}}
-    else ((.push_senders // null) as $p
+    else (.push_senders as $p
       | {default: (if $p == null then attest_builtin_senders else ($p | attest_senders_norm) end),
          source: (if $p == null then "builtin" elif ($p | attest_senders_norm) == null then "malformed" else "config" end),
-         recipients: ((.recipients // null) as $r
+         recipients: (.recipients as $r
            | if $r == null then {}
              elif ($r | type) != "object" then "malformed"
-             else $r | with_entries(select((.value | type) != "object" or (.value.push_senders // null) != null)
+             else $r | with_entries(select((.value | type) != "object" or .value.push_senders != null)
                        | .value = (if (.value | type) != "object" then null else (.value.push_senders | attest_senders_norm) end)) end)})
     end;
 def attest_senders_for($to): if .recipients == "malformed" then null
@@ -11828,6 +11884,32 @@ _peer_elig_args() {
     return 0
 }
 
+# Plan 111 phase 5 (replay, p3 verify ruling 2): in enforce, the ids of the
+# given messages (a JSON array, $1) that are already in
+# messages-archive.jsonl are appended to PEER_ELIG_ARGS as `--seen <ids>`: a
+# queued line with an archived id is a verbatim replay of mail `peer gc`
+# archived, never eligible (duplicate-id). off/warn: nothing is read (warn
+# changes nothing). Returns 1 when the archive exists but cannot be read, so
+# the caller fails closed (verify-failed: no verdict, never recorded).
+_peer_elig_seen_args() {
+    local messages="$1" archive="$PEER_DATA_DIR/messages-archive.jsonl" ids hits rc=0 seen
+    [[ "${PEER_ATTEST_MODE:-warn}" == enforce ]] || return 0
+    [[ -e "$archive" ]] || return 0
+    [[ -f "$archive" && -r "$archive" ]] || return 1
+    ids="$(jq -r 'if type == "array" then .[] | .id? | strings | select(. != "" and (test("\\n") | not)) else empty end' <<< "$messages" 2>/dev/null)" || return 1
+    [[ -n "$ids" ]] || return 0
+    # A fixed-string prefilter (ids are plain tokens); jq then keeps exact
+    # `id` matches only.
+    hits="$(LC_ALL=C grep -F -- "$ids" "$archive" 2>/dev/null)" || rc=$?
+    (( rc <= 1 )) || return 1
+    seen="$(jq -cn --arg ids "$ids" --arg hits "$hits" '($ids | split("\n")) as $want
+        | [$hits | split("\n")[] | select(. != "") | (try fromjson catch null) | objects | .id | strings
+           | select(. as $i | $want | index($i))] | unique' 2>/dev/null)" || return 1
+    [[ "$seen" == "["* ]] || return 1
+    [[ "$seen" == "[]" ]] || PEER_ELIG_ARGS+=(--seen "$seen")
+    return 0
+}
+
 # A JSON array of messages on stdin -> [{id, from, to, status, created_at, e}]
 # where e = {push, bell, reason, detail} (lib/peer_seal.py eligibility_one,
 # the built-in default allowlist). Needs PEER_ATTEST_SINCE (call
@@ -11840,7 +11922,11 @@ _peer_eligibility_list() {
     host_id="$(_cctrl_host_id_read 2>/dev/null)" || host_id=""
     local -a PEER_ELIG_ARGS=()
     _peer_elig_args
-    ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" "${PEER_ELIG_ARGS[@]}" 2>/dev/null)" || ver=""
+    if _peer_elig_seen_args "$messages"; then
+        ver="$(printf '%s' "$messages" | _peer_seal_helper verify "$host_id" "${PEER_ELIG_ARGS[@]}" 2>/dev/null)" || ver=""
+    else
+        ver=""
+    fi
     [[ "$ver" == "["* ]] || ver="null"
     { printf '%s\n' "$messages"; printf '%s\n' "$ver"; } | jq -c -s '
         .[0] as $m | .[1] as $v
@@ -11873,13 +11959,26 @@ _peer_attest_log() {
                 # file and fresh lines (p3 verify N1). A loser skips the
                 # rotation and just appends; a lock left by a killed writer
                 # is cleared after a minute.
-                local lock="$dir/.attestation.log.rotate"
+                # Phase 5 (p4 verify N2): two writers can both clear a stale
+                # lock and both hold one, so the move itself is safe without
+                # the lock: rename the log to a name only this writer owns
+                # (one rename wins the big file), then check what it got: the
+                # big log goes to .1; a small fresh log (another holder
+                # rotated first) is appended back, never moved over .1.
+                local lock="$dir/.attestation.log.rotate" mine="$dir/.attestation.log.rot.$$.$RANDOM"
                 if [[ -d "$lock" ]] && [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
                     rmdir "$lock" 2>/dev/null || true
                 fi
                 if mkdir "$lock" 2>/dev/null; then
                     size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
-                    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )); then mv -f "$f" "$f.1"; fi
+                    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )) && mv "$f" "$mine" 2>/dev/null; then
+                        size="$(wc -c < "$mine" 2>/dev/null | tr -d ' ')"
+                        if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )); then
+                            mv -f "$mine" "$f.1"
+                        else
+                            cat "$mine" >> "$f"; rm -f "$mine"
+                        fi
+                    fi
                     rmdir "$lock" 2>/dev/null || true
                 fi
             fi
@@ -12088,15 +12187,20 @@ _peer_doorbell_move() {
         if (.peers | type) != "array" then "doorbell.json .peers is not an array: nothing to move"
         elif (.peers | index($old)) == null then "\($old) is not in the doorbell peers (\(.peers | map(tostring) | join(", "))): nothing to move"
         elif (.peers | index($new)) != null then "\($new) is already in the doorbell peers: refusing (remove \($old) by hand if it is stale)"
+        elif (.recipients | type) == "object" and (.recipients | has($old)) and (.recipients | has($new))
+             and .recipients[$old] != .recipients[$new] then
+          "both \($old) and \($new) have a push allowlist override (recipients.\($old), recipients.\($new)): refusing, so neither is lost; run cctrl peer doorbell reset-senders --for \($old) (or --for \($new)) first"
         else "" end' <<< "$cur")" || err="doorbell.json is unreadable"
     [[ -z "$err" ]] || { _peer_doorbell_move_err "$json" 65 "$err"; return; }
     now="$(_peer_now_utc)"
     # Plan 111 phase 4: a per-recipient push allowlist override keyed by OLD
-    # moves with it (unless NEW already has one, which is kept).
+    # moves with it. Phase 5 (p4 verify N5): when NEW already has one, an
+    # identical OLD one is dropped and a different one refuses the move above
+    # (never left orphaned under OLD).
     new="$(jq -c --arg old "$from" --arg new "$to" --arg now "$now" \
         '.peers |= map(if . == $old then $new else . end) | .updated_at = $now
-         | if (.recipients | type) == "object" and (.recipients | has($old)) and (.recipients | has($new) | not)
-           then .recipients |= (.[$new] = .[$old] | del(.[$old])) else . end' <<< "$cur")" || return 1
+         | if (.recipients | type) == "object" and (.recipients | has($old))
+           then .recipients |= ((if has($new) then . else .[$new] = .[$old] end) | del(.[$old])) else . end' <<< "$cur")" || return 1
     if ! $dry_run; then
         _peer_doorbell_write_locked "$new" || { _peer_doorbell_move_err "$json" 1 "Could not write $(_peer_doorbell_file)"; return; }
     fi
@@ -12155,8 +12259,11 @@ _peer_doorbell_senders() { # allow|deny|reset args...
     res="$(jq -c --arg action "$action" --arg for "$for" --argjson roles "$roles" --argjson peers "$peers" --arg now "$now" "$PEER_ATTEST_CFG_JQ"'
         . as $c | ($c | attest_allow) as $a
         | (if $for == "" then "push_senders" else "recipients.\($for).push_senders" end) as $key
-        | if $action == "reset" and $for != "" and has("recipients") and .recipients != null and (.recipients | type) != "object" then
-            {err: "doorbell.json .recipients is not an object (every recipient matches nothing): fix it by hand"}
+        | if $action == "reset" and has("recipients") and .recipients != null and (.recipients | type) != "object" then
+            # Phase 5 (p4 verify N6): a non-object recipients holds no
+            # override and makes every recipient match nothing; reset removes it.
+            {cfg: ((if $for == "" then del(.push_senders) else . end) | del(.recipients) | .updated_at = $now),
+             key: (if $for == "" then "push_senders" else "recipients" end), repaired: "recipients"}
           elif $action == "reset" then
             {cfg: ((if $for == "" then del(.push_senders)
                    elif (.recipients | type) == "object" and ((.recipients[$for] | type) == "object") then
@@ -12168,12 +12275,11 @@ _peer_doorbell_senders() { # allow|deny|reset args...
              key: $key}
           else
             (if $for == "" then {base: $a.default, bad: ($a.source == "malformed")}
-             elif $a.recipients == "malformed" then {base: null, bad: true, hand: true, why: "doorbell.json .recipients is not an object (every recipient matches nothing)"}
+             elif $a.recipients == "malformed" then {base: null, bad: true, why: "doorbell.json .recipients is not an object (every recipient matches nothing)"}
              elif ($a.recipients | has($for)) then {base: $a.recipients[$for], bad: ($a.recipients[$for] == null)}
              elif $a.default == null then {base: null, bad: true, why: "doorbell.json push_senders is malformed (the default an override starts from)", fix: ""}
              else {base: $a.default, bad: false} end) as $b
-            | if $b.bad and $b.hand == true then {err: ($b.why + ": fix it by hand")}
-              elif $b.bad then {err: (($b.why // "doorbell.json \($key) is malformed (it matches nothing)") + ": fix it by hand or run cctrl peer doorbell reset-senders"
+            | if $b.bad then {err: (($b.why // "doorbell.json \($key) is malformed (it matches nothing)") + ": fix it by hand or run cctrl peer doorbell reset-senders"
                                     + (($b.fix // $for) | if . == "" then "" else " --for \(.)" end))}
               else
                 (if $action == "allow" then {roles: (($b.base.roles + $roles) | unique), peers: (($b.base.peers + $peers) | unique)}
@@ -12205,6 +12311,9 @@ _peer_doorbell_senders() { # allow|deny|reset args...
         [[ -n "$for" ]] && scope="the push allowlist for $for"
         if [[ "$action" == reset ]]; then
             $dry_run && echo "Dry run: would reset $scope in $(_peer_doorbell_file)." || echo "Reset $scope in $(_peer_doorbell_file)."
+            if [[ "$(jq -r '.repaired // empty' <<< "$res")" == recipients ]]; then
+                $dry_run && echo "  would remove the malformed .recipients key (not an object)." || echo "  removed the malformed .recipients key (not an object)."
+            fi
         else
             $dry_run && echo "Dry run: would write $scope in $(_peer_doorbell_file):" || echo "Wrote $scope in $(_peer_doorbell_file):"
         fi

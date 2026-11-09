@@ -7,7 +7,7 @@ ever prints MACs (which are not secret) and verification facts.
 Modes:
   seal <host_id>    stdin: one message object. stdout: the hex MAC.
                     Creates the key on first use (atomic, create-once).
-  verify <host_id> [--eligibility <since> [--allow <json>]]
+  verify <host_id> [--eligibility <since> [--allow <json>] [--seen <json>]]
                     stdin: a JSON array of messages. stdout: a JSON array of
                     verification objects, one per message, same order.
                     Never creates the key. With --eligibility (plan 111
@@ -20,6 +20,9 @@ Modes:
                     "recipients": {name: A} | "malformed"}, A = {"roles":
                     [...], "peers": [...]} or null (malformed: matches
                     nothing). Without it, the built-in default applies.
+                    --seen (phase 5) is a JSON array of ids already in
+                    messages-archive.jsonl: a line with one of them is a
+                    replay (detail duplicate-id), never eligible.
   doctor <host_id>  stdin: a JSON array of messages. stdout: one JSON object
                     with the key status (path, exists, mode; never the key)
                     and verification counts. Never creates the key.
@@ -297,7 +300,13 @@ def verify_one(message, host_id, key):
         out["reason"] = "other-host-seal"
         return out
     if key is None:
+        # Read-time reason unchanged (the plan: a lost key reads
+        # seal-mismatch). The internal flag tells eligibility this is no
+        # verdict on the line (key-unavailable), so a transient key problem
+        # never records the mail as blocked (phase 5, p4 verify M1). cmd_verify
+        # strips it from the output.
         out["reason"] = "seal-mismatch"
+        out["_key_unavailable"] = True
         return out
     try:
         good = hmac.compare_digest(mac_for(message, seal_host, key), mac)
@@ -388,7 +397,8 @@ def eligibility_one(message, ver, dup_ids, since, allow=None):
     replay checks, which can only take eligibility away."""
     out = {"push": False, "bell": False, "reason": "sender-unattested", "detail": None}
     if not isinstance(message, dict) or not ver.get("verified"):
-        out["detail"] = ver.get("reason") or "legacy-unsealed"
+        out["detail"] = ("key-unavailable" if ver.get("_key_unavailable")
+                         else (ver.get("reason") or "legacy-unsealed"))
         return out
     mid = message.get("id")
     if not isinstance(mid, str) or mid in dup_ids:
@@ -464,26 +474,44 @@ def cmd_verify(host_id, opts):
     eligibility = False
     since = ""
     allow = None
+    seen = set()
     if opts:
-        if len(opts) not in (2, 4) or opts[0] != "--eligibility":
+        if len(opts) % 2 or opts[0] != "--eligibility":
             return 64
         eligibility, since = True, opts[1]
-        if len(opts) == 4:
-            if opts[2] != "--allow":
+        rest = opts[2:]
+        while rest:
+            flag, value = rest[0], rest[1]
+            rest = rest[2:]
+            if flag == "--allow":
+                try:
+                    allow = json.loads(value)
+                except ValueError:
+                    allow = "malformed"
+                if allow is None:
+                    allow = "malformed"
+            elif flag == "--seen":
+                # Phase 5 (replay, p3 verify ruling 2): ids already in
+                # messages-archive.jsonl (`peer gc`). A queued line with such
+                # an id is a verbatim replay of archived mail: duplicate-id.
+                try:
+                    ids = json.loads(value)
+                except ValueError:
+                    return 64
+                if not isinstance(ids, list):
+                    return 64
+                seen = set(i for i in ids if isinstance(i, str))
+            else:
                 return 64
-            try:
-                allow = json.loads(opts[3])
-            except ValueError:
-                allow = "malformed"
-            if allow is None:
-                allow = "malformed"
     messages = _read_messages()
     key = _load_key_or_none()
     results = [verify_one(m, host_id, key) for m in messages]
     if eligibility:
-        dups = _dup_ids(messages)
+        dups = _dup_ids(messages) | seen
         for m, ver in zip(messages, results):
             ver["eligibility"] = eligibility_one(m, ver, dups, since, allow)
+    for ver in results:
+        ver.pop("_key_unavailable", None)
     sys.stdout.write(json.dumps(results, separators=(",", ":")) + "\n")
     return 0
 
