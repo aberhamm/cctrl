@@ -2013,6 +2013,19 @@ Plays different sounds based on what Claude is doing:
 
 Distinguishes "done" from "needs input" by parsing the session transcript and checking whether the last message ends with a question. No arbitrary delays — all notifications are instant.
 
+**Turning the sounds off (per host).** `cctrl hooks sounds off` writes
+`"notifySounds": false` to `~/.config/cctrl/config.json` (or
+`$CCTRL_USER_CONFIG`), which lives outside the installed release, so a new
+`cctrl install` keeps it. `cctrl hooks sounds on` turns them back on, and
+`cctrl hooks sounds` prints the effective setting and where it comes from.
+Precedence: the env var `CCTRL_NOTIFY_SOUNDS=on|off` (also `1|0`,
+`true|false`, `yes|no`), then `notifySounds` in `data/config.local.json`, the
+user config and `data/config.json`, then the default **on**. An unrecognised
+value is ignored. Off silences only the `afplay` chime and the spoken `say`
+line; everything else the Stop and Notification hooks do is unchanged.
+`cctrl hooks doctor` shows the setting in one line. A legacy hook that runs
+`notify.sh` directly (below) reads the same env var and config files.
+
 ```json
 {
   "hooks": {

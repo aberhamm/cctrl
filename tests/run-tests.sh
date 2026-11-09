@@ -7080,6 +7080,118 @@ PY
     echo "ok: hooks run stop tees one stdin capture to both notify.sh and session-log.py"
 }
 
+test_notify_sounds_off_switch() {
+    # 2026-11-09: a per-host off switch for hooks/notify.sh sounds that a new
+    # install cannot undo (it lives in the user config, not the release).
+    # afplay/say/osascript are stubs that only log; nothing plays.
+    local t="$TMPDIR/notify-sounds" out rc
+    mkdir -p "$t/hooks" "$t/data" "$t/stub" "$t/proj"
+    cp "$ROOT/cctrl" "$t/cctrl"; chmod +x "$t/cctrl"
+    cp "$ROOT/hooks/notify.sh" "$t/hooks/notify.sh"; chmod +x "$t/hooks/notify.sh"
+    printf 'import sys\nopen("%s/sessionlog.in", "a").write(sys.stdin.read() + "\\n")\n' "$t" > "$t/hooks/session-log.py"
+    local s
+    for s in afplay say osascript; do
+        printf '#!/bin/sh\necho "%s $*" >> "%s/sounds.log"\n' "$s" "$t" > "$t/stub/$s"
+        chmod +x "$t/stub/$s"
+    done
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All finished."}]}}' > "$t/done.jsonl"
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Ship it?"}]}}' > "$t/ask.jsonl"
+    local p_done="{\"transcript_path\":\"$t/done.jsonl\"}" p_ask="{\"transcript_path\":\"$t/ask.jsonl\"}"
+    local p_perm='{"type":"permission_prompt"}' p_idle='{"type":"idle_prompt"}'
+    _ns() { # cctrl with the stub PATH and a scratch user/local config
+        env -u CCTRL_NOTIFY_SOUNDS PATH="$t/stub:$PATH" CLAUDE_PROJECT_DIR="$t/proj" \
+            CCTRL_USER_CONFIG="$t/user.json" CCTRL_CONFIG_LOCAL="$t/local.json" "$@"
+    }
+    _ns_wait() { # $1 = expected line count: background afplay may land late
+        local i=0 n
+        while (( i < 40 )); do
+            n=0; [[ -f "$t/sounds.log" ]] && n="$(wc -l < "$t/sounds.log" | tr -d ' ')"
+            (( n >= $1 )) && break
+            sleep 0.05; i=$((i + 1))
+        done
+        [[ "$1" -ne 0 ]] || sleep 0.2
+    }
+    # Runs all four events through cctrl; records stdout+rc (non-sound outputs).
+    _ns_all() { # $1 = expected sound lines; extra args = env assignments
+        local want="$1"; shift
+        rm -f "$t/sounds.log" "$t/sessionlog.in"
+        out=""
+        out+="$(printf '%s' "$p_done" | _ns "$@" "$t/cctrl" hooks run stop 2>&1; echo "rc=$?")|"
+        out+="$(printf '%s' "$p_ask" | _ns "$@" "$t/cctrl" hooks run stop 2>&1; echo "rc=$?")|"
+        out+="$(printf '%s' "$p_perm" | _ns "$@" "$t/cctrl" hooks run notify 2>&1; echo "rc=$?")|"
+        out+="$(printf '%s' "$p_idle" | _ns "$@" "$t/cctrl" hooks run notify 2>&1; echo "rc=$?")"
+        _ns_wait "$want"
+    }
+    _ns_log() { [[ -f "$t/sounds.log" ]] && sort "$t/sounds.log"; return 0; }
+
+    # Default (nothing set): sounds on, unchanged.
+    _ns_all 6
+    local on_out="$out" on_sessionlog
+    on_sessionlog="$(cat "$t/sessionlog.in")"
+    [[ "$(_ns_log)" == "$(printf '%s\n' \
+        'afplay /System/Library/Sounds/Glass.aiff' 'afplay /System/Library/Sounds/Ping.aiff' \
+        'afplay /System/Library/Sounds/Tink.aiff' 'say -r 200 proj done' \
+        'say -r 200 proj needs input' 'say -r 200 proj needs permission' | sort)" ]] \
+        || fail "default sounds changed: $(_ns_log)"
+    out="$(_ns "$t/cctrl" hooks sounds 2>&1)"
+    assert_contains "$out" "notify sounds: on (default)"
+
+    # `hooks sounds off` writes the user config, keeping other keys.
+    printf '{"defaultProfile":"keepme"}\n' > "$t/user.json"
+    out="$(_ns "$t/cctrl" hooks sounds off 2>&1)" || fail "hooks sounds off failed: $out"
+    jq -e '.notifySounds == false and .defaultProfile == "keepme"' "$t/user.json" >/dev/null \
+        || fail "user config not written as expected: $(cat "$t/user.json")"
+    assert_contains "$out" "notify sounds: off ($t/user.json)"
+    _ns_all 0
+    [[ -z "$(_ns_log)" ]] || fail "sounds played while off: $(_ns_log)"
+    [[ "$out" == "$on_out" ]] || fail "non-sound output changed with sounds off: [$out] vs [$on_out]"
+    [[ "$(cat "$t/sessionlog.in")" == "$on_sessionlog" ]] || fail "session-log.py input changed with sounds off"
+
+    # A legacy hook that runs notify.sh directly honours the config too.
+    rm -f "$t/sounds.log"
+    printf '%s' "$p_done" | _ns "$t/hooks/notify.sh" stop
+    printf '%s' "$p_perm" | _ns "$t/hooks/notify.sh" notification
+    _ns_wait 0
+    [[ -z "$(_ns_log)" ]] || fail "direct notify.sh played sounds while off: $(_ns_log)"
+
+    # Env override wins over the config, both ways.
+    _ns_all 6 CCTRL_NOTIFY_SOUNDS=on
+    [[ "$(_ns_log | grep -c .)" -eq 6 ]] || fail "CCTRL_NOTIFY_SOUNDS=on did not override config off: $(_ns_log)"
+    out="$(_ns CCTRL_NOTIFY_SOUNDS=on "$t/cctrl" hooks sounds 2>&1)"
+    assert_contains "$out" "notify sounds: on (env CCTRL_NOTIFY_SOUNDS)"
+    _ns "$t/cctrl" hooks sounds on >/dev/null 2>&1 || fail "hooks sounds on failed"
+    jq -e '.notifySounds == true' "$t/user.json" >/dev/null || fail "hooks sounds on did not write true"
+    _ns_all 0 CCTRL_NOTIFY_SOUNDS=off
+    [[ -z "$(_ns_log)" ]] || fail "CCTRL_NOTIFY_SOUNDS=off did not silence: $(_ns_log)"
+    rm -f "$t/sounds.log"
+    printf '%s' "$p_done" | _ns CCTRL_NOTIFY_SOUNDS=0 "$t/hooks/notify.sh" stop
+    _ns_wait 0
+    [[ -z "$(_ns_log)" ]] || fail "direct notify.sh ignored CCTRL_NOTIFY_SOUNDS=0"
+
+    # data/config.local.json outranks the user config; `hooks sounds` warns.
+    printf '{"notifySounds":false}\n' > "$t/local.json"
+    rc=0; out="$(_ns "$t/cctrl" hooks sounds on 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "hooks sounds on should fail while local config overrides (rc=$rc)"
+    assert_contains "$out" "notify sounds: off ($t/local.json)"
+    assert_contains "$out" "still overrides it"
+    rm -f "$t/local.json"
+
+    # An unrecognised value falls through to the default (on).
+    printf '{"notifySounds":"maybe"}\n' > "$t/user.json"
+    out="$(_ns "$t/cctrl" hooks sounds 2>&1)"
+    assert_contains "$out" "notify sounds: on (default)"
+
+    # hooks doctor shows the setting in one line.
+    printf '{"notifySounds":false}\n' > "$t/user.json"
+    out="$(_ns "$t/cctrl" hooks doctor 2>&1 || true)"
+    out="$(printf '%s' "$out" | sed $'s/\033\\[[0-9;]*m//g')"
+    [[ "$(printf '%s\n' "$out" | grep -c 'notify sounds:')" -eq 1 ]] || fail "doctor should show one sounds line: $out"
+    assert_contains "$out" "notify sounds: off ($t/user.json; set with: cctrl hooks sounds on|off)"
+    [[ ! -e "$t/sounds.log" ]] || [[ -z "$(grep osascript "$t/sounds.log")" ]] || fail "osascript was called"
+    unset -f _ns _ns_wait _ns_all _ns_log
+    echo "ok: notify sounds off switch (config, env, CLI, doctor) silences afplay/say only"
+}
+
 test_session_list_codex_default_model() {
     make_fake_tmux "$TMPDIR/tmux"
     make_fake_ps "$TMPDIR/ps"

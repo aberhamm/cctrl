@@ -332,6 +332,64 @@ _config_default_profile_source_file() {
     return 1
 }
 
+# hooks/notify.sh sounds (afplay chime + `say`). Off switch, per host:
+# env CCTRL_NOTIFY_SOUNDS (on|off|1|0|true|false|yes|no) wins, then the
+# config key notifySounds (true|false) from the highest-precedence config
+# file that sets it (data/config.local.json > user config > data/config.json),
+# then the default: on. An unrecognised value is ignored (falls through), so
+# a typo never silently changes behaviour. hooks/notify.sh repeats this same
+# order for a legacy direct `notify.sh stop` hook that bypasses cctrl.
+_notify_sounds_norm() {
+    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+        on|1|true|yes)   printf 'on' ;;
+        off|0|false|no)  printf 'off' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Prints "on|off<TAB>source", source = "env CCTRL_NOTIFY_SOUNDS", a config
+# file path, or "default".
+_notify_sounds_state() {
+    local v file raw
+    if v="$(_notify_sounds_norm "${CCTRL_NOTIFY_SOUNDS:-}")"; then
+        printf '%s\tenv CCTRL_NOTIFY_SOUNDS\n' "$v"
+        return 0
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        for file in "$CONFIG_LOCAL_FILE" "$CONFIG_USER_FILE" "$CONFIG_FILE"; do
+            [[ -n "$file" && -f "$file" ]] || continue
+            raw="$(jq -r 'if type == "object" and has("notifySounds") then (.notifySounds | tostring) else empty end' "$file" 2>/dev/null || true)"
+            if v="$(_notify_sounds_norm "$raw")"; then
+                printf '%s\t%s\n' "$v" "$file"
+                return 0
+            fi
+        done
+    fi
+    printf 'on\tdefault\n'
+}
+
+# Atomic jq write of one top-level key into the user config file. Writes
+# through realpath so a dotfiles symlink at CONFIG_USER_FILE survives.
+# $1 = key, $2 = JSON value.
+_config_user_set_json() {
+    local key="$1" value="$2" target dir tmp
+    target="$CONFIG_USER_FILE"
+    [[ -n "$target" ]] || return 1
+    if [[ -L "$target" ]]; then
+        target="$(realpath "$target" 2>/dev/null || readlink -f "$target" 2>/dev/null || printf '%s' "$target")"
+    fi
+    dir="$(dirname "$target")"
+    ( umask 077 && mkdir -p "$dir" ) || return 1
+    tmp="$(mktemp "$dir/.cctrl-config.XXXXXX")" || return 1
+    if [[ -f "$target" ]]; then
+        jq --arg k "$key" --argjson v "$value" '.[$k] = $v' "$target" > "$tmp" || { rm -f "$tmp"; return 1; }
+    else
+        jq -n --arg k "$key" --argjson v "$value" '{($k): $v}' > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    chmod 600 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$target"
+}
+
 # Five-step profile resolution for a launch: explicit --profile wins, then a
 # matched shortcut's .profile, then the configured default, then (read-only)
 # the legacy .active-profile, then no overlay. Steps 1-2 fail closed (exit 64)
@@ -19774,20 +19832,63 @@ cmd_hooks() {
         run) _hooks_run "$@" ;;
         install) _hooks_install "$@" ;;
         doctor) _hooks_doctor "$@" ;;
+        sounds) _hooks_sounds "$@" ;;
         -h|--help|help)
-            echo "Usage: cctrl hooks <run|install|doctor>"
+            echo "Usage: cctrl hooks <run|install|doctor|sounds>"
             echo ""
             echo "  run <name>    Execute a named hook (pre-tool-use, stop, notify, codex-observe, native-send-log)"
             echo "  install       Write portable hook configs (Claude Code; Codex only with --agent codex|all)"
             echo "  doctor        Validate hook configs point to working commands"
+            echo "  sounds [on|off]  Show or set this host's notify.sh sounds (notifySounds in the user config)"
             return 0
             ;;
         *)
             echo -e "${RED}Unknown hooks action: $action${RESET}" >&2
-            echo -e "${DIM}Usage: cctrl hooks <run|install|doctor>${RESET}" >&2
+            echo -e "${DIM}Usage: cctrl hooks <run|install|doctor|sounds>${RESET}" >&2
             return 1
             ;;
     esac
+}
+
+# `cctrl hooks sounds [on|off]`: show or set notifySounds in the user config
+# (~/.config/cctrl/config.json: per host, survives every cctrl install). With
+# no argument it prints the effective state and where it comes from.
+_hooks_sounds() {
+    local want="${1:-status}" state val src
+    case "$want" in
+        -h|--help|help)
+            echo "Usage: cctrl hooks sounds [on|off|status]"
+            echo ""
+            echo "  Sounds = the afplay chime and spoken 'say' line hooks/notify.sh plays when a"
+            echo "  turn ends, needs input, or waits on a permission prompt."
+            echo "  on|off   Write notifySounds true|false to $(_display_path "$CONFIG_USER_FILE")"
+            echo "  status   Show the effective setting and its source (default)"
+            echo "  Env override: CCTRL_NOTIFY_SOUNDS=on|off (wins over the config)."
+            return 0
+            ;;
+        status) ;;
+        on|off)
+            command -v jq >/dev/null 2>&1 || { echo -e "${RED}jq is required to write the config${RESET}" >&2; return 1; }
+            if [[ "$want" == "on" ]]; then val=true; else val=false; fi
+            _config_user_set_json notifySounds "$val" \
+                || { echo -e "${RED}Could not write notifySounds to $(_display_path "$CONFIG_USER_FILE")${RESET}" >&2; return 1; }
+            echo -e "${GREEN}✓${RESET} notifySounds = $val in $(_display_path "$CONFIG_USER_FILE")"
+            ;;
+        *)
+            echo -e "${RED}Unknown sounds action: $want${RESET}" >&2
+            echo -e "${DIM}Usage: cctrl hooks sounds [on|off|status]${RESET}" >&2
+            return 1
+            ;;
+    esac
+    state="$(_notify_sounds_state)"
+    src="${state#*$'\t'}"
+    [[ "$src" == /* ]] && src="$(_display_path "$src")"
+    echo "notify sounds: ${state%%$'\t'*} ($src)"
+    if [[ "$want" != "status" && "${state%%$'\t'*}" != "$want" ]]; then
+        echo -e "${YELLOW}⚠${RESET}  $src still overrides it" >&2
+        return 1
+    fi
+    return 0
 }
 
 _hooks_run() {
@@ -19826,7 +19927,10 @@ _hooks_run() {
             bell_msg="$(printf '%s' "$stop_input" | _peer_doorbell_eval claude 2>/dev/null)" || bell_rc=$?
             local continuing=""
             [[ $bell_rc -eq 2 && -n "$bell_msg" && "$bell_msg" != "ADVISORY"$'\n'* ]] && continuing=1
-            printf '%s' "$stop_input" | CCTRL_STOP_CONTINUING="$continuing" "$SCRIPT_DIR/hooks/notify.sh" stop 2>/dev/null || true
+            local sounds
+            sounds="$(_notify_sounds_state 2>/dev/null)" || sounds="on"
+            printf '%s' "$stop_input" | CCTRL_STOP_CONTINUING="$continuing" CCTRL_NOTIFY_SOUNDS="${sounds%%$'\t'*}" \
+                "$SCRIPT_DIR/hooks/notify.sh" stop 2>/dev/null || true
             printf '%s' "$stop_input" | python3 "$SCRIPT_DIR/hooks/session-log.py" 2>/dev/null || true
             if [[ $bell_rc -eq 2 && -n "$bell_msg" ]]; then
                 if [[ -z "$continuing" ]]; then
@@ -19839,7 +19943,9 @@ _hooks_run() {
             exit 0
             ;;
         notify)
-            exec "$SCRIPT_DIR/hooks/notify.sh" notification
+            local sounds
+            sounds="$(_notify_sounds_state 2>/dev/null)" || sounds="on"
+            CCTRL_NOTIFY_SOUNDS="${sounds%%$'\t'*}" exec "$SCRIPT_DIR/hooks/notify.sh" notification
             ;;
         codex-observe)
             CCTRL_BIN="$SCRIPT_DIR/cctrl" exec python3 "$SCRIPT_DIR/hooks/codex-session-observer.py"
@@ -20129,6 +20235,13 @@ _hooks_doctor() {
             issues=1
         fi
     done
+
+    # Informational, never an issue: whether notify.sh plays sounds here.
+    local sounds_state sounds_src
+    sounds_state="$(_notify_sounds_state)"
+    sounds_src="${sounds_state#*$'\t'}"
+    [[ "$sounds_src" == /* ]] && sounds_src="$(_display_path "$sounds_src")"
+    echo -e "${DIM}•${RESET} notify sounds: ${sounds_state%%$'\t'*} ($sounds_src; set with: cctrl hooks sounds on|off)"
 
     echo ""
 
