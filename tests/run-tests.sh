@@ -9647,10 +9647,24 @@ test_peer_seal_followups_never_block() {
         esac
     done
     [[ -p "$key" ]] || fail "the FIFO at the key path was replaced"
-    # The bound: a python3 that hangs cannot hang a send or a read.
-    printf '#!/bin/sh\nexec sleep 30\n' > "$bin/python3"; chmod +x "$bin/python3"
+    # The bound: a python3 that hangs cannot hang a send or a read. Proved by
+    # counting, not by a tight wall clock (a 10 s ceiling flaked on a loaded
+    # host, where a plain send alone takes ~3 s): the stub logs each start and
+    # the SIGALRM that ends it, so the check is "exactly one python3 call, and
+    # it was ended by the CCTRL_PEER_SEAL_TIMEOUT_SECONDS alarm". The wall
+    # ceiling only proves nothing waited out the 60 s hang, so it is half of it.
+    local pylog="$t/python3.log" n_start n_alarm n_done
+    cat > "$bin/python3" <<STUB
+#!/bin/sh
+trap 'kill \$p 2>/dev/null; printf "alarm\\n" >> "$pylog"; exit 142' ALRM
+printf 'start\n' >> '$pylog'
+sleep 60 & p=\$!
+wait \$p
+printf 'done\n' >> '$pylog'
+STUB
+    chmod +x "$bin/python3"
     for mode in send inbox; do
-        rc=0; t0="$(date +%s)"
+        rc=0; : > "$pylog"; t0="$(date +%s)"
         if [[ "$mode" == send ]]; then
             out="$(PATH="$bin:$PATH" "${e[@]}" CCTRL_PEER_SEAL_KEY_FILE="$t/st/k2" CCTRL_PEER_SEAL_TIMEOUT_SECONDS=1 "$ROOT/cctrl" peer send fu-rcpt --as fu-mo --json -- hang 2>&1)" || rc=$?
         else
@@ -9658,7 +9672,11 @@ test_peer_seal_followups_never_block() {
         fi
         t1="$(date +%s)"
         [[ "$rc" -eq 0 ]] || fail "hanging python3: $mode rc $rc: $out"
-        [[ $(( t1 - t0 )) -lt 10 ]] || fail "a hanging python3 held $mode for $(( t1 - t0 )) s"
+        n_start="$(grep -c '^start$' "$pylog" || true)"; n_alarm="$(grep -c '^alarm$' "$pylog" || true)"; n_done="$(grep -c '^done$' "$pylog" || true)"
+        [[ "$n_start" -eq 1 ]] || fail "hanging python3: $mode must make exactly one (bounded) python3 call, made $n_start"
+        [[ "$n_alarm" -eq "$n_start" && "$n_done" -eq 0 ]] \
+            || fail "hanging python3: every $mode python3 call must end by the seal alarm ($n_start started, $n_alarm alarmed, $n_done ran out)"
+        [[ $(( t1 - t0 )) -lt 30 ]] || fail "a hanging python3 held $mode for $(( t1 - t0 )) s"
         if [[ "$mode" == send ]]; then
             jq -e '.status == "queued" and (has("seal") | not)' <<< "$out" >/dev/null || fail "hanging python3 must queue unsealed: $out"
         else
