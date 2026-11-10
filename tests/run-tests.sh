@@ -24430,7 +24430,10 @@ test_tmux_second_server_routing() (
     printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\nexec %q "$@"\n' "$SRV2_DIR/tmux.log" "$tt" > "$SRV2_DIR/tmux"
     chmod +x "$SRV2_DIR/tmux"
     mkdir -p "$SRV2_DIR/srv2-clash"
-    (cd "$SRV2_DIR/srv2-clash" && PATH="$SRV2_DIR:$PATH" "$ROOT/cctrl" start --agent codex -m hi >/dev/null 2>&1) || true
+    # Pin the device tag: PATH here lacks the suite's hostname shim, so without
+    # it the name follows the real host (ms on the Studio, mbp on a MacBook)
+    # and the TMUX--ms-- clash fixture above would not clash.
+    (cd "$SRV2_DIR/srv2-clash" && PATH="$SRV2_DIR:$PATH" CCTRL_DEVICE_TAG=ms "$ROOT/cctrl" start --agent codex -m hi >/dev/null 2>&1) || true
     out="$(grep -- 'new-session' "$SRV2_DIR/tmux.log" || true)"
     assert_contains "$out" "-S $SRV2_NEW new-session -d -s TMUX--ms--srv2-clash"
     [[ "$out" != *"-s TMUX--ms--srv2-clash "* ]] || fail "start reused a name live on the old server: $out"
