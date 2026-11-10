@@ -7389,7 +7389,7 @@ _peer_cmd_say() {
             esac
         done
         if [[ "$queue_only" == true ]]; then
-            _peer_cmd_send "$identity" --from "$app_sender" "${app_flags[@]}"
+            _peer_cmd_send "$identity" --from "$app_sender" --no-deliver "${app_flags[@]}"
         else
             _peer_cmd_send "$identity" --from "$app_sender" --deliver "${app_flags[@]}"
         fi
@@ -9031,10 +9031,16 @@ _peer_cmd_send_impl() {
     # bell catches it at the end of the turn. --no-deliver opts out. Inert
     # without doorbell.json. A default delivery that cannot reach the pane
     # still exits 0: the message is queued, and a retry would duplicate it.
-    local deliver_implicit=false
-    if ! $deliver && ! $no_deliver && ! $allow_unknown && _peer_doorbell_send_defaults_deliver "$to"; then
-        deliver=true
-        deliver_implicit=true
+    local deliver_implicit=false nopush_reason="" nopush_detail=""
+    if ! $deliver && ! $no_deliver && ! $allow_unknown; then
+        if _peer_doorbell_send_defaults_deliver "$to"; then
+            deliver=true
+            deliver_implicit=true
+        else
+            # mdec-1110 (2): this plain send will queue without a push; keep
+            # why, for the notice after the queue write.
+            nopush_reason="${PEER_NOPUSH_REASON:-unknown}"; nopush_detail="${PEER_NOPUSH_DETAIL:-}"
+        fi
     fi
 
     # `--deliver` (plan 027): send, then attempt delivery, then classify the
@@ -9322,11 +9328,30 @@ _peer_cmd_send_impl() {
     _mailbox_lock_release
     [[ $rc -eq 0 ]] || return $rc
 
+    # mdec-1110 (2): a plain send that queued without a push says so (stderr,
+    # or JSON fields), for any reason. --no-deliver stays quiet: the sender
+    # chose it, and send --deliver / reply run their inner send that way.
+    local nopush_text=""
+    if ! $no_deliver; then
+        if $allow_unknown; then
+            if [[ -z "$to_peer_json" ]]; then nopush_reason="unknown-recipient"; else nopush_reason="allow-unknown"; fi
+        fi
+        [[ -n "$nopush_reason" ]] || nopush_reason="unknown"
+        nopush_text="$(_peer_not_pushed_text "$id" "$to" "$nopush_reason" "$nopush_detail")"
+    fi
+
     if $json; then
-        jq '.' <<< "$message"
+        if [[ -n "$nopush_text" ]]; then
+            jq --arg r "$nopush_reason" --arg d "$nopush_detail" --arg t "$nopush_text" \
+                '. + {pushed: false, push_skipped_reason: $r} + (if $d != "" then {push_skipped_detail: $d} else {} end) + {push_notice: $t}' <<< "$message"
+        else
+            jq '.' <<< "$message"
+        fi
     else
         echo -e "${GREEN}Queued message: ${BOLD}$id${RESET}"
+        [[ -n "$nopush_text" ]] && echo -e "${YELLOW}Notice:${RESET} $nopush_text" >&2
     fi
+    return 0
 }
 
 _peer_cmd_inbox() {
@@ -11233,6 +11258,70 @@ _peer_send_and_deliver() {
     return "$PEER_SD_RC"
 }
 
+# mdec-1110 (2): the one "queued, not pushed" line, for every send path.
+#   $1 = message id  $2 = recipient  $3 = reason code  $4 = detail (optional)
+# Codes: recipient-not-doorbell-enabled, sender-unattested, sender-not-allowed,
+# ring-cap, ring-cap-invalid, ring-cap-unverifiable, pane-not-ready,
+# no-live-pane, no-tmux-pane, remote-peer, not-claude-pane,
+# role-not-deliver-default, deliver-default-off, tmux-unavailable,
+# unknown-recipient, allow-unknown, push-failed, unknown.
+_peer_not_pushed_text() {
+    local id="$1" to="$2" reason="$3" detail="${4:-}" why
+    case "$reason" in
+        recipient-not-doorbell-enabled) why="$to is not doorbell-enabled" ;;
+        sender-unattested) why="the sender is not attested for a push (attestation enforce)" ;;
+        sender-not-allowed) why="the sender is not on $to's push allowlist" ;;
+        ring-cap) why="$to is at its doorbell ring cap (${detail:-all} rings used in the last hour)" ;;
+        ring-cap-invalid|ring-cap-unverifiable) why="the doorbell ring cap cannot be checked ($reason; see cctrl peer doctor)" ;;
+        pane-not-ready) why="$to's pane is not ready (${detail:-busy})" ;;
+        no-live-pane) why="$to has no live tmux session" ;;
+        no-tmux-pane) why="$to has no tmux pane cctrl can push into" ;;
+        remote-peer) why="$to is on another host (${detail:-remote}) and a plain send pushes only locally" ;;
+        not-claude-pane) why="$to is not a Claude pane (agent ${detail:-unknown}) and a plain send pushes only into Claude panes" ;;
+        role-not-deliver-default) why="a plain send does not push to $to's role (${detail:-no role})" ;;
+        deliver-default-off) why="the doorbell's default delivery is off (deliver_default_roles is empty)" ;;
+        tmux-unavailable) why="tmux is not available" ;;
+        unknown-recipient) why="$to is not a known peer (--allow-unknown)" ;;
+        allow-unknown) why="an --allow-unknown send never pushes" ;;
+        push-failed) why="the push into $to's pane failed (${detail:-unknown})" ;;
+        *) why="the push was skipped (${detail:-${reason:-unknown}})" ;;
+    esac
+    printf 'Message %s is queued for %s; %s, so cctrl did not push it. %s must collect its own mail or be woken. Do not re-send: that would duplicate it.\n' \
+        "$id" "$to" "$why" "$to"
+}
+
+_peer_sd_ring_cap_n() { # -> "N of M" from PEER_SD_DELIVER_JSON, or "all"
+    local cap_n
+    cap_n="$(jq -r '.results[0].ring_cap | "\(.rings_last_hour) of \(.max_rings_per_hour)"' <<< "${PEER_SD_DELIVER_JSON:-null}" 2>/dev/null)" || cap_n=""
+    [[ "$cap_n" == *" of "* && "$cap_n" != *null* ]] || cap_n="all"
+    printf '%s\n' "$cap_n"
+}
+
+# Map a PEER_SD_* outcome to PEER_NOPUSH_REASON / _DETAIL. Returns 1 (and
+# sets nothing) when the outcome pushed.
+_peer_sd_not_pushed_reason() {
+    local r="${PEER_SD_DELIVER_REASON:-}"
+    PEER_NOPUSH_REASON=""; PEER_NOPUSH_DETAIL=""
+    case "$PEER_SD_OUTCOME" in
+        sent-and-queued)
+            case "$r" in
+                recipient-not-doorbell-enabled|sender-unattested|sender-not-allowed) PEER_NOPUSH_REASON="$r" ;;
+                *) PEER_NOPUSH_REASON="no-tmux-pane"; PEER_NOPUSH_DETAIL="$r" ;;
+            esac ;;
+        sent-but-deferred)
+            case "$r" in
+                ring-cap) PEER_NOPUSH_REASON="ring-cap"; PEER_NOPUSH_DETAIL="$(_peer_sd_ring_cap_n)" ;;
+                ring-cap-invalid|ring-cap-unverifiable) PEER_NOPUSH_REASON="$r" ;;
+                "session not found") PEER_NOPUSH_REASON="no-live-pane" ;;
+                *) PEER_NOPUSH_REASON="pane-not-ready"; PEER_NOPUSH_DETAIL="${r:-busy}" ;;
+            esac ;;
+        sent-but-undelivered)
+            PEER_NOPUSH_REASON="push-failed"; PEER_NOPUSH_DETAIL="${r:-unknown}" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
 # Render a PEER_SD_* outcome for `peer reply` / `peer send --deliver`.
 #   $1 = json (bool)   $2 = recipient   $3 = context ("reply" | "send")
 # For context=reply the caller sets PEER_SD_ACK_STATE (acked|skipped|failed) and
@@ -11265,8 +11354,7 @@ _peer_send_deliver_emit() {
             case "$PEER_SD_DELIVER_REASON" in
                 ring-cap)
                     local cap_n
-                    cap_n="$(jq -r '.results[0].ring_cap | "\(.rings_last_hour) of \(.max_rings_per_hour)"' <<< "${PEER_SD_DELIVER_JSON:-null}" 2>/dev/null)" || cap_n=""
-                    [[ "$cap_n" == *" of "* && "$cap_n" != *null* ]] || cap_n="all"
+                    cap_n="$(_peer_sd_ring_cap_n)"
                     hint="Message $PEER_SD_MESSAGE_ID is queued; $to is at its doorbell ring cap ($cap_n rings used in the last hour), so nothing was pushed. It rings once the oldest ring ages out, or $to collects it; do not re-send (that would duplicate it)." ;;
                 ring-cap-invalid|ring-cap-unverifiable)
                     hint="Message $PEER_SD_MESSAGE_ID is queued; nothing was pushed because the doorbell ring cap cannot be checked ($PEER_SD_DELIVER_REASON; see cctrl peer doctor). $to collects it; do not re-send (that would duplicate it)." ;;
@@ -11276,13 +11364,17 @@ _peer_send_deliver_emit() {
         sent-and-queued)
             # Plan 110 S3: the push gate held it.
             if [[ "$PEER_SD_DELIVER_REASON" == "recipient-not-doorbell-enabled" ]]; then
-                warning="Message $PEER_SD_MESSAGE_ID is queued for $to; $to is not doorbell-enabled, so cctrl did not push it. It collects its own mail. Do not re-send or run peer deliver."
+                warning="$(_peer_not_pushed_text "$PEER_SD_MESSAGE_ID" "$to" recipient-not-doorbell-enabled)"
             fi ;;
     esac
     # Plan 108 fix MF1: delivery was the doorbell's default, not asked for.
     # The send succeeded and the message is queued; say so, exit 0.
-    if [[ -n "$implicit" && -n "$hint" ]]; then
-        warning="Message $PEER_SD_MESSAGE_ID is queued for $to. The doorbell's default delivery did not reach the pane (${PEER_SD_DELIVER_REASON:-${PEER_SD_OUTCOME#sent-but-}}); $to's Stop bell or 'cctrl peer deliver $to' picks it up. Do not re-send: that would duplicate it."
+    # mdec-1110 (2): a default delivery is a plain send, so ANY outcome that
+    # did not push gets the shared notice and the pushed/push_skipped_* fields.
+    local nopush_reason="" nopush_detail=""
+    if [[ -n "$implicit" && "$ctx" == "send" ]] && _peer_sd_not_pushed_reason; then
+        nopush_reason="$PEER_NOPUSH_REASON"; nopush_detail="$PEER_NOPUSH_DETAIL"
+        warning="$(_peer_not_pushed_text "$PEER_SD_MESSAGE_ID" "$to" "$nopush_reason" "$nopush_detail")"
         hint=""
     fi
 
@@ -11303,10 +11395,15 @@ _peer_send_deliver_emit() {
           --arg remote "$remote_host" \
           --arg implicit "$implicit" \
           --arg warning "$warning" \
+          --arg nopush "$nopush_reason" \
+          --arg nopush_detail "$nopush_detail" \
           '$base
            + {ok:$ok, outcome:$outcome, delivered:$delivered, to:$to, message_id:($base.id // null)}
            + (if $implicit != "" then {deliver_default:true} else {} end)
            + (if $warning != "" then {warning:$warning} else {} end)
+           + (if $nopush != "" then {pushed:false, push_skipped_reason:$nopush}
+                + (if $nopush_detail != "" then {push_skipped_detail:$nopush_detail} else {} end)
+                + {push_notice:$warning} else {} end)
            + (if $remote != "" then {remote_host:$remote} else {} end)
            + (if $reason != "" then {delivery_reason:$reason} else {} end)
            + (if $hint != "" then {hint:$hint} else {} end)
@@ -11327,7 +11424,7 @@ _peer_send_deliver_emit() {
             sent-but-deferred|sent-but-undelivered)
                 if [[ -n "$warning" ]]; then
                     echo -e "${GREEN}Sent and queued for $to${via}${RESET} (message $PEER_SD_MESSAGE_ID)"
-                    echo -e "${YELLOW}Warning:${RESET} $warning" >&2
+                    echo -e "${YELLOW}Notice:${RESET} $warning" >&2
                 elif [[ "$PEER_SD_OUTCOME" == "sent-but-deferred" ]]; then
                     echo -e "${YELLOW}Sent but deferred${via}${RESET} (message $PEER_SD_MESSAGE_ID). $hint" >&2
                 else
@@ -13047,20 +13144,39 @@ _peer_doorbell_send_defaults_deliver() { # to -> 0 when the send should default 
     #   (_peer_claude_push_ready: idle, no modal, no draft, fail-closed). A
     #   busy pane gets a plain send, and the Stop bell rings at the end of its
     #   turn.
-    local to="$1" roles peer_json role kind target
-    peer_json="$(_peer_resolve_json "$to" 2>/dev/null)" || return 1
-    _peer_has_capability "$peer_json" "tmux" || return 1
-    _peer_doorbell_enabled_for "$peer_json" || return 1
+    # mdec-1110 (2): every non-zero return sets PEER_NOPUSH_REASON (a code
+    # for _peer_not_pushed_text) and PEER_NOPUSH_DETAIL, so a plain send can
+    # say why it queued without a push. Read-only: no mailbox or ring write.
+    local to="$1" roles peer_json role kind target host
+    PEER_NOPUSH_REASON="unknown"; PEER_NOPUSH_DETAIL=""
+    peer_json="$(_peer_resolve_json "$to" 2>/dev/null)" || { PEER_NOPUSH_REASON="unknown-recipient"; return 1; }
+    _peer_has_capability "$peer_json" "tmux" || { PEER_NOPUSH_REASON="no-tmux-pane"; return 1; }
+    host="$(jq -r '.host // "local"' <<< "$peer_json" 2>/dev/null)" || host="local"
+    if [[ "$host" != "local" && "$host" != "${CCTRL_HOST_PREFIX:-local}" ]]; then
+        PEER_NOPUSH_REASON="remote-peer"; PEER_NOPUSH_DETAIL="$host"; return 1
+    fi
+    _peer_doorbell_enabled_for "$peer_json" || { PEER_NOPUSH_REASON="${PEER_PUSH_REASON:-recipient-not-doorbell-enabled}"; return 1; }
     role="$PEER_PUSH_ROLE"; kind="$PEER_PUSH_KIND"; target="$PEER_PUSH_TARGET"
-    [[ -n "$role" && -n "$target" ]] || return 1
+    [[ -n "$target" ]] || { PEER_NOPUSH_REASON="no-tmux-pane"; return 1; }
+    [[ -n "$role" ]] || { PEER_NOPUSH_REASON="role-not-deliver-default"; PEER_NOPUSH_DETAIL="no role"; return 1; }
     roles="$(jq -r '(.deliver_default_roles // ["orchestrator", "fleet-manager"]) | map(tostring) | join(" ")' <<< "$(_peer_doorbell_cfg_json)" 2>/dev/null)" || return 1
-    [[ -n "$roles" ]] || return 1
-    [[ " $roles " == *" $role "* || ( " $roles " == *" fleet-manager "* && "$role" == "orchestrator" && "$kind" == "fleet" ) ]] || return 1
-    command -v tmux >/dev/null 2>&1 || return 1
+    [[ -n "$roles" ]] || { PEER_NOPUSH_REASON="deliver-default-off"; return 1; }
+    [[ " $roles " == *" $role "* || ( " $roles " == *" fleet-manager "* && "$role" == "orchestrator" && "$kind" == "fleet" ) ]] \
+        || { PEER_NOPUSH_REASON="role-not-deliver-default"; PEER_NOPUSH_DETAIL="$role"; return 1; }
+    command -v tmux >/dev/null 2>&1 || { PEER_NOPUSH_REASON="tmux-unavailable"; return 1; }
     # The doorbell is a Claude Stop hook, so only a Claude pane has a bell to
     # fall back on; anything else stays plain.
-    [[ "$PEER_PUSH_AGENT" == "claude" ]] || return 1
-    _peer_claude_push_ready "$target"
+    [[ "$PEER_PUSH_AGENT" == "claude" ]] || { PEER_NOPUSH_REASON="not-claude-pane"; PEER_NOPUSH_DETAIL="${PEER_PUSH_AGENT:-unknown}"; return 1; }
+    if ! _peer_claude_push_ready "$target"; then
+        if [[ "$PEER_DELIVER_READY_REASON" == "session not found" ]]; then
+            PEER_NOPUSH_REASON="no-live-pane"
+        else
+            PEER_NOPUSH_REASON="pane-not-ready"; PEER_NOPUSH_DETAIL="${PEER_DELIVER_READY_REASON:-busy}"
+        fi
+        return 1
+    fi
+    PEER_NOPUSH_REASON=""
+    return 0
 }
 
 _peer_doorbell_write_locked() { # json -> atomic write, mode 600
@@ -13972,6 +14088,8 @@ cmd_peer() {
             echo "  cctrl peer overview [--as NAME] [--json]"
             echo "  cctrl peer send <to> [--as NAME|--from NAME] [--subject TEXT] [--body-file PATH|-] [--allow-unknown] [--deliver|--no-deliver] [--impersonate] [--json] -- <body>"
             echo "                                     With the doorbell enabled, sends to live orchestrator/fleet-manager peers deliver by default"
+            echo "                                     A plain send that queues without a push prints a Notice on stderr (JSON: pushed:false,"
+            echo "                                     push_skipped_reason, push_notice); --no-deliver stays quiet"
             echo "  cctrl peer reply <message-id> [--as NAME|--from NAME] [--subject TEXT] [--body-file PATH|-] [--deliver|--no-deliver] [--no-ack] [--impersonate] [--json] -- <body>"
             echo "  cctrl peer inbox [--as NAME] [--status queued,delivered] [--json]"
             echo "  cctrl peer outbox [--as NAME] [--status STATUS] [--json]"

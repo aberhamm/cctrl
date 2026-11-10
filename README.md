@@ -1430,6 +1430,17 @@ Both report one of five named outcomes so a failure is never silent:
 A delivery failure never rolls the send back. The message stays queued; do not
 re-send, which would duplicate it. MCP `send_message` reports the same outcome.
 
+A plain `peer send` (no `--deliver`) that queues without pushing says so: one
+`Notice:` line on stderr names the recipient and the reason (not
+doorbell-enabled, ring cap, pane not ready, no live pane, push failed, ...)
+and says the recipient must collect its own mail or be woken. With `--json`
+the same send adds `pushed: false`, `push_skipped_reason` (a code such as
+`recipient-not-doorbell-enabled`, `ring-cap`, `pane-not-ready`,
+`no-live-pane`, `push-failed`), `push_skipped_detail` when there is one, and
+`push_notice` (the text); every other field is unchanged and no stderr line is
+printed. A send that pushed prints nothing new, exit codes do not change, and
+`--no-deliver` stays quiet (the sender chose not to push).
+
 Agents that do not have a tmux session can poll the mailbox directly:
 
 ```bash

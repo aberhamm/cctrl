@@ -10880,7 +10880,9 @@ _p5_send() { # mode args... -> P5_RC P5_OUT P5_ERR (stdout/stderr), in a fresh c
 }
 # A send result with the per-run fields (id, seal MAC, attest pane facts)
 # normalized away, for off/warn/enforce comparisons.
-_p5_norm() { jq -S -c 'del(.id, .seal.mac) | .history |= map(del(.at))' 2>/dev/null <<< "$1" || printf '%s' "$1"; }
+# The mdec-1110 (2) notice fields are send output only (never stored), and
+# push_notice carries the message id, so they are dropped like .id.
+_p5_norm() { jq -S -c 'del(.id, .seal.mac, .pushed, .push_skipped_reason, .push_skipped_detail, .push_notice) | .history |= map(del(.at))' 2>/dev/null <<< "$1" || printf '%s' "$1"; }
 
 test_peer_attest_p5_enforce_send_refusal() {
     # Plan 111 phase 5: in enforce only, `peer send --as <local tmux-bound
@@ -10953,9 +10955,10 @@ $ref_out"
                 [[ "$(_p5_norm "$(cat "$P3_C/messages.jsonl")")" == "$(_p5_norm "$P5_OUT")" ]] || fail "p5 $mode [$c]: the mailbox line must be the result"
             fi
         done
-        # Text mode too: same stdout shape, no stderr.
+        # Text mode too: same stdout shape, no attestation stderr (the one
+        # mdec-1110 (2) not-pushed Notice is expected: this plain send queues).
         _p5_send warn "$ROOT/cctrl" peer send orchestrator --as comet -- hi
-        [[ "$P5_RC" -eq 0 && -z "$P5_ERR" ]] || fail "p5 warn text: rc $P5_RC err $P5_ERR"
+        [[ "$P5_RC" -eq 0 && -z "$(printf '%s\n' "$P5_ERR" | grep -v 'so cctrl did not push it' || true)" ]] || fail "p5 warn text: rc $P5_RC err $P5_ERR"
     done
     echo "ok: plan 111 p5 enforce refuses a tmux-bound --as at level none (rc 66 sender-unresolved, CCTRL_ORIGIN_ATTEST ignored); remote/impersonate/user/mailbox-only pass; off and warn unchanged"
 }
@@ -14736,6 +14739,151 @@ test_peer_send_default_deliver_gated() {
     _sdd -- orch1 --from carol --deliver --no-deliver -- x >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 64 ]] || fail "--deliver with --no-deliver must exit 64"
     echo "ok: send defaults to --deliver only for bell-enabled, idle Claude orchestrators; a default failure exits 0"
+}
+
+test_peer_send_not_pushed_notice() {
+    # mdec-1110 (2): a plain `peer send` (no --deliver) that queues without a
+    # push says so for ANY reason: one Notice line on stderr (human), or
+    # pushed:false + push_skipped_reason + push_notice (JSON, nothing on
+    # stderr). A push prints nothing new; --no-deliver stays quiet; exit
+    # codes do not change.
+    make_fake_tmux "$TMPDIR/tmux"
+    local T="$TMPDIR/send-not-pushed" out err rc
+    local data="$T/data" log="$T/tmux.log" sdir="$T/sessions"
+    mkdir -p "$data" "$sdir" "$T/home" "$T/o1" "$T/o2" "$T/w"
+    : > "$log"
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orch1 --dir "$T/o1" --agent claude --session TMUX--orch1 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register orch2 --dir "$T/o2" --agent claude --session TMUX--orch2 >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register wkr --dir "$T/w" --agent claude --session TMUX--wkr >/dev/null
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer register carol --dir "$T/w" --agent claude >/dev/null
+    mkdir -p "$CCTRL_SESSION_METADATA_DIR"
+    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--orch1.json"
+    printf '{"role":"orchestrator","orch_kind":"repo"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--orch2.json"
+    printf '{"role":"worker"}\n' > "$CCTRL_SESSION_METADATA_DIR/TMUX--wkr.json"
+    echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
+    write_claude_transcript "$T/projects/p/s1.jsonl" "Done."
+    _snp() { # extra-env... -- send args...  (stdout -> $out, stderr -> $err, rc -> $rc)
+        local -a envs=()
+        while [[ "$1" != "--" ]]; do envs+=("$1"); shift; done; shift
+        rc=0
+        out="$(env HOME="$T/home" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" TMUX_FAKE_HAS_SESSION="TMUX--orch1 TMUX--orch2 TMUX--wkr" \
+            TMUX_FAKE_CAPTURE_PANE=$'● done.\n────────────────────\n❯ \n────────────────────' \
+            TMUX_FAKE_PANE_PID=12345 CCTRL_CLAUDE_SESSIONS_DIR="$sdir" CCTRL_CLAUDE_PROJECTS_DIR="$T/projects" CCTRL_DATA_DIR="$data" ${envs[@]+"${envs[@]}"} \
+            "$ROOT/cctrl" peer send "$@" 2>"$T/err")" || rc=$?
+        err="$(cat "$T/err")"
+    }
+
+    # 1. Not doorbell-enabled (no doorbell.json): human = stdout unchanged +
+    # one Notice line on stderr naming the recipient and the reason.
+    _snp -- orch1 --from carol -- one
+    [[ "$rc" -eq 0 ]] || fail "not-enabled plain send must exit 0, got $rc"
+    assert_contains "$out" "Queued message:"
+    assert_not_contains "$out" "Notice"
+    [[ "$(printf '%s\n' "$err" | grep -c .)" -eq 1 ]] || fail "expected exactly one stderr line: $err"
+    assert_contains "$err" "Notice:"
+    assert_contains "$err" "queued for orch1; orch1 is not doorbell-enabled, so cctrl did not push it"
+    assert_contains "$err" "orch1 must collect its own mail or be woken"
+    # ...JSON: the new fields, every existing field unchanged, no stderr.
+    _snp -- orch1 --from carol --json -- two
+    [[ "$rc" -eq 0 ]] || fail "not-enabled JSON send must exit 0, got $rc"
+    [[ -z "$err" ]] || fail "JSON send must keep stderr empty: $err"
+    jq -e '.status == "queued" and .to == "orch1" and .from == "carol" and (.id | startswith("msg_")) and .outcome == null
+        and .pushed == false and .push_skipped_reason == "recipient-not-doorbell-enabled" and (has("push_skipped_detail") | not)
+        and (.push_notice | contains("orch1 is not doorbell-enabled")) and (.push_notice | contains("must collect its own mail or be woken"))
+        and (.id as $i | .push_notice | contains($i))' <<< "$out" >/dev/null || fail "not-enabled JSON fields: $out"
+    jq -e 'select(.body == "two") | has("pushed") | not' "$data/messages.jsonl" >/dev/null || fail "the stored message must not carry the notice fields"
+
+    # 2. --no-deliver: quiet (the sender chose it); stdout as before.
+    _snp -- orch1 --from carol --no-deliver -- three
+    [[ "$rc" -eq 0 && -z "$err" ]] || fail "--no-deliver must stay quiet (rc=$rc err=$err)"
+    assert_contains "$out" "Queued message:"
+    _snp -- orch1 --from carol --no-deliver --json -- four
+    [[ "$rc" -eq 0 && -z "$err" ]] || fail "--no-deliver JSON must stay quiet (rc=$rc err=$err)"
+    jq -e '.status == "queued" and (has("pushed") | not) and (has("push_skipped_reason") | not) and (has("push_notice") | not)' <<< "$out" >/dev/null \
+        || fail "--no-deliver JSON must be unchanged: $out"
+
+    # 3. Enabled + idle: the default delivery pushes; nothing new is printed.
+    CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer doorbell enable --peer orch1 --peer wkr >/dev/null
+    : > "$log"
+    _snp CCTRL_NOW_UTC=2026-06-13T00:00:01Z -- orch1 --from carol -- five
+    [[ "$rc" -eq 0 && -z "$err" ]] || fail "a pushed send must print nothing on stderr (rc=$rc err=$err)"
+    assert_contains "$out" "Sent and nudged orch1"
+    assert_contains "$(cat "$log")" "paste-buffer"
+    _snp CCTRL_NOW_UTC=2026-06-13T00:00:03Z -- orch1 --from carol --json -- six
+    [[ "$rc" -eq 0 && -z "$err" ]] || fail "a pushed JSON send must keep stderr empty (rc=$rc err=$err)"
+    jq -e '.outcome == "sent-and-nudged" and (has("pushed") | not) and (has("push_notice") | not) and (has("warning") | not)' <<< "$out" >/dev/null \
+        || fail "a pushed send must add no notice fields: $out"
+
+    # 4. Enabled but busy: pane-not-ready with the readiness detail.
+    echo '{"status":"busy","sessionId":"s1"}' > "$sdir/12345.json"
+    : > "$log"
+    _snp -- orch1 --from carol -- seven
+    [[ "$rc" -eq 0 ]] || fail "busy plain send must exit 0, got $rc"
+    assert_contains "$out" "Queued message:"
+    assert_contains "$err" "orch1's pane is not ready (claude status busy), so cctrl did not push it"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    _snp -- orch1 --from carol --json -- eight
+    jq -e '.pushed == false and .push_skipped_reason == "pane-not-ready" and .push_skipped_detail == "claude status busy"' <<< "$out" >/dev/null \
+        || fail "busy JSON fields: $out"
+    echo '{"status":"idle","sessionId":"s1"}' > "$sdir/12345.json"
+
+    # 5. Enabled but no live session: no-live-pane.
+    _snp TMUX_FAKE_HAS_SESSION="TMUX--orch2" -- orch1 --from carol --json -- nine
+    [[ "$rc" -eq 0 ]] || fail "dead-pane plain send must exit 0, got $rc"
+    jq -e '.pushed == false and .push_skipped_reason == "no-live-pane" and (.push_notice | contains("orch1 has no live tmux session"))' <<< "$out" >/dev/null \
+        || fail "no-live-pane JSON fields: $out"
+
+    # 6. A default delivery whose push fails: push-failed, exit 0 as before.
+    _snp TMUX_FAKE_PASTE_FAIL=1 CCTRL_NOW_UTC=2026-06-13T00:00:09Z -- orch1 --from carol --json -- ten
+    [[ "$rc" -eq 0 ]] || fail "a failed default delivery must still exit 0, got $rc"
+    jq -e '.outcome == "sent-but-undelivered" and .deliver_default == true and .pushed == false and .push_skipped_reason == "push-failed"
+        and .warning == .push_notice and (.push_notice | contains("so cctrl did not push it"))' <<< "$out" >/dev/null \
+        || fail "push-failed JSON fields: $out"
+    _snp TMUX_FAKE_PASTE_FAIL=1 CCTRL_NOW_UTC=2026-06-13T00:00:11Z -- orch1 --from carol -- eleven
+    assert_contains "$out" "Sent and queued for orch1"
+    [[ "$(printf '%s\n' "$err" | grep -c .)" -eq 1 ]] || fail "push-failed: expected exactly one stderr line: $err"
+    assert_contains "$err" "Notice:"
+    assert_contains "$err" "the push into orch1's pane failed"
+
+    # 6b. Ring cap reached (the pushes above spent it): the default delivery
+    # is deferred, nothing is pasted, ring-cap with the count.
+    jq '. + {max_rings_per_hour: 1}' "$data/doorbell.json" > "$T/doorbell.tmp" && mv "$T/doorbell.tmp" "$data/doorbell.json"
+    : > "$log"
+    _snp CCTRL_NOW_UTC=2026-06-13T00:00:30Z -- orch1 --from carol --json -- tencap
+    [[ "$rc" -eq 0 && -z "$err" ]] || fail "ring-cap JSON send must exit 0 with empty stderr (rc=$rc err=$err)"
+    jq -e '.outcome == "sent-but-deferred" and .pushed == false and .push_skipped_reason == "ring-cap"
+        and (.push_skipped_detail | test("^[0-9]+ of 1$"))
+        and (.push_notice | contains("orch1 is at its doorbell ring cap (")) and (.push_notice | contains("must collect its own mail or be woken"))' <<< "$out" >/dev/null \
+        || fail "ring-cap JSON fields: $out"
+    _snp CCTRL_NOW_UTC=2026-06-13T00:00:32Z -- orch1 --from carol -- tencap2
+    [[ "$rc" -eq 0 ]] || fail "ring-cap plain send must exit 0, got $rc"
+    assert_contains "$out" "Sent and queued for orch1"
+    [[ "$(printf '%s\n' "$err" | grep -c .)" -eq 1 ]] || fail "ring-cap: expected exactly one stderr line: $err"
+    assert_contains "$err" "Notice:"
+    assert_contains "$err" "at its doorbell ring cap"
+    assert_not_contains "$(cat "$log")" "paste-buffer"
+    jq 'del(.max_rings_per_hour)' "$data/doorbell.json" > "$T/doorbell.tmp" && mv "$T/doorbell.tmp" "$data/doorbell.json"
+
+    # 7. Enabled for a worker, whose role gets no default delivery.
+    _snp -- wkr --from carol --json -- twelve
+    jq -e '.pushed == false and .push_skipped_reason == "role-not-deliver-default" and .push_skipped_detail == "worker"' <<< "$out" >/dev/null \
+        || fail "worker JSON fields: $out"
+
+    # 8. --allow-unknown never pushes; an unknown recipient says so.
+    _snp -- ghost --from carol --allow-unknown --json -- thirteen
+    [[ "$rc" -eq 0 ]] || fail "--allow-unknown send must exit 0, got $rc"
+    jq -e '.pushed == false and .push_skipped_reason == "unknown-recipient"' <<< "$out" >/dev/null || fail "unknown recipient JSON: $out"
+    _snp -- orch2 --from carol --allow-unknown --json -- fourteen
+    jq -e '.pushed == false and .push_skipped_reason == "allow-unknown"' <<< "$out" >/dev/null || fail "--allow-unknown JSON: $out"
+
+    # 9. Explicit --deliver to a not-enabled recipient keeps its shape and
+    # uses the same text.
+    _snp -- orch2 --from carol --deliver --json -- fifteen
+    [[ "$rc" -eq 0 ]] || fail "explicit --deliver to a not-enabled peer must exit 0, got $rc"
+    jq -e '.outcome == "sent-and-queued" and .delivery_reason == "recipient-not-doorbell-enabled" and (has("pushed") | not)
+        and (.warning | contains("orch2 is not doorbell-enabled, so cctrl did not push it"))' <<< "$out" >/dev/null \
+        || fail "explicit --deliver not-enabled JSON: $out"
+    echo "ok: plain peer send says when it queued without a push (stderr Notice / JSON fields); pushes and --no-deliver stay quiet"
 }
 
 test_peer_watch_since_floor() {
