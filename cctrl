@@ -385,6 +385,10 @@ _TMUX_LOC_CACHE=""
 _TMUX_LOC_AT=-1
 _TMUX_LOC_KEY=""
 _TMUX_LOC_RESULT=""
+_TMUX_LOC_TTL=5
+# Whole seconds that bound each route probe (has-session) while set; the
+# timeout wrappers set it (dynamically scoped) around their route resolution.
+_TMUX_PROBE_SECS=""
 
 # tmux's own socket dir for -L names: $TMUX_TMPDIR (or /tmp)/tmux-UID, physical.
 _tmux_socket_dir() {
@@ -557,12 +561,21 @@ _tmux_servers() {
 # N4: a short-lived name->server map, primed once per process by listings
 # that make many named calls (session ls, prune). A hit routes with no probe;
 # a miss (a session newer than the map) probes every server live. It lives
-# CCTRL_TMUX_ROUTE_CACHE_SECONDS (default 5) and is dropped when this shell
-# runs new-session, kill-session or rename-session, or when $TMUX changes.
-# Destructive actions resolve holders live (_tmux_session_holders), never here.
+# CCTRL_TMUX_ROUTE_CACHE_SECONDS (default 5; 0 = no cache) and is dropped when
+# this shell runs new-session, kill-session or rename-session, or when $TMUX
+# changes. Destructive actions resolve holders live (_tmux_session_holders),
+# never here.
 _tmux_route_cache_drop() { _TMUX_LOC_CACHE=""; _TMUX_LOC_AT=-1; }
+# The map's lifetime in seconds into _TMUX_LOC_TTL (no fork: it runs per call).
+_tmux_route_cache_ttl_into() {
+    _TMUX_LOC_TTL="${CCTRL_TMUX_ROUTE_CACHE_SECONDS:-5}"
+    [[ "$_TMUX_LOC_TTL" =~ ^[0-9]+$ ]] || _TMUX_LOC_TTL=5
+    _TMUX_LOC_TTL=$((10#$_TMUX_LOC_TTL))
+}
 _tmux_route_cache_prime() {
     _tmux_routing_active || return 0
+    _tmux_route_cache_ttl_into
+    (( _TMUX_LOC_TTL > 0 )) || { _tmux_route_cache_drop; return 0; }
     _tmux_servers_refresh
     local s n map=""
     while IFS= read -r s; do
@@ -578,13 +591,13 @@ _tmux_route_cache_prime() {
 # <session name> -> _TMUX_LOC_RESULT, the socket of the server that holds it
 # (exact match, primary first); rc 1 if none.
 _tmux_locate_into() {
-    local name="${1#=}" s line ttl="${CCTRL_TMUX_ROUTE_CACHE_SECONDS:-5}"
+    local name="${1#=}" s line
     name="${name%%:*}"
     _TMUX_LOC_RESULT=""
     [[ -n "$name" ]] || return 1
     _tmux_servers_refresh
-    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=5
-    if (( _TMUX_LOC_AT >= 0 && SECONDS - _TMUX_LOC_AT <= ttl )) && [[ "$_TMUX_LOC_KEY" == "$_TMUX_SRV_KEY" ]]; then
+    _tmux_route_cache_ttl_into
+    if (( _TMUX_LOC_TTL > 0 && _TMUX_LOC_AT >= 0 && SECONDS - _TMUX_LOC_AT <= _TMUX_LOC_TTL )) && [[ "$_TMUX_LOC_KEY" == "$_TMUX_SRV_KEY" ]]; then
         while IFS= read -r line; do
             if [[ -n "$line" && "${line%%$'\t'*}" == "$name" ]]; then
                 _TMUX_LOC_RESULT="${line#*$'\t'}"
@@ -594,12 +607,24 @@ _tmux_locate_into() {
     fi
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
-        if command tmux -S "$s" has-session -t "=$name" 2>/dev/null; then
+        if _tmux_probe_has "$s" "=$name"; then
             _TMUX_LOC_RESULT="$s"
             return 0
         fi
     done <<< "$_TMUX_SRV_LIST"
     return 1
+}
+
+# has-session TARGET on server SOCK. Bounded by perl's alarm while
+# _TMUX_PROBE_SECS is set (the timeout wrappers), so a wedged server cannot
+# hang route resolution; a probe that times out reads as "not there".
+_tmux_probe_has() { # SOCK TARGET
+    if [[ -n "${_TMUX_PROBE_SECS:-}" ]] && command -v perl >/dev/null 2>&1; then
+        perl -e '$SIG{ALRM}="DEFAULT"; alarm shift @ARGV; exec { $ARGV[0] } @ARGV or exit 127' "$_TMUX_PROBE_SECS" \
+            tmux -S "$1" has-session -t "$2" 2>/dev/null
+    else
+        command tmux -S "$1" has-session -t "$2" 2>/dev/null
+    fi
 }
 
 # Every server that holds session NAME (exact), one per line. Live probes,
@@ -612,14 +637,18 @@ _tmux_session_holders() {
     _tmux_servers_refresh
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
-        if command tmux -S "$s" has-session -t "=$name" 2>/dev/null; then printf '%s\n' "$s"; fi
+        if _tmux_probe_has "$s" "=$name"; then printf '%s\n' "$s"; fi
     done <<< "$_TMUX_SRV_LIST"
     return 0
 }
 
 # N2: refuse a destructive ACTION on a session NAME that more than one
 # server holds (the name alone cannot say which copy is meant). rc 75.
-_tmux_refuse_ambiguous() { # NAME ACTION
+# _tmux_check_unambiguous sets _TMUX_AMBIG_MSG and returns 75 instead of
+# printing (paste paths put it in their delivery reason).
+_TMUX_AMBIG_MSG=""
+_tmux_check_unambiguous() { # NAME ACTION
+    _TMUX_AMBIG_MSG=""
     _tmux_routing_active || return 0
     local holders s n=0 labels=""
     holders="$(_tmux_session_holders "$1")"
@@ -629,7 +658,12 @@ _tmux_refuse_ambiguous() { # NAME ACTION
         labels+="${labels:+, }$(_tmux_server_label "$s") ($s)"
     done <<< "$holders"
     (( n > 1 )) || return 0
-    echo "cctrl: session '$1' exists on $n tmux servers: $labels; refusing to $2 it by name. Rename one copy (tmux -S <socket> rename-session -t '=$1' NEW) and retry." >&2
+    _TMUX_AMBIG_MSG="cctrl: session '$1' exists on $n tmux servers: $labels; refusing to $2 it by name. Rename one copy (tmux -S <socket> rename-session -t '=$1' NEW) and retry."
+    return 75
+}
+_tmux_refuse_ambiguous() { # NAME ACTION
+    _tmux_check_unambiguous "$1" "$2" && return 0
+    echo "$_TMUX_AMBIG_MSG" >&2
     return 75
 }
 
@@ -728,7 +762,7 @@ _tmux_route() {
         _tmux_servers_refresh
         while IFS= read -r s; do
             [[ -n "$s" ]] || continue
-            if command tmux -S "$s" has-session -t "$sess" 2>/dev/null; then _TMUX_RT_SOCK="$s"; break; fi
+            if _tmux_probe_has "$s" "$sess"; then _TMUX_RT_SOCK="$s"; break; fi
         done <<< "$_TMUX_SRV_LIST"
         if [[ -z "$_TMUX_RT_SOCK" ]]; then _tmux_home_into; _TMUX_RT_SOCK="$_TMUX_HOME"; fi
     fi
@@ -757,13 +791,12 @@ _tmux_primary_alive() {
 }
 
 # B2: the one-line refusal when the primary is down. The how-to-start hint is
-# CCTRL_TMUX_PRIMARY_START_HINT, else config tmuxPrimaryStartHint, else the
-# fleet default below.
+# CCTRL_TMUX_PRIMARY_START_HINT, else config tmuxPrimaryStartHint (where a
+# site puts its own launcher and runbook), else the generic default below.
 _tmux_primary_down_error() {
     local hint="${CCTRL_TMUX_PRIMARY_START_HINT:-}" got
     if [[ -z "$hint" ]] && got="$(_tmux_config_value tmuxPrimaryStartHint)"; then hint="${got%%$'\t'*}"; fi
-    # shellcheck disable=SC2016 # $(id -u) is printed for the user to run
-    [[ -n "$hint" ]] || hint='launchctl kickstart gui/$(id -u)/com.fleet-tmux-terminal, or double-click ~/scripts/fleet-tmux/start-fleet-tmux.command; runbook ~/dev/homelab/docs/runbooks/fleet-tmux-terminal.md'
+    [[ -n "$hint" ]] || hint='start the primary tmux server from Terminal (see docs/tmux-second-server.md)'
     echo "cctrl: the primary tmux server '$(_tmux_server_label "$_CCTRL_TMUX_PRIMARY")' ($_CCTRL_TMUX_PRIMARY) is not running and cctrl will not start it; it must be started from Terminal, not by cctrl: $hint" >&2
 }
 
@@ -9821,15 +9854,25 @@ _peer_has_capability() {
     jq -e --arg c "$capability" '(.capabilities // []) | index($c)' <<< "$peer_json" >/dev/null 2>&1
 }
 
+# Routed (mdec-1110): resolve the server here, in the caller, with each route
+# probe bounded by TIMEOUT (perl alarm), so the background job does nothing
+# but exec the real client and a timeout kill always hits tmux itself, never
+# a subshell that would leave the client running (N1). Sets _TMUX_ARGV.
+_tmux_timeout_argv() { # TIMEOUT TMUX-ARGS...
+    local _TMUX_PROBE_SECS=""
+    [[ "$1" =~ ^[1-9][0-9]*$ ]] && _TMUX_PROBE_SECS="$1"
+    shift
+    _tmux_argv "$@"
+}
+
 _tmux_run_with_timeout() {
     local timeout="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}" pid start now rc tmpout tmperr
     tmpout="$(mktemp)"
     tmperr="$(mktemp)"
-    # Routed (mdec-1110): resolve the server in the background job, then exec
-    # the real client, so a timeout kill hits tmux itself, never a subshell
-    # that would leave the client running (N1). Unset: the plain binary.
+    # Routed: _tmux_timeout_argv resolves the server first. Unset: plain binary.
     if _tmux_routing_active; then
-        ( _tmux_argv "$@"; exec "${_TMUX_ARGV[@]}" ) >"$tmpout" 2>"$tmperr" &
+        _tmux_timeout_argv "$timeout" "$@"
+        ( exec "${_TMUX_ARGV[@]}" ) >"$tmpout" 2>"$tmperr" &
     else
         tmux "$@" >"$tmpout" 2>"$tmperr" &
     fi
@@ -9837,7 +9880,9 @@ _tmux_run_with_timeout() {
     start="$(date +%s)"
     while kill -0 "$pid" 2>/dev/null; do
         now="$(date +%s)"
-        if (( now - start >= timeout )); then
+        # Strictly more than TIMEOUT whole-second ticks: `date +%s` has 1 s
+        # granularity, so `>=` could fire after almost no time at all.
+        if (( now - start > timeout )); then
             kill "$pid" 2>/dev/null || true
             sleep 0.05
             kill -9 "$pid" 2>/dev/null || true
@@ -9864,7 +9909,8 @@ _tmux_run_stdin_with_timeout() {
     tmperr="$(mktemp)"
     printf '%s' "$input" > "$tmpin"
     if _tmux_routing_active; then
-        ( _tmux_argv "$@"; exec "${_TMUX_ARGV[@]}" ) <"$tmpin" >"$tmpout" 2>"$tmperr" &
+        _tmux_timeout_argv "$timeout" "$@"
+        ( exec "${_TMUX_ARGV[@]}" ) <"$tmpin" >"$tmpout" 2>"$tmperr" &
     else
         tmux "$@" <"$tmpin" >"$tmpout" 2>"$tmperr" &
     fi
@@ -9872,7 +9918,7 @@ _tmux_run_stdin_with_timeout() {
     start="$(date +%s)"
     while kill -0 "$pid" 2>/dev/null; do
         now="$(date +%s)"
-        if (( now - start >= timeout )); then
+        if (( now - start > timeout )); then
             kill "$pid" 2>/dev/null || true
             sleep 0.05
             kill -9 "$pid" 2>/dev/null || true
@@ -10210,7 +10256,20 @@ _tmux_paste_buffer_name() {
     printf 'cctrl-%s-%s-%s-%s-%s' "$kind" "$owner" "$(date +%s)" "$$" "$RANDOM$RANDOM"
 }
 
-_peer_tmux_paste() { _tmux_with_pin "$1" _peer_tmux_paste_on_server "$@"; }
+# Routing on: a name held by more than one server is refused before anything
+# is loaded or pasted (the copy that would get the text is a guess); the
+# route probes are bounded like the paste itself.
+_peer_tmux_paste() {
+    if _tmux_routing_active; then
+        local _TMUX_PROBE_SECS=""
+        [[ "${CCTRL_TMUX_TIMEOUT_SECONDS:-5}" =~ ^[1-9][0-9]*$ ]] && _TMUX_PROBE_SECS="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}"
+        if ! _tmux_check_unambiguous "$1" "paste into"; then
+            PEER_DELIVER_REASON="$_TMUX_AMBIG_MSG"
+            return 1
+        fi
+    fi
+    _tmux_with_pin "$1" _peer_tmux_paste_on_server "$@"
+}
 _peer_tmux_paste_on_server() {
     local target="$1" buffer="$2" payload="$3" submit="${4:-true}"
     if ! _tmux_run_stdin_with_timeout "$payload" load-buffer -b "$buffer" -; then
@@ -15142,7 +15201,17 @@ _session_cmd_mcp() {
     exec python3 "$SCRIPT_DIR/lib/runtime_mcp.py" --session "$session" --cctrl "$SCRIPT_DIR/cctrl"
 }
 
-_session_tmux_paste() { _tmux_with_pin "$1" _session_tmux_paste_on_server "$@"; }
+_session_tmux_paste() { # same ambiguity refusal as _peer_tmux_paste
+    if _tmux_routing_active; then
+        local _TMUX_PROBE_SECS=""
+        [[ "${CCTRL_TMUX_TIMEOUT_SECONDS:-5}" =~ ^[1-9][0-9]*$ ]] && _TMUX_PROBE_SECS="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}"
+        if ! _tmux_check_unambiguous "$1" "paste into"; then
+            SESSION_SAY_REASON="$_TMUX_AMBIG_MSG"
+            return 1
+        fi
+    fi
+    _tmux_with_pin "$1" _session_tmux_paste_on_server "$@"
+}
 _session_tmux_paste_on_server() {
     # Generic tmux buffer paste (+ optional Enter). A session-scoped twin of
     # _peer_tmux_paste, kept deliberately separate: `session say` shares no
@@ -16298,6 +16367,9 @@ _task_tmux_rows_json_readonly() {
             errors+=("$(jq -nc --arg value "$line" '{error:"invalid-session-identity",value:$value}')")
             continue
         fi
+        # A placeholder (server keeper, routing on only) is not a task: it is
+        # left out of the catalogue, so snapshot and task ls never carry it.
+        _tmux_is_placeholder "$name" && continue
         cwd="$(tmux list-panes -t "=$name:" -F '#{pane_current_path}' 2>/dev/null | head -1)" || cwd=""
         pane_raw="$(tmux list-panes -t "=$name:" -F '#{pane_id}:#{pane_pid}' 2>/dev/null | head -1)" || pane_raw=""
         if [[ -z "$cwd" && -z "$pane_raw" ]]; then
@@ -17438,6 +17510,8 @@ _session_repair_bridge() {
     # swallows keystrokes) and clear any partial input. Returns the new
     # bridgeSessionId on success, non-zero if it never registers.
     local sess="$1" pid after i
+    # A name on more than one server: send nothing (which copy is a guess).
+    _tmux_refuse_ambiguous "$sess" "send /rc to" || return $?
     pid="$(_session_claude_pid "$sess")"
     tmux send-keys -t "=$sess:" -X cancel 2>/dev/null || true
     tmux send-keys -t "=$sess:" C-u 2>/dev/null || true
@@ -17520,6 +17594,10 @@ _session_realign() {
     # relaunch command is appended to it and NOTHING is killed or relaunched, so
     # the harness can assert on the exact argv without touching a real session.
     local name="$1" target="$2" sid="$3" purpose="$4"
+    # Routing on: never kill-and-relaunch a placeholder or a name held by more
+    # than one server (which copy would die is a guess); rc 75.
+    _tmux_refuse_placeholder "$name" realign || return $?
+    _tmux_refuse_ambiguous "$name" realign || return $?
     if [[ -n "${CCTRL_DOCTOR_RELAUNCH_LOG:-}" ]]; then
         _session_realign_cmd "$name" "$target" "$sid" "$purpose" with-role >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
         printf '\n' >> "$CCTRL_DOCTOR_RELAUNCH_LOG"
@@ -17571,8 +17649,11 @@ _session_doctor() {
     done
 
     local -a names=()
-    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
-        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    while IFS= read -r a; do
+        [[ -n "$a" ]] || continue
+        _tmux_is_placeholder "$a" && continue  # server keeper (routing on only)
+        names+=("$a")
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
     # Pre-pass: collect every live bridgeSessionId so we can detect collisions —
     # two sessions sharing one id means they fought over the same bridge name
@@ -18579,7 +18660,11 @@ _session_attach() {
     local -a sessions=()
     local s choice i
     while IFS= read -r s; do
-        [[ -n "$s" ]] && sessions+=("$s")
+        [[ -n "$s" ]] || continue
+        # The picker (and the partial match below) never offers a placeholder
+        # (server keeper, routing on only); attaching by its exact name works.
+        [[ "$attach_target" == "__picker__" ]] && _tmux_is_placeholder "$s" && continue
+        sessions+=("$s")
     done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
     if [[ ${#sessions[@]} -eq 0 ]]; then
@@ -18615,13 +18700,14 @@ _session_attach() {
     # Partial match
     local -a matches=()
     for s in "${sessions[@]}"; do
+        _tmux_is_placeholder "$s" && continue
         [[ "$s" == *"$attach_target"* ]] && matches+=("$s")
     done
 
     if [[ ${#matches[@]} -eq 0 ]]; then
         echo -e "${RED}No session matching '$attach_target'.${RESET}" >&2
         echo -e "${BOLD}Active sessions:${RESET}"
-        for s in "${sessions[@]}"; do echo "  $s"; done
+        for s in "${sessions[@]}"; do _tmux_is_placeholder "$s" || echo "  $s"; done
         return 1
     elif [[ ${#matches[@]} -eq 1 ]]; then
         _tmux_exec attach-session -t "=${matches[0]}"
@@ -19271,7 +19357,10 @@ _session_kill_on_server() {
     for arg in "$@"; do
         case "$arg" in
             --keep-restorable) keep_restorable=true ;;
-            --force) ;;  # only lifts the placeholder refusal (_session_kill)
+            # Routing on: --force only lifts the placeholder refusal
+            # (_session_kill). Routing off it is an ordinary word, as before
+            # mdec-1110 (so `kill --force X` still names "--force").
+            --force) _tmux_routing_active || { [[ -z "$kill_target" ]] && kill_target="$arg"; } ;;
             *) [[ -z "$kill_target" ]] && kill_target="$arg" ;;
         esac
     done

@@ -63,11 +63,23 @@ still fails closed. Older tmux gets the check only. The refusal is one stderr li
 69, and no socket is created:
 
 ```
-cctrl: the primary tmux server 'fleet' (/private/tmp/tmux-501/fleet) is not running and cctrl will not start it; it must be started from Terminal, not by cctrl: launchctl kickstart gui/$(id -u)/com.fleet-tmux-terminal, or double-click ~/scripts/fleet-tmux/start-fleet-tmux.command; runbook ~/dev/homelab/docs/runbooks/fleet-tmux-terminal.md
+cctrl: the primary tmux server 'fleet' (/private/tmp/tmux-501/fleet) is not running and cctrl will not start it; it must be started from Terminal, not by cctrl: start the primary tmux server from Terminal (see docs/tmux-second-server.md)
 ```
 
-The text after the last colon is the default hint (the runbook lives in the homelab repo,
-not here); set `tmuxPrimaryStartHint` / `CCTRL_TMUX_PRIMARY_START_HINT` to replace it.
+The text after the last colon is the hint. The default above is generic on purpose; a site
+names its own launcher and runbook with `tmuxPrimaryStartHint` (config) or
+`CCTRL_TMUX_PRIMARY_START_HINT` (env, wins). Example site config (illustrative: the launch
+agent label, `.command` file and runbook path are one site's own, not something cctrl ships),
+in `data/config.local.json` or `~/.config/cctrl/config.json`:
+
+```json
+{
+  "tmuxServer": "fleet",
+  "tmuxPrimaryStartHint": "launchctl kickstart gui/$(id -u)/com.example.fleet-tmux, or double-click ~/scripts/fleet-tmux/start-fleet-tmux.command; runbook ~/dev/site-docs/runbooks/fleet-tmux-terminal.md"
+}
+```
+
+The hint is printed verbatim (`$(id -u)` is for the reader to run; cctrl does not expand it).
 The read paths (list, has-session, display, show-options, the python helpers'
 list-sessions) never start a server. With tmuxServer unset nothing changes: plain
 `tmux new-session` starts the default server as it always did.
@@ -77,8 +89,10 @@ list-sessions) never start a server. With tmuxServer unset nothing changes: plai
 A session such as `fleet-anchor` that only keeps the fleet server alive is a placeholder.
 With a primary set, a session named in `tmuxPlaceholderSessions` (default `["fleet-anchor"]`):
 
-- is not listed by `session ls` (human or `--json`), so it is not a worker, not in
-  `peer ls`, and not snapshotted;
+- is not listed by `session ls` (human or `--json`), so it is not a worker and not in
+  `peer ls`;
+- is left out of the task catalogue, so `task ls` and `session snapshot` never carry it;
+- is not listed or audited by `session doctor`;
 - does not count in the `tmux servers:` line or `session servers` counts;
 - is never a prune candidate and does not count toward prune's cap;
 - is never restored into (a snapshot row naming it is demoted with reason
@@ -86,14 +100,18 @@ With a primary set, a session named in `tmuxPlaceholderSessions` (default `["fle
 - is refused by `session close` and `session kill` unless `--force`, with a message that it
   is the server keeper (`prune --yes` goes through close, so it is refused there too).
 
-`session attach fleet-anchor` still works.
+`session attach fleet-anchor` (its exact name) still works; `session attach` with no
+argument, and a partial-name attach, never pick it.
 
 ## Duplicate names
 
 New names must be free on every server, but a duplicate can still appear (a manual
 `tmux -L fleet new -s X`, another TMUX_TMPDIR). When a session name exists on more than one
-server, `session close NAME`, `session stop NAME` (close's alias), `session kill NAME` and
-`prune --yes` refuse with rc 75 and an error naming every server that holds it. Self-close
+server, `session close NAME`, `session stop NAME` (close's alias), `session kill NAME`,
+`prune --yes` and `session doctor --fix`'s realign refuse with rc 75 and an error naming every
+server that holds it. Text sends refuse it too and send nothing to either copy: peer delivery
+(`peer send`/`reply`/doorbell paste) fails with that error as its delivery reason, `session say`
+fails with it, and doctor's `/rc` bridge repair skips the session (`repair-failed`). Self-close
 (`cctrl close` with no name) sends every call about the caller's own session to the `$TMUX`
 server, so the copy elsewhere is never touched. `stop-exact` is unaffected: its execution id
 names the server instance.
@@ -102,13 +120,19 @@ names the server instance.
 
 `session ls` and `prune` prime a name->server map with one `list-sessions` per server, so
 each per-row named call routes with no probe. The map lives `CCTRL_TMUX_ROUTE_CACHE_SECONDS`
-(default 5) and is dropped when the same shell runs `new-session`, `kill-session` or
+(default 5; `0` turns the map off, so every named call probes live) and is dropped when the
+same shell runs `new-session`, `kill-session` or
 `rename-session`, or when `$TMUX` changes. A name missing from the map is probed live on every
 server. Destructive actions resolve holders live, never from the map. The server list itself
 is computed once per process (again only if `$TMUX` changes).
 
-Timeout-wrapped calls (`_tmux_run_with_timeout`) resolve the server in the background job and
-then `exec` the real tmux client, so a timeout kill reaches the client itself.
+Timeout-wrapped calls (`_tmux_run_with_timeout`, `_tmux_run_stdin_with_timeout`) resolve the
+server in the caller first, each route probe bounded by `CCTRL_TMUX_TIMEOUT_SECONDS` (perl
+`alarm`; a probe that times out reads as "not on that server"). The background job then only
+`exec`s the real tmux client, so a timeout kill always reaches the client itself. The deadline
+counts whole `date +%s` seconds and fires only when strictly more than the timeout has passed,
+so a call always gets at least the full timeout (at most one second more). That deadline rule
+applies with `tmuxServer` unset too.
 
 ## Inspect
 

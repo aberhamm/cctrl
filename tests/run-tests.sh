@@ -24320,6 +24320,12 @@ test_tmux_server_unset_is_plain() {
     assert_contains "$out" "tmux|new-session|-d|-s|y|cmd|"
     out="$("$ROOT/cctrl" session servers --json)"
     jq -e '.configured == false and .servers == []' <<< "$out" >/dev/null || fail "unset servers json: $out"
+    # NIT-6: routing off, --force is an ordinary word as at 782fcea: a leading
+    # --force is the target; a trailing one is ignored.
+    out="$(cctrl_source_eval '_session_kill --force srv2-kf-none' 2>&1 || true)"
+    assert_contains "$out" "No session named '--force'"
+    out="$(cctrl_source_eval '_session_kill srv2-kf-none --force' 2>&1 || true)"
+    assert_contains "$out" "No session named 'srv2-kf-none'"
     # The start path's tmux argv is unchanged (fake tmux logs every call).
     make_fake_tmux "$TMPDIR/tmux"
     local project="$TMPDIR/srv2-plain-project" log="$TMPDIR/srv2-plain.log"
@@ -24518,9 +24524,11 @@ test_tmux_server_never_starts_primary() (
     [[ "$(printf '%s\n' "$out" | grep -c .)" -eq 1 ]] || fail "the refusal is not one line: $out"
     assert_contains "$out" "primary tmux server 'fleet' ($SRV2_NEW) is not running and cctrl will not start it"
     assert_contains "$out" "must be started from Terminal, not by cctrl"
-    assert_contains "$out" 'launchctl kickstart gui/$(id -u)/com.fleet-tmux-terminal'
-    assert_contains "$out" "start-fleet-tmux.command"
-    assert_contains "$out" "docs/runbooks/fleet-tmux-terminal.md"
+    # The default hint is generic (public repo): no site launcher or runbook.
+    assert_contains "$out" "not by cctrl: start the primary tmux server from Terminal (see docs/tmux-second-server.md)"
+    assert_not_contains "$out" "launchctl"
+    assert_not_contains "$out" "homelab"
+    assert_not_contains "$out" ".command"
     [[ ! -e "$SRV2_NEW" ]] || fail "a refused new-session created the primary socket"
     # Old tmux (no -N): the pre-check alone still refuses.
     rc=0; out="$(cctrl_source_eval '_TMUX_HAS_N=no; tmux new-session -d -s srv2-nope "sleep 5"' 2>&1)" || rc=$?
@@ -24534,6 +24542,10 @@ test_tmux_server_never_starts_primary() (
     printf '{"tmuxPrimaryStartHint":"cfg-starter"}\n' > "$SRV2_DIR/hint.json"
     out="$(CCTRL_CONFIG_LOCAL="$SRV2_DIR/hint.json" cctrl_source_eval 'tmux new-session -d -s q' 2>&1 || true)"
     assert_contains "$out" "not by cctrl: cfg-starter"
+    # A site hint (launchctl + .command + runbook, as in the docs example) is printed verbatim.
+    printf '%s\n' '{"tmuxPrimaryStartHint":"launchctl kickstart gui/$(id -u)/com.example.fleet-tmux, or double-click ~/x.command; runbook ~/r.md"}' > "$SRV2_DIR/hint2.json"
+    out="$(CCTRL_CONFIG_LOCAL="$SRV2_DIR/hint2.json" cctrl_source_eval 'tmux new-session -d -s q' 2>&1 || true)"
+    assert_contains "$out" 'not by cctrl: launchctl kickstart gui/$(id -u)/com.example.fleet-tmux, or double-click ~/x.command; runbook ~/r.md'
     # cctrl start refuses before writing metadata, and starts nothing.
     make_fake_agent "$SRV2_DIR/codex" codex
     mkdir -p "$SRV2_DIR/srv2-dead"
@@ -24575,6 +24587,22 @@ test_tmux_placeholder_sessions() (
     assert_not_contains "$out" "fleet-anchor"
     out="$("$ROOT/cctrl" session prune --older-than 0s --json 2>/dev/null)"
     assert_not_contains "$out" "fleet-anchor"
+    # Task catalogue (so snapshot and task ls): no placeholder row.
+    out="$(cctrl_source_eval '_task_tmux_rows_json_readonly')"
+    jq -e '.status == "available" and ([.rows[].name] == ["ph-old"])' <<< "$out" >/dev/null || fail "task catalogue carries the placeholder: $out"
+    # session doctor never looks at it.
+    out="$(cctrl_source_eval '_session_agent_cmd() { echo "saw:$1" >&2; }; _session_doctor --json >/dev/null || true' 2>&1)"
+    assert_contains "$out" "saw:ph-old"
+    assert_not_contains "$out" "saw:fleet-anchor"
+    # attach: the picker never picks it (ph-old is the only offer, so it attaches
+    # straight away); a partial name skips it; its exact name still attaches.
+    out="$(cctrl_source_eval '_tmux_exec() { echo "exec:$*"; exit 0; }; _session_attach __picker__' </dev/null 2>&1)"
+    [[ "$out" == "exec:attach-session -t =ph-old" ]] || fail "attach picker offered the placeholder: $out"
+    rc=0; out="$(cctrl_source_eval '_tmux_exec() { echo "exec:$*"; exit 0; }; _session_attach anchor' </dev/null 2>&1)" || rc=$?
+    assert_not_contains "$out" "exec:"
+    assert_not_contains "$out" "fleet-anchor"
+    out="$(cctrl_source_eval '_tmux_exec() { echo "exec:$*"; exit 0; }; _session_attach fleet-anchor' </dev/null 2>&1)"
+    [[ "$out" == "exec:attach-session -t =fleet-anchor" ]] || fail "attach by the placeholder's exact name failed: $out"
     rc=0; out="$("$ROOT/cctrl" session kill fleet-anchor 2>&1)" || rc=$?
     [[ "$rc" -eq 75 ]] || fail "kill of the placeholder: rc $rc (want 75): $out"
     assert_contains "$out" "server keeper"
@@ -24655,6 +24683,27 @@ test_tmux_server_ambiguous_names() (
     [[ "$out" == "$SRV2_OLD"$'\n'"$SRV2_NEW" ]] || fail "forced-server routing is wrong: $out"
     out="$(cctrl_source_eval 'tmux display-message -p -t "=dup:" "#{socket_path}"')"
     [[ "$out" == "$SRV2_NEW" ]] || fail "unforced duplicate should resolve primary first: $out"
+    # NIT-4: doctor --fix realign, paste (peer delivery and say) and /rc repair
+    # refuse a duplicate name and send nothing (the tmux log shows no call).
+    rc=0; out="$(cctrl_source_eval '_launch_detached() { echo LAUNCHED; }; _session_realign dup /tmp sid-1 ""' 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "realign of a duplicate name: rc $rc (want 75): $out"
+    assert_contains "$out" "refusing to realign it by name"
+    assert_not_contains "$out" "LAUNCHED"
+    "$tt" -S "$SRV2_NEW" has-session -t '=dup' && "$tt" -S "$SRV2_OLD" has-session -t '=dup' || fail "a refused realign killed a copy"
+    out="$(cctrl_source_eval '_tmux_run_with_timeout() { echo "SENT:$*"; return 0; }; _tmux_run_stdin_with_timeout() { echo "SENT:$*"; return 0; }
+        r=0; _peer_tmux_paste dup buf-x payload true || r=$?; echo "peer-rc=$r reason=$PEER_DELIVER_REASON"
+        r=0; _session_tmux_paste dup buf-y payload true || r=$?; echo "say-rc=$r reason=$SESSION_SAY_REASON"' 2>&1)"
+    assert_not_contains "$out" "SENT:"
+    assert_contains "$out" "peer-rc=1 reason=cctrl: session 'dup' exists on 2 tmux servers"
+    assert_contains "$out" "say-rc=1 reason=cctrl: session 'dup' exists on 2 tmux servers"
+    rc=0; out="$(cctrl_source_eval 'tmux() { echo "SENT:$*"; }; _session_repair_bridge dup' 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "/rc repair of a duplicate name: rc $rc (want 75): $out"
+    assert_not_contains "$out" "SENT:"
+    # A unique name still pastes (the refusal is only for duplicates).
+    out="$(cctrl_source_eval '_tmux_run_with_timeout() { echo "SENT:$*"; return 0; }; _tmux_run_stdin_with_timeout() { echo "SENT:$*"; return 0; }
+        r=0; _session_tmux_paste fleet-anchor buf-z payload false || r=$?; echo "rc=$r"' 2>&1)"
+    assert_contains "$out" "SENT:paste-buffer -p -r -b buf-z -t =fleet-anchor:"
+    assert_contains "$out" "rc=0"
     echo "ok: duplicate session names across servers are refused; forced server stays on its copy"
 )
 
@@ -24709,13 +24758,32 @@ test_tmux_server_route_cache_and_paths() (
     printf '#!/usr/bin/env bash\ncase " $* " in *" display-message "*) echo $$ > %q; exec sleep 30 ;; esac\nexec %q "$@"\n' \
         "$SRV2_DIR/hung.pid" "$tt" > "$SRV2_DIR/tmux"
     chmod +x "$SRV2_DIR/tmux"
+    # Robust under load (BLOCKING-1): a 2 s budget, a primed route map, and
+    # the route is resolved before the fork, so the job only execs the client.
     rc=0
-    PATH="$SRV2_DIR:$PATH" CCTRL_TMUX_TIMEOUT_SECONDS=1 cctrl_source_eval '_tmux_run_with_timeout display-message -p -t "=c-old:" x' >/dev/null 2>&1 || rc=$?
+    PATH="$SRV2_DIR:$PATH" CCTRL_TMUX_TIMEOUT_SECONDS=2 cctrl_source_eval '_tmux_route_cache_prime; _tmux_run_with_timeout display-message -p -t "=c-old:" x' >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 124 ]] || fail "timeout wrapper rc $rc (want 124)"
-    local hung; hung="$(cat "$SRV2_DIR/hung.pid" 2>/dev/null || true)"
+    local hung="" w
+    for w in 1 2 3 4 5 6 7 8 9 10; do
+        hung="$(cat "$SRV2_DIR/hung.pid" 2>/dev/null || true)"
+        [[ "$hung" =~ ^[0-9]+$ ]] && break
+        sleep 0.2
+    done
     [[ "$hung" =~ ^[0-9]+$ ]] || fail "the hung client never ran"
     sleep 0.2
     if kill -0 "$hung" 2>/dev/null; then kill "$hung" 2>/dev/null || true; fail "timeout left the tmux client running (pid $hung)"; fi
+    # The background job is the client itself: the route is resolved in the
+    # caller (no probes after the fork), so even an unprimed call execs at once.
+    rm -f "$SRV2_DIR/hung.pid"
+    out="$(PATH="$SRV2_DIR:$PATH" CCTRL_TMUX_TIMEOUT_SECONDS=2 cctrl_source_eval '_tmux_timeout_argv 2 display-message -p -t "=c-old:" x; printf "%s|" "${_TMUX_ARGV[@]}"; echo "probe=${_TMUX_PROBE_SECS:-unset}"')"
+    [[ "$out" == "tmux|-S|$SRV2_OLD|display-message|-p|-t|=c-old:|x|probe=unset" ]] || fail "_tmux_timeout_argv resolved wrongly or leaked the probe bound: $out"
+    # The deadline never fires early: a 1 s budget still lets a 0.6 s call finish.
+    printf '#!/usr/bin/env bash\ncase " $* " in *" display-message "*) sleep 0.6; echo slow-ok; exit 0 ;; esac\nexec %q "$@"\n' "$tt" > "$SRV2_DIR/tmux"
+    out="$(PATH="$SRV2_DIR:$PATH" CCTRL_TMUX_TIMEOUT_SECONDS=1 cctrl_source_eval '_tmux_route_cache_prime; _tmux_run_with_timeout display-message -p -t "=c-old:" x && echo "rc0 $TMUX_RUN_OUTPUT"')" || true
+    [[ "$out" == "rc0 slow-ok" ]] || fail "a 1 s timeout fired before a 0.6 s call finished: $out"
+    # N4: CCTRL_TMUX_ROUTE_CACHE_SECONDS=0 turns the map off (a fresh entry is not used, prime stores nothing).
+    out="$(CCTRL_TMUX_ROUTE_CACHE_SECONDS=0 cctrl_source_eval '_TMUX_LOC_CACHE=$'"'"'c-old\t/nowhere\n'"'"'; _TMUX_LOC_AT=$SECONDS; _TMUX_LOC_KEY="$_TMUX_SRV_KEY"; _tmux_locate_into c-old; echo "$_TMUX_LOC_RESULT"; _tmux_route_cache_prime; echo "at=$_TMUX_LOC_AT"')"
+    [[ "$out" == "$SRV2_OLD"$'\n'"at=-1" ]] || fail "CCTRL_TMUX_ROUTE_CACHE_SECONDS=0 did not disable the route map: $out"
     echo "ok: route cache, physical sockets, extras split, stop-exact pin restore, timeout kills the client"
 )
 
