@@ -24,6 +24,22 @@ class TmuxServersTest(unittest.TestCase):
         self.assertEqual(got[3], ["tmux", "-S", "/s/x"])
         self.assertEqual(len(got), 4)
 
+    def test_dedupe_by_physical_socket(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            real = os.path.join(d, "real")
+            os.mkdir(real)
+            link = os.path.join(d, "link")
+            os.symlink(real, link)
+            env = {"_CCTRL_TMUX_PRIMARY": os.path.join(link, "fleet"),
+                   "TMUX": os.path.join(real, "fleet") + ",1,0",
+                   "TMUX_TMPDIR": "/nonexistent-cctrl-dir"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                got = tmux_servers.argv_prefixes()
+            fleet = os.path.join(os.path.realpath(real), "fleet")
+            self.assertEqual(got[0], ["tmux", "-S", fleet])
+            self.assertEqual([p for p in got if p[2] == fleet], [["tmux", "-S", fleet]])
+
 
 if __name__ == "__main__":
     unittest.main()

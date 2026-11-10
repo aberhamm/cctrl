@@ -19,6 +19,19 @@ def _socket_dir():
     return "%s/tmux-%d" % (base, os.getuid())
 
 
+def _physical(sock):
+    """The socket path with its directory resolved (dedupe by physical path)."""
+    d, base = os.path.split(sock)
+    if not d:
+        return sock
+    try:
+        if os.path.isdir(d):
+            return os.path.join(os.path.realpath(d), base)
+    except OSError:
+        pass
+    return sock
+
+
 def primary():
     return os.environ.get("_CCTRL_TMUX_PRIMARY") or ""
 
@@ -39,7 +52,7 @@ def argv_prefixes():
     socks.append(_socket_dir() + "/default")
     socks.extend(s for s in (os.environ.get("_CCTRL_TMUX_EXTRA") or "").split("\n") if s)
     out, seen = [], set()
-    for sock in socks:
+    for sock in (_physical(x) for x in socks):
         if sock not in seen:
             seen.add(sock)
             out.append(["tmux", "-S", sock])

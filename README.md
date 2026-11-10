@@ -301,6 +301,16 @@ With a primary set:
 - `cctrl session servers [--json]` shows the primary, which servers are
   running and the session count on each; the same line ends `session ls`
   and heads `session doctor`.
+- cctrl never starts the primary server. If it is not running, every launch
+  path refuses with one stderr line (exit 69) saying it must be started from
+  Terminal, plus a how-to hint (`tmuxPrimaryStartHint` /
+  `CCTRL_TMUX_PRIMARY_START_HINT` override the default). With tmux 3.2+ the
+  call also carries tmux's `-N`.
+- Placeholder sessions (`tmuxPlaceholderSessions`, default `fleet-anchor`)
+  that only keep a server alive are not listed, counted, snapshotted, pruned
+  or restored into; `close` and `kill` refuse them unless `--force`.
+- A name live on more than one server is refused by `close`/`kill`/`prune`
+  with an error naming the servers; self-close stays on the `$TMUX` server.
 - `session ls --json` rows and snapshot task rows carry `tmux_server`
   (`fleet`, `default`, or a path). A snapshot row without it means the
   default server, which is how every older snapshot reads.

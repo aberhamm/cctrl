@@ -351,7 +351,7 @@ _config_default_profile_source_file() {
 # path (tmux -S PATH); any other value is a socket name (tmux -L NAME), e.g.
 # CCTRL_TMUX_SERVER=fleet or "tmuxServer": "fleet". A config value of "" stops
 # the search (explicitly unset). CCTRL_TMUX_EXTRA_SERVERS / tmuxExtraServers
-# (names or paths, comma/space separated, or a JSON array) add servers that
+# (names or paths, comma separated, or a JSON array) add servers that
 # reads also look at.
 #
 # Unset (the default) means today's behaviour byte for byte: no tmux()
@@ -372,7 +372,19 @@ _CCTRL_TMUX_EXTRA=""
 _CCTRL_TMUX_SERVER_VALUE=""
 _CCTRL_TMUX_SERVER_SOURCE="unset"
 _CCTRL_TMUX_PIN=""
+_CCTRL_TMUX_FORCE=""
+_CCTRL_TMUX_FORCE_NAME=""
 _CCTRL_TMUX_DEFAULT_SOCK=""
+_CCTRL_TMUX_PLACEHOLDERS=""
+# Per-process caches (routing on only): the server list (keyed on $TMUX), the
+# tmux -N support check, and a short-lived name->server map (N4).
+_TMUX_SRV_LIST=""
+_TMUX_SRV_KEY=$'\001unset'
+_TMUX_HAS_N=""
+_TMUX_LOC_CACHE=""
+_TMUX_LOC_AT=-1
+_TMUX_LOC_KEY=""
+_TMUX_LOC_RESULT=""
 
 # tmux's own socket dir for -L names: $TMUX_TMPDIR (or /tmp)/tmux-UID, physical.
 _tmux_socket_dir() {
@@ -383,6 +395,22 @@ _tmux_socket_dir() {
     printf '%s/tmux-%s' "$base" "${UID:-$(id -u)}"
 }
 
+# A socket path with its directory resolved to the physical path (so a
+# configured /tmp/... path and the /private/tmp/... that tmux reports in
+# $TMUX are one server). A missing directory leaves the path as given.
+_tmux_physical_sock() {
+    local p="$1" dir base
+    case "$p" in */*) ;; *) printf '%s' "$p"; return 0 ;; esac
+    dir="${p%/*}"; base="${p##*/}"
+    [[ -n "$dir" ]] || dir=/
+    if [[ -d "$dir" ]] && dir="$(cd -P "$dir" 2>/dev/null && pwd)"; then
+        [[ "$dir" == / ]] && dir=""
+        printf '%s/%s' "$dir" "$base"
+    else
+        printf '%s' "$p"
+    fi
+}
+
 # <name-or-path> -> socket path ("" and rc 1 for an unusable value).
 _tmux_server_sock() {
     local v="$1"
@@ -391,7 +419,7 @@ _tmux_server_sock() {
         "~/"*) v="$HOME/${v#\~/}" ;;
     esac
     case "$v" in
-        */*) printf '%s' "$v" ;;
+        */*) _tmux_physical_sock "$v" ;;
         .|..) return 1 ;;
         *[[:space:]]*) return 1 ;;
         *) printf '%s/%s' "$(_tmux_socket_dir)" "$v" ;;
@@ -441,11 +469,30 @@ _tmux_srv_init() {
         elif got="$(_tmux_config_value tmuxExtraServers)"; then
             extra="${got%%$'\t'*}"
         fi
-        for e in ${extra//,/ }; do
+        # Comma (or newline) separated; no word splitting, so no globbing
+        # and a path may contain spaces. Surrounding blanks are trimmed.
+        while IFS= read -r -d ',' e || [[ -n "$e" ]]; do
+            e="${e#"${e%%[![:space:]]*}"}"; e="${e%"${e##*[![:space:]]}"}"
+            [[ -n "$e" ]] || continue
             s="$(_tmux_server_sock "$e")" || continue
             _CCTRL_TMUX_EXTRA+="$s"$'\n'
-        done
+        done <<< "${extra//$'\n'/,}"
         _CCTRL_TMUX_DEFAULT_SOCK="$(_tmux_socket_dir)/default"
+        # Placeholder ("server keeper") sessions: never workers, never counted,
+        # snapshotted, restored into, closed or killed (without --force).
+        local ph="fleet-anchor"
+        if [[ -n "${CCTRL_TMUX_PLACEHOLDER_SESSIONS+x}" ]]; then
+            ph="$CCTRL_TMUX_PLACEHOLDER_SESSIONS"
+        elif got="$(_tmux_config_value tmuxPlaceholderSessions)"; then
+            ph="${got%%$'\t'*}"
+        fi
+        _CCTRL_TMUX_PLACEHOLDERS=""
+        while IFS= read -r -d ',' e || [[ -n "$e" ]]; do
+            e="${e#"${e%%[![:space:]]*}"}"; e="${e%"${e##*[![:space:]]}"}"
+            [[ -n "$e" ]] && _CCTRL_TMUX_PLACEHOLDERS+="$e"$'\n'
+        done <<< "${ph//$'\n'/,}"
+        _TMUX_SRV_KEY=$'\001unset'; _TMUX_LOC_CACHE=""; _TMUX_LOC_AT=-1
+        _tmux_servers_refresh
         # For lib/tmux_servers.py (python helpers run by cctrl). Scrubbed from
         # new-session's environment so a server cctrl starts never inherits it.
         export _CCTRL_TMUX_PRIMARY _CCTRL_TMUX_EXTRA
@@ -453,67 +500,169 @@ _tmux_srv_init() {
     else
         unset -f tmux 2>/dev/null || true
         unset _CCTRL_TMUX_PRIMARY _CCTRL_TMUX_EXTRA 2>/dev/null || true
-        _CCTRL_TMUX_PRIMARY=""; _CCTRL_TMUX_EXTRA=""
+        _CCTRL_TMUX_PRIMARY=""; _CCTRL_TMUX_EXTRA=""; _CCTRL_TMUX_PLACEHOLDERS=""
     fi
 }
 
 _tmux_routing_active() { [[ -n "${_CCTRL_TMUX_PRIMARY:-}" ]]; }
 
-# The $TMUX server's socket ("" outside tmux).
-_tmux_current_sock() {
-    local s="${TMUX:-}"
-    s="${s%%,*}"
-    printf '%s' "$s"
-}
-
-# Home server: a pin, else the $TMUX server, else the primary.
-_tmux_home_sock() {
-    if [[ -n "$_CCTRL_TMUX_PIN" ]]; then printf '%s' "$_CCTRL_TMUX_PIN"; return 0; fi
-    local cur; cur="$(_tmux_current_sock)"
-    if [[ -n "$cur" ]]; then printf '%s' "$cur"; else printf '%s' "$_CCTRL_TMUX_PRIMARY"; fi
-}
-
-# Every server reads look at, primary first, deduplicated, one per line.
-_tmux_servers() {
-    local seen=$'\n' s cur
-    cur="$(_tmux_current_sock)"
+# Recompute the server list when $TMUX changed since the last call (no fork
+# when it has not). Order: primary, the $TMUX server, the default server,
+# extras; deduplicated by physical socket path (N6).
+_TMUX_CUR_SOCK=""
+_tmux_servers_refresh() {
+    [[ "${TMUX:-}" == "$_TMUX_SRV_KEY" ]] && return 0
+    local cur="${TMUX:-}" seen=$'\n' s list=""
+    _TMUX_SRV_KEY="$cur"
+    cur="${cur%%,*}"
+    [[ -n "$cur" ]] && cur="$(_tmux_physical_sock "$cur")"
+    _TMUX_CUR_SOCK="$cur"
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         [[ "$seen" == *$'\n'"$s"$'\n'* ]] && continue
         seen+="$s"$'\n'
-        printf '%s\n' "$s"
+        list+="$s"$'\n'
     done <<< "$_CCTRL_TMUX_PRIMARY"$'\n'"$cur"$'\n'"$_CCTRL_TMUX_DEFAULT_SOCK"$'\n'"$_CCTRL_TMUX_EXTRA"
+    _TMUX_SRV_LIST="$list"
+    _tmux_route_cache_drop
+    return 0
 }
 
-# <session name> -> socket of the server that holds it (exact match); rc 1 if none.
-_tmux_locate_session() {
-    local name="${1#=}" s
+# The $TMUX server's socket ("" outside tmux), physical path.
+_tmux_current_sock() {
+    _tmux_servers_refresh
+    printf '%s' "$_TMUX_CUR_SOCK"
+}
+
+# Home server (into _TMUX_HOME): a forced server (_tmux_with_server), else a
+# pin, else the $TMUX server, else the primary.
+_tmux_home_into() {
+    if [[ -n "$_CCTRL_TMUX_FORCE" ]]; then
+        _TMUX_HOME="$_CCTRL_TMUX_FORCE"
+    elif [[ -n "$_CCTRL_TMUX_PIN" ]]; then
+        _TMUX_HOME="$_CCTRL_TMUX_PIN"
+    else
+        _tmux_servers_refresh
+        _TMUX_HOME="${_TMUX_CUR_SOCK:-$_CCTRL_TMUX_PRIMARY}"
+    fi
+}
+_tmux_home_sock() { _tmux_home_into; printf '%s' "$_TMUX_HOME"; }
+
+# Every server reads look at, primary first, deduplicated, one per line.
+_tmux_servers() {
+    _tmux_servers_refresh
+    printf '%s' "$_TMUX_SRV_LIST"
+}
+
+# N4: a short-lived name->server map, primed once per process by listings
+# that make many named calls (session ls, prune). A hit routes with no probe;
+# a miss (a session newer than the map) probes every server live. It lives
+# CCTRL_TMUX_ROUTE_CACHE_SECONDS (default 5) and is dropped when this shell
+# runs new-session, kill-session or rename-session, or when $TMUX changes.
+# Destructive actions resolve holders live (_tmux_session_holders), never here.
+_tmux_route_cache_drop() { _TMUX_LOC_CACHE=""; _TMUX_LOC_AT=-1; }
+_tmux_route_cache_prime() {
+    _tmux_routing_active || return 0
+    _tmux_servers_refresh
+    local s n map=""
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        while IFS= read -r n; do
+            [[ -n "$n" ]] && map+="$n"$'\t'"$s"$'\n'
+        done < <(command tmux -S "$s" list-sessions -F '#{session_name}' 2>/dev/null || true)
+    done <<< "$_TMUX_SRV_LIST"
+    _TMUX_LOC_CACHE="$map"; _TMUX_LOC_AT=$SECONDS; _TMUX_LOC_KEY="$_TMUX_SRV_KEY"
+    return 0
+}
+
+# <session name> -> _TMUX_LOC_RESULT, the socket of the server that holds it
+# (exact match, primary first); rc 1 if none.
+_tmux_locate_into() {
+    local name="${1#=}" s line ttl="${CCTRL_TMUX_ROUTE_CACHE_SECONDS:-5}"
     name="${name%%:*}"
+    _TMUX_LOC_RESULT=""
     [[ -n "$name" ]] || return 1
+    _tmux_servers_refresh
+    [[ "$ttl" =~ ^[0-9]+$ ]] || ttl=5
+    if (( _TMUX_LOC_AT >= 0 && SECONDS - _TMUX_LOC_AT <= ttl )) && [[ "$_TMUX_LOC_KEY" == "$_TMUX_SRV_KEY" ]]; then
+        while IFS= read -r line; do
+            if [[ -n "$line" && "${line%%$'\t'*}" == "$name" ]]; then
+                _TMUX_LOC_RESULT="${line#*$'\t'}"
+                return 0
+            fi
+        done <<< "$_TMUX_LOC_CACHE"
+    fi
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         if command tmux -S "$s" has-session -t "=$name" 2>/dev/null; then
-            printf '%s' "$s"
+            _TMUX_LOC_RESULT="$s"
             return 0
         fi
-    done < <(_tmux_servers)
+    done <<< "$_TMUX_SRV_LIST"
     return 1
+}
+
+# Every server that holds session NAME (exact), one per line. Live probes,
+# never the cache: destructive actions use this (N2).
+_tmux_session_holders() {
+    _tmux_routing_active || return 0
+    local name="${1#=}" s
+    name="${name%%:*}"
+    [[ -n "$name" ]] || return 0
+    _tmux_servers_refresh
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        if command tmux -S "$s" has-session -t "=$name" 2>/dev/null; then printf '%s\n' "$s"; fi
+    done <<< "$_TMUX_SRV_LIST"
+    return 0
+}
+
+# N2: refuse a destructive ACTION on a session NAME that more than one
+# server holds (the name alone cannot say which copy is meant). rc 75.
+_tmux_refuse_ambiguous() { # NAME ACTION
+    _tmux_routing_active || return 0
+    local holders s n=0 labels=""
+    holders="$(_tmux_session_holders "$1")"
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        n=$((n + 1))
+        labels+="${labels:+, }$(_tmux_server_label "$s") ($s)"
+    done <<< "$holders"
+    (( n > 1 )) || return 0
+    echo "cctrl: session '$1' exists on $n tmux servers: $labels; refusing to $2 it by name. Rename one copy (tmux -S <socket> rename-session -t '=$1' NEW) and retry." >&2
+    return 75
+}
+
+# Placeholder ("server keeper") sessions (tmuxPlaceholderSessions, default
+# fleet-anchor): a session that only keeps a tmux server alive. Routing on
+# only, so an unset tmuxServer stays byte for byte as before.
+_tmux_is_placeholder() {
+    _tmux_routing_active || return 1
+    [[ -n "$_CCTRL_TMUX_PLACEHOLDERS" && -n "${1:-}" ]] || return 1
+    local n="${1#=}"
+    n="${n%%:*}"
+    [[ $'\n'"$_CCTRL_TMUX_PLACEHOLDERS" == *$'\n'"$n"$'\n'* ]]
+}
+_tmux_refuse_placeholder() { # NAME ACTION
+    _tmux_is_placeholder "$1" || return 0
+    echo "cctrl: '$1' is the tmux server keeper (a placeholder session that keeps its server alive); refusing to $2 it. Pass --force to $2 it anyway." >&2
+    return 75
 }
 
 # Pin id/untargeted calls to the server that holds session NAME (no-op when
 # routing is off or the session is nowhere). `_tmux_pin_clear` undoes it.
 _tmux_pin_session() {
     _tmux_routing_active || return 0
-    local s
     _CCTRL_TMUX_PIN=""
-    s="$(_tmux_locate_session "$1")" || return 0
-    _CCTRL_TMUX_PIN="$s"
+    _tmux_locate_into "$1" || return 0
+    _CCTRL_TMUX_PIN="$_TMUX_LOC_RESULT"
 }
 _tmux_pin_clear() { _CCTRL_TMUX_PIN=""; }
 
-# Route one tmux argv: sets _TMUX_RT_MODE (pass|union|one) and _TMUX_RT_SOCK.
+# Route one tmux argv: sets _TMUX_RT_MODE (pass|union|one), _TMUX_RT_SOCK,
+# _TMUX_RT_NEW (new-session) and _TMUX_RT_SUB (the subcommand).
 _tmux_route() {
-    _TMUX_RT_MODE=pass; _TMUX_RT_SOCK=""; _TMUX_RT_NEW=false
+    _TMUX_RT_MODE=pass; _TMUX_RT_SOCK=""; _TMUX_RT_NEW=false; _TMUX_RT_SUB=""
     _tmux_routing_active || return 0
     local -a args=("$@")
     local n=$# i=0 a sub target="" have_t=false all=false sess
@@ -528,6 +677,7 @@ _tmux_route() {
         esac
     done
     sub="${args[i]:-}"; i=$((i + 1))
+    _TMUX_RT_SUB="$sub"
     case "$sub" in
         ""|kill-server|start-server|start) return 0 ;;
         new-session|new)
@@ -552,36 +702,109 @@ _tmux_route() {
             list-sessions|ls|list-clients|lsc) _TMUX_RT_MODE=union; return 0 ;;
             list-panes|lsp|list-windows|lsw) $all && { _TMUX_RT_MODE=union; return 0; } ;;
         esac
-        _TMUX_RT_SOCK="$(_tmux_home_sock)"
+        _tmux_home_into; _TMUX_RT_SOCK="$_TMUX_HOME"
         return 0
     fi
     sess="${target#=}"; sess="${sess%%:*}"
+    # A forced server (_tmux_with_server, e.g. self-close) takes calls naming
+    # its session (or every targeted call when it names none), so a duplicate
+    # name on another server is never picked.
+    if [[ -n "$_CCTRL_TMUX_FORCE" ]] && [[ -z "$_CCTRL_TMUX_FORCE_NAME" || "$sess" == "$_CCTRL_TMUX_FORCE_NAME" ]]; then
+        _TMUX_RT_SOCK="$_CCTRL_TMUX_FORCE"; return 0
+    fi
     case "$sess" in
-        ""|[%\$@]*) _TMUX_RT_SOCK="$(_tmux_home_sock)"; return 0 ;;
+        ""|[%\$@]*) _tmux_home_into; _TMUX_RT_SOCK="$_TMUX_HOME"; return 0 ;;
     esac
     if [[ "$target" == =* ]]; then
-        _TMUX_RT_SOCK="$(_tmux_locate_session "$sess")" || _TMUX_RT_SOCK="$(_tmux_home_sock)"
+        if _tmux_locate_into "$sess"; then
+            _TMUX_RT_SOCK="$_TMUX_LOC_RESULT"
+        else
+            _tmux_home_into; _TMUX_RT_SOCK="$_TMUX_HOME"
+        fi
     else
         # A non-exact target keeps tmux's own (prefix) matching, per server.
         local s
         _TMUX_RT_SOCK=""
+        _tmux_servers_refresh
         while IFS= read -r s; do
             [[ -n "$s" ]] || continue
             if command tmux -S "$s" has-session -t "$sess" 2>/dev/null; then _TMUX_RT_SOCK="$s"; break; fi
-        done < <(_tmux_servers)
-        [[ -n "$_TMUX_RT_SOCK" ]] || _TMUX_RT_SOCK="$(_tmux_home_sock)"
+        done <<< "$_TMUX_SRV_LIST"
+        if [[ -z "$_TMUX_RT_SOCK" ]]; then _tmux_home_into; _TMUX_RT_SOCK="$_TMUX_HOME"; fi
     fi
+    return 0
+}
+
+# Does this tmux take the top-level -N ("do not start the server", 3.2+)?
+# Checked once per process with `tmux -V`, which talks to no server.
+_tmux_supports_N() {
+    if [[ -z "$_TMUX_HAS_N" ]]; then
+        local v
+        v="$(command tmux -V 2>/dev/null || true)"
+        _TMUX_HAS_N=no
+        if [[ "$v" =~ ([0-9]+)\.([0-9]+) ]]; then
+            if (( ${BASH_REMATCH[1]} > 3 || ( ${BASH_REMATCH[1]} == 3 && ${BASH_REMATCH[2]} >= 2 ) )); then _TMUX_HAS_N=yes; fi
+        elif [[ "$v" == *master* || "$v" == *next* ]]; then
+            _TMUX_HAS_N=yes
+        fi
+    fi
+    [[ "$_TMUX_HAS_N" == yes ]]
+}
+
+# Is the primary server running? list-sessions never starts a server.
+_tmux_primary_alive() {
+    command tmux -S "$_CCTRL_TMUX_PRIMARY" list-sessions >/dev/null 2>&1
+}
+
+# B2: the one-line refusal when the primary is down. The how-to-start hint is
+# CCTRL_TMUX_PRIMARY_START_HINT, else config tmuxPrimaryStartHint, else the
+# fleet default below.
+_tmux_primary_down_error() {
+    local hint="${CCTRL_TMUX_PRIMARY_START_HINT:-}" got
+    if [[ -z "$hint" ]] && got="$(_tmux_config_value tmuxPrimaryStartHint)"; then hint="${got%%$'\t'*}"; fi
+    # shellcheck disable=SC2016 # $(id -u) is printed for the user to run
+    [[ -n "$hint" ]] || hint='launchctl kickstart gui/$(id -u)/com.fleet-tmux-terminal, or double-click ~/scripts/fleet-tmux/start-fleet-tmux.command; runbook ~/dev/homelab/docs/runbooks/fleet-tmux-terminal.md'
+    echo "cctrl: the primary tmux server '$(_tmux_server_label "$_CCTRL_TMUX_PRIMARY")' ($_CCTRL_TMUX_PRIMARY) is not running and cctrl will not start it; it must be started from Terminal, not by cctrl: $hint" >&2
+}
+
+# `cctrl start` checks this before it writes anything (rc 69 = refused).
+_tmux_primary_require_alive() {
+    _tmux_routing_active || return 0
+    _tmux_primary_alive && return 0
+    _tmux_primary_down_error
+    return 69
+}
+
+# B2: new-session on the primary, never starting it. A primary server must be
+# started from Terminal / its login item (its TCC context and a clean global
+# environment), so a dead one is refused. With tmux >= 3.2 the call also
+# carries -N, so a server that dies between the check and the call still
+# fails closed instead of being started here.
+_tmux_new_on_primary() {
+    if ! _tmux_primary_alive; then _tmux_primary_down_error; return 69; fi
+    local rc=0
+    if _tmux_supports_N; then
+        env -u _CCTRL_TMUX_PRIMARY -u _CCTRL_TMUX_EXTRA tmux -N -S "$_CCTRL_TMUX_PRIMARY" "$@" || rc=$?
+    else
+        env -u _CCTRL_TMUX_PRIMARY -u _CCTRL_TMUX_EXTRA tmux -S "$_CCTRL_TMUX_PRIMARY" "$@" || rc=$?
+    fi
+    if (( rc != 0 )) && ! _tmux_primary_alive; then _tmux_primary_down_error; return 69; fi
+    return "$rc"
 }
 
 # The full argv (into _TMUX_ARGV) of one routed tmux call, for exec and for
 # perl-alarm wrappers that cannot call a shell function. A union command gets
 # the home server here (one server only); use the tmux() function for unions.
+# A new-session carries -N where tmux has it (never starts the primary).
 _tmux_argv() {
     _tmux_route "$@"
     if [[ "$_TMUX_RT_MODE" == pass ]]; then
         _TMUX_ARGV=(tmux "$@")
     elif [[ "$_TMUX_RT_MODE" == union ]]; then
-        _TMUX_ARGV=(tmux -S "$(_tmux_home_sock)" "$@")
+        _tmux_home_into
+        _TMUX_ARGV=(tmux -S "$_TMUX_HOME" "$@")
+    elif $_TMUX_RT_NEW && _tmux_supports_N; then
+        _TMUX_ARGV=(tmux -N -S "$_TMUX_RT_SOCK" "$@")
     else
         _TMUX_ARGV=(tmux -S "$_TMUX_RT_SOCK" "$@")
     fi
@@ -596,12 +819,15 @@ _tmux_exec() {
 # The router behind tmux() when a primary is configured.
 _tmux_routed() {
     _tmux_route "$@"
+    case "$_TMUX_RT_SUB" in
+        new-session|new|kill-session|rename-session|rename) _tmux_route_cache_drop ;;
+    esac
     case "$_TMUX_RT_MODE" in
         pass) command tmux "$@" ;;
         union) _tmux_union "$@" ;;
         *)
             if $_TMUX_RT_NEW; then
-                env -u _CCTRL_TMUX_PRIMARY -u _CCTRL_TMUX_EXTRA tmux -S "$_TMUX_RT_SOCK" "$@"
+                _tmux_new_on_primary "$@"
             else
                 command tmux -S "$_TMUX_RT_SOCK" "$@"
             fi
@@ -615,6 +841,7 @@ _tmux_routed() {
 # always did).
 _tmux_union() {
     local s out rc any=false
+    _tmux_servers_refresh
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         out="$(rc=0; command tmux -S "$s" "$@" 2>/dev/null || rc=$?; printf 'x%s' "$rc")"
@@ -622,29 +849,35 @@ _tmux_union() {
         [[ "$rc" == 0 ]] || continue
         any=true
         printf '%s' "$out"
-    done < <(_tmux_servers)
+    done <<< "$_TMUX_SRV_LIST"
     $any && return 0
     command tmux -S "$_CCTRL_TMUX_PRIMARY" "$@"
 }
 
 # One line per server for doctor/ls: "socket<TAB>role<TAB>alive|down<TAB>count".
+# Placeholder sessions are not counted.
 _tmux_server_report() {
-    local s role n out
+    local s role n out name cur
+    cur="$(_tmux_current_sock)"
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         role=""
         [[ "$s" == "$_CCTRL_TMUX_PRIMARY" ]] && role="primary"
         [[ "$s" == "$_CCTRL_TMUX_DEFAULT_SOCK" ]] && role="${role:+$role,}default"
-        [[ "$s" == "$(_tmux_current_sock)" ]] && role="${role:+$role,}current"
+        [[ "$s" == "$cur" ]] && role="${role:+$role,}current"
         [[ -n "$role" ]] || role="extra"
         if out="$(command tmux -S "$s" list-sessions -F '#{session_name}' 2>/dev/null)"; then
             n=0
-            [[ -n "$out" ]] && n="$(printf '%s\n' "$out" | grep -c .)"
+            while IFS= read -r name; do
+                [[ -n "$name" ]] || continue
+                _tmux_is_placeholder "$name" && continue
+                n=$((n + 1))
+            done <<< "$out"
             printf '%s\t%s\talive\t%s\n' "$s" "$role" "$n"
         else
             printf '%s\t%s\tdown\t0\n' "$s" "$role"
         fi
-    done < <(_tmux_servers)
+    done <<< "$_TMUX_SRV_LIST"
 }
 
 # Short label for a socket: its -L name when it lives in tmux's socket dir.
@@ -655,25 +888,55 @@ _tmux_server_label() {
 }
 
 # _tmux_with_pin NAME CMD ARGS...: run CMD with id/untargeted tmux calls
-# pinned to the server holding session NAME, then restore the previous pin.
+# pinned to the server holding session NAME (an empty NAME pins nothing),
+# then restore the previous pin. errexit stays live inside CMD (B1): routing
+# off runs CMD directly, exactly as before; routing on uses `CMD; rc=$?`, so
+# under set -e a failure exits as it always did (the pin no longer matters).
 _tmux_with_pin() {
-    local _twp_name="$1" _twp_prev="$_CCTRL_TMUX_PIN" _twp_rc=0
+    if ! _tmux_routing_active; then
+        shift
+        "$@"
+        return
+    fi
+    local _twp_name="$1" _twp_prev="$_CCTRL_TMUX_PIN" _twp_rc
     shift
-    [[ -n "$_twp_name" ]] && _tmux_pin_session "$_twp_name"
-    "$@" || _twp_rc=$?
+    if [[ -n "$_twp_name" ]]; then _tmux_pin_session "$_twp_name"; fi
+    "$@"; _twp_rc=$?
     _CCTRL_TMUX_PIN="$_twp_prev"
     return "$_twp_rc"
 }
 
-# Pin to the server whose @cctrl_server_instance_id is ID (stop-exact).
+# _tmux_with_server SOCK NAME CMD ARGS...: run CMD with id/untargeted tmux
+# calls, and every call that targets session NAME by name, sent to server
+# SOCK (self-close: the $TMUX server, so a same-named copy on another server
+# is never touched). An empty NAME sends every targeted call to SOCK. Calls
+# naming other sessions still route normally. Same errexit contract as
+# _tmux_with_pin.
+_tmux_with_server() {
+    if ! _tmux_routing_active || [[ -z "${1:-}" ]]; then
+        shift 2
+        "$@"
+        return
+    fi
+    local _tws_prev="$_CCTRL_TMUX_FORCE" _tws_prev_name="$_CCTRL_TMUX_FORCE_NAME" _tws_rc
+    _CCTRL_TMUX_FORCE="$1"; _CCTRL_TMUX_FORCE_NAME="$2"
+    shift 2
+    "$@"; _tws_rc=$?
+    _CCTRL_TMUX_FORCE="$_tws_prev"; _CCTRL_TMUX_FORCE_NAME="$_tws_prev_name"
+    return "$_tws_rc"
+}
+
+# Pin to the server whose @cctrl_server_instance_id is ID (stop-exact, which
+# runs inside _tmux_with_pin "" so the previous pin comes back afterwards).
 _tmux_pin_server_instance() {
     _tmux_routing_active || return 0
     local id="$1" s v
+    _tmux_servers_refresh
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         v="$(command tmux -S "$s" show-options -sqv @cctrl_server_instance_id 2>/dev/null || true)"
         if [[ -n "$v" && "$v" == "$id" ]]; then _CCTRL_TMUX_PIN="$s"; return 0; fi
-    done < <(_tmux_servers)
+    done <<< "$_TMUX_SRV_LIST"
     return 0
 }
 
@@ -681,13 +944,15 @@ _tmux_pin_server_instance() {
 _tmux_session_server_map() {
     _tmux_routing_active || return 0
     local s label n
+    _tmux_servers_refresh
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         label="$(_tmux_server_label "$s")"
         while IFS= read -r n; do
             [[ -n "$n" ]] && printf '%s\t%s\n' "$n" "$label"
         done < <(command tmux -S "$s" list-sessions -F '#{session_name}' 2>/dev/null || true)
-    done < <(_tmux_servers)
+    done <<< "$_TMUX_SRV_LIST"
+    return 0
 }
 
 # <map> <name> -> label (first server listed wins).
@@ -6029,6 +6294,17 @@ _launch_detached() {
     if [[ -n "$pinned_name" ]] && ! tmux has-session -t "=$pinned_name" 2>/dev/null; then
         session_name="$pinned_name"
     fi
+    # mdec-1110: never launch into a placeholder (server keeper) name, and
+    # never start a missing primary server (B2): refuse before writing anything.
+    if _tmux_is_placeholder "$session_name"; then
+        [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
+        echo "cctrl: '$session_name' is reserved for the tmux server keeper (tmuxPlaceholderSessions); refusing to launch a session with that name." >&2
+        return 75
+    fi
+    if ! _tmux_primary_require_alive; then
+        [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
+        return 69
+    fi
 
     local default_purpose final_purpose
     if $purpose_set; then
@@ -9549,7 +9825,14 @@ _tmux_run_with_timeout() {
     local timeout="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}" pid start now rc tmpout tmperr
     tmpout="$(mktemp)"
     tmperr="$(mktemp)"
-    tmux "$@" >"$tmpout" 2>"$tmperr" &
+    # Routed (mdec-1110): resolve the server in the background job, then exec
+    # the real client, so a timeout kill hits tmux itself, never a subshell
+    # that would leave the client running (N1). Unset: the plain binary.
+    if _tmux_routing_active; then
+        ( _tmux_argv "$@"; exec "${_TMUX_ARGV[@]}" ) >"$tmpout" 2>"$tmperr" &
+    else
+        tmux "$@" >"$tmpout" 2>"$tmperr" &
+    fi
     pid=$!
     start="$(date +%s)"
     while kill -0 "$pid" 2>/dev/null; do
@@ -9580,7 +9863,11 @@ _tmux_run_stdin_with_timeout() {
     tmpout="$(mktemp)"
     tmperr="$(mktemp)"
     printf '%s' "$input" > "$tmpin"
-    tmux "$@" <"$tmpin" >"$tmpout" 2>"$tmperr" &
+    if _tmux_routing_active; then
+        ( _tmux_argv "$@"; exec "${_TMUX_ARGV[@]}" ) <"$tmpin" >"$tmpout" 2>"$tmperr" &
+    else
+        tmux "$@" <"$tmpin" >"$tmpout" 2>"$tmperr" &
+    fi
     pid=$!
     start="$(date +%s)"
     while kill -0 "$pid" 2>/dev/null; do
@@ -14418,7 +14705,7 @@ cmd_session() {
             echo "                                 (delayed kill so the caller can finish output)"
             echo "    --in SECONDS | --now         Grace period (default 5s for own session)"
             echo "    --force                      Allow closing non-cctrl sessions"
-            echo "  cctrl session kill <name>      Kill a session immediately by name (legacy/manual)"
+            echo "  cctrl session kill <name> [--force]  Kill a session immediately by name (legacy/manual; --force for a placeholder)"
             echo "                                 Records it closed so restore skips it (--keep-restorable to skip)"
             echo "  cctrl session mark-closed <name> [--apply]  Record an already-ended session as closed"
             echo "  cctrl session stop-exact <name> --execution-id ID [--json]"
@@ -15715,6 +16002,9 @@ _session_list() {
         fi
     fi
     $json && _tmux_routing_active && tmux_server_map="$(_tmux_session_server_map)"
+    # One list-sessions per server primes the name->server map for the many
+    # named per-row calls below (N4).
+    _tmux_route_cache_prime
 
     local -a names=() execution_ids=()
     local listed_tmux_id listed_name listed_server_id listed_server_pid listed_server_started execution_id line
@@ -15733,6 +16023,8 @@ _session_list() {
             listed_server_pid=""; listed_server_started=""
         fi
         [[ -n "$listed_name" ]] || continue
+        # A placeholder (server keeper) session is not a worker (mdec-1110).
+        _tmux_is_placeholder "$listed_name" && continue
         execution_id=""
         if [[ -n "$execution_server_id" && "$listed_server_id" == "$execution_server_id" \
               && "$listed_server_pid" =~ ^[0-9]+$ && "$listed_server_started" =~ ^[0-9]+$ \
@@ -17873,13 +18165,19 @@ _session_restore() {
     live_active="$(jq '[.rows[]? | select(.control_owner == "cctrl" and .execution_runtime == "tmux" and .action_capabilities.tmux_attach.supported == true)] | length' "$catalogue_file" 2>/dev/null)"
     [[ "$live_active" =~ ^[0-9]+$ ]] || live_active="$max_active"
     if [[ ${#only_patterns[@]} -gt 0 ]]; then patterns_json="$(printf '%s\n' "${only_patterns[@]}" | jq -R . | jq -s .)"; fi
-    if ! jq --argjson patterns "$patterns_json" --arg limit "$limit" --argjson live_active "$live_active" --argjson max_active "$max_active" '
+    # A placeholder (server keeper) session is never restored into (mdec-1110).
+    local placeholders_json='[]'
+    if _tmux_routing_active && [[ -n "$_CCTRL_TMUX_PLACEHOLDERS" ]]; then
+        placeholders_json="$(printf '%s' "$_CCTRL_TMUX_PLACEHOLDERS" | jq -R . | jq -s .)"
+    fi
+    if ! jq --argjson patterns "$patterns_json" --arg limit "$limit" --argjson live_active "$live_active" --argjson max_active "$max_active" --argjson placeholders "$placeholders_json" '
       ($patterns | map(ascii_downcase)) as $needles
       |
       reduce .rows[] as $row ({base:., rows:[], used:0};
         ($row | ((.tmux_session // "") + " " + (.display_label // "") + " " + (.purpose // "") + " " + (.cwd // "")) | ascii_downcase) as $haystack
         | (if ($needles|length)==0 then true else ([$needles[] | . as $needle | $haystack | contains($needle)] | any) end) as $matched
-        | if ($row.disposition=="restore" and ($matched|not)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"filtered by --only",action_capabilities:{restore:{supported:false,reason:"filtered by --only"}}}]
+        | if ($row.disposition=="restore" and (($row.tmux_session // "") as $t | any($placeholders[]; . == $t))) then .rows += [$row + {disposition:"insufficient-evidence",reason:"tmux placeholder session (server keeper)",action_capabilities:{restore:{supported:false,reason:"tmux placeholder session (server keeper)"}}}]
+          elif ($row.disposition=="restore" and ($matched|not)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"filtered by --only",action_capabilities:{restore:{supported:false,reason:"filtered by --only"}}}]
           elif ($row.disposition=="restore" and $limit!="" and .used >= ($limit|tonumber)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by --limit",action_capabilities:{restore:{supported:false,reason:"deferred by --limit"}}}]
           elif ($row.disposition=="restore" and ($live_active + .used) >= $max_active) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by CCTRL_RESTORE_MAX_ACTIVE",action_capabilities:{restore:{supported:false,reason:"deferred by CCTRL_RESTORE_MAX_ACTIVE"}}}]
           else .rows += [$row] | if $row.disposition=="restore" then .used += 1 else . end end)
@@ -18379,6 +18677,11 @@ _session_stop_exact_error() {
 }
 
 _session_stop_exact() {
+    # stop-exact pins to the server its execution id names; the previous pin
+    # comes back afterwards (N8). An empty name pins nothing up front.
+    _tmux_with_pin "" _session_stop_exact_on_server "$@"
+}
+_session_stop_exact_on_server() {
     local name="" execution_id="" json=false
     # Select the output contract before validating any other argument so a
     # malformed invocation still returns JSON regardless of flag order.
@@ -18946,9 +19249,20 @@ _session_mark_closed() {
 
 _session_kill() {
     # Kill on the server that holds the session (mdec-1110): its "$N" id is
-    # only meaningful there.
-    local _kt="" _ka
-    for _ka in "$@"; do [[ "$_ka" == --* ]] || { _kt="$_ka"; break; }; done
+    # only meaningful there. A name on more than one server is refused (N2),
+    # and so is a placeholder (server keeper) session unless --force.
+    local _kt="" _ka _kforce=false
+    for _ka in "$@"; do
+        case "$_ka" in
+            --force) _kforce=true ;;
+            --*) ;;
+            *) [[ -n "$_kt" ]] || _kt="$_ka" ;;
+        esac
+    done
+    if [[ -n "$_kt" ]] && _tmux_routing_active; then
+        $_kforce || _tmux_refuse_placeholder "$_kt" kill || return $?
+        _tmux_refuse_ambiguous "$_kt" kill || return $?
+    fi
     _tmux_with_pin "$_kt" _session_kill_on_server "$@"
 }
 _session_kill_on_server() {
@@ -18957,6 +19271,7 @@ _session_kill_on_server() {
     for arg in "$@"; do
         case "$arg" in
             --keep-restorable) keep_restorable=true ;;
+            --force) ;;  # only lifts the placeholder refusal (_session_kill)
             *) [[ -z "$kill_target" ]] && kill_target="$arg" ;;
         esac
     done
@@ -19125,14 +19440,38 @@ _session_current() {
 }
 
 _session_close() {
-    # Close on the server that holds the session (mdec-1110). With no name
-    # the target is the caller's own session, on the $TMUX server (no pin).
-    local _ct="" _ca _skip=false
+    # Close on the server that holds the session (mdec-1110). A name on more
+    # than one server is refused (N2), and so is a placeholder (server keeper)
+    # session unless --force. With no name the target is the caller's own
+    # session: every call about it is sent to the $TMUX server.
+    local _ct="" _ca _skip=false _cforce=false _csock _ccur
     for _ca in "$@"; do
         if $_skip; then _skip=false; continue; fi
-        case "$_ca" in --in|--after) _skip=true ;; -*) ;; *) _ct="$_ca"; break ;; esac
+        case "$_ca" in
+            --in|--after) _skip=true ;;
+            --force|-f) _cforce=true ;;
+            -*) ;;
+            *) [[ -n "$_ct" ]] || _ct="$_ca" ;;
+        esac
     done
-    if [[ -n "$_ct" ]]; then _tmux_with_pin "$_ct" _session_close_on_server "$@"; else _session_close_on_server "$@"; fi
+    if ! _tmux_routing_active; then
+        if [[ -n "$_ct" ]]; then _tmux_with_pin "$_ct" _session_close_on_server "$@"; else _session_close_on_server "$@"; fi
+        return
+    fi
+    if [[ -n "$_ct" ]]; then
+        $_cforce || _tmux_refuse_placeholder "$_ct" close || return $?
+        _tmux_refuse_ambiguous "$_ct" close || return $?
+        _tmux_with_pin "$_ct" _session_close_on_server "$@"
+        return
+    fi
+    _csock="$(_tmux_current_sock)"
+    _ccur=""
+    [[ -n "$_csock" ]] && _ccur="$(_CCTRL_TMUX_FORCE="$_csock" _CCTRL_TMUX_FORCE_NAME="" _session_current_name 2>/dev/null || true)"
+    if [[ -n "$_ccur" ]]; then
+        _tmux_with_server "$_csock" "$_ccur" _session_close_on_server "$@"
+    else
+        _session_close_on_server "$@"
+    fi
 }
 _session_close_on_server() {
     # Gracefully close a session. Designed so an agent running INSIDE a
@@ -20260,12 +20599,18 @@ _session_prune() {
     now_ms=$(( $(date +%s) * 1000 ))
 
     local -a names=()
-    while IFS= read -r a; do [[ -n "$a" ]] && names+=("$a"); done \
-        < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    while IFS= read -r a; do
+        [[ -n "$a" ]] || continue
+        # Placeholder (server keeper) sessions are never candidates and do not
+        # count toward the cap's live total (mdec-1110).
+        _tmux_is_placeholder "$a" && continue
+        names+=("$a")
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    _tmux_route_cache_prime
 
     local -a cand_names=() cand_reasons=() cand_ms=() json_items=()
     local name cmd agent attached rollout last_active_ms mtime age_ms stale np reason last_iso
-    for name in "${names[@]}"; do
+    for name in ${names[@]+"${names[@]}"}; do
         # Never propose the session we're running inside.
         [[ -n "$current" && "$name" == "$current" ]] && continue
         # Attached sessions are excluded unless explicitly forced.

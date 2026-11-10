@@ -457,6 +457,7 @@ unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER
 unset CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL
 # mdec-1110: a host-level primary tmux server must not route the suite.
 unset CCTRL_TMUX_SERVER CCTRL_TMUX_EXTRA_SERVERS _CCTRL_TMUX_PRIMARY _CCTRL_TMUX_EXTRA
+unset CCTRL_TMUX_PLACEHOLDER_SESSIONS CCTRL_TMUX_PRIMARY_START_HINT CCTRL_TMUX_ROUTE_CACHE_SECONDS
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
 # Plan 100: an agent running the suite sets these; any of them would force
 # the non-interactive answer in the tty-ask tests or change an ask's outcome.
@@ -24296,6 +24297,7 @@ _srv2_setup() { # sets SRV2_DIR SRV2_SOCKDIR SRV2_OLD SRV2_NEW SRV2_TT
     SRV2_OLD="$SRV2_SOCKDIR/default"; SRV2_NEW="$SRV2_SOCKDIR/fleet"
     export TMUX_TMPDIR="$SRV2_DIR"
     unset TMUX TMUX_PANE CCTRL_TMUX_SERVER CCTRL_TMUX_EXTRA_SERVERS _CCTRL_TMUX_PRIMARY _CCTRL_TMUX_EXTRA
+    unset CCTRL_TMUX_PLACEHOLDER_SESSIONS CCTRL_TMUX_PRIMARY_START_HINT CCTRL_TMUX_ROUTE_CACHE_SECONDS
 }
 _srv2_cleanup() { # kill this test's sessions by exact name, on its own sockets only
     local sock name
@@ -24359,6 +24361,9 @@ test_tmux_second_server_routing() (
     local tt="$SRV2_TT" out rc
     "$tt" -S "$SRV2_OLD" new-session -d -s old-a 'sleep 120'
     "$tt" -S "$SRV2_OLD" new-session -d -s TMUX--ms--srv2-clash 'sleep 120'
+    # cctrl never starts the primary: it is up before cctrl runs, kept alive
+    # by its placeholder session (hidden from ls and the counts below).
+    "$tt" -S "$SRV2_NEW" new-session -d -s fleet-anchor 'sleep 120'
     export CCTRL_TMUX_SERVER=fleet
 
     # The router: new-session -> primary; reads see both; targets go where the session is.
@@ -24366,7 +24371,7 @@ test_tmux_second_server_routing() (
     "$tt" -S "$SRV2_NEW" has-session -t '=new-b' 2>/dev/null || fail "new-session did not land on the primary"
     "$tt" -S "$SRV2_OLD" has-session -t '=new-b' 2>/dev/null && fail "new-session also landed on the old server"
     out="$(cctrl_source_eval 'tmux list-sessions -F "#{session_name}"' | LC_ALL=C sort | tr '\n' ' ')"
-    [[ "$out" == "TMUX--ms--srv2-clash new-b old-a " ]] || fail "list-sessions is not the union of both servers: $out"
+    [[ "$out" == "TMUX--ms--srv2-clash fleet-anchor new-b old-a " ]] || fail "list-sessions is not the union of both servers: $out"
     out="$(cctrl_source_eval 'tmux display-message -p -t "=old-a:" "#{socket_path}"')"
     [[ "$out" == "$SRV2_OLD" ]] || fail "a -t =NAME call did not go to the server holding it: $out"
     cctrl_source_eval 'tmux has-session -t "=old-a" && tmux has-session -t "=new-b"' || fail "has-session misses a server"
@@ -24383,7 +24388,7 @@ test_tmux_second_server_routing() (
     # Plan 111 attest lookups: the whois pane listing covers both servers, and
     # the host-side probe runs on the server that holds the session.
     out="$(cctrl_source_eval '_peer_whois_list_panes' | cut -f1 | LC_ALL=C sort -u | tr '\n' ' ')"
-    [[ "$out" == "TMUX--ms--srv2-clash new-b old-a " ]] || fail "whois pane listing misses a server: $out"
+    [[ "$out" == "TMUX--ms--srv2-clash fleet-anchor new-b old-a " ]] || fail "whois pane listing misses a server: $out"
     out="$(cctrl_source_eval '_session_tmux_host_command old-a "echo \$TMUX" 5')"
     [[ "$out" == "$SRV2_OLD,"* ]] || fail "the attest probe did not run on the old server: $out"
     out="$(cctrl_source_eval '_session_tmux_host_command new-b "echo \$TMUX"')"
@@ -24400,6 +24405,8 @@ test_tmux_second_server_routing() (
     out="$("$ROOT/cctrl" session ls --json 2>/dev/null)"
     jq -e 'map({key:.name, value:.tmux_server}) | from_entries | .["old-a"]=="default" and .["new-b"]=="fleet"' <<< "$out" >/dev/null \
         || fail "session ls --json misses a server or its label: $out"
+    jq -e 'map(select(.name=="fleet-anchor")) | length == 0' <<< "$out" >/dev/null \
+        || fail "the placeholder session is listed as a worker: $out"
     jq -e 'map(select(.name=="old-a" or .name=="new-b") | .execution_id | startswith("tmux-v1:")) | all and length==2' <<< "$out" >/dev/null \
         || fail "execution ids missing for a server: $out"
     out="$("$ROOT/cctrl" session ls 2>/dev/null)"
@@ -24472,6 +24479,245 @@ JSON
     jq -e 'length==2 and all(.[]; .disposition=="restore")' <<< "$plan_old" >/dev/null || fail "old snapshot restore plan is wrong: $plan_old"
     echo "ok: snapshot records tmux_server; old snapshots without it restore the same"
 }
+
+test_tmux_with_pin_keeps_errexit() {
+    # B1: the pin wrappers never switch errexit off. Under set -e a failure
+    # inside the wrapped command stops right there, routing off or on, as a
+    # direct call always did. Run on whichever bash runs the suite (3.2 / 5.x).
+    local code mode out rc dead="$CCTRL_TEST_TMUX_TMPDIR/b1-$$/fleet"
+    for mode in off on; do
+        for code in \
+            'set -e; f() { false; echo AFTER-FALSE; }; _tmux_with_pin "$1" f; echo WRAPPER-RETURNED' \
+            'set -e; f() { false; echo AFTER-FALSE; }; _tmux_with_pin "" f; echo WRAPPER-RETURNED' \
+            'set -e; f() { false; echo AFTER-FALSE; }; _tmux_with_server "$2" "$1" f; echo WRAPPER-RETURNED'; do
+            rc=0
+            if [[ "$mode" == on ]]; then
+                out="$(CCTRL_TMUX_SERVER="$dead" cctrl_source_eval "$code" nosuch "$dead" 2>&1)" || rc=$?
+            else
+                out="$(cctrl_source_eval "$code" nosuch "$dead" 2>&1)" || rc=$?
+            fi
+            [[ "$rc" -ne 0 ]] || fail "routing $mode: set -e did not abort inside the wrapper ($code): $out"
+            assert_not_contains "$out" "AFTER-FALSE"
+            assert_not_contains "$out" "WRAPPER-RETURNED"
+        done
+    done
+    # A normal non-zero return (if/|| context) keeps its status and restores the pin.
+    out="$(CCTRL_TMUX_SERVER="$dead" cctrl_source_eval 'g() { return 3; }; _CCTRL_TMUX_PIN=prev; rc=0; _tmux_with_pin nosuch g || rc=$?; _CCTRL_TMUX_FORCE=pf; _tmux_with_server /x/y nosuch g || rc=$((rc * 10 + $?)); echo "$rc|$_CCTRL_TMUX_PIN|$_CCTRL_TMUX_FORCE"')"
+    [[ "$out" == "33|prev|pf" ]] || fail "wrapper status or pin restore is wrong: $out"
+    echo "ok: _tmux_with_pin/_tmux_with_server keep errexit (routing off and on)"
+}
+
+test_tmux_server_never_starts_primary() (
+    # B2: a dead primary is refused on every launch path; no socket appears.
+    _srv2_setup
+    trap _srv2_cleanup EXIT
+    local tt="$SRV2_TT" out rc
+    export CCTRL_TMUX_SERVER=fleet
+    rc=0; out="$(cctrl_source_eval 'tmux new-session -d -s srv2-nope "sleep 5"' 2>&1)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "routed new-session on a dead primary: rc $rc (want 69): $out"
+    [[ "$(printf '%s\n' "$out" | grep -c .)" -eq 1 ]] || fail "the refusal is not one line: $out"
+    assert_contains "$out" "primary tmux server 'fleet' ($SRV2_NEW) is not running and cctrl will not start it"
+    assert_contains "$out" "must be started from Terminal, not by cctrl"
+    assert_contains "$out" 'launchctl kickstart gui/$(id -u)/com.fleet-tmux-terminal'
+    assert_contains "$out" "start-fleet-tmux.command"
+    assert_contains "$out" "docs/runbooks/fleet-tmux-terminal.md"
+    [[ ! -e "$SRV2_NEW" ]] || fail "a refused new-session created the primary socket"
+    # Old tmux (no -N): the pre-check alone still refuses.
+    rc=0; out="$(cctrl_source_eval '_TMUX_HAS_N=no; tmux new-session -d -s srv2-nope "sleep 5"' 2>&1)" || rc=$?
+    [[ "$rc" -eq 69 && ! -e "$SRV2_NEW" ]] || fail "the no -N fallback started or did not refuse: rc $rc: $out"
+    # The exec/argv path carries -N (fails closed even without the check).
+    out="$(cctrl_source_eval '_tmux_argv new-session -d -s q; printf "%s|" "${_TMUX_ARGV[@]}"')"
+    [[ "$out" == "tmux|-N|-S|$SRV2_NEW|new-session|-d|-s|q|" ]] || fail "_tmux_argv new-session lacks -N: $out"
+    # The hint is overridable (env, then config), so cctrl stays generic.
+    out="$(CCTRL_TMUX_PRIMARY_START_HINT='run my-starter' cctrl_source_eval 'tmux new-session -d -s q' 2>&1 || true)"
+    assert_contains "$out" "not by cctrl: run my-starter"
+    printf '{"tmuxPrimaryStartHint":"cfg-starter"}\n' > "$SRV2_DIR/hint.json"
+    out="$(CCTRL_CONFIG_LOCAL="$SRV2_DIR/hint.json" cctrl_source_eval 'tmux new-session -d -s q' 2>&1 || true)"
+    assert_contains "$out" "not by cctrl: cfg-starter"
+    # cctrl start refuses before writing metadata, and starts nothing.
+    make_fake_agent "$SRV2_DIR/codex" codex
+    mkdir -p "$SRV2_DIR/srv2-dead"
+    local meta_dir meta_before
+    meta_dir="$(dirname "$(cctrl_source_eval '_session_metadata_file probe-name')")"
+    meta_before="$(ls -A "$meta_dir" 2>/dev/null | LC_ALL=C sort || true)"
+    rc=0; out="$(cd "$SRV2_DIR/srv2-dead" && PATH="$SRV2_DIR:$PATH" "$ROOT/cctrl" start --agent codex -m hi 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "cctrl start succeeded with the primary down: $out"
+    assert_contains "$out" "cctrl will not start it"
+    [[ ! -e "$SRV2_NEW" ]] || fail "cctrl start created the primary socket"
+    [[ "$(ls -A "$meta_dir" 2>/dev/null | LC_ALL=C sort || true)" == "$meta_before" ]] || fail "start wrote session metadata before refusing"
+    # Read paths never start it either.
+    cctrl_source_eval 'tmux list-sessions; tmux has-session -t =x; tmux display-message -p -t =x: x; _tmux_server_report; _tmux_route_cache_prime' >/dev/null 2>&1 || true
+    [[ ! -e "$SRV2_NEW" ]] || fail "a read path created the primary socket"
+    # Primary up: new-session lands there.
+    "$tt" -S "$SRV2_NEW" new-session -d -s fleet-anchor 'sleep 120'
+    cctrl_source_eval 'tmux new-session -d -s srv2-yes "sleep 120"' || fail "new-session on a live primary failed"
+    "$tt" -S "$SRV2_NEW" has-session -t '=srv2-yes' 2>/dev/null || fail "new-session did not land on the live primary"
+    echo "ok: cctrl never starts the primary tmux server (refusal, -N, fallback, hint override)"
+)
+
+test_tmux_placeholder_sessions() (
+    # N5: fleet-anchor keeps the fleet server alive and is never a worker.
+    _srv2_setup
+    trap _srv2_cleanup EXIT
+    local tt="$SRV2_TT" out rc
+    "$tt" -S "$SRV2_NEW" new-session -d -s fleet-anchor 'sleep 120'
+    "$tt" -S "$SRV2_OLD" new-session -d -s ph-old 'sleep 120'
+    export CCTRL_TMUX_SERVER=fleet
+    out="$("$ROOT/cctrl" session ls --json 2>/dev/null)"
+    jq -e 'map(.name) == ["ph-old"]' <<< "$out" >/dev/null || fail "session ls --json lists the placeholder: $out"
+    out="$("$ROOT/cctrl" session ls 2>/dev/null)"
+    assert_not_contains "$out" "fleet-anchor"
+    assert_contains "$out" "fleet [primary] 0 session(s)"
+    out="$("$ROOT/cctrl" session servers --json)"
+    jq -e --arg p "$SRV2_NEW" '.servers[] | select(.socket==$p) | .alive and .sessions==0' <<< "$out" >/dev/null \
+        || fail "session servers counts the placeholder: $out"
+    out="$(cctrl_source_eval '_session_list --peer-lite' 2>/dev/null)"
+    assert_not_contains "$out" "fleet-anchor"
+    out="$("$ROOT/cctrl" session prune --older-than 0s --json 2>/dev/null)"
+    assert_not_contains "$out" "fleet-anchor"
+    rc=0; out="$("$ROOT/cctrl" session kill fleet-anchor 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "kill of the placeholder: rc $rc (want 75): $out"
+    assert_contains "$out" "server keeper"
+    rc=0; out="$("$ROOT/cctrl" session close fleet-anchor --now 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "close of the placeholder: rc $rc (want 75): $out"
+    assert_contains "$out" "server keeper"
+    rc=0; out="$("$ROOT/cctrl" session stop fleet-anchor 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "stop of the placeholder: rc $rc: $out"
+    "$tt" -S "$SRV2_NEW" has-session -t '=fleet-anchor' 2>/dev/null || fail "the placeholder was killed without --force"
+    # Never launched into; config and env replace the default list.
+    out="$(cctrl_source_eval '_tmux_is_placeholder fleet-anchor && echo yes; _tmux_is_placeholder ph-old || echo no')"
+    [[ "$out" == $'yes\nno' ]] || fail "placeholder check is wrong: $out"
+    printf '{"tmuxPlaceholderSessions":["keeper-a","keeper b"]}\n' > "$SRV2_DIR/ph.json"
+    out="$(CCTRL_CONFIG_LOCAL="$SRV2_DIR/ph.json" cctrl_source_eval '_tmux_is_placeholder "keeper b" && _tmux_is_placeholder keeper-a && ! _tmux_is_placeholder fleet-anchor && echo cfg-ok')"
+    [[ "$out" == cfg-ok ]] || fail "tmuxPlaceholderSessions not honoured: $out"
+    out="$(CCTRL_TMUX_PLACEHOLDER_SESSIONS="" cctrl_source_eval '_tmux_is_placeholder fleet-anchor || echo none')"
+    [[ "$out" == none ]] || fail "an empty CCTRL_TMUX_PLACEHOLDER_SESSIONS must mean none: $out"
+    # Routing off: no placeholder logic at all (unset = as before).
+    out="$(env -u CCTRL_TMUX_SERVER "$BASH" -c 'CCTRL_NO_MAIN=1 source "$0"; _tmux_is_placeholder fleet-anchor || echo off' "$ROOT/cctrl")"
+    [[ "$out" == off ]] || fail "placeholder logic active with routing off: $out"
+    # --force kills it.
+    "$ROOT/cctrl" session kill fleet-anchor --force >/dev/null 2>&1 || fail "kill --force of the placeholder failed"
+    "$tt" -S "$SRV2_NEW" has-session -t '=fleet-anchor' 2>/dev/null && fail "kill --force left the placeholder"
+    echo "ok: placeholder sessions are hidden, uncounted, unpruned and refused without --force"
+)
+
+test_tmux_placeholder_not_restored_into() {
+    # N5: a snapshot row naming a placeholder is never restored into.
+    local root="$TMPDIR/srv2-ph-restore" data="$TMPDIR/srv2-ph-restore/data" snapshots="$TMPDIR/srv2-ph-restore/snapshots"
+    local host="0123456789abcdef0123456789abcdef" plan out
+    mkdir -p "$data" "$snapshots"
+    printf '%s\n' "$host" > "$data/host-id"
+    printf '{"schema_version":1,"status":"available","observed_at":"2026-11-10T10:00:00Z","source_cursor":"p","processes":[],"error":null}\n' > "$root/process.json"
+    printf '{"schema_version":1,"kind":"codex_reconcile_result_v1","records":[],"errors":[]}\n' > "$root/codex.json"
+    row() { printf '{"provider":"claude","provider_task_id":"%s","host_id":"%s","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"%s","tmux_session":"%s","action_capabilities":{"tmux_attach":{"supported":true}}}' "$1" "$host" "$1" "$2"; }
+    printf '{"schema_version":2,"host_id":"%s","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[%s,%s]}\n' \
+        "$host" "$(row c-anchor fleet-anchor)" "$(row c-work TMUX--work)" > "$root/catalogue.json"
+    printf '[{"name":"fleet-anchor","agent":"claude","session_id":"c-anchor","dir":"/tmp/x"},{"name":"TMUX--work","agent":"claude","session_id":"c-work","dir":"/tmp/x"}]\n' > "$root/sessions.json"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+      CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$snapshots" --json)" \
+      || fail "snapshot failed: $out"
+    jq '(.rows[].action_capabilities.tmux_attach)={supported:false,reason:"no-live-cctrl-tmux-owner"}' "$root/catalogue.json" > "$root/current.json"
+    plan="$(CCTRL_TMUX_SERVER="$CCTRL_TEST_TMUX_TMPDIR/ph-dead/fleet" CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" \
+      CCTRL_RESTORE_CATALOGUE_FILE="$root/current.json" CCTRL_RESTORE_PROCESS_FILE="$root/process.json" \
+      CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$root/codex.json" CCTRL_RESTORE_LAUNCH_LOG="$root/launch.log" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json \
+      | jq -c '[.plan[] | {provider_task_id, disposition, reason}] | sort_by(.provider_task_id)')"
+    jq -e '.[] | select(.provider_task_id=="c-anchor") | .disposition != "restore" and (.reason | contains("server keeper"))' <<< "$plan" >/dev/null \
+        || fail "a placeholder row would be restored into: $plan"
+    jq -e '.[] | select(.provider_task_id=="c-work") | .disposition == "restore"' <<< "$plan" >/dev/null \
+        || fail "a normal row lost its restore: $plan"
+    echo "ok: restore never restores into a placeholder session"
+}
+
+test_tmux_server_ambiguous_names() (
+    # N2: a name on two servers is refused by destructive actions; a forced
+    # server (self-close) only ever touches its own copy.
+    _srv2_setup
+    trap _srv2_cleanup EXIT
+    local tt="$SRV2_TT" out rc
+    "$tt" -S "$SRV2_NEW" new-session -d -s fleet-anchor 'sleep 120'
+    "$tt" -S "$SRV2_NEW" new-session -d -s dup 'sleep 120'
+    "$tt" -S "$SRV2_OLD" new-session -d -s dup 'sleep 120'
+    export CCTRL_TMUX_SERVER=fleet
+    rc=0; out="$("$ROOT/cctrl" session kill dup 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "kill of a duplicate name: rc $rc (want 75): $out"
+    assert_contains "$out" "exists on 2 tmux servers"
+    assert_contains "$out" "fleet ($SRV2_NEW)"
+    assert_contains "$out" "default ($SRV2_OLD)"
+    rc=0; out="$("$ROOT/cctrl" session close dup --force --now 2>&1)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "close of a duplicate name: rc $rc: $out"
+    assert_contains "$out" "exists on 2 tmux servers"
+    "$tt" -S "$SRV2_NEW" has-session -t '=dup' && "$tt" -S "$SRV2_OLD" has-session -t '=dup' \
+        || fail "a refused action killed a copy"
+    # Forced server: calls about NAME go there; calls about other names route normally.
+    out="$(cctrl_source_eval '_tmux_with_server "$1" dup tmux display-message -p -t "=dup:" "#{socket_path}"; _tmux_with_server "$1" dup tmux display-message -p -t "=fleet-anchor:" "#{socket_path}"' "$SRV2_OLD")"
+    [[ "$out" == "$SRV2_OLD"$'\n'"$SRV2_NEW" ]] || fail "forced-server routing is wrong: $out"
+    out="$(cctrl_source_eval 'tmux display-message -p -t "=dup:" "#{socket_path}"')"
+    [[ "$out" == "$SRV2_NEW" ]] || fail "unforced duplicate should resolve primary first: $out"
+    echo "ok: duplicate session names across servers are refused; forced server stays on its copy"
+)
+
+test_tmux_server_route_cache_and_paths() (
+    # N4 cache, N6 physical paths, N7 extras split, N8 stop-exact pin restore,
+    # N1 timeout wrapper kills the real client.
+    _srv2_setup
+    trap _srv2_cleanup EXIT
+    local tt="$SRV2_TT" out rc
+    "$tt" -S "$SRV2_NEW" new-session -d -s fleet-anchor 'sleep 120'
+    "$tt" -S "$SRV2_OLD" new-session -d -s c-old 'sleep 120'
+    export CCTRL_TMUX_SERVER=fleet
+    # N4: primed map routes without probes; kill-session drops it; misses probe live.
+    out="$(cctrl_source_eval '_tmux_route_cache_prime; _tmux_locate_into c-old && echo "hit=$_TMUX_LOC_RESULT"
+        # A name created after priming is still found (live probe on a miss).
+        command tmux -S "$1" new-session -d -s c-late "sleep 120"
+        _tmux_locate_into c-late && echo "late=$_TMUX_LOC_RESULT"
+        tmux kill-session -t "=c-late"; echo "at=$_TMUX_LOC_AT"' "$SRV2_OLD")"
+    assert_contains "$out" "hit=$SRV2_OLD"
+    assert_contains "$out" "late=$SRV2_OLD"
+    assert_contains "$out" "at=-1"
+    # A stale map entry expires with the TTL.
+    out="$(CCTRL_TMUX_ROUTE_CACHE_SECONDS=0 cctrl_source_eval '_TMUX_LOC_CACHE=$'"'"'c-old\t/nowhere\n'"'"'; _TMUX_LOC_AT=$((SECONDS - 2)); _TMUX_LOC_KEY="$_TMUX_SRV_KEY"; _tmux_locate_into c-old; echo "$_TMUX_LOC_RESULT"')"
+    [[ "$out" == "$SRV2_OLD" ]] || fail "an expired route cache entry was used: $out"
+    out="$(cctrl_source_eval '_TMUX_LOC_CACHE=$'"'"'c-old\t/nowhere\n'"'"'; _TMUX_LOC_AT=$SECONDS; _TMUX_LOC_KEY="$_TMUX_SRV_KEY"; _tmux_locate_into c-old; echo "$_TMUX_LOC_RESULT"')"
+    [[ "$out" == /nowhere ]] || fail "a fresh route cache entry was not used: $out"
+
+    # N6: a path value through a symlinked dir is the physical socket, and the
+    # $TMUX spelling of the same server is not listed twice.
+    ln -s "$SRV2_SOCKDIR" "$SRV2_DIR/link"
+    out="$(CCTRL_TMUX_SERVER="$SRV2_DIR/link/fleet" TMUX="$SRV2_NEW,1,0" cctrl_source_eval 'echo "$_CCTRL_TMUX_PRIMARY"; _tmux_servers')"
+    [[ "$(printf '%s\n' "$out" | head -1)" == "$SRV2_NEW" ]] || fail "path tmuxServer not resolved to the physical path: $out"
+    [[ "$(printf '%s\n' "$out" | grep -cxF "$SRV2_NEW")" -eq 2 ]] || fail "one server listed twice (or not at all): $out"
+    out="$(CCTRL_TMUX_SERVER="$SRV2_DIR/link/fleet" TMUX="$SRV2_DIR/link/default,1,0" cctrl_source_eval '_tmux_servers')"
+    [[ "$out" == "$SRV2_NEW"$'\n'"$SRV2_OLD"$'\n' || "$out" == "$SRV2_NEW"$'\n'"$SRV2_OLD" ]] || fail "servers not deduplicated by physical socket: $out"
+
+    # N7: extras split on commas only: no globbing, spaces kept.
+    mkdir -p "$SRV2_DIR/globdir"; : > "$SRV2_DIR/globdir/aa"; : > "$SRV2_DIR/globdir/bb"
+    out="$(cd "$SRV2_DIR/globdir" && CCTRL_TMUX_EXTRA_SERVERS='/p q/s1, *,  old2 ' cctrl_source_eval 'printf "%s" "$_CCTRL_TMUX_EXTRA"')"
+    [[ "$out" == "/p q/s1"$'\n'"$SRV2_SOCKDIR/*"$'\n'"$SRV2_SOCKDIR/old2"$'\n' || "$out" == "/p q/s1"$'\n'"$SRV2_SOCKDIR/*"$'\n'"$SRV2_SOCKDIR/old2" ]] \
+        || fail "tmuxExtraServers split is wrong: $out"
+
+    # N8: stop-exact restores the previous pin (stale id on the old server).
+    "$ROOT/cctrl" session ls --json >/dev/null 2>&1 || true
+    local old_id
+    old_id="$("$tt" -S "$SRV2_OLD" show-options -sqv @cctrl_server_instance_id 2>/dev/null || true)"
+    [[ "$old_id" =~ ^[0-9a-f]{32}$ ]] || fail "old server has no instance id: $old_id"
+    out="$(cctrl_source_eval '_CCTRL_TMUX_PIN=prev-pin; _session_stop_exact c-old --execution-id "tmux-v1:$1:1:1:\$999" --json >/dev/null 2>&1 || true; echo "$_CCTRL_TMUX_PIN"' "$old_id")"
+    [[ "$out" == prev-pin ]] || fail "stop-exact did not restore the previous pin: $out"
+
+    # N1: with routing on, a timed-out call kills the real tmux client.
+    printf '#!/usr/bin/env bash\ncase " $* " in *" display-message "*) echo $$ > %q; exec sleep 30 ;; esac\nexec %q "$@"\n' \
+        "$SRV2_DIR/hung.pid" "$tt" > "$SRV2_DIR/tmux"
+    chmod +x "$SRV2_DIR/tmux"
+    rc=0
+    PATH="$SRV2_DIR:$PATH" CCTRL_TMUX_TIMEOUT_SECONDS=1 cctrl_source_eval '_tmux_run_with_timeout display-message -p -t "=c-old:" x' >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 124 ]] || fail "timeout wrapper rc $rc (want 124)"
+    local hung; hung="$(cat "$SRV2_DIR/hung.pid" 2>/dev/null || true)"
+    [[ "$hung" =~ ^[0-9]+$ ]] || fail "the hung client never ran"
+    sleep 0.2
+    if kill -0 "$hung" 2>/dev/null; then kill "$hung" 2>/dev/null || true; fail "timeout left the tmux client running (pid $hung)"; fi
+    echo "ok: route cache, physical sockets, extras split, stop-exact pin restore, timeout kills the client"
+)
 
 run_codex_ownership_matrix_paths() {
     local fixture="$ROOT/tests/fixtures/codex-ownership-matrix.json" path
