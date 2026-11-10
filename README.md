@@ -2040,28 +2040,17 @@ output, within a 1 s budget; it never blocks or alters a send. The log rotates
 to one `.1` at `CCTRL_NATIVE_LOG_MAX_BYTES` (default 10 MB). Read it with
 `cctrl peer native-log`. `cctrl hooks doctor` checks both entries.
 
-### notify.sh — smart sound notifications
+### notify.sh — no sounds
 
-Plays different sounds based on what Claude is doing:
+`hooks/notify.sh` used to play an `afplay` chime and a spoken `say` line when a
+turn finished, needed input, or hit a permission prompt. Those sounds were
+removed from cctrl itself (2026-11-10), so no install can bring them back. The
+script stays as a silent entry point (it drains stdin and exits 0) so existing
+Stop and Notification hook registrations keep working.
 
-- **Ping** — Claude finished (no action needed)
-- **Glass** — Claude asked you a question (needs input)
-- **Tink** — a permission prompt is waiting
-
-Distinguishes "done" from "needs input" by parsing the session transcript and checking whether the last message ends with a question. No arbitrary delays — all notifications are instant.
-
-**Turning the sounds off (per host).** `cctrl hooks sounds off` writes
-`"notifySounds": false` to `~/.config/cctrl/config.json` (or
-`$CCTRL_USER_CONFIG`), which lives outside the installed release, so a new
-`cctrl install` keeps it. `cctrl hooks sounds on` turns them back on, and
-`cctrl hooks sounds` prints the effective setting and where it comes from.
-Precedence: the env var `CCTRL_NOTIFY_SOUNDS=on|off` (also `1|0`,
-`true|false`, `yes|no`), then `notifySounds` in `data/config.local.json`, the
-user config and `data/config.json`, then the default **on**. An unrecognised
-value is ignored. Off silences only the `afplay` chime and the spoken `say`
-line; everything else the Stop and Notification hooks do is unchanged.
-`cctrl hooks doctor` shows the setting in one line. A legacy hook that runs
-`notify.sh` directly (below) reads the same env var and config files.
+`cctrl hooks sounds [on|off|status]` is kept as a harmless no-op that says the
+sounds were removed, so scripts that call it do not break. The old
+`notifySounds` config key and `CCTRL_NOTIFY_SOUNDS` env var are ignored.
 
 ```json
 {

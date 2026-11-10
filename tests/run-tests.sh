@@ -7080,116 +7080,42 @@ PY
     echo "ok: hooks run stop tees one stdin capture to both notify.sh and session-log.py"
 }
 
-test_notify_sounds_off_switch() {
-    # 2026-11-09: a per-host off switch for hooks/notify.sh sounds that a new
-    # install cannot undo (it lives in the user config, not the release).
-    # afplay/say/osascript are stubs that only log; nothing plays.
-    local t="$TMPDIR/notify-sounds" out rc
-    mkdir -p "$t/hooks" "$t/data" "$t/stub" "$t/proj"
-    cp "$ROOT/cctrl" "$t/cctrl"; chmod +x "$t/cctrl"
-    cp "$ROOT/hooks/notify.sh" "$t/hooks/notify.sh"; chmod +x "$t/hooks/notify.sh"
-    printf 'import sys\nopen("%s/sessionlog.in", "a").write(sys.stdin.read() + "\\n")\n' "$t" > "$t/hooks/session-log.py"
-    local s
+test_notify_sounds_removed() {
+    # 2026-11-10: the notify sounds are gone from cctrl itself. notify.sh must
+    # contain no afplay/say call and must invoke neither (stubs on PATH log
+    # their invocations). `hooks sounds` stays as a harmless no-op.
+    local t="$TMPDIR/notify-nosound" out rc s
+    mkdir -p "$t/stub" "$t/proj"
+    if grep -v '^[[:space:]]*#' "$ROOT/hooks/notify.sh" | grep -E '(^|[^[:alnum:]_.-])(afplay|say)([[:space:]]|$)|osascript|NSSound' >/dev/null; then
+        fail "hooks/notify.sh still contains a sound call"
+    fi
     for s in afplay say osascript; do
         printf '#!/bin/sh\necho "%s $*" >> "%s/sounds.log"\n' "$s" "$t" > "$t/stub/$s"
         chmod +x "$t/stub/$s"
     done
-    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All finished."}]}}' > "$t/done.jsonl"
     printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"Ship it?"}]}}' > "$t/ask.jsonl"
-    local p_done="{\"transcript_path\":\"$t/done.jsonl\"}" p_ask="{\"transcript_path\":\"$t/ask.jsonl\"}"
-    local p_perm='{"type":"permission_prompt"}' p_idle='{"type":"idle_prompt"}'
-    _ns() { # cctrl with the stub PATH and a scratch user/local config
-        env -u CCTRL_NOTIFY_SOUNDS PATH="$t/stub:$PATH" CLAUDE_PROJECT_DIR="$t/proj" \
-            CCTRL_USER_CONFIG="$t/user.json" CCTRL_CONFIG_LOCAL="$t/local.json" "$@"
-    }
-    _ns_wait() { # $1 = expected line count: background afplay may land late
-        local i=0 n
-        while (( i < 40 )); do
-            n=0; [[ -f "$t/sounds.log" ]] && n="$(wc -l < "$t/sounds.log" | tr -d ' ')"
-            (( n >= $1 )) && break
-            sleep 0.05; i=$((i + 1))
-        done
-        [[ "$1" -ne 0 ]] || sleep 0.2
-    }
-    # Runs all four events through cctrl; records stdout+rc (non-sound outputs).
-    _ns_all() { # $1 = expected sound lines; extra args = env assignments
-        local want="$1"; shift
-        rm -f "$t/sounds.log" "$t/sessionlog.in"
-        out=""
-        out+="$(printf '%s' "$p_done" | _ns "$@" "$t/cctrl" hooks run stop 2>&1; echo "rc=$?")|"
-        out+="$(printf '%s' "$p_ask" | _ns "$@" "$t/cctrl" hooks run stop 2>&1; echo "rc=$?")|"
-        out+="$(printf '%s' "$p_perm" | _ns "$@" "$t/cctrl" hooks run notify 2>&1; echo "rc=$?")|"
-        out+="$(printf '%s' "$p_idle" | _ns "$@" "$t/cctrl" hooks run notify 2>&1; echo "rc=$?")"
-        _ns_wait "$want"
-    }
-    _ns_log() { [[ -f "$t/sounds.log" ]] && sort "$t/sounds.log"; return 0; }
-
-    # Default (nothing set): sounds on, unchanged.
-    _ns_all 6
-    local on_out="$out" on_sessionlog
-    on_sessionlog="$(cat "$t/sessionlog.in")"
-    [[ "$(_ns_log)" == "$(printf '%s\n' \
-        'afplay /System/Library/Sounds/Glass.aiff' 'afplay /System/Library/Sounds/Ping.aiff' \
-        'afplay /System/Library/Sounds/Tink.aiff' 'say -r 200 proj done' \
-        'say -r 200 proj needs input' 'say -r 200 proj needs permission' | sort)" ]] \
-        || fail "default sounds changed: $(_ns_log)"
-    out="$(_ns "$t/cctrl" hooks sounds 2>&1)"
-    assert_contains "$out" "notify sounds: on (default)"
-
-    # `hooks sounds off` writes the user config, keeping other keys.
-    printf '{"defaultProfile":"keepme"}\n' > "$t/user.json"
-    out="$(_ns "$t/cctrl" hooks sounds off 2>&1)" || fail "hooks sounds off failed: $out"
-    jq -e '.notifySounds == false and .defaultProfile == "keepme"' "$t/user.json" >/dev/null \
-        || fail "user config not written as expected: $(cat "$t/user.json")"
-    assert_contains "$out" "notify sounds: off ($t/user.json)"
-    _ns_all 0
-    [[ -z "$(_ns_log)" ]] || fail "sounds played while off: $(_ns_log)"
-    [[ "$out" == "$on_out" ]] || fail "non-sound output changed with sounds off: [$out] vs [$on_out]"
-    [[ "$(cat "$t/sessionlog.in")" == "$on_sessionlog" ]] || fail "session-log.py input changed with sounds off"
-
-    # A legacy hook that runs notify.sh directly honours the config too.
-    rm -f "$t/sounds.log"
-    printf '%s' "$p_done" | _ns "$t/hooks/notify.sh" stop
-    printf '%s' "$p_perm" | _ns "$t/hooks/notify.sh" notification
-    _ns_wait 0
-    [[ -z "$(_ns_log)" ]] || fail "direct notify.sh played sounds while off: $(_ns_log)"
-
-    # Env override wins over the config, both ways.
-    _ns_all 6 CCTRL_NOTIFY_SOUNDS=on
-    [[ "$(_ns_log | grep -c .)" -eq 6 ]] || fail "CCTRL_NOTIFY_SOUNDS=on did not override config off: $(_ns_log)"
-    out="$(_ns CCTRL_NOTIFY_SOUNDS=on "$t/cctrl" hooks sounds 2>&1)"
-    assert_contains "$out" "notify sounds: on (env CCTRL_NOTIFY_SOUNDS)"
-    _ns "$t/cctrl" hooks sounds on >/dev/null 2>&1 || fail "hooks sounds on failed"
-    jq -e '.notifySounds == true' "$t/user.json" >/dev/null || fail "hooks sounds on did not write true"
-    _ns_all 0 CCTRL_NOTIFY_SOUNDS=off
-    [[ -z "$(_ns_log)" ]] || fail "CCTRL_NOTIFY_SOUNDS=off did not silence: $(_ns_log)"
-    rm -f "$t/sounds.log"
-    printf '%s' "$p_done" | _ns CCTRL_NOTIFY_SOUNDS=0 "$t/hooks/notify.sh" stop
-    _ns_wait 0
-    [[ -z "$(_ns_log)" ]] || fail "direct notify.sh ignored CCTRL_NOTIFY_SOUNDS=0"
-
-    # data/config.local.json outranks the user config; `hooks sounds` warns.
-    printf '{"notifySounds":false}\n' > "$t/local.json"
-    rc=0; out="$(_ns "$t/cctrl" hooks sounds on 2>&1)" || rc=$?
-    [[ "$rc" -eq 1 ]] || fail "hooks sounds on should fail while local config overrides (rc=$rc)"
-    assert_contains "$out" "notify sounds: off ($t/local.json)"
-    assert_contains "$out" "still overrides it"
-    rm -f "$t/local.json"
-
-    # An unrecognised value falls through to the default (on).
-    printf '{"notifySounds":"maybe"}\n' > "$t/user.json"
-    out="$(_ns "$t/cctrl" hooks sounds 2>&1)"
-    assert_contains "$out" "notify sounds: on (default)"
-
-    # hooks doctor shows the setting in one line.
-    printf '{"notifySounds":false}\n' > "$t/user.json"
-    out="$(_ns "$t/cctrl" hooks doctor 2>&1 || true)"
-    out="$(printf '%s' "$out" | sed $'s/\033\\[[0-9;]*m//g')"
-    [[ "$(printf '%s\n' "$out" | grep -c 'notify sounds:')" -eq 1 ]] || fail "doctor should show one sounds line: $out"
-    assert_contains "$out" "notify sounds: off ($t/user.json; set with: cctrl hooks sounds on|off)"
-    [[ ! -e "$t/sounds.log" ]] || [[ -z "$(grep osascript "$t/sounds.log")" ]] || fail "osascript was called"
-    unset -f _ns _ns_wait _ns_all _ns_log
-    echo "ok: notify sounds off switch (config, env, CLI, doctor) silences afplay/say only"
+    printf '%s\n' '{"type":"assistant","message":{"content":[{"type":"text","text":"All finished."}]}}' > "$t/done.jsonl"
+    local ev payload
+    for ev in "stop|{\"transcript_path\":\"$t/done.jsonl\"}" "stop|{\"transcript_path\":\"$t/ask.jsonl\"}" \
+              'notification|{"type":"permission_prompt"}'; do
+        payload="${ev#*|}"
+        rc=0
+        printf '%s' "$payload" | env PATH="$t/stub:$PATH" CLAUDE_PROJECT_DIR="$t/proj" CCTRL_NOTIFY_SOUNDS=on \
+            "$ROOT/hooks/notify.sh" "${ev%%|*}" >"$t/out" 2>&1 || rc=$?
+        [[ "$rc" -eq 0 ]] || fail "notify.sh ${ev%%|*} exited $rc"
+        [[ ! -s "$t/out" ]] || fail "notify.sh produced output: $(cat "$t/out")"
+    done
+    sleep 0.2
+    [[ ! -e "$t/sounds.log" ]] || fail "notify.sh invoked a sound command: $(cat "$t/sounds.log")"
+    # `hooks sounds` is a no-op that never writes the user config.
+    for s in "" on off status; do
+        rc=0
+        out="$(env PATH="$t/stub:$PATH" CCTRL_USER_CONFIG="$t/user.json" "$ROOT/cctrl" hooks sounds $s 2>&1)" || rc=$?
+        [[ "$rc" -eq 0 ]] || fail "hooks sounds $s exited $rc: $out"
+        assert_contains "$out" "removed from cctrl"
+    done
+    [[ ! -e "$t/user.json" ]] || fail "hooks sounds wrote the user config"
+    echo "ok: notify sounds removed (no afplay/say in notify.sh, none invoked, hooks sounds is a no-op)"
 }
 
 test_session_list_codex_default_model() {
@@ -12023,8 +11949,8 @@ test_peer_attest_preflip_doctor_archive_large() {
 
 test_config_user_writers_dangling_symlink() {
     # Pre-flip (notify-sounds verify): the user config may be a dotfiles
-    # symlink whose target does not exist yet. Both writers (`hooks sounds`
-    # via _config_user_set_json, `cctrl use` via _config_user_set_default_profile,
+    # symlink whose target does not exist yet. Both writers (`_config_user_set_json`,
+    # `cctrl use` via _config_user_set_default_profile,
     # one shared writer) write to the link's target path, creating its dir,
     # keep the link, and leave no junk dir or temp file. A failed mv removes
     # its temp file.
@@ -12034,10 +11960,11 @@ test_config_user_writers_dangling_symlink() {
     printf '{"model":"x","env":{}}\n' > "$t/profiles/work.json"
     # Absolute dangling link: hooks sounds off.
     ln -s "$t/dots/abs/config.json" "$t/user-abs.json"
-    out="$(env -u CCTRL_NOTIFY_SOUNDS CCTRL_USER_CONFIG="$t/user-abs.json" CCTRL_CONFIG_LOCAL="$t/none.json" "$t/cctrl" hooks sounds off 2>&1)" \
-        || fail "dangling: hooks sounds off failed: $out"
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    out="$(CCTRL_USER_CONFIG="$t/user-abs.json" cctrl_source_eval '_config_user_set_json k false && echo wrote || echo failed')"
+    [[ "$out" == wrote ]] || fail "dangling: _config_user_set_json failed: $out"
     [[ -L "$t/user-abs.json" ]] || fail "dangling: the link was replaced"
-    jq -e '.notifySounds == false' "$t/dots/abs/config.json" >/dev/null || fail "dangling: not written to the link target"
+    jq -e '.k == false' "$t/dots/abs/config.json" >/dev/null || fail "dangling: not written to the link target"
     # Relative dangling link through a second link: cctrl use.
     mkdir -p "$t/rel"
     ln -s "../dots/rel/config.json" "$t/rel/hop.json"
@@ -12047,8 +11974,9 @@ test_config_user_writers_dangling_symlink() {
     [[ -L "$t/home/.config/cctrl/config.json" && -L "$t/rel/hop.json" ]] || fail "dangling: use replaced a link"
     jq -e '.defaultProfile == "work"' "$t/dots/rel/config.json" >/dev/null || fail "dangling: use did not write the relative chain's target"
     # Writing again keeps the other key.
-    env -u CCTRL_NOTIFY_SOUNDS CCTRL_USER_CONFIG="$t/home/.config/cctrl/config.json" CCTRL_CONFIG_LOCAL="$t/none.json" "$t/cctrl" hooks sounds off >/dev/null 2>&1 || true
-    jq -e '.defaultProfile == "work" and .notifySounds == false' "$t/dots/rel/config.json" >/dev/null || fail "dangling: the second write kept defaultProfile"
+    # shellcheck disable=SC2016 # evaluated in the sourced shell
+    CCTRL_USER_CONFIG="$t/home/.config/cctrl/config.json" cctrl_source_eval '_config_user_set_json k false' >/dev/null 2>&1 || true
+    jq -e '.defaultProfile == "work" and .k == false' "$t/dots/rel/config.json" >/dev/null || fail "dangling: the second write kept defaultProfile"
     # No junk dir (a name with a newline) and no temp files anywhere.
     out="$(find "$t" -name '*
 *' -o -name '.cctrl-config.*' 2>/dev/null)"
