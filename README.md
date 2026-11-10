@@ -266,6 +266,52 @@ Add `-d` to start the tmux session and return without attaching. No GUI required
 
 When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic), excluding any `fm-*` (fleet-manager) key — only an explicit `cctrl @fm-<x>` launch gets an `fm-` name. A directory with no matching non-`fm-` shortcut keeps its repo-folder slug (unchanged).
 
+#### A second tmux server (`tmuxServer`)
+
+cctrl can start new sessions on a named tmux server while existing sessions
+stay where they are, on the old default server. Name the **primary** server
+with the env var `CCTRL_TMUX_SERVER` or the config key `tmuxServer`:
+
+```bash
+export CCTRL_TMUX_SERVER=fleet          # tmux -L fleet
+```
+
+```json
+{ "tmuxServer": "fleet" }
+```
+
+A value containing `/` is a socket path (`tmux -S PATH`); any other value is a
+socket name (`tmux -L NAME`). Precedence: the env var, then `tmuxServer` in
+`data/config.local.json`, the user config (`~/.config/cctrl/config.json`) and
+`data/config.json`. `"tmuxServer": ""` in a higher file switches it off for
+that host. Optional `tmuxExtraServers` (or `CCTRL_TMUX_EXTRA_SERVERS`, names
+or paths, comma separated) lists more servers that cctrl reads.
+
+With a primary set:
+
+- `cctrl start`, shortcuts, spawns and a restore of a session that is not
+  live anywhere create the session on the primary.
+- `session ls`, `peer ls/send/whois`, the doorbell, `close`, `kill`,
+  `stop-exact`, `snapshot`, `restore`, `doctor` and name-collision checks see
+  every server: the primary, the server in `$TMUX`, the default server and
+  any extras. A new name must be free on all of them.
+- Every targeted action (send-keys, paste, capture, kill) goes to the server
+  that actually holds that session. Inside a session, `$TMUX` still picks
+  "my own session", on either server.
+- `cctrl session servers [--json]` shows the primary, which servers are
+  running and the session count on each; the same line ends `session ls`
+  and heads `session doctor`.
+- `session ls --json` rows and snapshot task rows carry `tmux_server`
+  (`fleet`, `default`, or a path). A snapshot row without it means the
+  default server, which is how every older snapshot reads.
+
+cctrl never runs `kill-server` and never restarts a server for this.
+**Rollback** is unsetting it: remove `tmuxServer` (or unset
+`CCTRL_TMUX_SERVER`) and cctrl is plain `tmux` again, byte for byte. While
+sessions still run on the named server, `"tmuxServer": "default"` plus
+`"tmuxExtraServers": ["fleet"]` sends new sessions back to the default
+server and keeps the named one visible until it drains.
+
 For tmux-backed Codex sessions, `cctrl close` treats the terminal owner as
 complete and archives the matching Codex app task automatically. Restarts stay
 open. A plain Codex exit leaves the app task available; use

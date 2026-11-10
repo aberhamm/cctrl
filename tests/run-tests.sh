@@ -455,6 +455,8 @@ chmod +x "$TMPDIR/hostname"
 # leak in (CCTRL_TMUX_CONTEXT flips `cctrl start` into foreground mode).
 unset CCTRL_TMUX_CONTEXT TMUX TMUX_PANE CCTRL_AGENT CCTRL_HOST_PREFIX CCTRL_PEER CCTRL_DEVICE_TAG CCTRL_TEST_HOSTNAME CCTRL_ATTACH_AFTER_START
 unset CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL
+# mdec-1110: a host-level primary tmux server must not route the suite.
+unset CCTRL_TMUX_SERVER CCTRL_TMUX_EXTRA_SERVERS _CCTRL_TMUX_PRIMARY _CCTRL_TMUX_EXTRA
 unset CCTRL_SESSION_KIND CCTRL_SESSION_NAME CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
 # Plan 100: an agent running the suite sets these; any of them would force
 # the non-interactive answer in the tty-ask tests or change an ask's outcome.
@@ -24276,6 +24278,199 @@ JSON
       || fail "post-create startup failure lost its exact receipt or remote hint: $out"
 
     echo "ok: launch-to-app composes exact recovery, attestation, opt-out, and safe handoff"
+}
+
+# ── Second tmux server (mdec-1110): tmuxServer / CCTRL_TMUX_SERVER ──────
+# Two real, isolated tmux servers on explicit sockets under the suite's
+# private tmux dir: "default" plays the old server, "fleet" the new primary.
+# Cleanup kills only this test's own sessions by exact name; never a server.
+_srv2_setup() { # sets SRV2_DIR SRV2_SOCKDIR SRV2_OLD SRV2_NEW SRV2_TT
+    SRV2_TT="$(command -v tmux)"
+    [[ -x "$SRV2_TT" ]] || fail "tmux is required for second-server coverage"
+    [[ -n "${CCTRL_TEST_TMUX_TMPDIR:-}" && -d "$CCTRL_TEST_TMUX_TMPDIR" ]] || fail "no private tmux dir"
+    SRV2_DIR="$CCTRL_TEST_TMUX_TMPDIR/s2-$$-$RANDOM"
+    mkdir -p "$SRV2_DIR"
+    SRV2_DIR="$(cd -P "$SRV2_DIR" && pwd)"
+    SRV2_SOCKDIR="$SRV2_DIR/tmux-$(id -u)"
+    mkdir -p "$SRV2_SOCKDIR"; chmod 700 "$SRV2_SOCKDIR"
+    SRV2_OLD="$SRV2_SOCKDIR/default"; SRV2_NEW="$SRV2_SOCKDIR/fleet"
+    export TMUX_TMPDIR="$SRV2_DIR"
+    unset TMUX TMUX_PANE CCTRL_TMUX_SERVER CCTRL_TMUX_EXTRA_SERVERS _CCTRL_TMUX_PRIMARY _CCTRL_TMUX_EXTRA
+}
+_srv2_cleanup() { # kill this test's sessions by exact name, on its own sockets only
+    local sock name
+    for sock in "$SRV2_OLD" "$SRV2_NEW"; do
+        [[ -S "$sock" ]] || continue
+        while IFS= read -r name; do
+            [[ -n "$name" ]] && "$SRV2_TT" -S "$sock" kill-session -t "=$name" 2>/dev/null || true
+        done < <("$SRV2_TT" -S "$sock" list-sessions -F '#{session_name}' 2>/dev/null || true)
+    done
+    rm -rf -- "$SRV2_DIR"
+}
+
+test_tmux_server_unset_is_plain() {
+    # Unset = today's behaviour byte for byte: no tmux() function, no -L/-S.
+    local out
+    out="$(cctrl_source_eval 'type -t tmux; _tmux_argv has-session -t =x; printf "%s|" "${_TMUX_ARGV[@]}"; echo; _tmux_argv new-session -d -s y cmd; printf "%s|" "${_TMUX_ARGV[@]}"')"
+    assert_contains "$out" "file"
+    assert_not_contains "$out" "function"
+    assert_contains "$out" "tmux|has-session|-t|=x|"
+    assert_contains "$out" "tmux|new-session|-d|-s|y|cmd|"
+    out="$("$ROOT/cctrl" session servers --json)"
+    jq -e '.configured == false and .servers == []' <<< "$out" >/dev/null || fail "unset servers json: $out"
+    # The start path's tmux argv is unchanged (fake tmux logs every call).
+    make_fake_tmux "$TMPDIR/tmux"
+    local project="$TMPDIR/srv2-plain-project" log="$TMPDIR/srv2-plain.log"
+    mkdir -p "$project"; : > "$log"
+    (cd "$project" && PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" start --agent codex -m hi >/dev/null)
+    assert_contains "$(cat "$log")" "TMUX new-session -d -s TMUX--srv2-plain-project"
+    assert_not_contains "$(cat "$log")" " -S "
+    assert_not_contains "$(cat "$log")" " -L "
+    echo "ok: unset tmuxServer keeps plain tmux"
+}
+
+test_tmux_server_config_precedence() {
+    local d="$TMPDIR/srv2-config" out
+    mkdir -p "$d"
+    printf '{"tmuxServer":"from-user"}\n' > "$d/user.json"
+    printf '{"tmuxServer":"from-local"}\n' > "$d/local.json"
+    printf '{"defaultAgent":"codex"}\n' > "$d/other.json"
+    local probe; probe='printf "%s|%s|%s\n" "$_CCTRL_TMUX_SERVER_VALUE" "$_CCTRL_TMUX_PRIMARY" "$(type -t tmux)"'
+    out="$(CCTRL_USER_CONFIG="$d/user.json" CCTRL_CONFIG_LOCAL="$d/other.json" cctrl_source_eval "$probe")"
+    [[ "$out" == "from-user|"*"/tmux-$(id -u)/from-user|function" ]] || fail "user config not used: $out"
+    out="$(CCTRL_USER_CONFIG="$d/user.json" CCTRL_CONFIG_LOCAL="$d/local.json" cctrl_source_eval "$probe")"
+    [[ "$out" == "from-local|"*"/from-local|function" ]] || fail "local config does not win over user: $out"
+    out="$(CCTRL_TMUX_SERVER=fleet CCTRL_USER_CONFIG="$d/user.json" CCTRL_CONFIG_LOCAL="$d/local.json" cctrl_source_eval "$probe")"
+    [[ "$out" == "fleet|"*"/fleet|function" ]] || fail "env does not win: $out"
+    out="$(CCTRL_TMUX_SERVER=/tmp/some/sock cctrl_source_eval "$probe")"
+    [[ "$out" == "/tmp/some/sock|/tmp/some/sock|function" ]] || fail "a value with / is not a socket path: $out"
+    printf '{"tmuxServer":""}\n' > "$d/off.json"
+    out="$(CCTRL_USER_CONFIG="$d/user.json" CCTRL_CONFIG_LOCAL="$d/off.json" cctrl_source_eval "$probe")"
+    [[ "$out" == "||file" ]] || fail "an empty tmuxServer must stop the search (explicit plain tmux): $out"
+    out="$(CCTRL_TMUX_SERVER='bad name' cctrl_source_eval "$probe" 2>&1)"
+    assert_contains "$out" "ignoring unusable tmuxServer"
+    assert_contains "$out" "||file"
+    echo "ok: tmuxServer precedence env > local > user, path vs name, empty = off"
+}
+
+test_tmux_second_server_routing() (
+    _srv2_setup
+    trap _srv2_cleanup EXIT
+    local tt="$SRV2_TT" out rc
+    "$tt" -S "$SRV2_OLD" new-session -d -s old-a 'sleep 120'
+    "$tt" -S "$SRV2_OLD" new-session -d -s TMUX--ms--srv2-clash 'sleep 120'
+    export CCTRL_TMUX_SERVER=fleet
+
+    # The router: new-session -> primary; reads see both; targets go where the session is.
+    cctrl_source_eval 'tmux new-session -d -s new-b "sleep 120"'
+    "$tt" -S "$SRV2_NEW" has-session -t '=new-b' 2>/dev/null || fail "new-session did not land on the primary"
+    "$tt" -S "$SRV2_OLD" has-session -t '=new-b' 2>/dev/null && fail "new-session also landed on the old server"
+    out="$(cctrl_source_eval 'tmux list-sessions -F "#{session_name}"' | LC_ALL=C sort | tr '\n' ' ')"
+    [[ "$out" == "TMUX--ms--srv2-clash new-b old-a " ]] || fail "list-sessions is not the union of both servers: $out"
+    out="$(cctrl_source_eval 'tmux display-message -p -t "=old-a:" "#{socket_path}"')"
+    [[ "$out" == "$SRV2_OLD" ]] || fail "a -t =NAME call did not go to the server holding it: $out"
+    cctrl_source_eval 'tmux has-session -t "=old-a" && tmux has-session -t "=new-b"' || fail "has-session misses a server"
+    rc=0; cctrl_source_eval 'tmux has-session -t "=nowhere"' 2>/dev/null || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "has-session found a session that is on no server"
+
+    # Peer delivery primitive (paste + Enter) reaches a session on the old server.
+    cctrl_source_eval '_peer_tmux_paste old-a cctrl-srv2-buf "srv2-hello" false' || fail "peer paste to old server failed"
+    sleep 0.3
+    assert_contains "$("$tt" -S "$SRV2_OLD" capture-pane -p -t '=old-a:')" "srv2-hello"
+    out="$(cctrl_source_eval 'printf "%s" "$_CCTRL_TMUX_PIN"')"
+    [[ -z "$out" ]] || fail "a pin leaked: $out"
+
+    # Plan 111 attest lookups: the whois pane listing covers both servers, and
+    # the host-side probe runs on the server that holds the session.
+    out="$(cctrl_source_eval '_peer_whois_list_panes' | cut -f1 | LC_ALL=C sort -u | tr '\n' ' ')"
+    [[ "$out" == "TMUX--ms--srv2-clash new-b old-a " ]] || fail "whois pane listing misses a server: $out"
+    out="$(cctrl_source_eval '_session_tmux_host_command old-a "echo \$TMUX" 5')"
+    [[ "$out" == "$SRV2_OLD,"* ]] || fail "the attest probe did not run on the old server: $out"
+    out="$(cctrl_source_eval '_session_tmux_host_command new-b "echo \$TMUX"')"
+    [[ "$out" == "$SRV2_NEW,"* ]] || fail "the attest probe did not run on the primary: $out"
+
+    # Inside a session on either server, implicit $TMUX calls stay on that server.
+    local pane
+    pane="$("$tt" -S "$SRV2_OLD" display-message -p -t '=old-a:' '#{pane_id}')"
+    out="$(TMUX="$SRV2_OLD,1,0" TMUX_PANE="$pane" cctrl_source_eval '_session_tmux_display_current_name; echo; _tmux_home_sock')"
+    assert_contains "$out" "old-a"
+    assert_contains "$out" "$SRV2_OLD"
+
+    # session ls sees both, with each row's server; the footer names them.
+    out="$("$ROOT/cctrl" session ls --json 2>/dev/null)"
+    jq -e 'map({key:.name, value:.tmux_server}) | from_entries | .["old-a"]=="default" and .["new-b"]=="fleet"' <<< "$out" >/dev/null \
+        || fail "session ls --json misses a server or its label: $out"
+    jq -e 'map(select(.name=="old-a" or .name=="new-b") | .execution_id | startswith("tmux-v1:")) | all and length==2' <<< "$out" >/dev/null \
+        || fail "execution ids missing for a server: $out"
+    out="$("$ROOT/cctrl" session ls 2>/dev/null)"
+    assert_contains "$out" "tmux servers: fleet [primary] 1 session(s)"
+    assert_contains "$out" "default [default] 2 session(s)"
+    out="$("$ROOT/cctrl" session servers --json)"
+    jq -e --arg p "$SRV2_NEW" '.configured and .primary==$p and (.servers|length)==2 and all(.servers[]; .alive)' <<< "$out" >/dev/null \
+        || fail "session servers --json is wrong: $out"
+
+    # stop-exact by execution id works on the old server.
+    local eid
+    eid="$("$ROOT/cctrl" session ls --json 2>/dev/null | jq -r '.[] | select(.name=="TMUX--ms--srv2-clash") | .execution_id')"
+    # Name collision first: a new name must be free on ALL servers.
+    make_fake_agent "$SRV2_DIR/codex" codex
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >> %q\nexec %q "$@"\n' "$SRV2_DIR/tmux.log" "$tt" > "$SRV2_DIR/tmux"
+    chmod +x "$SRV2_DIR/tmux"
+    mkdir -p "$SRV2_DIR/srv2-clash"
+    (cd "$SRV2_DIR/srv2-clash" && PATH="$SRV2_DIR:$PATH" "$ROOT/cctrl" start --agent codex -m hi >/dev/null 2>&1) || true
+    out="$(grep -- 'new-session' "$SRV2_DIR/tmux.log" || true)"
+    assert_contains "$out" "-S $SRV2_NEW new-session -d -s TMUX--ms--srv2-clash"
+    [[ "$out" != *"-s TMUX--ms--srv2-clash "* ]] || fail "start reused a name live on the old server: $out"
+    "$ROOT/cctrl" session stop-exact TMUX--ms--srv2-clash --execution-id "$eid" --json >/dev/null || fail "stop-exact on the old server failed"
+    "$tt" -S "$SRV2_OLD" has-session -t '=TMUX--ms--srv2-clash' 2>/dev/null && fail "stop-exact did not stop the old-server session"
+
+    # close reaches the old server and leaves the primary alone.
+    "$ROOT/cctrl" session close old-a --force --now >/dev/null 2>&1 || fail "close of an old-server session failed"
+    "$tt" -S "$SRV2_OLD" has-session -t '=old-a' 2>/dev/null && fail "close did not kill the old-server session"
+    "$tt" -S "$SRV2_NEW" has-session -t '=new-b' 2>/dev/null || fail "close touched the primary"
+    echo "ok: second tmux server: start on primary, reads see both, targets follow the session"
+)
+
+test_tmux_server_snapshot_records_server() {
+    local root="$TMPDIR/srv2-snapshot" data="$TMPDIR/srv2-snapshot/data" snapshots="$TMPDIR/srv2-snapshot/snapshots"
+    local host="0123456789abcdef0123456789abcdef" out old plan_new plan_old
+    mkdir -p "$data" "$snapshots"
+    printf '%s\n' "$host" > "$data/host-id"
+    cat > "$root/process.json" <<'JSON'
+{"schema_version":1,"status":"available","observed_at":"2026-11-10T10:00:00Z","source_cursor":"p","processes":[],"error":null}
+JSON
+    row() { # id tmux
+        printf '{"provider":"claude","provider_task_id":"%s","host_id":"%s","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"%s","tmux_session":"%s","action_capabilities":{"tmux_attach":{"supported":true}}}' "$1" "$host" "$1" "$2"
+    }
+    cat > "$root/catalogue.json" <<JSON
+{"schema_version":2,"host_id":"$host","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[$(row c-new TMUX--new), $(row c-old TMUX--old)]}
+JSON
+    cat > "$root/sessions.json" <<'JSON'
+[{"name":"TMUX--new","tmux_server":"fleet","agent":"claude","session_id":"c-new","dir":"/tmp/x"},
+ {"name":"TMUX--old","agent":"claude","session_id":"c-old","dir":"/tmp/x"}]
+JSON
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" \
+      CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session snapshot --dir "$snapshots" --json)" \
+      || fail "snapshot failed: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--new")][0].tmux_server=="fleet"' <<< "$out" >/dev/null \
+      || fail "snapshot did not record the server: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--old")][0] | has("tmux_server") | not' <<< "$out" >/dev/null \
+      || fail "a default-server row gained a tmux_server field: $out"
+    # An old snapshot (no tmux_server anywhere) plans exactly as the new one.
+    old="$root/old.json"
+    jq 'del(.tasks[].tmux_server)' "$snapshots/latest.json" > "$old"
+    jq '(.rows[].action_capabilities.tmux_attach)={supported:false,reason:"no-live-cctrl-tmux-owner"}' "$root/catalogue.json" > "$root/current.json"
+    printf '{"schema_version":1,"kind":"codex_reconcile_result_v1","records":[],"errors":[]}\n' > "$root/codex.json"
+    plan_new="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$root/current.json" \
+      CCTRL_RESTORE_PROCESS_FILE="$root/process.json" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$root/codex.json" CCTRL_RESTORE_LAUNCH_LOG="$root/launch.log" \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json | jq -c '[.plan[] | {provider_task_id, disposition}] | sort_by(.provider_task_id)')"
+    plan_old="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$root/current.json" \
+      CCTRL_RESTORE_PROCESS_FILE="$root/process.json" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$root/codex.json" CCTRL_RESTORE_LAUNCH_LOG="$root/launch.log" \
+      "$ROOT/cctrl" session restore --from "$old" --dry-run --json | jq -c '[.plan[] | {provider_task_id, disposition}] | sort_by(.provider_task_id)')"
+    [[ "$plan_new" == "$plan_old" ]] || fail "an old snapshot without tmux_server plans differently: $plan_old vs $plan_new"
+    jq -e 'length==2 and all(.[]; .disposition=="restore")' <<< "$plan_old" >/dev/null || fail "old snapshot restore plan is wrong: $plan_old"
+    echo "ok: snapshot records tmux_server; old snapshots without it restore the same"
 }
 
 run_codex_ownership_matrix_paths() {

@@ -330,6 +330,11 @@ def capture(args: argparse.Namespace) -> int:
             "last_active": text(session.get("last_active")),
             "live": True,
         }
+        # Which tmux server held the session (mdec-1110). Written only when
+        # cctrl has a primary configured; a row without it means the default
+        # server, which is how every older snapshot reads.
+        if text(session.get("tmux_server")):
+            row["tmux_server"] = text(session.get("tmux_server"))
         apply_label_bounds(row)
         if shadowed:
             row["shadowed_task_ids"] = shadowed

@@ -18,6 +18,12 @@ import shutil
 import subprocess
 import sys
 
+try:
+    from tmux_servers import argv_prefixes as _tmux_argv_prefixes
+except ImportError:  # run without lib/ on sys.path
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tmux_servers import argv_prefixes as _tmux_argv_prefixes
+
 NAME_RE = re.compile(r"^[0-9a-f]{12}-(\d{8}T\d{6}Z)$")
 MAX_FILE_BYTES = 8 * 1024 * 1024
 
@@ -186,20 +192,24 @@ def scan_session_records(scan, directory, live):
 
 
 def live_tmux_sessions(scan):
-    try:
-        r = run(["tmux", "list-sessions", "-F", "#{session_name}"])
-    except FileNotFoundError:
-        scan.fail("session scan unavailable (tmux not found)")
-        return None
-    except Exception as e:  # noqa: BLE001
-        scan.fail("session scan failed: %s" % type(e).__name__)
-        return None
-    if r.returncode != 0:
-        if any(m in r.stderr for m in ("no server running", "No such file or directory", "Connection refused")):
-            return set()
-        scan.fail("session scan failed (tmux exit %d)" % r.returncode)
-        return None
-    return set(r.stdout.split())
+    live = set()
+    # Every tmux server cctrl reads (mdec-1110); one server when routing is off.
+    for prefix in _tmux_argv_prefixes():
+        try:
+            r = run(prefix + ["list-sessions", "-F", "#{session_name}"])
+        except FileNotFoundError:
+            scan.fail("session scan unavailable (tmux not found)")
+            return None
+        except Exception as e:  # noqa: BLE001
+            scan.fail("session scan failed: %s" % type(e).__name__)
+            return None
+        if r.returncode != 0:
+            if any(m in r.stderr for m in ("no server running", "No such file or directory", "Connection refused")):
+                continue
+            scan.fail("session scan failed (tmux exit %d)" % r.returncode)
+            return None
+        live |= set(r.stdout.split())
+    return live
 
 
 def scan_bin_dir(scan, bin_path):

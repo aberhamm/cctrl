@@ -14,6 +14,13 @@ import subprocess
 import time
 
 from launch_event import load_event, verify_binding
+import sys
+
+try:
+    from tmux_servers import argv_prefixes as _tmux_argv_prefixes
+except ImportError:  # run without lib/ on sys.path
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tmux_servers import argv_prefixes as _tmux_argv_prefixes
 
 
 class Unproved(Exception):
@@ -103,7 +110,17 @@ class Collector:
         # Force UTF-8 and use printable framing. Only the five fixed header
         # fields are split: the arbitrary bootstrap command remains opaque.
         fields = '#{pane_id}|#{pane_pid}|#{session_created}|#{@cctrl_managed}|#{@cctrl_agent}|#{pane_start_command}'
-        output = self.run(['tmux', '-u', 'list-panes', '-t', '=' + name, '-F', fields])
+        prefixes = _tmux_argv_prefixes()
+        output = None
+        for index, prefix in enumerate(prefixes):
+            # Primary first, then the old default server (mdec-1110). Only the
+            # last server's failure is final; with routing off there is one.
+            try:
+                output = self.run(prefix + ['-u', 'list-panes', '-t', '=' + name, '-F', fields])
+                break
+            except Unproved:
+                if index == len(prefixes) - 1:
+                    raise
         rows = output.removesuffix('\n').split('\n')
         if len(rows) != 1:
             raise Unproved('ambiguous-pane')

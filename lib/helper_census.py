@@ -23,6 +23,12 @@ import statistics
 import subprocess
 import sys
 
+try:
+    from tmux_servers import argv_prefixes as _tmux_argv_prefixes
+except ImportError:  # run without lib/ on sys.path
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tmux_servers import argv_prefixes as _tmux_argv_prefixes
+
 DEFAULT_PER_SET = 18
 TIMEOUT = 15
 DEFAULT_WARN_SETS = 8
@@ -135,8 +141,11 @@ def read_panes():
         text = fx
     else:
         try:
-            r = _run(["tmux", "list-panes", "-a", "-F", "#{pane_pid} #{session_name}"], timeout=min(5, TIMEOUT))
-            text = r.stdout if r.returncode == 0 else ""
+            text = ""
+            for prefix in _tmux_argv_prefixes():  # every tmux server (mdec-1110)
+                r = _run(prefix + ["list-panes", "-a", "-F", "#{pane_pid} #{session_name}"], timeout=min(5, TIMEOUT))
+                if r.returncode == 0:
+                    text += r.stdout
         except (OSError, subprocess.SubprocessError):
             text = ""
     out = {}
