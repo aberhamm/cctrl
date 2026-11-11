@@ -20180,7 +20180,7 @@ test_peer_contract_docs() {
     [[ "$n" -le 30 ]] || fail "AGENTS.md peer contract too long ($n lines > 30)"
     # Public-repo hygiene: no environment specifics inside the contract section.
     if awk '/^## Peer messaging/{f=1;next}/^## /{if(f)exit}f' "$agents" \
-        | grep -Eq 'TMUX--|home\.matthew|homelab|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9]{4}\b'; then
+        | grep -Eq 'TMUX--|home\.[A-Za-z0-9-]+\.|\.ts\.net|homelab|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9]{4}\b'; then
         fail "AGENTS.md peer contract contains environment specifics"
     fi
     echo "ok: peer operating contract in AGENTS.md + CLAUDE.md routing + README envelope/overview/limitation docs"

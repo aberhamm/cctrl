@@ -156,6 +156,7 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
 - **Scope.**
   - `hooks doctor` treats stale absolute working-tree paths in Codex `hooks.json` as an issue,
     as it already does for Claude.
+  <!-- tmux-lint: allow (a canned input the doctor feeds to the guard; never run it) -->
   - Doctor runs a **functional** check: it feeds the guard a canned `tmux kill-server`, and
     the `-L <primary>` form from option 1, and expects a block. A broken guard is an issue
     (M10).
