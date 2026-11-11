@@ -25470,6 +25470,13 @@ test_paths_test_mode_gate() {
         [[ "$sh_rc" == "$py_rc" ]] || { echo "disagree sh=$sh_rc py=$py_rc"; return 0; }
         echo "$sh_rc"
     }
+    _a0_why() { # extra env assignments... -> "shell reason|python reason"
+        local sh py
+        sh="$(env -i PATH="$PATH" "${good[@]}" "$@" "$BASH" -c 'source "$1"; _cctrl_paths_resolve "$2"; _cctrl_test_mode; printf "%s" "$_CCTRL_TEST_MODE_REASON"' \
+            _ "$ROOT/lib/paths.sh" "$root" 2>/dev/null)" || true
+        py="$(env -i PATH="$PATH" "${good[@]}" "$@" python3 "$ROOT/lib/paths.py" test-mode --root "$root" 2>/dev/null)" || true
+        printf '%s|%s' "$sh" "$py"
+    }
     [[ "$(_a0_gate)" == 0 ]] || fail "a full sandbox is not test mode: $(_a0_gate)"
     [[ "$(_a0_gate CCTRL_TEST_MODE=0)" == 1 ]] || fail "CCTRL_TEST_MODE=0 gave test mode"
     rm -f "$sb/.cctrl-test-sandbox"
@@ -25481,6 +25488,43 @@ test_paths_test_mode_gate() {
     local v
     for v in CCTRL_DATA_DIR CCTRL_STATE_DIR CCTRL_SESSION_METADATA_DIR CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL TMUX_TMPDIR CCTRL_PEER_SEAL_KEY_FILE CCTRL_COSTS_DIR CCTRL_HOST_ID_FILE; do
         [[ "$(_a0_gate "$v=$outside/x")" == 1 ]] || fail "$v outside the sandbox still gave test mode: $(_a0_gate "$v=$outside/x")"
+    done
+    # NIT-2: the hosts, shortcuts, needs-me, autoheal and LaunchAgents
+    # overrides count too, inside passes and outside fails.
+    for v in CCTRL_HOSTS_FILE CCTRL_SHORTCUTS_FILE CCTRL_NEEDS_ME_SNAPSHOT CCTRL_AUTOHEAL_LOG CCTRL_LAUNCH_AGENTS_DIR; do
+        [[ "$(_a0_gate "$v=$sb/in/x")" == 0 ]] || fail "$v inside the sandbox lost test mode: $(_a0_gate "$v=$sb/in/x")"
+        [[ "$(_a0_gate "$v=$outside/x")" == 1 ]] || fail "$v outside the sandbox still gave test mode: $(_a0_gate "$v=$outside/x")"
+    done
+    # Their defaults follow HOME and the data dir: HOME outside moves the
+    # default LaunchAgents dir out.
+    [[ "$(_a0_gate HOME="$outside/home" CCTRL_USER_CONFIG="$sb/user.json")" == 1 ]] || fail "a LaunchAgents dir under an outside HOME gave test mode"
+    # The tmux socket: a plain name lives under TMUX_TMPDIR; a path must be
+    # inside; an inherited $TMUX socket must be inside; extras count too.
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER=fleet)" == 0 ]] || fail "a tmux server name lost test mode"
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER="$sb/tmux/sock")" == 0 ]] || fail "a tmux socket inside the sandbox lost test mode"
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER='~/sock')" == 0 ]] || fail "a ~/ tmux socket under the sandbox HOME lost test mode"
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER="$outside/sock")" == 1 ]] || fail "a tmux socket outside the sandbox gave test mode"
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER=fleet CCTRL_TMUX_EXTRA_SERVERS="a, $outside/sock")" == 1 ]] || fail "an extra tmux socket outside the sandbox gave test mode"
+    [[ "$(_a0_gate TMUX="$outside/default,1,0")" == 1 ]] || fail "an inherited TMUX socket outside the sandbox gave test mode"
+    [[ "$(_a0_gate TMUX="$sb/tmux/tmux-0/default,1,0")" == 0 ]] || fail "an inherited TMUX socket inside the sandbox lost test mode"
+    # A tmuxServer / tmuxExtraServers config key with no env value to win
+    # over it fails closed.
+    printf '{"tmuxServer":"fleet"}\n' > "$sb/user.json"
+    [[ "$(_a0_gate)" == 1 ]] || fail "tmuxServer in a config file gave test mode"
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER=fleet)" == 0 ]] || fail "CCTRL_TMUX_SERVER over a config tmuxServer lost test mode"
+    rm -f "$sb/user.json"
+    printf '{"tmuxExtraServers":["x"]}\n' > "$sb/local.json"
+    [[ "$(_a0_gate CCTRL_TMUX_SERVER=fleet)" == 1 ]] || fail "tmuxExtraServers in a config file gave test mode"
+    rm -f "$sb/local.json"
+    [[ "$(_a0_gate)" == 0 ]] || fail "the sandbox lost test mode after the config checks"
+    # NIT-1: no reason names a path; the seal key's one is generic.
+    local why
+    why="$(_a0_why CCTRL_PEER_SEAL_KEY_FILE="$outside/peer.key")"
+    [[ "$why" == "the seal key is outside the sandbox|the seal key is outside the sandbox" ]] || fail "seal key reason: $why"
+    for v in CCTRL_DATA_DIR CCTRL_HOSTS_FILE CCTRL_TMUX_SERVER TMUX; do
+        why="$(_a0_why "$v=$outside/x")"
+        [[ "$why" != *"$outside"* ]] || fail "the $v reason names a path: $why"
+        [[ "${why%%|*}" == "${why#*|}" ]] || fail "shell and Python reasons differ for $v: $why"
     done
     # A link inside the sandbox that points out of it is outside (realpath).
     ln -s "$outside" "$sb/escape"
@@ -25497,8 +25541,85 @@ test_paths_test_mode_gate() {
     local rc=0
     CCTRL_TEST_MODE=1 CCTRL_PEER_SEAL_KEY_FILE="$live_key" "$ROOT/cctrl" paths >/dev/null 2>&1 || rc=$?
     [[ "$rc" -eq 64 ]] || fail "cctrl ran in test mode with the live seal key (rc $rc)"
-    unset -f _a0_gate
+    unset -f _a0_gate _a0_why
     echo "ok: the test-mode gate needs every part, realpaths each state path into the sandbox, and refuses the live seal key (64)"
+}
+
+test_caller_umask_reaches_children_and_rewrites_keep_mode() {
+    # NIT-6: cctrl exports the caller's umask, so its own children (a plugin,
+    # a nested cctrl) see the real one, not cctrl's 077. A child trusts the
+    # inherited value only while its own umask is 077. The statusline install
+    # rewrites settings.json and keeps that file's own mode.
+    local base="$TMPDIR/a0-umask" out
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE"
+    cat > "$tree/plugins/cctrl-umaskdump" <<'SH'
+#!/bin/sh
+printf 'own=%s env=%s\n' "$(umask)" "${CCTRL_CALLER_UMASK-unset}"
+CCTRL_NO_MAIN=1 bash -c '. "$0"; printf "nested=%s\n" "$_CCTRL_CALLER_UMASK"' "$(dirname "$0")/../cctrl"
+SH
+    chmod +x "$tree/plugins/cctrl-umaskdump"
+    out="$(umask 022; env -u CCTRL_CALLER_UMASK "$tree/cctrl" umaskdump)"
+    assert_contains "$out" "own=0077 env=0022"
+    assert_contains "$out" "nested=0022"
+    _a0_um() { CCTRL_NO_MAIN=1 bash -c 'source "$0"; printf "%s" "$_CCTRL_CALLER_UMASK"' "$tree/cctrl"; }
+    [[ "$(umask 027; CCTRL_CALLER_UMASK=0022 _a0_um)" == 0027 ]] || fail "an inherited CCTRL_CALLER_UMASK overrode a non-077 caller umask"
+    [[ "$(umask 077; env -u CCTRL_CALLER_UMASK bash -c "$(declare -f _a0_um); tree='$tree'; _a0_um")" == 0077 ]] || fail "a 077 caller with no inherited value is not 0077"
+    [[ "$(umask 077; CCTRL_CALLER_UMASK=22 _a0_um)" == 0077 ]] || fail "a malformed CCTRL_CALLER_UMASK was trusted"
+    unset -f _a0_um
+    # Every process cctrl starts for the user goes through _cctrl_user_umask
+    # (caller umask, variable dropped); nothing else restores it by hand.
+    local hand
+    hand="$(grep -n 'umask "\$_CCTRL_CALLER_UMASK"' "$ROOT/cctrl" | grep -v '^[0-9]*:    umask "\$_CCTRL_CALLER_UMASK"$' || true)"
+    [[ -z "$hand" ]] || fail "a caller-umask restore bypasses _cctrl_user_umask: $hand"
+    [[ "$(grep -c '_cctrl_user_umask  # the agent' "$ROOT/cctrl")" -eq 5 ]] || fail "an agent exec does not use _cctrl_user_umask"
+    grep -q '^    _cctrl_user_umask$' "$ROOT/cctrl" || fail "tmux new-session does not use _cctrl_user_umask"
+    [[ "$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import codex_app_server as c; print(c.caller_umask({"CCTRL_CALLER_UMASK": "0027"}, 0o077), c.caller_umask({}, 0o077), c.caller_umask({"CCTRL_CALLER_UMASK": "x"}, 0o077), c.caller_umask({"CCTRL_CALLER_UMASK": "0027"}, 0o022))' "$ROOT/lib")" == "23 -1 -1 -1" ]] \
+        || fail "codex_app_server.caller_umask does not parse CCTRL_CALLER_UMASK"
+    # A rewritten existing file keeps its own mode.
+    local home="$base/home" m want
+    for want in 644 640; do
+        rm -rf "$home"; mkdir -p "$home/.claude"
+        printf '{"keep":1}\n' > "$home/.claude/settings.json"
+        chmod "$want" "$home/.claude/settings.json"
+        HOME="$home" CCTRL_CLAUDE_SETTINGS="$home/.claude/settings.json" "$tree/cctrl" statusline claude install >/dev/null
+        m="$(stat -f '%Lp' "$home/.claude/settings.json" 2>/dev/null || stat -c '%a' "$home/.claude/settings.json")"
+        [[ "$m" == "$want" ]] || fail "statusline install changed settings.json from $want to $m"
+        jq -e '.keep == 1 and (.statusLine.command | endswith("hooks/statusline.sh"))' "$home/.claude/settings.json" >/dev/null \
+            || fail "statusline install did not rewrite settings.json"
+    done
+    echo "ok: the caller umask reaches cctrl's children and a nested cctrl, never loosens a user umask, and a rewritten settings.json keeps its mode"
+}
+
+test_private_stores_have_explicit_modes() {
+    # NIT-7: the peer registry, the mailbox and the session-record dir are
+    # created 0700 / 0600 explicitly, even when the umask is wide.
+    local base="$TMPDIR/a0-explicit"
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE"
+    rm -rf "$base/pdata"
+    CCTRL_NO_MAIN=1 CCTRL_DATA_DIR="$base/pdata" CCTRL_SESSION_METADATA_DIR="$base/pdata/sessions" \
+        bash -c 'source "$0"; umask 022; _peer_init; _mailbox_init' "$tree/cctrl"
+    _a0_m() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+    [[ "$(_a0_m "$base/pdata")" == 700 ]] || fail "the peer data dir is $(_a0_m "$base/pdata"), want 700"
+    [[ "$(_a0_m "$base/pdata/peers.json")" == 600 ]] || fail "peers.json is $(_a0_m "$base/pdata/peers.json"), want 600"
+    [[ "$(_a0_m "$base/pdata/messages.jsonl")" == 600 ]] || fail "messages.jsonl is $(_a0_m "$base/pdata/messages.jsonl"), want 600"
+    [[ "$(grep -c 'mkdir -p -m 700 "\$SESSION_METADATA_DIR"' "$ROOT/cctrl")" -ge 7 ]] || fail "a session-record dir create has no explicit mode"
+    ! grep -q 'mkdir -p "\$SESSION_METADATA_DIR"' "$ROOT/cctrl" || fail "a session-record dir create relies on the umask"
+    unset -f _a0_m
+    echo "ok: peer registry, mailbox and session-record dirs are created with explicit private modes"
+}
+
+test_ports_plugin_without_lib_falls_back() {
+    # NIT-8: cctrl-ports copied without lib/ beside it still runs (as the
+    # hooks do), on the store's layout-1 default <tree>/data/ports-seen.json.
+    local base="$TMPDIR/a0-ports" out
+    rm -rf "$base"; mkdir -p "$base/t/plugins" "$base/t/data"
+    cp "$ROOT/plugins/cctrl-ports" "$base/t/plugins/cctrl-ports"
+    printf '{"seen":[47123],"scans":[]}' > "$base/t/data/ports-seen.json"
+    out="$(python3 "$base/t/plugins/cctrl-ports" --history 2>&1)" || fail "cctrl-ports without lib/ failed: $out"
+    assert_contains "$out" "47123"
+    echo "ok: cctrl-ports without lib/ falls back to <tree>/data/ports-seen.json"
 }
 
 test_state_fix_modes() {
@@ -25570,8 +25691,10 @@ test_cctrl_creates_private_files() {
 test_cctrl_restores_caller_umask_for_agents() {
     # The 077 umask is cctrl's own: an agent it execs, and a tmux server a
     # new-session may start, get the caller's umask back.
+    # The restore is _cctrl_user_umask (caller umask, CCTRL_CALLER_UMASK
+    # dropped from the child's env); each call sits right before the exec.
     local n
-    n="$(grep -c 'umask "\$_CCTRL_CALLER_UMASK"' "$ROOT/cctrl")"
+    n="$(grep -cE '^[[:space:]]+_cctrl_user_umask([[:space:]]|$)' "$ROOT/cctrl")"
     [[ "$n" -ge 6 ]] || fail "expected the caller umask restored at every agent exec and the new-session (found $n)"
     local line
     while IFS= read -r line; do
@@ -25581,7 +25704,7 @@ test_cctrl_restores_caller_umask_for_agents() {
             *exec*|*'tmux new-session'*) ;;
             *) fail "umask restore at line $line is not right before an exec or new-session: $next" ;;
         esac
-    done < <(grep -n 'umask "\$_CCTRL_CALLER_UMASK"' "$ROOT/cctrl" | cut -d: -f1)
+    done < <(grep -nE '^[[:space:]]+_cctrl_user_umask([[:space:]]|$)' "$ROOT/cctrl" | cut -d: -f1)
     local out
     out="$(umask 022; CCTRL_NO_MAIN=1 bash -c 'source "$0"; printf "%s %s\n" "$_CCTRL_CALLER_UMASK" "$(umask)"' "$ROOT/cctrl")"
     [[ "$out" == "0022 0077" ]] || fail "cctrl did not record the caller umask and set 077: $out"
@@ -25637,6 +25760,76 @@ test_data_config_runbook_preserves_file() {
     [[ "$rc" -ne 0 ]] || fail "restore overwrote or accepted a differing file"
     grep -q claude "$base/kept/data/config.json" || fail "restore changed a differing file"
     echo "ok: the data/config.json runbook keeps the file across the untracking fast-forward (save/restore, history fallback, no overwrite)"
+}
+
+test_data_config_runbook_ff_zero_window() {
+    # NIT-3: `ff` is the preferred, scripted step: save, rm --cached, merge
+    # --ff-only, verify. The file is never absent (a post-merge hook sees it
+    # right after the merge, before any restore), a re-run is a no-op, a
+    # half-done run (index already untracked) finishes, and a dirty tree or a
+    # bad ref is refused with HEAD unchanged. Scratch repos only.
+    local base="$TMPDIR/a0-runbook-ff" rb="$ROOT/install/data-config-runbook.sh" out rc
+    rm -rf "$base"; mkdir -p "$base"
+    local G=(git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main -c commit.gpgsign=false)
+    "${G[@]}" init -q "$base/origin"
+    printf 'data/\n' > "$base/origin/.gitignore"
+    mkdir -p "$base/origin/data"
+    printf '{"defaultAgent":"codex"}\n' > "$base/origin/data/config.json"
+    "${G[@]}" -C "$base/origin" add .gitignore
+    "${G[@]}" -C "$base/origin" add -f data/config.json
+    "${G[@]}" -C "$base/origin" commit -q -m pre
+    local c
+    for c in ff half dirty; do "${G[@]}" clone -q "$base/origin" "$base/$c"; done
+    mkdir -p "$base/origin/share"
+    cp "$base/origin/data/config.json" "$base/origin/share/config.default.json"
+    "${G[@]}" -C "$base/origin" rm -q --cached data/config.json
+    "${G[@]}" -C "$base/origin" add share/config.default.json
+    "${G[@]}" -C "$base/origin" commit -q -m untrack
+    local target
+    target="$(git -C "$base/origin" rev-parse HEAD)"
+    for c in ff half dirty; do "${G[@]}" -C "$base/$c" fetch -q; done
+    # 1. The zero-window ff. The hook runs right after the merge.
+    printf '#!/bin/sh\n[ -f data/config.json ] && echo present > ../ff-hook.log || echo missing > ../ff-hook.log\n' > "$base/ff/.git/hooks/post-merge"
+    chmod +x "$base/ff/.git/hooks/post-merge"
+    git -C "$base/ff" config core.hooksPath "$base/ff/.git/hooks"   # over any global hooksPath
+    out="$("$rb" ff "$base/ff" origin/main 2>&1)" || fail "runbook ff failed: $out"
+    [[ "$(cat "$base/ff-hook.log" 2>/dev/null)" == present ]] || fail "data/config.json was absent right after the merge: $(cat "$base/ff-hook.log" 2>/dev/null)"
+    [[ "$(git -C "$base/ff" rev-parse HEAD)" == "$target" ]] || fail "ff did not reach the target"
+    assert_contains "$out" "present, untracked, ignored"
+    assert_contains "$out" "ff done"
+    cmp -s "$base/ff/data/config.json" "$base/origin/share/config.default.json" || fail "ff changed the file content"
+    [[ -f "$base/ff/data/config.json.a0-keep" ]] || fail "ff kept no backup copy"
+    [[ -z "$(git -C "$base/ff" status --porcelain)" ]] || fail "the tree is not clean after ff"
+    # 2. Idempotent: a second run only checks.
+    out="$("$rb" ff "$base/ff" origin/main 2>&1)" || fail "a second ff failed: $out"
+    assert_contains "$out" "already at or past"
+    cmp -s "$base/ff/data/config.json" "$base/origin/share/config.default.json" || fail "a second ff changed the file"
+    # 3. A half-done run (index already untracked, no merge yet) finishes.
+    git -C "$base/half" rm -q --cached data/config.json
+    out="$("$rb" ff "$base/half" origin/main 2>&1)" || fail "ff after a partial run failed: $out"
+    [[ "$(git -C "$base/half" rev-parse HEAD)" == "$target" ]] || fail "the partial run did not finish"
+    [[ -f "$base/half/data/config.json" && -z "$(git -C "$base/half" status --porcelain)" ]] || fail "the partial run left the file or tree wrong"
+    # 4. A dirty tree is refused, HEAD and the index unchanged.
+    local before
+    before="$(git -C "$base/dirty" rev-parse HEAD)"
+    printf 'x\n' >> "$base/dirty/.gitignore"
+    rc=0; out="$("$rb" ff "$base/dirty" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff on a dirty tree should exit 1 (got $rc): $out"
+    assert_contains "$out" "local changes"
+    [[ "$(git -C "$base/dirty" rev-parse HEAD)" == "$before" ]] || fail "ff moved a dirty tree"
+    git -C "$base/dirty" ls-files --error-unmatch data/config.json >/dev/null 2>&1 || fail "ff untracked the file in a dirty tree"
+    git -C "$base/dirty" checkout -q -- .gitignore
+    printf '{"defaultAgent":"claude"}\n' > "$base/dirty/data/config.json"
+    rc=0; "$rb" ff "$base/dirty" origin/main >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff with a modified data/config.json should exit 1 (got $rc)"
+    git -C "$base/dirty" checkout -q -- data/config.json
+    # 5. A bad ref, and a usage error.
+    rc=0; "$rb" ff "$base/dirty" no-such-ref >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 66 ]] || fail "ff with an unknown ref should exit 66 (got $rc)"
+    rc=0; "$rb" ff "$base/dirty" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "ff with no ref should exit 64 (got $rc)"
+    [[ "$(git -C "$base/dirty" rev-parse HEAD)" == "$before" ]] || fail "a refused ff moved HEAD"
+    echo "ok: runbook ff keeps data/config.json with no window, is idempotent, finishes a partial run, refuses a dirty tree"
 }
 
 test_pre_a0_release_without_data_config_recorded() {

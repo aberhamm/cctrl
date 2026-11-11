@@ -112,7 +112,12 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
     to any pre-A0 release would run without the file. **A0's runbook, on each checkout:**
     copy `data/config.json` aside before the fast-forward, fast-forward, restore it (now
     untracked and ignored), and confirm with `git status --ignored data/config.json`. The
-    install preflight warns when the file is missing from the live data dir.
+    install preflight warns when the file is missing from the live data dir. Preferred form,
+    with no window in which the file is absent: `install/data-config-runbook.sh ff <checkout>
+    <ref>` (refuses a dirty tree; save, `git rm --cached data/config.json`, `merge
+    --ff-only`, verify; idempotent). Any later move of a checkout back across the untracking
+    commit (a checkout of an older commit, a bisect, a branch switch, including one made by a
+    sync tool) deletes or blocks the file again; run `check` / `restore` after it.
   - **SH-S3 installed-mode signal:** `self-install.sh` writes `.installed` into the release as
     its last step before activation, after the gate. VERSION is no longer the signal. Mode is
     "installed" only when `.installed` sits next to the **resolved** (realpath) script.
@@ -122,7 +127,9 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
     `CCTRL_RUNTIME_MODE` is found in the environment it is ignored and unset before children
     are spawned. A checkout and the gate's scratch tree are both "checkout".
   - `umask 077` at entry. Explicit 0600 and 0700 on every create, including the files listed
-    above that use the ambient umask today. `cctrl state fix-modes [--dry-run]` tightens
+    above that use the ambient umask today. (As built: the umask carries most creates; the
+    peer registry, mailbox, session-record dirs, seal key and doorbell state set the mode
+    explicitly; existing wide files are tightened once by `state fix-modes` at install.) `cctrl state fix-modes [--dry-run]` tightens
     existing files once; it runs as part of the install.
   - The location does not change in A0.
 - **Closes.** F10, L1 (modes), MF-M1, SH-S2, SH-S3; review S5, S6, S10 (gate half); prepares

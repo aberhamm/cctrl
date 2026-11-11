@@ -33,8 +33,42 @@ _config_home() {
 # umask is kept and restored for the processes cctrl starts for the user (the
 # agent it execs, and the tmux server a new-session may start), so an agent's
 # own files in a project keep the user's usual modes.
+# CCTRL_CALLER_UMASK carries it to cctrl's own children (plugins, helpers, a
+# nested cctrl, the codex app-server proxy), which start under 077. A child
+# trusts the inherited value only while its own umask is 077, so a stale
+# value can never loosen a user's own umask; and _cctrl_user_umask drops it
+# from the env of every agent and tmux server cctrl starts.
 _CCTRL_CALLER_UMASK="$(umask)"
+_cctrl_umask_re='^0[0-7][0-7][0-7]$'
+if [[ "$_CCTRL_CALLER_UMASK" == 0077 && "${CCTRL_CALLER_UMASK:-}" =~ $_cctrl_umask_re ]]; then
+    _CCTRL_CALLER_UMASK="$CCTRL_CALLER_UMASK"
+fi
+unset _cctrl_umask_re
+export CCTRL_CALLER_UMASK="$_CCTRL_CALLER_UMASK"
 umask 077
+
+# For a process cctrl starts for the user (an agent exec, a tmux server):
+# the caller's umask, and no CCTRL_CALLER_UMASK in its env. Undo with
+# _cctrl_own_umask when cctrl carries on afterwards.
+_cctrl_user_umask() {
+    umask "$_CCTRL_CALLER_UMASK"
+    unset CCTRL_CALLER_UMASK
+}
+_cctrl_own_umask() {
+    umask 077
+    export CCTRL_CALLER_UMASK="$_CCTRL_CALLER_UMASK"
+}
+
+# Replace TARGET with TMP, keeping TARGET's own mode when it already exists
+# (tmp files are 0600, so a plain mv would tighten a user's 0644 file).
+_mv_keep_mode() { # TMP TARGET
+    local tmp="$1" target="$2" m=""
+    if [[ -f "$target" && ! -L "$target" ]]; then
+        m="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target" 2>/dev/null || true)"
+        [[ "$m" =~ ^[0-7]{3,4}$ ]] && chmod "$m" "$tmp" 2>/dev/null
+    fi
+    mv -f "$tmp" "$target"
+}
 
 # Plan 116 A0: every data, costs, usage, snapshot, audit and config path comes
 # from the one resolver, lib/paths.sh (rules there; lib/paths.py is its Python
@@ -209,10 +243,16 @@ _cctrl_paths_upper() {
 # these hold:
 #   - CCTRL_TEST_MODE=1;
 #   - every resolved state path (state root, data, store data, costs, audit,
-#     user and local config, session records, snapshots, host id and
-#     TMUX_TMPDIR) resolves by realpath inside one directory that holds a
-#     .cctrl-test-sandbox file;
-#   - the effective seal key path resolves inside that directory too.
+#     user and local config, session records, snapshots, host id, shortcuts,
+#     hosts, the needs-me snapshot, the autoheal log, the LaunchAgents dir
+#     and TMUX_TMPDIR) resolves by realpath inside one directory that holds
+#     a .cctrl-test-sandbox file;
+#   - the effective seal key path resolves inside that directory too;
+#   - every tmux socket cctrl could reach does too: the socket in $TMUX, and
+#     any path given in CCTRL_TMUX_SERVER or CCTRL_TMUX_EXTRA_SERVERS (a
+#     plain name lives under TMUX_TMPDIR, which is checked). A tmuxServer or
+#     tmuxExtraServers key in any config layer, with no env value to win
+#     over it, is not test mode (fail closed; set the env value instead).
 # Separately, test mode refuses to run at all (exit 64) when the effective
 # seal key path is the live user's key path. The live path comes from the
 # password database (getpwuid), never from HOME. The marker is not a secret:
@@ -285,6 +325,53 @@ _cctrl_tm_key_is_live() {
     [[ "$_CCTRL_TM_KEY" == "$_CCTRL_TM_LIVE_KEY" || "$a" == "$b" ]]
 }
 
+# 0 (reject) when PATH is empty or resolves outside $_CCTRL_TM_SANDBOX, with
+# the reason in _CCTRL_TEST_MODE_REASON. The reason names the LABEL, never
+# the path.
+_cctrl_tm_reject() { # LABEL PATH
+    if [[ -z "$2" ]]; then
+        _CCTRL_TEST_MODE_REASON="a state path is empty: $1"
+        return 0
+    fi
+    _cctrl_tm_realpath "$2"
+    case "$_CCTRL_TM_REAL" in
+        "$_CCTRL_TM_SANDBOX"|"$_CCTRL_TM_SANDBOX"/*) return 1 ;;
+    esac
+    _CCTRL_TEST_MODE_REASON="outside the sandbox: $1"
+    return 0
+}
+
+# 0 (reject) when a tmux server list (names or socket paths, comma or newline
+# separated, as cctrl reads CCTRL_TMUX_SERVER and CCTRL_TMUX_EXTRA_SERVERS)
+# holds a socket path outside the sandbox. A plain name is a socket under
+# TMUX_TMPDIR, which the gate checks on its own.
+_cctrl_tm_reject_tmux() { # LABEL LIST
+    local nl=$'\n' e list
+    list="${2//$nl/,}"
+    while [[ -n "$list" ]]; do
+        e="${list%%,*}"
+        if [[ "$list" == *,* ]]; then list="${list#*,}"; else list=""; fi
+        e="${e#"${e%%[![:space:]]*}"}"; e="${e%"${e##*[![:space:]]}"}"
+        case "$e" in "~/"*) e="${HOME:-}/${e#\~/}" ;; esac
+        case "$e" in
+            */*) _cctrl_tm_reject "$1" "$e" && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# 0 when any config layer's text names KEY (matched as "KEY", not parsed).
+_cctrl_tm_config_has() { # KEY
+    local f content
+    for f in "$_CCTRL_P_CONFIG_DEFAULT" "$_CCTRL_P_CONFIG_LEGACY" "$_CCTRL_P_CONFIG_USER" "$_CCTRL_P_CONFIG_LOCAL"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        content=""
+        IFS= read -r -d '' content < "$f" 2>/dev/null || true
+        [[ "$content" == *"\"$1\""* ]] && return 0
+    done
+    return 1
+}
+
 # The test-mode gate. Needs _cctrl_paths_resolve to have run. Returns 0 in
 # test mode, 1 when not, 64 when test mode is asked for with the live key.
 # The reason is in _CCTRL_TEST_MODE_REASON.
@@ -314,24 +401,40 @@ _cctrl_test_mode() {
         _CCTRL_TEST_MODE_REASON="no .cctrl-test-sandbox above the state root"
         return 1
     fi
-    local p
-    for p in "$_CCTRL_P_STATE_ROOT" "$_CCTRL_P_DATA_DIR" "$_CCTRL_P_STORE_DATA_DIR" \
-        "$_CCTRL_P_COSTS_DIR" "$_CCTRL_P_AUDIT_DIR" "$_CCTRL_P_CONFIG_USER" \
-        "$_CCTRL_P_CONFIG_LOCAL" "$_CCTRL_P_SESSIONS_DIR" "$_CCTRL_P_SNAPSHOTS_DIR" \
-        "$_CCTRL_P_HOST_ID_FILE" "$TMUX_TMPDIR" "$_CCTRL_TM_KEY"; do
-        if [[ -z "$p" ]]; then
-            _CCTRL_TEST_MODE_REASON="a state path is empty"
-            return 1
-        fi
-        _cctrl_tm_realpath "$p"
-        case "$_CCTRL_TM_REAL" in
-            "$sandbox"|"$sandbox"/*) ;;
-            *)
-                _CCTRL_TEST_MODE_REASON="outside the sandbox: $p"
-                return 1
-                ;;
-        esac
-    done
+    _CCTRL_TM_SANDBOX="$sandbox"
+    _cctrl_tm_reject state_root "$_CCTRL_P_STATE_ROOT" && return 1
+    _cctrl_tm_reject data_dir "$_CCTRL_P_DATA_DIR" && return 1
+    _cctrl_tm_reject store_data_dir "$_CCTRL_P_STORE_DATA_DIR" && return 1
+    _cctrl_tm_reject costs_dir "$_CCTRL_P_COSTS_DIR" && return 1
+    _cctrl_tm_reject audit_dir "$_CCTRL_P_AUDIT_DIR" && return 1
+    _cctrl_tm_reject config_user "$_CCTRL_P_CONFIG_USER" && return 1
+    _cctrl_tm_reject config_local "$_CCTRL_P_CONFIG_LOCAL" && return 1
+    _cctrl_tm_reject sessions_dir "$_CCTRL_P_SESSIONS_DIR" && return 1
+    _cctrl_tm_reject snapshots_dir "$_CCTRL_P_SNAPSHOTS_DIR" && return 1
+    _cctrl_tm_reject host_id_file "$_CCTRL_P_HOST_ID_FILE" && return 1
+    _cctrl_tm_reject shortcuts_file "$_CCTRL_P_SHORTCUTS_FILE" && return 1
+    _cctrl_tm_reject hosts_file "$_CCTRL_P_HOSTS_FILE" && return 1
+    _cctrl_tm_reject needs_me_snapshot "$_CCTRL_P_NEEDS_ME_SNAPSHOT" && return 1
+    _cctrl_tm_reject autoheal_log "${CCTRL_AUTOHEAL_LOG:-$_CCTRL_P_DATA_DIR/autoheal.log}" && return 1
+    _cctrl_tm_reject launch_agents_dir "${CCTRL_LAUNCH_AGENTS_DIR:-${HOME:-}/Library/LaunchAgents}" && return 1
+    _cctrl_tm_reject TMUX_TMPDIR "$TMUX_TMPDIR" && return 1
+    if _cctrl_tm_reject seal_key "$_CCTRL_TM_KEY"; then
+        _CCTRL_TEST_MODE_REASON="the seal key is outside the sandbox"
+        return 1
+    fi
+    if [[ -n "${TMUX:-}" ]]; then
+        _cctrl_tm_reject TMUX "${TMUX%%,*}" && return 1
+    fi
+    _cctrl_tm_reject_tmux CCTRL_TMUX_SERVER "${CCTRL_TMUX_SERVER:-}" && return 1
+    _cctrl_tm_reject_tmux CCTRL_TMUX_EXTRA_SERVERS "${CCTRL_TMUX_EXTRA_SERVERS:-}" && return 1
+    if [[ -z "${CCTRL_TMUX_SERVER:-}" ]] && _cctrl_tm_config_has tmuxServer; then
+        _CCTRL_TEST_MODE_REASON="tmuxServer is set in a config file; set CCTRL_TMUX_SERVER in test mode"
+        return 1
+    fi
+    if [[ -z "${CCTRL_TMUX_EXTRA_SERVERS:-}" ]] && _cctrl_tm_config_has tmuxExtraServers; then
+        _CCTRL_TEST_MODE_REASON="tmuxExtraServers is set in a config file; set CCTRL_TMUX_EXTRA_SERVERS in test mode"
+        return 1
+    fi
     _CCTRL_TEST_MODE_REASON="sandbox $sandbox"
     return 0
 }
@@ -2654,11 +2757,11 @@ _launch_exec_agent() {
             rm -f "$_restart_marker"
             export CCTRL_RESTART_MARKER="$_restart_marker"
             echo -e "${DIM}claude ${LAUNCH_FLAGS[*]}${RESET}"
-            umask "$_CCTRL_CALLER_UMASK"  # the agent gets the caller's umask (plan 116 A0)
+            _cctrl_user_umask  # the agent gets the caller's umask (plan 116 A0)
             exec "$SCRIPT_DIR/lib/session-wrapper.sh" claude "$_restart_marker" "${LAUNCH_FLAGS[@]}"
         else
             echo -e "${DIM}claude ${LAUNCH_FLAGS[*]}${RESET}"
-            umask "$_CCTRL_CALLER_UMASK"  # the agent gets the caller's umask (plan 116 A0)
+            _cctrl_user_umask  # the agent gets the caller's umask (plan 116 A0)
             exec claude "${LAUNCH_FLAGS[@]}"
         fi
     fi
@@ -2760,16 +2863,16 @@ _launch_exec_agent() {
         rm -f "$_restart_marker"
         export CCTRL_RESTART_MARKER="$_restart_marker"
         echo -e "${DIM}codex ${LAUNCH_FLAGS[*]} ${_codex_initial[*]:-}${RESET}"
-        umask "$_CCTRL_CALLER_UMASK"  # the agent gets the caller's umask (plan 116 A0)
+        _cctrl_user_umask  # the agent gets the caller's umask (plan 116 A0)
         exec "$SCRIPT_DIR/lib/session-wrapper.sh" codex "$_restart_marker" "${LAUNCH_FLAGS[@]}" \
             --cctrl-initial ${_codex_initial[@]+"${_codex_initial[@]}"}
     elif [[ "$resume" == "true" ]]; then
         echo -e "${DIM}codex resume ${LAUNCH_FLAGS[*]} ${_codex_initial[*]:1}${RESET}"
-        umask "$_CCTRL_CALLER_UMASK"  # the agent gets the caller's umask (plan 116 A0)
+        _cctrl_user_umask  # the agent gets the caller's umask (plan 116 A0)
         exec codex resume "${LAUNCH_FLAGS[@]}" "${_codex_initial[@]:1}"
     else
         echo -e "${DIM}codex ${LAUNCH_FLAGS[*]} ${_codex_initial[*]:-}${RESET}"
-        umask "$_CCTRL_CALLER_UMASK"  # the agent gets the caller's umask (plan 116 A0)
+        _cctrl_user_umask  # the agent gets the caller's umask (plan 116 A0)
         exec codex "${LAUNCH_FLAGS[@]}" ${_codex_initial[@]+"${_codex_initial[@]}"}
     fi
 }
@@ -3479,7 +3582,7 @@ _task_register_app_owned_launch() {
     host_id="$(_cctrl_host_id)" || return 1
     record_file="$(_task_record_file codex "$host_id" "$provider_task_id")" || return 1
     record_key="${record_file##*/}"; record_key="${record_key%.json}"
-    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     base_event="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || return 1
     launch_event="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || { rm -f "$base_event"; return 1; }
@@ -4656,7 +4759,7 @@ _task_registry_apply_event() {
     local record_key="$1" event_file="$2" record_file input_file result_file output_file tmp status rc=0
     [[ "$record_key" =~ ^(task-[0-9a-f]{64}|launch-[0-9a-f-]+)$ ]] || return 1
     [[ -f "$event_file" && ! -L "$event_file" ]] || return 1
-    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
     record_file="$SESSION_METADATA_DIR/$record_key.json"
     _task_registry_lock_acquire "$record_key" || return $?
     input_file="$(mktemp "$SESSION_METADATA_DIR/.task-input.XXXXXX")" || rc=1
@@ -4799,7 +4902,7 @@ PYRECEIPT
         printf '%s' "$canonical"
         return 0
     fi
-    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
     tmp="$(mktemp "$SESSION_METADATA_DIR/.task-promote.XXXXXX")" || return 1
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     NORMALIZED_RECORD="$normalized" python3 - "$canonical" "$provider_task_id" "$now" "$TASK_RECORD_MAX_EVIDENCE" > "$tmp" <<'PY'
@@ -5164,7 +5267,7 @@ _session_write_metadata() {
     # Plan 100: role (orchestrator|worker), orch_kind (fleet|repo|empty), and
     # the optional succeeds label. Empty stores null; a pre-plan record has none.
     local role="${19:-}" orch_kind="${20:-}" succeeds="${21:-}" resuming="${22:-}"
-    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
     # Plan 100 D11: a fresh launch knows the label it launched with. A resumed
     # launch (conversation id given) never seeds the set from the purpose alone:
     # an existing record keeps its set, one without gets the baseline later.
@@ -5174,7 +5277,7 @@ _session_write_metadata() {
         [[ "$names_known" == "[]" ]] && names_known=""
     fi
     local tmp created_at host_label host_id provider lifecycle_state provider_task_id launch_id output_file
-    mkdir -p "$SESSION_METADATA_DIR" || return 1
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
     tmp="$(mktemp "$SESSION_METADATA_DIR/.task-write.XXXXXX")" || return 1
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     host_label="${CCTRL_HOST_PREFIX:-local}"
@@ -6002,7 +6105,7 @@ _fleet_lock_acquire() {
     # registry dir cannot be created.
     local runtime="$1" dir attempt now created pid age stale
     dir="$(_fleet_lock_dir "$runtime")"
-    mkdir -p "$SESSION_METADATA_DIR" 2>/dev/null || return 2
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" 2>/dev/null || return 2
     for attempt in 1 2; do
         if mkdir "$dir" 2>/dev/null; then
             date +%s > "$dir/created" 2>/dev/null || true
@@ -6727,9 +6830,9 @@ _launch_detached() {
     # The caller's umask, not cctrl's 077, for the session: if no server is
     # running, this call starts one, and every pane inherits the server's.
     local _new_session_rc=0
-    umask "$_CCTRL_CALLER_UMASK"
+    _cctrl_user_umask
     tmux new-session -d -s "$session_name" "$shell_cmd" || _new_session_rc=$?
-    umask 077
+    _cctrl_own_umask
     if (( _new_session_rc != 0 )); then
         rm -f "$(_session_metadata_file "$session_name")" 2>/dev/null || true
         [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
@@ -6886,9 +6989,12 @@ _prompt_attach_session() {
 
 # ── Peer registry ─────────────────────────────────────────────────────
 
+# Peer and mailbox stores are private (plan 116 A0): explicit 0700 / 0600 on
+# create, not only the umask, so a caller that sources cctrl under another
+# umask still gets private files.
 _peer_init() {
-    mkdir -p "$(dirname "$PEERS_FILE")"
-    [[ -f "$PEERS_FILE" ]] || echo "{}" > "$PEERS_FILE"
+    mkdir -p -m 700 "$(dirname "$PEERS_FILE")"
+    [[ -f "$PEERS_FILE" ]] || { echo "{}" > "$PEERS_FILE" && chmod 600 "$PEERS_FILE"; }
 }
 
 _peer_now_utc() {
@@ -8479,8 +8585,8 @@ _peer_cmd_overview() {
 }
 
 _mailbox_init() {
-    mkdir -p "$(dirname "$MESSAGES_FILE")"
-    [[ -f "$MESSAGES_FILE" ]] || : > "$MESSAGES_FILE"
+    mkdir -p -m 700 "$(dirname "$MESSAGES_FILE")"
+    [[ -f "$MESSAGES_FILE" ]] || { : > "$MESSAGES_FILE" && chmod 600 "$MESSAGES_FILE"; }
 }
 
 _mailbox_lock_path() {
@@ -20992,7 +21098,7 @@ _session_backfill_ids() {
         esac
     done
 
-    mkdir -p "$SESSION_METADATA_DIR" 2>/dev/null || true
+    mkdir -p -m 700 "$SESSION_METADATA_DIR" 2>/dev/null || true
     local uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     local n_filled=0 n_already=0 n_unrecoverable=0
     local -a json_items=()
@@ -21483,7 +21589,7 @@ cmd_statusline() {
                 local tmp status_cmd
                 tmp="$(mktemp)"
                 status_cmd="$SCRIPT_DIR/hooks/statusline.sh"
-                jq --arg cmd "$status_cmd" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
+                jq --arg cmd "$status_cmd" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$tmp" && _mv_keep_mode "$tmp" "$SETTINGS"
                 echo -e "${GREEN}Installed Claude statusline:${RESET} $status_cmd"
                 return 0
             fi
@@ -23019,10 +23125,8 @@ cmd_paths() {
             [[ -n "$mode_of" ]] || continue
             modes="$(jq -c --arg k "$key" --arg m "$mode_of" '. + {($k): $m}' <<< "$modes")"
         done <<< "$kv"
-        printf '%s
-' "$kv" | jq -R -s --argjson modes "$modes" --arg tm "$tm" --arg tmr "$_CCTRL_TEST_MODE_REASON" '
-            [split("
-")[] | select(length > 0) | capture("^(?<k>[^=]+)=(?<v>.*)$") ]
+        printf '%s\n' "$kv" | jq -R -s --argjson modes "$modes" --arg tm "$tm" --arg tmr "$_CCTRL_TEST_MODE_REASON" '
+            [split("\n")[] | select(length > 0) | capture("^(?<k>[^=]+)=(?<v>.*)$") ]
             | map({(.k): .v}) | add
             | . + {modes: $modes, test_mode: $tm, test_mode_reason: $tmr}'
         return 0
@@ -23038,15 +23142,12 @@ cmd_paths() {
                 fi ;;
         esac
         if [[ -n "$mode_of" ]]; then
-            printf '%-20s %s  (%s)
-' "$key" "$val" "$mode_of"
+            printf '%-20s %s  (%s)\n' "$key" "$val" "$mode_of"
         else
-            printf '%-20s %s
-' "$key" "$val"
+            printf '%-20s %s\n' "$key" "$val"
         fi
     done <<< "$kv"
-    printf '%-20s %s (%s)
-' test_mode "$tm" "$_CCTRL_TEST_MODE_REASON"
+    printf '%-20s %s (%s)\n' test_mode "$tm" "$_CCTRL_TEST_MODE_REASON"
 }
 
 # `cctrl state ...` (plan 116). A0 ships fix-modes only; the location of the

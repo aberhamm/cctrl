@@ -79,6 +79,21 @@ ServerRequestCallback = Callable[[str, Mapping[str, Any]], Any]
 NotificationCallback = Callable[[str, Mapping[str, Any]], None]
 
 
+def caller_umask(environ: Mapping[str, str] | None = None, current: int | None = None) -> int:
+    """The caller's umask that cctrl exports as CCTRL_CALLER_UMASK, as an int
+    for subprocess.Popen(umask=...); -1 (leave it alone) when unset or bad.
+    Trusted only while this process runs at cctrl's 077, as cctrl does."""
+    if current is None:
+        current = os.umask(0o077)
+        os.umask(current)
+    if current != 0o077:
+        return -1
+    value = (os.environ if environ is None else environ).get("CCTRL_CALLER_UMASK", "")
+    if re.fullmatch(r"0[0-7]{3}", value):
+        return int(value, 8)
+    return -1
+
+
 class AdapterError(RuntimeError):
     """Stable, JSON-serializable adapter failure."""
 
@@ -335,6 +350,9 @@ class AppServerClient:
                 stderr=subprocess.PIPE,
                 bufsize=0,
                 start_new_session=True,
+                # cctrl runs at umask 077; the proxy (and any daemon it may
+                # start) gets the caller's umask (plan 116 A0).
+                umask=caller_umask(),
             )
         except OSError as exc:
             raise AdapterError(EXIT_CONNECT, "connect", f"failed to start App Server proxy: {exc}") from exc

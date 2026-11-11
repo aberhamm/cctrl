@@ -163,10 +163,16 @@ _cctrl_paths_upper() {
 # these hold:
 #   - CCTRL_TEST_MODE=1;
 #   - every resolved state path (state root, data, store data, costs, audit,
-#     user and local config, session records, snapshots, host id and
-#     TMUX_TMPDIR) resolves by realpath inside one directory that holds a
-#     .cctrl-test-sandbox file;
-#   - the effective seal key path resolves inside that directory too.
+#     user and local config, session records, snapshots, host id, shortcuts,
+#     hosts, the needs-me snapshot, the autoheal log, the LaunchAgents dir
+#     and TMUX_TMPDIR) resolves by realpath inside one directory that holds
+#     a .cctrl-test-sandbox file;
+#   - the effective seal key path resolves inside that directory too;
+#   - every tmux socket cctrl could reach does too: the socket in $TMUX, and
+#     any path given in CCTRL_TMUX_SERVER or CCTRL_TMUX_EXTRA_SERVERS (a
+#     plain name lives under TMUX_TMPDIR, which is checked). A tmuxServer or
+#     tmuxExtraServers key in any config layer, with no env value to win
+#     over it, is not test mode (fail closed; set the env value instead).
 # Separately, test mode refuses to run at all (exit 64) when the effective
 # seal key path is the live user's key path. The live path comes from the
 # password database (getpwuid), never from HOME. The marker is not a secret:
@@ -239,6 +245,53 @@ _cctrl_tm_key_is_live() {
     [[ "$_CCTRL_TM_KEY" == "$_CCTRL_TM_LIVE_KEY" || "$a" == "$b" ]]
 }
 
+# 0 (reject) when PATH is empty or resolves outside $_CCTRL_TM_SANDBOX, with
+# the reason in _CCTRL_TEST_MODE_REASON. The reason names the LABEL, never
+# the path.
+_cctrl_tm_reject() { # LABEL PATH
+    if [[ -z "$2" ]]; then
+        _CCTRL_TEST_MODE_REASON="a state path is empty: $1"
+        return 0
+    fi
+    _cctrl_tm_realpath "$2"
+    case "$_CCTRL_TM_REAL" in
+        "$_CCTRL_TM_SANDBOX"|"$_CCTRL_TM_SANDBOX"/*) return 1 ;;
+    esac
+    _CCTRL_TEST_MODE_REASON="outside the sandbox: $1"
+    return 0
+}
+
+# 0 (reject) when a tmux server list (names or socket paths, comma or newline
+# separated, as cctrl reads CCTRL_TMUX_SERVER and CCTRL_TMUX_EXTRA_SERVERS)
+# holds a socket path outside the sandbox. A plain name is a socket under
+# TMUX_TMPDIR, which the gate checks on its own.
+_cctrl_tm_reject_tmux() { # LABEL LIST
+    local nl=$'\n' e list
+    list="${2//$nl/,}"
+    while [[ -n "$list" ]]; do
+        e="${list%%,*}"
+        if [[ "$list" == *,* ]]; then list="${list#*,}"; else list=""; fi
+        e="${e#"${e%%[![:space:]]*}"}"; e="${e%"${e##*[![:space:]]}"}"
+        case "$e" in "~/"*) e="${HOME:-}/${e#\~/}" ;; esac
+        case "$e" in
+            */*) _cctrl_tm_reject "$1" "$e" && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# 0 when any config layer's text names KEY (matched as "KEY", not parsed).
+_cctrl_tm_config_has() { # KEY
+    local f content
+    for f in "$_CCTRL_P_CONFIG_DEFAULT" "$_CCTRL_P_CONFIG_LEGACY" "$_CCTRL_P_CONFIG_USER" "$_CCTRL_P_CONFIG_LOCAL"; do
+        [[ -n "$f" && -f "$f" ]] || continue
+        content=""
+        IFS= read -r -d '' content < "$f" 2>/dev/null || true
+        [[ "$content" == *"\"$1\""* ]] && return 0
+    done
+    return 1
+}
+
 # The test-mode gate. Needs _cctrl_paths_resolve to have run. Returns 0 in
 # test mode, 1 when not, 64 when test mode is asked for with the live key.
 # The reason is in _CCTRL_TEST_MODE_REASON.
@@ -268,24 +321,40 @@ _cctrl_test_mode() {
         _CCTRL_TEST_MODE_REASON="no .cctrl-test-sandbox above the state root"
         return 1
     fi
-    local p
-    for p in "$_CCTRL_P_STATE_ROOT" "$_CCTRL_P_DATA_DIR" "$_CCTRL_P_STORE_DATA_DIR" \
-        "$_CCTRL_P_COSTS_DIR" "$_CCTRL_P_AUDIT_DIR" "$_CCTRL_P_CONFIG_USER" \
-        "$_CCTRL_P_CONFIG_LOCAL" "$_CCTRL_P_SESSIONS_DIR" "$_CCTRL_P_SNAPSHOTS_DIR" \
-        "$_CCTRL_P_HOST_ID_FILE" "$TMUX_TMPDIR" "$_CCTRL_TM_KEY"; do
-        if [[ -z "$p" ]]; then
-            _CCTRL_TEST_MODE_REASON="a state path is empty"
-            return 1
-        fi
-        _cctrl_tm_realpath "$p"
-        case "$_CCTRL_TM_REAL" in
-            "$sandbox"|"$sandbox"/*) ;;
-            *)
-                _CCTRL_TEST_MODE_REASON="outside the sandbox: $p"
-                return 1
-                ;;
-        esac
-    done
+    _CCTRL_TM_SANDBOX="$sandbox"
+    _cctrl_tm_reject state_root "$_CCTRL_P_STATE_ROOT" && return 1
+    _cctrl_tm_reject data_dir "$_CCTRL_P_DATA_DIR" && return 1
+    _cctrl_tm_reject store_data_dir "$_CCTRL_P_STORE_DATA_DIR" && return 1
+    _cctrl_tm_reject costs_dir "$_CCTRL_P_COSTS_DIR" && return 1
+    _cctrl_tm_reject audit_dir "$_CCTRL_P_AUDIT_DIR" && return 1
+    _cctrl_tm_reject config_user "$_CCTRL_P_CONFIG_USER" && return 1
+    _cctrl_tm_reject config_local "$_CCTRL_P_CONFIG_LOCAL" && return 1
+    _cctrl_tm_reject sessions_dir "$_CCTRL_P_SESSIONS_DIR" && return 1
+    _cctrl_tm_reject snapshots_dir "$_CCTRL_P_SNAPSHOTS_DIR" && return 1
+    _cctrl_tm_reject host_id_file "$_CCTRL_P_HOST_ID_FILE" && return 1
+    _cctrl_tm_reject shortcuts_file "$_CCTRL_P_SHORTCUTS_FILE" && return 1
+    _cctrl_tm_reject hosts_file "$_CCTRL_P_HOSTS_FILE" && return 1
+    _cctrl_tm_reject needs_me_snapshot "$_CCTRL_P_NEEDS_ME_SNAPSHOT" && return 1
+    _cctrl_tm_reject autoheal_log "${CCTRL_AUTOHEAL_LOG:-$_CCTRL_P_DATA_DIR/autoheal.log}" && return 1
+    _cctrl_tm_reject launch_agents_dir "${CCTRL_LAUNCH_AGENTS_DIR:-${HOME:-}/Library/LaunchAgents}" && return 1
+    _cctrl_tm_reject TMUX_TMPDIR "$TMUX_TMPDIR" && return 1
+    if _cctrl_tm_reject seal_key "$_CCTRL_TM_KEY"; then
+        _CCTRL_TEST_MODE_REASON="the seal key is outside the sandbox"
+        return 1
+    fi
+    if [[ -n "${TMUX:-}" ]]; then
+        _cctrl_tm_reject TMUX "${TMUX%%,*}" && return 1
+    fi
+    _cctrl_tm_reject_tmux CCTRL_TMUX_SERVER "${CCTRL_TMUX_SERVER:-}" && return 1
+    _cctrl_tm_reject_tmux CCTRL_TMUX_EXTRA_SERVERS "${CCTRL_TMUX_EXTRA_SERVERS:-}" && return 1
+    if [[ -z "${CCTRL_TMUX_SERVER:-}" ]] && _cctrl_tm_config_has tmuxServer; then
+        _CCTRL_TEST_MODE_REASON="tmuxServer is set in a config file; set CCTRL_TMUX_SERVER in test mode"
+        return 1
+    fi
+    if [[ -z "${CCTRL_TMUX_EXTRA_SERVERS:-}" ]] && _cctrl_tm_config_has tmuxExtraServers; then
+        _CCTRL_TEST_MODE_REASON="tmuxExtraServers is set in a config file; set CCTRL_TMUX_EXTRA_SERVERS in test mode"
+        return 1
+    fi
     _CCTRL_TEST_MODE_REASON="sandbox $sandbox"
     return 0
 }

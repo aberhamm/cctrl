@@ -211,8 +211,13 @@ _SELF_DIR   = os.path.dirname(os.path.realpath(__file__))
 _CCTRL_DIR  = os.path.dirname(_SELF_DIR)
 # Paths come from the shared resolver (plan 116 A0).
 sys.path.insert(0, os.path.join(_CCTRL_DIR, 'lib'))
-import paths as _cctrl_paths  # noqa: E402
-PORTS_FILE  = _cctrl_paths.resolve(_CCTRL_DIR)['ports_file']
+try:
+    import paths as _cctrl_paths  # noqa: E402
+    PORTS_FILE  = _cctrl_paths.resolve(_CCTRL_DIR)['ports_file']
+except ImportError:
+    # A copy with no lib/ beside it (as the hooks do): the store's layout-1
+    # default, <tree>/data/ports-seen.json.
+    PORTS_FILE  = os.path.join(_CCTRL_DIR, 'data', 'ports-seen.json')
 DATA_DIR    = os.path.dirname(PORTS_FILE)
 
 def _load_db() -> dict:

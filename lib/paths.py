@@ -152,6 +152,21 @@ def _inside(path, top):
     return path == top or path.startswith(top.rstrip("/") + "/")
 
 
+def _config_names(p, key):
+    """True when any config layer's text names "key" (matched, not parsed)."""
+    needle = ('"%s"' % key).encode()
+    for f in config_layers(p):
+        try:
+            with open(f, "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        # The shell reads up to the first NUL byte; do the same.
+        if needle in raw.split(b"\0", 1)[0]:
+            return True
+    return False
+
+
 def test_mode(p, environ=None):
     """(state, reason): state is True in test mode, False when not, and the
     string "refused" when test mode is asked for with the live seal key."""
@@ -176,14 +191,45 @@ def test_mode(p, environ=None):
         sandbox = os.path.dirname(sandbox)
     if not sandbox or sandbox == "/":
         return False, "no .cctrl-test-sandbox above the state root"
-    for path in (p["state_root"], p["data_dir"], p["store_data_dir"], p["costs_dir"],
-                 p["audit_dir"], p["config_user"], p["config_local"],
-                 p["sessions_dir"], p["snapshots_dir"], p["host_id_file"],
-                 tmux_tmpdir, key):
+
+    def _outside(path):
+        return not _inside(os.path.realpath(path), sandbox)
+
+    home = env.get("HOME", "")
+    checks = (
+        ("state_root", p["state_root"]), ("data_dir", p["data_dir"]),
+        ("store_data_dir", p["store_data_dir"]), ("costs_dir", p["costs_dir"]),
+        ("audit_dir", p["audit_dir"]), ("config_user", p["config_user"]),
+        ("config_local", p["config_local"]), ("sessions_dir", p["sessions_dir"]),
+        ("snapshots_dir", p["snapshots_dir"]), ("host_id_file", p["host_id_file"]),
+        ("shortcuts_file", p["shortcuts_file"]), ("hosts_file", p["hosts_file"]),
+        ("needs_me_snapshot", p["needs_me_snapshot"]),
+        ("autoheal_log", env.get("CCTRL_AUTOHEAL_LOG") or p["data_dir"] + "/autoheal.log"),
+        ("launch_agents_dir", env.get("CCTRL_LAUNCH_AGENTS_DIR") or home + "/Library/LaunchAgents"),
+        ("TMUX_TMPDIR", tmux_tmpdir),
+    )
+    # Reasons name the label, never the path.
+    for label, path in checks:
         if not path:
-            return False, "a state path is empty"
-        if not _inside(os.path.realpath(path), sandbox):
-            return False, "outside the sandbox: " + path
+            return False, "a state path is empty: " + label
+        if _outside(path):
+            return False, "outside the sandbox: " + label
+    if not key or _outside(key):
+        return False, "the seal key is outside the sandbox"
+    tmux = env.get("TMUX", "")
+    if tmux and _outside(tmux.split(",", 1)[0]):
+        return False, "outside the sandbox: TMUX"
+    for name in ("CCTRL_TMUX_SERVER", "CCTRL_TMUX_EXTRA_SERVERS"):
+        for e in env.get(name, "").replace("\n", ",").split(","):
+            e = e.strip()
+            if e.startswith("~/"):
+                e = home + "/" + e[2:]
+            if "/" in e and _outside(e):
+                return False, "outside the sandbox: " + name
+    for env_name, cfg_key in (("CCTRL_TMUX_SERVER", "tmuxServer"),
+                              ("CCTRL_TMUX_EXTRA_SERVERS", "tmuxExtraServers")):
+        if not env.get(env_name) and _config_names(p, cfg_key):
+            return False, "%s is set in a config file; set %s in test mode" % (cfg_key, env_name)
     return True, "sandbox " + sandbox
 
 
