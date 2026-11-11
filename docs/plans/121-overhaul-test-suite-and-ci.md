@@ -2,13 +2,13 @@
 id: 121
 title: Overhaul E - CI on hosted runners, a steady parallel suite, and the best-case test set
 status: blocked
-blocked-by: []
+blocked-by: [115]
 priority: 15
 allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-11-11
-approval: "mdec-1111-fable-findings-plans: PLAN ONLY. Waits for Matthew's prioritisation from plan 115. Enabling Actions on the public repo needs his yes; tests need no install."
+approval: "Operator approval on record (plan-only grant): PLAN ONLY. Run per phase under the orchestrator; never flip this plan to pending as a whole. Waits for Matthew's prioritisation from plan 115. Enabling Actions on the public repo needs his yes; tests need no install."
 approved-by: pending (Matthew, via plan 115)
 reviews: []
 related: 115, 116, 117, 118, 119, 120, 122, 090, 095, 097, 105
@@ -67,7 +67,7 @@ plan; timings come from earlier reports.
 - **Tests.** The matrix itself. A deliberately broken branch must fail each job once, recorded
   in the verify.
 - **Rollback.** Delete the workflow files.
-- **Depends on.** Nothing.
+- **Blocked by.** Nothing.
 - **Needs Matthew's yes:** enabling Actions on the public repo. The workflow files are a
   public change.
 
@@ -91,7 +91,7 @@ plan; timings come from earlier reports.
   - A guard that every quarantine entry has an unexpired date.
   - The stress job.
 - **Rollback.** `git revert`.
-- **Depends on.** E0.
+- **Blocked by.** E0.
 - **Needs Matthew's yes:** none (tests only).
 
 ### E2. Split the test file and run in parallel (step 6)
@@ -111,7 +111,7 @@ plan; timings come from earlier reports.
   - Each file alone, and in random order, in CI.
   - The sorted list of passed tests equals the pre-split list (plan 105's no-loss proof).
 - **Rollback.** `git revert` (tests only).
-- **Depends on.** E1.
+- **Blocked by.** E1.
 - **Needs Matthew's yes:** none.
 
 ### E3. Unit tests (step 8)
@@ -125,8 +125,11 @@ plan; timings come from earlier reports.
 - **Closes.** F7 (unit gaps), L6.
 - **Size.** 20 h (Fable). About 250 cases.
 - **Risk.** Low.
+- **Tests.** The new cases are the deliverable. Check: each named module has a test file;
+  every new test fails when its target function is stubbed to return a wrong value (a
+  one-off sabotage run recorded in the verify); the suite stays inside E1's time budgets.
 - **Rollback.** n/a.
-- **Depends on.** Plan 120's B0 and B1.
+- **Blocked by.** Plan 120's B0 and B1.
 - **Needs Matthew's yes:** none.
 
 ### E4. Hostile input and security cases (step 5, before the hardening phases)
@@ -147,8 +150,11 @@ plan; timings come from earlier reports.
 - **Closes.** L6 (no hostile tests), SH-S8 (escape output).
 - **Size.** 12 h (Fable). About 80 cases.
 - **Risk.** Low.
+- **Tests.** Every expected failure names its audit id and fails today for the stated reason
+  (not a harness error); a guard test fails if an expected failure starts passing without
+  its marker being removed; the output-escape cases run on a real pty.
 - **Rollback.** n/a.
-- **Depends on.** E0.
+- **Blocked by.** E0.
 - **Needs Matthew's yes:** none.
 
 ### E5. Mailbox corruption and concurrency, as a named suite (step 8)
@@ -159,8 +165,11 @@ plan; timings come from earlier reports.
 - **Closes.** F3 and L2 (test side).
 - **Size.** 6 h beyond A1 (Fable).
 - **Risk.** Low.
+- **Tests.** The named suite runs on both lock kinds and both bashes; a fault injected at each
+  write step leaves a readable mailbox with no lost message; the old-release writer case and
+  the three-party steal case (plan 116's A1) are included.
 - **Rollback.** n/a.
-- **Depends on.** A1, E2.
+- **Blocked by.** A1, E2.
 - **Needs Matthew's yes:** none.
 
 ### E6. Approvals doc-lint (step 6)
@@ -169,10 +178,12 @@ plan; timings come from earlier reports.
   plan 119's `cctrl approvals check`, and the real record shape. The command's own parser
   tests are in O7.
 - **Closes.** M8 (drift).
-- **Size.** 3 h (Fable).
+- **Size.** 3 h (Fable). Separate from O7's own 8 h; no double count.
 - **Risk.** Low.
+- **Tests.** The lint fails on a fixture skill whose block drifts from the command's usage, and
+  passes on the real skills.
 - **Rollback.** n/a.
-- **Depends on.** Plan 119's O7.
+- **Blocked by.** Plan 119's O7.
 - **Needs Matthew's yes:** none.
 
 ### E7. Install and rollback suite (step 6)
@@ -182,11 +193,16 @@ plan; timings come from earlier reports.
   - Interruption at each installer step.
   - After plan 116's A4: no release ever links into a working tree.
   - Hooks fail open with python3 missing, a syntax error, or the release missing.
-- **Closes.** M9 (no install tests), L6.
+  - A raising PreToolUse guard is allowed, logs one stderr line and bumps the counter that
+    `hooks doctor` reports (plan 117's C4; review S16).
+- **Closes.** M9 (no install tests), L6, M10 (the swallowed-exception regression).
 - **Size.** 4 h beyond plan 117 (Fable).
 - **Risk.** Low.
+- **Tests.** The suite is the deliverable. Check: an interruption at each installer step
+  leaves either the old or the new release active, never neither; each fail-open case
+  exits 0 with one stderr line.
 - **Rollback.** n/a.
-- **Depends on.** C1, C2, C3.
+- **Blocked by.** C1, C2, C3.
 - **Needs Matthew's yes:** none.
 
 ### E8. Remote exec over ssh, mocked (step 8)
@@ -201,8 +217,11 @@ plan; timings come from earlier reports.
 - **Closes.** M11 and L4 (test side), L6.
 - **Size.** 8 h (Fable). About 30 cases.
 - **Risk.** Low.
+- **Tests.** The fake `ssh` itself has a self-test (it runs the received string under both
+  shells and records argv); each case asserts the exact argv, including `--`, and the remote
+  result.
 - **Rollback.** n/a.
-- **Depends on.** E2.
+- **Blocked by.** E2.
 - **Needs Matthew's yes:** none.
 
 ### E9. Property and fuzz tests (step 8)
@@ -219,8 +238,10 @@ plan; timings come from earlier reports.
 - **Closes.** F7 (depth).
 - **Size.** 12 h (Fable).
 - **Risk.** Low.
+- **Tests.** Each property runs with a fixed seed in CI and a random seed nightly; a failing
+  example is saved to the hypothesis database and replayed as a regression.
 - **Rollback.** n/a.
-- **Depends on.** B0.
+- **Blocked by.** B0.
 - **Needs Matthew's yes:** none.
 
 ### E10. Integration on an isolated tmux socket (step 8)
@@ -231,13 +252,17 @@ plan; timings come from earlier reports.
   - End to end: send, deliver, ack.
   - A split-pane target (audit M1, plan 119's O6a).
   - A second server; close and reap.
-  - **A detached-tmux caller and a `script` caller for the classifier** (MF-M6, plan 118).
+  - **A detached-tmux caller, a `script` caller, an argv[0]-spoofed root and a `pty.fork`
+    caller for the classifier** (MF-M6 and the plan 115 review's MUST-FIX 1, plan 118).
   - A separate, slower CI job with a pinned tmux version.
 - **Closes.** M1, M2, MF-M6 (test side).
 - **Size.** 20 h (reviewer; Fable 12).
 - **Risk.** Medium. Real tmux in CI.
+- **Tests.** Each scenario runs on its own private socket and leaves no server behind (checked
+  after the job); the fake agent's fixtures are replayed through both detectors; the job is
+  run three times in a row on the verify to show it is steady.
 - **Rollback.** n/a.
-- **Depends on.** E2. It must land before plan 120's B6.
+- **Blocked by.** E2. It must land before plan 120's B6.
 - **Needs Matthew's yes:** none.
 
 ### E11. Coverage that works (step 10; SH-S7)
@@ -262,8 +287,11 @@ plan; timings come from earlier reports.
 - **Closes.** F4 (coverage), SH-S7, MF-M8 (no Linux dependency).
 - **Size.** 16 h (reviewer; Fable 8).
 - **Risk.** Low. The tools are slow; it runs nightly.
+- **Tests.** A fixture subprocess call shows up in the Python figure; a fixture bash function
+  run in a child shows up in the bash figure, mapped to its `src/sh` line; the ratchet job
+  fails on a planted coverage drop.
 - **Rollback.** n/a.
-- **Depends on.** B1, E2.
+- **Blocked by.** B1, E2.
 - **Needs Matthew's yes:** none (the badge is part of plan 122's D1 README change).
 
 ### E12. Mutation, soak, crash, disk-full and differential fuzz (step 8; SH-S8)
@@ -288,8 +316,10 @@ plan; timings come from earlier reports.
 - **Size.** 10 h (reviewer, "mutation + soak"). This is lean for the full list. If it
   overruns, the disk-image cases move to a follow-up, and that is the first thing to cut.
 - **Risk.** Low.
+- **Tests.** A planted mutant in the seal verify is killed; the soak job fails on a planted
+  lost message; the disk image is always detached after the test, even on failure.
 - **Rollback.** n/a.
-- **Depends on.** B0, B3 (the differential part), E10 (the soak harness).
+- **Blocked by.** B0, B3 (the differential part), E10 (the soak harness).
 - **Needs Matthew's yes:** none.
 
 ### L1. Linux port (step 9; only if plan 115 Q5 = supported; MF-M8)
@@ -304,7 +334,7 @@ plan; timings come from earlier reports.
 - **Risk.** Medium.
 - **Tests.** The full suite on Ubuntu.
 - **Rollback.** `git revert`.
-- **Depends on.** E2, and plan 116's A1 and A3.
+- **Blocked by.** E2, and plan 116's A1 and A3.
 - **Needs Matthew's yes:** the Q5 decision itself.
 
 ## Size summary
@@ -326,6 +356,24 @@ plan; timings come from earlier reports.
 | E12 | 10 | reviewer (new) |
 | **Total** | **155** | |
 | L1 (optional) | 25 | reviewer |
+
+The revision of plans 115-122 changed no size here.
+
+## Execution and acceptance criteria
+
+- **Execution.** Run per phase under the orchestrator: E0 at step 1, E4 at step 5, E1, E2, E6
+  and E7 at step 6, E3, E5 and E8-E10, E12 at step 8, E11 at step 10. Never flip this plan to
+  `pending` as a whole. The frontmatter `blocked-by: [115]` is a guard (115 stays `split`).
+- [ ] E0: every job fails once on a deliberately broken branch (recorded); Actions are pinned
+  by SHA; no workflow has secrets or `pull_request_target`; no self-hosted runner.
+- [ ] E1: no test compares elapsed time to a constant; a missing tool is SKIP locally and FAIL
+  in CI; every quarantine entry has an owner and an unexpired date.
+- [ ] E2: the sorted list of passed tests equals the pre-split list; the parallel run is under
+  5 minutes on 8 cores.
+- [ ] E4: every open audit finding has an expected-failure case keyed to its id.
+- [ ] E5-E12: each named suite runs in CI (nightly where stated) and meets its own Tests line.
+- [ ] Every test is hermetic: no live fleet, live mailbox or live seal key (plan 116's
+  test-mode gate refuses the live key).
 
 ## Out of scope
 

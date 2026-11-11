@@ -2,13 +2,13 @@
 id: 120
 title: Overhaul B - split the bash source into modules and move the peer subsystem into tested Python
 status: blocked
-blocked-by: []
+blocked-by: [115]
 priority: 16
 allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-11-11
-approval: "mdec-1111-fable-findings-plans: PLAN ONLY. Waits for Matthew's prioritisation from plan 115 (Q12: decide on this workstream after stop 2). Each install needs its own yes."
+approval: "Operator approval on record (plan-only grant): PLAN ONLY. Run per phase under the orchestrator; never flip this plan to pending as a whole. Waits for Matthew's prioritisation from plan 115 (Q12: decide on this workstream after stop 2). Each install needs its own yes."
 approved-by: pending (Matthew, via plan 115)
 reviews: []
 related: 115, 116, 118, 119, 121, 122, 105, 111
@@ -103,7 +103,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - `python3.9 -m compileall`.
   - The hooks fail-open matrix: python missing, a syntax error, the release missing, a slow
     start.
-- **Depends on.** Plan 121's E2.
+- **Blocked by.** Plan 121's E2.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### B1. Split the bash source (step 8)
@@ -120,7 +120,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
 - **Risk.** Low. No runtime change, by construction.
 - **Tests.** `cmp` of the built file against the pre-split blob; the full suite on both
   bashes.
-- **Depends on.** B0.
+- **Blocked by.** B0.
 - **Needs Matthew's yes:** none for B1 itself, since the built file is unchanged. It still
   goes through the normal install of the next phase.
 
@@ -141,7 +141,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - Every error path writes to stderr (a table-driven test).
   - A temp-leak test: no files left after each command class.
   - The lint baseline gate.
-- **Depends on.** B1.
+- **Blocked by.** B1.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### B3. Mailbox store and message model in Python (step 8)
@@ -166,7 +166,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - Property tests: no message lost under any interleaving; round-trip.
   - The A1 corruption and concurrency set, including an old-release bash writer against the
     new Python writer.
-- **Depends on.** B2; plan 121's E1 and E2.
+- **Blocked by.** B2; plan 121's E1 and E2.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### B4. Identity, attestation, seal, and the caller classifier (step 8)
@@ -184,10 +184,11 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
 - **Risk.** Medium-high. Security-relevant; behaviour must not change in any mode.
 - **Tests.**
   - The attestation tests unchanged.
-  - A differential test, including the classifier's MF-M6 cases (detached tmux, `script`).
+  - A differential test, including the classifier's MF-M6 cases (detached tmux, `script`,
+    argv[0] spoof, `pty.fork`, the tty rule) and the `proc_pidpath` walk.
   - Unit tests for `canonical`, `verify_one` and `eligibility_one`.
   - The override is ignored outside test mode.
-- **Depends on.** B3; plan 118 (O3.1, O4.2) landed.
+- **Blocked by.** B3; plan 118 (O3.1, O4.2) landed.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### B5. Doorbell (step 8)
@@ -204,7 +205,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - `tests/bench-doorbell.sh` becomes a budget test: median and p95 recorded, no more than 20%
     regression.
   - Hook contract tests.
-- **Depends on.** B4.
+- **Blocked by.** B4.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### B6. Delivery (step 8; plan 119's O6b follows)
@@ -224,7 +225,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - Pane fixtures replayed through both detectors.
   - Plan 121's E10 integration on a private socket with the fake agent.
   - A differential test.
-- **Depends on.** B5; plan 121's E10.
+- **Blocked by.** B5; plan 121's E10.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### B7. Peer CLI in Python; delete the bash peer code (step 8)
@@ -246,7 +247,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - MCP tool tests.
   - The cross-version matrix with plan 121's E8 fake ssh.
   - A `peer send` process-count budget (under 10 spawns at 31 fake sessions).
-- **Depends on.** B6 and plan 119's O6b.
+- **Blocked by.** B6 and plan 119's O6b.
 - **Needs Matthew's yes:** the install on each Mac. Install both Macs in the same window,
   because of skew.
 
@@ -269,7 +270,7 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
   - Unit tests per extracted function.
   - A drift check between help, completions and dispatch.
   - A `session list` timing budget.
-- **Depends on.** B7.
+- **Blocked by.** B7.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ## Size summary
@@ -287,7 +288,28 @@ at launch follow it without a restart). `CCTRL_PEER_IMPL` stays only as a test o
 | B8 | 36 | reviewer |
 | **Total** | **180** | |
 
-Every phase from B3 to B7 can end the workstream with a working system.
+Every phase from B3 to B7 can end the workstream with a working system. The revision of
+plans 115-122 changed no size here.
+
+## Execution and acceptance criteria
+
+- **Execution.** Run per phase under the orchestrator, B0 → B8 in order, and only after
+  Matthew's decision on this workstream (plan 115 Q12) and after plan 121's E1 and E2. Never
+  flip this plan to `pending` as a whole: it is 180 h of phases with installs between them.
+  The frontmatter `blocked-by: [115]` is a guard (115 stays `split`). Rollback is stated once
+  for every phase, above the phase list, because it is the same for each.
+- [ ] B1: the built `cctrl` is byte-identical to the pre-split file (`cmp`).
+- [ ] B2: every error path writes to stderr; no temp file leaks; the lint baseline only
+  shrinks.
+- [ ] B3-B7: each port passes the black-box suite unchanged and a differential test against
+  the bash implementation; `peer_impl: sh` in `config.local.json` restores the old path
+  without a restart.
+- [ ] B4: the classifier's MF-M6 cases (detached tmux, `script`, argv[0] spoof, `pty.fork`)
+  give the same class in both implementations.
+- [ ] B7: the cross-version matrix passes; `peer send` stays under 10 spawns at 31 fake
+  sessions.
+- [ ] B8: help, completions and dispatch come from one command table, with a drift check.
+- [ ] Every frozen interface listed above is unchanged, checked by test.
 
 ## Out of scope
 

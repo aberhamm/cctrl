@@ -2,13 +2,13 @@
 id: 117
 title: Overhaul C - safe installs, a real rollback, settings safety, releases and distribution
 status: blocked
-blocked-by: []
+blocked-by: [115]
 priority: 12
 allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-11-11
-approval: "mdec-1111-fable-findings-plans: PLAN ONLY. Waits for Matthew's prioritisation from plan 115. Every install, the MacBook clean-up, the first public tag and the tap repo each need their own yes."
+approval: "Operator approval on record (plan-only grant): PLAN ONLY. Run per phase under the orchestrator; never flip this plan to pending as a whole. Waits for Matthew's prioritisation from plan 115. Every install, the MacBook clean-up, the first public tag and the tap repo each need their own yes."
 approved-by: pending (Matthew, via plan 115)
 reviews: []
 related: 115, 116, 121, 122, 079, 083, 102, 105, 107
@@ -21,7 +21,8 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
 ## Problem
 
 - `install/self-install.sh` checks only that tracked files are clean. It does not check the
-  branch (live-sync can switch it), that HEAD is pushed, or that no other install is running.
+  branch (a file-sync tool covering the checkout can switch it), that HEAD is pushed, or that
+  no other install is running.
   It copies the launcher and checks `self-install.sh` from the working tree, not from the
   release under test. It runs the gate with whichever `bash` is first on PATH: 5.3 on the
   Studio, 3.2 on the MacBook. That is how two MacBook gate failures reached install day.
@@ -69,7 +70,7 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
   - A path with a quote in it.
   - kill -9 between the temp write and the replace leaves the original intact.
 - **Rollback.** Previous release. The backup file restores any settings change.
-- **Depends on.** Nothing. It can run in parallel with A1.
+- **Blocked by.** Nothing. It can run in parallel with A1.
 - **Needs Matthew's yes:** the install on each Mac. Running `hooks install` afterwards is a
   normal operator act; it now refuses rather than wipes.
 
@@ -87,7 +88,9 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
     `--keep 0`.
   - **Layout guard (MF-M2).**
     - Each release ships `share/state-compat.json` with `{"layout_min":1,"layout_max":2}`
-      (layout 2 is plan 116's A2).
+      (layout 2 is plan 116's A2). A release may declare `layout_max: 2` only if it carries
+      A0's layout-2 resolver rule; a CI check ties the two, so the ids stay honest after A4
+      removes the compat link (review S7).
     - A release without the file counts as layout 1 only.
     - `rollback` reads the current layout from the state marker and refuses a target that
       cannot read it, unless `--force` is given. `--force` prints what will break, and
@@ -107,8 +110,11 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
     works.
   - A missing target, a `.tmp-*` target.
   - Rollback to a release whose launcher differs.
+  - Rollback to a pre-A0 (layout-1) release when the live `data/config.json` is missing
+    prints a warning that names plan 116's A0 runbook (review S5).
 - **Rollback.** The manual atomic re-point, `ln -s` then `mv -fh current.next current`.
-- **Depends on.** Nothing. It must land before A2 (plan 116).
+- **Blocked by.** Plan 116's A0 (the dormant layout-2 rule, so a release that declares
+  `layout_max: 2` really reads layout 2; review S7). It must land before A2 (plan 116).
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### C1. Install preflight and lock (step 3)
@@ -140,7 +146,8 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
   - One bash leg fails.
   - The launcher really comes from the release.
 - **Rollback.** `git revert`; the installer is self-contained.
-- **Depends on.** Nothing. Should land before A2.
+- **Blocked by.** Plan 116's A0 (the `.installed` marker) and A1 (the link-protocol lock
+  helper used for `install.lock`). It must land before A2.
 - **Needs Matthew's yes:** the install on each Mac. From then on, installs refuse unpushed
   trees.
 
@@ -152,19 +159,30 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
   - Doctor runs a **functional** check: it feeds the guard a canned `tmux kill-server`, and
     the `-L <primary>` form from option 1, and expects a block. A broken guard is an issue
     (M10).
+  - **A swallowed guard exception becomes visible (review S16, M10).** Today an exception
+    inside the PreToolUse guard is swallowed (`hooks/pre-tool-use.py`, the top-level
+    handler) and the call is allowed. It stays fail-open by design (plan 079), but the
+    handler now writes one stderr line and bumps a 0600 error counter in the state dir, and
+    `hooks doctor` reports a non-zero count since the last check as an issue.
+  - The guard covers only the Bash tool matcher. That is **accepted and stated** in
+    SECURITY.md (plan 122's D2): the kill guard is about shell commands, and other tools
+    cannot run tmux. Widening the matcher is out of scope.
   - `hooks install --agent codex` removes working-tree leaves, with the Codex installer's
     backup.
   - Then **one supervised session on the MacBook** clears its two stale Codex hooks
     (`block-git-commit.py`, `session-log.py` from `~/dev/cctrl/hooks`).
-- **Closes.** M10 (doctor parity and tamper evidence, in part), F5 (MacBook drift).
+- **Closes.** M10 (doctor parity, tamper evidence in part, the swallowed exception; the
+  Bash-only matcher is accepted), F5 (MacBook drift).
 - **Size.** 6 h (Fable), plus about 1 h on the MacBook.
 - **Risk.** Low.
 - **Tests.**
   - Doctor fixtures for each stale form, for Claude and Codex.
   - The functional self-test with a guard that is missing, broken or always-allowing.
   - The installer cleans a fixture `hooks.json` and writes a backup.
+  - A guard that raises: the call is allowed, one stderr line is written, the counter rises
+    and doctor reports it (plan 121's E7 keeps it as a regression).
 - **Rollback.** The Codex installer backup (`hooks.json.cctrl-backup-*`).
-- **Depends on.** C3 (the shared writer).
+- **Blocked by.** C3 (the shared writer).
 - **Needs Matthew's yes:** the install, and the supervised MacBook session.
 
 ### C5. Retire `install.sh` (step 6)
@@ -179,7 +197,7 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
 - **Risk.** Low.
 - **Tests.** The bootstrap in a temp HOME; a statusline path assertion.
 - **Rollback.** `git revert`.
-- **Depends on.** C1.
+- **Blocked by.** C1.
 - **Needs Matthew's yes:** a public-repo change (the old installer goes away).
 
 ### C6. SemVer source of truth and the release process (step 6)
@@ -205,7 +223,7 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
   - The CHANGELOG check on fixture diffs.
   - The release notes extraction.
 - **Rollback.** `git revert`. A published tag stays published, so publish deliberately.
-- **Depends on.** C1 (installer), E0 (CI).
+- **Blocked by.** C1 (installer), E0 (CI).
 - **Needs Matthew's yes:** the first public tag and GitHub Release (v0.9.0 at stop 2b of plan
   115).
 
@@ -233,7 +251,7 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
   - The tarball install in a temp HOME.
   - `brew audit --strict` on the formula, in CI on macOS.
 - **Rollback.** Reinstall. Uninstall never touches state without `--purge`.
-- **Depends on.** C6, A4 (paths final), C3 (hooks uninstall).
+- **Blocked by.** C6, A4 (paths final), C3 (hooks uninstall).
 - **Needs Matthew's yes:** creating the tap repo (public), and the v1.0 tag.
 
 ## Size summary
@@ -247,7 +265,24 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
 | C5 | 4 | Fable |
 | C6 | 3 | this plan (part of the reviewer's 10) |
 | C7 | 5 | this plan (part of the reviewer's 10) |
-| **Total** | **44** (+1 supervised) | |
+| **Total** | **44** (+1 supervised) | unchanged by the revision |
+
+## Execution and acceptance criteria
+
+- **Execution.** Run per phase under the orchestrator: C3 at step 2, C2 and C1 at step 3
+  (both before plan 116's A2), C4-C6 at step 6, C7 at step 10. Never flip this plan to
+  `pending` as a whole. The frontmatter `blocked-by: [115]` is a guard (115 stays `split`).
+- [ ] C3: a malformed, non-object or empty `settings.json` is refused and left byte-identical;
+  kill -9 mid-write leaves the original intact; uninstall removes only cctrl's entries.
+- [ ] C2: `release rollback` round-trips; prune never removes the rollback target; the layout
+  guard refuses a layout-1 target once the marker says 2; a release declares
+  `layout_max: 2` only with A0's resolver rule.
+- [ ] C1: installs refuse a dirty tree, the wrong branch, an unpushed HEAD and a concurrent
+  install; both bash legs run; the launcher comes from the release.
+- [ ] C4: doctor flags stale Codex paths and a broken or raising guard; the MacBook's stale
+  hooks are gone.
+- [ ] C5-C7: the bootstrap, `--version`, CHANGELOG check, tarball, formula audit and
+  `cctrl uninstall` (state kept unless `--purge`) all pass in a temp HOME.
 
 ## Out of scope
 

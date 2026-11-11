@@ -2,13 +2,13 @@
 id: 118
 title: Overhaul O3/O4 - gate and log say, caller checks on roles, doorbell and mail, sealed role grants
 status: blocked
-blocked-by: []
+blocked-by: [115]
 priority: 13
 allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-11-11
-approval: "mdec-1111-fable-findings-plans: PLAN ONLY. Waits for Matthew's prioritisation from plan 115. Installs, the hook-rule settings changes, --regrant-live on each Mac and every enforce flip each need their own yes."
+approval: "Operator approval on record (plan-only grant): PLAN ONLY. Run per phase under the orchestrator; never flip this plan to pending as a whole. Waits for Matthew's prioritisation from plan 115. Installs, the hook-rule settings changes, --regrant-live on each Mac and every enforce flip each need their own yes."
 approved-by: pending (Matthew, via plan 115)
 reviews: []
 related: 115, 116, 119, 120, 121, 122, 077, 108, 110, 111, 114
@@ -20,6 +20,10 @@ Umbrella: plan 115. This plan merges the two drafts `plan-audit-opt3-say-gate.md
 - **MF-M6:** the operator class was reachable through a detached tmux or `script`.
 - **MF-M7:** the design must use plan 116's resolver paths and plan 120's interface list.
 - **SH-S15:** sizes rescaled to 40 h and 35 h.
+- **The plan 115 review (second round):** MUST-FIX 1 (the classifier uses `proc_pidpath` and a
+  tty rule, the `open … .command` residual is named, iTerm2 and SSH are handled, and the
+  `operator-tty` grant path gets an out-of-band confirmation), S3 (no A2 dependency), S4
+  (`--operator` parsed in O3.1) and S14 (grants after a power cycle).
 
 It is written against the post-plan-116 layout. Baseline is `main` at `8c249fc`, where option
 2 is in (an unknown attestation mode fails closed) and option 1 is in (the kill guard).
@@ -49,16 +53,31 @@ It is written against the post-plan-116 layout. Baseline is `main` at `8c249fc`,
   This plan does three things within that limit:
   - makes the sanctioned path the only clean one;
   - logs every privileged act in sealed logs;
-  - raises role forgery from "edit one JSON field" to "read the key or drive Terminal.app".
-- **Accepted residual risk (stated in SECURITY.md by plan 122's D2):**
-  - (1) an agent that drives Terminal.app through osascript or Automation gets a login-rooted
-    tty. O3.1 checks on the MacBook, in a supervised session, whether that needs a consent
-    prompt;
-  - (2) reading the seal key or editing state files directly. A hook rule narrows this but
-    only matches command text;
-  - (3) a prompt-injected fleet manager has the FM's rights;
-  - (4) raw `tmux send-keys`/`paste-buffer` and the native socket bypass `say` entirely, so
+  - raises role forgery from "edit one JSON field" to "read the key, or open a real Terminal
+    window and pass an out-of-band confirmation" (see below).
+- **Accepted residual risk (stated in SECURITY.md by plan 122's D2), revised for the plan 115
+  review's MUST-FIX 1:**
+  - (1) **Any agent can open a genuine login-rooted Terminal window.** `open -a Terminal
+    x.command` (or `open x.command`, or a `.terminal` file) runs a file the agent wrote in a
+    new Terminal window under a real `login`. The process chain is genuine, so no ancestry
+    check, including the `proc_pidpath` walk below, can tell it from Matthew typing. It
+    needs no Automation/TCC consent. This is a one-call barrier, not "drive Terminal.app".
+    The class check alone is therefore **not** a barrier against a hostile agent. The
+    barrier for the grant set is the out-of-band confirmation (Q10 in plan 115, built in
+    O4.1): an agent in a fresh `.command` window has no sudo ticket, no password and no
+    finger on Touch ID.
+  - (2) An agent that drives Terminal.app or iTerm2 through osascript or System Events can
+    also type into an existing window. That needs an Automation consent prompt the first
+    time (to be confirmed by O3.1's supervised check), and the out-of-band confirmation
+    still stops it unless the window already holds a sudo ticket (the confirmation runs
+    `sudo -k` first, so it never reuses one).
+  - (3) Reading the seal key or editing state files directly. A hook rule narrows this but
+    only matches command text.
+  - (4) A prompt-injected fleet manager has the FM's rights.
+  - (5) Raw `tmux send-keys`/`paste-buffer` and the native socket bypass `say` entirely, so
     the sanctioned path is made the visible one.
+  - Without the out-of-band confirmation (if Q10 rejects it), (1) means `operator-tty` is a
+    label for honest callers only, and SECURITY.md says so in those words.
 
 ## Design
 
@@ -76,7 +95,7 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
 | `worker` | level session, role worker or none |
 | `agent-unattested` | an agent is on the ancestor chain, but the walk is not level session |
 | `app-claimed` | no pane, and `CODEX_THREAD_ID`/`CODEX_SESSION_ID` is set |
-| `operator-tty` | no agent ancestor; stdin and stderr are TTYs; no `SSH_CONNECTION`; **the ancestor walk reaches a login root** (the Terminal.app or iTerm2 executable, or `login` under one), with no tmux server process and no `script` on the chain |
+| `operator-tty` | no agent ancestor; stdin and stderr are TTYs; no `SSH_CONNECTION`; **the `proc_pidpath` walk reaches a login root**: a `/usr/bin/login` process whose parent's real executable is the Terminal.app binary, and the caller's controlling tty **is that `login`'s tty** (so no pty creator of any kind sits between the window and the caller) |
 | `operator-flag` | no agent ancestor, and `--operator` given |
 | `script` | no agent ancestor, and none of the above; this includes every pane of a daemonised tmux server and every reparented (`ppid 1`) process, TTY or not |
 | `remote` | arrived over SSH from the other Mac with `CCTRL_ORIGIN_ATTEST` claims |
@@ -89,11 +108,40 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
 
   Matthew's own plain tmux shells also classify as `script`. He uses a plain Terminal tab, or
   `--operator` for the operations that allow it.
-- **The login roots are hard-coded.** They are matched by absolute executable path from
-  `/bin/ps -o comm=` and are not configurable. A test-mode-only override exists for the
-  harness, gated as in plan 119's O5.
-- **Agent ancestor.** A comm basename of `claude` or `codex`, or
-  `$CLAUDE_SESSIONS_DIR/<pid>.json` exists for it. It uses one `/bin/ps -axo pid=,ppid=,comm=`
+- **Executables come from `proc_pidpath`, never from `ps comm` or argv[0]** (plan 115 review,
+  MUST-FIX 1). On macOS `ps -o comm=` reports argv[0], which any process can set with
+  `exec -a`; the reviewer reproduced a `/bin/sleep` that `ps` reported as the Terminal binary.
+  - The walk takes pid and ppid from one `/bin/ps -axo pid=,ppid=,tty=` snapshot (the kernel
+    sets those; a process cannot forge them), and resolves **every** chain element's real
+    executable with `proc_pidpath()` from libproc, through `ctypes` (stdlib only).
+  - A pid that exits mid-walk, or whose `proc_pidpath` fails, ends the walk as `script`.
+  - Optional hardening, decided at build time: check that the root binary is the
+    Apple-signed platform Terminal (`codesign --verify -R 'anchor apple'`, cached per pid
+    and start time). It is cheap insurance against a copied, re-signed binary, but it does
+    not touch the `open` residual.
+- **The tty rule replaces the name list of pty creators.** The draft denied `script` and tmux
+  by name, and the review showed that other pty creators (Python `pty.fork`, `expect`,
+  `screen`, any small C stub) were not named. The rule is now positive: the caller's
+  controlling tty must equal the tty of the `login` process found under the root. Any pty
+  created below the window gives a different tty and the class is `script`.
+- **The login roots are hard-coded.** Terminal.app's binary path and `/usr/bin/login`, both
+  matched by `proc_pidpath`, not configurable. A test-mode-only override exists for the
+  harness, gated by plan 116's test-mode gate (A0), and the override can only name binaries
+  inside the test sandbox.
+- **iTerm2 is unverified, so it is not a login root yet.** With session restoration on,
+  iTerm2 runs shells under `iTermServer` helper processes that are probably daemonised
+  (ppid 1), and the helper binary is copied into a user-writable Application Support
+  directory. Until O3.1's supervised check records the real chain on the MacBook (with and
+  without session restoration), iTerm2 shells classify as `script`, and Matthew uses a
+  Terminal.app window for grant acts. If the check shows a stable chain whose root is the
+  signed iTerm2 app binary under `/Applications`, a follow-up adds it with the same tty
+  rule.
+- **Over SSH Matthew is never `operator-tty`.** `SSH_CONNECTION` set means `script` (or
+  `operator-flag` with `--operator`). So grant-set acts on one Mac cannot be done from the
+  other over SSH; Matthew must be at that Mac's screen, or in Screen Sharing to a Terminal
+  window on it. Plan 115 Q10 states this.
+- **Agent ancestor.** A real executable (by `proc_pidpath`) whose basename is `claude` or
+  `codex`, or `$CLAUDE_SESSIONS_DIR/<pid>.json` exists for it. It uses the same single
   snapshot, and the walk is capped at 16 levels.
 - **Env markers** (`CLAUDECODE`, `CODEX_THREAD_ID`, `CCTRL_PEER`) may only lower a class,
   never raise one (plan 111 rule).
@@ -114,9 +162,26 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
   - `set-role --regrant-live`.
 
   Allowed **only** for `fleet-manager` with a good grant (plus handover rules) and for
-  `operator-tty`. **Never** for `operator-flag`, `script`, `remote` or `app-claimed`.
-  Remote grant acts are refused, because origin claims can be forged by raw ssh. This is the
-  MF-M6 fix for options 3/4.
+  `operator-tty` **with the out-of-band confirmation below**. **Never** for `operator-flag`,
+  `script`, `remote` or `app-claimed`. Remote grant acts are refused, because origin claims
+  can be forged by raw ssh. This is the MF-M6 fix for options 3/4.
+- **Out-of-band confirmation on the `operator-tty` grant path** (recommended in plan 115 Q10;
+  built in O4.1):
+  - Before a grant-set act by `operator-tty`, cctrl runs `sudo -k` and then `sudo -v` on the
+    caller's tty. `sudo -v` only validates credentials: **no command runs as root**. With
+    `pam_tid` enabled in `/etc/pam.d/sudo_local`, the prompt is Touch ID; otherwise the
+    login password.
+  - An agent in a fresh `open … .command` window has no password and no finger, and `sudo -k`
+    removes any ticket an existing window held.
+  - If `sudo -k; sudo -n -v` succeeds (a NOPASSWD rule), the confirmation is unavailable.
+    cctrl says so, logs `confirm: unavailable`, and treats it as failed in enforce.
+  - The FM-with-grant path needs no confirmation, so normal fleet operation is unchanged.
+    Only Matthew's own grant acts (`--regrant-live`, starting an orchestrator himself,
+    doorbell edits by hand) prompt.
+  - Logged in `admin.jsonl` as `confirm: ok | failed | unavailable`. In warn a failure is
+    logged `would-refuse` and the act proceeds; in enforce it is refused with exit 77.
+  - If Q10 rejects the confirmation, the row stays `operator-tty` alone and SECURITY.md
+    states residual (1) without a barrier.
 - **Operator-flag set** (allowed for `operator-flag` as well as FM and `operator-tty`):
   - `say`;
   - `set-role X worker`, and clearing a non-orchestrator;
@@ -145,11 +210,11 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
 - One line, pasted before the body in the same `load-buffer`/`paste-buffer -p -r`:
   `[cctrl say] from: <who> · <how> · id: say_<UTC>_<6hex>`.
 - Examples:
-  - `from: TMUX--ms--fm-orchestrator (fleet-manager) · verified session`
-  - `from: operator · terminal on ms`
-  - `from: operator · --operator, no terminal on ms`
-  - `from: unverified caller (worker TMUX--ms--x) · warn mode`
-  - `from: TMUX--mbp--fm (fleet-manager) · remote from mbp, claims not verified here`
+  - `from: TMUX--hostA--fm (fleet-manager) · verified session`
+  - `from: operator · terminal on hostA`
+  - `from: operator · --operator, no terminal on hostA`
+  - `from: unverified caller (worker TMUX--hostA--w1) · warn mode`
+  - `from: TMUX--hostB--fm (fleet-manager) · remote from hostB, claims not verified here`
 - Every field is a validated name or a fixed word. C0 characters are stripped and the line is
   capped at 240 characters. warn and off carry no "untrusted" wording (plan 111 §3).
 - **Raw exemption:** a one-line body starting with `/`, and `--raw` bodies, are sent without
@@ -231,6 +296,20 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
   anyone else leaves `missing`.
 - **Migration.** On each Mac, Matthew runs `cctrl session set-role --regrant-live --dry-run`
   in Terminal, reads the list, then runs it for real. Roles nobody vouches for stay `missing`.
+- **After a power cycle or reboot (plan 115 review S14).** Every pane anchor changes, so every
+  grant reads `stale`, **including the new FM's own**. Doctrine has the new FM run the
+  restore, but an FM with a stale grant cannot issue grants, and the FM is normally not
+  started from a plain Terminal tab. So after each power cycle every orchestrator is
+  `missing`/`stale` until Matthew runs `--regrant-live` (with the confirmation) at that Mac's
+  screen. Under `attestation` enforce, orchestrator mail is not push-eligible until then;
+  in warn nothing changes except the doctor row. Plan 115 Q10 offers a re-anchor option,
+  decided before O4.2 is built: `session restore` re-anchors a grant only when its mac
+  verifies, its agent session id matches the pre-restore snapshot entry, **and its old pane
+  anchor predates the current boot time** (`kern.boottime`), so only panes that really died
+  with the reboot qualify. Each re-anchor is logged in `admin.jsonl` as `re-anchored` and
+  mailed to the FM like any grant notice. If chosen, it is built in O4.2 (inside its 13 h,
+  replacing the "restore by the FM issues grants" path for this case) with tests for each of
+  the three conditions.
 
 ### Modes
 
@@ -267,33 +346,60 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
 All in warn. Each phase is installed separately. Sizes are the option drafts' phases
 rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
 
-### O3.1. Classifier, say gate in warn, `say.jsonl` (step 5)
+### O3.1. Classifier, say gate in warn, `say.jsonl`, `--operator` parsed (step 5)
 
 - **Scope.**
-  - `lib/caller_class.py` with the MF-M6 login-root rule.
+  - `lib/caller_class.py` with the MF-M6 login-root rule as revised above: `proc_pidpath`
+    for every chain element, the tty-equality rule, Terminal.app only (iTerm2 pending the
+    check below).
   - The gate inside `_session_say`, so all three entry points are covered.
   - The `say_gate` mode, `say.jsonl` with seal and rotation, and the doctor rows.
-  - A supervised MacBook check of whether osascript from a fleet pane can drive Terminal
-    without a consent prompt (result goes into SECURITY.md).
-- **Closes.** H1 (logging and the decision point), M5 (part), MF-M6, MF-M7.
-- **Size.** 18 h (12 rescaled from the draft's 8, plus 6 for MF-M6).
+  - **`--operator` is parsed here** and logged as the class `operator-flag` (plan 115 review
+    S4). It is used in step 5 by O4.1's tests and in step 6 by A3's plist, so it must exist
+    before them. O3.3 only adds the enforce refusals.
+  - **A supervised check on the MacBook, in Terminal.app and in iTerm2** (result goes into
+    SECURITY.md and decides the iTerm2 row):
+    - `open -a Terminal x.command` and `open x.command` from a fleet pane: record the chain
+      and the class (expected: `operator-tty`, which is the stated residual);
+    - osascript/System Events driving Terminal and iTerm2 from a fleet pane: is there a
+      consent prompt?
+    - a plain iTerm2 tab with and without session restoration: record the real chain
+      (`iTermServer`, its ppid and its `proc_pidpath`).
+- **Closes.** H1 (logging and the decision point), M5 (part), MF-M6, MF-M7, plan 115 review
+  MUST-FIX 1 (classifier half; O4.1 has the confirmation half), S4.
+- **Size.** 22 h (12 rescaled from the draft's 8, plus 6 for MF-M6, plus 3 for the
+  `proc_pidpath` walk, the tty rule and their tests, plus 1 moved from O3.3 for
+  `--operator`).
 - **Risk.** Low. warn only; adds about 0.3 s per say.
 - **Tests.**
   - Every class. A real pty under `script -q /dev/null` with **no** login root gives
     `script`.
   - **A detached tmux on a private socket running cctrl gives `script`; a double-forked
     `script` gives `script`** (the MF-M6 cases).
+  - **argv[0] spoof:** a double-forked stub run with `exec -a <Terminal binary path>` (ppid
+    1), with a pty under it and cctrl inside, gives `script`; `ps comm` shows the Terminal
+    path and the classifier still says `script`.
+  - **Other pty creators:** Python `pty.fork` under a reparented stub gives `script`; a pty
+    opened below a genuine (test-mode) login root also gives `script` by the tty rule.
+  - `login` is matched by `proc_pidpath` (`/usr/bin/login`), not by the bare `ps` name.
+  - A pid that exits mid-walk gives `script`.
   - A login-rooted chain via the test-mode root override gives `operator-tty`. The override
-    is ignored outside test mode.
-  - An env override caps the class. `--operator` inside an agent's chain is still `agent`.
+    is ignored outside test mode, and cannot name a binary outside the sandbox.
+  - `SSH_CONNECTION` set gives `script` even under a login root.
+  - An env override caps the class. `--operator` inside an agent's chain is still `agent`;
+    `--operator` with no agent ancestor is `operator-flag`.
   - The log: one line per attempt, no body bytes (canary body), 0600/0700, the mac verifies,
     a tampered line fails, a missing key writes the line unsealed, rotation under
     concurrency.
   - Performance at most 0.4 s per say.
 - **Rollback.** `say_gate: off` (logging continues), or the previous release.
-- **Depends on.** Plan 116's A0 (`audit_dir`, `paths.py`), A1 (lock helper) and A2 (final
-  paths); plan 121's E4 (its expected-failure cases flip to passing).
-- **Needs Matthew's yes:** the install on each Mac, and the supervised MacBook osascript check.
+- **Blocked by.** Plan 116's A0 (`audit_dir`, `paths.py`, the test-mode gate) and A1 (lock
+  helper). **Not A2** (plan 115 review S3): the classifier, `say.jsonl` and the caller gates
+  use the state root's `audit/`, which exists before the move. Only the O3.5/O4.4 hook rules
+  need post-A2 paths. Plan 121's E4 should land first (its expected-failure cases flip to
+  passing).
+- **Needs Matthew's yes:** the install on each Mac, and the supervised check on the MacBook
+  (Terminal.app and iTerm2).
 
 ### O3.2. Provenance line, raw exemptions, `say-verify` (step 5)
 
@@ -315,29 +421,36 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   - `say-verify`: found, unknown, bad mac, target mismatch.
 - **Rollback.** `say_gate: off` removes the line without an uninstall; or the previous
   release.
-- **Depends on.** O3.1.
+- **Blocked by.** O3.1.
 - **Needs Matthew's yes:**
   - the install on each Mac;
   - the skills and APPROVALS wording change, which reaches every new worker;
-  - the homelab copies (Paperclip runbook, homelab plan 219, `runner-brief.md`) changed by
-    the homelab orchestrator in the same window.
+  - any external runbooks or briefs outside this repo that paste follow-ups or call
+    `session say` (for example an external launchd job), updated by their owners in the
+    same window.
 
 ### O4.1. Caller checks on roles, start and doorbell; `admin.jsonl` (step 5)
 
 - **Scope.** Gates on set-role, `start --role orchestrator`, the second-FM override and the
   doorbell mutators, with the MF-M6 table. The `caller_checks` mode, `admin.jsonl` and the
   doctor row. The enforce code path is built; the live mode stays warn.
-- **Closes.** H2 (CLI half).
-- **Size.** 10 h.
+  - **The out-of-band confirmation** (`sudo -k; sudo -v`, Touch ID where enabled) on the
+    `operator-tty` grant path, as designed above, if plan 115 Q10 accepts it.
+- **Closes.** H2 (CLI half); plan 115 review MUST-FIX 1 (confirmation half).
+- **Size.** 12 h (10 rescaled from the draft's 7, plus 2 for the confirmation).
 - **Risk.** Low (warn).
 - **Tests.**
   - Each table row × class, in warn and in enforce (exit 77, nothing written).
   - A worker self-promoting is refused in enforce.
   - `--orch-kind fleet` only for the `succeeds` session or `operator-tty`.
-  - `operator-flag` is refused for the grant set.
+  - `operator-flag` is refused for the grant set (`--operator` exists since O3.1).
   - Doorbell `move` by either FM at handover.
+  - The confirmation, with a stubbed `sudo` on a test-mode PATH: ok proceeds; failed is
+    `would-refuse` in warn and exit 77 in enforce; a NOPASSWD stub (`sudo -n -v` succeeds
+    after `-k`) reads `unavailable`; `sudo -k` is always called first; the FM-with-grant
+    path never prompts. The stub is honoured only in test mode.
 - **Rollback.** `caller_checks: off`, or the previous release.
-- **Depends on.** O3.1.
+- **Blocked by.** O3.1.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### O4.2. Sealed role grants and `--regrant-live` (step 5)
@@ -357,9 +470,12 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   - Plan 111 eligibility under enforce needs `ok`.
   - Restore by the FM issues grants.
 - **Rollback.** The previous release. Grants are extra record fields that old code ignores.
-- **Depends on.** O4.1.
+- **Blocked by.** O4.1.
 - **Needs Matthew's yes:** the install on each Mac; then **Matthew runs `--regrant-live`
-  himself in Terminal on each Mac**, after reading the dry run.
+  himself in a Terminal.app window at each Mac's screen** (not over SSH, and not in iTerm2
+  until O3.1's check clears it), after reading the dry run. **He must do this again after
+  every power cycle or reboot of a Mac**, because every grant goes `stale` (S14), unless the
+  Q10 re-anchor option is chosen.
 
 ### O4.3. Mailbox binding and gc limits (step 5)
 
@@ -378,20 +494,21 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
     unchanged.
   - gc rows per class; `--dry-run` is open.
 - **Rollback.** `caller_checks: off`, or the previous release.
-- **Depends on.** O4.1.
+- **Blocked by.** O4.1.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### O3.3. Say-gate enforce code path (step 7)
 
-- **Scope.** The refusal table, exit 77, `--operator`, the Codex app opt-in, and the
-  `--force-busy` limit. The live mode stays warn.
+- **Scope.** The refusal table, exit 77, the enforce refusals for `--operator` (the flag
+  itself is parsed since O3.1), the Codex app opt-in, and the `--force-busy` limit. The live
+  mode stays warn.
 - **Closes.** H1 (enforce readiness).
-- **Size.** 8 h.
+- **Size.** 7 h (8 rescaled, minus 1 moved to O3.1).
 - **Risk.** Low (code only).
 - **Tests.** The enforce table row by row; an unknown mode is treated as enforce; the JSON
   shape.
 - **Rollback.** The previous release.
-- **Depends on.** O3.2.
+- **Blocked by.** O3.2.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### O3.4. Remote say (step 7)
@@ -404,7 +521,7 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
 - **Tests.** A stubbed ssh (plan 121's E8 harness): claims carried, an old receiver ignores
   them, a forged-claims fixture is logged as `remote`, and a remote grant act is refused.
 - **Rollback.** The previous release.
-- **Depends on.** O3.3.
+- **Blocked by.** O3.3.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ### O3.5 and O4.4. Hook rules, docs and skills (step 7)
@@ -417,6 +534,8 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
     into another session).
   - Skills:
     - `cctrl-fleet-manager`: handover and restore issue grants; who runs `doorbell move`;
+      the restore runbook says that after a power cycle every grant is `stale` and Matthew
+      runs `--regrant-live` at each Mac's screen (or the Q10 re-anchor applies);
     - `cctrl-repo-orchestrator`: ask the FM for role and doorbell changes;
     - `cctrl-spawn`: only the FM or Matthew starts orchestrators; exit 77.
   - Plan 111's out-of-scope and Risks lines.
@@ -428,7 +547,7 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
     repo symlink, a release symlink and the state dir.
   - The hook fails open on bad input and when python3 is missing.
 - **Rollback.** `cctrl hooks install` from the previous release; plan 117's C3 backup.
-- **Depends on.** O3.4 and O4.3; plan 117's C3 (settings writer).
+- **Blocked by.** O3.4 and O4.3; plan 117's C3 (settings writer).
 - **Needs Matthew's yes:** the install, **and the change to `~/.claude/settings.json` and
   Codex `hooks.json` on each Mac**.
 
@@ -438,7 +557,8 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
 - **Each needs:**
   - one week in warn with zero unexplained `would-refuse` in doctor;
   - the skills changes live;
-  - the homelab Paperclip runner on `--operator` or on the mailbox only;
+  - every external script that calls `session say` (for example an external launchd job)
+    moved to `--operator` or to the mailbox only;
   - for `attestation`, every live orchestrator at `role_grant: ok`.
 - **Rollback:** set the key back to `warn` (a hand edit).
 - **Needs Matthew's yes:** each flip, separately.
@@ -447,16 +567,35 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
 
 | Phase | h | Source |
 |---|---|---|
-| O3.1 | 18 | draft 8 → reviewer scale 12, + 6 for MF-M6 |
+| O3.1 | 22 | draft 8 → reviewer scale 12, + 6 for MF-M6, + 3 for `proc_pidpath`/tty rule (plan 115 review MUST-FIX 1), + 1 from O3.3 (`--operator`, S4) |
 | O3.2 | 9 | draft 6 → reviewer scale |
-| O3.3 | 8 | draft 5 → reviewer scale |
+| O3.3 | 7 | draft 5 → reviewer scale 8, − 1 to O3.1 |
 | O3.4 | 6 | draft 4 → reviewer scale |
 | O3.5 | 5 | draft 3 → reviewer scale |
-| O4.1 | 10 | draft 7 → reviewer scale |
+| O4.1 | 12 | draft 7 → reviewer scale 10, + 2 for the out-of-band confirmation |
 | O4.2 | 13 | draft 9 → reviewer scale |
 | O4.3 | 9 | draft 6 → reviewer scale |
 | O4.4 | 3 | draft 2 → reviewer scale |
-| **Total** | **81** | reviewer 40 + 35, plus 6 |
+| **Total** | **86** | reviewer 40 + 35, plus 6 (MF-M6), plus 5 (this revision) |
+
+## Execution and acceptance criteria
+
+- **Execution.** Run per phase under the orchestrator, in the order and with the "Blocked by"
+  lines above. Never flip this plan to `pending` as a whole: `mstack-run` would then run every
+  phase, including the settings changes, in one go. The frontmatter `blocked-by: [115]` is a
+  guard (115 stays `split`).
+- [ ] The classifier resolves every chain element with `proc_pidpath`; the argv[0]-spoof,
+  `pty.fork`, detached-tmux and double-forked `script` tests all give `script`.
+- [ ] `--operator` parses and logs `operator-flag` from O3.1 on.
+- [ ] Every grant-set act by `operator-tty` runs the confirmation (if Q10 accepts it), and its
+  result is in `admin.jsonl`.
+- [ ] Every table row × class has a warn and an enforce test (exit 77, nothing written).
+- [ ] `say.jsonl` and `admin.jsonl` never hold a body, are 0600 in a 0700 dir, verify, and
+  rotate under the A1 lock.
+- [ ] The supervised check's results (`open … .command`, osascript, iTerm2 chain) are written
+  into SECURITY.md (plan 122's D2), and the iTerm2 row is decided from them.
+- [ ] The hook rules match after A2 through every symlink form.
+- [ ] No enforce flip happens inside this plan; each is its own yes.
 
 ## Interfaces frozen for plan 120 (MF-M7)
 
@@ -477,7 +616,7 @@ verification. Its differential test covers the classifier.
 - Caller checks on `session close/kill/rename/reconcile-names` and `peer register/unregister`
   of other sessions (opt4 Q4, audit L5): a later plan.
 - A logged `session key` command (plan 042).
-- Out-of-band confirmation (password or Touch ID) for the grant set, unless plan 115 Q10 says
-  otherwise.
+- Out-of-band confirmation for the FM-with-grant path, and for the operator-flag set
+  (`say`, worker roles, acked gc). Only the `operator-tty` grant path prompts.
 - Pane targeting and paste verification (plan 119), and envelope hardening for mailbox
   messages (plan 119).

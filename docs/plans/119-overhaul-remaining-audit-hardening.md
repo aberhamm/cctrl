@@ -2,13 +2,13 @@
 id: 119
 title: Overhaul O5-O12 - envelope, timestamps and env overrides, pane targeting, approvals check, ring cap, names, remote hosts
 status: blocked
-blocked-by: []
+blocked-by: [115]
 priority: 14
 allows-migrations: false
 needs-review: eng
 review-required: eng
 created: 2026-11-11
-approval: "mdec-1111-fable-findings-plans: PLAN ONLY. Waits for Matthew's prioritisation from plan 115. Every install needs its own yes; O7 also changes skills text."
+approval: "Operator approval on record (plan-only grant): PLAN ONLY. Run per phase under the orchestrator; never flip this plan to pending as a whole. Waits for Matthew's prioritisation from plan 115. Every install needs its own yes; O7 also changes skills text."
 approved-by: pending (Matthew, via plan 115)
 reviews: []
 related: 115, 116, 118, 120, 121, 024, 028, 029, 034, 039, 040, 041, 096, 110, 111
@@ -33,6 +33,11 @@ Umbrella: plan 115.
 All sizes here are **this plan's estimates** (marked P in plan 115); the reviewer did not
 size these. Baseline is `main` at `8c249fc`.
 
+**Phase ids.** O5-O7 follow the audit's option numbers. **O12 is not an audit option** (the
+audit has options 1-11, and option 11, "accept the risk", is rejected in plan 115). O12 is
+this plan's name for the leftover items M6, M7, M11 and L4; O8-O11 are not used here because
+options 8-10 map to plans 117, 116 and 120.
+
 ## O5. Envelope hardening and test-mode-only overrides (step 5)
 
 - **Scope.**
@@ -53,14 +58,17 @@ size these. Baseline is `main` at `8c249fc`.
       escapes.
     - `--json` output is unchanged (it is already escaped).
   - **M4.** `_peer_now_utc` honours `CCTRL_NOW_UTC` only in test mode.
-  - **M5 and SH-S6.** One test-mode gate, `_cctrl_test_mode`, true only when the harness sets
-    a marker that agents cannot reach by env alone. The gate is:
-    - `CCTRL_TEST_MODE=1`, **and**
-    - `CCTRL_DATA_DIR` under a directory holding the harness's `.cctrl-test-sandbox` file,
-      which the harness creates in its own `mktemp -d`.
+  - **M5 and SH-S6.** One test-mode gate, `_cctrl_test_mode`. **It now ships in plan 116's
+    A0** (review S10), so A1's fault-injection variable is gated from its first release. The
+    property it guarantees is not "a marker agents cannot reach" (an agent can make its own
+    sandbox): it is that overrides only take effect when **every** state path, and the seal
+    key path, resolves inside one sandbox holding `.cctrl-test-sandbox`, and test mode
+    refuses the live seal key. A sandbox with no live store and no live key cannot mint
+    anything the live store would accept. O5 wires the remaining users to that gate.
 
     Outside test mode, the attest path ignores `CCTRL_NOW_UTC`, the fault-injection variables
-    (plan 116), plan 120's B4 tool-path override and the login-root override (plan 118), and
+    (plan 116), plan 120's B4 tool-path override, the login-root override and the `sudo`
+    stub (plan 118), and
     records `env_override` when `CCTRL_SESSION_METADATA_DIR`, `TMUX_TMPDIR` or
     `CCTRL_TMUX_EXTRA_SERVERS` differ from the resolver defaults. The class cap itself is in
     plan 118.
@@ -69,18 +77,19 @@ size these. Baseline is `main` at `8c249fc`.
     handoff, item 2).
 - **Closes.** M3, M4, M5 (the env half; plan 118 does the tool-path half), SH-S6 (the gate
   that B4 reuses).
-- **Size.** 8 h (P).
+- **Size.** 7 h (P; was 8, with 1 h moved to plan 116's A0 with the gate).
 - **Risk.** Low. The human output format changes; scripts use `--json`.
 - **Tests.**
   - Hostile subjects are refused: LF, CR, ESC, NUL, a forged header.
-  - A body containing a fake `[cctrl peer message] from: fleet-claude · verified` line and a
+  - A body containing a fake `[cctrl peer message] from: peer-x · verified` line and a
     fake fence renders inside the real fence.
   - Display stripping on the human paths.
   - `CCTRL_NOW_UTC` is ignored outside test mode, and the name-recycle guard holds.
-  - The test-mode gate needs both parts.
+  - Every override listed above is ignored outside test mode (the gate's own tests are in
+    plan 116's A0).
   - Plan 121's E4 expected failures for M3 and M4 flip to passing.
 - **Rollback.** The previous release. Stored messages are unchanged.
-- **Depends on.** Plan 116's A0 (the sandbox marker path). Plan 121's E4 should land first.
+- **Blocked by.** Plan 116's A0 (the test-mode gate). Plan 121's E4 should land first.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ## O6a. Pane-id targeting (step 5)
@@ -105,7 +114,7 @@ size these. Baseline is `main` at `8c249fc`.
   - A pane that dies between the check and the paste, which fails cleanly.
   - All existing delivery tests unchanged.
 - **Rollback.** The previous release.
-- **Depends on.** O3.1 (so say is logged when the targeting changes). Independent of plan
+- **Blocked by.** O3.1 (so say is logged when the targeting changes). Independent of plan
   120.
 - **Needs Matthew's yes:** the install on each Mac.
 
@@ -133,7 +142,7 @@ size these. Baseline is `main` at `8c249fc`.
   - Pane fixtures replayed through both detectors.
   - A differential test against the sh path for the non-modal cases.
 - **Rollback.** `peer_impl: sh` in `config.local.json`, or the previous release.
-- **Depends on.** Plan 120's B6, plan 121's E10, and O6a.
+- **Blocked by.** Plan 120's B6, plan 121's E10, and O6a.
 - **Needs Matthew's yes:** the install on each Mac.
 
 ## O7. `cctrl approvals check` and a corrected APPROVALS block (step 6; audit option 7)
@@ -157,14 +166,16 @@ size these. Baseline is `main` at `8c249fc`.
     - a "narrowing" follow-up still needs an id.
   - **Authenticity** (a writer agents cannot imitate) is out of scope, as the audit says.
 - **Closes.** M8 (window, revocation, epoch and time errors).
-- **Size.** 8 h (P; includes the 3 h for E6's command tests).
+- **Size.** 8 h (P). It includes the command's own parser and property tests. Plan 121's E6
+  (3 h) is separate: the doc-lint that the skills' block matches the command. No double
+  count.
 - **Risk.** Low. Read-only.
 - **Tests.**
   - Parser unit and property tests: long records, an adjacent record not bled into, a
     revocation later in the file, expiry at the boundary, a malformed record, the epoch.
   - A doc-lint test that the skills' block matches the command's usage (plan 121's E6).
 - **Rollback.** `git revert`. The skills fall back to the recipe.
-- **Depends on.** Nothing.
+- **Blocked by.** Nothing.
 - **Needs Matthew's yes:** the install on each Mac, and the skills text change (it reaches
   every new worker and the fleet manager's doctrine).
 
@@ -185,6 +196,11 @@ size these. Baseline is `main` at `8c249fc`.
       output.
     - Replies to a recycled name warn when the occupant's `created_at` is after the original
       message.
+    - **Deferred, with reason (review S16):** tying the push allowlist to a session's
+      creation time. Allowlist entries carry no time today, so it needs a doorbell.json
+      shape change (a frozen interface) and belongs with stable identity (plans
+      028/029/034). Until then the reply warning above and the doctor row cover recycled
+      names.
   - **M11.**
     - `host add` validates the hostname and user (`^[A-Za-z0-9][A-Za-z0-9._-]*$`, no leading
       `-`), and existing `hosts.json` entries are validated on read (a bad one is skipped
@@ -209,7 +225,7 @@ size these. Baseline is `main` at `8c249fc`.
   - A leading `=` survives zsh on the remote fake.
 - **Rollback.** The previous release. Ring state files are versioned. Old code reads the new
   per-sender file as a missing state and treats it as zero, which is today's behaviour.
-- **Depends on.** Plan 116's A0. E8's fake ssh is useful but not required; a minimal stub is
+- **Blocked by.** Plan 116's A0. E8's fake ssh is useful but not required; a minimal stub is
   enough.
 - **Needs Matthew's yes:** the install on each Mac.
 
@@ -217,12 +233,30 @@ size these. Baseline is `main` at `8c249fc`.
 
 | Phase | h | Step |
 |---|---|---|
-| O5 | 8 | 5 |
+| O5 | 7 | 5 |
 | O6a | 6 | 5 |
 | O12 | 13 | 5 |
 | O7 | 8 | 6 |
 | O6b | 12 | 8 |
-| **Total** | **47** | |
+| **Total** | **46** | was 47; 1 h moved to plan 116's A0 |
+
+## Execution and acceptance criteria
+
+- **Execution.** Run per phase under the orchestrator: O5, O6a and O12 at step 5 (which may
+  start once plan 116's A0 and A1 are done), O7 at step 6, O6b at step 8 after plan 120's B6.
+  Never flip this plan to `pending` as a whole. The frontmatter `blocked-by: [115]` is a
+  guard (115 stays `split`).
+- [ ] O5: hostile subjects are refused; a forged header and fence in a body render inside the
+  real fence; `CCTRL_NOW_UTC` and every other override are ignored outside test mode; plan
+  121's E4 cases for M3 and M4 pass.
+- [ ] O6a: with a split pane, the paste lands only in the agent pane; two agent panes are
+  refused with exit 75.
+- [ ] O6b: a modal raised between check and Enter withholds the Enter; a timed-out client is
+  `unknown`.
+- [ ] O7: `approvals check` parses whole records, honours revocations, expiry and epoch, and
+  the skills' block matches it (E6).
+- [ ] O12: junk senders cannot burn the reserved rings; corrupt ring state reads as cap; a
+  probe timeout refuses; hostile host values are refused and every ssh argv has `--`.
 
 ## Out of scope
 
