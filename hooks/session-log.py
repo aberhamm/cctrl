@@ -17,7 +17,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CCTRL_DIR = Path(__file__).resolve().parent.parent
-SPENDING_LOG = CCTRL_DIR / "costs" / "spending.jsonl"
+# Paths come from the shared resolver (plan 116 A0), imported, never by
+# spawning cctrl. A partial copy of the tree without lib/ keeps the old
+# default, so the hook still fails open.
+os.umask(0o077)
+sys.path.insert(0, str(CCTRL_DIR / "lib"))
+try:
+    import paths  # noqa: E402
+    SPENDING_LOG = Path(paths.resolve(str(CCTRL_DIR))["spending_log"])
+except ImportError:
+    SPENDING_LOG = CCTRL_DIR / "costs" / "spending.jsonl"
 
 
 def sum_session_tokens(session_path):

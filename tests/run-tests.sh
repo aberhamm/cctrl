@@ -25083,6 +25083,614 @@ run_codex_ownership_matrix_paths() {
     done < <(jq -r '.paths[].path' "$fixture")
 }
 
+# --- Plan 116 A0: one path resolver, private modes, config default ---------
+
+# A fixture cctrl tree for the A0 tests: cctrl, lib/, hooks/, share/ and an
+# empty data/ and costs/, with a physical (resolved) path in _A0_TREE.
+_a0_tree() { # dir
+    local dir="$1"
+    rm -rf "$dir"
+    mkdir -p "$dir/lib" "$dir/hooks" "$dir/share" "$dir/data" "$dir/costs" "$dir/plugins"
+    cp "$ROOT/cctrl" "$dir/cctrl"
+    chmod +x "$dir/cctrl"
+    cp -R "$ROOT/lib/." "$dir/lib/"
+    cp -R "$ROOT/hooks/." "$dir/hooks/"
+    cp "$ROOT/share/config.default.json" "$dir/share/config.default.json"
+    _A0_TREE="$(cd -P "$dir" && pwd -P)"
+}
+
+# The shell resolver's key=value output for the tree in $1 under the bash in
+# $2, in a clean environment plus the assignments in $3 (one string).
+_a0_shell_kv() { # root bash "assignments"
+    local root="$1" sh="$2" row="$3"
+    # shellcheck disable=SC2086
+    env -i PATH="$PATH" HOME="$_A0_HOME" $row "$sh" -c \
+        'source "$1"; _cctrl_paths_resolve "$2"; _cctrl_paths_kv; printf "env_runtime_mode=%s\n" "${CCTRL_RUNTIME_MODE-unset}"' \
+        _ "$ROOT/lib/paths.sh" "$root"
+}
+
+_a0_py_kv() { # root "assignments"
+    local root="$1" row="$2"
+    # shellcheck disable=SC2086
+    env -i PATH="$PATH" HOME="$_A0_HOME" $row python3 -c '
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import paths
+p = paths.resolve(sys.argv[2])
+for k in paths.KEYS:
+    print("%s=%s" % (k, p[k]))
+print("env_runtime_mode=%s" % os.environ.get("CCTRL_RUNTIME_MODE", "unset"))
+' "$ROOT/lib" "$root"
+}
+
+_a0_kv_get() { # kv-text key
+    printf '%s\n' "$1" | sed -n "s/^$2=//p"
+}
+
+test_paths_resolver_matrix() {
+    # Plan 116 A0: each override x installed vs checkout x bash 3.2 and 5. The
+    # shell and the Python resolvers must agree on every row, and the rules
+    # the plan names hold (layout rule only in installed mode, CCTRL_DATA_DIR
+    # governs the session family, no env signal for the mode).
+    local base="$TMPDIR/a0-matrix"
+    rm -rf "$base"
+    mkdir -p "$base/home"
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE"
+    _A0_HOME="$(cd -P "$base/home" && pwd -P)"
+    local st
+    for st in l2 l2c l20 l1 mig plain; do mkdir -p "$base/st-$st/data" "$base/st-$st/costs"; done
+    printf '{"layout":2,"moved_at":"2026-11-11T00:00:00Z"}\n' > "$base/st-l2/data/LAYOUT"
+    printf '{ "layout" : 2 }\n' > "$base/st-l2c/costs/LAYOUT"
+    printf '{"layout":20}\n' > "$base/st-l20/data/LAYOUT"
+    printf '{"layout":1}\n' > "$base/st-l1/data/LAYOUT"
+    printf '{"pid":1}\n' > "$base/st-mig/.migrating"
+
+    local -a rows=(
+        ""
+        "CCTRL_DATA_DIR=$base/d"
+        "CCTRL_COSTS_DIR=$base/c"
+        "CCTRL_STATE_DIR=$base/st-plain"
+        "CCTRL_STATE_DIR=relative/state"
+        "XDG_STATE_HOME=$base/xs"
+        "XDG_STATE_HOME=relative-xs"
+        "CCTRL_SESSION_METADATA_DIR=$base/sm"
+        "CCTRL_DATA_DIR=$base/d CCTRL_SESSION_METADATA_DIR=$base/sm2"
+        "CCTRL_HOST_ID_FILE=$base/hid"
+        "CCTRL_HOSTS_FILE=$base/hosts.json"
+        "CCTRL_SHORTCUTS_FILE=$base/shortcuts.json"
+        "CCTRL_CONFIG_LOCAL=$base/local.json"
+        "CCTRL_USER_CONFIG=$base/user.json"
+        "XDG_CONFIG_HOME=$base/xc"
+        "XDG_CONFIG_HOME=relative-xc"
+        "CCTRL_NEEDS_ME_SNAPSHOT=$base/nm.json"
+        "HOME="
+        "CCTRL_RUNTIME_MODE=installed"
+        "CCTRL_STATE_DIR=$base/st-l2"
+        "CCTRL_STATE_DIR=$base/st-l2 CCTRL_DATA_DIR=$base/d"
+        "CCTRL_STATE_DIR=$base/st-l2c"
+        "CCTRL_STATE_DIR=$base/st-l20"
+        "CCTRL_STATE_DIR=$base/st-l1"
+        "CCTRL_STATE_DIR=$base/st-mig"
+    )
+    local -a shells=("$BASH")
+    if [[ -x /bin/bash && "$(cd -P /bin && pwd -P)/bash" != "$BASH" ]]; then shells+=(/bin/bash); fi
+    local mode row sh shell_kv py_kv n=0 got
+    for mode in checkout installed; do
+        if [[ "$mode" == installed ]]; then : > "$tree/.installed"; else rm -f "$tree/.installed"; fi
+        for row in "${rows[@]}"; do
+            py_kv="$(_a0_py_kv "$tree" "$row")"
+            for sh in "${shells[@]}"; do
+                shell_kv="$(_a0_shell_kv "$tree" "$sh" "$row")"
+                [[ "$shell_kv" == "$py_kv" ]] || fail "shell ($sh) and Python resolvers disagree ($mode, row '$row'):
+$(diff <(printf '%s\n' "$shell_kv") <(printf '%s\n' "$py_kv"))"
+                n=$((n + 1))
+            done
+            [[ "$(_a0_kv_get "$py_kv" mode)" == "$mode" ]] || fail "mode is not $mode for row '$row'"
+            [[ "$(_a0_kv_get "$py_kv" env_runtime_mode)" == unset ]] || fail "CCTRL_RUNTIME_MODE survived the resolver (row '$row')"
+            case "$row" in
+                "CCTRL_STATE_DIR=$base/st-l2")
+                    if [[ "$mode" == installed ]]; then
+                        [[ "$(_a0_kv_get "$py_kv" store_data_dir)" == "$base/st-l2/data" ]] || fail "installed layout 2 did not use the state data dir"
+                        [[ "$(_a0_kv_get "$py_kv" data_layout)" == 2 ]] || fail "data_layout is not 2"
+                        [[ "$(_a0_kv_get "$py_kv" shortcuts_file)" == "$base/st-l2/data/shortcuts.json" ]] || fail "shortcuts did not follow layout 2"
+                    else
+                        [[ "$(_a0_kv_get "$py_kv" store_data_dir)" == "$tree/data" ]] || fail "a checkout must keep its own data/ under layout 2 (Q2)"
+                    fi
+                    [[ "$(_a0_kv_get "$py_kv" costs_dir)" == "$tree/costs" ]] || fail "a data marker must not move costs"
+                    ;;
+                "CCTRL_STATE_DIR=$base/st-l2 CCTRL_DATA_DIR=$base/d")
+                    [[ "$(_a0_kv_get "$py_kv" data_dir)" == "$base/d" ]] || fail "CCTRL_DATA_DIR must win over layout 2"
+                    ;;
+                "CCTRL_STATE_DIR=$base/st-l2c")
+                    got="$(_a0_kv_get "$py_kv" costs_dir)"
+                    if [[ "$mode" == installed ]]; then [[ "$got" == "$base/st-l2c/costs" ]] || fail "installed costs layout 2 not used: $got"
+                    else [[ "$got" == "$tree/costs" ]] || fail "checkout costs moved: $got"; fi
+                    ;;
+                "CCTRL_STATE_DIR=$base/st-l20"|"CCTRL_STATE_DIR=$base/st-l1")
+                    [[ "$(_a0_kv_get "$py_kv" data_layout)" == 1 ]] || fail "marker '$row' must not read as layout 2"
+                    ;;
+                "CCTRL_STATE_DIR=$base/st-mig")
+                    [[ "$(_a0_kv_get "$py_kv" migrating)" == 1 ]] || fail "the .migrating sentinel was not reported"
+                    ;;
+                "CCTRL_STATE_DIR=relative/state")
+                    [[ "$(_a0_kv_get "$py_kv" state_root)" == "$_A0_HOME/.local/state/cctrl" ]] || fail "a relative CCTRL_STATE_DIR must be ignored"
+                    ;;
+                "CCTRL_DATA_DIR=$base/d")
+                    [[ "$(_a0_kv_get "$py_kv" sessions_dir)" == "$base/d/sessions" ]] || fail "SESSION_METADATA_DIR must derive from CCTRL_DATA_DIR"
+                    [[ "$(_a0_kv_get "$py_kv" host_id_file)" == "$base/d/host-id" ]] || fail "host-id must derive from CCTRL_DATA_DIR"
+                    [[ "$(_a0_kv_get "$py_kv" snapshots_dir)" == "$base/d/snapshots" ]] || fail "snapshots must derive from CCTRL_DATA_DIR"
+                    [[ "$(_a0_kv_get "$py_kv" shortcuts_file)" == "$tree/data/shortcuts.json" ]] || fail "shortcuts stay in the store's data dir"
+                    ;;
+                "")
+                    [[ "$(_a0_kv_get "$py_kv" audit_dir)" == "$_A0_HOME/.local/state/cctrl/audit" ]] || fail "audit_dir is not <state root>/audit"
+                    [[ "$(_a0_kv_get "$py_kv" config_default)" == "$tree/share/config.default.json" ]] || fail "config_default is not share/"
+                    [[ "$(_a0_kv_get "$py_kv" migrating)" == 0 ]] || fail "migrating without a sentinel"
+                    ;;
+            esac
+        done
+    done
+    rm -f "$tree/.installed"
+    echo "ok: shell and Python resolvers agree on $n path-matrix rows (${#rows[@]} overrides x installed/checkout x ${#shells[@]} bash)"
+}
+
+test_paths_embedded_copy_matches() {
+    # cctrl runs as one file, so it embeds lib/paths.sh verbatim. The copy
+    # and the file must never differ, and nothing else in cctrl or the hooks
+    # builds a data or costs path by hand (plan 116 A0: one resolver).
+    local copy="$TMPDIR/a0-embedded-paths.sh"
+    awk '/^# >>> lib\/paths\.sh/{f=1; next} /^# <<< lib\/paths\.sh/{f=0} f' "$ROOT/cctrl" > "$copy"
+    [[ -s "$copy" ]] || fail "no embedded lib/paths.sh block in cctrl"
+    cmp -s "$copy" "$ROOT/lib/paths.sh" || fail "cctrl's embedded resolver differs from lib/paths.sh:
+$(diff "$copy" "$ROOT/lib/paths.sh" | head -20)"
+    local hits
+    hits="$(grep -nE '(SCRIPT_DIR|CCTRL_DIR|_cctrl_dir\))/(data|costs)\b' \
+        "$ROOT/cctrl" "$ROOT/hooks/statusline.sh" "$ROOT/completions/_cctrl" 2>/dev/null \
+        | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' \
+        | grep -vF '_CCTRL_P_STORE_DATA_DIR="$CCTRL_DIR/data"' || true)"
+    [[ -z "$hits" ]] || fail "a data/costs path is built outside the resolver:
+$hits"
+    grep -q 'import paths' "$ROOT/hooks/session-log.py" || fail "session-log.py does not import the resolver"
+    grep -q 'import paths' "$ROOT/plugins/cctrl-ports" || fail "cctrl-ports does not import the resolver"
+    echo "ok: cctrl embeds lib/paths.sh verbatim and builds no data path by hand"
+}
+
+test_paths_command_reports_mode_and_paths() {
+    local out
+    out="$("$ROOT/cctrl" paths --json)"
+    [[ "$(jq -r .mode <<< "$out")" == checkout ]] || fail "cctrl paths --json mode is not checkout: $out"
+    [[ "$(jq -r .data_dir <<< "$out")" == "$CCTRL_DATA_DIR" ]] || fail "cctrl paths ignores CCTRL_DATA_DIR"
+    [[ "$(jq -r .sessions_dir <<< "$out")" == "$CCTRL_SESSION_METADATA_DIR" ]] || fail "cctrl paths ignores CCTRL_SESSION_METADATA_DIR"
+    [[ "$(jq -r .test_mode <<< "$out")" == false ]] || fail "the suite must not be in test mode by default"
+    [[ "$(jq -r '.modes | type' <<< "$out")" == object ]] || fail "no modes object"
+    out="$("$ROOT/cctrl" paths)"
+    grep -Eq '^mode +checkout$' <<< "$out" || fail "cctrl paths text has no mode line: $out"
+    assert_contains "$out" "audit_dir"
+    local rc=0
+    "$ROOT/cctrl" paths --bogus >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "cctrl paths --bogus should exit 64 (got $rc)"
+    echo "ok: cctrl paths [--json] reports the mode, the resolved paths and their modes"
+}
+
+test_paths_runtime_mode_env_is_ignored_and_not_inherited() {
+    # Review S6: no env signal. A checkout run with CCTRL_RUNTIME_MODE=installed
+    # in its env still resolves "checkout", and children of an installed run
+    # do not carry the variable.
+    local base="$TMPDIR/a0-mode" out
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE"
+    cat > "$tree/plugins/cctrl-envdump" <<'SH'
+#!/bin/sh
+printf 'child=%s\n' "${CCTRL_RUNTIME_MODE-unset}"
+SH
+    chmod +x "$tree/plugins/cctrl-envdump"
+    out="$(CCTRL_RUNTIME_MODE=installed "$tree/cctrl" paths --json)"
+    [[ "$(jq -r .mode <<< "$out")" == checkout ]] || fail "an inherited CCTRL_RUNTIME_MODE made a checkout 'installed'"
+    out="$(CCTRL_RUNTIME_MODE=installed "$tree/cctrl" envdump)"
+    [[ "$out" == "child=unset" ]] || fail "a checkout run passed CCTRL_RUNTIME_MODE to a child: $out"
+    : > "$tree/.installed"
+    out="$("$tree/cctrl" paths --json)"
+    [[ "$(jq -r .mode <<< "$out")" == installed ]] || fail ".installed next to the resolved script did not give installed"
+    out="$(CCTRL_RUNTIME_MODE=installed "$tree/cctrl" envdump)"
+    [[ "$out" == "child=unset" ]] || fail "an installed run passed CCTRL_RUNTIME_MODE to a child: $out"
+    # Through a symlink (the release's `current` link): the mode follows the
+    # resolved script, so a link to a checkout is still a checkout.
+    rm -f "$tree/.installed"
+    ln -s "$tree" "$base/current"
+    out="$("$base/current/cctrl" paths --json)"
+    [[ "$(jq -r .mode <<< "$out")" == checkout ]] || fail "a link to a checkout read as installed"
+    [[ "$(jq -r .root <<< "$out")" == "$tree" ]] || fail "root is not the resolved tree: $(jq -r .root <<< "$out")"
+    echo "ok: the mode comes only from .installed next to the resolved script; CCTRL_RUNTIME_MODE is ignored and never inherited"
+}
+
+test_paths_layout2_read_without_compat_link() {
+    # Review S7: an installed fixture release reads a state root whose
+    # data/LAYOUT says 2, with no data symlink in the release at all. The
+    # same tree in checkout mode keeps its own data/ (Q2).
+    local base="$TMPDIR/a0-layout" out
+    _a0_tree "$base/release"
+    local rel="$_A0_TREE"
+    rm -rf "$rel/data"
+    mkdir -p "$base/state/data" "$base/state/costs"
+    printf '{"layout":2}\n' > "$base/state/data/LAYOUT"
+    printf '{"moved":{"dir":"/tmp","agent":"claude"}}\n' > "$base/state/data/shortcuts.json"
+    : > "$rel/.installed"
+    out="$(env -u CCTRL_DATA_DIR -u CCTRL_SESSION_METADATA_DIR -u CCTRL_HOST_ID_FILE \
+        CCTRL_STATE_DIR="$base/state" "$rel/cctrl" shortcuts ls 2>&1)"
+    assert_contains "$out" "moved"
+    out="$(env -u CCTRL_DATA_DIR -u CCTRL_SESSION_METADATA_DIR -u CCTRL_HOST_ID_FILE \
+        CCTRL_STATE_DIR="$base/state" "$rel/cctrl" paths --json)"
+    [[ "$(jq -r .data_dir <<< "$out")" == "$base/state/data" ]] || fail "installed layout 2 data_dir: $(jq -r .data_dir <<< "$out")"
+    [[ "$(jq -r .sessions_dir <<< "$out")" == "$base/state/data/sessions" ]] || fail "installed layout 2 sessions_dir"
+    [[ ! -e "$rel/data" ]] || fail "reading layout 2 created a data/ in the release"
+    rm -f "$rel/.installed"
+    out="$(env -u CCTRL_DATA_DIR CCTRL_STATE_DIR="$base/state" "$rel/cctrl" paths --json)"
+    [[ "$(jq -r .data_dir <<< "$out")" == "$rel/data" ]] || fail "a checkout must not read the state dir (Q2)"
+    echo "ok: an installed release reads a layout-2 state root with no compat link; a checkout keeps its own data/"
+}
+
+test_paths_config_layer_order() {
+    # MF-M1: share/config.default.json is the lowest layer, under a legacy
+    # data/config.json (kept by the runbook), the user config and
+    # config.local.json.
+    local rc="$TMPDIR/a0-cfg" u="$TMPDIR/a0-cfg-user.json" l="$TMPDIR/a0-cfg-local.json" out
+    rm -rf "$rc"; mkdir -p "$rc/share" "$rc/data"
+    rc="$(cd -P "$rc" && pwd -P)"
+    cp "$ROOT/cctrl" "$rc/cctrl"
+    printf '{"k":"default","a":"default","tmuxServer":"from-default"}\n' > "$rc/share/config.default.json"
+    printf '{"k":"legacy","b":"legacy"}\n' > "$rc/data/config.json"
+    printf '{"k":"user","c":"user"}\n' > "$u"
+    printf '{"k":"local"}\n' > "$l"
+    _a0_cfg() { CCTRL_NO_MAIN=1 CCTRL_USER_CONFIG="$u" CCTRL_CONFIG_LOCAL="$l" bash -c 'source "$0"; _config_jq "[.k,.a,.b,.c] | join(\",\")"; _tmux_config_value k; echo; _tmux_config_value tmuxServer' "$rc/cctrl"; }
+    out="$(_a0_cfg)"
+    [[ "$(sed -n 1p <<< "$out")" == "local,default,legacy,user" ]] || fail "merge order wrong: $out"
+    assert_contains "$(sed -n 2p <<< "$out")" "local"$'\t'"$l"
+    assert_contains "$(sed -n 3p <<< "$out")" "from-default"$'\t'"$rc/share/config.default.json"
+    rm -f "$l"
+    [[ "$(_a0_cfg | sed -n 1p)" == "user,default,legacy,user" ]] || fail "user must win over legacy and default"
+    rm -f "$u"
+    [[ "$(_a0_cfg | sed -n 1p)" == "legacy,default,legacy," ]] || fail "legacy must win over default"
+    rm -f "$rc/data/config.json"
+    [[ "$(_a0_cfg | sed -n 1p)" == "default,default,," ]] || fail "the shipped default must be read on its own"
+    jq -e '.defaultAgent == "codex"' "$ROOT/share/config.default.json" >/dev/null \
+        || fail "share/config.default.json lost the shipped default"
+    unset -f _a0_cfg
+    echo "ok: config layers resolve default < legacy data/config.json < user < local"
+}
+
+test_paths_data_dir_untracked() {
+    # MF-M1: nothing under data/ is tracked (A2's preflight refuses otherwise).
+    if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && [[ "$(cd -P "$(git -C "$ROOT" rev-parse --show-toplevel)" && pwd -P)" == "$(cd -P "$ROOT" && pwd -P)" ]]; then
+        local tracked
+        tracked="$(git -C "$ROOT" ls-files -- data)"
+        [[ -z "$tracked" ]] || fail "git ls-files data is not empty: $tracked"
+        echo "ok: git ls-files data is empty"
+    else
+        # The install gate runs from a git-archive tree with no .git; the
+        # archive then holds exactly the tracked files, so data/ must be absent.
+        [[ ! -e "$ROOT/data/config.json" ]] || fail "an archived tree ships data/config.json"
+        echo "ok: (no git checkout) the archived tree ships no data/config.json"
+    fi
+}
+
+test_hooks_resolve_paths_without_spawning_cctrl() {
+    # SH-S2: the statusline and session-log hooks resolve paths by sourcing or
+    # importing the resolver, never by running cctrl. A PATH stub and a stub
+    # cctrl in the tree record any spawn.
+    local base="$TMPDIR/a0-hooks" log="$TMPDIR/a0-hooks-spawn.log" bin="$TMPDIR/a0-hooks-bin"
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE"
+    rm -rf "$bin"; mkdir -p "$bin"; rm -f "$log"
+    printf '#!/bin/sh\necho "$0 $*" >> "%s"\nexit 0\n' "$log" > "$bin/cctrl"
+    cp "$bin/cctrl" "$tree/cctrl"
+    chmod +x "$bin/cctrl" "$tree/cctrl"
+    local jq_dir py_dir hp
+    jq_dir="$(dirname "$(command -v jq)")"
+    py_dir="$(dirname "$(command -v python3)")"
+    hp="$(_test_path "$bin" "$jq_dir" "$py_dir")"
+    local payload='{"model":{"display_name":"Opus"},"cwd":"/tmp/demo","context_window":{"total_input_tokens":5},"rate_limits":{"five_hour":{"used_percentage":10},"seven_day":{"used_percentage":20}}}'
+    ( umask 022; printf '%s' "$payload" | env -u CCTRL_DATA_DIR PATH="$hp" bash "$tree/hooks/statusline.sh" >/dev/null )
+    [[ -f "$tree/data/rate-limits.json" ]] || fail "statusline did not write the resolved rate-limits file"
+    [[ -s "$tree/data/rate-limits-history.jsonl" ]] || fail "statusline did not append history"
+    local proj="$TMPDIR/a0-hooks-proj" hook_in
+    mkdir -p "$proj"
+    printf '%s\n' '{"sessionId":"s-a0","message":{"role":"assistant","model":"m","usage":{"input_tokens":3,"output_tokens":4}}}' > "$proj/t.jsonl"
+    hook_in="$(jq -nc --arg tp "$proj/t.jsonl" '{transcript_path:$tp, session_id:"s-a0"}')"
+    ( umask 022; printf '%s' "$hook_in" | PATH="$hp" python3 "$tree/hooks/session-log.py" )
+    [[ -s "$tree/costs/spending.jsonl" ]] || fail "session-log did not write the resolved spending log"
+    [[ ! -e "$log" ]] || fail "a hook spawned cctrl: $(cat "$log")"
+    local f m
+    for f in "$tree/data/rate-limits.json" "$tree/data/rate-limits-history.jsonl" "$tree/costs/spending.jsonl"; do
+        m="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+        [[ "$m" == 600 ]] || fail "$f is $m, want 600 (hooks create private files under any umask)"
+    done
+    echo "ok: statusline and session-log resolve paths with no cctrl spawn and write 0600 files"
+}
+
+test_completions_resolve_through_checked_install() {
+    # A0 also fixes the zsh completions: with the checked install the command
+    # on PATH is a launcher copy, so the tree is $CCTRL_HOME/current. Paths
+    # come from lib/paths.py. A checkout on PATH (via a symlink) still works.
+    command -v zsh >/dev/null 2>&1 || { echo "SKIP: zsh not installed"; return 0; }
+    local base="$TMPDIR/a0-zsh" out
+    rm -rf "$base"; mkdir -p "$base/home/bin" "$base/home/lib/cctrl/releases"
+    _a0_tree "$base/home/lib/cctrl/releases/r1"
+    local rel="$_A0_TREE"
+    printf '{"alpha":{"dir":"/tmp"},"beta":{"dir":"/tmp"}}\n' > "$rel/data/shortcuts.json"
+    printf '{"hostx":{"host":"h"}}\n' > "$rel/data/hosts.json"
+    ln -s "releases/r1" "$base/home/lib/cctrl/current"
+    cp "$ROOT/install/cctrl-launcher.sh" "$base/home/bin/cctrl"
+    chmod +x "$base/home/bin/cctrl"
+    sed '$d' "$ROOT/completions/_cctrl" > "$base/_cctrl.fn"
+    local zprog='
+source "$1"
+compadd() { local a; for a in "$@"; do [[ "$a" == -* ]] && continue; print -r -- "$a"; done; }
+print -r -- "dir=$(_cctrl_dir)"
+_cctrl_shortcut_names
+_cctrl_hosts
+'
+    out="$(env -u CCTRL_DATA_DIR HOME="$base/home" CCTRL_HOME="$base/home/lib/cctrl" PATH="$base/home/bin:$PATH" \
+        zsh -f -c "$zprog" _ "$base/_cctrl.fn" 2>&1)"
+    assert_contains "$out" "dir=$rel"
+    assert_contains "$out" "alpha"
+    assert_contains "$out" "beta"
+    assert_contains "$out" "hostx"
+    # A checkout reached through a symlink on PATH.
+    rm -f "$base/home/bin/cctrl"
+    ln -s "$rel/cctrl" "$base/home/bin/cctrl"
+    out="$(env -u CCTRL_DATA_DIR HOME="$base/home" CCTRL_HOME="$base/nowhere" PATH="$base/home/bin:$PATH" \
+        zsh -f -c "$zprog" _ "$base/_cctrl.fn" 2>&1)"
+    assert_contains "$out" "dir=$rel"
+    assert_contains "$out" "alpha"
+    echo "ok: zsh completions find the tree through the checked-install launcher and read shortcuts and hosts via lib/paths.py"
+}
+
+test_paths_test_mode_gate() {
+    # Review S10: test mode needs CCTRL_TEST_MODE=1, every state path and the
+    # seal key inside one .cctrl-test-sandbox directory, and refuses (64)
+    # when the effective seal key is the live user's key path. Shell and
+    # Python agree. The live key is only named, never opened.
+    local sb="$TMPDIR/a0-sandbox"
+    rm -rf "$sb"; mkdir -p "$sb/state" "$sb/data" "$sb/tmux" "$sb/meta" "$sb/root/data" "$sb/root/costs"
+    : > "$sb/.cctrl-test-sandbox"
+    local root
+    root="$(cd -P "$sb/root" && pwd -P)"
+    local -a good=(
+        CCTRL_TEST_MODE=1 HOME="$sb/home" CCTRL_STATE_DIR="$sb/state" CCTRL_DATA_DIR="$sb/data"
+        CCTRL_SESSION_METADATA_DIR="$sb/meta" CCTRL_USER_CONFIG="$sb/user.json"
+        CCTRL_CONFIG_LOCAL="$sb/local.json" CCTRL_PEER_SEAL_KEY_FILE="$sb/state/peer-seal.key"
+        TMUX_TMPDIR="$sb/tmux"
+    )
+    _a0_gate() { # extra env assignments...
+        local sh_rc=0 py_rc=0
+        env -i PATH="$PATH" "${good[@]}" "$@" "$BASH" -c 'source "$1"; _cctrl_paths_resolve "$2"; _cctrl_test_mode' \
+            _ "$ROOT/lib/paths.sh" "$root" >/dev/null 2>&1 || sh_rc=$?
+        env -i PATH="$PATH" "${good[@]}" "$@" python3 "$ROOT/lib/paths.py" test-mode --root "$root" >/dev/null 2>&1 || py_rc=$?
+        [[ "$sh_rc" == "$py_rc" ]] || { echo "disagree sh=$sh_rc py=$py_rc"; return 0; }
+        echo "$sh_rc"
+    }
+    [[ "$(_a0_gate)" == 0 ]] || fail "a full sandbox is not test mode: $(_a0_gate)"
+    [[ "$(_a0_gate CCTRL_TEST_MODE=0)" == 1 ]] || fail "CCTRL_TEST_MODE=0 gave test mode"
+    rm -f "$sb/.cctrl-test-sandbox"
+    [[ "$(_a0_gate)" == 1 ]] || fail "no sandbox marker gave test mode"
+    : > "$sb/.cctrl-test-sandbox"
+    [[ "$(_a0_gate TMUX_TMPDIR=)" == 1 ]] || fail "an unset TMUX_TMPDIR gave test mode"
+    local outside="$TMPDIR/a0-outside"
+    mkdir -p "$outside"
+    local v
+    for v in CCTRL_DATA_DIR CCTRL_STATE_DIR CCTRL_SESSION_METADATA_DIR CCTRL_USER_CONFIG CCTRL_CONFIG_LOCAL TMUX_TMPDIR CCTRL_PEER_SEAL_KEY_FILE CCTRL_COSTS_DIR CCTRL_HOST_ID_FILE; do
+        [[ "$(_a0_gate "$v=$outside/x")" == 1 ]] || fail "$v outside the sandbox still gave test mode: $(_a0_gate "$v=$outside/x")"
+    done
+    # A link inside the sandbox that points out of it is outside (realpath).
+    ln -s "$outside" "$sb/escape"
+    [[ "$(_a0_gate CCTRL_DATA_DIR="$sb/escape/d")" == 1 ]] || fail "a symlink out of the sandbox gave test mode"
+    # The live key: refused even with every other part present. HOME is moved
+    # so the live path must come from the password database, not HOME.
+    local live_key
+    live_key="$(python3 -c 'import os,pwd; print(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local/state/cctrl/peer-seal.key"))')"
+    [[ "$(_a0_gate CCTRL_PEER_SEAL_KEY_FILE="$live_key")" == 64 ]] || fail "the live seal key was not refused: $(_a0_gate CCTRL_PEER_SEAL_KEY_FILE="$live_key")"
+    local real_home
+    real_home="$(python3 -c 'import os,pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')"
+    [[ "$(_a0_gate CCTRL_PEER_SEAL_KEY_FILE= HOME="$real_home")" == 64 ]] || fail "the default key under the real home was not refused"
+    # cctrl itself refuses to run in test mode with the live key (exit 64).
+    local rc=0
+    CCTRL_TEST_MODE=1 CCTRL_PEER_SEAL_KEY_FILE="$live_key" "$ROOT/cctrl" paths >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "cctrl ran in test mode with the live seal key (rc $rc)"
+    unset -f _a0_gate
+    echo "ok: the test-mode gate needs every part, realpaths each state path into the sandbox, and refuses the live seal key (64)"
+}
+
+test_state_fix_modes() {
+    # A0: `cctrl state fix-modes [--dry-run]` tightens existing data and costs
+    # files once: dirs 0700, files keep only owner bits. A symlink inside is
+    # never followed, and a dry run changes nothing.
+    local base="$TMPDIR/a0-fixmodes"
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE"
+    mkdir -p "$tree/data/sub" "$base/outside"
+    ( umask 022
+      printf 'x\n' > "$tree/data/messages-archive.jsonl"
+      printf 'x\n' > "$tree/data/sub/a.body"
+      printf 'x\n' > "$tree/costs/spending.jsonl"
+      printf 'x\n' > "$base/outside/target" )
+    chmod 755 "$tree/data" "$tree/data/sub"
+    chmod 644 "$tree/data/messages-archive.jsonl" "$tree/data/sub/a.body" "$tree/costs/spending.jsonl" "$base/outside/target"
+    ln -s "$base/outside/target" "$tree/data/link"
+    _a0_mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+    local out
+    out="$(env -u CCTRL_DATA_DIR "$tree/cctrl" state fix-modes --dry-run)"
+    assert_contains "$out" "messages-archive.jsonl 0644 -> 0600 (dry run)"
+    [[ "$(_a0_mode "$tree/data/messages-archive.jsonl")" == 644 ]] || fail "a dry run changed a mode"
+    env -u CCTRL_DATA_DIR "$tree/cctrl" state fix-modes >/dev/null
+    [[ "$(_a0_mode "$tree/data")" == 700 ]] || fail "data dir not 0700"
+    [[ "$(_a0_mode "$tree/data/sub")" == 700 ]] || fail "sub dir not 0700"
+    [[ "$(_a0_mode "$tree/data/messages-archive.jsonl")" == 600 ]] || fail "archive not 0600"
+    [[ "$(_a0_mode "$tree/data/sub/a.body")" == 600 ]] || fail "body not 0600"
+    [[ "$(_a0_mode "$tree/costs/spending.jsonl")" == 600 ]] || fail "spending not 0600"
+    [[ "$(_a0_mode "$base/outside/target")" == 644 ]] || fail "fix-modes followed a symlink out of the data dir"
+    out="$(env -u CCTRL_DATA_DIR "$tree/cctrl" state fix-modes)"
+    [[ -z "$out" ]] || fail "a second run should change nothing: $out"
+    local rc=0
+    "$tree/cctrl" state fix-modes --bogus >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "bad flag should exit 64"
+    unset -f _a0_mode
+    echo "ok: state fix-modes tightens data and costs to 0700/0600, dry run changes nothing, symlinks are not followed"
+}
+
+test_cctrl_creates_private_files() {
+    # A0: umask 077 at entry, so the files cctrl writes in the data dir (the
+    # mailbox, peers, hosts, shortcuts, the switch log) are 0600 and its dirs
+    # 0700 even when the caller's umask is 022.
+    local base="$TMPDIR/a0-private"
+    _a0_tree "$base/tree"
+    local tree="$_A0_TREE" data="$base/tree/data"
+    rm -rf "$data" "$tree/costs"
+    (
+        umask 022
+        export CCTRL_DATA_DIR="$tree/data" CCTRL_SESSION_METADATA_DIR="$tree/data/sessions" CCTRL_HOST_ID_FILE="$tree/data/host-id"
+        "$tree/cctrl" peer register a0peer >/dev/null 2>&1
+        "$tree/cctrl" peer send a0peer --from user -- "hi" >/dev/null 2>&1
+        "$tree/cctrl" host add a0host a0.invalid >/dev/null 2>&1 || true
+        "$tree/cctrl" @add a0short "$TMPDIR" >/dev/null 2>&1 || true
+    )
+    [[ -f "$tree/data/messages.jsonl" ]] || fail "peer send wrote no mailbox"
+    local f m bad=""
+    while IFS= read -r f; do
+        m="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f")"
+        if [[ -d "$f" ]]; then [[ "$m" == 700 ]] || bad+=" $f=$m"
+        else [[ "$m" == 600 ]] || bad+=" $f=$m"; fi
+    done < <(find "$tree/data" \( -type f -o -type d \))
+    [[ -z "$bad" ]] || fail "cctrl created files that are not private:$bad"
+    [[ -f "$tree/data/hosts.json" ]] || fail "host add wrote no hosts.json"
+    [[ -f "$tree/data/shortcuts.json" ]] || fail "@add wrote no shortcuts.json"
+    echo "ok: files and dirs cctrl creates in the data dir are 0600/0700 under a 022 caller umask"
+}
+
+test_cctrl_restores_caller_umask_for_agents() {
+    # The 077 umask is cctrl's own: an agent it execs, and a tmux server a
+    # new-session may start, get the caller's umask back.
+    local n
+    n="$(grep -c 'umask "\$_CCTRL_CALLER_UMASK"' "$ROOT/cctrl")"
+    [[ "$n" -ge 6 ]] || fail "expected the caller umask restored at every agent exec and the new-session (found $n)"
+    local line
+    while IFS= read -r line; do
+        local next
+        next="$(sed -n "$((line + 1))p" "$ROOT/cctrl")"
+        case "$next" in
+            *exec*|*'tmux new-session'*) ;;
+            *) fail "umask restore at line $line is not right before an exec or new-session: $next" ;;
+        esac
+    done < <(grep -n 'umask "\$_CCTRL_CALLER_UMASK"' "$ROOT/cctrl" | cut -d: -f1)
+    local out
+    out="$(umask 022; CCTRL_NO_MAIN=1 bash -c 'source "$0"; printf "%s %s\n" "$_CCTRL_CALLER_UMASK" "$(umask)"' "$ROOT/cctrl")"
+    [[ "$out" == "0022 0077" ]] || fail "cctrl did not record the caller umask and set 077: $out"
+    echo "ok: cctrl runs at umask 077 and gives agents and new tmux servers the caller's umask"
+}
+
+test_data_config_runbook_preserves_file() {
+    # Review S5: untracking data/config.json deletes it from every other
+    # checkout on fast-forward. A fixture clone shows the loss; the runbook
+    # (save, fast-forward, restore) keeps it, untracked and ignored; a clone
+    # without a saved copy is rebuilt from history; a differing file is never
+    # overwritten.
+    local base="$TMPDIR/a0-runbook" rb="$ROOT/install/data-config-runbook.sh" out
+    rm -rf "$base"; mkdir -p "$base"
+    local G=(git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main -c commit.gpgsign=false)
+    "${G[@]}" init -q "$base/origin"
+    printf 'data/\n' > "$base/origin/.gitignore"
+    mkdir -p "$base/origin/data"
+    printf '{"defaultAgent":"codex"}\n' > "$base/origin/data/config.json"
+    "${G[@]}" -C "$base/origin" add .gitignore
+    "${G[@]}" -C "$base/origin" add -f data/config.json
+    "${G[@]}" -C "$base/origin" commit -q -m pre
+    "${G[@]}" clone -q "$base/origin" "$base/lost"
+    "${G[@]}" clone -q "$base/origin" "$base/kept"
+    "${G[@]}" clone -q "$base/origin" "$base/nokeep"
+    mkdir -p "$base/origin/share"
+    cp "$base/origin/data/config.json" "$base/origin/share/config.default.json"
+    "${G[@]}" -C "$base/origin" rm -q --cached data/config.json
+    "${G[@]}" -C "$base/origin" add share/config.default.json
+    "${G[@]}" -C "$base/origin" commit -q -m untrack
+    # 1. The hazard: a plain fast-forward deletes the file.
+    "${G[@]}" -C "$base/lost" pull -q --ff-only
+    [[ ! -e "$base/lost/data/config.json" ]] || fail "fixture: the fast-forward was expected to delete data/config.json"
+    # 2. The runbook keeps it.
+    out="$("$rb" save "$base/kept")"
+    assert_contains "$out" "present, tracked"
+    "${G[@]}" -C "$base/kept" pull -q --ff-only
+    [[ ! -e "$base/kept/data/config.json" ]] || fail "fixture: the fast-forward should still delete the tracked file"
+    out="$("$rb" restore "$base/kept")"
+    assert_contains "$out" "restored"
+    assert_contains "$out" "present, untracked, ignored"
+    cmp -s "$base/kept/data/config.json" "$base/origin/share/config.default.json" || fail "restored content differs"
+    [[ -z "$(git -C "$base/kept" status --porcelain)" ]] || fail "the restored file shows in git status"
+    # 3. No keep copy: rebuilt from the commit before the untracking.
+    "${G[@]}" -C "$base/nokeep" pull -q --ff-only
+    out="$("$rb" restore "$base/nokeep")"
+    assert_contains "$out" "(no keep copy)"
+    cmp -s "$base/nokeep/data/config.json" "$base/origin/share/config.default.json" || fail "history restore differs"
+    # 4. A differing file is never overwritten.
+    printf '{"defaultAgent":"claude"}\n' > "$base/kept/data/config.json"
+    local rc=0
+    "$rb" restore "$base/kept" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "restore overwrote or accepted a differing file"
+    grep -q claude "$base/kept/data/config.json" || fail "restore changed a differing file"
+    echo "ok: the data/config.json runbook keeps the file across the untracking fast-forward (save/restore, history fallback, no overwrite)"
+}
+
+test_pre_a0_release_without_data_config_recorded() {
+    # Review S5: record what a release from before A0 does when its
+    # data/config.json is gone (a rollback after the untracking). Result: it
+    # still runs, on built-in defaults, but the shipped defaultAgent (codex)
+    # is lost, so the runbook step is mandatory and the install warns.
+    local pre=""
+    if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        if git -C "$ROOT" cat-file -e HEAD:data/config.json 2>/dev/null; then
+            pre=HEAD
+        else
+            local gone
+            gone="$(git -C "$ROOT" log -1 --format=%H --diff-filter=D -- data/config.json 2>/dev/null || true)"
+            [[ -n "$gone" ]] && pre="$gone^"
+        fi
+    fi
+    if [[ -z "$pre" ]] || ! git -C "$ROOT" cat-file -e "$pre:cctrl" 2>/dev/null; then
+        echo "SKIP: no git history for a pre-A0 release (install gate tree)"
+        return 0
+    fi
+    local rc="$TMPDIR/a0-preA0" out_with out_without
+    rm -rf "$rc"; mkdir -p "$rc/data"
+    git -C "$ROOT" show "$pre:cctrl" > "$rc/cctrl"
+    chmod +x "$rc/cctrl"
+    git -C "$ROOT" show "$pre:data/config.json" > "$rc/data/config.json"
+    out_with="$(CCTRL_NO_MAIN=1 CCTRL_USER_CONFIG="$TMPDIR/none.json" CCTRL_CONFIG_LOCAL="$TMPDIR/none.json" \
+        bash -c 'source "$0"; _config_default_agent || echo none' "$rc/cctrl")"
+    rm -f "$rc/data/config.json"
+    out_without="$(CCTRL_NO_MAIN=1 CCTRL_USER_CONFIG="$TMPDIR/none.json" CCTRL_CONFIG_LOCAL="$TMPDIR/none.json" \
+        bash -c 'source "$0"; _config_default_agent || echo none' "$rc/cctrl")"
+    [[ "$out_with" == codex ]] || fail "pre-A0 release with the file: expected codex, got $out_with"
+    [[ "$out_without" == none ]] || fail "pre-A0 release without the file: expected no default agent, got $out_without"
+    local help_rc=0
+    "$rc/cctrl" help >/dev/null 2>&1 || help_rc=$?
+    [[ "$help_rc" -eq 0 ]] || fail "pre-A0 release without data/config.json failed to run (rc $help_rc)"
+    grep -q 'data/config.json is missing' "$ROOT/install/self-install.sh" || fail "self-install does not warn when the file is missing"
+    echo "ok: recorded: a pre-A0 release without data/config.json runs but loses defaultAgent=codex (runbook mandatory; install warns)"
+}
+
+test_self_install_writes_installed_marker_after_gate() {
+    # SH-S3: .installed is written into the release after the suite gate and
+    # before activation; there is no env export of the mode.
+    local si="$ROOT/install/self-install.sh" gate marker swap
+    gate="$(grep -n 'bash "\$SCRATCH/tests/run-tests.sh"' "$si" | head -1 | cut -d: -f1)"
+    marker="$(grep -n '> "\$SCRATCH/.installed"' "$si" | head -1 | cut -d: -f1)"
+    swap="$(grep -n 'mv -fh "\$NEXT_LINK" "\$CURRENT_LINK"' "$si" | head -1 | cut -d: -f1)"
+    [[ -n "$gate" && -n "$marker" && -n "$swap" ]] || fail "self-install: gate/marker/swap lines not found ($gate/$marker/$swap)"
+    (( gate < marker && marker < swap )) || fail "the .installed marker must come after the gate and before activation ($gate < $marker < $swap)"
+    ! grep -q 'CCTRL_RUNTIME_MODE' "$si" || fail "self-install must not export a mode variable"
+    grep -q 'state fix-modes' "$si" || fail "self-install does not run state fix-modes"
+    echo "ok: self-install writes .installed after the gate and before the swap, with no env signal"
+}
+
 # Groups as data (plan 105 P4): `_group_tests <group>` prints the tests a
 # CCTRL_TEST_ONLY group runs, in order. codex-ownership-matrix has its own
 # block below (live-store manifest around the run); provider-neutral and

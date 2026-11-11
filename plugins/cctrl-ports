@@ -209,8 +209,11 @@ def discover_ports_in_dir(root: str) -> list[dict]:
 
 _SELF_DIR   = os.path.dirname(os.path.realpath(__file__))
 _CCTRL_DIR  = os.path.dirname(_SELF_DIR)
-DATA_DIR    = os.path.join(_CCTRL_DIR, 'data')
-PORTS_FILE  = os.path.join(DATA_DIR, 'ports-seen.json')
+# Paths come from the shared resolver (plan 116 A0).
+sys.path.insert(0, os.path.join(_CCTRL_DIR, 'lib'))
+import paths as _cctrl_paths  # noqa: E402
+PORTS_FILE  = _cctrl_paths.resolve(_CCTRL_DIR)['ports_file']
+DATA_DIR    = os.path.dirname(PORTS_FILE)
 
 def _load_db() -> dict:
     """Load the ports database, returning a fresh one if it doesn't exist."""

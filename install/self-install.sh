@@ -87,17 +87,29 @@ LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"
 
 # Keep validation isolated from live registry churn. Mutable state is linked
 # only after the staged release has passed every gate.
-# data/config.json is tracked despite data/ being gitignored (it ships a
-# default config for fresh installs), so the archive leaves a real
-# data/config.json behind. Clear it before symlinking -- the repo's own
-# data/config.json is the same file; the symlink is authoritative.
+# Nothing under data/ is tracked any more (plan 116 A0 moved the shipped
+# default to share/config.default.json), so the archive has no data/. The rm
+# stays as a guard: the symlink is authoritative.
 rm -rf "$SCRATCH/data" "$SCRATCH/costs" "$SCRATCH/profiles" "$SCRATCH/.active-profile"
+
+# Plan 116 A0 (review S5): untracking data/config.json deletes it from every
+# other checkout on fast-forward. New releases read share/config.default.json
+# instead, but a rollback to an older release would run without the file.
+if [[ ! -f "$ROOT/data/config.json" ]]; then
+    echo "cctrl self-install: WARNING: $ROOT/data/config.json is missing. This release falls back to share/config.default.json, but a rollback to a release older than plan 116 A0 would run without it. Restore it with install/data-config-runbook.sh restore <checkout>." >&2
+fi
 
 # Mutable state lives in the repo, never duplicated into a release.
 for link in data costs profiles; do
     ln -s "$ROOT/$link" "$SCRATCH/$link"
 done
 ln -s "$ROOT/.active-profile" "$SCRATCH/.active-profile"
+
+# Plan 116 A0 (SH-S3): the installed-mode marker, written after every gate
+# and just before activation. A tree is "installed" only when this file sits
+# next to its resolved cctrl; there is no environment signal. The gate above
+# ran in this same tree before the marker existed, so it ran in checkout mode.
+printf '%s\n' "$SHA" > "$SCRATCH/.installed"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 RELEASE_NAME="${SHORT_SHA}-${TS}"
@@ -132,6 +144,12 @@ chmod +x "$LAUNCHER_TMP"
 mv "$LAUNCHER_TMP" "$CCTRL_BIN"
 
 echo "cctrl self-install: installed launcher at $CCTRL_BIN" >&2
+
+# Plan 116 A0: tighten the modes of the live data and costs (dirs 0700,
+# files lose group and other bits). Never fatal: the release is already live.
+if ! "$CURRENT_LINK/cctrl" state fix-modes; then
+    echo "cctrl self-install: WARNING: 'cctrl state fix-modes' failed; run it by hand" >&2
+fi
 echo >&2
 echo "Rollback (restores the previous symlink-into-working-tree behavior):" >&2
 echo "  ln -sf $ROOT/cctrl $CCTRL_BIN" >&2

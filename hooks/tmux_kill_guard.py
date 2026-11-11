@@ -378,7 +378,9 @@ def _socket_dir(environ):
 
 def _config_files(environ, script_dir):
     """cctrl's config files, highest precedence first (cctrl CONFIG_LOCAL_FILE,
-    CONFIG_USER_FILE, CONFIG_FILE)."""
+    CONFIG_USER_FILE, CONFIG_FILE, CONFIG_DEFAULT_FILE; plan 116 A0 moved the
+    shipped default to share/config.default.json). The same rules as
+    lib/paths.py, kept inline so the guard has no import to fail."""
     files = [environ.get("CCTRL_CONFIG_LOCAL") or os.path.join(script_dir, "data", "config.local.json")]
     user = environ.get("CCTRL_USER_CONFIG") or ""
     if not user and environ.get("HOME"):
@@ -387,6 +389,7 @@ def _config_files(environ, script_dir):
     if user:
         files.append(user)
     files.append(os.path.join(script_dir, "data", "config.json"))
+    files.append(os.path.join(script_dir, "share", "config.default.json"))
     return files
 
 

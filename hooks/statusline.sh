@@ -2,8 +2,24 @@
 # Statusline script for Claude Code
 # Displays context window bar + captures rate_limits to disk
 
-CCTRL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-DATA_DIR="$CCTRL_DIR/data"
+# Private modes for what this hook writes (plan 116 A0). It is a leaf: it
+# starts nothing long-lived, so no child inherits the umask.
+umask 077
+# The tree, resolved (-P), so the shared resolver can see the .installed
+# marker of an installed release. Paths come from lib/paths.sh, which runs no
+# subprocess: this hook renders constantly and never spawns cctrl.
+CCTRL_DIR="$(cd -P "$(dirname "$0")/.." && pwd -P)"
+# A partial copy of the tree without lib/ keeps the old default.
+if [[ -r "$CCTRL_DIR/lib/paths.sh" ]]; then
+    # shellcheck source=../lib/paths.sh
+    source "$CCTRL_DIR/lib/paths.sh"
+    _cctrl_paths_resolve "$CCTRL_DIR"
+else
+    _CCTRL_P_STORE_DATA_DIR="$CCTRL_DIR/data"
+    _CCTRL_P_RATE_LIMITS_FILE="$_CCTRL_P_STORE_DATA_DIR/rate-limits.json"
+    _CCTRL_P_RATE_LIMITS_HISTORY="$_CCTRL_P_STORE_DATA_DIR/rate-limits-history.jsonl"
+fi
+DATA_DIR="$_CCTRL_P_STORE_DATA_DIR"
 
 input=$(cat)
 
@@ -63,7 +79,7 @@ if [[ -n "$rate_limits" ]]; then
         profile: $profile,
         five_hour: .rate_limits.five_hour,
         seven_day: .rate_limits.seven_day
-    }' > "$DATA_DIR/rate-limits.json"
+    }' > "$_CCTRL_P_RATE_LIMITS_FILE"
 
     # Append to history (one line per reading, compact)
     echo "$input" | jq -c --arg ts "$ts" --arg profile "$profile" '{
@@ -71,5 +87,5 @@ if [[ -n "$rate_limits" ]]; then
         profile: $profile,
         five_hour: .rate_limits.five_hour.used_percentage,
         seven_day: .rate_limits.seven_day.used_percentage
-    }' >> "$DATA_DIR/rate-limits-history.jsonl"
+    }' >> "$_CCTRL_P_RATE_LIMITS_HISTORY"
 fi

@@ -1,26 +1,45 @@
 #compdef cctrl
 
-# Resolve cctrl's install dir from the command path (works through symlinks)
+# The cctrl tree. A checkout, or an old symlink install, resolves straight to
+# it. The checked install (plan 079) puts a launcher copy on PATH instead, so
+# then the tree is $CCTRL_HOME/current, resolved.
 _cctrl_dir() {
     local bin="${commands[cctrl]:-$(whence -p cctrl 2>/dev/null)}"
     [[ -n "$bin" ]] || return 1
-    local real="$(readlink -f "$bin" 2>/dev/null || realpath "$bin" 2>/dev/null)"
-    echo "${real:h}"
+    local real="${bin:A}"
+    if [[ -f "${real:h}/lib/paths.py" ]]; then
+        echo "${real:h}"
+        return 0
+    fi
+    local cur="${CCTRL_HOME:-$HOME/.local/lib/cctrl}/current"
+    [[ -f "$cur/cctrl" ]] || return 1
+    echo "${cur:A}"
+}
+
+# One path from the shared resolver, lib/paths.py (plan 116 A0). Completion
+# never builds a data path itself, and never spawns cctrl.
+_cctrl_path() {
+    local dir
+    dir="$(_cctrl_dir)" || return 1
+    [[ -n "$dir" && -f "$dir/lib/paths.py" ]] || return 1
+    python3 "$dir/lib/paths.py" get "$1" --root "$dir" 2>/dev/null
 }
 
 _cctrl_profiles() {
     local dir="$(_cctrl_dir)/profiles"
-    [[ -d "$dir" ]] || return
+    local userdir="${XDG_CONFIG_HOME:-$HOME/.config}/cctrl/profiles"
+    [[ "${XDG_CONFIG_HOME:-}" == /* ]] || userdir="$HOME/.config/cctrl/profiles"
     local -a profiles
-    for f in "$dir"/*.json(N); do
+    for f in "$userdir"/*.json(N) "$dir"/*.json(N); do
         profiles+=("${f:t:r}")
     done
+    profiles=(${(u)profiles})
     (( ${#profiles} )) && compadd -X "profiles" "$@" -- "${profiles[@]}"
 }
 
 _cctrl_shortcuts() {
-    local file="$(_cctrl_dir)/data/shortcuts.json"
-    [[ -f "$file" ]] || return
+    local file="$(_cctrl_path shortcuts_file)"
+    [[ -n "$file" && -f "$file" ]] || return
     local -a names descs
     local key val
     while IFS=$'\t' read -r key val; do
@@ -31,8 +50,8 @@ _cctrl_shortcuts() {
 }
 
 _cctrl_shortcut_names() {
-    local file="$(_cctrl_dir)/data/shortcuts.json"
-    [[ -f "$file" ]] || return
+    local file="$(_cctrl_path shortcuts_file)"
+    [[ -n "$file" && -f "$file" ]] || return
     local -a names
     names=("${(@f)$(jq -r 'keys[]' "$file" 2>/dev/null)}")
     (( ${#names} )) && compadd "$@" -- "${names[@]}"
@@ -51,15 +70,17 @@ _cctrl_plugins() {
 _cctrl_hosts() {
     # Built-in aliases for the local machine, plus any registered hosts.
     compadd "$@" -- local self
-    local file="$(_cctrl_dir)/data/hosts.json"
-    [[ -f "$file" ]] || return
+    local file="$(_cctrl_path hosts_file)"
+    [[ -n "$file" && -f "$file" ]] || return
     local -a names
     names=("${(@f)$(jq -r 'keys[]' "$file" 2>/dev/null)}")
     (( ${#names} )) && compadd "$@" -- "${names[@]}"
 }
 
 _cctrl_peers() {
-    local file="$(_cctrl_dir)/data/peers.json"
+    local data="$(_cctrl_path data_dir)" file
+    [[ -n "$data" ]] || return
+    file="$data/peers.json"
     [[ -f "$file" ]] || return
     local -a names
     names=("${(@f)$(jq -r 'to_entries[] | .key, ((.value.aliases // [])[])' "$file" 2>/dev/null)}")
@@ -67,7 +88,9 @@ _cctrl_peers() {
 }
 
 _cctrl_message_ids() {
-    local file="$(_cctrl_dir)/data/messages.jsonl"
+    local data="$(_cctrl_path data_dir)" file
+    [[ -n "$data" ]] || return
+    file="$data/messages.jsonl"
     [[ -f "$file" ]] || return
     local -a ids
     ids=("${(@f)$(jq -r '.id // empty' "$file" 2>/dev/null)}")
@@ -95,6 +118,8 @@ _cctrl() {
         'diff:Diff current settings vs a profile'
         'rename:Rename a session display label (--self for the current session)'
         'release:Manage installed cctrl releases (prune)'
+        'paths:Show resolved data, state and config paths and the mode'
+        'state:Data store maintenance (fix-modes)'
         'helpers:Read-only census of MCP helper processes per codex/claude owner'
         'edit:Open a profile in \$EDITOR'
         'start:Launch selected agent (foreground, or -d for a detached session)'
@@ -221,6 +246,17 @@ _cctrl() {
                 '--check[Exit 1 when an owner is flagged]' \
                 '--warn-sets[Flag owners above N estimated helper sets]:count:' \
                 '--warn-gb[Flag owners above G GB helper memory]:gigabytes:'
+            ;;
+        paths)
+            _arguments '--json[Machine-readable output]'
+            ;;
+        state)
+            if (( CURRENT == 3 )); then
+                local -a state_cmds=('fix-modes:Make data and costs private')
+                _describe "state commands" state_cmds
+            elif [[ "${words[3]}" == fix-modes ]]; then
+                _arguments '--dry-run[List the changes only]'
+            fi
             ;;
         release)
             if (( CURRENT == 3 )); then
