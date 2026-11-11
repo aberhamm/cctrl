@@ -12,8 +12,18 @@ pane (a sub-agent's too) inherits `$TMUX`. A bare `tmux kill-server` there
 kills the server the session itself runs on. On 2026-10-09 one such cleanup
 line killed a whole fleet (docs/findings/tmux-untargeted-default-server.md).
 
-This is an accident guard, not a security boundary. It reads the command
-text only: it starts nothing, opens no file and never calls tmux. A script
+It also blocks a kill-server that does name a server, when that server is
+one of cctrl's: the default server, the primary (tmuxServer /
+CCTRL_TMUX_SERVER, "fleet" on the Studio), any extra server (tmuxExtraServers
+/ CCTRL_TMUX_EXTRA_SERVERS) and the $TMUX server itself, by -L name or by -S
+path (normalised: /tmp vs /private/tmp, //, ./, ..). `resolve_servers()`
+reads those the same way cctrl does (audit 2026-11 H3, mdec-1111); when a
+config file cannot be read it fails safe and also blocks any -L name and any
+-S path inside a tmux socket directory.
+
+This is an accident guard, not a security boundary. The parser reads the
+command text only: it starts nothing and never calls tmux (only
+`resolve_servers()` reads cctrl's config files). A script
 written to a file and run later, or a command hidden behind a function or a
 variable set in an earlier call, is out of its reach. When the parse is
 uncertain it prefers to block (see the plan for the list).
@@ -21,6 +31,9 @@ uncertain it prefers to block (see the plan for the list).
 
 from __future__ import annotations
 
+import json
+import os
+import posixpath
 import re
 
 MAX_DEPTH = 6
@@ -43,6 +56,15 @@ _HEREDOC_WORD_RE = re.compile(r"[A-Za-z_]")
 _SHELL_VAR_RE = re.compile(r"^\$\{?(?:SHELL|BASH|ZSH_NAME|ZSH)\b")
 _VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)")
 _HEREDOC_OPEN_RE = re.compile(r"<<(-?)[ \t]*((?:\\|'|\")?[A-Za-z_][A-Za-z0-9_]*['\"]?)")
+_ANSI_SEG_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'?", re.S)
+# A socket in a tmux socket directory: .../tmp/tmux-<uid>/<name> (also
+# ${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/<name>).
+_NAMED_SOCK_RE = re.compile(r"/tmp\}?/tmux-[^/]+/([^/]+)$")
+_SOCK_DIR_NAME_RE = re.compile(r"^tmux-[^/]+$")
+_SOCK_ARG_RE = re.compile(r"(?<![\w$-])-[0-9A-Za-z]*([SL])[ \t]*([^\s;&|]*)")
+# Servers protected even when no config names them: tmux's default server and
+# the name cctrl's docs give the primary.
+BUILTIN_NAMES = frozenset({"default", "fleet"})
 _ANSI_SIMPLE = {
     "n": "\n", "t": "\t", "\\": "\\", "'": "'", '"': '"', "a": "\a",
     "b": "\b", "e": "\x1b", "f": "\f", "r": "\r", "v": "\v",
@@ -88,31 +110,307 @@ def _dequote(text):
     return re.sub(r"[\\'\"]", "", text.replace("\\\n", ""))
 
 
+def _ansi_decode(body):
+    """The value of the body of an ANSI-C quoted string ($'...')."""
+    out = []
+    i, n = 0, len(body)
+    while i < n:
+        if body[i] == "\\" and i + 1 < n:
+            e = body[i + 1]
+            if e in _ANSI_SIMPLE:
+                out.append(_ANSI_SIMPLE[e])
+                i += 2
+                continue
+            m = _ANSI_NUM_RE.match(body, i + 1)
+            if m:
+                if m.group(3) is not None:
+                    code = int(m.group(3), 8)
+                else:
+                    code = int(m.group(1) or m.group(2), 16)
+                out.append(chr(code))
+                i = m.end()
+                continue
+            out.append(e)
+            i += 2
+            continue
+        out.append(body[i])
+        i += 1
+    return "".join(out)
+
+
+def _flatten(text):
+    """_dequote after decoding $'...' (ANSI-C) and dropping the $ of $"..."
+    (locale quoting): `tmux kill-$'server'` and `kill-$'\\x73'erver` read
+    kill-server here, where plain _dequote leaves `kill-$server`."""
+    text = _ANSI_SEG_RE.sub(lambda m: _ansi_decode(m.group(1)), text)
+    return _dequote(text.replace('$"', '"'))
+
+
+def may_mention_kill(text):
+    """Cheap pre-check (no parse) for hooks/pre-tool-use.py: could this text
+    spell the kill once the shell has removed its quoting? Any $'...' or
+    $"..." counts as maybe, since an escape can spell any letter."""
+    return "kill-ser" in _dequote(text) or "$'" in text or '$"' in text
+
+
 def _mentions_kill(text):
-    return "kill-ser" in _dequote(text)
+    return "kill-ser" in _dequote(text) or "kill-ser" in _flatten(text)
 
 
-def _loose(text):
+class Servers:
+    """The tmux servers a named kill-server must not hit (besides the
+    inherited one, which the parser also finds as $TMUX / socket_path).
+
+    names: -L names (and the last part of a -S path in a tmux socket dir).
+    paths: socket paths, kept as normalised keys (see _sock_keys).
+    known: False when a config file could not be read; the guard then also
+    blocks any -L name and any -S path inside a tmux socket directory."""
+    __slots__ = ("names", "paths", "known", "socket_dir", "home")
+
+    def __init__(self, names=(), paths=(), known=True, socket_dir="", home=None):
+        self.home = os.environ.get("HOME", "") if home is None else home
+        self.names = BUILTIN_NAMES | frozenset(n for n in names if n)
+        keys = set()
+        for path in paths:
+            if path:
+                keys |= _sock_keys(path, self.home)
+        self.paths = frozenset(keys)
+        self.known = known
+        self.socket_dir = socket_dir
+
+
+def _strip_private(path):
+    return re.sub(r"^/private(?=/(?:tmp|var|etc)(?:/|$))", "", path)
+
+
+def _sock_keys(path, home=""):
+    """Normalised forms of a socket path: ~ expanded, //, ./ and .. folded,
+    /private/tmp read as /tmp, and the directory's physical path when it
+    exists. Two paths name one socket when their key sets meet."""
+    if path == "~" or path.startswith("~/"):
+        path = home + path[1:]
+    if not path.startswith("/"):
+        return {path}
+    lexical = re.sub(r"^/+", "/", posixpath.normpath(path))
+    keys = {lexical, _strip_private(lexical)}
+    directory, base = posixpath.split(lexical)
+    try:
+        if directory and os.path.isdir(directory):
+            keys.add(_strip_private(posixpath.join(os.path.realpath(directory), base)))
+    except (OSError, ValueError):
+        pass
+    return keys
+
+
+DEFAULT_SERVERS = Servers()
+
+
+def _expand_known(text, home):
+    """A best-effort value of a -S/-L word that is not literal: $HOME, $UID
+    and $(id -u) are replaced by what they mean here, ${VAR:-word} by word."""
+    uid = str(os.getuid())
+    text = re.sub(r"\$\{HOME\}|\$HOME(?![A-Za-z0-9_])", lambda m: home, text)
+    text = re.sub(r"\$\{UID\}|\$UID(?![A-Za-z0-9_])|\$\(id -u\)|`id -u`", uid, text)
+    # ${VAR:-word} / ${VAR-word} / ${VAR:=word}: read as its default word.
+    return re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=]([^}$]*)\}", lambda m: m.group(1), text)
+
+
+def _sock_path_problem(text, literal, servers):
+    """Why a -S path names a protected server, or None."""
+    for cand in ([text] if literal else [text, _expand_known(text, servers.home)]):
+        m = _NAMED_SOCK_RE.search(cand)
+        if m and m.group(1) in servers.names:
+            return "-S names the %r server's socket" % m.group(1)
+        if not cand.startswith(("/", "~")):
+            continue
+        keys = _sock_keys(cand, servers.home)
+        if keys & servers.paths:
+            return "-S names a cctrl tmux server (the primary, an extra or the inherited one)"
+        for key in keys:
+            m = _NAMED_SOCK_RE.search(key)
+            if m and m.group(1) in servers.names:
+                return "-S names the %r server's socket" % m.group(1)
+        if not servers.known:
+            dirs = _sock_keys(servers.socket_dir, servers.home) if servers.socket_dir else set()
+            for key in keys:
+                directory = posixpath.dirname(key)
+                if _SOCK_DIR_NAME_RE.match(posixpath.basename(directory)) or directory in dirs:
+                    return ("-S is in a tmux socket directory and cctrl's tmux config could not be read "
+                            "(cannot tell a private server from the fleet's)")
+    return None
+
+
+def _sock_name_problem(name, servers):
+    """Why a -L name names a protected server, or None."""
+    if name in servers.names:
+        if name == "default":
+            return "-L default names the default server"
+        return "-L %s names a cctrl tmux server" % name
+    if (servers.socket_dir and "/" not in name
+            and _sock_keys(servers.socket_dir + "/" + name, servers.home) & servers.paths):
+        return "-L %s names a cctrl tmux server" % name
+    if not servers.known:
+        return "-L %s, and cctrl's tmux config could not be read (cannot tell it from the fleet's)" % name
+    return None
+
+
+def _loose(text, servers=DEFAULT_SERVERS):
     """Regex fallback for text that is not parsed as shell (another language's
     code, a parse that failed or nested too deep). True when a tmux word is
-    followed by the kill with no -S/-L token between them."""
-    flat = _dequote(text)
-    marks = [m.start() for m in TMUX_RE.finditer(flat)]
-    for n, start in enumerate(marks):
-        end = marks[n + 1] if n + 1 < len(marks) else len(flat)
-        region = flat[start:end]
-        kill = KILL_RE.search(region)
-        if kill and not _SOCK_FLAG_RE.search(region[:kill.start()]):
-            return True
+    followed by the kill with no -S/-L token between them, or with one that
+    names a protected server."""
+    for flat in {_dequote(text), _flatten(text)}:
+        marks = [m.start() for m in TMUX_RE.finditer(flat)]
+        for n, start in enumerate(marks):
+            end = marks[n + 1] if n + 1 < len(marks) else len(flat)
+            region = flat[start:end]
+            kill = KILL_RE.search(region)
+            if not kill:
+                continue
+            before = region[:kill.start()]
+            if not _SOCK_FLAG_RE.search(before):
+                return True
+            for m in _SOCK_ARG_RE.finditer(before):
+                value = m.group(2)
+                if value == "" or _INHERITED_SOCK_RE.search(value):
+                    return True
+                if m.group(1) == "L":
+                    if "$" not in value and _sock_name_problem(value, servers):
+                        return True
+                elif _sock_path_problem(value, False, servers):
+                    return True
     return False
+
+
+def _env_list(value):
+    return [part.strip() for part in re.split(r"[,\n]", value or "") if part.strip()]
+
+
+def _socket_dir(environ):
+    """tmux's -L socket dir, physical (cctrl _tmux_socket_dir)."""
+    base = environ.get("TMUX_TMPDIR") or "/tmp"
+    if base != "/":
+        base = base.rstrip("/")
+    try:
+        if os.path.isdir(base):
+            base = os.path.realpath(base)
+    except (OSError, ValueError):
+        pass
+    return "%s/tmux-%d" % (base, os.getuid())
+
+
+def _config_files(environ, script_dir):
+    """cctrl's config files, highest precedence first (cctrl CONFIG_LOCAL_FILE,
+    CONFIG_USER_FILE, CONFIG_FILE)."""
+    files = [environ.get("CCTRL_CONFIG_LOCAL") or os.path.join(script_dir, "data", "config.local.json")]
+    user = environ.get("CCTRL_USER_CONFIG") or ""
+    if not user and environ.get("HOME"):
+        xdg = environ.get("XDG_CONFIG_HOME") or ""
+        user = (xdg + "/cctrl" if xdg.startswith("/") else environ["HOME"] + "/.config/cctrl") + "/config.json"
+    if user:
+        files.append(user)
+    files.append(os.path.join(script_dir, "data", "config.json"))
+    return files
+
+
+def _config_value(key, files, problems):
+    """The value of key from the first config file that has it, read the way
+    cctrl's _tmux_config_value reads it (a list joined with commas, null ""),
+    or None. A file that exists but cannot be read or parsed is added to
+    problems: cctrl skips it, the guard then fails safe."""
+    for path in files:
+        try:
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8") as handle:
+                text = handle.read()
+        except (OSError, ValueError):
+            problems.append(path)
+            continue
+        if '"%s"' % key not in text:
+            continue
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            problems.append(path)
+            continue
+        if not isinstance(doc, dict) or key not in doc:
+            continue
+        value = doc[key]
+        if value is None:
+            return ""
+        if isinstance(value, list):
+            return ",".join(v if isinstance(v, str) else json.dumps(v) for v in value)
+        return value if isinstance(value, str) else json.dumps(value)
+    return None
+
+
+def _server_sock(value, environ, socket_dir):
+    """cctrl's _tmux_server_sock: a value with "/" is a path, any other a -L
+    name in the socket dir. None for an unusable value."""
+    if not value:
+        return None
+    if value.startswith("~/"):
+        value = (environ.get("HOME") or "") + value[1:]
+    if "/" in value:
+        return value
+    if value in (".", "..") or re.search(r"\s", value):
+        return None
+    return socket_dir + "/" + value
+
+
+def resolve_servers(environ=None, script_dir=None):
+    """The Servers to protect, resolved the way cctrl's _tmux_srv_init does:
+    env CCTRL_TMUX_SERVER, else tmuxServer from the first config file that
+    sets it; CCTRL_TMUX_EXTRA_SERVERS, else tmuxExtraServers (comma separated
+    or a JSON array; protected even when no primary is set). Also what cctrl
+    exported to this process (_CCTRL_TMUX_PRIMARY, _CCTRL_TMUX_EXTRA) and the
+    $TMUX socket. Never raises: an error reads as an unknown config (fail
+    safe)."""
+    try:
+        environ = os.environ if environ is None else environ
+        if script_dir is None:
+            script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        socket_dir = _socket_dir(environ)
+        files = _config_files(environ, script_dir)
+        problems = []
+        primary = environ.get("CCTRL_TMUX_SERVER") or ""
+        if not primary:
+            primary = _config_value("tmuxServer", files, problems) or ""
+        extra = environ.get("CCTRL_TMUX_EXTRA_SERVERS") or ""
+        if not extra:
+            extra = _config_value("tmuxExtraServers", files, problems) or ""
+        names, paths = set(), set()
+        for value in [primary.strip()] + _env_list(extra):
+            sock = _server_sock(value, environ, socket_dir)
+            if sock is None:
+                continue
+            paths.add(sock)
+            if "/" not in value:
+                names.add(value)
+        exported = [environ.get("_CCTRL_TMUX_PRIMARY") or ""] + _env_list(environ.get("_CCTRL_TMUX_EXTRA"))
+        current = (environ.get("TMUX") or "").split(",", 1)[0]
+        for sock in exported + [current]:
+            if sock:
+                paths.add(sock)
+        for sock in paths:
+            directory, base = posixpath.split(sock)
+            if base and _SOCK_DIR_NAME_RE.match(posixpath.basename(directory)):
+                names.add(base)
+        home = environ.get("HOME") or ""
+        return Servers(names, paths, known=not problems, socket_dir=socket_dir,
+                       home=home if isinstance(home, str) else "")
+    except Exception:
+        return Servers(known=False)
 
 
 class _Ctx:
     """State of one check_command call."""
-    __slots__ = ("full", "has_tmux", "seen", "assigned")
+    __slots__ = ("full", "has_tmux", "seen", "assigned", "servers")
 
-    def __init__(self, full):
+    def __init__(self, full, servers=DEFAULT_SERVERS):
         self.full = full
+        self.servers = servers
         self.has_tmux = re.search("tmux", full, re.I) is not None
         self.seen = set()   # texts already checked and found clean
         self.assigned = {}  # NAME -> value of the NAME=value words seen so far
@@ -406,29 +704,10 @@ class _Lexer:
     def _ansi(self, i, buf):
         """After $' : ANSI-C quoting. Returns the next index."""
         s, n = self.s, self.n
-        out = []
+        start = i
         while i < n and s[i] != "'":
-            if s[i] == "\\" and i + 1 < n:
-                e = s[i + 1]
-                if e in _ANSI_SIMPLE:
-                    out.append(_ANSI_SIMPLE[e])
-                    i += 2
-                    continue
-                m = _ANSI_NUM_RE.match(s, i + 1)
-                if m:
-                    if m.group(3) is not None:
-                        code = int(m.group(3), 8)
-                    else:
-                        code = int(m.group(1) or m.group(2), 16)
-                    out.append(chr(code))
-                    i = m.end()
-                    continue
-                out.append(e)
-                i += 2
-                continue
-            out.append(s[i])
-            i += 1
-        buf.append("".join(out))
+            i += 2 if (s[i] == "\\" and i + 1 < n) else 1
+        buf.append(_ansi_decode(s[start:min(i, n)]))
         return i + 1
 
     def _word(self, i):
@@ -505,21 +784,35 @@ def _socket_problem(sock_s, sock_l, ctx):
             return "-S resolves to the inherited server ($TMUX / socket_path)"
         if _DEFAULT_SOCK_RE.search(text):
             return "-S names the default server's socket"
+        problem = _sock_path_problem(text, literal, ctx.servers)
+        if problem:
+            return problem
         if not literal and "/" not in text and _DEFAULT_SOCK_DIR_RE.search(ctx.full):
             return "-S is a variable and the line names the default socket directory (/tmp/tmux-<uid>)"
         for var in _VAR_RE.findall(text) if not literal else ():
             value = ctx.assigned.get(var, "")
-            if _INHERITED_SOCK_RE.search(value) or _DEFAULT_SOCK_RE.search(value):
-                return "-S is $%s, which this line set from the inherited or the default server" % var
+            if (_INHERITED_SOCK_RE.search(value) or _DEFAULT_SOCK_RE.search(value)
+                    or (value and _sock_path_problem(value, False, ctx.servers))):
+                return "-S is $%s, which this line set from the inherited, the default or a cctrl server" % var
         return None
     if sock_l is not None:
         text, literal = sock_l
         if text == "" and literal:
             return "-L has an empty name"
-        if text == "default":
-            return "-L default names the default server"
         if _INHERITED_SOCK_RE.search(text):
             return "-L is built from the inherited server ($TMUX / socket_path)"
+        if literal:
+            return _sock_name_problem(text, ctx.servers)
+        for var in _VAR_RE.findall(text):
+            value = ctx.assigned.get(var, "")
+            problem = _sock_name_problem(value, ctx.servers) if value else None
+            if problem:
+                return "-L is $%s, which this line set: %s" % (var, problem)
+        default = _expand_known(text, ctx.servers.home)
+        if default != text and "$" not in default and default in ctx.servers.names:
+            return "-L %s defaults to a cctrl tmux server: %s" % (text, _sock_name_problem(default, ctx.servers))
+        if not ctx.servers.known:
+            return "-L is a variable and cctrl's tmux config could not be read (cannot tell it from the fleet's)"
         return None
     return "no -S/-L on this tmux invocation"
 
@@ -788,7 +1081,7 @@ def _check_text(text, depth, ctx):
     if text in ctx.seen:
         return None
     if depth > MAX_DEPTH or len(ctx.seen) >= MAX_STEPS:
-        return "too nested to parse; tmux kill-server without -S/-L" if _loose(text) else None
+        return "too nested to parse; tmux kill-server without -S/-L" if _loose(text, ctx.servers) else None
     cmds, subs = _Lexer(text).run()
     for sub in subs:
         reason = _check_text(sub, depth + 1, ctx)
@@ -809,19 +1102,23 @@ def _check_text(text, depth, ctx):
     return None
 
 
-def check_command(command):
+def check_command(command, servers=None):
     """A reason (str) when the command would run `tmux kill-server` against a
-    server its tmux invocation does not name; None when it would not. Never
-    raises: a parser error falls back to the regex check."""
+    server its tmux invocation does not name, or names but is one of cctrl's
+    (servers: a Servers; default the built-in names only; the hook passes
+    resolve_servers()). None when it would not. Never raises: a parser error
+    falls back to the regex check."""
+    if not isinstance(servers, Servers):
+        servers = DEFAULT_SERVERS
     if not isinstance(command, str) or not _mentions_kill(command):
         return None
     try:
         if len(command) > MAX_LEN:
-            return "command too long to parse; tmux kill-server without -S/-L" if _loose(command) else None
-        return _check_text(command, 0, _Ctx(command))
+            return "command too long to parse; tmux kill-server without -S/-L" if _loose(command, servers) else None
+        return _check_text(command, 0, _Ctx(command, servers))
     except Exception:  # fail open unless the fallback itself is a positive match
         try:
-            return "could not parse the command; tmux kill-server without -S/-L" if _loose(command) else None
+            return "could not parse the command; tmux kill-server without -S/-L" if _loose(command, servers) else None
         except Exception:
             return None
 
@@ -836,8 +1133,9 @@ def block_message(reason):
         "Do this instead:\n"
         "  - kill only your own sessions, by exact name:  tmux -S \"<your socket>\" kill-session -t '=NAME'\n"
         "  - or kill your own private server:             tmux -S \"<your socket>\" kill-server\n"
-        "The socket flag (-S <path>, or -L <name> other than \"default\") must be on the same tmux invocation\n"
-        "as kill-server. An environment prefix (TMUX_TMPDIR=..., env -u TMUX) does not count.\n"
+        "The socket flag (-S <path>, or -L <name>) must be on the same tmux invocation as kill-server, and it\n"
+        "must not name the default server, the inherited one or a cctrl server (the primary, e.g. -L fleet,\n"
+        "or a tmuxExtraServers entry). An environment prefix (TMUX_TMPDIR=..., env -u TMUX) does not count.\n"
         "If the words are only text (a note, a brief, a commit message): pass them as one quoted argument\n"
         "or write them to a file with a quoted here-document (<<'EOF').\n"
     ) % reason

@@ -12443,7 +12443,7 @@ _peer_doorbell_eval_inner() {
     # enforce: the fast path keeps only level-session mail from an allowlisted
     # role (sealed fields are checked on the slow path), and the baseline is
     # the later of baseline_at and attestation_since.
-    case "$attest_mode" in off|warn|enforce) ;; *) attest_mode=warn ;; esac
+    case "$attest_mode" in off|warn|enforce) ;; *) attest_mode=enforce ;; esac
     local attest_fast=""
     if [[ "$attest_mode" == enforce ]]; then
         [[ "$attest_since" == "invalid" ]] && { _peer_doorbell_dbg "off: attestation enforce with an invalid attestation_since (fail closed)"; return 0; }
@@ -12883,18 +12883,21 @@ _peer_doorbell_enabled_for() { # peer_json -> 0 when the doorbell is enabled FOR
 }
 
 # Plan 111 phase 3: attestation mode. doorbell.json `attestation`: off | warn
-# | enforce. Absent or null -> warn, the live default. An unknown value also
-# reads warn (it never acts) and `peer doctor` flags it. `attestation_since`
+# | enforce. Absent or null -> warn, the live default. Any other value (a
+# typo such as "enforced", a wrong case, a number, an object, "") FAILS
+# CLOSED: it reads enforce, so a typo can never silently turn gating off,
+# and `peer doctor` flags it (audit 2026-11 H2, mdec-1111). `attestation_since`
 # (ISO UTC, set at the enforce flip): mail created at or before it never
 # pushes or rings in enforce. The effective since is the later of it and
 # baseline_at; a malformed attestation_since reads "invalid", which makes no
 # mail eligible (fail closed; only acted on in enforce).
 PEER_ATTEST_CFG_JQ='
 def attest_iso_ok: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$");
-def attest_mode_valid: type != "object" or (has("attestation") | not) or .attestation == null
-    or (.attestation as $a | ["off", "warn", "enforce"] | index($a)) != null;
-def attest_mode: if type == "object" and (.attestation as $a | ["off", "warn", "enforce"] | index($a)) != null
-    then .attestation else "warn" end;
+def attest_mode_known: (.attestation | type) == "string" and (.attestation | IN("off", "warn", "enforce"));
+def attest_mode_valid: type != "object" or (has("attestation") | not) or .attestation == null or attest_mode_known;
+def attest_mode: if type != "object" or (has("attestation") | not) or .attestation == null then "warn"
+    elif attest_mode_known then .attestation
+    else "enforce" end;
 def attest_since: if type != "object" then ""
     elif (.attestation_since // null) != null and (.attestation_since | attest_iso_ok | not) then "invalid"
     else ([.attestation_since, .baseline_at] | map(select(attest_iso_ok)) | max // "") end;
@@ -12941,7 +12944,8 @@ def attest_sender_ok($s; $from; $session; $role; $kind):
 # PEER_ATTEST_SINCE_RAW and PEER_ATTEST_ALLOW (phase 4: the resolved push
 # allowlist, attest_allow as compact JSON; "" = the built-in default).
 # Optional $1: the doorbell.json document already read. Unreadable config ->
-# warn, which acts on nothing.
+# warn, which acts on nothing (the doorbell then reads not enabled, so nothing
+# pushes). A present but unknown attestation value -> enforce (fail closed).
 _peer_attestation_cfg() {
     local cfg="${1:-}" out=""
     PEER_ATTEST_MODE=warn; PEER_ATTEST_MODE_VALID=true; PEER_ATTEST_SINCE=""; PEER_ATTEST_SINCE_RAW=""; PEER_ATTEST_ALLOW=""
@@ -12951,7 +12955,7 @@ _peer_attestation_cfg() {
         (if type == "object" then (.attestation_since // "" | tostring | gsub("[\n\r]"; " ")) else "" end),
         (try (attest_allow | tojson) catch ""), "."' <<< "${cfg:-null}" 2>/dev/null)" || return 0
     { IFS= read -r PEER_ATTEST_MODE; IFS= read -r PEER_ATTEST_MODE_VALID; IFS= read -r PEER_ATTEST_SINCE; IFS= read -r PEER_ATTEST_SINCE_RAW; IFS= read -r PEER_ATTEST_ALLOW; } <<< "$out"
-    case "$PEER_ATTEST_MODE" in off|warn|enforce) ;; *) PEER_ATTEST_MODE=warn ;; esac
+    case "$PEER_ATTEST_MODE" in off|warn|enforce) ;; *) PEER_ATTEST_MODE=enforce ;; esac
     [[ "$PEER_ATTEST_ALLOW" == "{"*"}" ]] || PEER_ATTEST_ALLOW=""
     return 0
 }
@@ -13851,7 +13855,7 @@ _peer_doctor_eligibility_check() {
              window_days: 7, total: ($l | length), push_eligible: $push, bell_only: $bell, not_eligible: $none,
              would_block_senders: $blocked, log_lines: $log,
              push_senders: {source: $al.source, default: $al.default, recipients: $al.recipients},
-             summary: ("mode " + (if $valid == "true" then $mode else "INVALID \(($cfg // {}).attestation | tojson) (reads warn)" end)
+             summary: ("mode " + (if $valid == "true" then $mode else "INVALID \(($cfg // {}).attestation | tojson) (reads enforce: fail closed)" end)
                + (if $mode == "enforce" then " (gating on)" elif $mode == "warn" then " (logs only, delivery unchanged)" else " (no eligibility logging)" end)
                + (if $since == "invalid" then "; attestation_since INVALID \($raw | tojson): nothing is eligible" elif $raw != "" then "; attestation_since \($raw)" else "" end)
                + "; " + $allow_text
@@ -21345,7 +21349,8 @@ _hooks_run() {
         echo "Usage: cctrl hooks run <name>"
         echo ""
         echo "  pre-tool-use   Checks on Bash tool calls. BLOCKS (exit 2) a 'tmux kill-server' without"
-        echo "                 -S/-L on that tmux invocation; warns (exit 1, no block) on a git commit"
+        echo "                 -S/-L on that tmux invocation, or naming the default, \$TMUX or a cctrl server"
+        echo "                 (tmuxServer/tmuxExtraServers, e.g. -L fleet); warns (exit 1, no block) on a git commit"
         echo "  stop           Peer doorbell (plan 108; exit 2 on new mail, only when enabled), then"
         echo "                 post-turn logging and notifications"
         echo "  notify         Push notification on agent events"

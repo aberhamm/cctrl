@@ -4,8 +4,10 @@ PreToolUse (Bash) entry point of `cctrl hooks run pre-tool-use`. One process,
 two checks on the same stdin payload:
 
   1. tmux guard (docs/plans/107): BLOCKS (exit 2, reason on stderr) a command
-     that would run `tmux kill-server` without -S/-L on that tmux invocation.
-     The parser is hooks/tmux_kill_guard.py.
+     that would run `tmux kill-server` without -S/-L on that tmux invocation,
+     or with one that names the default server, the $TMUX server or one of
+     cctrl's servers (tmuxServer / tmuxExtraServers, e.g. -L fleet; audit
+     2026-11 H3). The parser is hooks/tmux_kill_guard.py.
   2. hooks/block-git-commit.py: the advisory git-commit warning (exit 1),
      unchanged.
 
@@ -40,13 +42,21 @@ def _tmux_guard(raw):
     """Exit status 2 after printing the reason, or None to let the call go on."""
     try:
         command = _command(json.loads(raw))
-        # Cheap pre-check so the common call never imports the parser.
-        if not command or "kill-ser" not in re.sub(r"[\\'\"]", "", command.replace("\\\n", "")):
+        # Cheap pre-check so the common call never imports the parser. It
+        # must not miss what the shell would turn into the kill: quotes and
+        # backslashes are dropped, and any $'...' / $"..." (ANSI-C or locale
+        # quoting, which can spell any letter: kill-$'server') goes to the
+        # parser too (audit 2026-11 H3). Same rule as
+        # tmux_kill_guard.may_mention_kill, kept inline so no import is needed.
+        if not command or ("kill-ser" not in re.sub(r"[\\'\"]", "", command.replace("\\\n", ""))
+                           and "$'" not in command and '$"' not in command):
             return None
         sys.dont_write_bytecode = True  # never write __pycache__ into a release
         sys.path.insert(0, HERE)
         import tmux_kill_guard
-        reason = tmux_kill_guard.check_command(command)
+        # The fleet's own servers (tmuxServer / tmuxExtraServers, as cctrl
+        # resolves them): a kill-server that names one is blocked too.
+        reason = tmux_kill_guard.check_command(command, tmux_kill_guard.resolve_servers())
         if reason:
             sys.stderr.write(tmux_kill_guard.block_message(reason))
             return 2

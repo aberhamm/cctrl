@@ -1636,8 +1636,10 @@ reads `sender: user (not an agent session; cctrl cannot confirm it is the
 operator) - reply in this conversation, not via cctrl`.
 
 Attestation mode (plan 111 phase 3) is `attestation` in `data/doorbell.json`:
-`off`, `warn` or `enforce`; absent (or an unknown value) means `warn`, the live
-default. A message is eligible when its seal verifies, its sender attested
+`off`, `warn` or `enforce`; absent (or `null`) means `warn`, the live
+default. Any other value (a typo such as `"enforced"`, `"WARN"`, a number, a
+list, `""`) **fails closed**: it reads `enforce`, and `peer doctor` shows it as
+`mode INVALID ... (reads enforce: fail closed)` (audit 2026-11 H2). A message is eligible when its seal verifies, its sender attested
 level session, it is not a replay (a duplicate id, or a queued line that
 records a delivery or ack), it was created after `attestation_since` and
 `baseline_at`, and its sender is on the recipient's push allowlist: pushes
@@ -2150,8 +2152,21 @@ once killed a whole fleet.
   chain. A `-S`/`-L` on a different tmux call of the same line does not count.
   `-L default`, `-S "$TMUX..."` and `-S /tmp/tmux-<uid>/default` are blocked
   too: they name the inherited or the default server.
-- Allowed: `tmux -S "$D/sock" kill-server`, `tmux -L <name> kill-server`,
-  and the words as text only (a `grep` pattern, `echo`, a commit message, a
+- cctrl's own servers are blocked by name and by path too (audit 2026-11 H3):
+  the primary (`tmuxServer` / `CCTRL_TMUX_SERVER`, e.g. `-L fleet` or
+  `-S /private/tmp/tmux-<uid>/fleet`), every `tmuxExtraServers` /
+  `CCTRL_TMUX_EXTRA_SERVERS` entry and the `$TMUX` server's socket. The guard
+  resolves them the way cctrl does (env first, then `config.local.json`, the
+  user config, `data/config.json`; a name is `-L NAME`, a value with `/` is
+  `-S PATH`). `-S` paths are normalised (`/tmp` vs `/private/tmp`, `//`,
+  `./`, `..`, `~`, `$HOME`, `${VAR:-default}`). `default` and `fleet` are
+  protected even with no config. If a config file cannot be read or parsed,
+  the guard fails safe: any `-L` name and any `-S` path inside a
+  `tmux-<uid>` socket directory is blocked too.
+- `$'...'` (ANSI-C) and `$"..."` quoting cannot hide the kill
+  (`tmux kill-$'server'`, `$'kill-\x73erver'`): they are decoded first.
+- Allowed: `tmux -S "$D/sock" kill-server`, `tmux -L <name> kill-server` for
+  a name that is not one of the above, and the words as text only (a `grep` pattern, `echo`, a commit message, a
   quoted here-document written to a file, a comment).
 - Uncertain parses block (a socket flag held in a variable, a variable as the
   command name on a line that mentions tmux). The message names the safe

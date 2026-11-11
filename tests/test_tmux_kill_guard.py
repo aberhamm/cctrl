@@ -8,6 +8,7 @@ payload on stdin (it reads the payload and never runs the command)."""
 # tmux-lint: allow-file (the table of blocked and allowed command strings; none is ever run)
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -281,6 +282,92 @@ ALLOW = [
 ]
 
 
+# Audit 2026-11 H3 (mdec-1111): $'...' / $"..." quoting spells the kill. These
+# block with no config at all (the built-in servers).
+BLOCK_ANSI = [
+    "tmux kill-$'server'",
+    "tmux kill-se$'r'ver",
+    "tmux $'kill-\\x73erver'",
+    "tmux $'kill-\\163erver'",
+    "tmux $'\\x6bill-server'",
+    "tmux $'kill-\\u0073erver'",
+    "tmux kill-$\"server\"",
+    "$'tmux' kill-$'server'",
+    "$'\\x74mux' kill-server",
+    "bash -c $'tmux kill-\\x73erver'",
+    "tmux -L $'fleet' kill-server",
+    "tmux -S $'/tmp/tmux-501/fleet' kill-server",
+]
+
+# Audit 2026-11 H3: a kill-server that names one of cctrl's servers. Checked
+# with FLEET_ENV below: primary "fleet", extras "spare" and a path.
+FLEET_ENV = {
+    "HOME": "/Users/nobody",
+    "CCTRL_TMUX_SERVER": "fleet",
+    "CCTRL_TMUX_EXTRA_SERVERS": "spare, /Users/nobody/socks/side",
+}
+BLOCK_FLEET = [
+    "tmux -L fleet kill-server",
+    "tmux -Lfleet kill-server",
+    "tmux -L 'fleet' kill-server",
+    "tmux -L fl\"ee\"t kill-server",
+    "tmux -uL fleet kill-server",
+    "tmux -L fleet kill-ser",
+    "tmux -L fleet kill-$'server'",
+    "/opt/homebrew/bin/tmux -L fleet kill-server",
+    "env -u TMUX tmux -L fleet kill-server",
+    "TMUX_TMPDIR=/tmp/x tmux -L fleet kill-server",
+    "tmux -S /private/tmp/tmux-501/fleet kill-server",
+    "tmux -S /tmp/tmux-501/fleet kill-server",
+    "tmux -S /tmp//tmux-501/fleet kill-server",
+    "tmux -S /tmp/tmux-501/./fleet kill-server",
+    "tmux -S /tmp/x/../tmux-501/fleet kill-server",
+    "tmux -S //private/tmp/tmux-501/fleet kill-server",
+    "tmux -S \"${TMUX_TMPDIR:-/tmp}/tmux-$(id -u)/fleet\" kill-server",
+    "S=/tmp/tmux-501/fleet; tmux -S \"$S\" kill-server",
+    "N=fleet; tmux -L \"$N\" kill-server",
+    "tmux -L \"${N:-fleet}\" kill-server",
+    "tmux -L fle\\et kill-server",
+    "tmux -S \"${SOCK:-/tmp/tmux-501/fleet}\" kill-server",
+    "tmux -L spare kill-server",
+    "tmux -S /tmp/tmux-501/spare kill-server",
+    "tmux -S /Users/nobody/socks/side kill-server",
+    "tmux -S /Users/nobody/socks//side kill-server",
+    "tmux -S \"$HOME/socks/side\" kill-server",
+    "bash -c 'tmux -L fleet kill-server'",
+    "ssh studio 'tmux -L fleet kill-server'",
+    "sh -c \"tmux -S /private/tmp/tmux-501/fleet kill-server\"",
+    "python3 -c \"import os; os.system('tmux -L fleet kill-server')\"",
+    # the default server's socket, unnormalised (the audit's other -S finding)
+    "tmux -S /tmp//tmux-501/default kill-server",
+    "tmux -S /tmp/tmux-501/./default kill-server",
+]
+# Must stay allowed with the fleet config: other servers, other commands, text.
+ALLOW_FLEET = [
+    "tmux -L probe kill-server",
+    "tmux -L fleetx kill-server",
+    "tmux -L \"$name\" kill-server",
+    "tmux -S /tmp/tmux-501/probe kill-server",
+    "tmux -S /Users/nobody/socks/other kill-server",
+    "tmux -L fleet ls",
+    "tmux -L fleet list-sessions",
+    "tmux -L fleet kill-session -t '=mine'",
+    "tmux -S /private/tmp/tmux-501/fleet list-sessions",
+    "echo 'tmux -L fleet kill-server'",
+    "grep -rn 'tmux -L fleet kill-server' docs/",
+    "git commit -m 'guard: block tmux -L fleet kill-server'",
+    "echo $'never run tmux kill-server'",
+    "printf $'%s\\n' done",
+]
+
+
+def fleet_servers(**extra):
+    env = dict(FLEET_ENV)
+    env.update(extra)
+    with tempfile.TemporaryDirectory() as tmp:
+        return guard.resolve_servers(environ=env, script_dir=tmp)
+
+
 class ParserTests(unittest.TestCase):
     def test_blocks(self):
         for command in BLOCK:
@@ -298,6 +385,50 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(BLOCK), len(set(BLOCK)))
         self.assertEqual(len(ALLOW), len(set(ALLOW)))
         self.assertFalse(set(BLOCK) & set(ALLOW))
+        blocked = set(BLOCK) | set(BLOCK_ANSI) | set(BLOCK_FLEET)
+        self.assertEqual(len(BLOCK_ANSI) + len(BLOCK_FLEET), len(set(BLOCK_ANSI) | set(BLOCK_FLEET)))
+        self.assertFalse(blocked & (set(ALLOW) | set(ALLOW_FLEET)))
+
+    def test_ansi_c_quoting_cannot_hide_the_kill(self):
+        for command in BLOCK_ANSI:
+            with self.subTest(command=command):
+                self.assertTrue(guard.may_mention_kill(command), "pre-check misses %r" % command)
+                self.assertIsInstance(guard.check_command(command), str, "not blocked: %r" % command)
+
+    def test_named_fleet_and_extra_servers_are_blocked(self):
+        servers = fleet_servers()
+        for command in BLOCK_FLEET + BLOCK + BLOCK_ANSI:
+            with self.subTest(command=command):
+                self.assertIsInstance(guard.check_command(command, servers), str, "not blocked: %r" % command)
+
+    def test_other_servers_stay_allowed_with_the_fleet_config(self):
+        servers = fleet_servers()
+        for command in ALLOW_FLEET + ALLOW:
+            with self.subTest(command=command):
+                self.assertIsNone(guard.check_command(command, servers), "blocked: %r" % command)
+
+    def test_fleet_is_protected_with_no_config(self):
+        # "fleet" and "default" are built in: protected even when nothing
+        # could be resolved.
+        for command in ("tmux -L fleet kill-server", "tmux -S /private/tmp/tmux-501/fleet kill-server",
+                        "tmux -S /tmp//tmux-501/default kill-server"):
+            with self.subTest(command=command):
+                self.assertIsInstance(guard.check_command(command), str)
+        self.assertIsNone(guard.check_command("tmux -L spare kill-server"))
+
+    def test_parser_error_fallback_knows_the_fleet_servers(self):
+        original = guard._check_text
+        guard._check_text = lambda *args: 1 // 0
+        try:
+            servers = fleet_servers()
+            for command in ("tmux -L fleet kill-server", "tmux -S /private/tmp/tmux-501/fleet kill-server",
+                            "tmux -L spare kill-server", "tmux kill-$'server'"):
+                with self.subTest(command=command):
+                    self.assertIsInstance(guard.check_command(command, servers), str)
+            self.assertIsNone(guard.check_command("tmux -L probe kill-server", servers))
+            self.assertIsNone(guard.check_command("tmux -S /tmp/x/sock kill-server", servers))
+        finally:
+            guard._check_text = original
 
     def test_non_string_input_is_allowed(self):
         for value in (None, 7, ["tmux", "kill-server"], {"command": "tmux kill-server"}):
@@ -331,19 +462,141 @@ class ParserTests(unittest.TestCase):
         self.assertIn("kill-session -t '=NAME'", message)
         self.assertIn("killed a", message)
         self.assertIn("$TMUX", message)
+        self.assertIn("-L fleet", message)
+
+
+class ResolveServersTests(unittest.TestCase):
+    """resolve_servers() reads the servers the way cctrl's _tmux_srv_init does."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.script_dir = Path(self.tmp) / "release"
+        (self.script_dir / "data").mkdir(parents=True)
+        self.user = Path(self.tmp) / "user-config.json"
+        self.local = Path(self.tmp) / "local-config.json"
+        self.env = {"HOME": self.tmp, "CCTRL_USER_CONFIG": str(self.user), "CCTRL_CONFIG_LOCAL": str(self.local)}
+
+    def resolve(self, **extra):
+        env = dict(self.env)
+        env.update(extra)
+        return guard.resolve_servers(environ=env, script_dir=str(self.script_dir))
+
+    def blocked(self, command, servers):
+        return isinstance(guard.check_command(command, servers), str)
+
+    def test_config_key_names_the_primary(self):
+        self.user.write_text(json.dumps({"tmuxServer": "main"}))
+        servers = self.resolve()
+        self.assertTrue(servers.known)
+        self.assertTrue(self.blocked("tmux -L main kill-server", servers))
+        self.assertTrue(self.blocked("tmux -S /private/tmp/tmux-501/main kill-server", servers))
+        self.assertFalse(self.blocked("tmux -L probe kill-server", servers))
+
+    def test_env_wins_over_config_and_config_precedence(self):
+        self.user.write_text(json.dumps({"tmuxServer": "fromuser"}))
+        (self.script_dir / "data" / "config.json").write_text(json.dumps({"tmuxServer": "fromrepo"}))
+        self.local.write_text(json.dumps({"tmuxServer": "fromlocal"}))
+        servers = self.resolve()
+        self.assertTrue(self.blocked("tmux -L fromlocal kill-server", servers))
+        self.assertFalse(self.blocked("tmux -L fromuser kill-server", servers))
+        servers = self.resolve(CCTRL_TMUX_SERVER="fromenv")
+        self.assertTrue(self.blocked("tmux -L fromenv kill-server", servers))
+        self.assertFalse(self.blocked("tmux -L fromlocal kill-server", servers))
+        # A null value stops the search (explicitly unset), as in cctrl.
+        self.local.write_text(json.dumps({"tmuxServer": None}))
+        self.assertFalse(self.blocked("tmux -L fromuser kill-server", self.resolve()))
+        # The repo config is the last resort.
+        self.local.unlink()
+        self.user.unlink()
+        self.assertTrue(self.blocked("tmux -L fromrepo kill-server", self.resolve()))
+
+    def test_extra_servers_list_names_and_paths(self):
+        side = Path(self.tmp) / "socks" / "side"
+        self.user.write_text(json.dumps({"tmuxServer": "main", "tmuxExtraServers": ["spare", str(side), "~/socks/home"]}))
+        servers = self.resolve()
+        for command in ("tmux -L spare kill-server", "tmux -S %s kill-server" % side,
+                        "tmux -S %s/socks//side kill-server" % self.tmp, "tmux -S ~/socks/home kill-server",
+                        "tmux -S %s/socks/home kill-server" % self.tmp):
+            with self.subTest(command=command):
+                self.assertTrue(self.blocked(command, servers))
+        self.assertFalse(self.blocked("tmux -S %s/socks/other kill-server" % self.tmp, servers))
+        servers = self.resolve(CCTRL_TMUX_EXTRA_SERVERS="envextra")
+        self.assertTrue(self.blocked("tmux -L envextra kill-server", servers))
+        self.assertFalse(self.blocked("tmux -L spare kill-server", servers))
+
+    def test_exported_primary_and_the_tmux_socket_are_protected(self):
+        sock = Path(self.tmp) / "srv" / "primary.sock"
+        sock.parent.mkdir()
+        servers = self.resolve(_CCTRL_TMUX_PRIMARY=str(sock), _CCTRL_TMUX_EXTRA="%s/srv/x\n" % self.tmp,
+                               TMUX="/private/tmp/tmux-501/mine,123,0")
+        self.assertTrue(self.blocked("tmux -S %s kill-server" % sock, servers))
+        self.assertTrue(self.blocked("tmux -S %s/srv/./x kill-server" % self.tmp, servers))
+        self.assertTrue(self.blocked("tmux -S /tmp/tmux-501/mine kill-server", servers))
+        self.assertTrue(self.blocked("tmux -L mine kill-server", servers))
+        self.assertFalse(self.blocked("tmux -S %s/srv/y kill-server" % self.tmp, servers))
+
+    def test_physical_path_dedupe(self):
+        # A configured path through a symlinked directory is the same socket
+        # as its physical path (cctrl _tmux_physical_sock).
+        real = Path(self.tmp) / "real"
+        real.mkdir()
+        link = Path(self.tmp) / "link"
+        link.symlink_to(real)
+        self.user.write_text(json.dumps({"tmuxServer": str(link / "srv")}))
+        servers = self.resolve()
+        self.assertTrue(self.blocked("tmux -S %s kill-server" % (real / "srv"), servers))
+        self.assertTrue(self.blocked("tmux -S %s kill-server" % (link / "srv"), servers))
+
+    def test_unreadable_config_fails_safe(self):
+        self.user.write_text('{"tmuxServer": ')
+        servers = self.resolve()
+        self.assertFalse(servers.known)
+        for command in ("tmux -L probe kill-server", "tmux -L \"$name\" kill-server",
+                        "tmux -S /tmp/tmux-501/probe kill-server", "tmux -S /private/tmp/tmux-501/x kill-server",
+                        "tmux -L fleet kill-server", "tmux kill-server"):
+            with self.subTest(command=command):
+                self.assertTrue(self.blocked(command, servers))
+        # private sockets outside a tmux socket dir stay allowed (the suite's)
+        for command in ("tmux -S \"$D/sock\" kill-server", "tmux -S /tmp/x/sock kill-server",
+                        "S=$(mktemp -d)/sock; tmux -S \"$S\" new-session -d; tmux -S \"$S\" kill-server",
+                        "tmux -L probe ls"):
+            with self.subTest(command=command):
+                self.assertFalse(self.blocked(command, servers))
+
+    def test_resolve_never_raises(self):
+        servers = guard.resolve_servers(environ={"HOME": 7}, script_dir=self.tmp)
+        self.assertFalse(servers.known)
+        self.assertTrue(self.blocked("tmux -L probe kill-server", servers))
+
+
+# The entry point resolves servers from its environment and config: run it
+# with no inherited cctrl tmux settings and no user config.
+_SCRUB = ("CCTRL_TMUX_SERVER", "CCTRL_TMUX_EXTRA_SERVERS", "_CCTRL_TMUX_PRIMARY", "_CCTRL_TMUX_EXTRA",
+          "TMUX", "TMUX_PANE", "TMUX_TMPDIR", "XDG_CONFIG_HOME")
+
+
+def hook_env(tmp, **extra):
+    env = {k: v for k, v in os.environ.items() if k not in _SCRUB}
+    env["CCTRL_USER_CONFIG"] = str(Path(tmp) / "no-user-config.json")
+    env["CCTRL_CONFIG_LOCAL"] = str(Path(tmp) / "no-local-config.json")
+    env.update(extra)
+    return env
 
 
 class EntryPointTests(unittest.TestCase):
     """hooks/pre-tool-use.py: the process `cctrl hooks run pre-tool-use` execs."""
 
     def run_hook(self, stdin_text):
-        return subprocess.run(
-            [sys.executable, str(HOOK)],
-            input=stdin_text,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            return subprocess.run(
+                [sys.executable, str(HOOK)],
+                input=stdin_text,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=hook_env(tmp),
+            )
 
     def run_hook_for_command(self, command):
         return self.run_hook(json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}))
@@ -405,6 +658,69 @@ class EntryPointTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)  # the guard really ran from the copy
             self.assertEqual(list(Path(tmp).rglob("__pycache__")), [])
+
+
+class FleetEntryPointTests(unittest.TestCase):
+    """Audit 2026-11 H3 end to end: a copy of the hooks in a release-shaped
+    dir whose data/config.json names the fleet server, run as the hook runs."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        release = Path(self.tmp) / "release"
+        (release / "hooks").mkdir(parents=True)
+        (release / "data").mkdir()
+        for source in (ROOT / "hooks").glob("*.py"):
+            shutil.copy(source, release / "hooks")
+        self.hook = release / "hooks" / "pre-tool-use.py"
+        self.config = release / "data" / "config.json"
+        self.config.write_text(json.dumps({"tmuxServer": "fleet", "tmuxExtraServers": ["spare"]}))
+
+    def run_for(self, command, **env):
+        return subprocess.run(
+            [sys.executable, str(self.hook)],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=hook_env(self.tmp, **env),
+        )
+
+    def test_named_fleet_and_extra_servers_exit_2(self):
+        for command in ("tmux -L fleet kill-server",
+                        "tmux -S /private/tmp/tmux-501/fleet kill-server",
+                        "tmux -S /tmp//tmux-501/fleet kill-server",
+                        "tmux -L spare kill-server",
+                        "tmux kill-$'server'",
+                        "tmux $'kill-\\x73erver'",
+                        "tmux -L fleet kill-$'serv'er"):
+            with self.subTest(command=command):
+                result = self.run_for(command)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("BLOCKED", result.stderr)
+
+    def test_extra_server_from_env(self):
+        self.assertEqual(self.run_for("tmux -L other kill-server").returncode, 0)
+        self.assertEqual(self.run_for("tmux -L other kill-server", CCTRL_TMUX_EXTRA_SERVERS="other").returncode, 2)
+        # what cctrl exports to the hook counts too
+        self.assertEqual(self.run_for("tmux -S /tmp/elsewhere/sock kill-server",
+                                      _CCTRL_TMUX_PRIMARY="/tmp/elsewhere/sock").returncode, 2)
+
+    def test_private_sockets_and_other_commands_still_pass(self):
+        for command in ("tmux -S \"$D/sock\" kill-server", "tmux -L probe kill-server",
+                        "tmux -L fleet ls", "tmux -L fleet kill-session -t '=x'",
+                        "echo $'hello'", "printf $'a\\tb\\n'"):
+            with self.subTest(command=command):
+                result = self.run_for(command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+
+    def test_unreadable_config_blocks_ambiguous_names_only(self):
+        self.config.write_text('{"tmuxServer": "fleet",')
+        self.assertEqual(self.run_for("tmux -L probe kill-server").returncode, 2)
+        self.assertEqual(self.run_for("tmux -S /private/tmp/tmux-501/x kill-server").returncode, 2)
+        self.assertEqual(self.run_for("tmux -S \"$D/sock\" kill-server").returncode, 0)
+        self.assertEqual(self.run_for("tmux -S /tmp/x/sock kill-server").returncode, 0)
 
 
 if __name__ == "__main__":

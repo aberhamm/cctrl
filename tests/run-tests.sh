@@ -10226,12 +10226,36 @@ $first_out"
     out="$("${P3_E[@]}" CCTRL_NOW_UTC=2026-02-03T00:00:00Z "$ROOT/cctrl" peer doctor)"
     assert_contains "$out" "sender_eligibility: mode warn (logs only, delivery unchanged)"
     assert_contains "$out" "mallory 1 (seal-mismatch 1)"
-    jq '.attestation = "enforced"' "$P3_C/doorbell.json" > "$P3_C/db.tmp" && mv "$P3_C/db.tmp" "$P3_C/doorbell.json"
+    # An unknown or unparseable mode FAILS CLOSED (audit 2026-11 H2,
+    # mdec-1111): it reads enforce, so on the mixed mailbox only the one
+    # eligible line pushes (as in test_peer_attest_p3_enforce_push_gate), and
+    # doctor flags it. A typo can never silently turn gating off.
+    local unk n=0
+    for unk in '"enforced"' '"WARN"' '"Enforce"' '""' '5' 'true' '{}' '["warn"]' '["off"]'; do
+        n=$((n + 1))
+        _p3_copy "unknown-$n" warn; _p3_env "$P3_C"
+        jq --argjson v "$unk" '.attestation = $v' "$P3_C/doorbell.json" > "$P3_C/db.tmp" && mv "$P3_C/db.tmp" "$P3_C/doorbell.json"
+        out="$("${P3_E[@]}" "$ROOT/cctrl" peer doctor)"
+        assert_contains "$out" "mode INVALID $(jq -c . <<< "$unk") (reads enforce: fail closed) (gating on)"
+        out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
+        jq -e '.results[0].status == "nudged" and .results[0].queued == 1' <<< "$out" >/dev/null \
+            || fail "unknown mode $unk must read enforce (one eligible push): $out"
+        [[ "$(grep -c 'paste-buffer' "$P3_C/tmux.log")" -eq 1 ]] || fail "unknown mode $unk: exactly one paste"
+        jq -e -s '.[-1].mode == "enforce" and .[-1].acted == true and .[-1].ineligible == 4' "$P3_C/doorbell/attestation.log" >/dev/null \
+            || fail "unknown mode $unk: the log must record an enforce verdict: $(cat "$P3_C/doorbell/attestation.log" 2>&1)"
+        out="$("${P3_E[@]}" "$ROOT/cctrl" peer doorbell status)"
+        assert_contains "$out" "attestation: enforce (gating on)"
+    done
+    # An explicit null is the absent key: today's default, warn (all 5 nudged,
+    # nothing acted on), not "unknown".
+    _p3_copy null-mode warn; _p3_env "$P3_C"
+    jq '.attestation = null' "$P3_C/doorbell.json" > "$P3_C/db.tmp" && mv "$P3_C/db.tmp" "$P3_C/doorbell.json"
     out="$("${P3_E[@]}" "$ROOT/cctrl" peer doctor)"
-    assert_contains "$out" 'mode INVALID "enforced" (reads warn)'
-    # An unknown mode reads warn: delivery as plan 110.
+    assert_contains "$out" "sender_eligibility: mode warn (logs only, delivery unchanged)"
     out="$("${P3_E[@]}" "$ROOT/cctrl" peer deliver comet --json)"
-    jq -e '.results[0].status == "nudged"' <<< "$out" >/dev/null || fail "an invalid mode must read warn: $out"
+    jq -e '.results[0].status == "nudged" and .results[0].queued == 5' <<< "$out" >/dev/null || fail "attestation null must read warn: $out"
+    jq -e -s 'all(.[]; .mode == "warn" and .acted == false)' "$P3_C/doorbell/attestation.log" >/dev/null \
+        || fail "attestation null: warn log only: $(cat "$P3_C/doorbell/attestation.log" 2>&1)"
     # doorbell enable keeps the attestation keys.
     _p3_mode "$P3_C" enforce 2026-01-15T00:00:00Z
     "${P3_E[@]}" "$ROOT/cctrl" peer doorbell enable --peer extra >/dev/null
@@ -10388,7 +10412,7 @@ test_peer_attest_p3_stop_bell() {
         [[ -n "${7:-}" ]] && line="$(jq -c "$7" <<< "$line")"
         printf '%s\n' "$line" >> "$BELL_DATA/messages.jsonl"
     }
-    for mode in off warn enforce; do
+    for mode in off warn enforce enforced; do
         _bell_fixture "$TMPDIR/p3-bell-$mode"
         # The fixture runs a copy of cctrl; the seal check needs its lib.
         cp -R "$ROOT/lib" "$BELL_DIR/lib"
@@ -10438,6 +10462,16 @@ test_peer_attest_p3_stop_bell() {
                 _bell_enable "$(jq -c '. + {attestation: "enforce"}' <<< "$_bell_cfg_default")"
                 mv "$key" "$key.away"; _bell_stop; mv "$key.away" "$key"
                 [[ "$BELL_RC" -eq 0 ]] || fail "enforce with no key must not ring" ;;
+            enforced)
+                # An unknown mode (a typo) fails closed: the bell gates as in
+                # enforce (audit 2026-11 H2, mdec-1111).
+                [[ "$BELL_RC" -eq 0 ]] || fail "unknown mode: forged/legacy mail must not ring: $BELL_ERR"
+                jq -e '.rung["msg_20260201_000001_f00001"] == "blocked"' "$BELL_DATA/doorbell/state/TMUX--t-a.json" >/dev/null \
+                    || fail "unknown mode: a forged id must be recorded as blocked: $(cat "$BELL_DATA/doorbell/state/TMUX--t-a.json" 2>&1)"
+                jq -e -s 'any(.[]; .path == "bell" and .mode == "enforce" and .acted == true)' "$BELL_DATA/doorbell/attestation.log" >/dev/null \
+                    || fail "unknown mode bell log: $(cat "$BELL_DATA/doorbell/attestation.log" 2>&1)"
+                _p3_bell_line TMUX--t-a msg_20260201_000005_e00001 orch1 2026-02-01T00:00:05Z session orchestrator
+                _bell_stop; [[ "$BELL_RC" -eq 2 ]] || fail "unknown mode: eligible orchestrator mail must still ring" ;;
         esac
         unset CCTRL_HOST_ID_FILE CCTRL_PEER_SEAL_KEY_FILE
     done
