@@ -264,7 +264,7 @@ is visible before you confirm, and `--only` excludes it.
 
 **Cost, measured.** An earlier draft of this plan estimated "~30 tmux queries
 plus a `stat` per session, well under a second". That was wrong by about 3x.
-Measured on `ms-128g-bln` 2026-08-05: `session ls --json` takes **1.06s for 10
+Measured on the Studio 2026-08-05: `session ls --json` takes **1.06s for 10
 sessions** (~106ms/session; three runs at 1.07/1.05/1.06). The row loop spawns
 ~18 subprocesses per session, including six separate `_session_metadata_field`
 calls — six `jq` invocations against the same file. At the 20-30 sessions this

@@ -162,7 +162,7 @@ nudge target typos fail, and zero-second watch intervals are rejected.
 
 **Verification:**
 
-- `PLAN_ID=007 bash /Users/matthew/dev/projects/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
+- `PLAN_ID=007 bash ~/dev/projects/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
 - `codex review --uncommitted` -> 3 findings, all fixed
 
 **Commit:** `d9678b8` — `feat(peer): add orchestrator watch workflow`

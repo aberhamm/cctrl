@@ -253,7 +253,7 @@ additively, never repurpose a key):
 
 ```json
 {
-  "path": "/Users/matthew/dev/cctrl",
+  "path": "/Users/<user>/dev/cctrl",
   "name": "cctrl",
   "vcs": "git",
   "branch": "main",

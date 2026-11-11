@@ -147,8 +147,8 @@ rather than reinvented.
 {
   "session": "TMUX--ms--homelab--4",
   "deny": ["push", "delete", "service-restart", "credential-write", "purchase"],
-  "allow_paths_write": ["/Users/matthew/dev/homelab/docs/findings"],
-  "deny_paths_write": ["/Users/matthew/Library", "/Users/matthew/.claude.json"],
+  "allow_paths_write": ["/Users/<user>/dev/homelab/docs/findings"],
+  "deny_paths_write": ["/Users/<user>/Library", "/Users/<user>/.claude.json"],
   "note": "survey-and-propose only; deletions require per-item human approval"
 }
 ```

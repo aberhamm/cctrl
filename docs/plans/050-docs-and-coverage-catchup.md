@@ -141,7 +141,7 @@ would churn work that is already in `main`.
 ### Additional finding, fixed here (not in the original plan)
 
 `lib/usage_costs.py` hardcoded one machine's home directory. `claude_project_name`
-matched the literal strings `-Users-matthew--projects-` and `-Users-matthew-`, so
+matched the literal strings `-Users-<user>--projects-` and `-Users-<user>-`, so
 on any other machine every Claude project fell through to its raw encoded path in
 the `By Project` column — a real correctness bug, not just a public-repo hygiene
 problem. The encoded `$HOME` prefix is now derived at runtime via a new

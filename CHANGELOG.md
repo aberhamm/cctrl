@@ -865,8 +865,8 @@ catch-up, and a cost-reporting fix for anyone whose username isn't the author's.
 
 ### Fixed
 - `cctrl costs` no longer hardcodes one machine's username when naming projects.
-  `claude_project_name` matched the literal strings `-Users-matthew--projects-`
-  and `-Users-matthew-`, so on any other machine — or any other home directory —
+  `claude_project_name` matched the literal strings `-Users-<user>--projects-`
+  and `-Users-<user>-`, so on any other machine — or any other home directory —
   every Claude project fell through to its raw encoded path. The encoded `$HOME`
   prefix is now derived at runtime, and `codex_project_name` lost its matching
   hardcoded `~/_projects/` special case.

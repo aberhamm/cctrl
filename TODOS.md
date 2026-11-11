@@ -206,16 +206,16 @@ to cctrl, homelab, or obsidian-vault on the Studio don't reach the MacBook until
 ```bash
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.livesync-cli.plist
 # If that still fails, check the wrapper script and node version:
-bash /Users/matthew/scripts/livesync-cli-wrapper.sh  # manual test
+bash ~/scripts/livesync-cli-wrapper.sh  # manual test
 ```
 If the I/O error persists, the plist may need re-signing or the service identity may be
 stale after a macOS update. Check `log show --predicate 'subsystem == "com.apple.xpc.launchd"' --last 5m`.
 
-**Wrapper:** `/Users/matthew/scripts/livesync-cli-wrapper.sh`
-**Logs:** `/Users/matthew/apps/livesync-cli/logs/livesync-cli.{stdout,stderr}.log`
-**Last log entry:** clean SIGTERM shutdown, CouchDB target at `http://100.67.240.85:5984/obsidian`
+**Wrapper:** `~/scripts/livesync-cli-wrapper.sh`
+**Logs:** `~/apps/livesync-cli/logs/livesync-cli.{stdout,stderr}.log`
+**Last log entry:** clean SIGTERM shutdown, CouchDB target at the private sync server (`http://<private-ip>:5984/<db>`)
 
-**Depends on / blocked by:** nothing; fix requires Matthew in a GUI terminal on ms-128g-bln.
+**Depends on / blocked by:** nothing; fix requires Matthew in a GUI terminal on the Mac Studio.
 
 ## Hygiene audit follow-ups (2026-10-07)
 

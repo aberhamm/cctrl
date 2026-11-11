@@ -20,7 +20,7 @@ makes any cctrl command run on a named remote host transparently over SSH.
 
 **Acceptance criteria:**
 
-- [ ] `cctrl host add studio ms-128g-bln` saves the host to `data/hosts.json`
+- [ ] `cctrl host add studio <studio-host>` saves the host to `data/hosts.json`
 - [ ] `cctrl host list` shows registered hosts
 - [ ] `cctrl host rm studio` removes a host
 - [ ] `cctrl host doctor studio` checks SSH, remote cctrl, tmux, claude presence and offers to fix missing packages
@@ -67,7 +67,7 @@ No sync. Each machine is its own source of truth.
 ```json
 {
   "studio": {
-    "hostname": "ms-128g-bln",
+    "hostname": "<studio-host>",
     "user": ""
   }
 }
@@ -93,7 +93,7 @@ management, non-macOS remote hosts.
 6. Implement `host doctor` with connectivity checks and interactive auto-fix
 7. Update zsh completions for `host` subcommand and `--host` flag
 8. Update README with host feature documentation
-9. Test: `cctrl host add studio ms-128g-bln && cctrl --host studio session ls`
+9. Test: `cctrl host add studio <studio-host> && cctrl --host studio session ls`
 
 ## Verification
 

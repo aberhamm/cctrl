@@ -1,0 +1,18 @@
+# Allowlist for tests/check-public-hygiene.py: documented, justified exceptions.
+# Format: CATEGORY VALUE [PATH_GLOB]   (PATH_GLOB defaults to *, fnmatch syntax)
+# Keep this file small. Prefer a placeholder in the source over a new entry.
+# RFC 5737 (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24) and RFC 3849
+# (2001:db8::/32) documentation addresses are never flagged, so they need no entry.
+
+# Loopback in localhost examples and local-only server binds (CDP, ports plugin).
+private-ip 127.0.0.1
+
+# Placeholder user in docs and in the encoded-$HOME example ('-Users-me-dev-cctrl').
+home-path me
+
+# Fake fixture users in the test suite (screens, metadata fixtures, fake HOMEs).
+home-path test     tests/*
+home-path nobody   tests/*
+home-path someone  tests/*
+home-path someone-else tests/*
+home-path x        tests/*

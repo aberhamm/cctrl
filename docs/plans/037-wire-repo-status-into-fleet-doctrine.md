@@ -262,7 +262,7 @@ demonstrably fails to stick.
   `grep -Eic 'never (auto-)?commit|never .*git add' skills/cctrl-fleet-manager/SKILL.md skills/cctrl-session-end/SKILL.md`
   is non-zero for each
 - `[assert]` **environment-agnostic gate** —
-  `grep -REn '~/dev|/Users/|ms-128g|100\.[0-9]+\.[0-9]+\.[0-9]+' skills/cctrl-fleet-manager/SKILL.md skills/cctrl-session-end/SKILL.md`
+  `grep -REn '~/dev|/Users/|<studio-host>|100\.[0-9]+\.[0-9]+\.[0-9]+' skills/cctrl-fleet-manager/SKILL.md skills/cctrl-session-end/SKILL.md`
   returns nothing (AGENTS.md requires cctrl's skills carry no environment
   specifics). Scope the gate to the two files this plan edits: `skills/README.md`
   and `skills/cctrl-spawn/SKILL.md` legitimately carry `~/dev/...` example paths

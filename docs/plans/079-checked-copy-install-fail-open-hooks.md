@@ -87,11 +87,11 @@ needed to any path-resolution code in `cctrl`/`lib/`.
   — bare command, resolved via `$PATH`, not an absolute path. **No
   change needed** as long as `~/.local/bin/cctrl` keeps existing and
   stays on `$PATH`. The statusline hook (settings.json:86) is a separate,
-  direct `/Users/matthew/dev/cctrl/hooks/statusline.sh` — out of scope
+  direct `~/dev/cctrl/hooks/statusline.sh` — out of scope
   (see "Out of scope"), but it stays exposed to live-tree edits either
   way; noting it so it isn't mistaken for something this plan fixes.
 - `~/Library/LaunchAgents/com.cctrl.session-snapshot.plist` —
-  `ProgramArguments = ["/Users/matthew/.local/bin/cctrl", "session",
+  `ProgramArguments = ["/Users/<user>/.local/bin/cctrl", "session",
   "snapshot", "--quiet"]`, `PATH` in its `EnvironmentVariables` is
   `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` (does **not** include
   `~/.local/bin` — it relies on the absolute path). **No change needed**;
@@ -102,7 +102,7 @@ needed to any path-resolution code in `cctrl`/`lib/`.
   own blocking exit-code convention should be confirmed before plan 038
   (see below) lands, but that's plan 038's problem, not this one's.
 - Live sessions' baked MCP runtime/peer args (`--cctrl
-  /Users/matthew/dev/cctrl/cctrl`, confirmed via `ps auxww` against
+  ~/dev/cctrl/cctrl`, confirmed via `ps auxww` against
   `lib/runtime_mcp.py`/`lib/peer_mcp.py` argv, and the peer MCP
   `--mcp-config` baked at `cctrl:732-733`) already point at the dev tree
   directly, **not** at `~/.local/bin/cctrl` — those were baked when
@@ -229,10 +229,10 @@ deliberate narrowing, not a no-op.
 ~/.local/lib/cctrl/current                  <- symlink -> releases/<git-sha>-<timestamp>
 ~/.local/lib/cctrl/releases/<sha>-<ts>/
     cctrl, lib/, hooks/, completions/, plugins/   <- real copies (__pycache__ excluded)
-    data      -> /Users/matthew/dev/cctrl/data           <- symlink, never copied
-    costs     -> /Users/matthew/dev/cctrl/costs           <- symlink, never copied
-    profiles  -> /Users/matthew/dev/cctrl/profiles        <- symlink, never copied
-    .active-profile -> /Users/matthew/dev/cctrl/.active-profile  <- symlink, never copied
+    data      -> $HOME/dev/cctrl/data                <- symlink, never copied
+    costs     -> $HOME/dev/cctrl/costs                <- symlink, never copied
+    profiles  -> $HOME/dev/cctrl/profiles             <- symlink, never copied
+    .active-profile -> $HOME/dev/cctrl/.active-profile  <- symlink, never copied
 ```
 
 `~/.local/lib/cctrl` is a new path (distinct from the existing
@@ -404,14 +404,14 @@ A `trap` removes the scratch dir on any failure or interrupt.
 One command restores today's behavior exactly (symlink straight into the
 working tree):
 ```
-ln -sf /Users/matthew/dev/cctrl/cctrl /Users/matthew/.local/bin/cctrl
+ln -sf ~/dev/cctrl/cctrl ~/.local/bin/cctrl
 ```
 `ln -sf` unlinks then re-creates, so there's a sub-millisecond window
 where `~/.local/bin/cctrl` doesn't exist; a hook firing in that window
 gets `command not found` (exit 127), which Claude Code treats as
 non-blocking (only exit 2 blocks — see "Hook exit-code convention"), so
 this is acceptable as-is. A strictly atomic alternative if ever needed:
-`ln -s /Users/matthew/dev/cctrl/cctrl cctrl.rb && mv -fh cctrl.rb cctrl`
+`ln -s ~/dev/cctrl/cctrl cctrl.rb && mv -fh cctrl.rb cctrl`
 from `~/.local/bin`.
 
 Do **not** delete `~/.local/lib/cctrl` (the `releases/` tree) right after
@@ -492,7 +492,7 @@ itself.
   release path exactly** (not merely "points at some `releases/...` dir" —
   the macOS `mv -f` bug in review left `current` pointing at the *old*
   release while silently creating `releases/<old>/current.next`)
-- [assert] `readlink ~/.local/lib/cctrl/current/data` == `/Users/matthew/dev/cctrl/data`
+- [assert] `readlink ~/.local/lib/cctrl/current/data` == `$HOME/dev/cctrl/data`
 - [assert] same for `costs`, `profiles`, `.active-profile`
 - [cmd] `cctrl session ls` — works
 - [cmd] `cctrl profile ls` — active profile still shows "personal" (proves
@@ -523,7 +523,7 @@ itself.
   plan-only per the fleet manager's instruction not to touch live tmux
   targeting in this change.
 - `~/.claude/settings.json`'s statusline hook
-  (`/Users/matthew/dev/cctrl/hooks/statusline.sh`, called by absolute
+  (`~/dev/cctrl/hooks/statusline.sh`, called by absolute
   path, not through `cctrl`) — untouched by this plan, stays exposed to
   live-tree edits the same as before.
 - Fixing `hooks/block-git-commit.py`'s exit code (1, non-blocking today)

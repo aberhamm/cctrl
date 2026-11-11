@@ -129,7 +129,7 @@ doctor` with doorbell presence, executable, and registration checks.
 **Verification:**
 
 - `bash -n cctrl && bash -n hooks/peer-doorbell.sh && bash -n tests/run-tests.sh && zsh -n completions/_cctrl && git diff --check && bash tests/run-tests.sh < /dev/null` -> PASS
-- `PLAN_ID=008 bash /Users/matthew/dev/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
+- `PLAN_ID=008 bash ~/dev/mstack/skills/mstack-run/scripts/health-check.sh run` -> PASS, composite 9.9/10
 - `codex exec` review pass -> no findings
 
 **Commit:** `0039d61` — `feat(peer): add idle hook doorbell`

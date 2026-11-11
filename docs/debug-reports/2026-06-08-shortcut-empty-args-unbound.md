@@ -9,7 +9,7 @@ Running a shortcut with no extra arguments failed immediately:
 
 ```text
 cctrl @mstack
-/Users/matthew/.local/bin/cctrl: line 2112: original_args[@]: unbound variable
+/Users/<user>/.local/bin/cctrl: line 2112: original_args[@]: unbound variable
 ```
 
 ## Root Cause

@@ -14,7 +14,7 @@ created: 2026-10-27
 ## Plain-English Summary
 
 <!-- Evidence captured 2026-10-27 by TMUX--ms--cctrl (wrap-up of the restore RAM-gate work), for the author to turn into the summary:
-- On the Studio, `cctrl session restore --dry-run --json` exits 64: {"error":"snapshot hostname mismatch","snapshot_hostname":"ms-128g-bln","local_hostname":"ms"}.
+- On the Studio, `cctrl session restore --dry-run --json` exits 64: {"error":"snapshot hostname mismatch","snapshot_hostname":"<studio-host>","local_hostname":"ms"}.
 - restore takes local_hostname from ${CCTRL_HOST_PREFIX:-$(hostname -s)}; the session shell has CCTRL_HOST_PREFIX=ms, while the snapshot records `hostname -s`.
 - Same result on the previous release (0ce27fa), so it is older than 7566c4f. `--force-host` works around it (481 rows, ok:true).
 - Matters after a Studio power cycle: the fleet manager's restore runbook would hit exit 64.

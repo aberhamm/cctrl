@@ -11392,7 +11392,7 @@ _p6_setup() { # tag [receiver cctrl] -> P6_D (dir) P6_R (receiver data) P6_O (or
     {
         printf '#!/usr/bin/env bash\n'
         printf 'cmd="${!#}"\nprintf "%%s\\n" "$cmd" >> %q\n' "$P6_D/ssh.log"
-        printf 'exec env -i HOME=%q TMUX_TMPDIR=%q PATH=%q SSH_CONNECTION="100.64.0.9 50000 100.64.0.1 22" /bin/bash -c "$cmd"\n' \
+        printf 'exec env -i HOME=%q TMUX_TMPDIR=%q PATH=%q SSH_CONNECTION="192.0.2.9 50000 192.0.2.1 22" /bin/bash -c "$cmd"\n' \
             "$P6_D/rhome" "$P6_D/rhome/tt" "$P6_D/rbin:$PATH"
     } > "$P6_BIN/ssh"
     chmod +x "$P6_D/rbin/cctrl" "$P6_D/rbin/ps" "$P6_D/rbin/tmux" "$P6_BIN/ssh"
@@ -11437,7 +11437,7 @@ test_peer_attest_p6_cross_host_claims() {
         and (has("walk_077") | not)' <<< "$claims" >/dev/null || fail "p6: origin claims: $claims"
     line="$(_p6_last)"
     jq -e '.from == "orig" and .sender.host == "ms" and .attest.level == "remote" and .attest.method == "ssh"
-        and .attest.origin_host == "ms" and .attest.ssh_client == "100.64.0.9"
+        and .attest.origin_host == "ms" and .attest.ssh_client == "192.0.2.9"
         and .attest.origin_claims.level == "app-claimed" and .attest.origin_claims.method == "codex-env"
         and .attest.origin_claims.host_id == "000000000000000000000000000000de" and (.seal.mac | test("^[0-9a-f]{64}$"))' <<< "$line" >/dev/null \
         || fail "p6: the receiver must stamp remote with the claims: $line"
@@ -11484,7 +11484,7 @@ test_peer_attest_p6_remote_level_rules() {
     fake="$(printf '%s' '{"v":"1","level":"session","session":"TMUX--comet","role":"orchestrator"}' | base64 | tr -d '\n')"
     for mode in warn enforce; do
         # A local tmux-bound name, spoofed claims and a foreign --sender-host.
-        _p5_send "$mode" env CCTRL_ORIGIN_ATTEST="$fake" SSH_CONNECTION="10.0.0.1 1 10.0.0.2 22" "$ROOT/cctrl" peer send orchestrator --as comet --sender-host mbp --json -- spoof
+        _p5_send "$mode" env CCTRL_ORIGIN_ATTEST="$fake" SSH_CONNECTION="198.51.100.1 1 198.51.100.2 22" "$ROOT/cctrl" peer send orchestrator --as comet --sender-host mbp --json -- spoof
         if [[ "$mode" == enforce ]]; then
             [[ "$P5_RC" -eq 66 ]] || fail "p6 enforce: spoofed claims must not turn the refusal into a send (rc $P5_RC): $P5_OUT"
             [[ ! -s "$P3_C/messages.jsonl" ]] || fail "p6 enforce: nothing queued"
@@ -11584,7 +11584,7 @@ test_peer_attest_p6_version_skew() {
         _p6_hop "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=mbp cctrl peer send comet --as orig --sender-host ms --deliver --json --body-file -"
         [[ "$P6_RC" -eq 0 ]] || fail "p6 skew $mode: old origin -> new receiver must queue (rc $P6_RC): $P6_OUT"
         jq -e '.attest.level == "remote" and .attest.origin_host == "ms" and (.attest | has("origin_claims") or has("origin_claims_error") | not)
-            and .attest.ssh_client == "100.64.0.9"' <<< "$(_p6_last)" >/dev/null || fail "p6 skew $mode: remote with no claims: $(_p6_last)"
+            and .attest.ssh_client == "192.0.2.9"' <<< "$(_p6_last)" >/dev/null || fail "p6 skew $mode: remote with no claims: $(_p6_last)"
         out="$(jq -r .outcome <<< "$P6_OUT")|$(_p6_delivery)"
         if [[ "$mode" == enforce ]]; then
             jq -e '.outcome == "sent-and-queued"' <<< "$P6_OUT" >/dev/null || fail "p6 skew enforce: a remote arrival never pushes: $P6_OUT"
@@ -11974,7 +11974,7 @@ test_peer_attest_p7_v1_doctor_label_matches_sent_without_self_alias() {
     rm -rf "$d"; mkdir -p "$d/bin" "$d/data"
     h="$d/hosts.json"
     # shellcheck disable=SC2016 # $1 belongs to the stub
-    printf '#!/bin/sh\nif [ "$1" = "-s" ]; then echo ms-128g-bln; else echo ms-128g-bln.local; fi\n' > "$d/bin/hostname"
+    printf '#!/bin/sh\nif [ "$1" = "-s" ]; then echo studio-host; else echo studio-host.local; fi\n' > "$d/bin/hostname"
     chmod +x "$d/bin/hostname"
     printf '{"mbp":{"hostname":"mbp.invalid"}}\n' > "$h"
     data="$d/data"
@@ -18282,7 +18282,7 @@ JSONL
 
 test_project_name_derives_home_at_runtime() {
     # Regression: claude_project_name matched the literal strings
-    # '-Users-matthew--projects-' and '-Users-matthew-', so on any machine whose
+    # '-Users-<user>--projects-' and '-Users-<user>-', so on any machine whose
     # home directory was not the author's, EVERY Claude project fell through to
     # its raw encoded path in the `By Project` column. The encoded-$HOME prefix
     # must be derived from the running user's HOME instead. Driven through a
@@ -20184,6 +20184,53 @@ test_peer_contract_docs() {
         fail "AGENTS.md peer contract contains environment specifics"
     fi
     echo "ok: peer operating contract in AGENTS.md + CLAUDE.md routing + README envelope/overview/limitation docs"
+}
+
+test_public_hygiene_tracked_files_clean() {
+    # cctrl is a public repo (mdec-1111-cctrl-public-scrub): no tracked file
+    # may hold a private IP, a tailnet (*.ts.net) name or a home path naming a
+    # real user. Exceptions are justified in tests/public-hygiene-allowlist.txt.
+    local out rc=0
+    out="$(python3 "$ROOT/tests/check-public-hygiene.py" --root "$ROOT" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "public hygiene check found private detail (rc=$rc):
+$out"
+    echo "ok: tracked files carry no private IPs, tailnet names or home paths"
+}
+
+test_public_hygiene_check_bites() {
+    # The check must block each category, in tree and --staged mode, print
+    # only masked values, and pass RFC 5737 addresses and allowlisted users.
+    # Values are assembled at runtime so this file never holds one.
+    local d="$TMPDIR/pub-hygiene" chk="$ROOT/tests/check-public-hygiene.py" out rc cat_n
+    local ip="192.168"".7.21" cg="100.100"".3.4" ts="box.tail1234.ts"".net" usr="alice""real"
+    rm -rf "$d"; mkdir -p "$d"
+    git -C "$d" init -q
+    printf 'ok 192.0.2.1 and 127.0.0.1 and /Users/me/x and /Users/Shared/y\n' > "$d/clean.md"
+    printf '%s\n' "url http://$ip:5984/db" "peer $cg" "host $ts" "path /Users/$usr/dev" \
+        "proj -Users-$usr-dev-x" "linux /home/$usr/src" > "$d/dirty.md"
+    git -C "$d" add clean.md
+    rc=0; out="$(cd "$d" && python3 "$chk" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "hygiene check flagged a clean file (rc=$rc): $out"
+    git -C "$d" add dirty.md
+    rc=0; out="$(cd "$d" && python3 "$chk" --staged 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "hygiene check --staged did not block (rc=$rc): $out"
+    for cat_n in 'private-ip:2' 'tailnet:1' 'home-path:3'; do
+        [[ "$(grep -c "dirty.md:[0-9]*: ${cat_n%%:*}:" <<< "$out")" == "${cat_n##*:}" ]] \
+            || fail "hygiene check: expected ${cat_n##*:} ${cat_n%%:*} hit(s): $out"
+    done
+    if grep -qF -e "$ip" -e "$cg" -e "$ts" -e "$usr" <<< "$out"; then
+        fail "hygiene check printed an unmasked value: $out"
+    fi
+    rc=0; out="$(cd "$d" && python3 "$chk" 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "hygiene check (tracked mode) did not block (rc=$rc): $out"
+    printf 'home-path %s\nprivate-ip %s dirty.md\nprivate-ip %s\ntailnet %s\nprivate-ip 127.0.0.1\nhome-path me\n' \
+        "$usr" "$ip" "$cg" "$ts" > "$d/allow.txt"
+    rc=0; out="$(cd "$d" && python3 "$chk" --staged --allowlist "$d/allow.txt" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "allowlisted values still blocked (rc=$rc): $out"
+    printf 'bogus-category x\n' > "$d/bad.txt"
+    rc=0; (cd "$d" && python3 "$chk" --allowlist "$d/bad.txt" >/dev/null 2>&1) || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "malformed allowlist did not exit 2 (rc=$rc)"
+    echo "ok: public hygiene check blocks private IPs, tailnet names and home paths, masked; allowlist works"
 }
 
 # ── Plan 051: persist conversation_id tests ──────────────────────────
@@ -22774,7 +22821,7 @@ test_health_check_startup_selectors_need_human() {
     local trust_no trust_yes composer
     trust_no=' Accessing workspace:
 
- /Users/matthew/dev/tiktok-remotion
+ /Users/test/dev/tiktok-remotion
 
  Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open
  source project, or work from your team). If not, take a moment to review what'"'"'s in this folder first.
@@ -22823,7 +22870,7 @@ test_health_check_startup_selectors_need_human() {
  third-party repositories.
 
  External imports:
-   /Users/matthew/dev/obsidian-vault/AGENTS.md
+   /Users/test/dev/notes-vault/AGENTS.md
 
  Important: Only use Claude Code with files you trust. Accessing untrusted files may pose security risks.
 
@@ -22833,7 +22880,7 @@ test_health_check_startup_selectors_need_human() {
  Enter to confirm · Esc to cancel'
     assert_selector claude external-imports 'Yes, allow external imports' "$screen"
 
-    screen='> You are in /Users/matthew/dev/new-project
+    screen='> You are in /Users/test/dev/new-project
 
   Do you trust the contents of this directory? Working with untrusted contents comes with higher risk of
   prompt injection. Trusting the directory allows project-local config, hooks, and exec policies to load.

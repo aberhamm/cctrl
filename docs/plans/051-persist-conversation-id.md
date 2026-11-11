@@ -21,7 +21,7 @@ process and therefore dies with it. `_session_id` (cctrl:5747) resolves it via
 ever writes that value into the session record, so when the machine loses power
 the mapping from "session that was doing X" to "conversation UUID to resume" is
 gone. It was reconstructed by hand three times on 2026-08-02/03 (two reboots of
-`ms-128g-bln`, one 28-session fleet), each time by reading transcript files
+the Studio, one 28-session fleet), each time by reading transcript files
 under `~/.claude/projects/` and guessing from the first user message. That is
 the entire problem this plan removes.
 

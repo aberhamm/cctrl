@@ -147,7 +147,7 @@ existing four-function `*_refresh_paths` convention) or running against a copied
 script dir as `test_profile_*` already does. Pick the override; it is three
 lines and removes a real testability gap.
 
-*Shortcut dirs are not all repos.* Today `@projects → /Users/matthew/dev` — a
+*Shortcut dirs are not all repos.* Today `@projects → ~/dev` — a
 root, not a repo. Do **not** auto-promote a non-repo shortcut into a root; that
 magic would silently turn `--shortcuts` into a 58-repo scan. It resolves to a
 `not-a-repo` row exactly as plan 035 specifies, and the operator writes

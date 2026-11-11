@@ -49,6 +49,26 @@ else
 fi
 # --- end gitleaks -----------------------------------------------------------
 
+# --- public-repo hygiene ----------------------------------------------------
+# cctrl is public: block staged private IPs, tailnet (*.ts.net) names and home
+# paths naming a real user (tests/check-public-hygiene.py; justified
+# exceptions in tests/public-hygiene-allowlist.txt). Runs before the mstack
+# delegation below for the same exec reason as gitleaks. Skipped only when the
+# checker or python3 is absent (e.g. another repo sharing this hook); a hit or
+# a checker error blocks the commit.
+_hygiene_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -n "$_hygiene_root" ] && [ -f "$_hygiene_root/tests/check-public-hygiene.py" ]; then
+  if command -v python3 >/dev/null 2>&1; then
+    if ! python3 "$_hygiene_root/tests/check-public-hygiene.py" --staged --root "$_hygiene_root" >&2; then
+      echo "pre-commit: public-repo hygiene check failed (see above); commit refused." >&2
+      exit 1
+    fi
+  else
+    echo "pre-commit: python3 not found — skipping public-repo hygiene check." >&2
+  fi
+fi
+# --- end public-repo hygiene ------------------------------------------------
+
 # Resolve review-gate.sh across supported agent runtimes.
 _find_review_gate() {
   local d
