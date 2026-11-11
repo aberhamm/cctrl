@@ -9,7 +9,7 @@ cctrl is a public repository. This check fails when a scanned file holds:
                 address in Tailscale's IPv6 ULA /48
   tailnet       a MagicDNS name (*.ts.net)
   home-path     an absolute home path naming a user: /Users/<name>,
-                /home/<name>/, or the encoded -Users-<name>- form Claude Code
+                /home/<name>, or the encoded -Users-<name>- form Claude Code
                 uses for project directories
 
 Use neutral placeholders instead: ~/, $HOME, /Users/<user>, <private-ip>,
@@ -38,14 +38,15 @@ import re
 import subprocess
 import sys
 
-IPV4_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w]|\.\d)")
+# A word character may precede the address (IP_10.x), a digit or dot may not.
+IPV4_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w]|\.\d)")
 # Tailscale's IPv6 ULA /48. Split so this file does not match itself.
 TS_IPV6_RE = re.compile(r"(?i)(?<![0-9a-f:])(fd7a:115c" r":a1e0:[0-9a-f:]*)")
 TAILNET_RE = re.compile(r"(?i)(?<![a-z0-9.-])((?:[a-z0-9-]+\.)+ts\.net)\b")
 HOME_RES = (
     re.compile(r"/Users/([A-Za-z][A-Za-z0-9._-]*)(?![A-Za-z0-9._-])"),
-    re.compile(r"(?<![A-Za-z0-9._-])/home/([A-Za-z_][A-Za-z0-9._-]*)/"),
-    re.compile(r"(?<![A-Za-z0-9])-Users-([A-Za-z][A-Za-z0-9._]*)-"),
+    re.compile(r"(?<![A-Za-z0-9._-])/home/([A-Za-z_][A-Za-z0-9._-]*)(?![A-Za-z0-9._-])"),
+    re.compile(r"(?<![A-Za-z0-9])-Users-([A-Za-z][A-Za-z0-9._]*)(?=-|$|[^A-Za-z0-9._])"),
 )
 # Not a person's home: macOS's shared folder.
 HOME_NOT_A_USER = {"Shared"}
@@ -146,8 +147,12 @@ def main(argv):
     sources = []  # (display path, bytes)
     if args.files:
         for f in args.files:
-            with open(f, "rb") as fh:
-                sources.append((f, fh.read()))
+            try:
+                with open(f, "rb") as fh:
+                    sources.append((f, fh.read()))
+            except OSError as exc:
+                sys.stderr.write("check-public-hygiene: cannot read %s: %s\n" % (f, exc.strerror))
+                return 2
     else:
         try:
             root = args.root or git(["rev-parse", "--show-toplevel"], None).decode().strip()

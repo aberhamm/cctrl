@@ -4654,7 +4654,7 @@ test_detached_arg_parsing() {
     assert_contains "$(cat "$log")" "start --foreground"
 
     : > "$log"
-    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_TEST_HOSTNAME=mattbook-pro.local CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex "$project")"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$log" CCTRL_TEST_HOSTNAME=macbook-pro.local CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex "$project")"
     assert_contains "$out" "detached session started"
     assert_contains "$out" "CCTRL_SESSION=TMUX--mbp--project"
     assert_contains "$(cat "$log")" "new-session -d -s TMUX--mbp--project"
@@ -20187,7 +20187,7 @@ test_peer_contract_docs() {
 }
 
 test_public_hygiene_tracked_files_clean() {
-    # cctrl is a public repo (mdec-1111-cctrl-public-scrub): no tracked file
+    # cctrl is a public repo: no tracked file
     # may hold a private IP, a tailnet (*.ts.net) name or a home path naming a
     # real user. Exceptions are justified in tests/public-hygiene-allowlist.txt.
     local out rc=0
@@ -20207,14 +20207,15 @@ test_public_hygiene_check_bites() {
     git -C "$d" init -q
     printf 'ok 192.0.2.1 and 127.0.0.1 and /Users/me/x and /Users/Shared/y\n' > "$d/clean.md"
     printf '%s\n' "url http://$ip:5984/db" "peer $cg" "host $ts" "path /Users/$usr/dev" \
-        "proj -Users-$usr-dev-x" "linux /home/$usr/src" > "$d/dirty.md"
+        "proj -Users-$usr-dev-x" "linux /home/$usr/src" "env HOME=/home/$usr" "enc -Users-$usr" \
+        "var IP_$ip" > "$d/dirty.md"
     git -C "$d" add clean.md
     rc=0; out="$(cd "$d" && python3 "$chk" 2>&1)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "hygiene check flagged a clean file (rc=$rc): $out"
     git -C "$d" add dirty.md
     rc=0; out="$(cd "$d" && python3 "$chk" --staged 2>&1)" || rc=$?
     [[ "$rc" -eq 1 ]] || fail "hygiene check --staged did not block (rc=$rc): $out"
-    for cat_n in 'private-ip:2' 'tailnet:1' 'home-path:3'; do
+    for cat_n in 'private-ip:3' 'tailnet:1' 'home-path:5'; do
         [[ "$(grep -c "dirty.md:[0-9]*: ${cat_n%%:*}:" <<< "$out")" == "${cat_n##*:}" ]] \
             || fail "hygiene check: expected ${cat_n##*:} ${cat_n%%:*} hit(s): $out"
     done
@@ -20230,6 +20231,8 @@ test_public_hygiene_check_bites() {
     printf 'bogus-category x\n' > "$d/bad.txt"
     rc=0; (cd "$d" && python3 "$chk" --allowlist "$d/bad.txt" >/dev/null 2>&1) || rc=$?
     [[ "$rc" -eq 2 ]] || fail "malformed allowlist did not exit 2 (rc=$rc)"
+    rc=0; out="$(cd "$d" && python3 "$chk" "$d/no-such-file.md" 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "a missing FILE argument did not exit 2 (rc=$rc): $out"
     echo "ok: public hygiene check blocks private IPs, tailnet names and home paths, masked; allowlist works"
 }
 

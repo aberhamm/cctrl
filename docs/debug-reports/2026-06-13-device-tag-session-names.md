@@ -17,8 +17,8 @@ Added `_device_tag` in `cctrl`:
 
 - `CCTRL_HOST_PREFIX` still wins for remote aliases.
 - `CCTRL_DEVICE_TAG` can explicitly override local detection.
-- Known local hostnames map to stable tags: `ms-*` -> `ms`, `mattbook-pro` /
-  MacBook variants -> `mbp`.
+- Known local hostnames map to stable tags: `ms-*` -> `ms`, MacBook host
+  names (`macbook-pro`, `mbp`, `mbp-*`) -> `mbp`.
 - Unknown hostnames keep the old untagged behavior.
 
 ## Evidence
