@@ -164,9 +164,11 @@ release and distribution gaps in SH-S13. Baseline is `main` at `8c249fc`.
     handler) and the call is allowed. It stays fail-open by design (plan 079), but the
     handler now writes one stderr line and bumps a 0600 error counter in the state dir, and
     `hooks doctor` reports a non-zero count since the last check as an issue.
-  - The guard covers only the Bash tool matcher. That is **accepted and stated** in
+  - The kill guard covers only the Bash tool matcher. That is **accepted and stated** in
     SECURITY.md (plan 122's D2): the kill guard is about shell commands, and other tools
-    cannot run tmux. Widening the matcher is out of scope.
+    cannot run tmux. Widening the kill guard's matcher is out of scope. (The separate
+    state-file rule of plan 118's O4.4 does match Write, Edit and NotebookEdit, because
+    those tools can write state files.)
   - `hooks install --agent codex` removes working-tree leaves, with the Codex installer's
     backup.
   - Then **one supervised session on the MacBook** clears its two stale Codex hooks

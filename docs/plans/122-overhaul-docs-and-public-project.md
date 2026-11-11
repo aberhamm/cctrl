@@ -112,16 +112,22 @@ has an MIT `LICENSE` already. Baseline is `main` at `8c249fc`.
       - **any agent can open a genuine login-rooted Terminal window** with `open -a Terminal
         x.command` (or `open x.command`): the chain is real, no ancestry check can tell it
         apart, and no consent prompt appears. The class check is a label for honest callers;
-        the barrier for grant acts is the out-of-band confirmation (`sudo -v`, Touch ID
-        where enabled), if plan 115 Q10 accepts it, and the doc says which;
+        the barrier for grant acts on the sanctioned path is the out-of-band
+        confirmation (`/usr/bin/sudo -v`, Touch ID where enabled), if plan 115 Q10 accepts it, and the doc says which;
       - an agent that drives Terminal.app or iTerm2 through osascript can type into an
         existing window; the supervised check's result on the consent prompt is quoted;
       - iTerm2 shells are not `operator-tty` until that check clears them, and SSH sessions
         never are, so grant acts need Matthew at the Mac's screen;
       - after a power cycle every role grant is stale until re-granted;
       - a same-uid process can read the seal key or edit state;
-      - hook rules are text heuristics, and the PreToolUse guard covers only the Bash tool
-        matcher (accepted: other tools cannot run tmux);
+      - the Bash hook rules are text heuristics, and the kill guard covers only the Bash
+        tool matcher (accepted: other tools cannot run tmux); the state-file rule also
+        matches Write, Edit and NotebookEdit by resolved path (plan 118's O4.4), and any
+        Codex file-edit gap found there is stated;
+      - **refuse any Touch ID or password prompt you did not start yourself**: the Touch ID
+        dialog is generic, and cctrl prints the act it is confirming on the tty before it
+        prompts (plan 118's O4.1). The confirmation guards the sanctioned path only; a
+        same-uid process that reads the seal key can still mint a grant (stated above);
       - raw tmux bypasses `say`;
     - the hooks fail open by design (plan 079, audit M10); a swallowed guard exception is now
       counted and reported by `hooks doctor` (plan 117's C4);

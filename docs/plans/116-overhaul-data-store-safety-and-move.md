@@ -17,7 +17,8 @@ related: 115, 117, 118, 120, 121, 049, 070, 071, 078, 079
 Workstream A of the overhaul (umbrella: plan 115). It covers Fable's plan (a), audit option 9 and
 findings F2, F3, F9, F10, F13, L1, L2, L3. It is revised for the independent review's
 MF-M1 to MF-M5 and SH-S1 to SH-S4, and again for the second review of plans 115-122
-(MUST-FIX 2, S2, S5-S10). Sizes are the reviewer's where they differ from Fable's, plus the
+(MUST-FIX 2, S2, S5-S10), and a third time for the re-check of that revision (cited
+R3-MF1, R3-MF2 and R3-S4 to R3-S8). Sizes are the reviewer's where they differ from Fable's, plus the
 revision hours named in each phase. Baseline is `main` at `8c249fc`.
 
 ## Problem
@@ -183,9 +184,10 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
       alias.
     - **Stale steal, spelled out (review S9).** Our stealers serialise on a short-lived steal
       guard (`<lock>.steal`, same link protocol, 5 s cap). Under it:
-      1. read the pid and `stat` the lock (inode, mtime); judge stale only if the pid is dead,
-         **or** the process with that pid started after the lock's mtime (pid reuse), **or**
-         the lock is older than the hold timeout (below);
+      1. read the pid and `stat` the lock (inode, mtime); judge stale **only** if the pid is
+         dead, **or** the process with that pid started after the lock's mtime (pid reuse,
+         judged by pid plus start time). Nothing else makes a lock stale: age never does
+         (re-check R3-MF2, below);
       2. rename the lock to a unique aside name, then `stat` the aside file;
       3. **same inode:** unlink the aside file and `link(2)` our temp file to the lock path.
          If that link fails with EEXIST, someone else acquired legitimately; we go back to
@@ -201,8 +203,16 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
       path and makes Linux safe. Next to the system `shlock` binary a narrow race remains,
       which step 4 detects and reports. It is removed when no retained release calls
       `shlock` any more (after A4, the bash side can use the portable implementation only).
-    - **Hold timeout.** A lock held longer than 120 s (mailbox operations take well under a
-      second) is reported by `peer doctor` with its pid and age, and judged stale by step 1.
+    - **No hold timeout; lock age is a doctor warning only** (re-check R3-MF2). A
+      live holder can be SIGSTOPped (Ctrl-Z), swapped out under memory pressure or frozen by
+      a MacBook sleeping mid-operation. If age made its lock stale, a waiter would take the
+      lock, the holder would resume and rename its temp file over `messages.jsonl`, and
+      every write made meanwhile would be lost; the release-time pid check comes too late to
+      help. So a lock whose holder is alive (same pid, same start time) is never taken, however
+      old. A lock held longer than 120 s (mailbox operations take well under a second) is a
+      `peer doctor` **warning** with its pid, the holder's command and its age, for the
+      operator to look at. This keeps plan 049 items 3-4 (what to do about long holds) out of
+      scope, as the Out of scope section says.
     - Bash shlock users, the portable fallback and Python must exclude each other. They do,
       because all three are one protocol on one path, apart from the reported race above.
   - **Migration sentinel (MUST-FIX 2), so A1 releases are safe writers during A2.** The lock
@@ -219,6 +229,26 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
       the resolved dir has changed since resolution, they release the lock, remove the
       directory they created (only if they created it and it is empty), wait and retry.
       This closes the resolve-then-rename window for new-release writers.
+    - **Both modes check it** (re-check R3-S8). Until A4, hooks and hand runs from
+      `~/dev/cctrl` are live **checkout-mode** writers to the very directory that moves (for
+      example the second Mac's Codex hooks before C4, or a statusline still pointing into
+      the checkout). So the sentinel check is in the resolver's shared write path and runs
+      in installed **and** checkout mode, always at the fixed default state root (or the
+      sandbox's state root under test mode). A hand run from some other worktree, whose
+      `data/` is not moving, also waits; that costs seconds once per Mac and keeps the rule
+      simple.
+    - **A sentinel left by a crash is visible** (re-check R3-S5). The sentinel file
+      holds `{pid, pid_start, host, step, created_at}` from the `--apply` or `--rollback` run
+      that made it. If that run crashes, the sentinel stays on purpose (the data is
+      half-moved, so writers must keep waiting), but:
+      - the exit-75 message names the sentinel's pid, its age and step, says whether that
+        pid is still alive, and gives the two ways out: `cctrl state migrate --apply`
+        (resume) or `--rollback`;
+      - `peer doctor` shows a row for it: **info** while the owning pid is alive and the
+        sentinel is younger than 2 minutes, an **issue** once the owner is dead or the age
+        passes 2 minutes;
+      - `cctrl state migrate --status` prints the same fields and the resume or rollback
+        command.
   - The same lock helper (`_cctrl_lock_acquire <file>`) guards `peers.json` and
     `shortcuts.json` rewrites (L2, plan 049 item 2), and later the plan 118 log rotation
     (MF-M7).
@@ -226,9 +256,12 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
     reason replaced rather than just removed.
   - Stays in bash on purpose: a small diff under the existing mailbox tests.
 - **Closes.** F3 (read, rewrite, corruption, backup, version), L2, MF-M4, SH-S1, plan 049 items
-  1-2; review S9; the writer half of MUST-FIX 2.
-- **Size.** 23 h (reviewer 20; Fable 12; plus 2 for the sentinel and post-lock re-validation,
-  plus 1 for the stale-steal specification and its tests).
+  1-2; review S9; the writer half of MUST-FIX 2; re-check items R3-MF2, R3-S5
+  (reporting half), R3-S7 and R3-S8.
+- **Size.** 24 h (reviewer 20; Fable 12; plus 2 for the sentinel and post-lock re-validation,
+  plus 1 for the stale-steal specification and its tests, plus 1 in the re-check for the
+  crash-left sentinel's doctor, status and exit-75 reporting, the checkout-mode coverage and
+  the live-holder test).
 - **Risk.** Medium. This is the hottest path in the fleet. An old release under rollback must
   still exclude new writers, which is what the compatibility test proves.
 - **Tests.**
@@ -243,14 +276,28 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
   - A bash shlock holder against the Python locker; stale steal with two waiters; release
     refused when the pid does not match.
   - **Three-party steal (S9):** a stale lock, two waiters and a third process that acquires
-    legitimately between a waiter's check and its rename (forced with a test-mode hook). The
-    found-live path restores the lock, or reports `lock-steal-collision`, and never ends with
-    two holders who both believe they acquired through our code.
+    legitimately between a waiter's check and its rename (forced with a test-mode hook).
+    Pass when either the found-live path puts the lock back and the waiter goes back to
+    waiting, **or** step 4's EEXIST branch fires and the run is **detected and reported as
+    `lock-steal-collision`** (record written, aside file left for doctor, the waiter does
+    not acquire). In that branch two holders can briefly both have acquired through our
+    code; that is the narrow race step 4 reports, so the test asserts the report, not its
+    absence (re-check R3-S7).
   - PID reuse: a lock whose pid now belongs to a process started after the lock's mtime is
-    stale; the hold-timeout doctor row appears.
+    stale.
+  - **A live holder is never stolen (R3-MF2):** a holder that is SIGSTOPped while
+    holding the lock past the warning age (a test-mode override shortens the 120 s
+    threshold to 2 s; the mtime is not backdated, which would look like pid reuse) is
+    **not** taken by a waiter; the waiter keeps waiting, `peer doctor` shows the age warning, and
+    after SIGCONT the holder's rewrite and the waiter's write both land.
   - **Sentinel:** with `<state root>/.migrating` present a writer waits and creates nothing;
     a writer that resolved the old path, then finds the sentinel after taking the lock,
     releases, removes only its own empty dir, and retries; the 120 s cap exits 75.
+  - **Sentinel in checkout mode (R3-S8):** a fixture checkout-mode run (no `.installed`)
+    with the sandbox sentinel present waits and creates nothing, like an installed run.
+  - **Crash-left sentinel (R3-S5):** a sentinel whose recorded pid is dead gives exit 75
+    with the pid, age, step and the `--apply`/`--rollback` hint; the doctor row is an issue;
+    a sentinel with a live owner under 2 minutes old is info only.
   - Both lock kinds on both bashes.
   - An old-release reader on a file with `v` and a quarantine present.
 - **Rollback.** Previous release. The file stays plain JSONL, and old code tolerates `v` and
@@ -296,15 +343,21 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
      - `--apply` asks for the host name to be typed as confirmation, and runs only in the
        supervised session. The plan 118 classifier does not exist yet at step 4, so this is
        doctrine plus the confirmation, not a caller check.
-  2. **Backup.** A 0600 tarball of `data/`, `costs/` and `profiles/` beside the state root,
-     with its hash recorded. It is taken **after** the sentinel of step 3 is created (the
-     sentinel comes first in the run), so the manifest matches what moves.
-  3. **Sentinel, then marker inside the moving directory.** Create `<state root>/.migrating`
-     (a fixed path) at the very start of `--apply`, before the backup. From then on every A1+ writer waits instead of resolving or
-     creating directories, and re-validates after taking a lock (A1). Hooks that only
-     sample (the statusline history) skip their write while the sentinel exists instead of
-     waiting. Then write `data/LAYOUT` (`{"layout":2,…}`) **before** the rename. The A0
-     resolver in installed mode uses the state dir when `<state>/data/LAYOUT` says 2.
+  2. **Sentinel first.** Create `<state root>/.migrating` (a fixed path, holding
+     `{pid, pid_start, host, step, created_at}`, see A1) at the very start of `--apply`.
+     From then on every A1+ writer, in installed or checkout mode, waits instead of
+     resolving or creating directories, and re-validates after taking a lock (A1). Hooks
+     that only sample (the statusline history) skip their write while the sentinel exists
+     instead of waiting; other hooks wait at most 5 s and then skip (see the losable list).
+  3. **Locks, then backup, then marker** (re-check R3-S6). Take the mailbox,
+     `peers.json` and `shortcuts.json` locks and **hold them until step 6's relinks are
+     done**, so no writer that honours them is inside a write during the backup or the
+     renames. Old releases already use the mailbox lock path (MF-M4), so they are excluded
+     from the mailbox too; they do not lock `peers.json` or `shortcuts.json` (L2). Then the
+     **backup**: a 0600 tarball of `data/`, `costs/` and `profiles/` beside the state root,
+     with a manifest of per-file sizes and hashes. Then write `data/LAYOUT`
+     (`{"layout":2,…}`) **before** the rename. The A0 resolver in installed mode uses the
+     state dir when `<state>/data/LAYOUT` says 2.
      - **Corrected claim (review MUST-FIX 2).** The earlier text said the marker makes
        new-release writers "switch at the same instant and never recreate the old `data/`".
        That is false on its own: a new-release writer that resolved the old path just
@@ -313,39 +366,76 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
        the lock) is what closes that window for A1+ writers. Old-release writers (pre-A1:
        pinned MCP bridges, old hooks) can still recreate `data/`; the bounded merge
        catches them.
-  4. Take the mailbox and peers locks. `rename(data, <state>/data)`.
+  4. `rename(data, <state>/data)`, still under the locks.
   5. Create a symlink at `data.tmp` and `rename` it to `data`. A symlink cannot be renamed
      onto a directory. If an old-release writer recreated `data/` in the window, the tool
-     takes the lock, merges the stray directory into the state dir (mailbox by message id,
-     appends by line, everything else newest wins, with a conflict list), removes it and
+     merges the stray directory into the state dir under the held locks, removes it and
      retries. This is **bounded to 5 attempts, then abort and `--rollback`** (MF-M5).
-     **For whole-file JSON stores the merge never discards silently:** when the stray copy
-     and the state copy of `peers.json`, ring or doorbell state, a `sessions/*` record or
-     `shortcuts.json` differ, the newest wins and the other version is kept beside it as
-     `<file>.migrate-conflict-<ts>` (0600), listed in the report for the operator.
+     **The merge rule (re-check R3-MF1).** A stray `data/` exists only because an
+     old-release writer created an empty directory after the rename, so any whole-file store
+     it wrote there was most likely built from an **empty base** (it read the now-missing
+     file as absent) and holds only that writer's own change. The stray copy is therefore
+     never allowed to replace the live state copy:
+     - **mailbox:** merged by message id, the newest status winning by `updated_at`;
+     - **append-only logs** (statusline history, spending, debug): merged by line;
+     - **keyed whole-file stores, merged per key:** `peers.json` per peer name and
+       `shortcuts.json` per key. A key only in the stray copy is added. A key in both with
+       different values keeps the **state copy's** value, and the stray value is written to
+       `<file>.migrate-stray-<ts>` (0600). Keys missing from the stray copy are **not**
+       treated as deletions (an empty base cannot be told from a delete);
+     - **every other whole-file store** (ring and doorbell state, each `sessions/<name>`
+       record, `hosts.json`, and anything not named above): **the state copy wins**. The
+       stray copy is kept aside as `<file>.migrate-stray-<ts>` (0600). A file that exists
+       only in the stray directory (for example a session record created in the window) is
+       moved in, since there is nothing to lose;
+     - every kept-aside file is listed in the report for the operator, who can apply a
+       stray change by hand. Nothing is discarded silently, and nothing near-empty replaces
+       a full store.
   6. Repeat for `costs/` (its own marker). Then `profiles/`, per Q3: copy it into
      `~/.config/cctrl/profiles` and refuse on a name clash with a differing file. The old
      directory is renamed to `profiles.migrated-<ts>`, never deleted.
-  7. **Remove the sentinel, then verify.** The sentinel is removed as soon as step 6's renames
-     and relinks are done (the window, including the backup, is seconds; the target is under 30 s, measured in the rehearsal), before the
-     hashing verify, which is read-only. `--rollback` sets the sentinel again for its own
-     window. **Verify:** file counts and hashes match the backup manifest, the mailbox parses, and
-     `peer doctor` and `session list` agree before and after (read-only).
-  8. Write a report: what moved, the writer
-     inventory, the conflicts and their kept-aside files, the data the operator should
-     review (`shortcuts.json.bak*`, the hand notes, `snapshots/restore-*.json`), and which
-     writes can be affected in the window.
-     - **Corrected losable-writes list (review MUST-FIX 2).** The earlier "statusline samples
-       only" was wrong under a newest-wins merge. What the window can affect:
+  7. **Release the locks, remove the sentinel, then verify.** Both go as soon as step 6's
+     renames and relinks are done (the window, including the backup, is seconds; the target
+     is under 30 s, measured in the rehearsal), before the hashing verify, which is
+     read-only. `--rollback` sets the sentinel and takes the locks again for its own window.
+     **Verify (re-check R3-S6), per file class against the backup manifest:**
+     - files every writer locks (the mailbox, since old releases share its lock path), and
+       every file no merge touched: **exact** match of size and hash;
+     - `peers.json` and `shortcuts.json`: exact match, or the difference is exactly the
+       keys the report lists as added from a stray copy;
+     - append-only logs: the backed-up content is a **prefix** of the moved file (an
+       accepted old-release writer can append between the backup and the rename, and the
+       merge appends stray lines);
+     - other whole-file stores: exact match (the state copy wins the merge), with any stray
+       copy listed as kept aside;
+     - file counts: the manifest's files are all present; extra files are only those the
+       report lists as moved in from a stray directory;
+     - and the mailbox parses, and `peer doctor` and `session list` agree before and after
+       (read-only).
+  8. Write a report: what moved, the writer inventory, the merges and their kept-aside
+     files, the data the operator should review (`shortcuts.json.bak*`, the hand notes,
+     `snapshots/restore-*.json`), and which writes can be affected in the window.
+     - **Corrected losable-writes list (review MUST-FIX 2; R3-MF1 and
+       SHOULD 4).** What the window can affect:
        - mailbox messages: **not lost** (merged by id; the newest status wins by
-         `updated_at`);
-       - append-only logs (statusline history, spending, debug): **not lost** (merged by
-         line); statusline samples skipped while the sentinel exists are simply not taken;
-       - **whole-file JSON stores written concurrently in the window** (`peers.json`, ring
-         and doorbell state, `sessions/*`, `shortcuts.json`): **last writer wins**, so a
-         concurrent update can be superseded. It is not silently lost: the losing version
-         is kept as `<file>.migrate-conflict-<ts>` and listed for the operator to review.
-       - Matthew approves the migration on this list, not on the old one.
+         `updated_at`). An old-release sender that waits on the held mailbox lock longer
+         than its own lock wait fails with today's lock error, and its sender sees it and
+         can retry;
+       - append-only logs written by a running writer: **not lost** (merged by line);
+       - **writes that hooks skip are dropped, not queued.** While the sentinel exists,
+         A1+ hooks wait at most 5 s and then skip. So, for any Stop that fires more than
+         5 s into the window: the **session-log Stop hook's spending and session-log
+         lines**, and the **Stop/doorbell hook's ring and bell writes**, are not written.
+         A missed ring means a waiting message is noticed at the next Stop or poll instead.
+         Statusline history samples are simply not taken;
+       - **whole-file stores written by an old-release writer in the window**
+         (`peers.json`, `shortcuts.json`, ring and doorbell state, `sessions/*`,
+         `hosts.json`): the live state copy is **kept**. A new peer name or shortcut key
+         from the stray copy is added; any other change that writer made (an update to an
+         existing key, a ring or doorbell change, a session record update, a deletion) is
+         **not applied** and is kept aside as `<file>.migrate-stray-<ts>`, listed for the
+         operator to apply by hand if it matters;
+       - Matthew approves the migration on this list, not on the earlier ones.
 - **The sync gate (MF-M3).** It runs on both Macs:
   - (a) Matthew reads the scope (includes and excludes) of any file-sync tool that covers the
     checkout. An agent never opens that tool's configuration.
@@ -376,10 +466,12 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
   - the fix is `cctrl state migrate --relink`, which merges any stray directory with the
     same bounded merge and restores the symlink.
 - **Closes.** F2, L1, F13 (decided by the canary, and D1 fixes the docs), MF-M3, MF-M5, SH-S3
-  (the gate and checkout resolution test), SH-S4; review MUST-FIX 2 (migration half), S2.
-- **Size.** 23 h build (reviewer 20; Fable 12; plus 3 for the writer inventory, the
-  conflict-kept merge, the split-brain row and guard, and their tests), plus about 1 h
-  supervised per Mac.
+  (the gate and checkout resolution test), SH-S4; review MUST-FIX 2 (migration half), S2;
+  re-check items R3-MF1, R3-S4 and R3-S6.
+- **Size.** 25 h build (reviewer 20; Fable 12; plus 3 for the writer inventory, the
+  kept-aside merge, the split-brain row and guard, and their tests; plus 2 in the
+  re-check for the state-copy-wins and per-key merge with its fixtures, locks held across the backup, and the
+  per-class verify), plus about 1 h supervised per Mac.
 - **Risk.** Medium-high. It is a one-time live change. The window is two renames. A1+ writers
   wait on the sentinel; old-release writers can still recreate `data/`, the bounded merge
   catches them, and the inventory names them in advance.
@@ -392,8 +484,19 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
   - **A new-release writer that resolves before the rename and writes after it** (MUST-FIX 2):
     it waits on the sentinel or re-validates after the lock, creates no stray `data/`, and
     its message lands in the state dir.
-  - An old-release writer in the window: its stray `data/` is merged; a concurrent
-    `peers.json` update produces a `migrate-conflict` file and a report line.
+  - An old-release writer in the window: its stray `data/` is merged by the rules above.
+  - **Empty-base stray store (R3-MF1):** after the rename, an old-release
+    writer reads `peers.json` as missing, recreates `data/`, and writes a `peers.json`
+    holding only its own one entry. After the merge the full state copy survives with every
+    original peer, the writer's entry is added if its name was new (or kept aside in
+    `peers.json.migrate-stray-<ts>` if the name existed with another value), and no original
+    peer is deleted. The same for `shortcuts.json` by key. For a `sessions/<name>` record
+    and for doorbell state, the state copy is kept byte for byte, the stray copy is kept
+    aside, and both appear in the report.
+  - **Locks across the backup (R3-S6):** a new-release sender started during the backup
+    waits on the held lock and lands after the relink; an accepted old-release writer that
+    appends to a log between the backup and the rename passes the prefix verify; a forced
+    mismatch in the mailbox fails the exact verify.
   - The writer inventory on a fixture: a fake MCP bridge, a fake launchd plist naming the
     launcher, an open file under `data/`; a pre-A1 writer refuses without
     `--accept-old-writers`.
@@ -406,7 +509,7 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
   - The previous release's `cctrl` runs against the migrated layout through the symlink.
   - Gate and checkout resolve the same paths under the harness (SH-S3).
   - A post-move check list built only from read-only status commands.
-- **Rollback.** `cctrl state migrate --rollback`: under the same locks, reverse the rename,
+- **Rollback.** `cctrl state migrate --rollback`: under the sentinel and the same locks, reverse the rename,
   remove the symlink and the marker, and restore `profiles/` from `profiles.migrated-<ts>`.
   If that fails, restore the tarball. The previous release keeps working either way, because
   it follows the symlink.
@@ -504,11 +607,11 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
 | Phase | h | Source |
 |---|---|---|
 | A0 | 14 | reviewer 12, + 2 (S5 runbook and test; test-mode gate moved from O5) |
-| A1 | 23 | reviewer 20, + 3 (sentinel; stale-steal spec) |
-| A2 | 23 + 2 supervised | reviewer 20, + 3 (writer inventory, conflict-kept merge, split-brain guard) |
+| A1 | 24 | reviewer 20, + 3 (sentinel; stale-steal spec), + 1 re-check (crash-left sentinel reporting, checkout mode, live-holder test) |
+| A2 | 25 + 2 supervised | reviewer 20, + 3 (writer inventory, kept-aside merge, split-brain guard), + 2 re-check (state-copy-wins and per-key merge, locks across the backup, per-class verify) |
 | A3 | 8 | Fable |
 | A4 | 7 | reviewer 6, + 1 (configuration scan) |
-| **Total** | **75** (+2 supervised) | was 66 |
+| **Total** | **78** (+2 supervised) | was 66; 75 after the second review; + 3 in the re-check |
 
 ## Execution and acceptance criteria
 
@@ -524,7 +627,8 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
   `mkdir -p` the data dir.
 - [ ] A2: the writer inventory and the corrected losable-writes list were in front of Matthew
   before each Mac's run; the new-release-writer-in-the-window test passes; the post-move
-  read-only checks agree before and after; no `migrate-conflict` file is left unreviewed.
+  read-only checks agree before and after; the empty-base stray-store fixture keeps the full
+  state copy; no `migrate-stray` file is left unreviewed.
 - [ ] A3: queued and unread mail never move; `session-log.py` loses no line under 10
   concurrent Stops.
 - [ ] A4: no retained release, live process or configuration entry points into a working
@@ -547,6 +651,7 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
 
 - Reshuffling files inside `data/`, or moving `shortcuts.json` and `hosts.json` to
   `~/.config`.
-- Plan 049 items 3-4 (lock hold vs timeout, nudge dedupe).
+- Plan 049 items 3-4 (what to do about a long lock hold, nudge dedupe). A1 never steals a
+  lock from a live holder and only reports a long hold as a `peer doctor` warning.
 - Any change to the seal key path.
 - Syncing state between the Macs. Each Mac keeps its own store.

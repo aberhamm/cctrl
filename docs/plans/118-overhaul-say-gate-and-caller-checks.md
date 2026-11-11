@@ -24,6 +24,10 @@ Umbrella: plan 115. This plan merges the two drafts `plan-audit-opt3-say-gate.md
   tty rule, the `open … .command` residual is named, iTerm2 and SSH are handled, and the
   `operator-tty` grant path gets an out-of-band confirmation), S3 (no A2 dependency), S4
   (`--operator` parsed in O3.1) and S14 (grants after a power cycle).
+- **The re-check of that revision** (cited R3-S1 to R3-S3 and R3-S9): `sudo` and python3 by
+  absolute path, the ticket cleared after the prompt and the act printed before it (S1);
+  the re-anchor compares against a sealed conversation id and has a caller rule (S2); the
+  state-file hook rule covers the file tools (S3); a class-name nit (S9).
 
 It is written against the post-plan-116 layout. Baseline is `main` at `8c249fc`, where option
 2 is in (an unknown attestation mode fails closed) and option 1 is in (the kill guard).
@@ -71,8 +75,10 @@ It is written against the post-plan-116 layout. Baseline is `main` at `8c249fc`,
     time (to be confirmed by O3.1's supervised check), and the out-of-band confirmation
     still stops it unless the window already holds a sudo ticket (the confirmation runs
     `sudo -k` first, so it never reuses one).
-  - (3) Reading the seal key or editing state files directly. A hook rule narrows this but
-    only matches command text.
+  - (3) Reading the seal key or editing state files directly. Hook rules narrow this: for
+    Bash they only match command text; for the file tools (Write, Edit, NotebookEdit) they
+    match the target path exactly (O4.4). A process that is not an agent tool call, or a
+    script the agent runs, is not covered.
   - (4) A prompt-injected fleet manager has the FM's rights.
   - (5) Raw `tmux send-keys`/`paste-buffer` and the native socket bypass `say` entirely, so
     the sanctioned path is made the visible one.
@@ -146,7 +152,13 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
 - **Env markers** (`CLAUDECODE`, `CODEX_THREAD_ID`, `CCTRL_PEER`) may only lower a class,
   never raise one (plan 111 rule).
 - **M5 hardening in this path.**
-  - Tools are called by absolute path (`/bin/ps`, the pinned tmux binary).
+  - Tools are called by absolute path (`/bin/ps`, the pinned tmux binary, `/usr/bin/sudo`
+    for the confirmation below).
+  - **The interpreter is pinned too** (re-check R3-S1). Bash calls the classifier as
+    `<pinned python3> -I lib/caller_class.py --json`, where the pinned python3 is an
+    absolute path recorded by the install (`/usr/bin/python3` unless the install records
+    another absolute path), never a PATH lookup. A `.command` script that prepends a fake
+    `python3` or `sudo` to PATH therefore changes nothing.
   - When `CCTRL_SESSION_METADATA_DIR`, `TMUX_TMPDIR`, `CCTRL_TMUX_EXTRA_SERVERS` or
     `CCTRL_DATA_DIR` differ from the resolver's defaults, the log records `env_override` and
     the class is capped at `worker`/`script`.
@@ -167,10 +179,24 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
   can be forged by raw ssh. This is the MF-M6 fix for options 3/4.
 - **Out-of-band confirmation on the `operator-tty` grant path** (recommended in plan 115 Q10;
   built in O4.1):
-  - Before a grant-set act by `operator-tty`, cctrl runs `sudo -k` and then `sudo -v` on the
-    caller's tty. `sudo -v` only validates credentials: **no command runs as root**. With
-    `pam_tid` enabled in `/etc/pam.d/sudo_local`, the prompt is Touch ID; otherwise the
-    login password.
+  - Before a grant-set act by `operator-tty`, cctrl runs `/usr/bin/sudo -k` and then
+    `/usr/bin/sudo -v` on the caller's tty. `sudo -v` only validates credentials: **no
+    command runs as root**. With `pam_tid` enabled in `/etc/pam.d/sudo_local`, the prompt is
+    Touch ID; otherwise the login password. A Mac Studio has no built-in sensor, so Touch ID
+    there needs a Touch ID keyboard; over Screen Sharing it falls back to the password.
+  - **Hardening (re-check R3-S1):**
+    - `sudo` is called **by absolute path** (`/usr/bin/sudo`), never from PATH, with a
+      scrubbed environment: `SUDO_ASKPASS` and `SUDO_PROMPT` are removed and `-A` is never
+      passed, so the prompt cannot be redirected to a helper the agent wrote;
+    - **before the prompt**, cctrl prints on the tty exactly what is being approved: the act
+      (for example `set-role --regrant-live`), its target session or sessions, and the
+      window's origin (the tty and the Terminal login it hangs from);
+    - **after a successful `-v`, cctrl runs `/usr/bin/sudo -k` again**, so no root ticket is
+      left on Matthew's tty for the next five minutes (otherwise an agent that can type into
+      that window through osascript, residual 2, could use it for `sudo <anything>`). The
+      same happens after a failed or cancelled prompt;
+    - SECURITY.md (plan 122's D2) says: **refuse any Touch ID or password prompt you did not
+      start yourself**, because the Touch ID dialog is generic and does not name the act.
   - An agent in a fresh `open … .command` window has no password and no finger, and `sudo -k`
     removes any ticket an existing window held.
   - If `sudo -k; sudo -n -v` succeeds (a NOPASSWD rule), the confirmation is unavailable.
@@ -285,7 +311,9 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
 ### Sealed role grants (option 4)
 
 - set-role, start and restore write `role_grant: {v:1, role, orch_kind, session,
-  pane_started, granted_by:{class, session}, at, mac}` into the session record. The mac uses
+  agent_session_id, pane_started, granted_by:{class, session}, at, mac}` into the session
+  record. `agent_session_id` is the Claude or Codex conversation id running in the pane at
+  grant time; it is inside the mac (re-check R3-S2). The mac uses
   domain `cctrl-role-grant-v1`, with the same key and helper.
 - `_peer_caller_attest` verifies the grant: the mac is good, `session` matches, `pane_started`
   equals the anchor, and role and kind equal the record. It adds `role_grant: ok | missing |
@@ -304,12 +332,39 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
   screen. Under `attestation` enforce, orchestrator mail is not push-eligible until then;
   in warn nothing changes except the doctor row. Plan 115 Q10 offers a re-anchor option,
   decided before O4.2 is built: `session restore` re-anchors a grant only when its mac
-  verifies, its agent session id matches the pre-restore snapshot entry, **and its old pane
-  anchor predates the current boot time** (`kern.boottime`), so only panes that really died
-  with the reboot qualify. Each re-anchor is logged in `admin.jsonl` as `re-anchored` and
-  mailed to the FM like any grant notice. If chosen, it is built in O4.2 (inside its 13 h,
-  replacing the "restore by the FM issues grants" path for this case) with tests for each of
-  the three conditions.
+  verifies, **the conversation id restore actually resumes in the new pane equals the
+  grant's sealed `agent_session_id`**, and its old pane anchor predates the current boot
+  time (`kern.boottime`), so only panes that really died with the reboot qualify.
+  - **Compared against sealed data, not the snapshot** (re-check R3-S2). The pre-restore
+    snapshot is restore's own input and is writable by any same-uid process, so comparing
+    the snapshot's id with itself proves nothing: an agent that edited the snapshot before
+    a reboot would get its own conversation restored under an orchestrator's name. The
+    sealed `agent_session_id` cannot be changed without the seal key. **The limit, stated
+    plainly:** an agent that reads the seal key can still forge a whole grant (residual 3);
+    the re-anchor adds no new hole beyond that.
+  - **Who may trigger a re-anchoring restore** (re-check R3-S2). After a reboot every grant
+    is stale, including the new FM's, so class `fleet-manager` (which needs `role_grant:
+    ok`) cannot be the rule. The trust comes from the three sealed conditions, which bind
+    each grant to the exact conversation that held it; the caller rule keeps the act on
+    the sanctioned path. A re-anchoring restore is allowed for:
+    - `operator-tty` (Matthew in Terminal at that Mac; no confirmation prompt, since a
+      re-anchor issues no new grant);
+    - a level session whose record says role orchestrator, orch_kind fleet, with its own
+      grant `stale` or `missing` (the new FM after a power cycle, the doctrine path);
+    - `operator-flag`, for a scripted restore Matthew runs himself.
+
+    Refused for `worker`, `agent-unattested`, `script`, `remote` and `app-claimed`, and for
+    a repo orchestrator: they get a plain restore (sessions come back, grants stay
+    `stale`, and the doctor row says to run `--regrant-live`). The new FM's **own** grant is
+    never re-anchored by its own restore, because its conversation is new; Matthew issues
+    it, or a still-valid predecessor hands over. A record edited to claim the FM role
+    gains nothing: it can only re-anchor grants whose sealed conditions already hold.
+    A grant whose conversation has changed since it was issued (for example after
+    `/clear`) does not re-anchor; Matthew regrants it.
+  - Each re-anchor is logged in `admin.jsonl` as `re-anchored`, with the caller class, and
+    mailed to the FM like any grant notice. If chosen, it is built in O4.2 (13 h plus 1 h
+    for the sealed id and the caller rule, replacing the "restore by the FM issues grants"
+    path for this case) with tests for each of the three conditions and the caller rule.
 
 ### Modes
 
@@ -334,12 +389,22 @@ adds an agent-ancestor check, a tty check and a **login-root** check. It returns
   commands that:
   - contain `--operator` or `CCTRL_ORIGIN_ATTEST=`, including inside `ssh '…'` strings;
   - write to `doorbell.json`, `sessions/`, `audit/` or the seal key.
+- **The state-file rule also covers the file tools** (re-check R3-S3). Claude's Write, Edit
+  and NotebookEdit tools can write `doorbell.json`, `sessions/`, `audit/` and the seal key
+  as easily as Bash can. The M10 reason for a Bash-only matcher ("only shell commands can
+  run tmux") fits the kill guard, not this rule. So O4.4 adds a second PreToolUse matcher
+  for `Write|Edit|NotebookEdit` that realpath-normalises the tool's `file_path` (or
+  `notebook_path`) and denies it when it falls under those paths. This is path matching on
+  a structured field, so it is more reliable than the Bash heuristics. Codex: its
+  file-edit hook entry gets the same path rule where Codex's `hooks.json` exposes the target
+  path; where it does not, that gap is stated in SECURITY.md (plan 122's D2). The kill
+  guard itself stays Bash-only (M10, accepted).
 - **Paths are matched by resolved real path.** The hook imports plan 116's `paths.py` and
   realpath-normalises every path-like token, so the state dir, the
   `~/dev/cctrl/data` symlink and every release's `data` symlink all match. A rule written
   for today's `data/doorbell.json` would stop working the day A2 lands.
-- The rules are text heuristics on the command line. Obfuscation defeats them, which is the
-  stated residual. They fail open on bad input, like every hook (plan 079).
+- The Bash rules are text heuristics on the command line. Obfuscation defeats them, which is
+  the stated residual. All the rules fail open on bad input, like every hook (plan 079).
 
 ## Phases
 
@@ -386,7 +451,8 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   - A login-rooted chain via the test-mode root override gives `operator-tty`. The override
     is ignored outside test mode, and cannot name a binary outside the sandbox.
   - `SSH_CONNECTION` set gives `script` even under a login root.
-  - An env override caps the class. `--operator` inside an agent's chain is still `agent`;
+  - An env override caps the class. `--operator` inside an agent's chain keeps the agent's class
+    (`worker` at level session, else `agent-unattested`; never `operator-flag`; R3-S9);
     `--operator` with no agent ancestor is `operator-flag`.
   - The log: one line per attempt, no body bytes (canary body), 0600/0700, the mac verifies,
     a tampered line fails, a missing key writes the line unsealed, rotation under
@@ -436,7 +502,7 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   doctor row. The enforce code path is built; the live mode stays warn.
   - **The out-of-band confirmation** (`sudo -k; sudo -v`, Touch ID where enabled) on the
     `operator-tty` grant path, as designed above, if plan 115 Q10 accepts it.
-- **Closes.** H2 (CLI half); plan 115 review MUST-FIX 1 (confirmation half).
+- **Closes.** H2 (CLI half); plan 115 review MUST-FIX 1 (confirmation half); re-check R3-S1.
 - **Size.** 12 h (10 rescaled from the draft's 7, plus 2 for the confirmation).
 - **Risk.** Low (warn).
 - **Tests.**
@@ -445,10 +511,16 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   - `--orch-kind fleet` only for the `succeeds` session or `operator-tty`.
   - `operator-flag` is refused for the grant set (`--operator` exists since O3.1).
   - Doorbell `move` by either FM at handover.
-  - The confirmation, with a stubbed `sudo` on a test-mode PATH: ok proceeds; failed is
-    `would-refuse` in warn and exit 77 in enforce; a NOPASSWD stub (`sudo -n -v` succeeds
-    after `-k`) reads `unavailable`; `sudo -k` is always called first; the FM-with-grant
-    path never prompts. The stub is honoured only in test mode.
+  - The confirmation, with a stubbed `sudo` at a test-mode-only absolute path override (the
+    override is honoured only under A0's test-mode gate and can only name a binary inside
+    the sandbox): ok proceeds; failed is `would-refuse` in warn and exit 77 in enforce; a
+    NOPASSWD stub (`sudo -n -v` succeeds after `-k`) reads `unavailable`; `sudo -k` is
+    always called first **and again after** an ok, a failed and a cancelled prompt; the act,
+    target and origin are printed before the prompt; `SUDO_ASKPASS` set in the caller's env
+    is not passed on; the FM-with-grant path never prompts.
+  - **PATH cannot steer it (R3-S1):** outside test mode, a fake `sudo` and a fake `python3`
+    first on PATH are never run (the stubs write a canary file; the test asserts it is
+    absent).
 - **Rollback.** `caller_checks: off`, or the previous release.
 - **Blocked by.** O3.1.
 - **Needs Matthew's yes:** the install on each Mac.
@@ -460,7 +532,8 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   - `role_grant` appears in the attest and in eligibility (warn: doctor only).
   - `--regrant-live [--dry-run]`.
 - **Closes.** H2 (grant half: a hand-edited record no longer yields an orchestrator).
-- **Size.** 13 h.
+- **Size.** 14 h (13, plus 1 in the re-check for the sealed `agent_session_id` and the
+  re-anchor caller rule, R3-S2).
 - **Risk.** Medium. It touches start, restore and attest.
 - **Tests.**
   - A hand-edited record reads `bad`; a grant copied to another session, or kept across a
@@ -469,6 +542,13 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   - A sealed message keeps `role_grant`.
   - Plan 111 eligibility under enforce needs `ok`.
   - Restore by the FM issues grants.
+  - The grant carries `agent_session_id` inside the mac; editing it reads `bad`.
+  - **Re-anchor (if Q10 chooses it; R3-S2):** a snapshot edited before the reboot so that an
+    orchestrator's name resumes another conversation does **not** re-anchor (the resumed
+    id differs from the sealed one); each of the three conditions failing alone blocks it;
+    a re-anchoring restore by `worker`, `agent-unattested`, `script` or a repo
+    orchestrator is a plain restore with grants left `stale`; by `operator-tty` or the
+    stale-granted FM it re-anchors and logs the caller class.
 - **Rollback.** The previous release. Grants are extra record fields that old code ignores.
 - **Blocked by.** O4.1.
 - **Needs Matthew's yes:** the install on each Mac; then **Matthew runs `--regrant-live`
@@ -527,7 +607,8 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
 ### O3.5 and O4.4. Hook rules, docs and skills (step 7)
 
 - **Scope.**
-  - The PreToolUse rules above, matching resolved paths.
+  - The PreToolUse rules above, matching resolved paths, including the O4.4 file-tool
+    matcher (`Write|Edit|NotebookEdit`) for the state-file rule (R3-S3).
   - README (the say, doorbell, set-role and recv/ack/gc sections, and the attestation
     table).
   - `--help` text and the `AGENTS.md` peer contract (`--as` must be you; workers never say
@@ -539,12 +620,15 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
     - `cctrl-repo-orchestrator`: ask the FM for role and doorbell changes;
     - `cctrl-spawn`: only the FM or Matthew starts orchestrators; exit 77.
   - Plan 111's out-of-scope and Risks lines.
-- **Closes.** H1, H2, MF-M7 (hook paths).
-- **Size.** 5 h + 3 h.
+- **Closes.** H1, H2, MF-M7 (hook paths); re-check R3-S3.
+- **Size.** 5 h + 4 h (O4.4 is 3, plus 1 in the re-check for the file-tool matcher).
 - **Risk.** Medium. A hook change on every session.
 - **Tests.**
   - The rules deny the forms (including inside `ssh '…'`) and match **after A2** through the
     repo symlink, a release symlink and the state dir.
+  - **File tools (R3-S3):** a Write, an Edit and a NotebookEdit targeting `doorbell.json`, a
+    `sessions/` record, an `audit/` log and the seal key are each denied, through each of
+    those three path forms; a Write to an unrelated file in the same repo is allowed.
   - The hook fails open on bad input and when python3 is missing.
 - **Rollback.** `cctrl hooks install` from the previous release; plan 117's C3 backup.
 - **Blocked by.** O3.4 and O4.3; plan 117's C3 (settings writer).
@@ -573,10 +657,10 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
 | O3.4 | 6 | draft 4 → reviewer scale |
 | O3.5 | 5 | draft 3 → reviewer scale |
 | O4.1 | 12 | draft 7 → reviewer scale 10, + 2 for the out-of-band confirmation |
-| O4.2 | 13 | draft 9 → reviewer scale |
+| O4.2 | 14 | draft 9 → reviewer scale 13, + 1 re-check (sealed agent session id, re-anchor caller rule) |
 | O4.3 | 9 | draft 6 → reviewer scale |
-| O4.4 | 3 | draft 2 → reviewer scale |
-| **Total** | **86** | reviewer 40 + 35, plus 6 (MF-M6), plus 5 (this revision) |
+| O4.4 | 4 | draft 2 → reviewer scale 3, + 1 re-check (file-tool matcher for the state-file rule) |
+| **Total** | **88** | reviewer 40 + 35, plus 6 (MF-M6), plus 5 (second-review revision), plus 2 (re-check: O4.2 +1, O4.4 +1) |
 
 ## Execution and acceptance criteria
 
@@ -594,7 +678,8 @@ rescaled to the reviewer's totals (SH-S15), plus 6 h for MF-M6.
   rotate under the A1 lock.
 - [ ] The supervised check's results (`open … .command`, osascript, iTerm2 chain) are written
   into SECURITY.md (plan 122's D2), and the iTerm2 row is decided from them.
-- [ ] The hook rules match after A2 through every symlink form.
+- [ ] The hook rules match after A2 through every symlink form, and the state-file rule
+  denies Write, Edit and NotebookEdit as well as Bash.
 - [ ] No enforce flip happens inside this plan; each is its own yes.
 
 ## Interfaces frozen for plan 120 (MF-M7)
