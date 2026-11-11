@@ -445,7 +445,8 @@ Phase status:
   orch-cctrl-reports/plan-111-p2-fix-impl.md.
 - Phase 3: built 2026-11-08 on branch feat/peer-attest-p3 (not pushed, not
   installed; live default warn). doorbell.json `attestation` off | warn |
-  enforce (absent, null or unknown = warn) and `attestation_since`; the
+  enforce (absent or null = warn; unknown = enforce (fail closed, since
+  0135e89; originally unknown = warn)) and `attestation_since`; the
   built-in default allowlist (push: orchestrator/fleet-manager roles; Stop
   bell also level-session workers). `_peer_push_allowed` checks each queued
   message (or the inline id), the Stop bell filters on the jq fast path and

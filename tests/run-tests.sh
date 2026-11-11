@@ -10243,8 +10243,12 @@ $first_out"
         [[ "$(grep -c 'paste-buffer' "$P3_C/tmux.log")" -eq 1 ]] || fail "unknown mode $unk: exactly one paste"
         jq -e -s '.[-1].mode == "enforce" and .[-1].acted == true and .[-1].ineligible == 4' "$P3_C/doorbell/attestation.log" >/dev/null \
             || fail "unknown mode $unk: the log must record an enforce verdict: $(cat "$P3_C/doorbell/attestation.log" 2>&1)"
+        # doorbell status flags it as doctor does (audit-opt1-2 verify NIT-6).
         out="$("${P3_E[@]}" "$ROOT/cctrl" peer doorbell status)"
-        assert_contains "$out" "attestation: enforce (gating on)"
+        assert_contains "$out" "attestation: enforce (INVALID $(jq -c . <<< "$unk"): reads enforce, fail closed; gating on)"
+        out="$("${P3_E[@]}" "$ROOT/cctrl" peer doorbell status --json)"
+        jq -e '.attestation == "enforce" and .attestation_valid == false' <<< "$out" >/dev/null \
+            || fail "unknown mode $unk: doorbell status --json must say attestation_valid false: $out"
     done
     # An explicit null is the absent key: today's default, warn (all 5 nudged,
     # nothing acted on), not "unknown".
@@ -10256,11 +10260,21 @@ $first_out"
     jq -e '.results[0].status == "nudged" and .results[0].queued == 5' <<< "$out" >/dev/null || fail "attestation null must read warn: $out"
     jq -e -s 'all(.[]; .mode == "warn" and .acted == false)' "$P3_C/doorbell/attestation.log" >/dev/null \
         || fail "attestation null: warn log only: $(cat "$P3_C/doorbell/attestation.log" 2>&1)"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer doorbell status)"
+    assert_contains "$out" "attestation: warn (allowlist logged"
+    assert_not_contains "$out" "INVALID"
     # doorbell enable keeps the attestation keys.
     _p3_mode "$P3_C" enforce 2026-01-15T00:00:00Z
     "${P3_E[@]}" "$ROOT/cctrl" peer doorbell enable --peer extra >/dev/null
     jq -e '.attestation == "enforce" and .attestation_since == "2026-01-15T00:00:00Z"' "$P3_C/doorbell.json" >/dev/null \
         || fail "doorbell enable must keep attestation and attestation_since: $(cat "$P3_C/doorbell.json")"
+    # A valid enforce: no INVALID marker.
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer doorbell status)"
+    assert_contains "$out" "attestation: enforce (gating on)"
+    assert_not_contains "$out" "INVALID"
+    out="$("${P3_E[@]}" "$ROOT/cctrl" peer doorbell status --json)"
+    jq -e '.attestation == "enforce" and .attestation_valid == true' <<< "$out" >/dev/null \
+        || fail "valid enforce: doorbell status --json must say attestation_valid true: $out"
     echo "ok: plan 111 p3 warn changes no delivery (deliver/inline/dry-run identical to off), logs would-be blocks, shows eligibility"
 }
 
@@ -10476,6 +10490,31 @@ test_peer_attest_p3_stop_bell() {
         unset CCTRL_HOST_ID_FILE CCTRL_PEER_SEAL_KEY_FILE
     done
     echo "ok: plan 111 p3 Stop bell: off/warn ring as before (warn logs), enforce rings only for eligible senders"
+}
+
+test_peer_attest_jq_15_compatible() {
+    # audit-opt1-2 verify NIT-5: cctrl's jq must run on jq 1.5. jq 1.6 added
+    # IN/INDEX/walk/$ENV, 1.7 pick/toarray/abs/trim; a jq error in the bell
+    # turns it off (`|| return 0`) and _peer_attestation_cfg falls back to
+    # warn. Static check over cctrl, then the attest_mode truth table on the
+    # jq at hand (the replacement for IN must keep it).
+    local hits cfg_jq v doc want got
+    hits="$(grep -nE '(^|[^A-Za-z0-9_])(IN|INDEX|walk|pick|toarray|have_literal_numbers)\(|\$ENV([^A-Za-z0-9_]|$)|\| *(trim|ltrim|rtrim|abs|toarray)([^A-Za-z0-9_]|$)' "$ROOT/cctrl" || true)"
+    [[ -z "$hits" ]] || fail "cctrl uses a jq builtin newer than jq 1.5: $hits"
+    cfg_jq="$(sed -n "/^PEER_ATTEST_CFG_JQ='/,/'\$/p" "$ROOT/cctrl")"
+    [[ "$cfg_jq" == "PEER_ATTEST_CFG_JQ='"*"'" ]] || fail "could not extract PEER_ATTEST_CFG_JQ"
+    eval "$cfg_jq"
+    for v in 'null|warn|true' '{}|warn|true' '{"attestation":null}|warn|true' '{"attestation":"off"}|off|true' \
+             '{"attestation":"warn"}|warn|true' '{"attestation":"enforce"}|enforce|true' \
+             '{"attestation":"enforced"}|enforce|false' '{"attestation":"WARN"}|enforce|false' \
+             '{"attestation":""}|enforce|false' '{"attestation":5}|enforce|false' '{"attestation":["warn"]}|enforce|false' \
+             '[]|warn|true'; do
+        doc="${v%%|*}"; want="${v#*|}"
+        got="$(jq -r "$PEER_ATTEST_CFG_JQ"' "\(attest_mode)|\(attest_mode_valid)"' <<< "$doc")" \
+            || fail "attest jq failed on $doc"
+        [[ "$got" == "$want" ]] || fail "attest_mode of $doc: got $got, want $want"
+    done
+    echo "ok: cctrl jq uses no jq 1.6+ builtin; attest_mode truth table unchanged"
 }
 
 test_peer_attest_p3_say_peer() {

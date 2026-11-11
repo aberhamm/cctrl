@@ -16,7 +16,10 @@ It also blocks a kill-server that does name a server, when that server is
 one of cctrl's: the default server, the primary (tmuxServer /
 CCTRL_TMUX_SERVER, "fleet" on the Studio), any extra server (tmuxExtraServers
 / CCTRL_TMUX_EXTRA_SERVERS) and the $TMUX server itself, by -L name or by -S
-path (normalised: /tmp vs /private/tmp, //, ./, ..). `resolve_servers()`
+path (normalised: /tmp vs /private/tmp, //, ./, ..; casefolded, as APFS is
+case-insensitive), by a -L value holding a / (a path under the socket dir)
+and by a relative -S whose last part names one (the cwd is unknown; see
+_relative_sock_problem). `resolve_servers()`
 reads those the same way cctrl does (audit 2026-11 H3, mdec-1111); when a
 config file cannot be read it fails safe and also blocks any -L name and any
 -S path inside a tmux socket directory.
@@ -47,7 +50,8 @@ KILL_RE = re.compile(r"(?<![\w-])" + _KILL + r"(?![\w-])")
 TMUX_RE = re.compile(r"(?<![\w.-])tmux(?![\w.-])")
 _SOCK_FLAG_RE = re.compile(r"(?<![\w$-])-[0-9A-Za-z]*[SL]")
 _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=")
-_ANSI_NUM_RE = re.compile(r"x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|([0-7]{1,3})")
+# \xHH, \uHHHH, \UHHHHHHHH (bash 4.2+, zsh) and \NNN (octal).
+_ANSI_NUM_RE = re.compile(r"x([0-9A-Fa-f]{1,2})|u([0-9A-Fa-f]{1,4})|U([0-9A-Fa-f]{1,8})|([0-7]{1,3})")
 _PYTHON_RE = re.compile(r"^python[0-9.]*$")
 _INHERITED_SOCK_RE = re.compile(r"\$\{?TMUX(?![A-Za-z0-9_])|socket_path")
 _DEFAULT_SOCK_RE = re.compile(r"/tmp\}?/tmux-[^/]+/default$")
@@ -123,11 +127,12 @@ def _ansi_decode(body):
                 continue
             m = _ANSI_NUM_RE.match(body, i + 1)
             if m:
-                if m.group(3) is not None:
-                    code = int(m.group(3), 8)
+                if m.group(4) is not None:
+                    code = int(m.group(4), 8)
                 else:
-                    code = int(m.group(1) or m.group(2), 16)
-                out.append(chr(code))
+                    code = int(m.group(1) or m.group(2) or m.group(3), 16)
+                # Past U+10FFFF the shell writes nothing useful; drop it.
+                out.append(chr(code) if code <= 0x10FFFF else "")
                 i = m.end()
                 continue
             out.append(e)
@@ -164,12 +169,20 @@ class Servers:
     names: -L names (and the last part of a -S path in a tmux socket dir).
     paths: socket paths, kept as normalised keys (see _sock_keys).
     known: False when a config file could not be read; the guard then also
-    blocks any -L name and any -S path inside a tmux socket directory."""
-    __slots__ = ("names", "paths", "known", "socket_dir", "home")
+    blocks any -L name and any -S path inside a tmux socket directory.
+    basenames: the last part of every protected name and path, for a
+    relative -S (see _relative_sock_problem).
+
+    Names and path keys are casefolded, and so is everything compared with
+    them: macOS's APFS is case-insensitive by default, so -L FLEET and
+    -S /tmp/tmux-501/Fleet reach the fleet socket there. Folding on every
+    platform over-blocks only a kill-server of a server whose name differs
+    from a protected one in case alone (case-sensitive Linux)."""
+    __slots__ = ("names", "paths", "known", "socket_dir", "home", "basenames")
 
     def __init__(self, names=(), paths=(), known=True, socket_dir="", home=None):
         self.home = os.environ.get("HOME", "") if home is None else home
-        self.names = BUILTIN_NAMES | frozenset(n for n in names if n)
+        self.names = frozenset(_fold(n) for n in BUILTIN_NAMES | frozenset(n for n in names if n))
         keys = set()
         for path in paths:
             if path:
@@ -177,16 +190,28 @@ class Servers:
         self.paths = frozenset(keys)
         self.known = known
         self.socket_dir = socket_dir
+        self.basenames = self.names | frozenset(
+            posixpath.basename(k) for k in keys if k.startswith("/") and posixpath.basename(k))
+
+
+def _fold(text):
+    """The case-insensitive key of a socket name or path (see Servers)."""
+    return text.casefold()
 
 
 def _strip_private(path):
-    return re.sub(r"^/private(?=/(?:tmp|var|etc)(?:/|$))", "", path)
+    return re.sub(r"^/private(?=/(?:tmp|var|etc)(?:/|$))", "", path, flags=re.I)
 
 
 def _sock_keys(path, home=""):
     """Normalised forms of a socket path: ~ expanded, //, ./ and .. folded,
     /private/tmp read as /tmp, and the directory's physical path when it
-    exists. Two paths name one socket when their key sets meet."""
+    exists, all casefolded (see Servers). Two paths name one socket when
+    their key sets meet."""
+    return {_fold(key) for key in _sock_keys_raw(path, home)}
+
+
+def _sock_keys_raw(path, home=""):
     if path == "~" or path.startswith("~/"):
         path = home + path[1:]
     if not path.startswith("/"):
@@ -218,10 +243,13 @@ def _expand_known(text, home):
 def _sock_path_problem(text, literal, servers):
     """Why a -S path names a protected server, or None."""
     for cand in ([text] if literal else [text, _expand_known(text, servers.home)]):
-        m = _NAMED_SOCK_RE.search(cand)
+        m = _NAMED_SOCK_RE.search(_fold(cand))
         if m and m.group(1) in servers.names:
             return "-S names the %r server's socket" % m.group(1)
         if not cand.startswith(("/", "~")):
+            problem = _relative_sock_problem(cand, servers)
+            if problem:
+                return problem
             continue
         keys = _sock_keys(cand, servers.home)
         if keys & servers.paths:
@@ -240,11 +268,60 @@ def _sock_path_problem(text, literal, servers):
     return None
 
 
+def _relative_sock_problem(path, servers):
+    """Why a relative -S path may name a protected server, or None.
+
+    The rule: tmux resolves a relative -S against the shell's cwd, which the
+    guard cannot know (`cd /tmp/tmux-501 && tmux -S fleet kill-server`). So a
+    relative -S blocks when its last part (after ./, .. and trailing /
+    folding) is a protected server's name or the last part of a protected
+    socket path, whatever directory it sits in. A private socket with any
+    other last part (`-S ./x/sock`, `-S sock`) stays allowed. With an
+    unreadable config it also blocks a bare relative name and a path whose
+    directory is a tmux socket dir (tmux-<uid>), as -L does. A path still
+    holding an expansion ($, `) is not relative as far as the guard can
+    tell (`-S "$D/sock"`) and is left to the checks above."""
+    if not path or "$" in path or "`" in path:
+        return None
+    norm = posixpath.normpath(path)
+    base = _fold(posixpath.basename(norm))
+    if base in servers.basenames:
+        return ("-S %s is relative (the guard cannot know the cwd) and its last part names "
+                "a cctrl tmux server's socket (%r)" % (path, base))
+    if not servers.known:
+        directory = posixpath.dirname(norm)
+        if directory in ("", ".") or _SOCK_DIR_NAME_RE.match(posixpath.basename(directory)):
+            return ("-S %s is relative and cctrl's tmux config could not be read "
+                    "(cannot tell a private server from the fleet's)" % path)
+    return None
+
+
+def _label_path_problem(name, servers):
+    """Why a -L value holding a / names a protected server, or None. tmux
+    does not reject such a label: it builds <socket dir>/<label>, so
+    `-L ./fleet` and `-L ../tmux-501/fleet` reach the fleet socket."""
+    base_dir = servers.socket_dir or "/tmp/tmux-%d" % os.getuid()
+    path = re.sub(r"^/+", "/", posixpath.normpath(base_dir + "/" + name))
+    directory, base = posixpath.split(path)
+    if base and _sock_keys(directory, servers.home) & _sock_keys(base_dir, servers.home):
+        problem = _sock_name_problem(base, servers)
+        return "-L %s is %s in the socket dir: %s" % (name, base, problem) if problem else None
+    problem = _sock_path_problem(path, True, servers)
+    if problem:
+        return "-L %s is the path %s: %s" % (name, path, problem)
+    if not servers.known:
+        return "-L %s, and cctrl's tmux config could not be read (cannot tell it from the fleet's)" % name
+    return None
+
+
 def _sock_name_problem(name, servers):
-    """Why a -L name names a protected server, or None."""
-    if name in servers.names:
-        if name == "default":
-            return "-L default names the default server"
+    """Why a -L name names a protected server, or None. Names compare
+    casefolded (see Servers)."""
+    if "/" in name:
+        return _label_path_problem(name, servers)
+    if _fold(name) in servers.names:
+        if _fold(name) == "default":
+            return "-L %s names the default server" % name
         return "-L %s names a cctrl tmux server" % name
     if (servers.socket_dir and "/" not in name
             and _sock_keys(servers.socket_dir + "/" + name, servers.home) & servers.paths):
@@ -809,7 +886,7 @@ def _socket_problem(sock_s, sock_l, ctx):
             if problem:
                 return "-L is $%s, which this line set: %s" % (var, problem)
         default = _expand_known(text, ctx.servers.home)
-        if default != text and "$" not in default and default in ctx.servers.names:
+        if default != text and "$" not in default and _sock_name_problem(default, ctx.servers):
             return "-L %s defaults to a cctrl tmux server: %s" % (text, _sock_name_problem(default, ctx.servers))
         if not ctx.servers.known:
             return "-L is a variable and cctrl's tmux config could not be read (cannot tell it from the fleet's)"

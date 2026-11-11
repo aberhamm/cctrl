@@ -361,6 +361,66 @@ ALLOW_FLEET = [
 ]
 
 
+# mdec-1111 nit round (audit-opt1-2 verify NIT-1..4). Block with no config
+# (the built-in servers) and with the fleet config.
+UID = os.getuid()
+BLOCK_NITS = [
+    # NIT-1: APFS is case-insensitive, so names and paths compare casefolded
+    "tmux -L FLEET kill-server",
+    "tmux -L Fleet kill-server",
+    "tmux -L Default kill-server",
+    "tmux -LFLEET kill-server",
+    "tmux -S /tmp/tmux-501/FLEET kill-server",
+    "tmux -S /tmp/TMUX-501/Default kill-server",
+    "tmux -S /PRIVATE/TMP/tmux-501/fleet kill-server",
+    "N=FLEET; tmux -L \"$N\" kill-server",
+    "tmux -L \"${N:-Fleet}\" kill-server",
+    # NIT-2: a -L value with a / is a path under the socket dir
+    "tmux -L ./fleet kill-server",
+    "tmux -L ../tmux-%d/fleet kill-server" % UID,
+    "tmux -L .//fleet/ kill-server",
+    "tmux -L x/../default kill-server",
+    "tmux -L ./FLEET kill-server",
+    "tmux -L \"${N:-./fleet}\" kill-server",
+    # NIT-3: \U in $'...' (bash 4.2+, zsh)
+    "tmux kill-$'\\U00000073'erver",
+    "tmux $'kill-\\U73'erver",
+    "tmux -L $'\\U00000066leet' kill-server",
+    # NIT-4: a relative -S whose last part names a protected server
+    "cd /tmp/tmux-501 && tmux -S fleet kill-server",
+    "tmux -S fleet kill-server",
+    "tmux -S ./fleet kill-server",
+    "tmux -S fleet/ kill-server",
+    "tmux -S ../tmux-501/default kill-server",
+    "tmux -S x/../FLEET kill-server",
+    "tmux -S \"${S:-fleet}\" kill-server",
+]
+if UID != 501:
+    BLOCK_NITS.append("tmux -L ../tmux-501/fleet kill-server")
+# Fleet-config-only blocks (FLEET_ENV names "spare" and .../socks/side).
+BLOCK_NITS_FLEET = [
+    "tmux -L SPARE kill-server",
+    "tmux -L ./spare kill-server",
+    "tmux -S spare kill-server",
+    "tmux -S ./side kill-server",
+    "tmux -S /users/NOBODY/socks/SIDE kill-server",
+]
+# Must stay allowed with no config and with the fleet config.
+ALLOW_NITS = [
+    "tmux -S ./x/sock kill-server",
+    "tmux -S sock kill-server",
+    "tmux -S x/fleetx kill-server",
+    "tmux -S fleet ls",
+    "tmux -S ./fleet list-sessions",
+    "tmux -L ./probe kill-server",
+    "tmux -L ../other/fleet kill-server",
+    "tmux -L PROBE kill-server",
+    "tmux -L FLEET kill-session -t '=x'",
+    "echo $'\\U0001F600 kill-server'",
+    "printf $'\\U00000041\\n'",
+]
+
+
 def fleet_servers(**extra):
     env = dict(FLEET_ENV)
     env.update(extra)
@@ -406,6 +466,41 @@ class ParserTests(unittest.TestCase):
         for command in ALLOW_FLEET + ALLOW:
             with self.subTest(command=command):
                 self.assertIsNone(guard.check_command(command, servers), "blocked: %r" % command)
+
+    def test_nit_round_case_label_path_unicode_and_relative_forms_block(self):
+        lists = set(BLOCK_NITS) | set(BLOCK_NITS_FLEET)
+        self.assertEqual(len(lists), len(BLOCK_NITS) + len(BLOCK_NITS_FLEET))
+        self.assertFalse(lists & (set(ALLOW) | set(ALLOW_FLEET) | set(ALLOW_NITS)))
+        servers = fleet_servers()
+        for command in BLOCK_NITS:
+            with self.subTest(command=command):
+                self.assertTrue(guard.may_mention_kill(command))
+                self.assertIsInstance(guard.check_command(command), str, "not blocked: %r" % command)
+                self.assertIsInstance(guard.check_command(command, servers), str, "not blocked: %r" % command)
+        for command in BLOCK_NITS_FLEET:
+            with self.subTest(command=command):
+                self.assertIsInstance(guard.check_command(command, servers), str, "not blocked: %r" % command)
+
+    def test_nit_round_private_forms_stay_allowed(self):
+        servers = fleet_servers()
+        for command in ALLOW_NITS:
+            with self.subTest(command=command):
+                self.assertIsNone(guard.check_command(command), "blocked: %r" % command)
+                self.assertIsNone(guard.check_command(command, servers), "blocked: %r" % command)
+
+    def test_ansi_decode_unicode_escapes(self):
+        self.assertEqual(guard._ansi_decode("\\U00000073"), "s")
+        self.assertEqual(guard._ansi_decode("\\U73x"), "sx")
+        self.assertEqual(guard._ansi_decode("\\u0073"), "s")
+        self.assertEqual(guard._ansi_decode("\\UFFFFFFFF!"), "!")  # past U+10FFFF: dropped, no raise
+
+    def test_loose_fallback_covers_the_nit_forms(self):
+        servers = fleet_servers()
+        for command in ("tmux -L FLEET kill-server", "tmux -L ./fleet kill-server",
+                        "tmux -S fleet kill-server", "tmux kill-$'\\U00000073'erver"):
+            with self.subTest(command=command):
+                self.assertTrue(guard._loose(command, servers))
+        self.assertFalse(guard._loose("tmux -S ./x/sock kill-server", servers))
 
     def test_fleet_is_protected_with_no_config(self):
         # "fleet" and "default" are built in: protected even when nothing
@@ -560,9 +655,14 @@ class ResolveServersTests(unittest.TestCase):
         # private sockets outside a tmux socket dir stay allowed (the suite's)
         for command in ("tmux -S \"$D/sock\" kill-server", "tmux -S /tmp/x/sock kill-server",
                         "S=$(mktemp -d)/sock; tmux -S \"$S\" new-session -d; tmux -S \"$S\" kill-server",
-                        "tmux -L probe ls"):
+                        "tmux -L probe ls", "tmux -S ./x/sock kill-server"):
             with self.subTest(command=command):
                 self.assertFalse(self.blocked(command, servers))
+        # a relative -S: the cwd is unknown, like -L (nit round NIT-4)
+        for command in ("tmux -S sock kill-server", "tmux -S ../tmux-501/probe kill-server",
+                        "tmux -L ./probe kill-server", "tmux -L PROBE kill-server"):
+            with self.subTest(command=command):
+                self.assertTrue(self.blocked(command, servers))
 
     def test_resolve_never_raises(self):
         servers = guard.resolve_servers(environ={"HOME": 7}, script_dir=self.tmp)
@@ -693,7 +793,11 @@ class FleetEntryPointTests(unittest.TestCase):
                         "tmux -L spare kill-server",
                         "tmux kill-$'server'",
                         "tmux $'kill-\\x73erver'",
-                        "tmux -L fleet kill-$'serv'er"):
+                        "tmux -L fleet kill-$'serv'er",
+                        "tmux -L FLEET kill-server",
+                        "tmux -L ./fleet kill-server",
+                        "tmux -S fleet kill-server",
+                        "tmux kill-$'\\U00000073'erver"):
             with self.subTest(command=command):
                 result = self.run_for(command)
                 self.assertEqual(result.returncode, 2, result.stderr)
