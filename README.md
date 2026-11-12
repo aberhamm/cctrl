@@ -2076,7 +2076,7 @@ CCTRL_TEST_NAMES="$(grep -v '^[[:space:]]*#' tests/smoke-tests.txt | grep .)" ba
 tests/ci-shellcheck.sh            # shellcheck against tests/shellcheck-baseline.txt (--update to re-record)
 ```
 
-CI covers macOS only; there is no Linux leg.
+CI covers macOS only; there is no Linux leg. GitHub disables scheduled workflows after 60 days without repository activity, so the nightly run can stop silently.
 
 Run one or a few tests, list the registry, or get timings:
 

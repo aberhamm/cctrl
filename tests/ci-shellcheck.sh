@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck against a recorded baseline (plan 121 E0).
+# Compare shellcheck findings with a recorded baseline (plan 121 E0).
 #   tests/ci-shellcheck.sh           compare with tests/shellcheck-baseline.txt, rc 1 on any increase
 #   tests/ci-shellcheck.sh --update  rewrite the baseline from the current tree
 # The baseline holds "<count> <file> <SCcode>" lines (severity warning and above),
@@ -10,16 +10,26 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 BASE="tests/shellcheck-baseline.txt"
 command -v shellcheck >/dev/null || { echo "ci-shellcheck: shellcheck not installed" >&2; exit 127; }
+shellcheck --version >/dev/null 2>&1 || { echo "ci-shellcheck: shellcheck is installed but broken" >&2; exit 2; }
 
 files=(cctrl)
 while IFS= read -r f; do files+=("$f"); done < <(git ls-files '*.sh' | sort)
 
 now="$(mktemp "${TMPDIR:-/tmp}/ci-shellcheck.XXXXXX")"
 trap 'rm -f "$now"' EXIT
+# rc 0 = clean, rc 1 = findings; rc >= 2 means shellcheck itself failed: fatal.
+out="$(mktemp "${TMPDIR:-/tmp}/ci-shellcheck-out.XXXXXX")"
+trap 'rm -f "$now" "$out"' EXIT
 for f in "${files[@]}"; do
-    shellcheck -S warning -f gcc -x "$f" 2>/dev/null \
-        | sed -n 's/^\([^:]*\):[0-9]*:[0-9]*: .*\[\(SC[0-9]*\)\]$/\1 \2/p' || true
-done | sort | uniq -c | sed 's/^ *//' > "$now"
+    src=0
+    shellcheck -S warning -f gcc -x "$f" 2>/dev/null >> "$out" || src=$?
+    if (( src >= 2 )); then
+        echo "ci-shellcheck: shellcheck failed (rc $src) on $f" >&2
+        exit 2
+    fi
+done
+sed -n 's/^\([^:]*\):[0-9]*:[0-9]*: .*\[\(SC[0-9]*\)\]$/\1 \2/p' "$out" \
+    | sort | uniq -c | sed 's/^ *//' > "$now"
 
 if [[ "${1:-}" == "--update" ]]; then
     { echo "# shellcheck -S warning baseline (plan 121 E0): count file code. Regenerate: tests/ci-shellcheck.sh --update"

@@ -5,7 +5,7 @@
 # no secrets; `pull_request` only (never `pull_request_target`).
 #
 # What runs when:
-#   push (any branch)   lint, python, hygiene, gitleaks, smoke (bash 3.2 + 5)
+#   push (main only)    lint, python, hygiene, gitleaks, smoke (bash 3.2 + 5)
 #   pull_request        lint, python, hygiene, gitleaks, full (bash 3.2 + 5)
 #   nightly (schedule)  the same as a pull request, on the default branch
 #
@@ -16,6 +16,7 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
   schedule:
     - cron: "17 3 * * *"
@@ -119,9 +120,19 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Install gitleaks
-        run: brew install gitleaks
+        run: |
+          set -euo pipefail
+          v=8.30.1
+          sha=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
+          f="gitleaks_${v}_darwin_arm64.tar.gz"
+          d="$(mktemp -d)"
+          curl -fsSL -o "$d/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${v}/${f}"
+          echo "${sha}  $d/$f" | shasum -a 256 -c -
+          tar -xzf "$d/$f" -C "$d" gitleaks
+          mkdir -p "$HOME/bin" && mv "$d/gitleaks" "$HOME/bin/gitleaks"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
       - name: scan history and tree (findings are redacted)
-        run: gitleaks detect --source . --redact --no-banner --verbose
+        run: gitleaks git --source . --redact --no-banner --verbose
 
   smoke:
     name: smoke (${{ matrix.leg }})
