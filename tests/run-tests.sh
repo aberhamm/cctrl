@@ -21283,8 +21283,8 @@ test_task_registry_lock_stale_timeout_and_release_token() {
 }
 
 test_task_registry_structural_boundary() {
-    rg -q '^_task_registry_apply_event\(\)' "$ROOT/cctrl" || fail "registry apply boundary is missing"
-    rg -q '^_task_registry_reduce_files\(\)' "$ROOT/cctrl" || fail "pure registry reducer boundary is missing"
+    grep -Eq '^_task_registry_apply_event\(\)' "$ROOT/cctrl" || fail "registry apply boundary is missing"
+    grep -Eq '^_task_registry_reduce_files\(\)' "$ROOT/cctrl" || fail "pure registry reducer boundary is missing"
     local update transition direct_rewrite
     update="$(awk '/^_session_update_metadata_field\(\)/,/^}/' "$ROOT/cctrl")"
     transition="$(awk '/^_task_record_transition\(\)/,/^}/' "$ROOT/cctrl")"
@@ -24514,21 +24514,21 @@ test_codex_ownership_matrix_contract() {
       all(.fixtures[]; .cli_version==$versions.cli_version and .app_version==$versions.app_version)
     ' "$ROOT/tests/fixtures/codex-lifecycle/manifest.json" >/dev/null \
         || fail "codex-lifecycle-v1 is not bound to the declared CLI/app versions"
-    rg -q "three ownership paths" "$ROOT/README.md" \
+    grep -Eq "three ownership paths" "$ROOT/README.md" \
         || fail "README is not the canonical three-path decision table"
-    rg -q -- "--app-owned" "$ROOT/README.md" "$ROOT/skills/cctrl-spawn/SKILL.md" "$ROOT/completions/_cctrl" \
+    grep -Eq -- "--app-owned" "$ROOT/README.md" "$ROOT/skills/cctrl-spawn/SKILL.md" "$ROOT/completions/_cctrl" \
         || fail "app-owned path is missing from an operator surface"
-    rg -q "release-to-app" "$ROOT/skills/cctrl-session-end/SKILL.md" \
+    grep -Eq "release-to-app" "$ROOT/skills/cctrl-session-end/SKILL.md" \
         || fail "session-end skill omits verified app handoff"
-    rg -q "provider-neutral.*cctrl task ls|cctrl task ls.*provider-neutral" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
+    grep -Eq "provider-neutral.*cctrl task ls|cctrl task ls.*provider-neutral" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
         || fail "fleet-manager skill does not begin from provider-neutral task inventory"
-    if ! rg -q "Peer messaging for app tasks remains deferred" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
-        || ! rg -q "plans 028/029" "$ROOT/skills/cctrl-fleet-manager/SKILL.md"; then
+    if ! grep -Eq "Peer messaging for app tasks remains deferred" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
+        || ! grep -Eq "plans 028/029" "$ROOT/skills/cctrl-fleet-manager/SKILL.md"; then
         fail "app-task peer identity deferral is undocumented"
     fi
-    rg -q "transport.*not ownership|transport option.*not a" "$ROOT/README.md" \
+    grep -Eq "transport.*not ownership|transport option.*not a" "$ROOT/README.md" \
         || fail "README still implies --remote is simultaneous app access"
-    if rg -q "Codex app bridge|Codex app-server endpoint|Codex: launch through local app-server" \
+    if grep -Eq "Codex app bridge|Codex app-server endpoint|Codex: launch through local app-server" \
         "$ROOT/README.md" "$ROOT/cctrl" "$ROOT/completions/_cctrl"; then
         fail "a stale --remote app-control description remains"
     fi
