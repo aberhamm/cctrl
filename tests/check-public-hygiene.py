@@ -28,7 +28,9 @@ Justified exceptions live in tests/public-hygiene-allowlist.txt (override with
 the full *.ts.net name, or the user name of a home path.
 
 Matches are printed masked so the check never republishes what it caught.
-Exit status: 0 clean, 1 hits found, 2 usage or git error.
+Exit status: 0 clean, 1 hits found, 2 usage or git error, 3 not a git work
+tree (the tracked and --staged modes need a checkout; a release tree built by
+`git archive` has no .git, so callers may treat 3 as "nothing to check here").
 """
 import argparse
 import fnmatch
@@ -124,6 +126,9 @@ def scan_text(path, text, entries):
     return hits
 
 
+NOT_A_WORK_TREE = 3
+
+
 def git(args, root):
     return subprocess.run(["git"] + args, cwd=root, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, check=True).stdout
@@ -154,6 +159,18 @@ def main(argv):
                 sys.stderr.write("check-public-hygiene: cannot read %s: %s\n" % (f, exc.strerror))
                 return 2
     else:
+        where = args.root or os.getcwd()
+        try:
+            inside = git(["rev-parse", "--is-inside-work-tree"], where).decode().strip()
+        except subprocess.CalledProcessError:
+            inside = ""
+        except OSError as exc:
+            sys.stderr.write("check-public-hygiene: git failed: %s\n" % exc)
+            return 2
+        if inside != "true":
+            sys.stderr.write("check-public-hygiene: not a git work tree: %s (tracked and --staged "
+                             "modes need a checkout; exit %d)\n" % (where, NOT_A_WORK_TREE))
+            return NOT_A_WORK_TREE
         try:
             root = args.root or git(["rev-parse", "--show-toplevel"], None).decode().strip()
             if args.staged:

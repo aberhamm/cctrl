@@ -2837,6 +2837,10 @@ test_no_ansi_c_unicode_escapes() {
     # this file does not match itself.
     local bs=$'\\' pat hits
     pat="[$]'[^']*${bs}${bs}[uU][0-9a-fA-F]"
+    if ! _root_is_git_checkout; then
+        echo "SKIP: not a git checkout (install gate archive tree); the lint reads tracked files"
+        return 0
+    fi
     hits="$(cd "$ROOT" 2>/dev/null && git ls-files tests cctrl lib install hooks 2>/dev/null \
         | grep -v '\.py$' | while IFS= read -r f; do
             [[ -f "$f" ]] && grep -nE -- "$pat" "$f" | sed "s|^|$f:|" || true
@@ -20253,10 +20257,22 @@ test_peer_contract_docs() {
     echo "ok: peer operating contract in AGENTS.md + CLAUDE.md routing + README envelope/overview/limitation docs"
 }
 
+# True when $ROOT is the top of a git work tree. The install gate runs the
+# suite from a `git archive` release tree, which has no .git: tests that read
+# git's view of tracked files must skip there instead of failing.
+_root_is_git_checkout() {
+    git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && [[ "$(cd -P "$(git -C "$ROOT" rev-parse --show-toplevel)" && pwd -P)" == "$(cd -P "$ROOT" && pwd -P)" ]]
+}
+
 test_public_hygiene_tracked_files_clean() {
     # cctrl is a public repo: no tracked file
     # may hold a private IP, a tailnet (*.ts.net) name or a home path naming a
     # real user. Exceptions are justified in tests/public-hygiene-allowlist.txt.
+    if ! _root_is_git_checkout; then
+        echo "SKIP: not a git checkout (install gate archive tree); the hygiene check reads tracked files"
+        return 0
+    fi
     local out rc=0
     out="$(python3 "$ROOT/tests/check-public-hygiene.py" --root "$ROOT" 2>&1)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "public hygiene check found private detail (rc=$rc):
@@ -20300,7 +20316,13 @@ test_public_hygiene_check_bites() {
     [[ "$rc" -eq 2 ]] || fail "malformed allowlist did not exit 2 (rc=$rc)"
     rc=0; out="$(cd "$d" && python3 "$chk" "$d/no-such-file.md" 2>&1)" || rc=$?
     [[ "$rc" -eq 2 ]] || fail "a missing FILE argument did not exit 2 (rc=$rc): $out"
-    echo "ok: public hygiene check blocks private IPs, tailnet names and home paths, masked; allowlist works"
+    # A tree with no .git (a git-archive release) is exit 3, not git's raw 128.
+    local nogit="$TMPDIR/pub-hygiene-nogit"
+    rm -rf "$nogit"; mkdir -p "$nogit"; cp "$d/dirty.md" "$nogit/"
+    rc=0; out="$(GIT_CEILING_DIRECTORIES="$TMPDIR" python3 "$chk" --root "$nogit" 2>&1)" || rc=$?
+    [[ "$rc" -eq 3 ]] || fail "a tree with no .git did not exit 3 (rc=$rc): $out"
+    assert_contains "$out" "not a git work tree"
+    echo "ok: public hygiene check blocks private IPs, tailnet names and home paths, masked; allowlist works; no .git is exit 3"
 }
 
 # ── Plan 051: persist conversation_id tests ──────────────────────────
