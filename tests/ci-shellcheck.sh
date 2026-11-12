@@ -16,13 +16,12 @@ files=(cctrl)
 while IFS= read -r f; do files+=("$f"); done < <(git ls-files '*.sh' | sort)
 
 now="$(mktemp "${TMPDIR:-/tmp}/ci-shellcheck.XXXXXX")"
-trap 'rm -f "$now"' EXIT
 # rc 0 = clean, rc 1 = findings; rc >= 2 means shellcheck itself failed: fatal.
 out="$(mktemp "${TMPDIR:-/tmp}/ci-shellcheck-out.XXXXXX")"
 trap 'rm -f "$now" "$out"' EXIT
 for f in "${files[@]}"; do
     src=0
-    shellcheck -S warning -f gcc -x "$f" 2>/dev/null >> "$out" || src=$?
+    shellcheck -S warning -f gcc -x "$f" >> "$out" || src=$?
     if (( src >= 2 )); then
         echo "ci-shellcheck: shellcheck failed (rc $src) on $f" >&2
         exit 2

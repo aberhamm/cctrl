@@ -80,7 +80,7 @@ _runner_parse() { # "$@" of the harness; sets _RT_LIST/_RT_FILTER/_RT_WANT
             || { echo "run-tests.sh: could not read the test registry (--list failed)" >&2; exit 64; }
         _RT_REG_COUNT="$(printf '%s\n' "$_rt_reg" | grep -c .)"
         for _rt_w in $_RT_WANT; do
-            if ! printf '%s\n' "$_rt_reg" | grep -Fxq -- "$_rt_w"; then
+            if ! grep -Fxq -- "$_rt_w" <<<"$_rt_reg"; then
                 _rt_near="$(printf '%s\n' "$_rt_reg" | grep -iF -- "$_rt_w" | head -5 | tr '\n' ' ' || true)"
                 echo "run-tests.sh: unknown test name (not in the full-run list): $_rt_w${_rt_near:+  (near: $_rt_near)}" >&2
                 _rt_bad=1
@@ -1372,13 +1372,13 @@ _registration_problems() { # <harness file> -> one problem per line; empty when 
         fi
         kind="$(printf '%s\n' "$entry" | awk '{print $2}')"
         name="$(printf '%s\n' "$entry" | awk '{print $3}')"
-        printf '%s\n' "$defs" | grep -Fxq -- "$name" || echo "$kind entry names no defined test: $name"
+        grep -Fxq -- "$name" <<<"$defs" || echo "$kind entry names no defined test: $name"
     done < <(grep '^_rt_register [A-Z]' "$f" || true)
     # 2. every group entry names a defined, discoverable test (a test the
     # discovery pattern cannot see would be reachable only through a group)
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
-        printf '%s\n' "$defs" | grep -Fxq -- "$name" || echo "group entry names no defined (discoverable) test: $name"
+        grep -Fxq -- "$name" <<<"$defs" || echo "group entry names no defined (discoverable) test: $name"
     done < <(awk '/^_group_tests\(\) \{/ { g = 1; next } g && /^\}/ { g = 0 } g && /printf/ { while (match($0, /test_[A-Za-z0-9_]+/)) { print substr($0, RSTART, RLENGTH); $0 = substr($0, RSTART + RLENGTH) } }' "$f")
     # 3. discovery sees as many tests as a second, independent grep finds
     local n_awk n_grep
@@ -1450,6 +1450,31 @@ test_registration_guard_self_test() {
     assert_contains "$out" "test defined twice: $t_a"
     unset -f _fx_registry
     echo "ok: the registration guard flags bad SKIP names, group-only tests, hidden definitions, missing reasons and duplicates"
+}
+
+test_registration_guard_large_name_list() {
+    # CI hardening: a defs list over the 64 KB pipe buffer must still find a
+    # name. `printf | grep -Fxq` under pipefail SIGPIPEs once grep exits on an
+    # early match, which reported a false "names no defined test". The helper
+    # reads the list through a here-string, so size cannot matter.
+    local d="$TMPDIR/reg-big-fx" fx i pad
+    mkdir -p "$d"
+    fx="$d/fx.sh"
+    pad="$(printf 'x%.0s' {1..60})"
+    {
+        for ((i = 0; i < 1500; i++)); do printf 'test_fx''_big_%s_%04d() { :; }\n' "$pad" "$i"; done
+        printf "_rt_register SKIP test_fx""_big_%s_0000 'fixture reason'\n" "$pad"
+        printf '_group_tests() {\n    case "$1" in\n        g1) printf '"'"'%%s\\n'"'"' test_fx_big_%s_0001 ;;\n    esac\n}\n' "$pad"
+    } > "$fx"
+    local sz out k
+    sz="$(awk '/^test_fx_big_/ { n += length($0) + 1 } END { print n }' "$fx")"
+    (( sz > 65536 )) || fail "fixture too small to exceed a pipe buffer: $sz bytes"
+    for k in 1 2 3 4 5; do
+        out="$(_registration_problems "$fx")"
+        [[ -z "$out" ]] || fail "large name list gave false problems (round $k): $out"
+    done
+    rm -rf "$d"
+    echo "ok: a name list over 64 KB is searched without a pipe"
 }
 
 test_no_unreferenced_functions() {
@@ -1603,7 +1628,7 @@ FX
     [[ "$rc" -eq 0 ]] || fail "real --list rc=$rc"
     [[ "$(printf '%s\n' "$out" | sed -n 1p)" == "test_private_tmux_shim_contract" && "$(printf '%s\n' "$out" | sed -n 2p)" == "test_tmux_default_server_is_private" ]] \
         || fail "real --list should start with the two always-on tests (shim contract, then the private-server guard)"
-    printf '%s\n' "$out" | grep -Fxq test_runner_filter_and_list || fail "real --list does not contain this test"
+    grep -Fxq test_runner_filter_and_list <<<"$out" || fail "real --list does not contain this test"
     # Discovery (P4): --list is every definition minus the SKIP entries, in
     # source order, with RUN_LAST last.
     local n_def n_skip
@@ -1612,7 +1637,7 @@ FX
     [[ "$(printf '%s\n' "$out" | grep -c '^test_')" -eq $(( n_def - n_skip )) ]] || fail "real --list should be every definition minus the $n_skip SKIP entries"
     local n_sk
     while IFS= read -r n_sk; do
-        if printf '%s\n' "$out" | grep -Fxq -- "$n_sk"; then fail "real --list contains the SKIP-listed test $n_sk"; fi
+        if grep -Fxq -- "$n_sk" <<<"$out"; then fail "real --list contains the SKIP-listed test $n_sk"; fi
     done < <(grep '^_rt_register SKIP ' "$ROOT/tests/run-tests.sh" | awk '{print $3}')
     [[ "$(printf '%s\n' "$out" | tail -n 1)" == "test_tmux_sockets_left_behind" ]] || fail "real --list should end with the RUN_LAST test"
     [[ "$(printf '%s\n' "$out" | grep -c '^test_')" -gt 400 ]] || fail "real --list has too few tests"
@@ -17145,7 +17170,7 @@ test_snapshot_retention_pruning() {
 test_snapshot_no_tmux_mutation() {
     local body
     body="$(sed -n '/_session_snapshot()/,/^}/p' "$ROOT/cctrl")"
-    if printf '%s' "$body" | grep -Eq 'send-keys|paste-buffer|load-buffer'; then
+    if grep -Eq 'send-keys|paste-buffer|load-buffer' <<<"$body"; then
         fail "_session_snapshot contains tmux mutation commands"
     fi
     echo "ok: no tmux mutation in _session_snapshot"
@@ -17734,7 +17759,7 @@ test_restore_no_force_structural() {
     # --force-host references) must not contain --force.
     local body
     body="$(sed -n '/_session_restore()/,/^}/p' "$ROOT/cctrl" | grep -v '^\s*#' | grep -v 'force-host\|force_host')"
-    if printf '%s' "$body" | grep -q -- '--force'; then
+    if grep -q -- '--force' <<<"$body"; then
         fail "_session_restore contains --force (must never pass --force to cctrl start)"
     fi
     echo "ok: no --force structural"
@@ -17745,7 +17770,7 @@ test_restore_no_pane_inference_structural() {
     # load-buffer, or capture-pane.
     local body
     body="$(sed -n '/_session_restore()/,/^}/p' "$ROOT/cctrl" | grep -v '^\s*#')"
-    if printf '%s' "$body" | grep -Eq 'send-keys|paste-buffer|load-buffer|capture-pane'; then
+    if grep -Eq 'send-keys|paste-buffer|load-buffer|capture-pane' <<<"$body"; then
         fail "_session_restore contains pane inference commands"
     fi
     echo "ok: no pane inference structural"

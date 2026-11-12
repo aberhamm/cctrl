@@ -106,9 +106,8 @@ jobs:
           python-version: "3.13"
       - name: private IPs, tailnet names, home paths
         run: python3 tests/check-public-hygiene.py
-      # DENY-LIST HOOK (plan 122, D6a): add the private-name deny-list check
-      # as a further step here, after D6a lands its check. Keep it in this job
-      # (same checkout, same read-only token) and run it over tracked files.
+      - name: private-name deny list (tracked patterns)
+        run: python3 tests/check-public-hygiene.py --deny tests/public-hygiene-deny.txt
 
   gitleaks:
     name: gitleaks
@@ -126,13 +125,13 @@ jobs:
           sha=b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
           f="gitleaks_${v}_darwin_arm64.tar.gz"
           d="$(mktemp -d)"
-          curl -fsSL -o "$d/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${v}/${f}"
+          curl -fsSL --retry 3 --max-time 120 -o "$d/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${v}/${f}"
           echo "${sha}  $d/$f" | shasum -a 256 -c -
           tar -xzf "$d/$f" -C "$d" gitleaks
           mkdir -p "$HOME/bin" && mv "$d/gitleaks" "$HOME/bin/gitleaks"
           echo "$HOME/bin" >> "$GITHUB_PATH"
       - name: scan history and tree (findings are redacted)
-        run: gitleaks git --source . --redact --no-banner --verbose
+        run: gitleaks git . --redact --no-banner --verbose
 
   smoke:
     name: smoke (${{ matrix.leg }})
