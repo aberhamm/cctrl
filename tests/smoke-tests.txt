@@ -1,0 +1,23 @@
+# CI smoke subset (plan 121 E0): one test name per line, run on every push by
+# .github/workflows/ci.yml through the existing CCTRL_TEST_NAMES filter of
+# tests/run-tests.sh. Names must exist in `tests/run-tests.sh --list`; the
+# runner refuses an unknown name. Keep the whole subset under about 3 minutes
+# on a hosted macOS runner. The full run (PRs and nightly) ignores this file.
+test_syntax
+test_every_defined_test_is_registered
+test_registration_guard_self_test
+test_runner_filter_and_list
+test_no_unsafe_tmux_isolation
+test_no_errexit_unsafe_post_increment
+test_no_ansi_c_unicode_escapes
+test_tmux_exact_target_lint
+test_cctrl_launcher_hooks_run_fails_open_on_broken_release
+test_cctrl_launcher_hooks_run_passes_deliberate_exit_through
+test_cctrl_launcher_hooks_run_fails_open_on_unexpected_exit
+test_cctrl_launcher_non_hooks_run_commands_fail_loudly
+test_cctrl_launcher_hooks_run_fails_open_when_release_missing
+test_cctrl_launcher_hooks_run_passes_exit_2_through
+test_cctrl_current_swap_is_atomic_on_bsd_mv
+test_launch_args
+test_bash_leg_is_honest
+test_no_shimless_test_path

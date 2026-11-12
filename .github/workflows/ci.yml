@@ -1,0 +1,188 @@
+# CI for cctrl (plan 121, phase E0).
+#
+# Rules (plan 115 Q4, SH-S9): GitHub-hosted macOS runners only, never a
+# self-hosted runner; every action pinned by full commit SHA; read-only token;
+# no secrets; `pull_request` only (never `pull_request_target`).
+#
+# What runs when:
+#   push (any branch)   lint, python, hygiene, gitleaks, smoke (bash 3.2 + 5)
+#   pull_request        lint, python, hygiene, gitleaks, full (bash 3.2 + 5)
+#   nightly (schedule)  the same as a pull request, on the default branch
+#
+# The smoke subset is tests/smoke-tests.txt (one test name per line), fed to
+# the existing CCTRL_TEST_NAMES filter of tests/run-tests.sh. The full run
+# is tests/run-tests.sh with no filter, then the Python unittests.
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+  HOMEBREW_NO_ENV_HINTS: "1"
+
+jobs:
+  lint:
+    name: lint
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.9"
+      - name: Python 3.9 byte-compile
+        run: |
+          py_files="$(git ls-files '*.py'; echo plugins/cctrl-ports; echo plugins/cctrl-scan)"
+          echo "$py_files" | while IFS= read -r f; do
+            python3 -m py_compile "$f"
+          done
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Python 3.13 byte-compile
+        run: |
+          py_files="$(git ls-files '*.py'; echo plugins/cctrl-ports; echo plugins/cctrl-scan)"
+          echo "$py_files" | while IFS= read -r f; do
+            python3 -m py_compile "$f"
+          done
+      - name: Install tools
+        run: brew install shellcheck ruff bash
+      - name: ruff (syntax errors and undefined names only)
+        run: ruff check --select E9,F63,F7,F82 --output-format=concise .
+      - name: bash -n (bash 3.2 and bash 5)
+        run: |
+          for f in cctrl $(git ls-files '*.sh'); do
+            /bin/bash -n "$f"
+            /opt/homebrew/bin/bash -n "$f"
+          done
+      - name: shellcheck against the recorded baseline
+        run: bash tests/ci-shellcheck.sh
+
+  python:
+    name: python unit tests
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install tools
+        run: brew install tmux jq bash
+      - name: git identity for fixtures
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+      - name: unittest
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+  hygiene:
+    name: public hygiene
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: private IPs, tailnet names, home paths
+        run: python3 tests/check-public-hygiene.py
+      # DENY-LIST HOOK (plan 122, D6a): add the private-name deny-list check
+      # as a further step here, after D6a lands its check. Keep it in this job
+      # (same checkout, same read-only token) and run it over tracked files.
+
+  gitleaks:
+    name: gitleaks
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks
+        run: brew install gitleaks
+      - name: scan history and tree (findings are redacted)
+        run: gitleaks detect --source . --redact --no-banner --verbose
+
+  smoke:
+    name: smoke (${{ matrix.leg }})
+    if: github.event_name == 'push'
+    runs-on: macos-15
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: bash 3.2
+            bash: /bin/bash
+          - leg: bash 5
+            bash: /opt/homebrew/bin/bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install tools
+        run: brew install tmux jq bash
+      - name: git identity for fixtures
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+      - name: smoke subset
+        env:
+          BASH_UNDER_TEST: ${{ matrix.bash }}
+        run: |
+          "$BASH_UNDER_TEST" --version | head -1
+          names="$(grep -v '^[[:space:]]*#' tests/smoke-tests.txt | grep .)"
+          CCTRL_TEST_NAMES="$names" "$BASH_UNDER_TEST" tests/run-tests.sh
+
+  full:
+    name: full suite (${{ matrix.leg }})
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: bash 3.2
+            bash: /bin/bash
+          - leg: bash 5
+            bash: /opt/homebrew/bin/bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Install tools
+        run: brew install tmux jq bash
+      - name: git identity for fixtures
+        run: |
+          git config --global user.name "ci"
+          git config --global user.email "ci@example.invalid"
+      - name: full suite (includes the Python unittests)
+        env:
+          BASH_UNDER_TEST: ${{ matrix.bash }}
+        run: |
+          "$BASH_UNDER_TEST" --version | head -1
+          "$BASH_UNDER_TEST" tests/run-tests.sh

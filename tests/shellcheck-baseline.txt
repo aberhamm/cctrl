@@ -1,0 +1,24 @@
+# shellcheck -S warning baseline (plan 121 E0): count file code. Regenerate: tests/ci-shellcheck.sh --update
+4 cctrl SC2034
+2 cctrl SC2088
+1 cctrl SC2100
+6 cctrl SC2128
+4 cctrl SC2155
+9 cctrl SC2174
+9 cctrl SC2178
+19 cctrl SC2179
+7 lib/codex-launch-to-app.sh SC2034
+1 lib/paths.sh SC2088
+1 lib/paths.sh SC2148
+2 tests/run-tests.sh SC1007
+1 tests/run-tests.sh SC1010
+2 tests/run-tests.sh SC1083
+2 tests/run-tests.sh SC2010
+2 tests/run-tests.sh SC2034
+4 tests/run-tests.sh SC2088
+1 tests/run-tests.sh SC2097
+1 tests/run-tests.sh SC2098
+13 tests/run-tests.sh SC2128
+10 tests/run-tests.sh SC2155
+5 tests/run-tests.sh SC2178
+1 tests/run-tests.sh SC2179

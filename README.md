@@ -2061,6 +2061,23 @@ notes say. The slowest tests are the session-close/terminate fixtures
 (`test_session_close_reaps_pane_processes` about 16 s,
 `test_session_terminate_records_closed` about 13 s).
 
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on GitHub-hosted macOS runners only (never a
+self-hosted runner), with every action pinned by commit SHA, a read-only token
+and no secrets. Every push runs lint, the Python unit tests, the public-hygiene
+check, gitleaks and a smoke subset (the test names in `tests/smoke-tests.txt`,
+about a minute) on `/bin/bash` 3.2 and Homebrew bash 5. Pull requests and a
+nightly run execute the full suite on both bashes instead of the smoke subset.
+Reproduce the smoke run locally with:
+
+```bash
+CCTRL_TEST_NAMES="$(grep -v '^[[:space:]]*#' tests/smoke-tests.txt | grep .)" bash tests/run-tests.sh
+tests/ci-shellcheck.sh            # shellcheck against tests/shellcheck-baseline.txt (--update to re-record)
+```
+
+CI covers macOS only; there is no Linux leg.
+
 Run one or a few tests, list the registry, or get timings:
 
 ```bash
