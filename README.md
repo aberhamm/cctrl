@@ -264,7 +264,20 @@ disconnects. Use `--foreground` or `--no-tmux` for quick direct one-offs.
 
 Add `-d` to start the tmux session and return without attaching. No GUI required — just tmux. An explicit detached launch requires an explicit target (a dir or `@shortcut`); defaulting to `$HOME` would drop a full-access agent into `~/.ssh`, `~/.aws`, etc.
 
-When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/unstructured-data-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic), excluding any `fm-*` (fleet-manager) key — only an explicit `cctrl @fm-<x>` launch gets an `fm-` name. A directory with no matching non-`fm-` shortcut keeps its repo-folder slug (unchanged).
+When a directory launch (`cctrl start -d <dir>`) targets a directory that a configured shortcut points at, the session adopts that shortcut's short alias for its name — so `cctrl start -d ~/dev/my-portal` and `cctrl start -d @portal` produce the identical `TMUX--<device>--portal` name (and therefore the identical `--remote-control` bridge prefix). If several shortcuts point at the same directory, the first match by sorted key wins (deterministic), excluding any `fm-*` (fleet-manager) key — only an explicit `cctrl @fm-<x>` launch gets an `fm-` name. A directory with no matching non-`fm-` shortcut keeps its repo-folder slug (unchanged).
+
+#### Display names for repos (`repo_labels`)
+
+Session lists and the app title a session as `<Repo>: <purpose>`. The repo part is the
+shortcut or folder name, title-cased by default (`my-portal` shows as `My Portal`). To
+choose your own display names, add a `repo_labels` object to any config layer (the same
+files as `defaultAgent`; later layers win, keys merge):
+
+```json
+{ "repo_labels": { "my-portal": "Portal", "docs-site": "Docs" } }
+```
+
+The key is the slug cctrl would otherwise title-case. cctrl ships no entries.
 
 #### A second tmux server (`tmuxServer`)
 
@@ -1099,7 +1112,7 @@ manages other sessions, and comes in two kinds: `fleet` (the fleet-manager
 orchestrator, at most one per runtime per machine) and `repo` (a repo-level
 orchestrator). A shortcut or a launch declares it; cctrl records it on the
 session (`role`, `orch_kind`, shown in `cctrl session ls --json`) and replays it
-on `restore` and `session doctor --fix`. Phase 1 changed no existing session label; its two name effects were that `-d ~/dev/rentkompass` now launches as the `rentkompass` worker name (no longer adopting the orchestrator shortcut) and that `session doctor --fix` realign pins the recorded tmux name.
+on `restore` and `session doctor --fix`. Phase 1 changed no existing session label; its two name effects were that `-d ~/dev/my-app` now launches as the `my-app` worker name (no longer adopting the orchestrator shortcut) and that `session doctor --fix` realign pins the recorded tmux name.
 
 ```bash
 cctrl start -d ~/dev/myapp --orch-kind repo       # an orchestrator of kind repo
@@ -1194,7 +1207,7 @@ tmux sessions derived from `cctrl session ls --json`. An app-owned Codex peer
 can instead bind to its exact provider task id.
 
 ```bash
-cctrl peer register comet --dir ~/dev/comet-automation --agent codex
+cctrl peer register comet --dir ~/dev/my-project --agent codex
 cctrl peer register reviewer --agent codex --capability polling
 cctrl peer alias comet comet-agent
 
@@ -1481,7 +1494,7 @@ The preferred setup is an idle doorbell: launch the session with a peer
 identity, then let the agent check its mailbox at natural pause points.
 
 ```bash
-cctrl start -d --peer comet ~/dev/comet-automation
+cctrl start -d --peer comet ~/dev/my-project
 cctrl start --foreground --peer comet --agent codex
 ```
 

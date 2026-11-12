@@ -11,6 +11,12 @@ cctrl is a public repository. This check fails when a scanned file holds:
   home-path     an absolute home path naming a user: /Users/<name>,
                 /home/<name>, or the encoded -Users-<name>- form Claude Code
                 uses for project directories
+  deny-pattern  a match of a regex listed in a deny file (one per line, `#`
+                starts a comment, matched case-insensitively). The tracked
+                tests/public-hygiene-deny.txt holds patterns that are neutral
+                by themselves; the optional, untracked
+                tests/public-hygiene-deny.local.txt holds the maintainer's
+                private names. Override with --deny FILE (repeatable).
 
 Use neutral placeholders instead: ~/, $HOME, /Users/<user>, <private-ip>,
 <host>, example.internal, or the RFC 5737 documentation ranges (192.0.2.0/24,
@@ -63,8 +69,28 @@ PRIVATE_V4 = [ipaddress.ip_network("%d.%d.0.0/%d" % n) for n in (
     (127, 0, 8),       # loopback (127.0.0.1 is allowlisted for localhost examples)
     (169, 254, 16))]   # link-local
 
-DEFAULT_ALLOWLIST = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "public-hygiene-allowlist.txt")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ALLOWLIST = os.path.join(_HERE, "public-hygiene-allowlist.txt")
+DEFAULT_DENY = [os.path.join(_HERE, "public-hygiene-deny.txt"),
+                os.path.join(_HERE, "public-hygiene-deny.local.txt")]
+
+
+def load_deny(paths):
+    rules = []
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for n, raw in enumerate(fh, 1):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                try:
+                    rules.append(re.compile(line, re.IGNORECASE))
+                except re.error as exc:
+                    sys.stderr.write("%s:%d: bad deny pattern: %s\n" % (path, n, exc))
+                    sys.exit(2)
+    return rules
 
 
 def load_allowlist(path):
@@ -77,7 +103,7 @@ def load_allowlist(path):
             if not line:
                 continue
             parts = line.split()
-            if len(parts) not in (2, 3) or parts[0] not in ("private-ip", "tailnet", "home-path"):
+            if len(parts) not in (2, 3) or parts[0] not in ("private-ip", "tailnet", "home-path", "deny-pattern"):
                 sys.stderr.write("%s:%d: bad allowlist entry (want CATEGORY VALUE [PATH_GLOB])\n" % (path, n))
                 sys.exit(2)
             entries.append((parts[0], parts[1], parts[2] if len(parts) == 3 else "*"))
@@ -98,10 +124,12 @@ def mask(category, value):
         return value.split(".", 1)[0] + ".*.*.*"
     if category == "tailnet":
         return "****.ts.net"
+    if category == "deny-pattern":
+        return value[:1] + "*" * 3
     return value[:1] + "***"
 
 
-def scan_text(path, text, entries):
+def scan_text(path, text, entries, deny=()):
     hits = []
     for lineno, line in enumerate(text.splitlines(), 1):
         found = []
@@ -120,6 +148,9 @@ def scan_text(path, text, entries):
             for m in rx.finditer(line):
                 if m.group(1) not in HOME_NOT_A_USER:
                     found.append(("home-path", m.group(1)))
+        for rx in deny:
+            for m in rx.finditer(line):
+                found.append(("deny-pattern", m.group(0)))
         for category, value in found:
             if not allowed(entries, category, value, path):
                 hits.append((path, lineno, category, value))
@@ -144,10 +175,13 @@ def main(argv):
     ap = argparse.ArgumentParser(description="Block private infrastructure detail in the public repo.")
     ap.add_argument("--staged", action="store_true", help="scan the staged content (pre-commit)")
     ap.add_argument("--allowlist", default=DEFAULT_ALLOWLIST)
+    ap.add_argument("--deny", action="append", default=None,
+                    help="deny-pattern file (repeatable; default: the tracked and local files in tests/)")
     ap.add_argument("--root", default=None, help="repository root (default: git toplevel of cwd)")
     ap.add_argument("files", nargs="*")
     args = ap.parse_args(argv)
     entries = load_allowlist(args.allowlist)
+    deny = load_deny(args.deny if args.deny is not None else DEFAULT_DENY)
 
     sources = []  # (display path, bytes)
     if args.files:
@@ -198,7 +232,7 @@ def main(argv):
     for name, blob in sources:
         text = decode(blob)
         if text is not None:
-            hits.extend(scan_text(name, text, entries))
+            hits.extend(scan_text(name, text, entries, deny))
 
     for path, lineno, category, value in hits:
         print("%s:%d: %s: %s" % (path, lineno, category, mask(category, value)))

@@ -5251,28 +5251,41 @@ _session_repo_name() {
     fi
 }
 
+# Optional per-user display names for repo slugs: a `repo_labels` object in
+# any config layer ({"my-repo": "My Repo"}), later layers winning. Nothing is
+# shipped, so an unmapped slug is title-cased from its basename. The common
+# case (no layer mentions repo_labels) forks nothing: `$(<file)` is a builtin.
+_session_repo_label_lookup() {
+    local slug="$1" file text
+    local -a files=()
+    command -v jq >/dev/null 2>&1 || return 1
+    while IFS= read -r file; do
+        text="$(<"$file")" || continue
+        [[ "$text" == *repo_labels* ]] && files+=("$file")
+    done < <(_config_files)
+    [[ ${#files[@]} -gt 0 ]] || return 1
+    jq -s -r --arg slug "$slug" '
+        [.[] | (.repo_labels? // empty) | select(type == "object")]
+        | reduce .[] as $m ({}; . * $m)
+        | .[$slug] // empty | select(type == "string")
+    ' "${files[@]}" 2>/dev/null
+}
+
 _session_pretty_repo_label() {
-    local slug="$1"
-    case "$slug" in
-        obsidian|obsidian-vault) printf '%s' 'Obsidian' ;;
-        scraper|django-c|django-celery-scraper) printf '%s' 'Scraper' ;;
-        comet|comet-automation) printf '%s' 'Comet' ;;
-        homelab) printf '%s' 'Homelab' ;;
-        rentkompass) printf '%s' 'Rentkompass' ;;
-        agenthub|agent-hub) printf '%s' 'Agent Hub' ;;
-        voice-assistant|voice-studio) printf '%s' 'Voice Assistant' ;;
-        portal|unstructured-data-portal) printf '%s' 'Portal' ;;
-        cctrl) printf '%s' 'cctrl' ;;
-        *)
-            printf '%s' "$slug" | awk -F- '{
-                for (i = 1; i <= NF; i++) {
-                    if ($i == "") continue
-                    $i = toupper(substr($i, 1, 1)) substr($i, 2)
-                }
-                print $0
-            }' OFS=" "
-            ;;
-    esac
+    local slug="$1" mapped
+    [[ "$slug" == "cctrl" ]] && { printf '%s' 'cctrl'; return 0; }
+    mapped="$(_session_repo_label_lookup "$slug" || true)"
+    if [[ -n "$mapped" ]]; then
+        printf '%s' "$mapped"
+        return 0
+    fi
+    printf '%s' "$slug" | awk -F- '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "") continue
+            $i = toupper(substr($i, 1, 1)) substr($i, 2)
+        }
+        print $0
+    }' OFS=" "
 }
 
 _session_clean_purpose_label() {

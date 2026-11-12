@@ -1,0 +1,5 @@
+# Deny patterns for tests/check-public-hygiene.py: one regex per line, matched
+# case-insensitively against every tracked file. Only patterns that are neutral
+# by themselves belong here (this file is public). Private names go in the
+# untracked tests/public-hygiene-deny.local.txt, which the check also reads.
+# Run standalone: python3 tests/check-public-hygiene.py

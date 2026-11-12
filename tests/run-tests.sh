@@ -22145,6 +22145,65 @@ test_codex_title_skips_repo_prefix_for_star_label() {
     echo "ok: the Codex title skips its repo prefix for a star label"
 }
 
+test_repo_label_default_ships_no_private_names() {
+    # D6a: the shipped source and default config carry no repo-label map; an
+    # unmapped slug is title-cased from its basename.
+    local d="$TMPDIR/repo-label-default" out
+    rm -rf "$d"; mkdir -p "$d/home"
+    ! grep -q "repo_labels" "$ROOT/share/config.default.json" \
+        || fail "the shipped default config must not carry repo_labels"
+    out="$(HOME="$d/home" CCTRL_USER_CONFIG="$d/home/.config/cctrl/config.json" CCTRL_CONFIG_LOCAL="$d/none.json" \
+        cctrl_source_eval '_session_pretty_repo_label my-portal; echo; _session_pretty_repo_label cctrl; echo; _session_repo_name /x/some-repo')"
+    assert_contains "$out" "My Portal"
+    assert_contains "$out" "Some Repo"
+    assert_not_contains "$out" "Portal"$'\n'"Portal"
+    echo "ok: repo labels default to title-cased basenames with no shipped map"
+}
+
+test_repo_label_map_comes_from_config() {
+    # D6a: a repo_labels object in the user config or config.local.json maps a
+    # slug to a display name; local wins over user; unmapped slugs fall back.
+    local d="$TMPDIR/repo-label-config" out
+    rm -rf "$d"; mkdir -p "$d/home/.config/cctrl"
+    printf '{"repo_labels":{"my-portal":"The Portal","alpha":"User Alpha"}}\n' > "$d/home/.config/cctrl/config.json"
+    printf '{"repo_labels":{"alpha":"Local Alpha"}}\n' > "$d/local.json"
+    out="$(HOME="$d/home" CCTRL_USER_CONFIG="$d/home/.config/cctrl/config.json" CCTRL_CONFIG_LOCAL="$d/local.json" \
+        cctrl_source_eval '_session_pretty_repo_label my-portal; echo; _session_pretty_repo_label alpha; echo; _session_pretty_repo_label other-repo')"
+    assert_contains "$out" "The Portal"
+    assert_contains "$out" "Local Alpha"
+    assert_not_contains "$out" "User Alpha"
+    assert_contains "$out" "Other Repo"
+    printf '{"repo_labels":"not-an-object"}\n' > "$d/local.json"
+    out="$(HOME="$d/home" CCTRL_USER_CONFIG="$d/home/.config/cctrl/config.json" CCTRL_CONFIG_LOCAL="$d/local.json" \
+        cctrl_source_eval '_session_pretty_repo_label my-portal')"
+    assert_contains "$out" "The Portal"
+    echo "ok: repo_labels in config maps slugs; local overrides user; bad shape is ignored"
+}
+
+test_public_hygiene_deny_list_bites() {
+    # D6a: the deny-pattern file blocks a planted name, masked, standalone and
+    # through the tracked/local default files; nothing private is tracked.
+    local d="$TMPDIR/pub-hygiene-deny" chk="$ROOT/tests/check-public-hygiene.py" out rc
+    local planted="zq""xvault"
+    rm -rf "$d"; mkdir -p "$d"
+    git -C "$d" init -q
+    printf 'clean line\n' > "$d/clean.md"
+    printf 'notes about %s here\n' "$planted" > "$d/dirty.md"
+    printf '# comment\n%s\n' "$planted" > "$d/deny.txt"
+    git -C "$d" add clean.md dirty.md
+    rc=0; out="$(cd "$d" && python3 "$chk" --deny "$d/deny.txt" 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "deny pattern did not block a planted name (rc=$rc): $out"
+    assert_contains "$out" "dirty.md:1: deny-pattern:"
+    if grep -qF "$planted" <<< "$out"; then fail "deny hit printed unmasked: $out"; fi
+    rc=0; out="$(cd "$d" && python3 "$chk" --deny /dev/null 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "an empty deny file blocked a clean tree (rc=$rc): $out"
+    printf '(' > "$d/bad.txt"
+    rc=0; (cd "$d" && python3 "$chk" --deny "$d/bad.txt" >/dev/null 2>&1) || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "a malformed deny pattern did not exit 2 (rc=$rc)"
+    [[ -f "$ROOT/tests/public-hygiene-deny.txt" ]] || fail "tracked deny file is missing"
+    echo "ok: the deny list blocks a planted name (masked), tolerates empty, rejects bad regex"
+}
+
 test_remote_orchestrator_launch_injects_no_default_purpose() {
     _remote_role_fixture p2np
     local out

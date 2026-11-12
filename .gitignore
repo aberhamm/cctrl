@@ -44,3 +44,6 @@ drafts/
 
 .mstack/
 .mstack-*
+
+# Maintainer-only extension of the public-hygiene deny list
+tests/public-hygiene-deny.local.txt
