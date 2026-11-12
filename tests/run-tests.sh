@@ -11609,6 +11609,73 @@ $ref"
     echo "ok: plan 111 p6 version skew ($P6_OLD_KIND old tree): new origin -> old receiver works; old origin -> new receiver is remote, no claims, never refused; delivery unchanged in off/warn"
 }
 
+test_device_tag_configuration() {
+    # The device segment of session names comes from configuration, never a
+    # personal host name. Precedence: CCTRL_HOST_PREFIX > CCTRL_DEVICE_TAG >
+    # the hosts.json alias for this machine > generic hostname patterns > none.
+    local d="$TMPDIR/devtag" h out err v
+    rm -rf "$d"; mkdir -p "$d"
+    h="$d/hosts.json"
+    _dt() { # hostname hosts-file device-tag [prefix] -> _device_tag (stdout; stderr to $d/err)
+        local -x PATH="$TMPDIR:$PATH" CCTRL_TEST_HOSTNAME="$1" CCTRL_HOSTS_FILE="$2"
+        if [[ -n "$3" ]]; then local -x CCTRL_DEVICE_TAG="$3"; else unset CCTRL_DEVICE_TAG; fi
+        if [[ -n "${4:-}" ]]; then local -x CCTRL_HOST_PREFIX="$4"; else unset CCTRL_HOST_PREFIX; fi
+        cctrl_source_eval '_device_tag' 2>"$d/err"
+    }
+    # 1. Generic fallback (no config): ms / ms-* -> ms, macbook-pro / mbp* -> mbp,
+    #    anything else -> no tag.
+    [[ "$(_dt ms-node.local "$d/none.json" "")" == ms ]] || fail "devtag: ms-* hostname should give ms"
+    [[ "$(_dt macbook-pro.local "$d/none.json" "")" == mbp ]] || fail "devtag: macbook-pro should give mbp"
+    [[ "$(_dt mbp-2.local "$d/none.json" "")" == mbp ]] || fail "devtag: mbp-* should give mbp"
+    [[ -z "$(_dt someones-book-pro.local "$d/none.json" "")" ]] || fail "devtag: a personal host name must not map to a tag"
+    [[ -z "$(_dt test-host.local "$d/none.json" "")" ]] || fail "devtag: an unknown host has no tag"
+    # 2. hosts.json: the alias whose hostname is this machine. Loopback and
+    #    invalid aliases are skipped; first valid alias in sorted order wins.
+    printf '%s\n' '{"aa":{"hostname":"localhost"},"bad_alias":{"hostname":"test-host"},"Lab":{"hostname":"test-host.local"},"zz":{"hostname":"test-host"},"remote":{"hostname":"other.invalid"}}' > "$h"
+    out="$(_dt test-host.local "$h" "")"
+    [[ "$out" == lab ]] || fail "devtag: hosts.json self alias (lowercased, loopback/invalid skipped), got '$out'"
+    out="$(_dt ms-node.local "$h" "")"
+    [[ "$out" == ms ]] || fail "devtag: no self alias for this host falls back to the hostname pattern, got '$out'"
+    printf '%s\n' '{"loop":{"hostname":"127.0.0.1"},"remote":{"hostname":"other.invalid"}}' > "$h"
+    [[ -z "$(_dt test-host.local "$h" "")" ]] || fail "devtag: a loopback-only hosts.json gives no tag"
+    printf '%s\n' '{"lab":{"hostname":"test-host"}}' > "$h"
+    out="$(_dt ms-node.local "$h" "")"
+    [[ "$out" == ms ]] || fail "devtag: a self alias for another host name must not match, got '$out'"
+    # 3. CCTRL_DEVICE_TAG beats hosts.json and the hostname; CCTRL_HOST_PREFIX beats all.
+    out="$(_dt test-host.local "$h" Rack-2)"
+    [[ "$out" == rack-2 ]] || fail "devtag: CCTRL_DEVICE_TAG wins over hosts.json, got '$out'"
+    out="$(_dt ms-node.local "$d/none.json" lab-9)"
+    [[ "$out" == lab-9 ]] || fail "devtag: CCTRL_DEVICE_TAG wins over the hostname pattern, got '$out'"
+    out="$(_dt test-host.local "$h" rack-2 via-host)"
+    [[ "$out" == via-host ]] || fail "devtag: CCTRL_HOST_PREFIX still wins, got '$out'"
+    # 4. Invalid CCTRL_DEVICE_TAG: ignored with a warning, never slugified or
+    #    evaluated; the next source is used.
+    for v in 'a b' 'x;touch '"$d"'/pwned' '$(touch '"$d"'/pwned2)' '`touch '"$d"'/pwned3`' 'a--b' '-lead' 'trail-' 'dot.ted' 'under_score' \
+             "$(printf 'a%.0s' {1..33})" $'line\nbreak'; do
+        out="$(_dt test-host.local "$h" "$v")"
+        err="$(cat "$d/err")"
+        [[ "$out" == lab ]] || fail "devtag: invalid CCTRL_DEVICE_TAG $(printf '%q' "$v") should fall through to hosts.json, got '$out'"
+        assert_contains "$err" "ignoring CCTRL_DEVICE_TAG"
+    done
+    [[ ! -e "$d/pwned" && ! -e "$d/pwned2" && ! -e "$d/pwned3" ]] || fail "devtag: an invalid CCTRL_DEVICE_TAG was executed"
+    out="$(_dt test-host.local "$h" "$(printf 'a%.0s' {1..32})")"
+    [[ ${#out} -eq 32 ]] || fail "devtag: a 32-character tag is valid, got '$out'"
+    # 5. End to end: the tag lands in the tmux session name.
+    make_fake_tmux "$TMPDIR/tmux"
+    mkdir -p "$d/project"
+    : > "$d/tmux.log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$d/tmux.log" CCTRL_DEVICE_TAG=lab-9 CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex "$d/project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--lab-9--project"
+    : > "$d/tmux.log"
+    out="$(PATH="$TMPDIR:$PATH" TMUX_LOG="$d/tmux.log" CCTRL_HOSTS_FILE="$h" CCTRL_EMIT_SESSION=1 "$ROOT/cctrl" start -d --agent codex "$d/project")"
+    assert_contains "$out" "CCTRL_SESSION=TMUX--lab--project"
+    # 6. No personal host name: the hostname fallback holds only the generic
+    #    patterns, so adding a machine's own name to it fails here.
+    out="$(cctrl_source_eval 'declare -f _device_tag' | awk '/case "\$host" in/{f=1; next} /esac/{f=0} f && /\)[[:space:]]*$/' | sed -E 's/^[[:space:]]+//; s/[[:space:]]+//g' | sort | tr '\n' ' ')" || out="(declare -f failed)"
+    [[ "$out" == "macbook-pro|mbp|mbp-*) ms-*|ms) " ]] || fail "devtag: the hostname fallback may hold only the generic patterns, got '$out'"
+    echo "ok: device tag precedence: CCTRL_HOST_PREFIX > CCTRL_DEVICE_TAG > hosts.json self alias > generic hostname pattern > none; invalid values rejected; no personal host name"
+}
+
 test_peer_attest_p6_origin_host_label() {
     # Plan 111 phase 6 (p5 verify): the origin's --sender-host. CCTRL_HOST_PREFIX
     # wins; else the hosts.json alias whose hostname is this machine; never
@@ -26004,6 +26071,14 @@ test_data_config_runbook_dirty_guidance() {
     assert_contains "$out" "reset --mixed $target"
     assert_contains "$out" "fetch origin"
     assert_contains "$out" "do NOT run git reset --hard"
+    # Paste safety: zsh without interactivecomments passes a trailing
+    # `# ...` to the command, so no printed line carries an inline comment,
+    # and each hinted command is a line of its own.
+    [[ "$out" != *" #"* ]] || fail "a runbook hint line carries an inline ' #' comment (not paste-safe in zsh): $out"
+    assert_contains "$out" "/synced fetch origin"$'\n'
+    assert_contains "$out" "/synced reset --mixed $target"$'\n'
+    assert_contains "$out" "data-config-runbook:   data-config-runbook.sh check "
+    assert_contains "$out" "/synced"$'\n'
     [[ "$before" == "$(git -C "$base/synced" rev-parse HEAD; git -C "$base/synced" ls-files -s)" ]] || fail "the synced-shape refusal changed HEAD or the index"
     [[ ! -e "$base/synced/data/config.json.a0-keep" ]] || fail "the synced-shape refusal wrote a keep copy"
     git -C "$base/synced" reset -q --mixed "$target"
@@ -26071,7 +26146,7 @@ test_data_config_runbook_dirty_guidance() {
     assert_contains "$out" "HEAD moved anyway (${before} -> ${target})"
     assert_contains "$out" "do NOT stash or reset --hard"
     [[ -f "$base/moved/data/config.json" ]] || fail "the moved-HEAD branch lost data/config.json"
-    echo "ok: runbook dirty refusals warn against reset --hard/stash/checkout . when data/config.json is tracked or ignored, hint reset --mixed for a synced tree (never with a local commit, a staged-only change, a ref that tracks the file or an extra untracked file), and report the reset-worked and HEAD-moved merge failures"
+    echo "ok: runbook dirty refusals warn against reset --hard/stash/checkout . when data/config.json is tracked or ignored, hint reset --mixed for a synced tree with paste-safe hint lines (never with a local commit, a staged-only change, a ref that tracks the file or an extra untracked file), and report the reset-worked and HEAD-moved merge failures"
 }
 
 test_pre_a0_release_without_data_config_recorded() {

@@ -2910,9 +2910,45 @@ _target_slug() {
 }
 
 
+# A device tag is one segment of a session name (TMUX--<tag>--<target>), so
+# it is short and plain: a letter or digit, then letters, digits or single
+# dashes, at most 32 characters, no trailing dash. Anything else (spaces,
+# shell metacharacters, `--`, dots, overlong values) is rejected, never
+# slugified into something else.
+_device_tag_valid() {
+    local v="${1:-}"
+    [[ ${#v} -le 32 && "$v" =~ ^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$ ]]
+}
+
+# The hosts.json alias for this machine: the first alias (sorted) whose
+# hostname is this machine's own name (_host_is_local). Loopback entries (an
+# SSH tunnel such as {"hostname": "localhost"}) never count, and aliases that
+# are not valid device tags are skipped.
+_device_tag_from_hosts() {
+    [[ -f "$HOSTS_FILE" ]] || return 0
+    local alias host
+    while IFS=$'\t' read -r alias host; do
+        [[ -n "$alias" && "$alias" != local && "$alias" != self ]] || continue
+        _device_tag_valid "$alias" || continue
+        _host_is_local "$host" || continue
+        case "$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')" in
+            localhost|localhost.local|localhost.localdomain|127.*|::1|0:0:0:0:0:0:0:1) continue ;;
+        esac
+        printf '%s' "$alias" | tr '[:upper:]' '[:lower:]'
+        return 0
+    done < <(jq -r 'to_entries | sort_by(.key)[] | select((.value | type) == "object")
+        | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
+    return 0
+}
+
 _device_tag() {
-    # Explicit remote host aliases win. For direct local launches, recognize the
-    # two personal machines so tmux session names stay machine-scoped.
+    # The device segment of session names. Precedence, first hit wins:
+    #   1. CCTRL_HOST_PREFIX  the --host alias a remote launch runs under
+    #   2. CCTRL_DEVICE_TAG   an explicit per-machine setting
+    #   3. hosts.json         the alias whose hostname is this machine
+    #   4. hostname pattern   generic names only (ms, ms-*, macbook-pro, mbp, mbp-*)
+    #   5. none               unknown hosts keep the historic untagged names
+    # An invalid CCTRL_DEVICE_TAG is ignored with a warning (falls through).
     local tag host
     if [[ -n "${CCTRL_HOST_PREFIX:-}" ]]; then
         tag="$(_slugify "$CCTRL_HOST_PREFIX")"
@@ -2921,8 +2957,16 @@ _device_tag() {
     fi
 
     if [[ -n "${CCTRL_DEVICE_TAG:-}" ]]; then
-        tag="$(_slugify "$CCTRL_DEVICE_TAG")"
-        [[ -n "$tag" ]] && printf '%s' "$tag"
+        if _device_tag_valid "$CCTRL_DEVICE_TAG"; then
+            printf '%s' "$CCTRL_DEVICE_TAG" | tr '[:upper:]' '[:lower:]'
+            return 0
+        fi
+        echo "cctrl: ignoring CCTRL_DEVICE_TAG: not a valid device tag (letters, digits and single dashes, at most 32 characters)" >&2
+    fi
+
+    tag="$(_device_tag_from_hosts)"
+    if [[ -n "$tag" ]]; then
+        printf '%s' "$tag"
         return 0
     fi
 
@@ -2930,7 +2974,7 @@ _device_tag() {
     host="$(printf '%s' "${host%.local}" | tr '[:upper:]' '[:lower:]')"
     case "$host" in
         ms-*|ms) printf 'ms' ;;
-        mattbook-pro|macbook-pro|mbp|mbp-*) printf 'mbp' ;;
+        macbook-pro|mbp|mbp-*) printf 'mbp' ;;
     esac
 }
 
@@ -2938,8 +2982,9 @@ _context_slug() {
     # Canonical context names use stable segments:
     #   <device>--<target>           for foreground agent/bridge names
     #   TMUX--<device>--<target>     for detached tmux-backed agent names
-    # The device segment comes from --host aliases, CCTRL_DEVICE_TAG, or known
-    # local hostnames. Unknown hosts keep the historic untagged names.
+    # The device segment comes from _device_tag (--host alias, CCTRL_DEVICE_TAG,
+    # the hosts.json alias for this machine, or a generic hostname pattern).
+    # Unknown hosts keep the historic untagged names.
     local include_tmux="${1:-false}" input="${2:-$PWD}"
     local name device out=""
     name="$(_target_slug "$input")"

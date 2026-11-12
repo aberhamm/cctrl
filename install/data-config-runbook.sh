@@ -213,10 +213,16 @@ do_ff() {
         printf '%s\n' "$dirty" >&2
         if tree_matches "$target"; then
             echo "data-config-runbook: the working tree already matches $ref (${target:0:12}) but HEAD is still at $(git -C "$checkout" rev-parse --short HEAD): the files were brought forward (for example by a file sync tool) and HEAD was not" >&2
-            echo "data-config-runbook: do not ff; move HEAD and the index only, which writes no working file:" >&2
-            echo "data-config-runbook:   git -C $checkout fetch origin            # only if $ref is not yet in this clone" >&2
+            # Each indented hint line is a bare command, with no trailing
+            # `# ...` comment: an interactive zsh without interactivecomments
+            # would pass the comment words to the command when pasted.
+            echo "data-config-runbook: do not ff; move HEAD and the index only, which writes no working file." >&2
+            echo "data-config-runbook: run the fetch only if $ref is not yet in this clone:" >&2
+            echo "data-config-runbook:   git -C $checkout fetch origin" >&2
+            echo "data-config-runbook: then move HEAD and the index:" >&2
             echo "data-config-runbook:   git -C $checkout reset --mixed $target" >&2
-            echo "data-config-runbook:   data-config-runbook.sh check $checkout   # expect: present, untracked, ignored" >&2
+            echo "data-config-runbook: then check; expect: present, untracked, ignored:" >&2
+            echo "data-config-runbook:   data-config-runbook.sh check $checkout" >&2
         else
             echo "data-config-runbook: commit them, or sort them out by hand, then re-run ff" >&2
         fi

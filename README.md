@@ -723,6 +723,21 @@ TMUX--myapp              # local detached session
 TMUX--studio--myapp      # detached session launched with --host studio
 ```
 
+The device segment (`studio` above) comes from the first of these that is set:
+
+1. `CCTRL_HOST_PREFIX`: the `--host` alias a remote launch runs under.
+2. `CCTRL_DEVICE_TAG`: an explicit per-machine tag, e.g. `export CCTRL_DEVICE_TAG=laptop`
+   in a shell file that SSH commands read too (such as `~/.zshenv`).
+3. `hosts.json`: the alias whose `hostname` is this machine (not a loopback
+   entry; the first alias in sorted order if several match).
+4. A generic hostname pattern: `ms`/`ms-*` gives `ms`; `macbook-pro`, `mbp`
+   and `mbp-*` give `mbp`.
+5. None: the name has no device segment (`TMUX--myapp`).
+
+A tag is a letter or digit, then letters, digits or single dashes, at most 32
+characters. An invalid `CCTRL_DEVICE_TAG` is ignored with a warning and the
+next source is used; an invalid `hosts.json` alias is skipped.
+
 `cctrl session ls` is self-describing. There is no header row — a legend line
 explains the two markers, and each row reads left to right as: `✦` (cctrl
 spawned it), session name, agent and model (or `shell (zsh)`), working
