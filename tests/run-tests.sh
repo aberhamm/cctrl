@@ -25963,7 +25963,7 @@ test_data_config_runbook_dirty_guidance() {
     "${G[@]}" -C "$base/origin" add .gitignore tool
     "${G[@]}" -C "$base/origin" add -f data/config.json
     "${G[@]}" -C "$base/origin" commit -q -m pre
-    for c in tracked synced partial failreset moved; do "${G[@]}" clone -q "$base/origin" "$base/$c"; done
+    for c in tracked synced partial failreset moved localc trk extra; do "${G[@]}" clone -q "$base/origin" "$base/$c"; done
     mkdir -p "$base/origin/share"
     cp "$base/origin/data/config.json" "$base/origin/share/config.default.json"
     printf 'v2\n' > "$base/origin/tool"
@@ -25974,7 +25974,7 @@ test_data_config_runbook_dirty_guidance() {
     target="$(git -C "$base/origin" rev-parse HEAD)"
     "${G[@]}" clone -q "$base/origin" "$base/ignored"
     mkdir -p "$base/ignored/data"; cp "$base/origin/share/config.default.json" "$base/ignored/data/config.json"
-    for c in tracked synced partial failreset moved; do "${G[@]}" -C "$base/$c" fetch -q; done
+    for c in tracked synced partial failreset moved localc trk extra; do "${G[@]}" -C "$base/$c" fetch -q; done
     # 1. Tracked file, dirty elsewhere (config.json not in the dirty list): warned, no reset hint.
     printf 'x\n' >> "$base/tracked/tool"
     rc=0; out="$("$rb" ff "$base/tracked" origin/main 2>&1)" || rc=$?
@@ -26018,6 +26018,40 @@ test_data_config_runbook_dirty_guidance() {
     [[ "$rc" -eq 1 ]] || fail "partly synced ff should exit 1 (got $rc): $out"
     [[ "$out" != *"reset --mixed"* ]] || fail "a partly synced tree got the reset --mixed hint: $out"
     assert_contains "$out" "do NOT run git reset --hard"
+    # 4b. Never hint when the hinted reset --mixed would be unsafe, even though
+    #     the files on disk equal the ref. Each case pins one guard in tree_matches.
+    #  - HEAD has a local commit the ref lacks (reset --mixed would orphan it).
+    printf 'mine\n' > "$base/localc/mine"
+    "${G[@]}" -C "$base/localc" add mine; "${G[@]}" -C "$base/localc" commit -q -m local
+    git -C "$base/origin" archive "$target" | tar -x -C "$base/localc"
+    rm -f "$base/localc/mine"
+    before="$(git -C "$base/localc" rev-parse HEAD)"
+    rc=0; out="$("$rb" ff "$base/localc" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "local-commit ff should exit 1 (got $rc): $out"
+    [[ "$out" != *"reset --mixed"* && "$out" != *"already matches"* ]] || fail "a checkout with a local commit not in the ref got the reset --mixed hint: $out"
+    [[ "$(git -C "$base/localc" rev-parse HEAD)" == "$before" ]] || fail "the local-commit refusal moved HEAD"
+    #  - HEAD is already the ref and the only change is staged (reset would drop it).
+    "${G[@]}" clone -q "$base/origin" "$base/staged"
+    mkdir -p "$base/staged/data"; cp "$base/origin/share/config.default.json" "$base/staged/data/config.json"
+    printf 'v3\n' > "$base/staged/tool"; "${G[@]}" -C "$base/staged" add tool; printf 'v2\n' > "$base/staged/tool"
+    rc=0; out="$("$rb" ff "$base/staged" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "staged-only ff should exit 1 (got $rc): $out"
+    [[ "$out" != *"reset --mixed"* && "$out" != *"already matches"* ]] || fail "HEAD == ref with a staged change got the reset --mixed hint: $out"
+    ! git -C "$base/staged" diff --cached --quiet || fail "the staged-only refusal dropped the staged change"
+    #  - The ref still tracks data/config.json (not a post-A0 target).
+    printf 'v1b\n' > "$base/trk/tool"; "${G[@]}" -C "$base/trk" commit -q -am pre2
+    local t2; t2="$(git -C "$base/trk" rev-parse HEAD)"
+    git -C "$base/trk" reset -q --mixed HEAD~1
+    rc=0; out="$("$rb" ff "$base/trk" "$t2" 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "tracking-ref ff should exit 1 (got $rc): $out"
+    [[ "$out" != *"reset --mixed"* && "$out" != *"already matches"* ]] || fail "a ref that still tracks data/config.json got the reset --mixed hint: $out"
+    #  - The tree equals the ref plus one untracked, unignored file.
+    git -C "$base/origin" archive "$target" | tar -x -C "$base/extra"
+    printf 'notes\n' > "$base/extra/notes.txt"
+    rc=0; out="$("$rb" ff "$base/extra" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "extra-untracked ff should exit 1 (got $rc): $out"
+    [[ "$out" != *"reset --mixed"* && "$out" != *"already matches"* ]] || fail "a tree with an extra untracked file got the reset --mixed hint: $out"
+    assert_contains "$out" "notes.txt"
     # 5. Merge fails, the index reset works: "tracked again", HEAD and file unchanged, tree clean.
     mkdir -p "$base/shim"
     printf '#!/bin/sh\nfor a in "$@"; do if [ "$a" = merge ]; then\n  [ "$RB_MODE" = move ] && "$RB_GIT" -C "$RB_CO" update-ref HEAD "$RB_TARGET"\n  exit 1\nfi; done\nexec "$RB_GIT" "$@"\n' > "$base/shim/git"
@@ -26037,7 +26071,7 @@ test_data_config_runbook_dirty_guidance() {
     assert_contains "$out" "HEAD moved anyway (${before} -> ${target})"
     assert_contains "$out" "do NOT stash or reset --hard"
     [[ -f "$base/moved/data/config.json" ]] || fail "the moved-HEAD branch lost data/config.json"
-    echo "ok: runbook dirty refusals warn against reset --hard/stash/checkout . when data/config.json is tracked or ignored, hint reset --mixed for a synced tree, and report the reset-worked and HEAD-moved merge failures"
+    echo "ok: runbook dirty refusals warn against reset --hard/stash/checkout . when data/config.json is tracked or ignored, hint reset --mixed for a synced tree (never with a local commit, a staged-only change, a ref that tracks the file or an extra untracked file), and report the reset-worked and HEAD-moved merge failures"
 }
 
 test_pre_a0_release_without_data_config_recorded() {
