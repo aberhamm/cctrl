@@ -21,7 +21,8 @@ out="$(mktemp "${TMPDIR:-/tmp}/ci-shellcheck-out.XXXXXX")"
 trap 'rm -f "$now" "$out"' EXIT
 for f in "${files[@]}"; do
     src=0
-    shellcheck -S warning -f gcc -x "$f" >> "$out" || src=$?
+    # Extended analysis is off for memory: about 34 GB peak with it, about 2 GB without (CI runner has 7 GB).
+    shellcheck --extended-analysis=false -S warning -f gcc -x "$f" >> "$out" || src=$?
     if (( src >= 2 )); then
         echo "ci-shellcheck: shellcheck failed (rc $src) on $f" >&2
         exit 2

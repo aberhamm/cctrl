@@ -2065,7 +2065,7 @@ notes say. The slowest tests are the session-close/terminate fixtures
 
 `.github/workflows/ci.yml` runs on GitHub-hosted macOS runners only (never a
 self-hosted runner), with every action pinned by commit SHA, a read-only token
-and no secrets. Every push runs lint, the Python unit tests, the public-hygiene
+and no secrets. Pushes to main and pull requests run lint, the Python unit tests, the public-hygiene
 check, gitleaks and a smoke subset (the test names in `tests/smoke-tests.txt`,
 about a minute) on `/bin/bash` 3.2 and Homebrew bash 5. Pull requests and a
 nightly run execute the full suite on both bashes instead of the smoke subset.
