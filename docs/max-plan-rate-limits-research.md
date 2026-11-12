@@ -158,3 +158,4 @@ The data supports this. The GitHub issues corroborate it. The public comms patte
 | `data/rate-limits.json` | Current rate limit snapshot |
 | `drafts/reddit-post.html` | Dark-themed HTML table + chart for screenshot |
 | `hooks/session-log.py` | Stop hook that writes to spending.jsonl (includes subagents as of 0d4fc66) |
+
