@@ -25944,6 +25944,102 @@ test_data_config_runbook_ff_refusals() {
     echo "ok: runbook refuses a subdirectory, another branch or a detached HEAD (unless --any-branch), a non-ff ref and a held lock; a failed merge says the index state and a re-run completes it"
 }
 
+test_data_config_runbook_dirty_guidance() {
+    # A0 live-steps round: every dirty-tree refusal warns against reset
+    # --hard / stash / checkout . whenever the checkout tracks or ignores
+    # data/config.json (not only when it is in the dirty list); a tree that
+    # already matches <ref> while HEAD is stale (files synced, .git not) gets
+    # the `reset --mixed <ref>` hint, and following it is safe; and the two
+    # merge-failure branches "reset worked" and "HEAD moved anyway" report
+    # the real state. Scratch repos only.
+    local base="$TMPDIR/a0-runbook-dirty" rb="$ROOT/install/data-config-runbook.sh" out rc c before
+    rm -rf "$base"; mkdir -p "$base"
+    local G=(git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main -c commit.gpgsign=false)
+    "${G[@]}" init -q "$base/origin"
+    printf 'data/\n' > "$base/origin/.gitignore"
+    mkdir -p "$base/origin/data"
+    printf '{"defaultAgent":"codex"}\n' > "$base/origin/data/config.json"
+    printf 'v1\n' > "$base/origin/tool"
+    "${G[@]}" -C "$base/origin" add .gitignore tool
+    "${G[@]}" -C "$base/origin" add -f data/config.json
+    "${G[@]}" -C "$base/origin" commit -q -m pre
+    for c in tracked synced partial failreset moved; do "${G[@]}" clone -q "$base/origin" "$base/$c"; done
+    mkdir -p "$base/origin/share"
+    cp "$base/origin/data/config.json" "$base/origin/share/config.default.json"
+    printf 'v2\n' > "$base/origin/tool"
+    "${G[@]}" -C "$base/origin" rm -q --cached data/config.json
+    "${G[@]}" -C "$base/origin" add share/config.default.json tool
+    "${G[@]}" -C "$base/origin" commit -q -m untrack
+    local target
+    target="$(git -C "$base/origin" rev-parse HEAD)"
+    "${G[@]}" clone -q "$base/origin" "$base/ignored"
+    mkdir -p "$base/ignored/data"; cp "$base/origin/share/config.default.json" "$base/ignored/data/config.json"
+    for c in tracked synced partial failreset moved; do "${G[@]}" -C "$base/$c" fetch -q; done
+    # 1. Tracked file, dirty elsewhere (config.json not in the dirty list): warned, no reset hint.
+    printf 'x\n' >> "$base/tracked/tool"
+    rc=0; out="$("$rb" ff "$base/tracked" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "dirty tracked ff should exit 1 (got $rc): $out"
+    assert_contains "$out" "do NOT run git reset --hard, git stash, git checkout ."
+    [[ "$out" != *"reset --mixed"* ]] || fail "an ordinary dirty tree got the reset --mixed hint: $out"
+    [[ "$out" != *"stash them"* ]] || fail "the refusal still suggests stash: $out"
+    # 2. Untracked but ignored (after A0), dirty: still warned.
+    printf 'x\n' >> "$base/ignored/tool"
+    rc=0; out="$("$rb" ff "$base/ignored" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "dirty ignored ff should exit 1 (got $rc): $out"
+    assert_contains "$out" "do NOT run git reset --hard"
+    # 3. A repo that never had data/config.json: no warning.
+    "${G[@]}" init -q "$base/plain"; printf 'a\n' > "$base/plain/a"
+    "${G[@]}" -C "$base/plain" add a; "${G[@]}" -C "$base/plain" commit -q -m a
+    printf 'b\n' >> "$base/plain/a"
+    rc=0; out="$("$rb" ff "$base/plain" HEAD 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "dirty plain ff should exit 1 (got $rc): $out"
+    [[ "$out" != *"do NOT run"* ]] || fail "warned in a repo without data/config.json: $out"
+    # 4. Files synced, HEAD stale: the tree equals <ref>. Refused with the hint;
+    #    following the hint gives the right end state; nothing was written first.
+    git -C "$base/origin" archive "$target" | tar -x -C "$base/synced"
+    before="$(git -C "$base/synced" rev-parse HEAD; git -C "$base/synced" ls-files -s)"
+    rc=0; out="$("$rb" ff "$base/synced" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "synced-shape ff should exit 1 (got $rc): $out"
+    assert_contains "$out" "already matches origin/main"
+    assert_contains "$out" "reset --mixed $target"
+    assert_contains "$out" "fetch origin"
+    assert_contains "$out" "do NOT run git reset --hard"
+    [[ "$before" == "$(git -C "$base/synced" rev-parse HEAD; git -C "$base/synced" ls-files -s)" ]] || fail "the synced-shape refusal changed HEAD or the index"
+    [[ ! -e "$base/synced/data/config.json.a0-keep" ]] || fail "the synced-shape refusal wrote a keep copy"
+    git -C "$base/synced" reset -q --mixed "$target"
+    out="$("$rb" check "$base/synced" 2>&1)"
+    assert_contains "$out" "present, untracked, ignored"
+    [[ -z "$(git -C "$base/synced" status --porcelain)" ]] || fail "status not clean after the hinted reset --mixed"
+    cmp -s "$base/synced/data/config.json" "$base/origin/data/config.json" || fail "the hinted reset changed data/config.json"
+    # A partly synced tree (one file still old) is not the signature: no hint.
+    git -C "$base/origin" archive "$target" | tar -x -C "$base/partial"
+    printf 'v1\n' > "$base/partial/tool"
+    rc=0; out="$("$rb" ff "$base/partial" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "partly synced ff should exit 1 (got $rc): $out"
+    [[ "$out" != *"reset --mixed"* ]] || fail "a partly synced tree got the reset --mixed hint: $out"
+    assert_contains "$out" "do NOT run git reset --hard"
+    # 5. Merge fails, the index reset works: "tracked again", HEAD and file unchanged, tree clean.
+    mkdir -p "$base/shim"
+    printf '#!/bin/sh\nfor a in "$@"; do if [ "$a" = merge ]; then\n  [ "$RB_MODE" = move ] && "$RB_GIT" -C "$RB_CO" update-ref HEAD "$RB_TARGET"\n  exit 1\nfi; done\nexec "$RB_GIT" "$@"\n' > "$base/shim/git"
+    chmod +x "$base/shim/git"
+    before="$(git -C "$base/failreset" rev-parse HEAD)"
+    rc=0; out="$(PATH="$base/shim:$PATH" RB_GIT="$(command -v git)" RB_MODE=fail "$rb" ff "$base/failreset" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff with a failing merge should exit 1 (got $rc): $out"
+    assert_contains "$out" "HEAD unchanged; data/config.json is tracked again in the index and present on disk"
+    [[ "$(git -C "$base/failreset" rev-parse HEAD)" == "$before" ]] || fail "a failed merge moved HEAD"
+    [[ -f "$base/failreset/data/config.json" && -z "$(git -C "$base/failreset" status --porcelain)" ]] || fail "after reset-worked the file or the index is wrong: $(git -C "$base/failreset" status --porcelain)"
+    out="$("$rb" ff "$base/failreset" origin/main 2>&1)" || fail "the re-run after reset-worked failed: $out"
+    assert_contains "$out" "ff done"
+    # 6. Merge fails but HEAD moved anyway: said so, with the warning; rc 1.
+    before="$(git -C "$base/moved" rev-parse HEAD)"
+    rc=0; out="$(PATH="$base/shim:$PATH" RB_GIT="$(command -v git)" RB_MODE=move RB_CO="$base/moved" RB_TARGET="$target" "$rb" ff "$base/moved" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff with a moved HEAD should exit 1 (got $rc): $out"
+    assert_contains "$out" "HEAD moved anyway (${before} -> ${target})"
+    assert_contains "$out" "do NOT stash or reset --hard"
+    [[ -f "$base/moved/data/config.json" ]] || fail "the moved-HEAD branch lost data/config.json"
+    echo "ok: runbook dirty refusals warn against reset --hard/stash/checkout . when data/config.json is tracked or ignored, hint reset --mixed for a synced tree, and report the reset-worked and HEAD-moved merge failures"
+}
+
 test_pre_a0_release_without_data_config_recorded() {
     # Review S5: record what a release from before A0 does when its
     # data/config.json is gone (a rollback after the untracking). Result: it

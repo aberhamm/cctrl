@@ -14,7 +14,8 @@
 #
 #   install/data-config-runbook.sh ff [--any-branch] <checkout> <ref>
 #
-# `ff` refuses a dirty tree, then runs save, `git rm --cached
+# `ff` refuses a dirty tree (and, when the tree already matches <ref> while
+# HEAD is behind, says to run `git reset --mixed <ref>` instead), then runs save, `git rm --cached
 # data/config.json`, `git merge --ff-only --no-autostash <ref>` and the
 # restore check. The file stays in place the whole time (it is untracked
 # before the merge, so the merge does not remove it). If the merge fails, HEAD
@@ -159,6 +160,37 @@ do_restore() {
     report
 }
 
+# Printed with every refusal over a dirty tree, whenever this checkout tracks
+# or ignores data/config.json (not only when the file is in the dirty list):
+# the usual "clean up" commands each delete or overwrite it, and when data/
+# is shared by a file sync tool the deletion reaches every copy.
+destructive_note() {
+    if tracked || in_head || ignored; then
+        echo "data-config-runbook: do NOT run git reset --hard, git stash, git checkout . or git clean here: each can delete or overwrite data/config.json, and if a file sync tool shares data/ the loss spreads to the other copies; run save first" >&2
+    fi
+}
+
+# True when the working tree already holds exactly the files of <target>, a
+# later commit that no longer tracks data/config.json, while HEAD is behind
+# it: the "files synced, HEAD stale" shape. Uses a throwaway index outside the
+# repo, so nothing in the checkout is written.
+tree_matches() {
+    local t="$1" d rc=1
+    git -C "$checkout" merge-base --is-ancestor HEAD "$t" 2>/dev/null || return 1
+    [[ "$(git -C "$checkout" rev-parse HEAD)" != "$t" ]] || return 1
+    ! git -C "$checkout" cat-file -e "$t:data/config.json" 2>/dev/null || return 1
+    d="$(mktemp -d "${TMPDIR:-/tmp}/rb-idx.XXXXXX")" || return 1
+    if GIT_INDEX_FILE="$d/index" git -C "$checkout" read-tree "$t" 2>/dev/null; then
+        GIT_INDEX_FILE="$d/index" git -C "$checkout" update-index -q --refresh >/dev/null 2>&1 || true
+        if GIT_INDEX_FILE="$d/index" git -C "$checkout" diff-files --quiet 2>/dev/null \
+            && [[ -z "$(GIT_INDEX_FILE="$d/index" git -C "$checkout" ls-files --others --exclude-standard 2>/dev/null)" ]]; then
+            rc=0
+        fi
+    fi
+    rm -rf "$d"
+    return "$rc"
+}
+
 # The checkout's status, minus the one change `ff` itself makes (a staged
 # removal of data/config.json from an earlier, interrupted run).
 dirty_lines() {
@@ -168,7 +200,7 @@ dirty_lines() {
 do_ff() {
     local target dirty branch
     target="$(git -C "$checkout" rev-parse -q --verify "$ref^{commit}" 2>/dev/null)" \
-        || { echo "data-config-runbook: unknown ref: $ref" >&2; exit 66; }
+        || { echo "data-config-runbook: unknown ref: $ref (fetch it first, e.g. git -C $checkout fetch origin)" >&2; exit 66; }
     branch="$(git -C "$checkout" symbolic-ref -q --short HEAD 2>/dev/null || true)"
     if [[ "$any_branch" -ne 1 && "$branch" != main ]]; then
         echo "data-config-runbook: refusing: $checkout is on ${branch:-a detached HEAD}, not main; ff moves the checked-out branch (pass --any-branch to allow it)" >&2
@@ -177,11 +209,18 @@ do_ff() {
     echo "data-config-runbook: $checkout is on ${branch:-a detached HEAD} at $(git -C "$checkout" rev-parse --short HEAD)"
     dirty="$(dirty_lines)"
     if [[ -n "$dirty" ]]; then
-        echo "data-config-runbook: refusing: $checkout has local changes; commit or stash them first:" >&2
+        echo "data-config-runbook: refusing: $checkout has local changes:" >&2
         printf '%s\n' "$dirty" >&2
-        if printf '%s\n' "$dirty" | grep -qF 'data/config.json'; then
-            echo "data-config-runbook: data/config.json is part of those changes: do NOT use git stash or git reset --hard (either deletes it); run save first and sort the tree out by hand" >&2
+        if tree_matches "$target"; then
+            echo "data-config-runbook: the working tree already matches $ref (${target:0:12}) but HEAD is still at $(git -C "$checkout" rev-parse --short HEAD): the files were brought forward (for example by a file sync tool) and HEAD was not" >&2
+            echo "data-config-runbook: do not ff; move HEAD and the index only, which writes no working file:" >&2
+            echo "data-config-runbook:   git -C $checkout fetch origin            # only if $ref is not yet in this clone" >&2
+            echo "data-config-runbook:   git -C $checkout reset --mixed $target" >&2
+            echo "data-config-runbook:   data-config-runbook.sh check $checkout   # expect: present, untracked, ignored" >&2
+        else
+            echo "data-config-runbook: commit them, or sort them out by hand, then re-run ff" >&2
         fi
+        destructive_note
         exit 1
     fi
     if git -C "$checkout" merge-base --is-ancestor "$target" HEAD; then
@@ -243,6 +282,7 @@ do_ff() {
     if [[ -n "$dirty" ]]; then
         echo "data-config-runbook: WARNING: $checkout is not clean after the fast-forward:" >&2
         printf '%s\n' "$dirty" >&2
+        destructive_note
         exit 1
     fi
     echo "data-config-runbook: ff done: data/config.json kept, untracked and ignored; tree clean"
