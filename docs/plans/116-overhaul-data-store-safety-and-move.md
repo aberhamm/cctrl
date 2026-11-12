@@ -113,11 +113,15 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
     copy `data/config.json` aside before the fast-forward, fast-forward, restore it (now
     untracked and ignored), and confirm with `git status --ignored data/config.json`. The
     install preflight warns when the file is missing from the live data dir. Preferred form,
-    with no window in which the file is absent: `install/data-config-runbook.sh ff <checkout>
-    <ref>` (refuses a dirty tree; save, `git rm --cached data/config.json`, `merge
-    --ff-only`, verify; idempotent). Any later move of a checkout back across the untracking
-    commit (a checkout of an older commit, a bisect, a branch switch, including one made by a
-    sync tool) deletes or blocks the file again; run `check` / `restore` after it.
+    with no window in which the file is absent: `install/data-config-runbook.sh ff
+    [--any-branch] <checkout> <ref>` (refuses a dirty tree, a path that is not the work
+    tree's top level, and a branch other than main unless `--any-branch`; save, `git rm
+    --cached data/config.json`, `merge --ff-only --no-autostash`, verify; idempotent). Git
+    never refuses a later move: the untracked file is ignored, so a move of a checkout back
+    across the untracking commit (a checkout of an older commit, a bisect, a branch switch,
+    including one made by a sync tool) silently overwrites it with the old shipped content,
+    and the next move forward deletes it. Run `save` before any move back, and `check` /
+    `restore` after every move.
   - **SH-S3 installed-mode signal:** `self-install.sh` writes `.installed` into the release as
     its last step before activation, after the gate. VERSION is no longer the signal. Mode is
     "installed" only when `.installed` sits next to the **resolved** (realpath) script.

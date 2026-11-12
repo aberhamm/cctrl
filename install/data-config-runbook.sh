@@ -12,16 +12,22 @@
 # Preferred: one scripted step per checkout, with no window in which the file
 # is missing:
 #
-#   install/data-config-runbook.sh ff <checkout> <ref>
+#   install/data-config-runbook.sh ff [--any-branch] <checkout> <ref>
 #
 # `ff` refuses a dirty tree, then runs save, `git rm --cached
-# data/config.json`, `git merge --ff-only <ref>` and the restore check. The
-# file stays in place the whole time (it is untracked before the merge, so
-# the merge does not remove it). If the merge fails, the index entry is put
-# back and nothing else has changed. Re-running `ff` after a partial or full
-# run is safe: a staged removal of data/config.json from an earlier run is
-# the one change it accepts, and a checkout already at or past <ref> is only
-# checked.
+# data/config.json`, `git merge --ff-only --no-autostash <ref>` and the
+# restore check. The file stays in place the whole time (it is untracked
+# before the merge, so the merge does not remove it). If the merge fails, HEAD
+# does not move; the index entry is put back when the index can be written,
+# and the message says which state the index is in. Re-running `ff` after a
+# partial or full run is safe: a staged removal of data/config.json from an
+# earlier run is the one change it accepts, and a checkout already at or past
+# <ref> is only checked. `ff` moves the checked-out branch, so it refuses a
+# detached HEAD or a branch other than main unless --any-branch is given.
+#
+# <checkout> must be the top level of a work tree (a clone or a linked
+# worktree), never a directory inside one: every subcommand refuses
+# otherwise, so the paths it checks and the repo it moves are the same.
 #
 # Manual fallback (it leaves a window with no file between steps 2 and 3):
 #
@@ -36,12 +42,15 @@
 # untracked and ignored (`git status --ignored`). `check` only reports.
 #
 # LATER MOVES: the file is safe only while the checkout stays at or past the
-# untracking commit. ANY move back across it deletes the now-ignored file
-# again or blocks the move: a checkout or reset to an older commit and back,
-# a bisect, a branch switch (including one made by a file sync tool in a
-# shared directory). After any such move, run `check`, and `restore` if the
-# file is missing. Moving back to an older commit first needs the untracked
-# file out of the way (git refuses to overwrite it); `save` keeps the copy.
+# untracking commit. Once untracked it is IGNORED, and git treats ignored
+# files as expendable: a move back to an older commit (a checkout or reset, a
+# bisect, a branch switch, including one made by a file sync tool in a shared
+# directory) silently OVERWRITES it with the old shipped content, and the next
+# move forward across the untracking commit DELETES it. Git does not refuse
+# either move. So: run `save` before any move back (it refuses if an older
+# keep copy differs), and run `check` after every move, then `restore` if the
+# file is missing (or copy the keep copy back by hand if a backward move
+# overwrote a local edit).
 #
 # This script never fetches, pushes or installs. `ff` merges only the
 # fast-forward it is given. It touches nothing but data/config.json, its keep
@@ -50,20 +59,36 @@ set -euo pipefail
 
 usage() {
     echo "Usage: data-config-runbook.sh save|restore|check <checkout>" >&2
-    echo "       data-config-runbook.sh ff <checkout> <ref>   (preferred: save, rm --cached, merge --ff-only, verify)" >&2
+    echo "       data-config-runbook.sh ff [--any-branch] <checkout> <ref>   (preferred: save, rm --cached, merge --ff-only, verify)" >&2
+    echo "       <checkout> is the top level of a work tree; ff moves only main unless --any-branch" >&2
     exit 64
 }
 
 [[ $# -ge 2 ]] || usage
-action="$1"
-checkout="$2"
+action="$1"; shift
+any_branch=0
+if [[ "$action" == ff && "${1:-}" == --any-branch ]]; then any_branch=1; shift; fi
 case "$action" in
-    ff) [[ $# -eq 3 ]] || usage; ref="$3" ;;
-    *) [[ $# -eq 2 ]] || usage ;;
+    ff) [[ $# -eq 2 ]] || usage; checkout="$1"; ref="$2" ;;
+    save|restore|check) [[ $# -eq 1 ]] || usage; checkout="$1" ;;
+    *) usage ;;
 esac
 [[ -d "$checkout" ]] || { echo "data-config-runbook: no such checkout: $checkout" >&2; exit 66; }
 git -C "$checkout" rev-parse --git-dir >/dev/null 2>&1 \
     || { echo "data-config-runbook: not a git checkout: $checkout" >&2; exit 66; }
+# MF-1: <checkout> must be the work tree's top level. From a subdirectory,
+# the file paths below would point into the subdirectory while HEAD:, the
+# index and the merge act on the enclosing repo, which could delete its real
+# data/config.json and still report success. Compare physical paths.
+_top="$(git -C "$checkout" rev-parse --show-toplevel 2>/dev/null)" || _top=""
+_real="$(cd -P -- "$checkout" && pwd -P)"
+_top_real=""
+[[ -n "$_top" ]] && _top_real="$(cd -P -- "$_top" 2>/dev/null && pwd -P)" || true
+if [[ -z "$_top_real" || "$_real" != "$_top_real" ]]; then
+    echo "data-config-runbook: refusing: $checkout is not the top level of a git work tree${_top:+ (its top level is $_top)}; pass the top-level path" >&2
+    exit 66
+fi
+checkout="$_real"
 
 file="$checkout/data/config.json"
 keep="$checkout/data/config.json.a0-keep"
@@ -141,13 +166,22 @@ dirty_lines() {
 }
 
 do_ff() {
-    local target dirty
+    local target dirty branch
     target="$(git -C "$checkout" rev-parse -q --verify "$ref^{commit}" 2>/dev/null)" \
         || { echo "data-config-runbook: unknown ref: $ref" >&2; exit 66; }
+    branch="$(git -C "$checkout" symbolic-ref -q --short HEAD 2>/dev/null || true)"
+    if [[ "$any_branch" -ne 1 && "$branch" != main ]]; then
+        echo "data-config-runbook: refusing: $checkout is on ${branch:-a detached HEAD}, not main; ff moves the checked-out branch (pass --any-branch to allow it)" >&2
+        exit 1
+    fi
+    echo "data-config-runbook: $checkout is on ${branch:-a detached HEAD} at $(git -C "$checkout" rev-parse --short HEAD)"
     dirty="$(dirty_lines)"
     if [[ -n "$dirty" ]]; then
         echo "data-config-runbook: refusing: $checkout has local changes; commit or stash them first:" >&2
         printf '%s\n' "$dirty" >&2
+        if printf '%s\n' "$dirty" | grep -qF 'data/config.json'; then
+            echo "data-config-runbook: data/config.json is part of those changes: do NOT use git stash or git reset --hard (either deletes it); run save first and sort the tree out by hand" >&2
+        fi
         exit 1
     fi
     if git -C "$checkout" merge-base --is-ancestor "$target" HEAD; then
@@ -171,14 +205,31 @@ do_ff() {
         echo "data-config-runbook: refusing: data/config.json is not tracked at HEAD; use save/restore by hand" >&2
         exit 1
     fi
+    local head_before
+    head_before="$(git -C "$checkout" rev-parse HEAD)"
     do_save
     if tracked; then
-        git -C "$checkout" rm -q --cached -- data/config.json
+        if ! git -C "$checkout" rm -q --cached -- data/config.json; then
+            echo "data-config-runbook: could not untrack data/config.json (is .git/index.lock held by another git process?); nothing changed but the keep copy; re-run ff" >&2
+            exit 1
+        fi
         echo "data-config-runbook: untracked data/config.json in the index (file left in place)"
     fi
-    if ! git -C "$checkout" merge -q --ff-only "$target"; then
-        git -C "$checkout" reset -q -- data/config.json || true
-        echo "data-config-runbook: the fast-forward failed; data/config.json is tracked again and in place" >&2
+    # --no-autostash: an autostash would re-track the file, and the
+    # fast-forward would then delete it.
+    if ! git -C "$checkout" merge -q --ff-only --no-autostash "$target"; then
+        local head_now on_disk=missing
+        head_now="$(git -C "$checkout" rev-parse HEAD 2>/dev/null || echo unknown)"
+        [[ -f "$file" ]] && on_disk="present"
+        if [[ "$head_now" != "$head_before" ]]; then
+            echo "data-config-runbook: the fast-forward failed and HEAD moved anyway ($head_before -> $head_now); data/config.json is $on_disk on disk; inspect by hand, do NOT stash or reset --hard" >&2
+        elif git -C "$checkout" reset -q -- data/config.json 2>/dev/null && tracked; then
+            echo "data-config-runbook: the fast-forward failed; HEAD unchanged; data/config.json is tracked again in the index and $on_disk on disk; fix the cause and re-run ff" >&2
+        else
+            echo "data-config-runbook: the fast-forward failed and the index could not be reset (is .git/index.lock held by another git process?)" >&2
+            echo "data-config-runbook: state: HEAD unchanged at ${head_before:0:12}; data/config.json is $on_disk on disk; the index holds a staged removal of it ('D  data/config.json'); nothing is lost" >&2
+            echo "data-config-runbook: re-run ff once the lock is gone: it accepts that staged removal and completes the fast-forward (do NOT stash or reset --hard)" >&2
+        fi
         report
         exit 1
     fi

@@ -25832,6 +25832,118 @@ test_data_config_runbook_ff_zero_window() {
     echo "ok: runbook ff keeps data/config.json with no window, is idempotent, finishes a partial run, refuses a dirty tree"
 }
 
+test_data_config_runbook_ff_refusals() {
+    # A0 verify MF-1 and NIT-a..e: the runbook acts only on a work tree's top
+    # level (a subdirectory with its own ignored data/config.json must not
+    # move or empty the enclosing repo), only on main unless --any-branch,
+    # refuses a non-fast-forward, survives merge.autostash, and when the
+    # merge fails on a held index.lock says the index holds a staged removal
+    # and a re-run completes it. Scratch repos only.
+    local base="$TMPDIR/a0-runbook-refuse" rb="$ROOT/install/data-config-runbook.sh" out rc c a
+    rm -rf "$base"; mkdir -p "$base"
+    local G=(git -c user.name=t -c user.email=t@example.invalid -c init.defaultBranch=main -c commit.gpgsign=false)
+    "${G[@]}" init -q "$base/origin"
+    printf 'data/\n' > "$base/origin/.gitignore"
+    mkdir -p "$base/origin/data" "$base/origin/sub"
+    printf 'k\n' > "$base/origin/sub/keep.txt"
+    printf '{"defaultAgent":"codex"}\n' > "$base/origin/data/config.json"
+    "${G[@]}" -C "$base/origin" add .gitignore sub/keep.txt
+    "${G[@]}" -C "$base/origin" add -f data/config.json
+    "${G[@]}" -C "$base/origin" commit -q -m pre
+    for c in sub div br det lock lock2 auto; do "${G[@]}" clone -q "$base/origin" "$base/$c"; done
+    mkdir -p "$base/origin/share"
+    cp "$base/origin/data/config.json" "$base/origin/share/config.default.json"
+    "${G[@]}" -C "$base/origin" rm -q --cached data/config.json
+    "${G[@]}" -C "$base/origin" add share/config.default.json
+    "${G[@]}" -C "$base/origin" commit -q -m untrack
+    local target
+    target="$(git -C "$base/origin" rev-parse HEAD)"
+    for c in sub div br det lock lock2 auto; do "${G[@]}" -C "$base/$c" fetch -q; done
+    _rb_state() { git -C "$1" rev-parse HEAD; git -C "$1" ls-files -s; cat "$1/data/config.json" 2>/dev/null || echo MISSING; }
+    # 1. MF-1: a subdirectory with a nested, ignored data/config.json.
+    mkdir -p "$base/sub/sub/data"
+    printf '{"nested":true}\n' > "$base/sub/sub/data/config.json"
+    printf 'data/\n' > "$base/sub/sub/.gitignore"; git -C "$base/sub" add sub/.gitignore
+    "${G[@]}" -C "$base/sub" commit -q -m nested
+    local before after
+    before="$(_rb_state "$base/sub")"
+    for a in "ff $base/sub/sub origin/main" "ff --any-branch $base/sub/sub origin/main" "save $base/sub/sub" "restore $base/sub/sub" "check $base/sub/sub"; do
+        rc=0; out="$("$rb" $a 2>&1)" || rc=$?
+        [[ "$rc" -eq 66 ]] || fail "runbook $a from a subdirectory should exit 66 (got $rc): $out"
+        assert_contains "$out" "not the top level"
+    done
+    after="$(_rb_state "$base/sub")"
+    [[ "$before" == "$after" ]] || fail "a subdirectory run changed the parent's HEAD, index or data/config.json"
+    [[ ! -e "$base/sub/sub/data/config.json.a0-keep" ]] || fail "a subdirectory run wrote a keep copy"
+    # A symlink to the top level is the same tree: accepted.
+    ln -s "$base/sub" "$base/sub-link"
+    out="$("$rb" check "$base/sub-link" 2>&1)" || fail "check through a symlink to the top level failed: $out"
+    assert_contains "$out" "present, tracked"
+    # 2. A non-fast-forward ref is refused, nothing changed.
+    printf 'local\n' > "$base/div/local.txt"; git -C "$base/div" add local.txt
+    "${G[@]}" -C "$base/div" commit -q -m local
+    before="$(_rb_state "$base/div")"
+    rc=0; out="$("$rb" ff "$base/div" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff to a non-fast-forward ref should exit 1 (got $rc): $out"
+    assert_contains "$out" "not a fast-forward"
+    [[ "$before" == "$(_rb_state "$base/div")" ]] || fail "a refused non-ff changed the checkout"
+    # 3. Branch check: another branch and a detached HEAD are refused, --any-branch allows them.
+    git -C "$base/br" checkout -q -b topic
+    before="$(_rb_state "$base/br")"
+    rc=0; out="$("$rb" ff "$base/br" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff on a branch other than main should exit 1 (got $rc): $out"
+    assert_contains "$out" "is on topic, not main"
+    [[ "$before" == "$(_rb_state "$base/br")" ]] || fail "a refused branch ff changed the checkout"
+    out="$("$rb" ff --any-branch "$base/br" origin/main 2>&1)" || fail "ff --any-branch on topic failed: $out"
+    assert_contains "$out" "ff done"
+    [[ "$(git -C "$base/br" rev-parse topic)" == "$target" && "$(git -C "$base/br" rev-parse main)" != "$target" ]] || fail "--any-branch did not move only the checked-out branch"
+    git -C "$base/det" checkout -q --detach
+    rc=0; out="$("$rb" ff "$base/det" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff on a detached HEAD should exit 1 (got $rc): $out"
+    assert_contains "$out" "detached HEAD"
+    out="$("$rb" ff --any-branch "$base/det" origin/main 2>&1)" || fail "ff --any-branch on a detached HEAD failed: $out"
+    [[ "$(git -C "$base/det" rev-parse HEAD)" == "$target" && -f "$base/det/data/config.json" ]] || fail "--any-branch detached ff did not finish"
+    # 4. A held index.lock before the run: refused cleanly, nothing moved.
+    : > "$base/lock/.git/index.lock"
+    before="$(_rb_state "$base/lock")"
+    rc=0; out="$("$rb" ff "$base/lock" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff with a held index.lock should exit 1 (got $rc): $out"
+    assert_contains "$out" "index.lock"
+    [[ "$before" == "$(_rb_state "$base/lock")" ]] || fail "ff with a held index.lock changed the checkout"
+    rm -f "$base/lock/.git/index.lock"
+    # 5. The merge fails on an index.lock taken after rm --cached (a git shim
+    #    takes the lock just before the merge): the message names the staged
+    #    removal, HEAD stays, the file stays, and a re-run completes it.
+    mkdir -p "$base/shim"
+    printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = merge ] && : > "$RB_LOCK"; done\nexec "$RB_GIT" "$@"\n' > "$base/shim/git"
+    chmod +x "$base/shim/git"
+    before="$(git -C "$base/lock2" rev-parse HEAD)"
+    rc=0; out="$(PATH="$base/shim:$PATH" RB_GIT="$(command -v git)" RB_LOCK="$base/lock2/.git/index.lock" "$rb" ff "$base/lock2" origin/main 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "ff with a merge-time index.lock should exit 1 (got $rc): $out"
+    assert_contains "$out" "staged removal"
+    assert_contains "$out" "re-run ff"
+    [[ "$out" != *"tracked again"* ]] || fail "the failure message claims the file is tracked again: $out"
+    [[ "$(git -C "$base/lock2" rev-parse HEAD)" == "$before" ]] || fail "a failed merge moved HEAD"
+    [[ -f "$base/lock2/data/config.json" ]] || fail "a failed merge lost data/config.json"
+    rm -f "$base/lock2/.git/index.lock"
+    [[ "$(git -C "$base/lock2" status --porcelain)" == "D  data/config.json" ]] || fail "the index is not in the stated state: $(git -C "$base/lock2" status --porcelain)"
+    out="$("$rb" ff "$base/lock2" origin/main 2>&1)" || fail "the re-run after a failed merge failed: $out"
+    assert_contains "$out" "ff done"
+    [[ "$(git -C "$base/lock2" rev-parse HEAD)" == "$target" ]] || fail "the re-run did not reach the target"
+    # 6. merge.autostash=true does not re-track (and so delete) the file.
+    git -C "$base/auto" config merge.autostash true
+    printf '#!/bin/sh\n[ -f data/config.json ] && echo present > ../auto-hook.log || echo missing > ../auto-hook.log\n' > "$base/auto/.git/hooks/post-merge"
+    chmod +x "$base/auto/.git/hooks/post-merge"
+    git -C "$base/auto" config core.hooksPath "$base/auto/.git/hooks"
+    out="$("$rb" ff "$base/auto" origin/main 2>&1)" || fail "ff with merge.autostash failed: $out"
+    [[ "$(cat "$base/auto-hook.log" 2>/dev/null)" == present ]] || fail "with merge.autostash the file was absent after the merge"
+    # 7. A usage error for an unknown flag position.
+    rc=0; "$rb" check --any-branch "$base/auto" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--any-branch on check should be a usage error (got $rc)"
+    unset -f _rb_state
+    echo "ok: runbook refuses a subdirectory, another branch or a detached HEAD (unless --any-branch), a non-ff ref and a held lock; a failed merge says the index state and a re-run completes it"
+}
+
 test_pre_a0_release_without_data_config_recorded() {
     # Review S5: record what a release from before A0 does when its
     # data/config.json is gone (a rollback after the untracking). Result: it
