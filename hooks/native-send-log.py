@@ -224,6 +224,21 @@ def _append(data_dir, host, record):
         os.close(lfd)
 
 
+def _migration_clear():
+    """Plan 116 A1: a writer waits while <state root>/.migrating exists. A hook
+    waits briefly (its own 1 s budget is the cap here; the shared rule is at
+    most 5 s) and then skips its write, failing open. True = go ahead."""
+    try:
+        lib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "lib")
+        sys.path.insert(0, lib)
+        import locks
+        import paths
+        state_root = paths.resolve(os.path.dirname(os.path.realpath(lib)))["state_root"]
+        return locks.sentinel_wait(state_root, max_wait=0.8, kind="hook")
+    except Exception:
+        return True
+
+
 def hook():
     _silence()
     _budget(1.0)
@@ -235,6 +250,8 @@ def hook():
 
     data_dir = os.environ.get("CCTRL_NSL_DATA_DIR", "")
     if not data_dir or not os.path.isdir(data_dir):
+        return
+    if not _migration_clear():
         return
     raw = sys.stdin.buffer.read(1024 * 1024)
     payload = json.loads(raw.decode("utf-8"))

@@ -8680,6 +8680,11 @@ test_peer_mailbox_unknowns_and_identity() {
     assert_contains "$out" '"from": "orchestrator"'
 }
 
+# Plan 116 A1 (SH-S1): this test used to be SKIPped as "hangs on macOS bash 3.2
+# (flock issue)". The hang was the mkdir/shlock lock fallback, which a crashed
+# holder could wedge; the link-protocol lock steals only from a dead pid, so it
+# runs again. The stale lock below is the legacy directory form the old
+# CCTRL_MAILBOX_LOCK_KIND=dir fallback left behind; it is still reclaimed.
 test_peer_mailbox_concurrency_and_stale_lock() {
     local data="$TMPDIR/mailbox-concurrency-data"
     setup_mailbox_peers "$data"
@@ -8715,6 +8720,656 @@ test_peer_mailbox_concurrency_and_stale_lock() {
     out="$(CCTRL_MAILBOX_LOCK_KIND=dir CCTRL_DATA_DIR="$stale_data" "$ROOT/cctrl" peer send ghost --from phantom --allow-unknown --json -- "stale lock")"
     assert_contains "$out" '"status": "queued"'
     [[ ! -d "$stale_data/messages.jsonl.lock" ]] || fail "expected stale lock directory to be reclaimed and released"
+}
+
+# ── Plan 116 A1: mailbox hardening, lock-compatible ─────────────────────
+#
+# A1_ENV is a test-mode sandbox (A0's gate): the fault-injection and hook
+# variables below bite only while it holds. Every path lives under one
+# .cctrl-test-sandbox directory under $TMPDIR; nothing touches a live store.
+# Run bash code with the sandbox tree's cctrl sourced (functions only).
+_a1_eval() {
+    local code="$1"; shift
+    "${A1_ENV[@]}" CCTRL_NO_MAIN=1 "$BASH" -c 'code="$1"; shift; source "$0"; eval "$code"' "$A1_CCTRL" "$code" "$@"
+}
+
+_a1_sandbox() { # NAME  (sets A1_SB A1_DATA A1_STATE A1_ENV)
+    A1_SB="$TMPDIR/a1-$1"
+    rm -rf "$A1_SB"
+    mkdir -p "$A1_SB/state" "$A1_SB/data" "$A1_SB/tmux" "$A1_SB/home"
+    : > "$A1_SB/.cctrl-test-sandbox"
+    A1_SB="$(cd -P "$A1_SB" && pwd -P)"
+    # A0's gate also wants <root>/data inside the sandbox, so test-mode runs
+    # use a copy of the tree that lives there.
+    mkdir -p "$A1_SB/root"
+    cp -R "$ROOT/cctrl" "$ROOT/lib" "$ROOT/share" "$ROOT/hooks" "$A1_SB/root/"
+    A1_CCTRL="$A1_SB/root/cctrl"
+    A1_LIB="$A1_SB/root/lib"
+    A1_DATA="$A1_SB/data"
+    A1_STATE="$A1_SB/state"
+    A1_ENV=(env -u TMUX -u TMUX_PANE -u CCTRL_SHORTCUTS_FILE -u CCTRL_HOSTS_FILE -u CCTRL_NEEDS_ME_SNAPSHOT
+        -u CCTRL_AUTOHEAL_LOG -u CCTRL_LAUNCH_AGENTS_DIR -u CCTRL_TMUX_SERVER -u CCTRL_TMUX_EXTRA_SERVERS
+        -u CCTRL_COSTS_DIR -u CCTRL_PEER CCTRL_HOST_ID_FILE="$A1_DATA/host-id"
+        CCTRL_TEST_MODE=1 HOME="$A1_SB/home"
+        CCTRL_STATE_DIR="$A1_STATE" CCTRL_DATA_DIR="$A1_DATA" CCTRL_SESSION_METADATA_DIR="$A1_SB/meta"
+        CCTRL_USER_CONFIG="$A1_SB/user.json" CCTRL_CONFIG_LOCAL="$A1_SB/local.json"
+        CCTRL_PEER_SEAL_KEY_FILE="$A1_STATE/peer-seal.key" TMUX_TMPDIR="$A1_SB/tmux")
+}
+
+_a1_register_peers() {
+    mkdir -p "$A1_SB/comet" "$A1_SB/orchestrator"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer register comet --dir "$A1_SB/comet" --agent codex >/dev/null
+    "${A1_ENV[@]}" "$A1_CCTRL" peer register orchestrator --dir "$A1_SB/orchestrator" --agent codex >/dev/null
+}
+
+# Run python code with lib/ importable: args after the code are sys.argv[1:].
+_a1_py() {
+    local code="$1"; shift
+    "${A1_ENV[@]}" python3 -c "import sys; sys.path.insert(0, '$A1_LIB'); $code" "$@"
+}
+
+# A live process to stand in as a lock holder / sentinel owner. Prints its pid.
+_a1_sleeper() {
+    sleep 300 >/dev/null 2>&1 &
+    echo $!
+}
+
+test_mailbox_tolerant_read_and_quarantine() {
+    _a1_sandbox tolerant
+    _a1_register_peers
+    local mbx="$A1_DATA/messages.jsonl" good out rc q
+    good='{"v":1,"id":"msg_good1","from":"orchestrator","to":"comet","status":"queued","subject":"","body":"ok","created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:00:00Z"}'
+    {
+        printf '%s\n' "$good"
+        printf '{"id":"msg_trunc","from":"orche'                 # (replaced below: truncated line in the middle)
+        printf '\n'
+        printf '{"id":"msg_nul","body":"a\000b"}\n'
+        printf '{"id":"msg_utf8","body":"\377\376bad"}\n'
+        printf '[1,2,3]\n'
+        printf '"just a string"\n'
+        python3 - <<'PY'
+import json
+big = {"v": 1, "id": "msg_big", "from": "orchestrator", "to": "comet", "status": "queued", "subject": "", "body": "x" * (1024 * 1024),
+       "created_at": "2026-11-01T00:00:01Z", "updated_at": "2026-11-01T00:00:01Z"}
+print(json.dumps(big))
+PY
+        printf '{"id":"msg_dup","from":"orchestrator","to":"comet","status":"queued","body":"first","created_at":"2026-11-01T00:00:02Z","updated_at":"2026-11-01T00:00:02Z"}\n'
+        printf '{"id":"msg_dup","from":"orchestrator","to":"comet","status":"delivered","body":"first","created_at":"2026-11-01T00:00:02Z","updated_at":"2026-11-01T00:00:09Z"}\n'
+        printf '{"id":"msg_tail","from":"orchestrator","to":"comet","status":"queued","body":"cut off here'   # truncated last line, no newline
+    } > "$mbx"
+    chmod 600 "$mbx"
+
+    # Good lines stay readable; the bad ones are set aside, not fatal.
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer inbox --as comet --json 2>&1)" || fail "tolerant read failed: $out"
+    jq -e '[.. | objects | select(.id? == "msg_good1")] | length >= 1' <<< "$out" >/dev/null || fail "good line not readable: ${out:0:300}"
+    jq -e '[.. | objects | select(.id? == "msg_big")] | length >= 1' <<< "$out" >/dev/null || fail "1 MB line not readable"
+
+    q="$A1_DATA/messages.quarantine.jsonl"
+    [[ -f "$q" ]] || fail "no quarantine file"
+    [[ "$(_mcp_file_mode "$q")" == 600 ]] || fail "quarantine is not 0600: $(_mcp_file_mode "$q")"
+    jq -e -s 'map(.reason) | (index("unparseable") != null) and (index("nul-byte") != null) and (index("invalid-utf8") != null) and (index("wrong-type") != null)' "$q" >/dev/null \
+        || fail "quarantine reasons missing: $(jq -c '.reason' "$q" | tr '\n' ' ')"
+    jq -e -s 'all(.[]; (.line | type) == "number" and (.raw | type) == "string")' "$q" >/dev/null || fail "quarantine records lack line numbers"
+    jq -e -s 'map(select(.reason == "nul-byte"))[0].line == 3' "$q" >/dev/null || fail "NUL line number wrong: $(jq -c '[.reason,.line]' "$q" | tr '\n' ' ')"
+
+    # A second read does not quarantine the same lines again.
+    local n1 n2
+    n1="$(grep -c . "$q")"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer inbox --as comet --json >/dev/null 2>&1 || true
+    n2="$(grep -c . "$q")"
+    [[ "$n1" == "$n2" ]] || fail "quarantine grew on re-read: $n1 -> $n2"
+
+    # Strict mode (flag or env) keeps the exit 65.
+    rc=0; out="$("${A1_ENV[@]}" "$A1_CCTRL" peer inbox --as comet --json --strict 2>&1)" || rc=$?
+    [[ "$rc" == 65 ]] || fail "--strict should exit 65, got $rc"
+    rc=0; out="$("${A1_ENV[@]}" CCTRL_MAILBOX_STRICT=1 "$A1_CCTRL" peer check --as comet --json 2>&1)" || rc=$?
+    [[ "$rc" == 65 ]] || fail "CCTRL_MAILBOX_STRICT=1 should exit 65, got $rc"
+
+    # peer doctor reports the quarantine count.
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "mailbox_quarantine") | .quarantined >= 5' <<< "$out" >/dev/null \
+        || fail "doctor does not report the quarantine count: $(jq -c '.checks[] | select(.name == "mailbox_quarantine")' <<< "$out")"
+
+    # A write after a tolerant read keeps every good line and drops the bad ones.
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "after bad lines" >/dev/null || fail "send over a damaged mailbox failed"
+    # (the append must not glue onto the truncated last line)
+    [[ "$(grep -c '"body": *"after bad lines"\|"body":"after bad lines"' "$mbx")" == 1 ]] || fail "the new message was swallowed by the truncated tail"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null || fail "recv (a rewrite) failed on a damaged mailbox"
+    jq -e . "$mbx" >/dev/null || fail "mailbox still has bad lines after a rewrite"
+    [[ "$(jq -s '[.[] | select(.id == "msg_good1" or .id == "msg_big")] | length' "$mbx")" == 2 ]] || fail "good lines lost across the rewrite"
+    [[ "$(jq -s '[.[] | select(.body == "after bad lines")] | length' "$mbx")" == 1 ]] || fail "the new message is missing after the rewrite"
+    echo "ok: tolerant read quarantines bad lines (truncated, NUL, bad UTF-8, wrong type), strict keeps 65, doctor reports the count"
+}
+
+test_mailbox_safe_rewrite_backups_and_crash() {
+    _a1_sandbox rewrite
+    _a1_register_peers
+    local mbx="$A1_DATA/messages.jsonl" id before out rc
+    # Static: the rewrite is no longer mktemp-in-$TMPDIR plus mv.
+    ! sed -n '/^_mailbox_rewrite_json_locked()/,/^}/p' "$ROOT/cctrl" | grep -q 'mktemp' || fail "_mailbox_rewrite_json_locked still uses mktemp"
+    sed -n '/^_mailbox_rewrite_json_locked()/,/^}/p' "$ROOT/cctrl" | grep -q 'lib/mailbox.py' || fail "_mailbox_rewrite_json_locked does not use lib/mailbox.py"
+
+    id="$("${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "one" | jq -r '.id')"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "two" >/dev/null
+    jq -e -s 'all(.[]; .v == 1)' "$mbx" >/dev/null || fail "new messages lack v: 1"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null          # a rewrite
+    [[ -f "$mbx.bak" ]] || fail "no messages.jsonl.bak after a rewrite"
+    local dated
+    dated="$(ls "$A1_DATA" | grep -c '^messages\.jsonl\.bak\.[0-9]\{8\}$' || true)"
+    [[ "$dated" == 1 ]] || fail "expected one dated backup, found $dated"
+    local f
+    for f in "$mbx" "$mbx.bak" "$A1_DATA"/messages.jsonl.bak.*; do
+        [[ "$(_mcp_file_mode "$f")" == 600 ]] || fail "$f is not 0600"
+    done
+    # Dated copies are pruned after 7 days; today's is kept.
+    : > "$mbx.bak.20200101"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer ack "$id" --as comet --json >/dev/null 2>&1 || true
+    [[ ! -e "$mbx.bak.20200101" ]] || fail "an old dated backup was not pruned"
+    ls "$A1_DATA" | grep -q '^\.messages\.jsonl\.tmp\.' && fail "temp file left in the data dir after a clean rewrite"
+
+    # Crash between the temp write and the rename (test-mode fault): the
+    # mailbox is intact, and the next writer recovers.
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "to be received" >/dev/null
+    before="$(cat "$mbx")"
+    # recv rewrites the mailbox (queued -> delivered): crash it after the temp write.
+    rc=0
+    "${A1_ENV[@]}" CCTRL_TEST_MAILBOX_FAULT=after-tmp "$A1_CCTRL" peer recv --as comet --json >"$A1_SB/fault.out" 2>&1 || rc=$?
+    [[ "$rc" != 0 ]] || fail "the after-tmp fault did not fire in test mode"
+    ls -a "$A1_DATA" | grep -q '^\.messages\.jsonl\.tmp\.' || fail "expected a stray temp file from the crashed rewrite"
+    [[ "$(cat "$mbx")" == "$before" ]] || fail "the mailbox changed although the writer died before the rename"
+    jq -e . "$mbx" >/dev/null || fail "mailbox corrupt after a crash between temp write and rename"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer inbox --as comet --json 2>&1)" || fail "mailbox unreadable after a crash: $out"
+    # The next writer steals the dead holder's lock and sweeps the stray temp.
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "after crash" >/dev/null || fail "writer could not recover after a crash"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null || fail "recv after a crash failed"
+    ls -a "$A1_DATA" | grep -q '^\.messages\.jsonl\.tmp\.' && fail "stray temp file not swept by the next rewrite"
+    # The fault variable is ignored outside test mode.
+    out="$(env -u TMUX CCTRL_DATA_DIR="$A1_DATA" CCTRL_TEST_MAILBOX_FAULT=after-tmp "$A1_CCTRL" peer recv --as comet --json 2>&1)" || fail "fault variable bit outside test mode: $out"
+    echo "ok: rewrite is same-dir temp + fsync + rename with 0600 backups (.bak + dated, pruned); a crash mid-rewrite leaves the mailbox intact"
+}
+
+test_mailbox_restore_and_repair() {
+    _a1_sandbox repair
+    _a1_register_peers
+    local mbx="$A1_DATA/messages.jsonl" out ids i
+    for i in 1 2 3; do
+        "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "m$i" >/dev/null
+    done
+    ids="$(jq -r '.id' "$mbx")"
+    local first
+    first="$(printf '%s\n' "$ids" | head -n 1)"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null          # rewrite: .bak = pre-recv state
+    # Damage: truncate the mailbox mid-line, and add a duplicate id with an
+    # older status. Backup restore: repair rebuilds from .bak + current.
+    local keep
+    keep="$(head -n 1 "$mbx")"
+    {
+        printf '%s\n' "$keep"
+        printf '%s\n' "$keep" | jq -c '.status = "queued" | .updated_at = "2000-01-01T00:00:00Z"'
+        printf '{"id":"cut'
+    } > "$mbx"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --dry-run --json)" || fail "repair --dry-run failed"
+    jq -e '.dry_run == true' <<< "$out" >/dev/null || fail "dry run not flagged: $out"
+    [[ "$(grep -c . "$mbx")" == 3 ]] || fail "repair --dry-run changed the mailbox"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --json)" || fail "repair failed: $out"
+    [[ "$(jq -s 'length' "$mbx")" == 3 ]] || fail "repair did not restore all 3 messages: $(jq -s 'length' "$mbx")"
+    [[ "$(jq -s 'map(.id) | length - (unique | length)' "$mbx")" == 0 ]] || fail "repair left duplicate ids"
+    [[ "$(jq -s --arg id "$first" '.[] | select(.id == $id) | .status' "$mbx")" == '"delivered"' ]] \
+        || fail "newest status did not win: $(jq -s --arg id "$first" '.[] | select(.id == $id) | .status' "$mbx")"
+    # Idempotent: a second repair changes nothing.
+    local snap
+    snap="$(cat "$mbx")"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer repair --json >/dev/null || fail "second repair failed"
+    [[ "$(cat "$mbx")" == "$snap" ]] || fail "repair is not idempotent"
+    echo "ok: peer repair rebuilds from backup + quarantine, one id each, newest status wins, idempotent, --dry-run writes nothing"
+}
+
+test_mailbox_concurrent_senders_ack_gc() {
+    _a1_sandbox concurrent
+    _a1_register_peers
+    local mbx="$A1_DATA/messages.jsonl" i failed=0 pid
+    local -a pids=()
+    local delivered
+    delivered="$("${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "to ack" | jq -r '.id')"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "old, to gc" >/dev/null
+    for i in $(seq 1 50); do
+        "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "parallel $i" >/dev/null 2>&1 &
+        pids+=("$!")
+        if (( i % 10 == 0 )); then
+            "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null 2>&1 &
+            pids+=("$!")
+            "${A1_ENV[@]}" "$A1_CCTRL" peer ack "$delivered" --as comet --json >/dev/null 2>&1 &
+            pids+=("$!")
+            "${A1_ENV[@]}" "$A1_CCTRL" peer gc --older-than 1000d --dry-run --json >/dev/null 2>&1 &
+            pids+=("$!")
+        fi
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || true; done
+    jq -e . "$mbx" >/dev/null || fail "mailbox corrupt after concurrent writers"
+    out="$(jq -s '[.[] | select(.body | startswith("parallel "))] | length' "$mbx")"
+    [[ "$out" == 50 ]] || fail "lost messages under concurrency: $out of 50 senders landed"
+    [[ "$(jq -s 'map(.id) | length - (unique | length)' "$mbx")" == 0 ]] || fail "duplicate ids after concurrent writers"
+    echo "ok: 50 concurrent senders with recv/ack/gc lose no message"
+}
+
+test_lock_protocol_cross_implementation() {
+    _a1_sandbox lockx
+    local target="$A1_SB/data/box.jsonl" lock holder rc out
+    lock="$target.lock"
+    # A lock is a file holding a pid, published with link(2) (shlock's form).
+    _a1_eval "_cctrl_lock_acquire '$target' 2" || fail "bash acquire failed"
+    # (that shell exited, so the lock now holds a dead pid)
+    [[ "$(_a1_py "import locks; print(locks.read_pid('$lock')[0] is not None)")" == True ]] || fail "lock file does not hold a pid"
+    # bash holder against the Python locker.
+    holder="$A1_SB/holder.sh"
+    cat > "$holder" <<EOF
+CCTRL_NO_MAIN=1 source "$A1_CCTRL"
+_cctrl_lock_acquire "$target" 5 || exit 9
+echo held
+sleep \${1:-3}
+_cctrl_lock_release "\$_CCTRL_LOCK_PATH"
+EOF
+    "$BASH" "$holder" 3 > "$A1_SB/holder.out" &
+    holder=$!
+    local waited=0
+    while ! grep -q held "$A1_SB/holder.out" 2>/dev/null; do sleep 0.1; waited=$((waited + 1)); (( waited < 100 )) || fail "bash holder never took the lock"; done
+    rc=0; _a1_py "
+import locks, sys
+try:
+    locks.acquire('$target', timeout=1)
+    sys.exit(0)
+except locks.LockTimeout:
+    sys.exit(7)" || rc=$?
+    [[ "$rc" == 7 ]] || fail "the Python locker took a lock a bash holder has (rc=$rc)"
+    wait "$holder"
+    _a1_py "import locks; l = locks.acquire('$target', timeout=5); locks.release(l)" || fail "Python locker could not take the lock after the bash holder released"
+    # Python holder against the bash locker.
+    _a1_py "import locks, time; locks.acquire('$target', timeout=5); print('held', flush=True); time.sleep(3)" > "$A1_SB/pyholder.out" &
+    holder=$!
+    waited=0
+    while ! grep -q held "$A1_SB/pyholder.out" 2>/dev/null; do sleep 0.1; waited=$((waited + 1)); (( waited < 100 )) || fail "python holder never took the lock"; done
+    rc=0; _a1_eval "_cctrl_lock_acquire '$target' 1" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" != 0 ]] || fail "the bash locker took a lock a Python holder has"
+    wait "$holder" || true
+    # Release is refused when the file holds another pid.
+    printf '%10d\n' "$$" > "$lock"
+    _a1_py "import locks, sys; sys.exit(0 if not locks.release('$lock', pid=999991) else 1)" || fail "Python released a lock that holds another pid"
+    [[ -f "$lock" ]] || fail "lock vanished"
+    _a1_eval "_cctrl_lock_release_path '$lock'" && fail "bash released a lock that holds another pid" || true
+    [[ -f "$lock" ]] || fail "lock vanished after a refused bash release"
+    rm -f "$lock"
+    echo "ok: bash and Python lockers exclude each other on one lock path; release refused when the pid does not match"
+}
+
+test_lock_stale_steal_two_waiters() {
+    _a1_sandbox steal
+    local target="$A1_SB/data/box.jsonl" lock log i
+    lock="$target.lock"
+    log="$A1_SB/crit.log"
+    : > "$log"
+    # A stale lock: a pid that is not running.
+    printf '%10d\n' 999983 > "$lock"
+    # Two waiters (one bash, one Python) race to steal it, each runs a critical
+    # section 5 times; the sections must never overlap.
+    cat > "$A1_SB/waiter.sh" <<EOF
+CCTRL_NO_MAIN=1 source "$A1_CCTRL"
+for i in 1 2 3 4 5; do
+    _cctrl_lock_acquire "$target" 20 || exit 9
+    echo "in bash" >> "$log"; sleep 0.05; echo "out bash" >> "$log"
+    _cctrl_lock_release "\$_CCTRL_LOCK_PATH"
+done
+EOF
+    "$BASH" "$A1_SB/waiter.sh" &
+    local w1=$!
+    _a1_py "
+import locks, time
+for i in range(5):
+    with locks.locked('$target', timeout=20):
+        open('$log', 'a').write('in py\n'); time.sleep(0.05); open('$log', 'a').write('out py\n')" &
+    local w2=$!
+    wait "$w1" || fail "bash waiter failed"
+    wait "$w2" || fail "python waiter failed"
+    [[ "$(grep -c '^in ' "$log")" == 10 ]] || fail "not every critical section ran: $(grep -c '^in ' "$log")"
+    awk '/^in /{ if (open) bad=1; open=1 } /^out /{ open=0 } END{ exit bad }' "$log" || fail "critical sections overlapped"
+    [[ ! -e "$lock" ]] || fail "lock left behind"
+    [[ ! -e "$lock.steal" ]] || fail "steal guard left behind"
+    echo "ok: a stale lock is stolen once under the steal guard; two waiters never overlap"
+}
+
+test_lock_pid_reuse_is_stale() {
+    _a1_sandbox pidreuse
+    local target="$A1_SB/data/box.jsonl" lock sp
+    lock="$target.lock"
+    sleep 300 &
+    sp=$!
+    # The pid is alive, but the lock is older than the process: pid reuse.
+    printf '%10d\n' "$sp" > "$lock"
+    touch -t 202001010000 "$lock"
+    _a1_eval "_cctrl_lock_judge '$lock' && [[ \$_LK_WHY == pid-reuse ]]" || { kill "$sp" 2>/dev/null; fail "a lock older than its pid's process was not judged stale (pid reuse)"; }
+    _a1_py "import locks, sys; s = locks.judge_stale('$lock'); sys.exit(0 if s[0] and s[1] == 'pid-reuse' else 1)" || { kill "$sp" 2>/dev/null; fail "python: pid reuse not judged stale"; }
+    _a1_eval "_cctrl_lock_acquire '$target' 5" || { kill "$sp" 2>/dev/null; fail "could not steal a pid-reuse lock"; }
+    # Age alone never makes a live, same-start holder stale: a lock whose mtime
+    # is just after the process start is live.
+    rm -f "$lock"
+    printf '%10d\n' "$sp" > "$lock"
+    if _a1_eval "_cctrl_lock_judge '$lock'"; then kill "$sp" 2>/dev/null; fail "a live holder's fresh lock was judged stale"; fi
+    kill "$sp" 2>/dev/null || true
+    echo "ok: pid reuse (process newer than the lock) is stale; a live holder is not"
+}
+
+test_lock_three_party_steal() {
+    _a1_sandbox threeparty
+    local target="$A1_SB/data/box.jsonl" lock hook live impl
+    lock="$target.lock"
+    live="$(_a1_sleeper)"
+    # Hook script: at after-judge a third process takes the stale lock
+    # legitimately (so the rename finds a different inode); at after-aside
+    # (second scenario) it takes the path again so putting the lock back fails.
+    hook="$A1_SB/hook.sh"
+    cat > "$hook" <<EOF
+#!/usr/bin/env bash
+lock="\$1"; stage="\$2"
+case "\$stage:\${HOOK_SCENARIO:-}" in
+    after-judge:*)
+        rm -f "\$lock"
+        printf '%10d\n' $live > "\$lock.third"
+        ln "\$lock.third" "\$lock"; rm -f "\$lock.third" ;;
+    after-aside:collide)
+        printf '%10d\n' $live > "\$lock.fourth"
+        ln "\$lock.fourth" "\$lock"; rm -f "\$lock.fourth" ;;
+esac
+EOF
+    chmod +x "$hook"
+    for impl in bash python; do
+        rm -f "$lock" "$lock".* 2>/dev/null || true
+        printf '%10d\n' 999983 > "$lock"
+        # Scenario 1: found live; the waiter puts the lock back and waits (times out).
+        local rc=0
+        if [[ "$impl" == bash ]]; then
+            _a1_eval "export HOOK_SCENARIO=back CCTRL_TEST_STEAL_HOOK='$hook'; _cctrl_lock_acquire '$target' 2" >/dev/null 2>&1 || rc=$?
+        else
+            "${A1_ENV[@]}" HOOK_SCENARIO=back CCTRL_TEST_STEAL_HOOK="$hook" python3 -c "
+import sys; sys.path.insert(0, '$A1_LIB'); import locks
+try:
+    locks.acquire('$target', timeout=2); sys.exit(0)
+except locks.LockTimeout:
+    sys.exit(7)" || rc=$?
+        fi
+        [[ "$rc" != 0 ]] || fail "$impl: a waiter acquired a lock a third process took legitimately"
+        [[ "$(tr -d ' \n' < "$lock")" == "$live" ]] || fail "$impl: the live holder's lock was not put back (holds: $(cat "$lock" 2>/dev/null))"
+        ls "$lock".aside.* >/dev/null 2>&1 && fail "$impl: aside file left after a clean put-back"
+        [[ ! -e "$lock.collisions" ]] || fail "$impl: collision recorded on a clean put-back"
+        # Scenario 2: a fourth process takes the path after the rename: the
+        # put-back fails with EEXIST. The waiter must not acquire, must leave
+        # the aside file, and must write a lock-steal-collision record.
+        rm -f "$lock" "$lock".* 2>/dev/null || true
+        printf '%10d\n' 999983 > "$lock"
+        rc=0
+        if [[ "$impl" == bash ]]; then
+            _a1_eval "export HOOK_SCENARIO=collide CCTRL_TEST_STEAL_HOOK='$hook'; _cctrl_lock_acquire '$target' 2" >/dev/null 2>&1 || rc=$?
+        else
+            "${A1_ENV[@]}" HOOK_SCENARIO=collide CCTRL_TEST_STEAL_HOOK="$hook" python3 -c "
+import sys; sys.path.insert(0, '$A1_LIB'); import locks
+try:
+    locks.acquire('$target', timeout=2); sys.exit(0)
+except locks.LockTimeout:
+    sys.exit(7)" || rc=$?
+        fi
+        [[ "$rc" != 0 ]] || fail "$impl: waiter acquired in the collision branch"
+        [[ -f "$lock.collisions" ]] || fail "$impl: no lock-steal-collision record"
+        grep -q 'lock-steal-collision' "$lock.collisions" || fail "$impl: collision record has the wrong kind"
+        ls "$lock".aside.* >/dev/null 2>&1 || fail "$impl: aside file not left for doctor"
+    done
+    kill "$live" 2>/dev/null || true
+    echo "ok: three-party steal: found-live puts the lock back; EEXIST on put-back writes lock-steal-collision and does not acquire (bash and python)"
+}
+
+test_lock_live_holder_never_stolen() {
+    _a1_sandbox sigstop
+    _a1_register_peers
+    local target="$A1_DATA/messages.jsonl" holder out waiter
+    # The holder takes the mailbox lock, then is SIGSTOPped (Ctrl-Z, memory
+    # pressure, a sleeping laptop) past the warning age.
+    _a1_py "import locks, time; locks.acquire('$target', timeout=5); print('held', flush=True); time.sleep(4)" > "$A1_SB/h.out" &
+    holder=$!
+    local waited=0
+    while ! grep -q held "$A1_SB/h.out" 2>/dev/null; do sleep 0.1; waited=$((waited + 1)); (( waited < 100 )) || fail "holder never took the lock"; done
+    kill -STOP "$holder"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "waiting behind a stopped holder" >"$A1_SB/w.out" 2>&1 &
+    waiter=$!
+    sleep 3
+    kill -0 "$waiter" 2>/dev/null || { kill -CONT "$holder" 2>/dev/null; fail "the waiter finished (stole or lost) while the live holder was stopped: $(cat "$A1_SB/w.out")"; }
+    [[ "$(tr -d ' \n' < "$target.lock")" == "$holder" ]] || { kill -CONT "$holder"; fail "the stopped holder's lock was taken"; }
+    # Doctor shows the age warning (test-mode override: 2 s) without failing.
+    out="$("${A1_ENV[@]}" CCTRL_TEST_LOCK_WARN_AGE=2 "$A1_CCTRL" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "mailbox_lock_age") | (.remedy // "") | test("held for [0-9]+s by pid")' <<< "$out" >/dev/null \
+        || { kill -CONT "$holder"; fail "doctor shows no age warning: $(jq -c '.checks[] | select(.name == "mailbox_lock_age")' <<< "$out")"; }
+    jq -e '.checks[] | select(.name == "stale_mailbox_lock") | .ok' <<< "$out" >/dev/null || { kill -CONT "$holder"; fail "a live old lock was reported stale"; }
+    kill -CONT "$holder"
+    wait "$holder" || true
+    wait "$waiter" || fail "the waiter's write did not land after SIGCONT: $(cat "$A1_SB/w.out")"
+    [[ "$(jq -s '[.[] | select(.body | startswith("waiting behind"))] | length' "$target")" == 1 ]] || fail "the waiter's message is missing"
+    echo "ok: a SIGSTOPped live holder past the warning age is never stolen; doctor warns; both writes land after SIGCONT"
+}
+
+test_lock_kinds_on_both_bashes() {
+    local kind sh n pid failed
+    local -a shells=(/bin/bash)
+    command -v bash >/dev/null 2>&1 && [[ "$(command -v bash)" != /bin/bash ]] && shells+=("$(command -v bash)")
+    for sh in "${shells[@]}"; do
+        for kind in auto dir; do
+            _a1_sandbox "kinds"
+            _a1_register_peers
+            local -a pids=()
+            for n in 1 2 3 4 5 6; do
+                "${A1_ENV[@]}" CCTRL_MAILBOX_LOCK_KIND="$kind" "$sh" "$A1_CCTRL" peer send comet --from orchestrator --json -- "kind $kind $n" >/dev/null 2>&1 &
+                pids+=("$!")
+            done
+            failed=0
+            for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+            [[ "$failed" == 0 ]] || fail "concurrent senders failed under $sh kind=$kind"
+            [[ "$(jq -s 'length' "$A1_DATA/messages.jsonl")" == 6 ]] || fail "lost messages under $sh kind=$kind: $(jq -s 'length' "$A1_DATA/messages.jsonl")"
+            [[ ! -d "$A1_DATA/messages.jsonl.lock" ]] || fail "kind=dir still made a lock directory under $sh"
+        done
+    done
+    echo "ok: the lock holds on /bin/bash 3.2 and PATH bash for kind=auto and the dir alias (${#shells[@]} shell(s))"
+}
+
+test_mailbox_old_release_interop() {
+    command -v shlock >/dev/null 2>&1 || { echo "ok (skipped: no shlock; the installed release locks with mkdir there)"; return 0; }
+    git -C "$ROOT" cat-file -e 7742883 2>/dev/null || { echo "ok (skipped: commit 7742883 not in this clone)"; return 0; }
+    _a1_sandbox oldnew
+    local old="$A1_SB/oldrelease" i pid failed=0
+    mkdir -p "$old"
+    git -C "$ROOT" archive 7742883 | tar -x -C "$old" || fail "could not extract the 7742883 tree"
+    [[ -x "$old/cctrl" ]] || chmod +x "$old/cctrl"
+    # Register through the new code (same file format), then hammer the same
+    # mailbox from the old release (shlock) and the new one together.
+    _a1_register_peers
+    local -a pids=()
+    for i in $(seq 1 15); do
+        env -u TMUX CCTRL_DATA_DIR="$A1_DATA" "$old/cctrl" peer send comet --from orchestrator --json -- "old $i" >/dev/null 2>"$A1_SB/old.$i.err" &
+        pids+=("$!")
+        "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "new $i" >/dev/null 2>"$A1_SB/new.$i.err" &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    [[ "$failed" == 0 ]] || fail "a sender failed: $(cat "$A1_SB"/old.*.err "$A1_SB"/new.*.err | head -5)"
+    [[ "$(jq -s '[.[] | select(.body | startswith("old "))] | length' "$A1_DATA/messages.jsonl")" == 15 ]] || fail "old-release messages lost"
+    [[ "$(jq -s '[.[] | select(.body | startswith("new "))] | length' "$A1_DATA/messages.jsonl")" == 15 ]] || fail "new-release messages lost"
+    # An old-release reader on a file with v: 1 and a quarantine present.
+    printf 'garbage\n' > "$A1_DATA/messages.quarantine.jsonl"
+    : > "$A1_DATA/messages.jsonl.bak"
+    out="$(env -u TMUX CCTRL_DATA_DIR="$A1_DATA" "$old/cctrl" peer check --as comet --json 2>&1)" || fail "old release cannot read a mailbox with v and a quarantine: $out"
+    jq -e '.queued == 30' <<< "$out" >/dev/null || fail "old reader miscounts: $out"
+    echo "ok: old-release (7742883, shlock) and new-release writers share one mailbox with no loss; the old reader tolerates v and the quarantine"
+}
+
+test_migration_sentinel_writers() {
+    _a1_sandbox sentinel
+    _a1_register_peers
+    local mbx="$A1_DATA/messages.jsonl" sent="$A1_STATE/.migrating" out rc live
+    live="$(_a1_sleeper)"
+    local started
+    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # The checkout run (no .installed) honours the sentinel like an installed one.
+    [[ ! -e "$ROOT/.installed" ]] || fail "the suite tree has .installed; this test needs checkout mode"
+    printf '{"pid":%s,"pid_start":"x","host":"%s","step":"copy","created_at":"%s"}\n' "$live" "$(hostname)" "$started" > "$sent"
+    # 1. A writer waits and creates nothing: cap shortened by the test-mode override.
+    rm -f "$mbx" "$mbx.lock"
+    rc=0
+    out="$("${A1_ENV[@]}" CCTRL_TEST_SENTINEL_WAIT=1 "$A1_CCTRL" peer send comet --from orchestrator --json -- "blocked" 2>&1)" || rc=$?
+    [[ "$rc" == 75 ]] || fail "a writer under the sentinel should exit 75, got $rc: $out"
+    [[ ! -e "$mbx" && ! -e "$mbx.lock" ]] || fail "a waiting writer created files"
+    assert_contains "$out" "state-migrating"
+    assert_contains "$out" "$live"
+    assert_contains "$out" "step copy"
+    assert_contains "$out" "alive"
+    assert_contains "$out" "state migrate --apply"
+    assert_contains "$out" "--rollback"
+    # 2. The override is ignored outside test mode (the cap stays 120 s).
+    ( env -u TMUX CCTRL_DATA_DIR="$A1_DATA" CCTRL_STATE_DIR="$A1_STATE" CCTRL_TEST_SENTINEL_WAIT=1 "$A1_CCTRL" peer send comet --from orchestrator --json -- "x" >/dev/null 2>&1; echo $? > "$A1_SB/nt.rc" ) &
+    local nt=$!
+    sleep 3
+    if kill -0 "$nt" 2>/dev/null; then
+        pkill -P "$nt" 2>/dev/null || true; kill "$nt" 2>/dev/null || true
+    else
+        fail "the cap override bit outside test mode (exit $(cat "$A1_SB/nt.rc"))"
+    fi
+    # 3. A writer waits, then proceeds when the sentinel is removed.
+    "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "after the move" >"$A1_SB/w.out" 2>&1 &
+    local w=$!
+    sleep 1
+    kill -0 "$w" 2>/dev/null || fail "the writer did not wait for the sentinel"
+    rm -f "$sent"
+    wait "$w" || fail "the writer failed after the sentinel went: $(cat "$A1_SB/w.out")"
+    [[ "$(jq -s '[.[] | select(.body == "after the move")] | length' "$mbx")" == 1 ]] || fail "the waiting write did not land"
+    # 4. A crash-left sentinel (dead owner): exit 75 names pid, age, step and
+    #    says the owner is not running; doctor shows an issue.
+    printf '{"pid":999979,"pid_start":"x","host":"%s","step":"swap","created_at":"2026-01-01T00:00:00Z"}\n' "$(hostname)" > "$sent"
+    rc=0
+    out="$("${A1_ENV[@]}" CCTRL_TEST_SENTINEL_WAIT=1 "$A1_CCTRL" peer send comet --from orchestrator --json -- "x" 2>&1)" || rc=$?
+    [[ "$rc" == 75 ]] || fail "crash-left sentinel: expected 75, got $rc"
+    assert_contains "$out" "999979"
+    assert_contains "$out" "step swap"
+    assert_contains "$out" "not running"
+    assert_contains "$out" "age "
+    assert_contains "$out" "--apply"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "migration_sentinel") | .ok == false' <<< "$out" >/dev/null || fail "doctor: a dead-owner sentinel is not an issue: $(jq -c '.checks[] | select(.name == "migration_sentinel")' <<< "$out")"
+    # 5. A live owner and a young sentinel is info only.
+    printf '{"pid":%s,"pid_start":"x","host":"%s","step":"copy","created_at":"%s"}\n' "$live" "$(hostname)" "$started" > "$sent"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "migration_sentinel") | .ok == true and .owner_alive == true' <<< "$out" >/dev/null || fail "doctor: live young sentinel is not info: $(jq -c '.checks[] | select(.name == "migration_sentinel")' <<< "$out")"
+    # ... and an old one (age past 2 minutes) is an issue even with a live owner.
+    touch -t 202001010000 "$sent"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer doctor --json 2>/dev/null)" || true
+    jq -e '.checks[] | select(.name == "migration_sentinel") | .ok == false' <<< "$out" >/dev/null || fail "doctor: an old sentinel is not an issue"
+    rm -f "$sent"
+    kill "$live" 2>/dev/null || true
+
+    # 6. Never mkdir -p the data dir: a missing dir under the sentinel stays missing.
+    _a1_sandbox sentinel2
+    printf '{"pid":999979,"host":"%s","step":"copy"}\n' "$(hostname)" > "$A1_STATE/.migrating"
+    rm -rf "$A1_SB/data/deeper"
+    "${A1_ENV[@]}" CCTRL_DATA_DIR="$A1_SB/data/deeper/leaf" CCTRL_TEST_SENTINEL_WAIT=1 "$A1_CCTRL" peer send x --from y --allow-unknown --json -- "z" >/dev/null 2>&1 && fail "a writer ran under the sentinel"
+    [[ ! -e "$A1_SB/data/deeper" ]] || fail "a writer created the data dir under the sentinel"
+    echo "ok: sentinel (checkout mode): writers wait and create nothing, exit 75 with pid/age/step/owner and the resume/rollback hint; doctor info/issue rows"
+}
+
+test_migration_sentinel_after_lock_revalidation() {
+    _a1_sandbox revalidate
+    local mbx="$A1_DATA/messages.jsonl" hook log leaf out
+    # The data dir does not exist yet, so the writer creates the leaf, takes the
+    # lock, and only then does the sentinel appear (test-mode hook). It must
+    # release, remove the empty dir it created, wait, and retry.
+    leaf="$A1_SB/data/newleaf"
+    log="$A1_SB/hook.log"
+    hook="$A1_SB/afterlock.sh"
+    cat > "$hook" <<EOF
+#!/usr/bin/env bash
+[[ -e "$A1_SB/hook.done" ]] && exit 0
+: > "$A1_SB/hook.done"
+printf '{"pid":$$,"host":"$(hostname)","step":"copy"}\n' > "$A1_STATE/.migrating"
+( sleep 1.2
+  if [[ -d "$leaf" ]]; then echo "dir present while waiting" >> "$log"; else echo "dir absent while waiting" >> "$log"; fi
+  rm -f "$A1_STATE/.migrating" ) &
+EOF
+    chmod +x "$hook"
+    # peer gc takes the mailbox lock first thing, so the lock path itself
+    # creates the leaf (a send would have made it earlier, via the registry).
+    out="$("${A1_ENV[@]}" CCTRL_DATA_DIR="$leaf" CCTRL_TEST_AFTER_LOCK_HOOK="$hook" "$A1_CCTRL" peer gc --older-than 1d --json 2>&1)" || fail "revalidating writer failed: $out"
+    [[ "$(cat "$log" 2>/dev/null)" == "dir absent while waiting" ]] || fail "the writer did not remove its own empty dir while waiting: $(cat "$log" 2>/dev/null)"
+    [[ -d "$leaf" && -f "$leaf/messages.jsonl" ]] || fail "the retried writer did not recreate the mailbox"
+    [[ ! -e "$leaf/messages.jsonl.lock" ]] || fail "lock left behind"
+    echo "ok: a sentinel that appears after the lock makes the writer release, remove its own empty dir, wait and retry"
+}
+
+test_peers_and_shortcuts_updates_are_locked() {
+    _a1_sandbox jsonlock
+    local i pid failed=0
+    local -a pids=()
+    mkdir -p "$A1_SB/p"
+    for i in 1 2 3 4 5 6 7 8; do
+        "${A1_ENV[@]}" "$A1_CCTRL" peer register "lockpeer$i" --dir "$A1_SB/p" --agent codex >/dev/null 2>&1 &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
+    [[ "$failed" == 0 ]] || fail "a concurrent register failed"
+    [[ "$(jq 'keys | length' "$A1_DATA/peers.json")" == 8 ]] || fail "concurrent registers lost peers: $(jq -c 'keys' "$A1_DATA/peers.json")"
+    # Static: every peers.json / shortcuts.json rewrite goes through the locked helper.
+    ! grep -n 'mv "\$tmp" "\$PEERS_FILE"\|mv "\$tmp" "\$SHORTCUTS_FILE"' "$ROOT/cctrl" || fail "an unlocked peers/shortcuts rewrite remains"
+    [[ "$(grep -c '_cctrl_json_update "\$\(PEERS\|SHORTCUTS\)_FILE"' "$ROOT/cctrl")" -ge 7 ]] || fail "the locked helper is not used at all seven rewrite sites"
+    echo "ok: peers.json and shortcuts.json rewrites take the shared lock (8 concurrent registers keep all 8)"
+}
+
+test_peer_overview_large_inputs() {
+    _a1_sandbox overview
+    _a1_register_peers
+    # A mailbox far over the argv limit used to fail with "jq: Argument list too long".
+    python3 - "$A1_DATA/messages.jsonl" <<'PY'
+import json, sys
+with open(sys.argv[1], "w") as f:
+    for i in range(1500):
+        f.write(json.dumps({"v": 1, "id": "msg_%d" % i, "from": "orchestrator", "to": "comet", "status": "queued",
+                            "subject": "", "body": "x" * 2000, "created_at": "2026-11-01T00:00:00Z",
+                            "updated_at": "2026-11-01T00:00:00Z"}) + "\n")
+PY
+    local out
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer overview --as comet --json 2>&1)" || fail "peer overview failed on a large mailbox: ${out:0:300}"
+    jq -e '.mailbox.queued == 1500' <<< "$out" >/dev/null || fail "overview miscounted: ${out:0:300}"
+    echo "ok: peer overview passes the doc and mailbox by file, not argv"
+}
+
+test_migration_sentinel_hooks_skip_write() {
+    # Hooks fail open: under the sentinel the SendMessage log hook waits briefly,
+    # then skips its write; with the sentinel gone it writes.
+    _a1_sandbox hooksent
+    mkdir -p "$A1_DATA"
+    printf '0123456789abcdef0123456789abcdef\n' > "$A1_DATA/host-id"
+    local log="$A1_DATA/native-sends.0123456789abcdef0123456789abcdef.jsonl" rc=0
+    printf '{"pid":999979,"host":"%s","step":"copy"}\n' "$(hostname)" > "$A1_STATE/.migrating"
+    _nsl_post toolu_S ok | "${A1_ENV[@]}" CCTRL_HOST_ID_FILE="$A1_DATA/host-id" "$A1_CCTRL" hooks run native-send-log >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 0 ]] || fail "the hook must fail open under the sentinel, got $rc"
+    [[ ! -e "$log" ]] || fail "the hook wrote under the migration sentinel"
+    rm -f "$A1_STATE/.migrating"
+    _nsl_post toolu_S ok | "${A1_ENV[@]}" CCTRL_HOST_ID_FILE="$A1_DATA/host-id" "$A1_CCTRL" hooks run native-send-log >/dev/null 2>&1 || true
+    [[ -s "$log" ]] || fail "the hook did not write once the sentinel was gone"
+    echo "ok: hooks wait briefly under the migration sentinel, then skip the write and exit 0"
+}
+
+test_a1_small_fold_ins() {
+    # _host_is_local survives a failing _local_names under set -e (and keeps
+    # the read-all-names-first SIGPIPE fix).
+    local out
+    out="$(cctrl_source_eval '
+        _local_names() { printf "%s\n" localhost; return 1; }
+        ( set -e; _host_is_local localhost; echo reached )')" || fail "_host_is_local aborted under set -e when _local_names failed"
+    [[ "$out" == reached ]] || fail "_host_is_local did not return 0 for localhost: $out"
+    sed -n '/^_host_is_local()/,/^}/p' "$ROOT/cctrl" | grep -v '^[[:space:]]*#' | grep -q '< <(_local_names)' && fail "_host_is_local is fed by process substitution again"
+    # The restore predecessor lookup no longer pipes a producer into head -n 1.
+    ! grep -n '_fleet_live_managers .*| head -n 1' "$ROOT/cctrl" || fail "a producer is still piped into head -n 1 under pipefail"
+    echo "ok: _host_is_local is set -e safe; no producer | head -n 1 left at the restore predecessor lookup"
 }
 
 test_peer_polling_json_contracts() {
@@ -8793,15 +9448,17 @@ test_peer_polling_identity_and_errors() {
     assert_contains "$out" '"code": "unknown-peer"'
     assert_not_contains "$out" $'\033['
 
+    # Plan 116 A1: a bad line no longer makes the mailbox unreadable; strict
+    # mode (CCTRL_MAILBOX_STRICT=1, for scripts) keeps the exit 65.
     printf '{not-json\n' > "$data/messages.jsonl"
     rc=0
-    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json 2>&1)" || rc=$?
-    [[ "$rc" -eq 65 ]] || fail "expected corrupt mailbox to exit 65, got $rc"
+    out="$(CCTRL_MAILBOX_STRICT=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer check --as comet --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected strict corrupt mailbox to exit 65, got $rc"
     assert_contains "$out" '"code": "mailbox-corrupt"'
     assert_not_contains "$out" $'\033['
 
     rc=0
-    out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json 2>&1)" || rc=$?
+    out="$(CCTRL_MAILBOX_STRICT=1 CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer recv --as comet --json 2>&1)" || rc=$?
     [[ "$rc" -eq 65 ]] || fail "expected corrupt mailbox recv to exit 65, got $rc"
     assert_contains "$out" '"code": "mailbox-corrupt"'
 }
@@ -26372,7 +27029,6 @@ _rt_register() { # RUN_FIRST|SKIP|RUN_LAST <test_name> '<reason>'  (test_every_d
 }
 _rt_register RUN_FIRST test_private_tmux_shim_contract 'before the guard below: checks the shim against a stub, so a shim bug fails the run before any real tmux is called through it (2026-10-09 incident)'
 _rt_register RUN_FIRST test_tmux_default_server_is_private 'before any test, focused group or not: proves a bare tmux hits the private server (plan 071 p5 incident)'
-_rt_register SKIP test_peer_mailbox_concurrency_and_stale_lock 'hangs on macOS bash 3.2 (flock issue), pre-existing, not plan 051/052'
 _rt_register SKIP test_task_inventory_provider_neutral_readonly 'fails at HEAD d0f93f0 too (its fake tmux list-sessions output is rejected as invalid-session-identity); it was only ever run through the task-inventory and codex-ownership-matrix groups. Plan 105 P4c: fixing the stale fixture is a follow-up'
 _rt_register RUN_LAST test_tmux_sockets_left_behind 'backstop: fails if any earlier test left a socket in the private dir, so it must run after all of them'
 _rt_discover() { # discovered test names in source order, minus the three lists
