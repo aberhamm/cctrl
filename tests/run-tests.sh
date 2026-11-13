@@ -26554,7 +26554,7 @@ test_private_stores_have_explicit_modes() {
     [[ "$(_a0_m "$base/pdata")" == 700 ]] || fail "the peer data dir is $(_a0_m "$base/pdata"), want 700"
     [[ "$(_a0_m "$base/pdata/peers.json")" == 600 ]] || fail "peers.json is $(_a0_m "$base/pdata/peers.json"), want 600"
     [[ "$(_a0_m "$base/pdata/messages.jsonl")" == 600 ]] || fail "messages.jsonl is $(_a0_m "$base/pdata/messages.jsonl"), want 600"
-    [[ "$(grep -c 'mkdir -p -m 700 "\$SESSION_METADATA_DIR"' "$ROOT/cctrl")" -ge 7 ]] || fail "a session-record dir create has no explicit mode"
+    [[ "$(grep -c '_cctrl_data_mkdir "\$SESSION_METADATA_DIR" 700' "$ROOT/cctrl")" -ge 7 ]] || fail "a session-record dir create has no explicit mode"
     ! grep -q 'mkdir -p "\$SESSION_METADATA_DIR"' "$ROOT/cctrl" || fail "a session-record dir create relies on the umask"
     unset -f _a0_m
     echo "ok: peer registry, mailbox and session-record dirs are created with explicit private modes"
