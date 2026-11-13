@@ -9414,6 +9414,68 @@ test_migration_sentinel_hooks_skip_write() {
     echo "ok: hooks wait briefly under the migration sentinel, then skip the write and exit 0"
 }
 
+test_migration_sentinel_statusline_and_session_log() {
+    # B2: statusline and session-log wait <= 5 s under the sentinel, then skip
+    # their write, never mkdir the data/costs dir, and never fail the hook.
+    _a1_sandbox hookwr
+    local payload out rc=0 t0 t1 transcript
+    payload='{"model":{"display_name":"Opus"},"cwd":"/tmp/demo","context_window":{"total_input_tokens":500},"rate_limits":{"five_hour":{"used_percentage":12.5},"seven_day":{"used_percentage":3.5}}}'
+    printf '{"pid":999979,"host":"%s","step":"copy"}\n' "$(hostname)" > "$A1_STATE/.migrating"
+    t0="$(date +%s)"
+    out="$("${A1_ENV[@]}" "$A1_SB/root/hooks/statusline.sh" <<< "$payload")" || rc=$?
+    t1="$(date +%s)"
+    [[ "$rc" == 0 ]] || fail "statusline failed under the sentinel: $rc"
+    [[ "$out" == *"Opus | demo | 500"* ]] || fail "statusline must still render under the sentinel: $out"
+    (( t1 - t0 <= 9 )) || fail "statusline waited more than the 5 s cap: $((t1 - t0)) s"
+    [[ ! -e "$A1_SB/root/data" ]] || fail "statusline re-created the data dir under the sentinel"
+    # session-log
+    transcript="$A1_SB/t.jsonl"
+    printf '%s\n' '{"sessionId":"s1","message":{"role":"assistant","model":"claude-opus-4-8","usage":{"input_tokens":11,"output_tokens":2}}}' > "$transcript"
+    rc=0
+    jq -nc --arg tp "$transcript" '{transcript_path:$tp, session_id:"s1"}' \
+        | "${A1_ENV[@]}" CCTRL_COSTS_DIR="$A1_STATE/costs-moved/costs" python3 "$A1_SB/root/hooks/session-log.py" || rc=$?
+    [[ "$rc" == 0 ]] || fail "session-log failed under the sentinel: $rc"
+    [[ ! -e "$A1_STATE/costs-moved" ]] || fail "session-log created the costs dir under the sentinel"
+    rm -f "$A1_STATE/.migrating"
+    "${A1_ENV[@]}" "$A1_SB/root/hooks/statusline.sh" <<< "$payload" >/dev/null || fail "statusline failed after the sentinel cleared"
+    [[ -s "$A1_SB/root/data/rate-limits.json" ]] || fail "statusline did not write rate-limits.json once the sentinel was gone"
+    jq -nc --arg tp "$transcript" '{transcript_path:$tp, session_id:"s1"}' \
+        | "${A1_ENV[@]}" CCTRL_COSTS_DIR="$A1_STATE/costs-ok/costs" python3 "$A1_SB/root/hooks/session-log.py" || fail "session-log failed after the sentinel cleared"
+    [[ -s "$A1_STATE/costs-ok/costs/spending.jsonl" ]] || fail "session-log did not write once the sentinel was gone"
+    echo "ok: statusline and session-log skip their write (<= 5 s) under the migration sentinel, make no dir, and write after it clears"
+}
+
+test_data_dir_writers_honour_sentinel() {
+    # B2: no writer of the data/costs dirs may mkdir -p behind a migration.
+    _a1_sandbox datamk
+    local rc=0 out
+    ! grep -nE 'mkdir -p( -m [0-9]+)? "\$(COSTS_DIR|SESSION_METADATA_DIR|PEER_DATA_DIR|snapshot_dir|receipt_dir|lock_root|state_dir|AUTOHEAL_LOG)' "$ROOT/cctrl" \
+        || fail "a raw mkdir -p of a data/costs dir remains in cctrl"
+    ! grep -nE 'mkdir -p "\$\(dirname "\$(HOSTS_FILE|SHORTCUTS_FILE|archive_file|AUTOHEAL_LOG)"\)"' "$ROOT/cctrl" \
+        || fail "a raw mkdir -p of the hosts/shortcuts/archive dir remains in cctrl"
+    rm -rf "$A1_DATA"
+    printf '{"pid":999979,"host":"%s","step":"copy"}\n' "$(hostname)" > "$A1_STATE/.migrating"
+    out="$("${A1_ENV[@]}" CCTRL_TEST_SENTINEL_WAIT=1 "$A1_CCTRL" @add Foo "$A1_SB/home" 2>&1)" || rc=$?
+    [[ "$rc" == 75 ]] || fail "@add under the sentinel must exit 75, got $rc: $out"
+    [[ ! -e "$A1_DATA" ]] || fail "_shortcuts_init created the data dir under the sentinel"
+    rm -f "$A1_STATE/.migrating"
+    echo "ok: data/costs-dir writers wait for the sentinel (exit 75) and create nothing; no raw mkdir -p of those dirs remains"
+}
+
+test_lock_sweeps_stray_tmp_of_dead_pids() {
+    _a1_sandbox straytmp
+    local dead=999989 live
+    live="$(_a1_sleeper)"
+    : > "$A1_DATA/messages.jsonl"
+    : > "$A1_DATA/messages.jsonl.lock.$dead.1234.tmp"
+    : > "$A1_DATA/messages.jsonl.lock.$live.5678.tmp"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer gc --older-than 1d --json >/dev/null 2>&1 || fail "gc failed"
+    [[ ! -e "$A1_DATA/messages.jsonl.lock.$dead.1234.tmp" ]] || fail "N4: a dead pid's stray lock temp file was not swept"
+    [[ -e "$A1_DATA/messages.jsonl.lock.$live.5678.tmp" ]] || fail "N4: a live pid's temp file was swept"
+    kill "$live" 2>/dev/null || true
+    echo "ok: acquire sweeps <lock>.<pid>.<rand>.tmp files of dead pids and leaves live ones"
+}
+
 test_a1_small_fold_ins() {
     # _host_is_local survives a failing _local_names under set -e (and keeps
     # the read-all-names-first SIGPIPE fix).

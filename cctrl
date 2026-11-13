@@ -2878,7 +2878,7 @@ _launch_exec_agent() {
 }
 
 _log_event() {
-    mkdir -p "$COSTS_DIR"
+    _cctrl_data_mkdir "$COSTS_DIR" || return 0
     local json="$1"
     echo "$json" >> "$SPENDING_LOG"
 }
@@ -3627,7 +3627,7 @@ _task_register_app_owned_launch() {
     host_id="$(_cctrl_host_id)" || return 1
     record_file="$(_task_record_file codex "$host_id" "$provider_task_id")" || return 1
     record_key="${record_file##*/}"; record_key="${record_key%.json}"
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 || return 1
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     base_event="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || return 1
     launch_event="$(mktemp "$SESSION_METADATA_DIR/.task-event.XXXXXX")" || { rm -f "$base_event"; return 1; }
@@ -3770,7 +3770,7 @@ _launch_app_owned_codex() {
     local host_id receipt_dir receipt_file
     host_id="$(_cctrl_host_id)" || return 1
     receipt_dir="$(_task_app_owned_receipt_dir)"
-    mkdir -p "$receipt_dir" || return 1
+    _cctrl_data_mkdir "$receipt_dir" || return 1
     chmod 700 "$receipt_dir" 2>/dev/null || return 1
     receipt_file="$(umask 077; mktemp "$receipt_dir/receipt.XXXXXX")" || return 1
     local -a adapter=(python3 "$SCRIPT_DIR/lib/codex_app_server.py" launch --cwd "$cwd" --receipt-file "$receipt_file")
@@ -4070,7 +4070,7 @@ _cctrl_host_id() {
         return $?
     fi
     dir="$(dirname "$file")"
-    mkdir -p "$dir" || return 1
+    _cctrl_data_mkdir "$dir" || return 1
     candidate="$(_random_hex_128)" || return 1
     tmp="$(mktemp "$dir/.host-id.XXXXXX")" || return 1
     chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
@@ -4386,7 +4386,7 @@ _task_registry_lock_acquire() {
     local owner pid created snapshot
     [[ "$record_key" =~ ^(task-[0-9a-f]{64}|launch-[0-9a-f-]+)$ ]] || return 1
     lock_root="$SESSION_METADATA_DIR/.task-registry-locks"
-    mkdir -p "$lock_root" || return 1
+    _cctrl_data_mkdir "$lock_root" || return 1
     chmod 700 "$lock_root" 2>/dev/null || return 1
     lock_file="$lock_root/$record_key.lock"
     token="$(openssl rand -hex 16 2>/dev/null || uuidgen 2>/dev/null | tr -d '-' | tr '[:upper:]' '[:lower:]')"
@@ -4804,7 +4804,7 @@ _task_registry_apply_event() {
     local record_key="$1" event_file="$2" record_file input_file result_file output_file tmp status rc=0
     [[ "$record_key" =~ ^(task-[0-9a-f]{64}|launch-[0-9a-f-]+)$ ]] || return 1
     [[ -f "$event_file" && ! -L "$event_file" ]] || return 1
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 || return 1
     record_file="$SESSION_METADATA_DIR/$record_key.json"
     _task_registry_lock_acquire "$record_key" || return $?
     input_file="$(mktemp "$SESSION_METADATA_DIR/.task-input.XXXXXX")" || rc=1
@@ -4947,7 +4947,7 @@ PYRECEIPT
         printf '%s' "$canonical"
         return 0
     fi
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 || return 1
     tmp="$(mktemp "$SESSION_METADATA_DIR/.task-promote.XXXXXX")" || return 1
     now="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     NORMALIZED_RECORD="$normalized" python3 - "$canonical" "$provider_task_id" "$now" "$TASK_RECORD_MAX_EVIDENCE" > "$tmp" <<'PY'
@@ -5325,7 +5325,7 @@ _session_write_metadata() {
     # Plan 100: role (orchestrator|worker), orch_kind (fleet|repo|empty), and
     # the optional succeeds label. Empty stores null; a pre-plan record has none.
     local role="${19:-}" orch_kind="${20:-}" succeeds="${21:-}" resuming="${22:-}"
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 || return 1
     # Plan 100 D11: a fresh launch knows the label it launched with. A resumed
     # launch (conversation id given) never seeds the set from the purpose alone:
     # an existing record keeps its set, one without gets the baseline later.
@@ -5335,7 +5335,7 @@ _session_write_metadata() {
         [[ "$names_known" == "[]" ]] && names_known=""
     fi
     local tmp created_at host_label host_id provider lifecycle_state provider_task_id launch_id output_file
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" || return 1
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 || return 1
     tmp="$(mktemp "$SESSION_METADATA_DIR/.task-write.XXXXXX")" || return 1
     created_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
     host_label="${CCTRL_HOST_PREFIX:-local}"
@@ -6163,7 +6163,7 @@ _fleet_lock_acquire() {
     # registry dir cannot be created.
     local runtime="$1" dir attempt now created pid age stale
     dir="$(_fleet_lock_dir "$runtime")"
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" 2>/dev/null || return 2
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 2>/dev/null || return 2
     for attempt in 1 2; do
         if mkdir "$dir" 2>/dev/null; then
             date +%s > "$dir/created" 2>/dev/null || true
@@ -8836,9 +8836,22 @@ _cctrl_lock_steal() { # LOCK TMP
 
 # _cctrl_lock_acquire FILE [TIMEOUT]: take FILE.lock. Sets _CCTRL_LOCK_PATH.
 # Rc 0 ok, 1 timeout.
+# Remove stray <lock>.<pid>.<rand>.tmp files left by acquirers that died (N4).
+_cctrl_lock_sweep_tmp() { # LOCK
+    local f p
+    for f in "$1".*.tmp; do
+        [[ -e "$f" ]] || continue
+        p="${f#"$1".}"
+        p="${p%%.*}"
+        [[ "$p" =~ ^[0-9]+$ ]] || continue
+        _cctrl_lock_pid_alive "$p" || rm -f "$f" 2>/dev/null || true
+    done
+}
+
 _cctrl_lock_acquire() {
     local file="$1" timeout="${2:-${CCTRL_MAILBOX_LOCK_TIMEOUT:-10}}" lock tmp start now
     lock="$file.lock"
+    _cctrl_lock_sweep_tmp "$lock"
     tmp="$lock.$$.$RANDOM.tmp"
     printf '%10d\n' "$$" > "$tmp" || return 1
     start="$(date +%s)"
@@ -8925,6 +8938,22 @@ _cctrl_json_update() { # FILE jq-args...
     fi
     _cctrl_lock_release "$held"
     return "$rc"
+}
+
+# mkdir -p for a directory under the data or costs store (plan 116 B2): never
+# while the migration sentinel is up (wait, rc 75 on timeout), and never
+# re-creating the data dir itself behind a migration: a data dir that is
+# missing goes through _cctrl_data_dir_ensure (leaf only, layout-marker check).
+_cctrl_data_mkdir() { # DIR [MODE]
+    local dir="$1" mode="${2:-}"
+    [[ -d "$dir" ]] && return 0
+    _cctrl_sentinel_wait cli || return $?
+    case "$dir/" in
+        "$_CCTRL_P_DATA_DIR"/*)
+            _cctrl_data_dir_ensure "$_CCTRL_P_DATA_DIR" || return $?
+            [[ -d "$dir" ]] && return 0 ;;
+    esac
+    if [[ -n "$mode" ]]; then mkdir -p -m "$mode" "$dir"; else mkdir -p "$dir"; fi
 }
 
 _mailbox_init() {
@@ -11257,7 +11286,7 @@ _peer_app_deliver_locked() {
     attempt="$(jq -r --arg peer "$PEER_DELIVER_PEER" '[.[] | select(.to==$peer and .status=="queued") | .app_delivery_attempt // empty][0] // empty' <<< "$messages")"
     if [[ -n "$attempt" ]]; then reused=true; else attempt="$(openssl rand -hex 16)"; fi
     [[ "$attempt" =~ ^[0-9a-f]{32}$ ]] || return 1
-    mkdir -p "$PEER_DATA_DIR/app-delivery"
+    _cctrl_data_mkdir "$PEER_DATA_DIR/app-delivery" || return 1
     receipt="$PEER_DATA_DIR/app-delivery/$attempt.json"
     body_file="$PEER_DATA_DIR/app-delivery/$attempt.body"
     if [[ "$reused" == false ]]; then printf '%s' "$payload" > "$body_file"; fi
@@ -12795,7 +12824,7 @@ _watch_lock_path() {
 }
 
 _watch_lock_acquire() {
-    mkdir -p "$PEER_DATA_DIR"
+    _cctrl_data_mkdir "$PEER_DATA_DIR" || return 1
     local lock_path pid
     lock_path="$(_watch_lock_path)"
     if mkdir "$lock_path" 2>/dev/null; then
@@ -13005,7 +13034,7 @@ _peer_cmd_gc() {
             ' <<< "$messages")"
             count="$(jq -r 'length' <<< "$eligible")"
             if [[ "$dry_run" != "true" && "$count" -gt 0 ]]; then
-                mkdir -p "$(dirname "$archive_file")"
+                _cctrl_data_mkdir "$(dirname "$archive_file")"
                 if ! { jq -c '.[]' <<< "$eligible" >> "$archive_file"; } 2>/dev/null; then
                     error="failed to append archive: $archive_file"
                     rc=1
@@ -13163,7 +13192,7 @@ _peer_doorbell_record_push() { # session created ids_json -> record one ring; ne
             rings: (($state | recent_rings($now | fromdateiso8601; $win)) + [$now]),
             rung: ($rung + ([$ids[] | select(type == "string") | {key: ., value: $now}] | from_entries)) }' 2>/dev/null)" || return 0
     [[ -n "$new" ]] || return 0
-    mkdir -p "$dir" 2>/dev/null || return 0
+    _cctrl_data_mkdir "$dir" 2>/dev/null || return 0
     tmp="$(mktemp "$dir/.state.XXXXXX" 2>/dev/null)" || return 0
     if printf '%s\n' "$new" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$file"; then return 0; fi
     rm -f "$tmp"
@@ -13177,7 +13206,7 @@ _peer_doorbell_eval() {
     local mode="${1:-claude}" out dbg_dir
     dbg_dir="$PEER_DATA_DIR/doorbell"
     if [[ -n "${CCTRL_DOORBELL_DEBUG:-}" || -f "$dbg_dir/debug" ]] \
-        && { [[ -f "$dbg_dir/debug.log" ]] || (umask 077; mkdir -p "$dbg_dir" && : > "$dbg_dir/debug.log") 2>/dev/null; }; then
+        && { [[ -f "$dbg_dir/debug.log" ]] || (umask 077; _cctrl_data_mkdir "$dbg_dir" && : > "$dbg_dir/debug.log") 2>/dev/null; }; then
         # Works inside `cctrl hooks run stop` too: its own stderr is discarded,
         # so the reasons go to a file, never to the model.
         out="$( (set +e; printf 'doorbell: --- %s pane=%s session=%s\n' "$(_peer_now_utc)" "${TMUX_PANE:-}" "${CCTRL_SESSION_NAME:-}" >&2
@@ -13490,7 +13519,7 @@ _peer_doorbell_eval_inner() {
                  + ([$ring[] | {key: ., value: $now}] | from_entries)
                  + ([$blocked[] | {key: ., value: "blocked"}] | from_entries)) }
     ')" || return 0
-    mkdir -p "$state_dir" 2>/dev/null || return 0
+    _cctrl_data_mkdir "$state_dir" 2>/dev/null || return 0
     tmp="$(mktemp "$state_dir/.state.XXXXXX" 2>/dev/null)" || return 0
     if printf '%s\n' "$new_state" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$state_file"; then :; else rm -f "$tmp"; _peer_doorbell_dbg "off: state write failed"; return 0; fi
     [[ -n "$lines" ]] || { _peer_doorbell_dbg "quiet: $live_name new mail all guard-blocked or held"; return 0; }
@@ -13830,7 +13859,7 @@ _peer_attest_log() {
     [[ -n "$line" ]] || return 0
     (
         umask 077
-        mkdir -p "$dir" || exit 0
+        _cctrl_data_mkdir "$dir" || exit 0
         if [[ -f "$f" ]]; then
             size="$(wc -c < "$f" 2>/dev/null | tr -d ' ')"
             if [[ "$size" =~ ^[0-9]+$ ]] && (( size > 1048576 )); then
@@ -13984,7 +14013,7 @@ _peer_doorbell_send_defaults_deliver() { # to -> 0 when the send should default 
 _peer_doorbell_write_locked() { # json -> atomic write, mode 600
     local f tmp
     f="$(_peer_doorbell_file)"
-    mkdir -p "$PEER_DATA_DIR" || return 1
+    _cctrl_data_mkdir "$PEER_DATA_DIR" || return 1
     tmp="$(mktemp "$PEER_DATA_DIR/.doorbell.XXXXXX")" || return 1
     if printf '%s\n' "$1" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f"; then return 0; fi
     rm -f "$tmp"
@@ -19055,7 +19084,7 @@ _session_snapshot() {
         esac
     done
     [[ -n "$snapshot_dir" ]] || snapshot_dir="${CCTRL_DATA_DIR:-$_CCTRL_P_STORE_DATA_DIR}/snapshots"
-    mkdir -p "$snapshot_dir" || return 1
+    _cctrl_data_mkdir "$snapshot_dir" || return 1
 
     local scratch catalogue_file sessions_file process_file resources_file snapshot_file
     local generated_at hostname_value host_id catalogue_rc=0 sessions_rc=0 process_rc=0 capture_rc=0
@@ -19420,7 +19449,7 @@ _autoheal_log() {
     # after-the-fact inspection. Best-effort: never fails a heal pass.
     local action="$1" sess="$2" reason="${3:-}" ts
     ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date +%s)"
-    mkdir -p "$(dirname "$AUTOHEAL_LOG")" 2>/dev/null || true
+    _cctrl_data_mkdir "$(dirname "$AUTOHEAL_LOG")" 2>/dev/null || true
     printf '%s %s %s%s\n' "$ts" "$action" "$sess" "${reason:+ ($reason)}" \
         >> "$AUTOHEAL_LOG" 2>/dev/null || true
 }
@@ -19444,7 +19473,7 @@ _session_autoheal_install() {
     local self plist
     self="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
     mkdir -p "$AUTOHEAL_LAUNCH_AGENTS_DIR"
-    mkdir -p "$(dirname "$AUTOHEAL_LOG")" 2>/dev/null || true
+    _cctrl_data_mkdir "$(dirname "$AUTOHEAL_LOG")" 2>/dev/null || true
     plist="$AUTOHEAL_LAUNCH_AGENTS_DIR/$AUTOHEAL_PLIST_LABEL.plist"
     cat > "$plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -21542,7 +21571,7 @@ _session_backfill_ids() {
         esac
     done
 
-    mkdir -p -m 700 "$SESSION_METADATA_DIR" 2>/dev/null || true
+    _cctrl_data_mkdir "$SESSION_METADATA_DIR" 700 2>/dev/null || true
     local uuid_re='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
     local n_filled=0 n_already=0 n_unrecoverable=0
     local -a json_items=()
@@ -22890,7 +22919,7 @@ cmd_chrome() {
 # Configured in data/hosts.json. Each entry maps an alias to a hostname.
 
 _hosts_init() {
-    mkdir -p "$(dirname "$HOSTS_FILE")"
+    _cctrl_data_mkdir "$(dirname "$HOSTS_FILE")" || return $?
     if [[ ! -f "$HOSTS_FILE" ]]; then
         local tmp
         tmp="$(mktemp "$(dirname "$HOSTS_FILE")/.hosts.XXXXXX")" || return 1
@@ -23407,7 +23436,7 @@ _needs_me_write_snapshot() {
     # thing this command ever writes — it never touches a session.
     local cur="$1" dir tmp
     dir="$(dirname "$NEEDS_ME_SNAPSHOT")"
-    mkdir -p "$dir" 2>/dev/null || true
+    _cctrl_data_mkdir "$dir" 2>/dev/null || true
     tmp="$(mktemp "${NEEDS_ME_SNAPSHOT}.XXXXXX" 2>/dev/null)" || tmp="${NEEDS_ME_SNAPSHOT}.tmp.$$"
     if printf '%s' "$cur" | jq 'map({(.name): (.state // "-")}) | add // {}' > "$tmp" 2>/dev/null; then
         mv -f "$tmp" "$NEEDS_ME_SNAPSHOT" 2>/dev/null || rm -f "$tmp" 2>/dev/null
@@ -24029,7 +24058,7 @@ cmd_host() {
 # Example: cctrl @HomeLab    cctrl @add HomeLab ~/homelab --profile max --resume
 
 _shortcuts_init() {
-    mkdir -p "$(dirname "$SHORTCUTS_FILE")"
+    _cctrl_data_mkdir "$(dirname "$SHORTCUTS_FILE")" || return $?
     [[ -f "$SHORTCUTS_FILE" ]] || echo "{}" > "$SHORTCUTS_FILE"
 }
 

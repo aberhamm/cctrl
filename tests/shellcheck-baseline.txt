@@ -3,8 +3,8 @@
 2 cctrl SC2088
 1 cctrl SC2100
 6 cctrl SC2128
-4 cctrl SC2155
-9 cctrl SC2174
+3 cctrl SC2155
+2 cctrl SC2174
 9 cctrl SC2178
 19 cctrl SC2179
 7 lib/codex-launch-to-app.sh SC2034
@@ -13,7 +13,6 @@
 2 tests/run-tests.sh SC1007
 1 tests/run-tests.sh SC1010
 2 tests/run-tests.sh SC1083
-2 tests/run-tests.sh SC2010
 2 tests/run-tests.sh SC2034
 4 tests/run-tests.sh SC2088
 1 tests/run-tests.sh SC2097

@@ -265,6 +265,23 @@ def _steal(lock, tmp):
         _release_path(guard, os.getpid())
 
 
+def _sweep_tmp(lock):
+    """Remove stray <lock>.<pid>.<rand>.tmp files left by acquirers that died."""
+    d = os.path.dirname(lock) or "."
+    prefix = os.path.basename(lock) + "."
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith(".tmp")):
+            continue
+        part = name[len(prefix):].split(".", 1)[0]
+        if part.isdigit() and not pid_alive(int(part)):
+            with contextlib.suppress(OSError):
+                os.unlink(os.path.join(d, name))
+
+
 def acquire(target, timeout=10.0, pid=None):
     """Take <target>.lock. Returns the lock path. Raises LockTimeout."""
     lock = lock_path(target)
@@ -272,6 +289,7 @@ def acquire(target, timeout=10.0, pid=None):
     if me != os.getpid():
         raise ValueError("acquire on behalf of another pid is not supported")
     deadline = time.monotonic() + timeout
+    _sweep_tmp(lock)
     tmp = _new_tmp(lock)
     try:
         while True:

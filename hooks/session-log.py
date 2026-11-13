@@ -26,7 +26,36 @@ try:
     import paths  # noqa: E402
     SPENDING_LOG = Path(paths.resolve(str(CCTRL_DIR))["spending_log"])
 except ImportError:
+    paths = None
     SPENDING_LOG = CCTRL_DIR / "costs" / "spending.jsonl"
+
+
+def _may_write():
+    """Plan 116 A1: honour <state root>/.migrating. Wait at most 5 s, then skip
+    the write (the hook never blocks or fails). Never `mkdir -p` the costs dir
+    behind a migration: make only the leaf, with parents only for an explicit
+    CCTRL_COSTS_DIR override."""
+    try:
+        state_root = paths.resolve(str(CCTRL_DIR))["state_root"]
+        if os.path.lexists(os.path.join(state_root, ".migrating")):
+            import locks
+            if not locks.sentinel_wait(state_root, max_wait=5, kind="hook"):
+                return False
+    except Exception:
+        pass
+    parent = SPENDING_LOG.parent
+    if parent.is_dir():
+        return True
+    try:
+        if os.environ.get("CCTRL_COSTS_DIR"):
+            parent.mkdir(parents=True, exist_ok=True)
+        else:
+            parent.mkdir(mode=0o700)
+    except FileExistsError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def sum_session_tokens(session_path):
@@ -113,7 +142,8 @@ def main():
     if totals["input_tokens"] == 0 and totals["output_tokens"] == 0:
         return
 
-    SPENDING_LOG.parent.mkdir(parents=True, exist_ok=True)
+    if not _may_write():
+        return
     lines = []
     if SPENDING_LOG.exists():
         with open(SPENDING_LOG) as f:

@@ -312,7 +312,17 @@ revision hours named in each phase. Baseline is `main` at `8c249fc`.
   - Both lock kinds on both bashes.
   - An old-release reader on a file with `v` and a quarantine present.
 - **Rollback.** Previous release. The file stays plain JSONL, and old code tolerates `v` and
-  ignores the quarantine and backups. The lock protocol is unchanged for old code.
+  ignores the quarantine and backups. The lock protocol is unchanged for old code in the default
+  (shlock) mode. **Two exceptions, found by the A1 verifier (S4):** an old release must not run
+  with `CCTRL_MAILBOX_LOCK_KIND=dir`, nor on a host without `shlock` (Linux), alongside a new
+  one: the old dir code `mkdir`s the lock path, finds no `pid` file inside a new link-protocol
+  lock, `rm -rf`s our live lock file and proceeds, which gives two holders. New code cannot fix
+  old code, so before a rollback check the launchd plists and env on every host for that
+  variable. Verifier probe 2 (macOS): `/usr/bin/shlock` never steals a stale lock itself (for a
+  dead pid it reports the process dead and returns 1), so the old release just waits out its
+  timeout on a stale lock, and the "shlock's own stale handling unlinks and re-links" race that
+  the steal-guard inode check was written for does not occur with this macOS build. The check
+  stays as defence against the dir-mode old code and other implementations.
 - **Blocked by.** A0 (paths and modes).
 - **Needs Matthew's yes:** the install on each Mac.
 

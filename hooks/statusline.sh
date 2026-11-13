@@ -64,8 +64,26 @@ fi
 # ── Capture: rate_limits to file (if present) ────────────────────────
 rate_limits=$(echo "$input" | jq '.rate_limits // empty')
 
-if [[ -n "$rate_limits" ]]; then
-    mkdir -p "$DATA_DIR"
+# Plan 116 A1: this writer honours <state root>/.migrating. It waits at most
+# 5 s for the sentinel to clear and then SKIPS its write; the output above is
+# already printed and the hook never fails. No process is spawned in the normal
+# no-sentinel case. It never `mkdir -p`s the data dir: a data dir that is
+# missing is made only as a leaf (never its parents), and not at all while a
+# migration is in progress.
+_sl_can_write() {
+    local f="${_CCTRL_P_MIGRATING_FILE:-}" waited=0
+    if [[ -n "$f" ]]; then
+        while [[ -e "$f" || -L "$f" ]]; do
+            (( waited >= 25 )) && return 1
+            sleep 0.2
+            waited=$((waited + 1))
+        done
+    fi
+    [[ -d "$DATA_DIR" ]] && return 0
+    mkdir -m 700 "$DATA_DIR" 2>/dev/null
+}
+
+if [[ -n "$rate_limits" ]] && _sl_can_write; then
 
     # Enrich with capture timestamp and profile
     profile=""
