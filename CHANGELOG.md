@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased] - 2026-10-02
 
 ### Changed
+- **CI full suite reports every failure (plan 121 E0 follow-up).** The `full` job in `.github/workflows/ci.yml` sets `CCTRL_TEST_KEEP_GOING=1`, so one run lists all failing tests instead of aborting at the first; the suite still exits non-zero when any test failed. Smoke is unchanged (fail-fast). The `full` job timeout stays at 90 minutes (hosted legs take about 30-34 minutes).
 - **Repo display names come from config, not source (plan 122 D6a).** `_session_pretty_repo_label` no longer carries a hard-coded map of repo names. An optional `repo_labels` object in any config layer (`{"my-repo": "My Repo"}`, later layers win) sets display names; an unmapped slug is title-cased from its basename. `tests/check-public-hygiene.py` gains a deny-pattern list (`tests/public-hygiene-deny.txt` plus an untracked `tests/public-hygiene-deny.local.txt`, or `--deny FILE`) as a standalone CI entry point. A stale operations note left `TODOS.md`, and README examples use neutral repo names.
 
 ### Security

@@ -193,6 +193,7 @@ jobs:
       - name: full suite (includes the Python unittests)
         env:
           BASH_UNDER_TEST: ${{ matrix.bash }}
+          CCTRL_TEST_KEEP_GOING: "1"
         run: |
           "$BASH_UNDER_TEST" --version | head -1
           "$BASH_UNDER_TEST" tests/run-tests.sh
