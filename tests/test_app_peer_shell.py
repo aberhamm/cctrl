@@ -81,7 +81,9 @@ printf '%s' '{"recipient_provider_task_id":"same-thread","created_at":"2026-10-1
 _peer_resolve_json() { printf '%s' '{"name":"a","capabilities":["app-server"]}'; }
 _peer_cmd_send() { printf '%s\\n' "$@"; }
 _peer_cmd_say a --no-submit --json -- 'hello body' > "$PEER_DATA_DIR/args"
-! grep -qF -- '--deliver' "$PEER_DATA_DIR/args"
+# `! cmd` never trips set -e, so the old `! grep -qF -- '--deliver'` could not
+# fail. Test the exit status explicitly: the send must not be asked to deliver.
+if grep -qxF -- '--deliver' "$PEER_DATA_DIR/args"; then exit 10; fi
 grep -qF -- 'hello body' "$PEER_DATA_DIR/args"
 ''')
         self.assertEqual(result.returncode,0,result.stderr)

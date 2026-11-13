@@ -8601,6 +8601,8 @@ _peer_cmd_overview() {
     _mailbox_read_json_or_error "$json" || return $?
     messages="$MAILBOX_MESSAGES"
 
+    # The peer doc and the mailbox can each exceed the argv limit
+    # ("jq: Argument list too long"), so they go in by file, not --argjson.
     local overview
     overview="$(jq -n \
         --argjson identity "$peer_json" \
@@ -19003,7 +19005,11 @@ _session_restore() {
                 esac
             done
             if [[ "$rs_kind" == fleet ]]; then
-                rs_pred="$(_fleet_live_managers "${rs_agent:-claude}" | head -n 1)"
+                # Read the whole list, then take the first line: `| head -n 1`
+                # closes the pipe under the producer and, with pipefail, turns
+                # its SIGPIPE (141) into a failure of the assignment.
+                rs_pred="$(_fleet_live_managers "${rs_agent:-claude}" || true)"
+                rs_pred="${rs_pred%%$'\n'*}"
             fi
             _CCTRL_REPLAY=restore
             _CCTRL_REPLAY_TMUX="$(jq -r '.tmux_session // empty' <<< "$row_file")"
@@ -22553,7 +22559,9 @@ _host_is_local() {
     # Read every name before comparing: returning early from a loop fed by
     # `< <(_local_names)` closes the pipe under the producer, and where
     # SIGPIPE is ignored (CI runners) its printf prints "write error: Broken pipe".
-    names="$(_local_names)"
+    # `|| true`: a failing _local_names (an empty hostname makes its last
+    # `[[ -n ]] &&` return 1) must not abort a set -e caller.
+    names="$(_local_names || true)"
     while IFS= read -r n; do
         [[ -z "$n" ]] && continue
         n="$(printf '%s' "${n%.local}" | tr '[:upper:]' '[:lower:]')"
