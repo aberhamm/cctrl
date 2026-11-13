@@ -8856,7 +8856,7 @@ test_mailbox_safe_rewrite_backups_and_crash() {
     "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null          # a rewrite
     [[ -f "$mbx.bak" ]] || fail "no messages.jsonl.bak after a rewrite"
     local dated
-    dated="$(ls "$A1_DATA" | grep -c '^messages\.jsonl\.bak\.[0-9]\{8\}$' || true)"
+    dated="$(compgen -G "$A1_DATA/messages.jsonl.bak.[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]" | wc -l | tr -d ' ' || true)"
     [[ "$dated" == 1 ]] || fail "expected one dated backup, found $dated"
     local f
     for f in "$mbx" "$mbx.bak" "$A1_DATA"/messages.jsonl.bak.*; do
@@ -8866,7 +8866,7 @@ test_mailbox_safe_rewrite_backups_and_crash() {
     : > "$mbx.bak.20200101"
     "${A1_ENV[@]}" "$A1_CCTRL" peer ack "$id" --as comet --json >/dev/null 2>&1 || true
     [[ ! -e "$mbx.bak.20200101" ]] || fail "an old dated backup was not pruned"
-    ls "$A1_DATA" | grep -q '^\.messages\.jsonl\.tmp\.' && fail "temp file left in the data dir after a clean rewrite"
+    compgen -G "$A1_DATA/.messages.jsonl.tmp.*" >/dev/null && fail "temp file left in the data dir after a clean rewrite"
 
     # Crash between the temp write and the rename (test-mode fault): the
     # mailbox is intact, and the next writer recovers.
@@ -8876,14 +8876,14 @@ test_mailbox_safe_rewrite_backups_and_crash() {
     rc=0
     "${A1_ENV[@]}" CCTRL_TEST_MAILBOX_FAULT=after-tmp "$A1_CCTRL" peer recv --as comet --json >"$A1_SB/fault.out" 2>&1 || rc=$?
     [[ "$rc" != 0 ]] || fail "the after-tmp fault did not fire in test mode"
-    ls -a "$A1_DATA" | grep -q '^\.messages\.jsonl\.tmp\.' || fail "expected a stray temp file from the crashed rewrite"
+    compgen -G "$A1_DATA/.messages.jsonl.tmp.*" >/dev/null || fail "expected a stray temp file from the crashed rewrite"
     [[ "$(cat "$mbx")" == "$before" ]] || fail "the mailbox changed although the writer died before the rename"
     jq -e . "$mbx" >/dev/null || fail "mailbox corrupt after a crash between temp write and rename"
     out="$("${A1_ENV[@]}" "$A1_CCTRL" peer inbox --as comet --json 2>&1)" || fail "mailbox unreadable after a crash: $out"
     # The next writer steals the dead holder's lock and sweeps the stray temp.
     "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "after crash" >/dev/null || fail "writer could not recover after a crash"
     "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null || fail "recv after a crash failed"
-    ls -a "$A1_DATA" | grep -q '^\.messages\.jsonl\.tmp\.' && fail "stray temp file not swept by the next rewrite"
+    compgen -G "$A1_DATA/.messages.jsonl.tmp.*" >/dev/null && fail "stray temp file not swept by the next rewrite"
     # The fault variable is ignored outside test mode.
     out="$(env -u TMUX CCTRL_DATA_DIR="$A1_DATA" CCTRL_TEST_MAILBOX_FAULT=after-tmp "$A1_CCTRL" peer recv --as comet --json 2>&1)" || fail "fault variable bit outside test mode: $out"
     echo "ok: rewrite is same-dir temp + fsync + rename with 0600 backups (.bak + dated, pruned); a crash mid-rewrite leaves the mailbox intact"
@@ -8909,20 +8909,34 @@ test_mailbox_restore_and_repair() {
         printf '%s\n' "$keep" | jq -c '.status = "queued" | .updated_at = "2000-01-01T00:00:00Z"'
         printf '{"id":"cut'
     } > "$mbx"
-    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --dry-run --json)" || fail "repair --dry-run failed"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --dry-run --from-backup --json)" || fail "repair --dry-run failed"
     jq -e '.dry_run == true' <<< "$out" >/dev/null || fail "dry run not flagged: $out"
     [[ "$(grep -c . "$mbx")" == 3 ]] || fail "repair --dry-run changed the mailbox"
-    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --json)" || fail "repair failed: $out"
-    [[ "$(jq -s 'length' "$mbx")" == 3 ]] || fail "repair did not restore all 3 messages: $(jq -s 'length' "$mbx")"
+    # S1: the default repair never reads the .bak, so it restores nothing from it.
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --dry-run --json)" || fail "default dry run failed"
+    jq -e '.from_backup == 0 and .result == 1' <<< "$out" >/dev/null || fail "default repair must not use the backup: $out"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --help)"
+    [[ "$out" == *--from-backup* ]] || fail "help does not mention --from-backup"
+    out="$("${A1_ENV[@]}" "$A1_CCTRL" peer repair --from-backup --json)" || fail "repair failed: $out"
+    [[ "$(jq -s 'length' "$mbx")" == 3 ]] || fail "repair --from-backup did not restore all 3 messages: $(jq -s 'length' "$mbx")"
     [[ "$(jq -s 'map(.id) | length - (unique | length)' "$mbx")" == 0 ]] || fail "repair left duplicate ids"
     [[ "$(jq -s --arg id "$first" '.[] | select(.id == $id) | .status' "$mbx")" == '"delivered"' ]] \
         || fail "newest status did not win: $(jq -s --arg id "$first" '.[] | select(.id == $id) | .status' "$mbx")"
     # Idempotent: a second repair changes nothing.
     local snap
     snap="$(cat "$mbx")"
-    "${A1_ENV[@]}" "$A1_CCTRL" peer repair --json >/dev/null || fail "second repair failed"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer repair --from-backup --json >/dev/null || fail "second repair failed"
     [[ "$(cat "$mbx")" == "$snap" ]] || fail "repair is not idempotent"
-    echo "ok: peer repair rebuilds from backup + quarantine, one id each, newest status wins, idempotent, --dry-run writes nothing"
+    # S1: a message gc removed on purpose is not brought back, with or without --from-backup.
+    "${A1_ENV[@]}" "$A1_CCTRL" peer gc --status queued,delivered,acked --older-than 0 --json >/dev/null 2>&1 \
+        || "${A1_ENV[@]}" "$A1_CCTRL" peer gc --status queued --older-than 0 >/dev/null 2>&1 || true
+    [[ "$(jq -s 'length' "$mbx")" == 0 ]] || fail "gc did not empty the mailbox for the S1 check: $(cat "$mbx")"
+    [[ -s "$A1_DATA/messages-archive.jsonl" ]] || fail "gc wrote no archive"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer repair --json >/dev/null || fail "repair after gc failed"
+    [[ "$(jq -s 'length' "$mbx")" == 0 ]] || fail "S1: default repair resurrected gc'd messages"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer repair --from-backup --json >/dev/null || fail "repair --from-backup after gc failed"
+    [[ "$(jq -s 'length' "$mbx")" == 0 ]] || fail "S1: --from-backup resurrected gc'd messages"
+    echo "ok: peer repair (--from-backup for the .bak, never gc-archived ids), one id each, newest status wins, idempotent, --dry-run writes nothing"
 }
 
 test_mailbox_concurrent_senders_ack_gc() {
@@ -9304,6 +9318,47 @@ EOF
     [[ -d "$leaf" && -f "$leaf/messages.jsonl" ]] || fail "the retried writer did not recreate the mailbox"
     [[ ! -e "$leaf/messages.jsonl.lock" ]] || fail "lock left behind"
     echo "ok: a sentinel that appears after the lock makes the writer release, remove its own empty dir, wait and retry"
+}
+
+test_json_update_revalidates_after_lock() {
+    _a1_sandbox jsonreval
+    local hook log out
+    mkdir -p "$A1_SB/p"
+    "${A1_ENV[@]}" "$A1_CCTRL" peer register firstpeer --dir "$A1_SB/p" --agent codex >/dev/null 2>&1 || fail "setup register failed"
+    log="$A1_SB/hook.log"
+    hook="$A1_SB/afterlock.sh"
+    cat > "$hook" <<EOF
+#!/usr/bin/env bash
+[[ -e "$A1_SB/hook.done" ]] && exit 0
+: > "$A1_SB/hook.done"
+printf '{"pid":$$,"host":"$(hostname)","step":"copy"}\n' > "$A1_STATE/.migrating"
+( sleep 1.2
+  if [[ -e "$A1_DATA/peers.json.lock" ]]; then echo "lock held while waiting" >> "$log"; else echo "lock released while waiting" >> "$log"; fi
+  rm -f "$A1_STATE/.migrating" ) &
+EOF
+    chmod +x "$hook"
+    out="$("${A1_ENV[@]}" CCTRL_TEST_AFTER_LOCK_HOOK="$hook" "$A1_CCTRL" peer register secondpeer --dir "$A1_SB/p" --agent codex 2>&1)" || fail "register under a late sentinel failed: $out"
+    [[ "$(cat "$log" 2>/dev/null)" == "lock released while waiting" ]] || fail "S5: _cctrl_json_update kept its lock across the sentinel: $(cat "$log" 2>/dev/null)"
+    [[ "$(jq 'keys | length' "$A1_DATA/peers.json")" == 2 ]] || fail "retried update lost a peer: $(jq -c 'keys' "$A1_DATA/peers.json")"
+    echo "ok: _cctrl_json_update re-validates after the lock (late sentinel: release, wait, retry)"
+}
+
+test_lock_link_refuses_directory_swap() {
+    _a1_sandbox linkdir
+    local lock="$A1_SB/x.lock" tmp="$A1_SB/x.lock.1.2.tmp" rc=0
+    eval "$(sed -n '/^_cctrl_lock_link() {/,/^}/p' "$ROOT/cctrl")"
+    printf '%10d\n' "$$" > "$tmp"
+    # Simulate an old dir-mode process mkdir-ing the lock path between the -d test and ln.
+    ln() { mkdir "$2"; command ln "$@"; }
+    _cctrl_lock_link "$tmp" "$lock" || rc=$?
+    unset -f ln
+    [[ "$rc" != 0 ]] || fail "S6: link into a directory was taken as the lock"
+    [[ -d "$lock" ]] || fail "setup: the lock path should be the directory"
+    [[ -z "$(ls -A "$lock")" ]] || fail "S6: stray link left inside the directory: $(ls -A "$lock")"
+    rm -rf "$lock"
+    _cctrl_lock_link "$tmp" "$lock" || fail "a normal link failed"
+    [[ -f "$lock" && "$lock" -ef "$tmp" ]] || fail "lock is not the tmp inode"
+    echo "ok: the bash lock link verifies a regular file with the tmp inode and undoes a link made inside a directory"
 }
 
 test_peers_and_shortcuts_updates_are_locked() {
@@ -12027,7 +12082,7 @@ SH
     [[ -e "$TMPDIR/p5-rot-once" ]] || fail "N2: the mv stand-in must have run"
     [[ "$(wc -l < "$f.1" | tr -d ' ')" -eq "$n_big" ]] || fail "N2: the rotated .1 was clobbered: $(wc -l < "$f.1") of $n_big lines"
     grep -q '"other-holder"' "$f" && grep -q '"double-holder"' "$f" || fail "N2: the fresh lines must stay in the log: $(cat "$f")"
-    ls "$data/doorbell" | grep -q '\.rot\.' && fail "N2: no private rotation file may be left: $(ls -a "$data/doorbell")"
+    compgen -G "$data/doorbell/*.rot.*" >/dev/null && fail "N2: no private rotation file may be left: $(ls -a "$data/doorbell")"
     [[ ! -e "$data/doorbell/.attestation.log.rotate" ]] || fail "N2: the rotation lock must be released"
     echo "ok: plan 111 p4 attestation.log rotation is safe under concurrent writers (mkdir lock + re-check); stale locks clear"
 }
@@ -15131,7 +15186,7 @@ second line token=sk-CANARY-SECRET"
     done
     [[ "$(wc -c < "$data/native-sends.key" | tr -d ' ')" -eq 32 ]] || fail "key is not 32 bytes"
     # Two hosts never share a file: the host id names it.
-    ls "$data" | grep -q '^native-sends\.0123456789abcdef0123456789abcdef\.jsonl$' || fail "log not named by host id"
+    [[ -e "$data/native-sends.0123456789abcdef0123456789abcdef.jsonl" ]] || fail "log not named by host id"
     echo "ok: plan 114 native-send log stores no body, summary or response; HMAC and 0600 hold"
 }
 

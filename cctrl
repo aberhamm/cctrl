@@ -8736,20 +8736,32 @@ _cctrl_lock_judge() {
         pid="$(cat "$lock/pid" 2>/dev/null || true)"
         _LK_PID="$pid"
         _cctrl_lock_pid_alive "$pid" && return 1
-        _LK_WHY=legacy-dir
+        _LK_WHY="legacy-dir"
         return 0
     fi
-    [[ -f "$lock" ]] || { _LK_WHY=gone; return 1; }
-    _cctrl_lock_stat "$lock" || { _LK_WHY=gone; return 1; }
+    [[ -f "$lock" ]] || { _LK_WHY="gone"; return 1; }
+    _cctrl_lock_stat "$lock" || { _LK_WHY="gone"; return 1; }
     IFS= read -r pid < "$lock" 2>/dev/null || true
     pid="${pid//[[:space:]]/}"
     _LK_PID="$pid"
-    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then _LK_WHY=corrupt; return 0; fi
-    if ! _cctrl_lock_pid_alive "$pid"; then _LK_WHY=dead; return 0; fi
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then _LK_WHY="corrupt"; return 0; fi
+    if ! _cctrl_lock_pid_alive "$pid"; then _LK_WHY="dead"; return 0; fi
     if _cctrl_lock_pid_start "$pid" && (( _LK_START > _LK_MTIME + 2 )); then
-        _LK_WHY=pid-reuse
+        _LK_WHY="pid-reuse"
         return 0
     fi
+    return 1
+}
+
+# Publish TMP as LOCK with link(2). `ln` onto a directory links INSIDE it and
+# still returns 0, so after a successful ln the lock path must be a regular file
+# sharing TMP's inode; otherwise undo the stray link and report failure (S6).
+_cctrl_lock_link() { # TMP LOCK
+    local tmp="$1" lock="$2"
+    [[ ! -d "$lock" ]] || return 1
+    ln "$tmp" "$lock" 2>/dev/null || return 1
+    if [[ -f "$lock" && ! -d "$lock" && "$lock" -ef "$tmp" ]]; then return 0; fi
+    if [[ -d "$lock" ]]; then rm -f "$lock/${tmp##*/}" 2>/dev/null || true; fi
     return 1
 }
 
@@ -8766,7 +8778,7 @@ _cctrl_lock_simple_acquire() { # LOCKPATH
     printf '%10d\n' "$$" > "$tmp" || return 1
     start="$(date +%s)"
     while :; do
-        if [[ ! -d "$lock" ]] && ln "$tmp" "$lock" 2>/dev/null; then rm -f "$tmp"; return 0; fi
+        if _cctrl_lock_link "$tmp" "$lock"; then rm -f "$tmp"; return 0; fi
         if _cctrl_lock_judge "$lock"; then rm -rf "$lock" 2>/dev/null || true; continue; fi
         now="$(date +%s)"
         if (( now - start >= 5 )); then rm -f "$tmp"; return 1; fi
@@ -8790,7 +8802,7 @@ _cctrl_lock_steal() { # LOCK TMP
     if [[ -d "$lock" && ! -L "$lock" ]]; then
         if _cctrl_lock_judge "$lock"; then
             rm -rf "$lock" 2>/dev/null || true
-            if ln "$tmp" "$lock" 2>/dev/null; then rc=0; fi
+            if _cctrl_lock_link "$tmp" "$lock"; then rc=0; fi
         fi
         _cctrl_lock_release_path "$guard" || true
         return "$rc"
@@ -8807,7 +8819,7 @@ _cctrl_lock_steal() { # LOCK TMP
             fi
             if _cctrl_lock_stat "$aside" && [[ "$_LK_INO" == "$ino" ]]; then
                 rm -f "$aside"
-                if ln "$tmp" "$lock" 2>/dev/null; then rc=0; fi
+                if _cctrl_lock_link "$tmp" "$lock"; then rc=0; fi
             else
                 # Found live: a lock someone took after our check. Put it back.
                 if ln "$aside" "$lock" 2>/dev/null; then
@@ -8832,7 +8844,7 @@ _cctrl_lock_acquire() {
     start="$(date +%s)"
     while :; do
         # (ln onto a directory would link INSIDE it: a legacy dir lock is judged, not linked over)
-        if [[ ! -d "$lock" ]] && ln "$tmp" "$lock" 2>/dev/null; then
+        if _cctrl_lock_link "$tmp" "$lock"; then
             rm -f "$tmp"
             _CCTRL_LOCK_PATH="$lock"
             return 0
@@ -8883,11 +8895,27 @@ _cctrl_data_dir_ensure() { # DIR
 # into a temp file in the same directory, rename over FILE, release. Waits out
 # the migration sentinel first. Used for peers.json and shortcuts.json.
 _cctrl_json_update() { # FILE jq-args...
-    local file="$1" tmp rc=0
+    local file="$1" tmp rc=0 dir before held tries=0
     shift
-    _cctrl_sentinel_wait cli || return $?
-    _cctrl_lock_acquire "$file" || return $?
-    local held="$_CCTRL_LOCK_PATH"
+    dir="$(dirname "$file")"
+    while :; do
+        _cctrl_sentinel_wait cli || return $?
+        before="$(_cctrl_dir_real "$dir")"
+        _cctrl_lock_acquire "$file" || return $?
+        held="$_CCTRL_LOCK_PATH"
+        if [[ -n "${CCTRL_TEST_AFTER_LOCK_HOOK:-}" ]] && _cctrl_test_mode >/dev/null 2>&1; then
+            "$CCTRL_TEST_AFTER_LOCK_HOOK" "$held" || true
+        fi
+        # Re-validate after the lock (plan 116 MUST-FIX 2): a migration that
+        # began, or a data dir that moved, while we waited invalidates the lock.
+        if _cctrl_lock_still_valid "$before" "$dir"; then break; fi
+        _cctrl_lock_release "$held"
+        tries=$((tries + 1))
+        if (( tries >= 50 )); then
+            echo -e "${RED}Data location kept changing; giving up.${RESET}" >&2
+            return 75
+        fi
+    done
     tmp="$(mktemp "$file.tmp.XXXXXX")" || { _cctrl_lock_release "$held"; return 1; }
     if jq "$@" "$file" > "$tmp"; then
         mv -f "$tmp" "$file" || rc=1
@@ -8915,11 +8943,20 @@ _cctrl_dir_real() {
     ( cd -P -- "$1" 2>/dev/null && pwd -P ) || printf ''
 }
 
+# After taking a lock: is it still valid? Not when the migration sentinel has
+# appeared, or when the realpath of the data dir DIR is no longer BEFORE.
+_cctrl_lock_still_valid() { # BEFORE DIR
+    local sf
+    sf="$(_cctrl_sentinel_file)"
+    [[ ! -e "$sf" && ! -L "$sf" ]] || return 1
+    [[ "$(_cctrl_dir_real "$2")" == "$1" ]]
+}
+
 # Take the mailbox lock. Waits out the migration sentinel first (rc 75), then
 # re-validates after the lock (sentinel appeared, or the data dir moved under
 # us): release, remove a dir we created if empty, wait, retry.
 _mailbox_lock_acquire() {
-    local dir created before after rc tries=0
+    local dir created before rc tries=0
     while :; do
         _cctrl_sentinel_wait cli || return $?
         _peer_refresh_paths
@@ -8934,21 +8971,13 @@ _mailbox_lock_acquire() {
         _cctrl_lock_acquire "$MESSAGES_FILE" || rc=$?
         [[ $rc -eq 0 ]] || return "$rc"
         MAILBOX_LOCK_HELD="$_CCTRL_LOCK_PATH"
-        MAILBOX_LOCK_KIND="file"
         if [[ -n "${CCTRL_TEST_AFTER_LOCK_HOOK:-}" ]] && _cctrl_test_mode >/dev/null 2>&1; then
             "$CCTRL_TEST_AFTER_LOCK_HOOK" "$MAILBOX_LOCK_HELD" || true
         fi
-        after=""
-        if [[ -e "$(_cctrl_sentinel_file)" || -L "$(_cctrl_sentinel_file)" ]]; then
-            after=sentinel
-        else
-            _peer_refresh_paths
-            after="$(_cctrl_dir_real "$(dirname "$MESSAGES_FILE")")"
-            [[ "$after" == "$before" ]] && after=""
-        fi
-        [[ -z "$after" ]] && return 0
+        _peer_refresh_paths
+        if _cctrl_lock_still_valid "$before" "$(dirname "$MESSAGES_FILE")"; then return 0; fi
         _cctrl_lock_release "$MAILBOX_LOCK_HELD"
-        unset MAILBOX_LOCK_HELD MAILBOX_LOCK_KIND
+        unset MAILBOX_LOCK_HELD
         if [[ "$created" == true ]]; then rmdir "$dir" 2>/dev/null || true; fi
         tries=$((tries + 1))
         if (( tries >= 50 )); then
@@ -8962,7 +8991,7 @@ _mailbox_lock_release() {
     local lock_path="${MAILBOX_LOCK_HELD:-}"
     [[ -n "$lock_path" ]] || return 0
     _cctrl_lock_release "$lock_path"
-    unset MAILBOX_LOCK_HELD MAILBOX_LOCK_KIND
+    unset MAILBOX_LOCK_HELD
 }
 
 # Tolerant read: bad lines go to messages.quarantine.jsonl and the good ones
@@ -14638,17 +14667,22 @@ _peer_doctor_eligibility_check() {
         || printf '%s\n' '{"name":"sender_eligibility","ok":true,"summary":"eligibility check unreadable (informational)"}'
 }
 
-# Plan 116 A1: rebuild the mailbox from itself, messages.jsonl.bak and the
-# quarantine: no duplicate ids, the newest status wins by updated_at.
+# Plan 116 A1: rebuild the mailbox from itself and the quarantine: no duplicate
+# ids, the newest status wins by updated_at. messages.jsonl.bak is restored only
+# with --from-backup, and never for ids `peer gc` archived on purpose.
 _peer_cmd_repair() {
-    local dry_run=false json=false out rc=0
+    local dry_run=false json=false from_backup=false out rc=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --dry-run) dry_run=true; shift ;;
             --json) json=true; shift ;;
+            --from-backup) from_backup=true; shift ;;
             -h|--help)
-                echo "Usage: cctrl peer repair [--dry-run] [--json]"
-                echo "  Rebuild the mailbox from messages.jsonl, its .bak and the quarantine."
+                echo "Usage: cctrl peer repair [--dry-run] [--from-backup] [--json]"
+                echo "  Rebuild the mailbox from messages.jsonl and the quarantine (no duplicate ids)."
+                echo "  --from-backup  also restore messages from messages.jsonl.bak, except ids that"
+                echo "                 'peer gc' archived in messages-archive.jsonl (removed on purpose)."
+                echo "  Without it a message removed on purpose is never brought back."
                 return 0 ;;
             *)
                 echo -e "${RED}Unknown peer repair flag: $1${RESET}" >&2
@@ -14656,18 +14690,21 @@ _peer_cmd_repair() {
         esac
     done
     _mailbox_init || return $?
+    local rargs=()
+    $dry_run && rargs+=(--dry-run)
+    $from_backup && rargs+=(--from-backup)
     if $dry_run; then
-        out="$(command python3 "$SCRIPT_DIR/lib/mailbox.py" repair "$MESSAGES_FILE" --dry-run)" || return $?
+        out="$(command python3 "$SCRIPT_DIR/lib/mailbox.py" repair "$MESSAGES_FILE" ${rargs[@]+"${rargs[@]}"})" || return $?
     else
         _mailbox_lock_acquire || return $?
-        out="$(command python3 "$SCRIPT_DIR/lib/mailbox.py" repair "$MESSAGES_FILE")" || rc=$?
+        out="$(command python3 "$SCRIPT_DIR/lib/mailbox.py" repair "$MESSAGES_FILE" ${rargs[@]+"${rargs[@]}"})" || rc=$?
         _mailbox_lock_release
         [[ $rc -eq 0 ]] || return "$rc"
     fi
     if $json; then
         printf '%s\n' "$out"
     else
-        jq -r '"mailbox repair" + (if .dry_run then " (dry run)" else "" end) + ": " + (.result|tostring) + " message(s) kept; " + (.current|tostring) + " in the mailbox, " + (.from_backup|tostring) + " restored from backup, " + (.from_quarantine|tostring) + " from quarantine, " + (.bad_lines|tostring) + " bad line(s) set aside"' <<< "$out"
+        jq -r '"mailbox repair" + (if .dry_run then " (dry run)" else "" end) + ": " + (.result|tostring) + " message(s) kept; " + (.current|tostring) + " in the mailbox, " + (.from_backup|tostring) + " restored from backup, " + (.skipped_archived|tostring) + " archived (skipped), " + (.from_quarantine|tostring) + " from quarantine, " + (.bad_lines|tostring) + " bad line(s) set aside"' <<< "$out"
     fi
 }
 
@@ -14725,7 +14762,7 @@ _peer_cmd_doctor() {
     if messages="$(_mailbox_read_json 2>/dev/null)"; then ok=true; else ok=false; fi
     check="$(jq -n --arg name mailbox_parseable --argjson ok "$ok" --arg path "$MESSAGES_FILE" '{name:$name,ok:$ok,path:$path}')"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
-    local lock_json lock_stale=false lock_pid="" info_json qn
+    local lock_json lock_stale=false lock_pid="" info_json
     lock_json="$(command python3 "$SCRIPT_DIR/lib/locks.py" status "$MESSAGES_FILE" 2>/dev/null)" || lock_json="{}"
     [[ "$(jq -r '.stale // false' <<< "$lock_json")" == "true" ]] && lock_stale=true
     lock_pid="$(jq -r '.pid // empty' <<< "$lock_json")"
@@ -14738,9 +14775,8 @@ _peer_cmd_doctor() {
         + (if (.collisions // 0) > 0 then {remedy: "\(.collisions) lock-steal-collision record(s) beside the lock; leftover .aside files are safe to inspect"} else {} end)' <<< "$lock_json")"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     info_json="$(command python3 "$SCRIPT_DIR/lib/mailbox.py" info "$MESSAGES_FILE" 2>/dev/null)" || info_json="{}"
-    qn="$(jq -r '.quarantined // 0' <<< "$info_json")"
     check="$(jq -c --argjson info "$info_json" '{name:"mailbox_quarantine", ok:true, quarantined:($info.quarantined // 0), duplicate_ids:($info.duplicate_ids // 0)}
-        + (if ($info.quarantined // 0) > 0 then {remedy: "\($info.quarantined) bad line(s) in messages.quarantine.jsonl; run: cctrl peer repair --dry-run"} else {} end)' <<< "{}")"
+        + (if ($info.quarantined // 0) > 0 then {remedy: "\($info.quarantined) bad line(s) in messages.quarantine.jsonl; run: cctrl peer repair --dry-run (add --from-backup only to restore lost messages)"} else {} end)' <<< "{}")"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     local sent_json
     sent_json="$(command python3 "$SCRIPT_DIR/lib/locks.py" sentinel "$_CCTRL_P_STATE_ROOT" 2>/dev/null)" || sent_json="null"

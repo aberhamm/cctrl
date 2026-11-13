@@ -123,9 +123,11 @@ def pid_start_epoch(pid):
 def read_pid(path):
     """(pid, stat_result) of a lock file, pid None if unparseable; (None, None) if gone."""
     try:
+        # fstat the open fd: the inode and mtime of the file actually read, with
+        # no second path lookup a swap could slip between (review S3).
         with open(path, "rb") as f:
             raw = f.read(64)
-        st = os.stat(path)
+            st = os.fstat(f.fileno())
     except OSError:
         return None, None
     m = re.match(rb"^\s*(\d+)\s*$", raw)

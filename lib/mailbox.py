@@ -17,9 +17,11 @@ rewrite and repair):
       Read a JSON array on stdin and replace FILE with it: backup first, then
       a temp file in the SAME directory, fsync, rename, fsync the directory.
 
-  mailbox.py repair FILE [--dry-run]
-      Rebuild FILE from itself, its .bak and the quarantine: no duplicate ids,
-      the newest status wins by updated_at. Idempotent.
+  mailbox.py repair FILE [--dry-run] [--from-backup]
+      Rebuild FILE from itself and the quarantine: no duplicate ids, the newest
+      status wins by updated_at. Idempotent. FILE.bak is read only with
+      --from-backup, and ids in messages-archive.jsonl (removed by `peer gc` on
+      purpose) are never restored from it.
 
   mailbox.py info FILE
       JSON facts for `peer doctor`: quarantine count, duplicate ids, stray
@@ -156,6 +158,7 @@ def quarantine(path, bad):
     fd = os.open(qpath, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, b"".join(out))
+        os.fsync(fd)
     finally:
         os.close(fd)
     return len(out)
@@ -171,7 +174,10 @@ def cmd_read(path, strict, no_quarantine):
             try:
                 quarantine(path, bad)
             except OSError as e:
-                sys.stderr.write("could not write the quarantine: %s\n" % e)
+                # Bad lines that could not be set aside must not be dropped by a
+                # caller's next rewrite: fail like the old reader did (review S2).
+                sys.stderr.write("could not write the quarantine, mailbox left as is: %s\n" % e)
+                return 65
     sys.stdout.buffer.write(_dumps([o for _n, o in good]) + b"\n")
     return 0
 
@@ -332,12 +338,40 @@ def _recover_from_quarantine(path):
     return out
 
 
-def repair_plan(path):
+def _archived_ids(path):
+    """Ids `peer gc` moved to messages-archive.jsonl: removed on purpose."""
+    ids = set()
+    d = os.path.dirname(path) or "."
+    for line in _read_bytes(os.path.join(d, "messages-archive.jsonl")).split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and isinstance(obj.get("id"), str):
+            ids.add(obj["id"])
+    return ids
+
+
+def repair_plan(path, from_backup=False):
+    """Default: the current good lines plus whatever the quarantine can rebuild.
+    The .bak is only consulted with from_backup, and even then an id that
+    `peer gc` archived stays gone (review S1: repair must not resurrect
+    messages removed on purpose)."""
     cur_good, cur_bad = parse_lines(_read_bytes(path))
-    bak_good, _ = parse_lines(_read_bytes(path + ".bak"))
     q = _recover_from_quarantine(path)
     cur = [o for _n, o in cur_good]
-    bak = [o for _n, o in bak_good]
+    bak = []
+    skipped = 0
+    if from_backup:
+        bak_good, _ = parse_lines(_read_bytes(path + ".bak"))
+        archived = _archived_ids(path)
+        for _n, o in bak_good:
+            if o.get("id") in archived:
+                skipped += 1
+            else:
+                bak.append(o)
     merged = merge([cur, bak, q])
     cur_ids = {o.get("id") for o in cur}
     return {
@@ -345,21 +379,27 @@ def repair_plan(path):
         "current": len(cur),
         "from_backup": sum(1 for o in merged if o.get("id") not in cur_ids and o in bak),
         "from_quarantine": sum(1 for o in merged if o.get("id") not in cur_ids and o in q and o not in bak),
+        "skipped_archived": skipped,
         "bad_lines": len(cur_bad),
         "result": len(merged),
     }
 
 
-def cmd_repair(path, dry_run):
-    plan = repair_plan(path)
+def cmd_repair(path, dry_run, from_backup=False):
+    plan = repair_plan(path, from_backup)
     if not dry_run:
         # A quarantine pass first, so nothing in a bad line is lost by the rewrite.
         _good, bad = parse_lines(_read_bytes(path))
         if bad:
-            quarantine(path, bad)
+            try:
+                quarantine(path, bad)
+            except OSError as e:
+                sys.stderr.write("could not write the quarantine, mailbox left as is: %s\n" % e)
+                return 65
         rewrite(path, plan["merged"])
     summary = {k: v for k, v in plan.items() if k != "merged"}
     summary["dry_run"] = dry_run
+    summary["from_backup_requested"] = from_backup
     sys.stdout.write(json.dumps(summary) + "\n")
     return 0
 
@@ -401,7 +441,7 @@ def main(argv):
     if cmd == "rewrite":
         return cmd_rewrite(path)
     if cmd == "repair":
-        return cmd_repair(path, "--dry-run" in rest)
+        return cmd_repair(path, "--dry-run" in rest, "--from-backup" in rest)
     if cmd == "info":
         return cmd_info(path)
     sys.stderr.write(__doc__)
