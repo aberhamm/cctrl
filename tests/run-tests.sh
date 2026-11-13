@@ -8846,7 +8846,8 @@ test_mailbox_safe_rewrite_backups_and_crash() {
     _a1_register_peers
     local mbx="$A1_DATA/messages.jsonl" id before out rc
     # Static: the rewrite is no longer mktemp-in-$TMPDIR plus mv.
-    ! sed -n '/^_mailbox_rewrite_json_locked()/,/^}/p' "$ROOT/cctrl" | grep -q 'mktemp' || fail "_mailbox_rewrite_json_locked still uses mktemp"
+    ! sed -n '/^_mailbox_rewrite_json_locked()/,/^}/p' "$ROOT/cctrl" | grep -q 'mktemp)' || fail "_mailbox_rewrite_json_locked still uses mktemp in \$TMPDIR"
+    sed -n '/^_mailbox_rewrite_json_locked()/,/^}/p' "$ROOT/cctrl" | grep -q 'mktemp "\$MESSAGES_FILE' || fail "the fallback temp file is not in the mailbox directory"
     sed -n '/^_mailbox_rewrite_json_locked()/,/^}/p' "$ROOT/cctrl" | grep -q 'lib/mailbox.py' || fail "_mailbox_rewrite_json_locked does not use lib/mailbox.py"
 
     id="$("${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "one" | jq -r '.id')"

@@ -8904,10 +8904,6 @@ _mailbox_init() {
     [[ -f "$MESSAGES_FILE" ]] || { : > "$MESSAGES_FILE" && chmod 600 "$MESSAGES_FILE"; }
 }
 
-_mailbox_lock_path() {
-    printf '%s.lock' "$MESSAGES_FILE"
-}
-
 _pid_alive() {
     local pid="${1:-}"
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -8971,19 +8967,39 @@ _mailbox_lock_release() {
 
 # Tolerant read: bad lines go to messages.quarantine.jsonl and the good ones
 # stay readable. --strict or CCTRL_MAILBOX_STRICT=1 keeps exit 65.
+# The common case (every line a valid JSON object) stays a single jq pass, with
+# no python3 call; iconv catches invalid UTF-8, which jq would silently repair.
+# Anything else goes to lib/mailbox.py, which quarantines. If that helper cannot
+# run, the old answer stands: not valid JSONL (65).
 _mailbox_read_json() {
+    local out
     _mailbox_init || return $?
     if [[ ! -s "$MESSAGES_FILE" ]]; then
         printf '[]\n'
         return
     fi
-    command python3 "$SCRIPT_DIR/lib/mailbox.py" read "$MESSAGES_FILE"
+    if iconv -f UTF-8 -t UTF-8 "$MESSAGES_FILE" >/dev/null 2>&1 \
+        && out="$(jq -s 'if (map(type == "object") | all) then . else error("not-object") end' "$MESSAGES_FILE" 2>/dev/null)"; then
+        printf '%s\n' "$out"
+        return
+    fi
+    command python3 "$SCRIPT_DIR/lib/mailbox.py" read "$MESSAGES_FILE" || return 65
 }
 
-# Safe rewrite: backup, same-directory temp file, fsync, rename, fsync the dir.
+# Safe rewrite: backup, same-directory temp file, fsync, rename, fsync the dir
+# (lib/mailbox.py). If the helper cannot run at all, fall back to a temp file in
+# the same directory plus rename, so a rewrite still never half-writes.
 _mailbox_rewrite_json_locked() {
-    local messages_json="$1"
-    command python3 "$SCRIPT_DIR/lib/mailbox.py" rewrite "$MESSAGES_FILE" <<< "$messages_json"
+    local messages_json="$1" tmp
+    if command python3 "$SCRIPT_DIR/lib/mailbox.py" rewrite "$MESSAGES_FILE" <<< "$messages_json"; then
+        return 0
+    fi
+    tmp="$(mktemp "$MESSAGES_FILE.tmp.XXXXXX")" || return 1
+    if jq -c '.[]' <<< "$messages_json" > "$tmp" && mv -f "$tmp" "$MESSAGES_FILE"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
 }
 
 _mailbox_generate_id_locked() {
