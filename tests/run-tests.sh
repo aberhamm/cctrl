@@ -8829,12 +8829,14 @@ test_peer_mcp_bridge_stdio() {
     # same TOOLS list, so a hardcoded total would be brittle. All 8 original names
     # must remain present (renaming breaks the ~16 live sessions with the current
     # list loaded), plus the new `peer_overview` entry point.
+    # Parenthesised `as $names | ...`: jq 1.8 parses `A and B and X as $v | body` as
+    # `(A and B and X) as $v | body`, making $names a boolean (broke the CI runner).
     printf '%s\n' "$out" | jq -s -e '
       length == 2
       and .[0].id == 1
       and .[1].id == 2
-      and ([.[1].result.tools[].name]) as $names
-      | (["whoami","list_peers","resolve_peer","send_message","check_messages","recv_message","show_message","ack_message","peer_overview"] | all(. as $n | $names | index($n) != null))
+      and (([.[1].result.tools[].name]) as $names
+      | (["whoami","list_peers","resolve_peer","send_message","check_messages","recv_message","show_message","ack_message","peer_overview"] | all(. as $n | $names | index($n) != null)))
     ' >/dev/null || fail "expected MCP tools/list to advertise all 8 original tools plus peer_overview by name"
 
     local overview_req
