@@ -19049,15 +19049,44 @@ _snapshot_process_source() {
     else
         ps -axo pid=,ppid=,lstart=,command= > "${output}.rows" 2> "${output}.err" || rc=$?
         python3 - "${output}.rows" "${output}.err" "$observed_at" "$rc" > "$output" <<'PY'
-import hashlib,json,sys
+import hashlib,json,os,subprocess,sys
 from pathlib import Path
 rows_path,error_path,observed_at,rc=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3],int(sys.argv[4])
 rows=[]
+def bare_resume(command):
+    # A claude resumed through the picker or --continue carries no id in argv;
+    # restore planning needs its cwd to know which conversations it may hold.
+    tokens=command.split()
+    if not tokens or os.path.basename(tokens[0]) != "claude":
+        return False
+    for i,tok in enumerate(tokens[1:],start=1):
+        if tok in ("--resume","-r","--continue","-c"):
+            nxt=tokens[i+1] if i+1 < len(tokens) else None
+            if nxt is None or nxt.startswith("-"):
+                return True
+    return False
+def cwd_of(pid):
+    try:
+        out=subprocess.run(["lsof","-a","-d","cwd","-Fn","-p",str(pid)],capture_output=True,text=True,timeout=5).stdout
+    except Exception:
+        out=""
+    for line in out.splitlines():
+        if line.startswith("n") and len(line) > 1:
+            return line[1:]
+    try:
+        return os.readlink("/proc/%d/cwd" % pid)
+    except OSError:
+        return None
 if rc == 0:
     for line in rows_path.read_text(errors="replace").splitlines():
         fields=line.strip().split(None,7)
         if len(fields)==8 and fields[0].isdigit() and fields[1].isdigit():
-            rows.append({"pid":int(fields[0]),"ppid":int(fields[1]),"started":" ".join(fields[2:7]),"command":fields[7]})
+            item={"pid":int(fields[0]),"ppid":int(fields[1]),"started":" ".join(fields[2:7]),"command":fields[7]}
+            if bare_resume(item["command"]):
+                cwd=cwd_of(item["pid"])
+                if cwd:
+                    item["cwd"]=cwd
+            rows.append(item)
 body=json.dumps(rows,sort_keys=True,separators=(",",":")).encode()
 error=error_path.read_text(errors="replace").strip() if rc else None
 print(json.dumps({"schema_version":1,"status":"available" if rc == 0 else "unavailable",
@@ -19083,9 +19112,19 @@ _snapshot_v1_to_v2() {
 _restore_plan_json() {
     local snapshot="$1" catalogue="$2" process="$3" codex_evidence="$4" host_id="$5" hostname_value="$6"
     local -a argv=(plan --snapshot "$snapshot" --catalogue "$catalogue" --process "$process" \
-        --host-id "$host_id" --hostname "$hostname_value")
+        --host-id "$host_id" --hostname "$hostname_value" \
+        --claude-sessions-dir "$CLAUDE_SESSIONS_DIR" --metadata-dir "$SESSION_METADATA_DIR")
     [[ -n "$codex_evidence" ]] && argv+=(--codex-evidence "$codex_evidence")
     python3 "$SCRIPT_DIR/lib/snapshot_restore.py" "${argv[@]}"
+}
+
+_scratch_rm() {
+    # Remove a mktemp -d scratch dir: only a non-empty, non-symlink directory
+    # under $TMPDIR (or /tmp), and then only that exact path. Always succeeds.
+    local dir="${1:-}" base="${TMPDIR:-/tmp}"
+    [[ -n "$dir" && "$dir" == "$base"/* && -d "$dir" && ! -L "$dir" ]] || return 0
+    rm -rf -- "$dir"
+    return 0
 }
 
 _session_snapshot() {
@@ -19117,7 +19156,7 @@ _session_snapshot() {
     process_file="$scratch/process.json"; resources_file="$scratch/resources.json"; snapshot_file="$scratch/snapshot.json"
     generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     hostname_value="${CCTRL_HOST_PREFIX:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
-    host_id="$(_cctrl_host_id)" || { rm -rf "$scratch"; return 69; }
+    host_id="$(_cctrl_host_id)" || { _scratch_rm "$scratch"; return 69; }
 
     if [[ -n "${CCTRL_SNAPSHOT_CATALOGUE_FILE:-}" ]]; then
         cp "$CCTRL_SNAPSHOT_CATALOGUE_FILE" "$catalogue_file" || catalogue_rc=$?
@@ -19135,7 +19174,7 @@ _session_snapshot() {
 
     if (( catalogue_rc != 0 )) || (( sessions_rc != 0 )) || ! jq -e 'type == "object" and .schema_version == 2' "$catalogue_file" >/dev/null 2>&1 || ! jq -e 'type == "array"' "$sessions_file" >/dev/null 2>&1; then
         $quiet || echo "snapshot: mandatory catalogue/tmux source unavailable; existing snapshots preserved." >&2
-        rm -rf "$scratch"
+        _scratch_rm "$scratch"
         return 69
     fi
     python3 "$SCRIPT_DIR/lib/snapshot_restore.py" capture --catalogue "$catalogue_file" --sessions "$sessions_file" \
@@ -19145,7 +19184,7 @@ _session_snapshot() {
     if (( capture_rc != 0 )); then
         $quiet || echo "snapshot: capture quality degraded; existing latest/history preserved." >&2
         $json_out && cat "$snapshot_file"
-        rm -rf "$scratch"
+        _scratch_rm "$scratch"
         return 69
     fi
 
@@ -19156,7 +19195,7 @@ _session_snapshot() {
     snapshot_bytes="$(wc -c < "$snapshot_file" | tr -d ' ')"
     if [[ "$max_bytes" =~ ^[0-9]+$ ]] && (( snapshot_bytes > max_bytes )); then
         $quiet || echo "snapshot: capture is ${snapshot_bytes} bytes, above CCTRL_SNAPSHOT_MAX_BYTES=${max_bytes}; existing latest/history preserved." >&2
-        rm -rf "$scratch"
+        _scratch_rm "$scratch"
         return 69
     fi
 
@@ -19168,7 +19207,7 @@ _session_snapshot() {
         existing_count="$(jq '.task_reference_count // .session_count // 0' "$snapshot_dir/latest.json" 2>/dev/null || echo 0)"
         if (( existing_count > 0 )); then
             $quiet || echo "snapshot: empty task catalogue, preserving existing latest.json with ${existing_count} task reference(s)."
-            rm -rf "$scratch"
+            _scratch_rm "$scratch"
             return 0
         fi
     fi
@@ -19185,8 +19224,8 @@ _session_snapshot() {
     task_count="$(jq '.task_reference_count' "$snapshot_file")"
     if $write_history; then
         ts_name="$(date -u +%Y%m%dT%H%M%SZ)"; history_file="$snapshot_dir/${ts_name}.json"
-        tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
-        cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$history_file" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
+        tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { _scratch_rm "$scratch"; return 1; }
+        cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$history_file" || { rm -f "$tmp_file"; _scratch_rm "$scratch"; return 1; }
     fi
     # Post-reboot guard (plan 070 D7): right after a power cycle no tmux
     # session is live, but registry rows survive, so the capture is non-empty
@@ -19203,16 +19242,16 @@ _session_snapshot() {
             $quiet || echo "snapshot: no live sessions (after a reboot?); keeping latest.json with ${old_live} live session(s)$($write_history && printf '; capture saved to history')."
         fi
         _snapshot_retention_prune "$snapshot_dir"
-        rm -rf "$scratch"
+        _scratch_rm "$scratch"
         return 0
     fi
-    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { rm -rf "$scratch"; return 1; }
-    cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$snapshot_dir/latest.json" || { rm -f "$tmp_file"; rm -rf "$scratch"; return 1; }
+    tmp_file="$(mktemp "$snapshot_dir/.snapshot-XXXXXX")" || { _scratch_rm "$scratch"; return 1; }
+    cat "$snapshot_file" > "$tmp_file" && mv "$tmp_file" "$snapshot_dir/latest.json" || { rm -f "$tmp_file"; _scratch_rm "$scratch"; return 1; }
     if $json_out; then cat "$snapshot_file"; else
         $quiet || echo "snapshot: ${task_count} task reference(s) written to ${snapshot_dir}/latest.json$($write_history || printf ' (unchanged; no history file)')"
     fi
     _snapshot_retention_prune "$snapshot_dir"
-    rm -rf "$scratch"
+    _scratch_rm "$scratch"
     return 0
 }
 
@@ -19225,18 +19264,44 @@ _restore_iso_epoch() {
     return 0
 }
 
+_restore_parse_kern_boottime() {
+    # Seconds from the raw `sysctl -n kern.boottime` text, which is
+    # `{ sec = 1794648679, usec = 473696 } Sat Nov 14 10:31:19 2026`. The
+    # pattern is anchored on the opening brace: an unanchored `sec = ` also
+    # matches inside `usec = ` and returns microseconds. Empty when it does
+    # not parse.
+    local raw="$1" out=""
+    out="$(printf '%s\n' "$raw" | sed -n 's/^[[:space:]]*{[[:space:]]*sec[[:space:]]*=[[:space:]]*\([0-9][0-9]*\)[[:space:]]*,.*/\1/p' | head -n 1)"
+    [[ "$out" =~ ^[0-9]+$ ]] && printf '%s' "$out"
+    return 0
+}
+
+_restore_parse_proc_btime() {
+    # Seconds from the text of Linux /proc/stat (a `btime N` line). Empty when absent.
+    local content="$1" out=""
+    out="$(printf '%s\n' "$content" | sed -n 's/^btime[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+    [[ "$out" =~ ^[0-9]+$ ]] && printf '%s' "$out"
+    return 0
+}
+
 _restore_boot_epoch() {
-    # When this boot began, epoch seconds. Seam: CCTRL_FAKE_BOOTTIME (epoch or
-    # RFC 3339 UTC). macOS: `sysctl -n kern.boottime` prints
-    # `{ sec = N, usec = M } <date>`; Linux: btime in /proc/stat. Empty when unknown.
-    local raw="${CCTRL_FAKE_BOOTTIME:-}" out=""
+    # When this boot began, epoch seconds; empty when unknown. TEST SEAM:
+    # CCTRL_FAKE_BOOTTIME (epoch seconds or RFC 3339 UTC) replaces the real
+    # source in production code too; nothing sets it, and it only changes
+    # which snapshot --from pre-boot picks. macOS reads kern.boottime, Linux
+    # /proc/stat btime (CCTRL_FAKE_PROC_STAT_FILE and CCTRL_FAKE_BOOTTIME_SYSCTL
+    # replace those inputs for tests).
+    local raw="${CCTRL_FAKE_BOOTTIME:-}" out="" text=""
     if [[ -n "$raw" ]]; then
         if [[ "$raw" =~ ^[0-9]+$ ]]; then printf '%s' "$raw"; else _restore_iso_epoch "$raw"; fi
         return 0
     fi
-    out="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9][0-9]*\).*/\1/p' | head -n 1 || true)"
-    if [[ ! "$out" =~ ^[0-9]+$ && -r /proc/stat ]]; then
-        out="$(sed -n 's/^btime \([0-9][0-9]*\).*/\1/p' /proc/stat 2>/dev/null | head -n 1 || true)"
+    if [[ -n "${CCTRL_FAKE_BOOTTIME_SYSCTL+x}" ]]; then text="$CCTRL_FAKE_BOOTTIME_SYSCTL"
+    else text="$(sysctl -n kern.boottime 2>/dev/null || true)"; fi
+    out="$(_restore_parse_kern_boottime "$text")"
+    if [[ ! "$out" =~ ^[0-9]+$ ]]; then
+        local stat_file="${CCTRL_FAKE_PROC_STAT_FILE:-/proc/stat}"
+        if [[ -r "$stat_file" ]]; then out="$(_restore_parse_proc_btime "$(cat "$stat_file" 2>/dev/null || true)")"; fi
     fi
     [[ "$out" =~ ^[0-9]+$ ]] && printf '%s' "$out"
     return 0
@@ -19284,9 +19349,20 @@ _restore_select_preboot() {
     printf '%s\n%s\n' "$best" "$why"
 }
 
+_restore_refusal_json() {
+    # The one document shape every refusal that happens before a plan exists
+    # prints under --json: ok:false, outcome:"refused", exit_code, error, plus
+    # any extra fields passed as a JSON object. args: exit_code error [extra_json]
+    local rc="$1" error="$2" extra="${3:-}"
+    [[ -n "$extra" ]] || extra='{}'
+    jq -n --argjson rc "$rc" --arg error "$error" --argjson extra "$extra" \
+        '{ok:false, outcome:"refused", exit_code:$rc, dry_run:null, error:$error, reason:$error, rows:[], plan:[], results:[], global_errors:[], source_snapshot:{},
+          result_counts:{restored:0,already_live:0,conflict:0,ambiguous:0,deferred:0,failed:0,not_restorable:0}} + $extra'
+}
+
 _restore_host_id_refusal() {
     local detail="$1" json="$2"
-    [[ "$json" == true ]] && jq -n --arg detail "$detail" '{ok:false,error:"durable host id unavailable",detail:$detail}'
+    [[ "$json" == true ]] && _restore_refusal_json 69 "durable host id unavailable" "$(jq -n --arg detail "$detail" '{detail:$detail}')"
     {
         echo "Refusing to restore: the durable host id is unavailable ($detail)."
         echo "Restore never creates a host id (a lost data/host-id means the data dir moved; a new id would make every recorded row foreign). Nothing was launched."
@@ -19336,6 +19412,7 @@ _restore_finish() {
                  evidence: ({attention: ($r.attention // null)}
                             + (if $r.tie_break then {tie_break: $r.tie_break} else {} end)
                             + (if $r.shadowed_task_ids then {shadowed_task_ids: $r.shadowed_task_ids} else {} end))})) as $results
+          | . + (if $outcome == "refused" then {error: $stopped, reason: $stopped} else {} end)
           | . + {ok: ($rc == 0), outcome: $outcome, exit_code: $rc, dry_run: $dry,
                  source_snapshot: ($source[0] // {}), plan: .rows, results: $results,
                  result_counts: {
@@ -19348,7 +19425,7 @@ _restore_finish() {
                    not_restorable: ([$results[] | select(.result == "skipped" and .evidence.attention == null)] | length)}}' \
             "$scratch/plan.json"
     fi
-    [[ -n "$scratch" && "$scratch" == */cctrl-restore-v2.* ]] && rm -rf -- "$scratch"
+    _scratch_rm "$scratch"
     return "$rc"
 }
 
@@ -19358,18 +19435,20 @@ _session_restore() {
     local snapshot_path="" dry_run=false assume_yes=false stale_ok=false force_host=false json=false quiet=false limit=""
     local from_mode=latest   # latest | explicit | pre-boot
     local -a only_patterns=()
+    local arg_json=false arg_i
+    for arg_i in "$@"; do [[ "$arg_i" == --json ]] && arg_json=true; done
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --from) [[ $# -ge 2 ]] || return 64
+            --from) [[ $# -ge 2 ]] || { $arg_json && _restore_refusal_json 64 "--from needs a value"; return 64; }
                 case "$2" in
                     latest) snapshot_path=""; from_mode=latest ;;
                     pre-boot) snapshot_path=""; from_mode="pre-boot" ;;
                     *) snapshot_path="$2"; from_mode=explicit ;;
                 esac
                 shift 2 ;;
-            --only) [[ $# -ge 2 ]] || return 64; only_patterns+=("$2"); shift 2 ;;
+            --only) [[ $# -ge 2 ]] || { $arg_json && _restore_refusal_json 64 "--only needs a value"; return 64; }; only_patterns+=("$2"); shift 2 ;;
             --dry-run) dry_run=true; shift ;;
-            --limit) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || return 64; limit="$2"; shift 2 ;;
+            --limit) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { $arg_json && _restore_refusal_json 64 "--limit needs a number"; return 64; }; limit="$2"; shift 2 ;;
             --yes|-y) assume_yes=true; shift ;;
             --stale-ok) stale_ok=true; shift ;;
             --force-host) force_host=true; shift ;;
@@ -19380,13 +19459,14 @@ _session_restore() {
                 echo "Plan or execute ownership-aware tmux resumes. Provider-managed tasks are never relaunched."
                 echo "A conflict or ambiguous row is skipped on its own; the other rows still restore. Every row is attempted before the exit code is chosen."
                 echo "--from pre-boot reads the newest complete snapshot with live sessions captured before this boot (max age CCTRL_RESTORE_BOOT_MAX_AGE, default 7 days)."
-                echo "Exit codes: 0 complete (every candidate restored or already live; nothing skipped for a conflict or ambiguity; or nothing to restore);"
+                echo "Exit codes: 0 complete (every candidate restored or already live; nothing skipped for a conflict or ambiguity; or nothing to restore; a cap/--limit deferral also exits 0 for now);"
                 echo "  1 at least one launch failed (the other rows were still attempted);"
                 echo "  75 partial: finished, but at least one row was skipped as conflict or ambiguous (--json: outcome partial);"
                 echo "  69 mandatory evidence unavailable (process table, registry/tmux source, data/host-id file, no pre-boot snapshot); nothing launched;"
                 echo "  64 invalid input, schema, stale snapshot or host mismatch; 78 needs --yes (no terminal). Nothing launched on 64, 69 or 78."
                 return 0 ;;
-            *) echo -e "${RED}Unknown restore flag: $1${RESET}" >&2; return 64 ;;
+            *) $arg_json && _restore_refusal_json 64 "unknown restore flag: $1"
+               echo -e "${RED}Unknown restore flag: $1${RESET}" >&2; return 64 ;;
         esac
     done
     # Restore only ever READS the durable host id: a missing file means the
@@ -19400,24 +19480,24 @@ _session_restore() {
         local boot_epoch pre_out
         boot_epoch="$(_restore_boot_epoch)"
         if [[ -z "$boot_epoch" ]]; then
-            $json && jq -n '{ok:false,error:"boot time unavailable"}'
+            $json && _restore_refusal_json 69 "boot time unavailable"
             echo "Refusing to restore: cannot determine this boot's start time (sysctl kern.boottime); nothing launched." >&2
             return 69
         fi
         max_age="${CCTRL_RESTORE_BOOT_MAX_AGE:-604800}"; [[ "$max_age" =~ ^[0-9]+$ ]] || max_age=604800
         if ! pre_out="$(_restore_select_preboot "$snapshots_dir" "$host_id" "$boot_epoch" "$max_age")"; then
-            $json && jq -n --arg why "$pre_out" '{ok:false,error:"no pre-boot snapshot found",why:$why}'
+            $json && _restore_refusal_json 69 "no pre-boot snapshot found" "$(jq -n --arg why "$pre_out" '{why:$why}')"
             { echo "Refusing to restore: no complete snapshot with live sessions was captured before this boot (looked in $snapshots_dir)."; printf '%s' "$pre_out"; } >&2
             return 69
         fi
         snapshot_path="$(printf '%s\n' "$pre_out" | sed -n 1p)"; source_why="$(printf '%s\n' "$pre_out" | sed -n 2p)"
     fi
     [[ -n "$snapshot_path" ]] || snapshot_path="$snapshots_dir/latest.json"
-    [[ -f "$snapshot_path" ]] || { $json && jq -n --arg path "$snapshot_path" '{ok:false,error:"snapshot not found",path:$path}'; return 64; }
+    [[ -f "$snapshot_path" ]] || { $json && _restore_refusal_json 64 "snapshot not found" "$(jq -n --arg path "$snapshot_path" '{path:$path}')"; return 64; }
 
     local schema generated_at snap_hostname local_hostname snap_epoch now_epoch age
     schema="$(jq -r '.schema_version // empty' "$snapshot_path" 2>/dev/null)"
-    [[ "$schema" == 1 || "$schema" == 2 ]] || { $json && jq -n --arg schema "$schema" '{ok:false,error:"unsupported snapshot schema",schema:$schema}'; return 64; }
+    [[ "$schema" == 1 || "$schema" == 2 ]] || { $json && _restore_refusal_json 64 "unsupported snapshot schema" "$(jq -n --arg schema "$schema" '{schema:$schema}')"; return 64; }
     generated_at="$(jq -r '.generated_at // empty' "$snapshot_path")"
     if [[ -n "$generated_at" ]] && ! $stale_ok && ! $assume_yes && [[ "$from_mode" != pre-boot ]]; then
         snap_epoch="$(date -j -u -f "%Y-%m-%dT%H:%M:%SZ" "$generated_at" +%s 2>/dev/null || date -u -d "$generated_at" +%s 2>/dev/null || true)"
@@ -19425,7 +19505,7 @@ _session_restore() {
         if [[ -n "$snap_epoch" ]]; then
             age=$(( now_epoch - snap_epoch ))
             if (( age > ${CCTRL_RESTORE_MAX_SNAPSHOT_AGE:-86400} )); then
-                $json && jq -n '{ok:false,error:"snapshot is stale"}'
+                $json && _restore_refusal_json 64 "snapshot is stale"
                 return 64
             fi
         fi
@@ -19453,8 +19533,8 @@ _session_restore() {
     fi
     if $host_mismatch && ! $force_host; then
         if $json; then
-            jq -n --arg snapshot "$snap_hostname" --arg local "$real_hostname" --arg sid "$snap_host_id" --arg lid "$host_id" \
-                '{ok:false,error:"snapshot host mismatch",snapshot_hostname:$snapshot,local_hostname:$local,snapshot_host_id:(if $sid=="" then null else $sid end),local_host_id:$lid}'
+            _restore_refusal_json 64 "snapshot host mismatch" "$(jq -n --arg snapshot "$snap_hostname" --arg local "$real_hostname" --arg sid "$snap_host_id" --arg lid "$host_id" \
+                '{snapshot_hostname:$snapshot,local_hostname:$local,snapshot_host_id:(if $sid=="" then null else $sid end),local_host_id:$lid}')"
         else
             echo "Refusing to restore: snapshot is from a different host (snapshot hostname '${snap_hostname:-unknown}', host id ${snap_host_id:-none}; this host '$real_hostname', host id $host_id). --force-host skips this check; rows are still matched by host id." >&2
         fi
@@ -19488,8 +19568,8 @@ _session_restore() {
         _restore_plan_json "$snapshot_path" "$catalogue_file" "$process_file" "$codex_file" "$host_id" "$local_hostname" > "$plan_file" || plan_rc=$?
     fi
     if ! jq -e 'type == "object" and (.rows | type == "array")' "$plan_file" >/dev/null 2>&1; then
-        $json && jq -n '{ok:false,error:"restore planner failed"}'
-        rm -rf "$scratch"; return 1
+        $json && _restore_refusal_json 1 "restore planner failed"
+        _scratch_rm "$scratch"; return 1
     fi
 
     # Filters and limits can demote eligible rows but can never upgrade them.
@@ -19511,16 +19591,17 @@ _session_restore() {
       reduce .rows[] as $row ({base:., rows:[], used:0};
         ($row | ((.tmux_session // "") + " " + (.display_label // "") + " " + (.purpose // "") + " " + (.cwd // "")) | ascii_downcase) as $haystack
         | (if ($needles|length)==0 then true else ([$needles[] | . as $needle | $haystack | contains($needle)] | any) end) as $matched
-        | if ($row.disposition=="restore" and (($row.tmux_session // "") as $t | any($placeholders[]; . == $t))) then .rows += [$row + {disposition:"insufficient-evidence",reason:"tmux placeholder session (server keeper)",action_capabilities:{restore:{supported:false,reason:"tmux placeholder session (server keeper)"}}}]
+        | if ($row.attention != null and ($matched|not)) then .rows += [($row | del(.attention)) + {attention_filtered:$row.attention}]
+          elif ($row.disposition=="restore" and (($row.tmux_session // "") as $t | any($placeholders[]; . == $t))) then .rows += [$row + {disposition:"insufficient-evidence",reason:"tmux placeholder session (server keeper)",action_capabilities:{restore:{supported:false,reason:"tmux placeholder session (server keeper)"}}}]
           elif ($row.disposition=="restore" and ($matched|not)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"filtered by --only",action_capabilities:{restore:{supported:false,reason:"filtered by --only"}}}]
           elif ($row.disposition=="restore" and $limit!="" and .used >= ($limit|tonumber)) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by --limit",action_capabilities:{restore:{supported:false,reason:"deferred by --limit"}}}]
           elif ($row.disposition=="restore" and ($live_active + .used) >= $max_active) then .rows += [$row + {disposition:"insufficient-evidence",reason:"deferred by CCTRL_RESTORE_MAX_ACTIVE",action_capabilities:{restore:{supported:false,reason:"deferred by CCTRL_RESTORE_MAX_ACTIVE"}}}]
           else .rows += [$row] | if $row.disposition=="restore" then .used += 1 else . end end)
       | .base + {rows:.rows} | .counts = (.rows | group_by(.disposition) | map({key:.[0].disposition,value:length}) | from_entries)' "$plan_file" > "$filtered"; then
-        rm -rf "$scratch"
+        _scratch_rm "$scratch"
         return 1
     fi
-    mv "$filtered" "$plan_file" || { rm -rf "$scratch"; return 1; }
+    mv "$filtered" "$plan_file" || { _scratch_rm "$scratch"; return 1; }
 
     if ! $json; then
         echo -e "${BOLD}Restore plan${RESET} ($(jq '.rows|length' "$plan_file") task references)"
@@ -19537,6 +19618,16 @@ _session_restore() {
     if $dry_run; then
         local dry_rc=0; (( attention_count == 0 )) || dry_rc=75
         _restore_finish "$scratch" "$json" true dry-run "$dry_rc"; return $?
+    fi
+    # Nothing to launch needs no confirmation, no terminal and no memory gate:
+    # every row is already live or was skipped on its own.
+    local pressure total_restorable
+    total_restorable="$(jq '[.rows[] | select(.disposition == "restore" and .action_capabilities.restore.supported == true and .action_capabilities.restore.reason == "tmux-resume")] | length' "$plan_file")"
+    if (( total_restorable == 0 )); then
+        local nothing_rc=0 nothing_outcome=complete
+        (( attention_count == 0 )) || { nothing_rc=75; nothing_outcome=partial; }
+        $quiet || $json || echo "Nothing to restore: no row needs a launch ($attention_count skipped for attention)."
+        _restore_finish "$scratch" "$json" "$dry_run" "$nothing_outcome" "$nothing_rc"; return $?
     fi
     if ! $assume_yes && [[ ! -t 0 || ! -t 1 ]]; then
         # A restore launches agents, so it needs a human yes: no terminal means
@@ -19555,17 +19646,6 @@ _session_restore() {
     # Same memory rule as `cctrl start` (_res_pressure_reason), checked before
     # the first wave and again before each later one; a refusal names the
     # number that tripped and stops at a clean wave boundary.
-    local pressure total_restorable
-    total_restorable="$(jq '[.rows[] | select(.disposition == "restore" and .action_capabilities.restore.supported == true and .action_capabilities.restore.reason == "tmux-resume")] | length' "$plan_file")"
-    if (( total_restorable == 0 )); then
-        # Nothing would launch (every row is already live or was skipped), so
-        # the memory gate has nothing to protect and must not turn a no-op
-        # into a refusal.
-        local nothing_rc=0 nothing_outcome=complete
-        (( attention_count == 0 )) || { nothing_rc=75; nothing_outcome=partial; }
-        $quiet || $json || echo "Nothing to restore: no row needs a launch ($attention_count skipped for attention)."
-        _restore_finish "$scratch" "$json" "$dry_run" "$nothing_outcome" "$nothing_rc"; return $?
-    fi
     if pressure="$(_res_pressure_reason)"; then
         echo "Refusing to restore: $pressure; $(_res_health_line)" >&2
         _restore_finish "$scratch" "$json" "$dry_run" refused 1 "$pressure"; return $?

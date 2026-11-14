@@ -18197,6 +18197,7 @@ _restore_run() {
         CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
         CCTRL_RESTORE_CATALOGUE_FILE="${SR_CATALOGUE-$dir/catalogue.json}" \
         CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$dir/claude-sessions" \
         CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" \
         CCTRL_RESTORE_LAUNCH_LOG="$dir/launch.log" \
         CCTRL_FAKE_MEM_FREE_PCT="${CCTRL_FAKE_MEM_FREE_PCT-80}" CCTRL_FAKE_SWAP_MB="${CCTRL_FAKE_SWAP_MB:-0}" \
@@ -18800,6 +18801,127 @@ test_restore_all_already_live_exits_0_fast_even_under_pressure() {
     out="$(CCTRL_FAKE_MEM_FREE_PCT=3 _restore_run "$dir" --yes --json 2>/dev/null)" || fail "json run failed"
     jq -e '.outcome=="complete" and .exit_code==0 and .result_counts.already_live>=4' <<< "$out" >/dev/null || fail "nothing-to-restore json wrong: $out"
     echo "ok: all already live exits 0 without touching the gate"
+}
+
+test_restore_boottime_parse_real_formats() {
+    local out
+    out="$(cctrl_source_eval '_restore_parse_kern_boottime "{ sec = 1794648679, usec = 473696 } Sat Nov 14 10:31:19 2026"')"
+    [[ "$out" == 1794648679 ]] || fail "kern.boottime must give the seconds, not usec: got '$out'"
+    out="$(cctrl_source_eval '_restore_parse_kern_boottime "{ sec = 1794648679, usec = 0 } Sat Nov 14 10:31:19 2026"')"
+    [[ "$out" == 1794648679 ]] || fail "usec = 0 variant: got '$out'"
+    out="$(cctrl_source_eval '_restore_parse_kern_boottime "garbage"')"
+    [[ -z "$out" ]] || fail "unparseable boottime must be empty: got '$out'"
+    out="$(cctrl_source_eval '_restore_parse_kern_boottime "{ usec = 5, sec = 7 }"')"
+    [[ -z "$out" ]] || fail "unexpected field order must not guess: got '$out'"
+    out="$(cctrl_source_eval '_restore_parse_proc_btime "$(printf "cpu  1 2 3\nbtime 1794648679\nprocesses 5\n")"')"
+    [[ "$out" == 1794648679 ]] || fail "Linux btime fixture: got '$out'"
+    out="$(cctrl_source_eval '_restore_parse_proc_btime "cpu 1 2 3"')"
+    [[ -z "$out" ]] || fail "no btime line must be empty: got '$out'"
+    # Through the whole resolver, with the real sysctl text and with a Linux /proc/stat fixture.
+    out="$(CCTRL_FAKE_BOOTTIME_SYSCTL="{ sec = 1794648679, usec = 473696 } Sat Nov 14 10:31:19 2026" cctrl_source_eval '_restore_boot_epoch')"
+    [[ "$out" == 1794648679 ]] || fail "_restore_boot_epoch via sysctl text: got '$out'"
+    printf 'cpu  1 2 3\nbtime 1794648000\n' > "$TMPDIR/fake-proc-stat"
+    out="$(CCTRL_FAKE_BOOTTIME_SYSCTL="" CCTRL_FAKE_PROC_STAT_FILE="$TMPDIR/fake-proc-stat" cctrl_source_eval '_restore_boot_epoch')"
+    [[ "$out" == 1794648000 ]] || fail "_restore_boot_epoch via /proc/stat fixture: got '$out'"
+    echo "ok: boot time parses the seconds from the real kern.boottime and /proc/stat formats"
+}
+
+test_restore_pre_boot_real_sysctl_text_selects_snapshot() {
+    local dir="$TMPDIR/restore-preboot-sysctl" out rc=0 snaps boot
+    _restore_fixture "$dir"
+    snaps="$dir/data/snapshots"; mkdir -p "$snaps"
+    jq --arg t "$(_restore_iso_ago 3)" '.generated_at=$t | .tasks |= map(.live=true)' "$dir/snapshots/latest.json" > "$snaps/latest.json"
+    boot="$(_restore_epoch_ago 2)"
+    out="$(CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME_SYSCTL="{ sec = $boot, usec = 473696 } Sat Nov 14 10:31:19 2026" SR_FROM=pre-boot _restore_run "$dir" --dry-run --json 2>/dev/null)" || rc=$?
+    jq -e '.source_snapshot.selection=="pre-boot" and .source_snapshot.live_count==5' <<< "$out" >/dev/null \
+        || fail "the real sysctl text must select the pre-boot snapshot (rc=$rc): $out"
+    echo "ok: --from pre-boot works from the real sysctl text"
+}
+
+test_restore_bare_resume_claude_blocks_its_cwd() {
+    local dir="$TMPDIR/restore-bare-resume" out rc=0
+    _restore_fixture "$dir"
+    mkdir -p "$dir/claude-sessions"
+    # A live claude resumed through the picker: no id in argv, cwd known, no session file.
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[{"pid":777,"ppid":1,"started":"x","command":"claude --name homelab --resume --chrome","cwd":"/Users/test/dev/cctrl"}],"error":null}' > "$dir/process.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "an unidentified claude in a row's cwd must give 75, got $rc: $out"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "a second claude was launched beside an unidentified live claude"
+    [[ "$(_restore_spawn_count "$dir")" -eq 3 ]] || fail "rows in other cwds must still launch: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="skipped" and .evidence.attention=="ambiguous" and (.reason|contains("unidentified live claude")))' <<< "$out" >/dev/null \
+        || fail "unidentified-claude row not reported: $out"
+    # The same process, but its session file names the conversation: already live, not ambiguous.
+    : > "$dir/launch.log"
+    printf '%s\n' '{"pid":777,"sessionId":"conv-aaa-111","cwd":"/Users/test/dev/cctrl"}' > "$dir/claude-sessions/777.json"
+    rc=0; out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a session file naming the conversation makes it already live (rc=$rc): $out"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="already-live")' <<< "$out" >/dev/null || fail "session-file match not reported: $out"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "the running conversation was launched"
+    echo "ok: a bare --resume claude is matched by session file or blocks its cwd"
+}
+
+test_restore_every_json_refusal_has_one_shape() {
+    local dir="$TMPDIR/restore-refusal-shape" out rc check
+    check() { # label expected_rc
+        jq -e --argjson rc "$2" '.ok==false and .outcome=="refused" and .exit_code==$rc and ((.error // .reason) | type=="string" and length>0)' <<< "$out" >/dev/null \
+            || fail "refusal '$1' is not the one document shape (rc=$rc): $out"
+        [[ "$rc" -eq "$2" ]] || fail "refusal '$1': expected exit $2, got $rc"
+    }
+    _restore_fixture "$dir"
+    mkdir -p "$dir/data/snapshots"
+    rc=0; out="$(CCTRL_DATA_DIR="$dir/data" SR_FROM=pre-boot CCTRL_FAKE_BOOTTIME_SYSCTL="" CCTRL_FAKE_PROC_STAT_FILE="$dir/none" _restore_run "$dir" --dry-run --json 2>/dev/null)" || rc=$?
+    check "boot time unknown" 69
+    rc=0; out="$(CCTRL_DATA_DIR="$dir/data" SR_FROM=pre-boot CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 2)" _restore_run "$dir" --dry-run --json 2>/dev/null)" || rc=$?
+    check "no pre-boot snapshot" 69
+    mv "$dir/host-id" "$dir/host-id.gone"
+    rc=0; out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    check "host id missing" 69
+    mv "$dir/host-id.gone" "$dir/host-id"
+    rc=0; out="$(SR_FROM="$dir/does-not-exist.json" _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    check "snapshot not found" 64
+    printf '{"schema_version":9,"tasks":[]}\n' > "$dir/bad-schema.json"
+    rc=0; out="$(SR_FROM="$dir/bad-schema.json" _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    check "bad schema" 64
+    jq '.host_id="ffffffffffffffffffffffffffffffff"' "$dir/snapshots/latest.json" > "$dir/foreign.json"
+    rc=0; out="$(SR_FROM="$dir/foreign.json" _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    check "host mismatch" 64
+    jq '.generated_at="2020-01-01T00:00:00Z"' "$dir/snapshots/latest.json" > "$dir/old.json"
+    rc=0; out="$(SR_FROM="$dir/old.json" _restore_run "$dir" --json 2>/dev/null)" || rc=$?
+    check "stale snapshot" 64
+    rc=0; out="$(_restore_run "$dir" --bogus-flag --json 2>/dev/null)" || rc=$?
+    check "unknown flag" 64
+    rc=0; out="$(_restore_run "$dir" --json 2>/dev/null </dev/null)" || rc=$?
+    check "no terminal, no --yes" 78
+    printf '%s\n' '{"schema_version":1,"status":"unavailable","observed_at":"2026-08-05T12:00:00Z","source_cursor":null,"processes":[],"error":"x"}' > "$dir/process.json"
+    rc=0; out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    check "process table unavailable" 69
+    echo "ok: every --json refusal prints outcome refused with exit_code and a reason"
+}
+
+test_restore_only_ignores_attention_on_other_rows() {
+    local dir="$TMPDIR/restore-only-attention" out rc=0
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict" | .execution_runtime="conflict" | .lifecycle_state="conflict")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_run "$dir" --only homelab --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "--only homelab must not exit 75 for an unrelated conflict row, got $rc: $out"
+    [[ "$(_restore_spawn_count "$dir")" -eq 1 ]] || fail "only the homelab row may launch: $(cat "$dir/launch.log")"
+    jq -e '.outcome=="complete"' <<< "$out" >/dev/null || fail "outcome must be complete: $out"
+    : > "$dir/launch.log"; rc=0
+    out="$(_restore_run "$dir" --only cctrl --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "--only on the conflict row itself must still be 75, got $rc: $out"
+    echo "ok: --only limits which rows count toward the exit code"
+}
+
+test_restore_nothing_to_do_needs_no_confirmation() {
+    local dir="$TMPDIR/restore-nothing-no-tty" out rc=0
+    _restore_fixture "$dir"
+    jq '.rows[].action_capabilities.tmux_attach={supported:true,reason:"available"}' "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+    out="$(_restore_run "$dir" 2>&1 </dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "all rows live, no tty, no --yes must exit 0, got $rc: $out"
+    assert_contains "$out" "Nothing to restore"
+    assert_not_contains "$out" "needs-user-decision"
+    echo "ok: nothing to restore exits 0 without a terminal or --yes"
 }
 
 test_restore_failed_launch_exits_1_and_others_still_attempted() {

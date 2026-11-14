@@ -965,15 +965,24 @@ table, a mandatory registry/tmux source, the `data/host-id` file) stops the run
 before anything launches. Before the usual checks, a row is already live when a
 `claude`/`codex` process carries its id as a whole argv token after
 `--resume`/`-r`/`--session-id` (or `codex resume <id>`), or when the current
-catalogue shows the same task live under another tmux name (a live fleet
-manager with a conflicted record is reported already live, not as a blocker).
-When every row is already live, restore prints "Nothing to restore" and exits 0
-without consulting the memory gate. Restore reads the durable host id and never
+catalogue shows the same task live under another tmux name. A conversation
+resumed through the picker (`claude --resume` with no id) is found through
+`<claude config dir>/sessions/<pid>.json` (`sessionId`), for the default config
+dir and every `claude_config_dir` a launch record names. A live bare `--resume`
+whose conversation cannot be read that way is an unidentified claude: any
+candidate row in its working directory is skipped as `ambiguous` (exit 75)
+rather than launched beside it. A live fleet manager whose record is conflicted
+is reported already live only when its id is in argv or in such a session file
+or the catalogue; otherwise the row is skipped as a conflict (75), never
+launched. `--only` limits which rows count toward the exit code. When no row
+needs a launch (every row already live or skipped), restore prints "Nothing to
+restore" and exits 0 (75 if a row needs attention) with no confirmation, no
+terminal and no memory gate. Restore reads the durable host id and never
 creates one (`data/host-id` missing: exit 69).
 
 | Exit | Meaning |
 |---|---|
-| `0` | complete: every candidate restored or already live, nothing skipped for a conflict or ambiguity |
+| `0` | complete: every candidate restored or already live, nothing skipped for a conflict or ambiguity. A row deferred by `CCTRL_RESTORE_MAX_ACTIVE` or `--limit` also exits 0 for now (`result: deferred`); boot restore step 2 will make a deferral that survives to the end exit 75 |
 | `1` | at least one launch failed (the other rows were still attempted) |
 | `75` | partial: finished, but at least one row was skipped as conflict or ambiguous |
 | `69` | mandatory evidence unavailable, no usable pre-boot snapshot, or no `data/host-id`; nothing launched |
