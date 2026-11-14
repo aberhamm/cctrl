@@ -18747,7 +18747,7 @@ test_restore_process_match_is_token_exact() {
       {"pid":1,"ppid":1,"started":"x","command":"grep conv-aaa-111"},
       {"pid":2,"ppid":1,"started":"x","command":"bash -c \"cctrl start -r conv-aaa-111\""},
       {"pid":3,"ppid":1,"started":"x","command":"claude --resume conv-aaa-1110"},
-      {"pid":4,"ppid":1,"started":"x","command":"claude --name conv-aaa-111 --resume"}],"error":null}' > "$dir/process.json"
+      {"pid":4,"ppid":1,"started":"x","command":"claude --name conv-aaa-111 --model m"}],"error":null}' > "$dir/process.json"
     out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "decoy process lines must not block anything (rc=$rc): $out"
     grep -q "conv-aaa-111" "$dir/launch.log" || fail "a grep/bash/longer-id/name line wrongly counted as running: $(cat "$dir/launch.log")"
