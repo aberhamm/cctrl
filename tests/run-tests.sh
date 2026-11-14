@@ -5134,7 +5134,7 @@ test_context_names() {
     mkdir -p "$project"
 
     local out
-    out="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 "$ROOT/cctrl" start --agent claude -m "bridge prompt")"
+    out="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 "$ROOT/cctrl" start --foreground --agent claude -m "bridge prompt")"
     assert_contains "$out" "CMD=claude"
     assert_contains "$out" "--remote-control"
     assert_contains "$out" "--remote-control-session-name-prefix"
@@ -5150,7 +5150,7 @@ test_bridge_prefix_matches_explicit_name() {
     mkdir -p "$project"
 
     local out
-    out="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 "$ROOT/cctrl" start --agent claude --name TMUX--ms--portal -m "hi")"
+    out="$(cd "$project" && PATH="$TMPDIR:$PATH" CCTRL_HOST_PREFIX=ms CCTRL_TMUX_CONTEXT=1 "$ROOT/cctrl" start --foreground --agent claude --name TMUX--ms--portal -m "hi")"
     assert_contains "$out" "--remote-control-session-name-prefix"
     assert_contains "$out" "TMUX--ms--portal-"
     # The old cwd-derived prefix must NOT appear.
