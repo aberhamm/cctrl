@@ -949,6 +949,18 @@ evidence. Names, titles, cwd, tmux-looking strings, and `cctrl_managed:true`
 never authorize restore. `--force-host` bypasses only an envelope hostname for
 inspection; it cannot make a foreign durable-host row eligible.
 
+The host check compares the snapshot's durable host id with this machine's, so
+`CCTRL_HOST_PREFIX` does not cause a false refusal; a snapshot from a different
+host exits `64`. Without a terminal and without `--yes`, restore launches
+nothing and exits **78**; the first stderr line is
+`cctrl: needs-user-decision: restore-confirmation`, followed by the reason. A
+caller that gets 78 must ask the human, then re-run with `--yes`.
+
+Separately, `cctrl start -r <id>` and `cctrl @name -r <id>` run from inside a
+session with no terminal (an agent's Bash tool) never run the agent inline in
+the caller's pane: they print a note and start detached. Pass `--foreground` to
+force inline.
+
 Schema-v1 remains readable through a conservative adapter. Legacy Codex rows
 are always insufficient evidence. A legacy Claude row can become a candidate
 only when it was managed, has a nonempty conversation id, an absolute cwd, and

@@ -3812,6 +3812,19 @@ _launch_app_owned_codex() {
     return "$rc"
 }
 
+# CCTRL_TMUX_CONTEXT=1 is inherited by everything an agent runs (its Bash
+# tool), so it cannot by itself mean "run inline": a non-interactive
+# `cctrl start` / `cctrl @name` from inside a session would run the agent in
+# the caller's pane under the caller's identity. The pane's own launch command
+# passes --foreground explicitly; otherwise inline needs a real terminal, and
+# without one the launch goes detached.
+_inline_context_mode() {
+    [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" && -t 0 && -t 1 ]]
+}
+_inline_context_nested_no_tty() {
+    [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && ! { [[ -t 0 && -t 1 ]]; }
+}
+
 cmd_start() {
     # Unified launch verb. Interactive starts are tmux-backed by default so
     # local and remote sessions are durable and addressable. Use
@@ -3830,19 +3843,9 @@ cmd_start() {
     fi
     local detach=false arg
     local foreground=false explicit_foreground=false nested_no_tty=false
-    # CCTRL_TMUX_CONTEXT=1 is inherited by everything an agent runs (its Bash
-    # tool), so it cannot by itself mean "run inline": a non-interactive
-    # `cctrl start` from inside a session would run the agent in the caller's
-    # pane under the caller's identity. The pane's own launch command passes
-    # --foreground explicitly; otherwise inline needs a real terminal, and
-    # without one start goes detached.
-    if [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]]; then
-        if [[ -t 0 && -t 1 ]]; then
-            foreground=true
-        else
-            nested_no_tty=true
-        fi
-    fi
+    # Inline-vs-detached rule shared with `cctrl @name`; see the helper.
+    _inline_context_mode && foreground=true
+    _inline_context_nested_no_tty && nested_no_tty=true
     for arg in "$@"; do
         [[ "$arg" == "--" ]] && break   # rest is a literal prompt; stop scanning
         case "$arg" in
@@ -19280,7 +19283,7 @@ _session_restore() {
             jq -n --arg snapshot "$snap_hostname" --arg local "$real_hostname" --arg sid "$snap_host_id" --arg lid "$host_id" \
                 '{ok:false,error:"snapshot host mismatch",snapshot_hostname:$snapshot,local_hostname:$local,snapshot_host_id:(if $sid=="" then null else $sid end),local_host_id:$lid}'
         else
-            echo "Refusing to restore: snapshot is from a different host (snapshot hostname '${snap_hostname:-unknown}', host id ${snap_host_id:-none}; this host '$real_hostname', host id $host_id). Re-run with --force-host to override." >&2
+            echo "Refusing to restore: snapshot is from a different host (snapshot hostname '${snap_hostname:-unknown}', host id ${snap_host_id:-none}; this host '$real_hostname', host id $host_id). --force-host skips this check; rows are still matched by host id." >&2
         fi
         return 64
     fi
@@ -24455,14 +24458,20 @@ _shortcut_jump() {
         return 1
     fi
 
-    local shortcut_foreground=false a
-    [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && shortcut_foreground=true
+    local shortcut_foreground=false shortcut_explicit=false shortcut_detach=false a
+    _inline_context_mode && shortcut_foreground=true
     for a in ${original_args[@]+"${original_args[@]}"}; do
         [[ "$a" == "--" ]] && break
         case "$a" in
-            --foreground|--no-tmux) shortcut_foreground=true ;;
+            --foreground|--no-tmux) shortcut_foreground=true; shortcut_explicit=true ;;
+            -d|--detach) shortcut_detach=true ;;
         esac
     done
+
+    if _inline_context_nested_no_tty && ! $shortcut_explicit && ! $shortcut_detach; then
+        echo "cctrl: start from inside a session with no terminal never runs the agent inline; starting detached (use --foreground to force inline)." >&2
+        shortcut_foreground=false
+    fi
 
     if ! $shortcut_foreground; then
         _launch_detached "@$key" ${original_args[@]+"${original_args[@]}"}

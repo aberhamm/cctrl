@@ -1,7 +1,9 @@
 ---
 id: 109
 title: "restore: CCTRL_HOST_PREFIX vs snapshot hostname mismatch makes plain restore exit 64 on the Studio"
-status: blocked
+status: skipped
+skipped: 2026-11-14
+skipped-reason: "superseded by the restore host-id fix (ec6a104, with the @name follow-up on this branch): the host check compares the durable host id, not the prefix"
 blocked-by: []
 priority:
 goal: restore-cctrl-host-prefix-vs-snapshot-hostname-mismatch
