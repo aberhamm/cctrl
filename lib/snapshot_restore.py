@@ -269,6 +269,139 @@ def launch_flags_for(metadata_dir: str, tmux_name: str | None) -> dict[str, Any]
     return flags
 
 
+TIE_MARGIN_DEFAULT = 120
+PROCESS_AGENTS = {"claude", "codex", "cctrl"}
+RESUME_FLAGS = {"--resume", "-r", "--session-id"}
+
+
+def _parse_time(value: Any) -> float | None:
+    """Epoch seconds for an RFC 3339 UTC string (fractions and a +00:00 suffix allowed), else None."""
+    if not isinstance(value, str) or not value:
+        return None
+    candidate = value.strip()
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1]
+    elif candidate.endswith("+00:00"):
+        candidate = candidate[:-6]
+    if "." in candidate:
+        candidate = candidate.split(".", 1)[0]
+    try:
+        parsed = dt.datetime.strptime(candidate, "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+def _iso(epoch: float | None) -> str | None:
+    if epoch is None:
+        return None
+    return dt.datetime.fromtimestamp(epoch, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def transcript_stat(task_id: str | None, projects_dirs: list[str]) -> tuple[float, int] | None:
+    """(mtime, size) of the newest <projects>/*/<id>.jsonl, or None."""
+    if not task_id or "/" in task_id or task_id in (".", ".."):
+        return None
+    best: tuple[float, int] | None = None
+    for directory in projects_dirs:
+        root = Path(directory)
+        if not root.is_dir():
+            continue
+        try:
+            for path in root.glob("*/" + task_id + ".jsonl"):
+                try:
+                    info = path.stat()
+                except OSError:
+                    continue
+                if best is None or info.st_mtime > best[0]:
+                    best = (info.st_mtime, info.st_size)
+        except OSError:
+            continue
+    return best
+
+
+def tie_break(claims: list[dict[str, Any]], host_id: str, projects_dirs: list[str], margin: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+    """Pick one of several open claims on a tmux name that is not live.
+
+    Returns (chosen, evidence, reason). chosen is None (a refusal, with the
+    specific reason) unless exactly one eligible claim has the newest activity
+    by at least `margin` seconds and all claims with activity evidence share
+    one cwd. Thin evidence refuses; it never guesses.
+    """
+    candidates = [
+        c for c in claims
+        if (text(c.get("host_id")) or host_id) == host_id
+        and c.get("registered_by_cctrl") is True and c.get("launched_by_cctrl") is True
+        and c.get("restore_strategy") in ("tmux", "tmux-resume")
+        and text(c.get("provider")) in ("claude", "codex")
+    ]
+    if not candidates:
+        return None, None, "no eligible candidate among the open claims"
+    if len({text(c.get("provider")) for c in candidates}) > 1:
+        return None, None, "the open claims belong to different providers"
+    provider = text(candidates[0].get("provider"))
+    detail: list[dict[str, Any]] = []
+    timed: list[tuple[float, dict[str, Any]]] = []
+    for candidate in candidates:
+        task_id = text(candidate.get("provider_task_id"))
+        stat = transcript_stat(task_id, projects_dirs) if provider == "claude" else None
+        recency = _parse_time(candidate.get("recency"))
+        moment = stat[0] if stat else (recency if provider == "codex" else None)
+        detail.append({
+            "id": task_id,
+            "transcript_mtime": _iso(stat[0]) if stat else None,
+            "transcript_bytes": stat[1] if stat else None,
+            "recency": text(candidate.get("recency")),
+            "cwd": text(candidate.get("cwd")),
+        })
+        if moment is not None:
+            timed.append((moment, candidate))
+    if not timed:
+        return None, None, "no candidate has a transcript"
+    if len({text(c.get("cwd")) for _, c in timed}) > 1:
+        return None, None, "candidates with activity evidence have different cwds"
+    timed.sort(key=lambda item: item[0], reverse=True)
+    lead = None if len(timed) == 1 else timed[0][0] - timed[1][0]
+    if lead is not None and lead < margin:
+        return None, None, f"the two newest candidates are within {margin}s of each other"
+    chosen = timed[0][1]
+    evidence = {
+        "basis": "transcript-mtime" if provider == "claude" else "record-recency",
+        "chosen": text(chosen.get("provider_task_id")),
+        "margin_s": None if lead is None else int(lead),
+        "candidates": detail,
+    }
+    return chosen, evidence, ""
+
+
+def process_running(process: dict[str, Any], task_ids: list[str]) -> tuple[int, str] | None:
+    """(pid, matched id) of a claude/codex/cctrl process that resumes one of the ids.
+
+    Whole-token matching only: the id must follow --resume / -r / --session-id
+    (or `resume` for codex) as its own argv token, or sit in --resume=ID. A
+    substring match would catch a grep, a peer command or an agent's Bash line.
+    """
+    wanted = {i for i in task_ids if i}
+    if not wanted:
+        return None
+    for item in process.get("processes") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("command"), str):
+            continue
+        tokens = item["command"].split()
+        if not tokens or os.path.basename(tokens[0]) not in PROCESS_AGENTS:
+            continue
+        agent = os.path.basename(tokens[0])
+        for index, token in enumerate(tokens):
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if token in RESUME_FLAGS and following in wanted:
+                return int(item.get("pid") or 0), following
+            if agent in ("codex", "cctrl") and token == "resume" and following in wanted:
+                return int(item.get("pid") or 0), following
+            if token.startswith(("--resume=", "--session-id=")) and token.split("=", 1)[1] in wanted:
+                return int(item.get("pid") or 0), token.split("=", 1)[1]
+    return None
+
+
 def capture(args: argparse.Namespace) -> int:
     catalogue = load(args.catalogue)
     sessions = load(args.sessions)
@@ -365,6 +498,11 @@ def capture(args: argparse.Namespace) -> int:
                 and source.get("control_owner") != "app" and source.get("execution_runtime") != "app-server" \
                 and source["tmux_session"] not in live_names:
             open_claims.setdefault(source["tmux_session"], []).append(source)
+    # Several open claims on a dead name: pick by activity evidence or refuse.
+    decisions: dict[str, tuple[dict[str, Any] | None, dict[str, Any] | None, str]] = {
+        name: tie_break(claims, args.host_id, list(args.claude_projects_dir or []), args.tie_margin)
+        for name, claims in open_claims.items() if len(claims) > 1
+    }
     for source in rows:
         if not isinstance(source, dict):
             continue
@@ -374,8 +512,10 @@ def capture(args: argparse.Namespace) -> int:
         if (provider, task_id, tmux_name) in seen or (tmux_name and tmux_name in live_names):
             continue
         claims = open_claims.get(tmux_name or "", []) if source.get("lifecycle_state") not in ENDED_STATES else []
-        if len(claims) > 1 and source is not claims[0]:
-            continue  # represented by the first claim's row, listed in its shadowed_task_ids
+        decision = decisions.get(tmux_name or "") if len(claims) > 1 else None
+        representative = (decision[0] if decision and decision[0] is not None else claims[0]) if len(claims) > 1 else None
+        if len(claims) > 1 and source is not representative:
+            continue  # represented by one claim's row, the rest listed in its shadowed_task_ids
         strategy = source.get("restore_strategy")
         if strategy == "tmux":
             strategy = "tmux-resume"
@@ -427,10 +567,14 @@ def capture(args: argparse.Namespace) -> int:
             continue
         apply_label_bounds(row)
         if len(claims) > 1:
-            row["shadowed_task_ids"] = sorted(text(c.get("provider_task_id")) or "" for c in claims[1:])
-            row["control_owner"] = row["execution_runtime"] = row["lifecycle_state"] = "unknown"
-            row["recovery_action"] = "unknown"
-            row["recovery_reason"] = "ambiguous-tmux-claim: several open records claim a tmux name that is not live"
+            row["shadowed_task_ids"] = sorted(text(c.get("provider_task_id")) or "" for c in claims if c is not source)
+            if decision and decision[0] is not None:
+                row["tie_break"] = decision[1]
+                row["recovery_action"], row["recovery_reason"] = action_for(row)
+            else:
+                row["control_owner"] = row["execution_runtime"] = row["lifecycle_state"] = "unknown"
+                row["recovery_action"] = "unknown"
+                row["recovery_reason"] = "ambiguous-tmux-claim: several open records claim a tmux name that is not live" + (f" ({decision[2]})" if decision and decision[2] else "")
         else:
             row["recovery_action"], row["recovery_reason"] = action_for(row)
         tasks.append(row)
@@ -585,7 +729,31 @@ def reconcile_record(reconcile: dict[str, Any], task_id: str, host_id: str) -> t
     return row, None
 
 
+def live_catalogue_names(rows: list[Any], provider: str, task_id: str, host_id: str) -> list[str]:
+    """tmux names of current catalogue rows that hold this exact task live."""
+    names = []
+    for item in rows:
+        if (
+            isinstance(item, dict)
+            and item.get("provider") == provider
+            and item.get("provider_task_id") == task_id
+            and item.get("host_id") == host_id
+            and item.get("action_capabilities", {}).get("tmux_attach", {}).get("supported") is True
+        ):
+            names.append(text(item.get("tmux_session")) or "")
+    return sorted(set(names))
+
+
 def plan(args: argparse.Namespace) -> int:
+    """Classify every snapshot row against current evidence.
+
+    Each row gets its own disposition. Only evidence that no row could be
+    judged without (the process table, a mandatory catalogue source) is a
+    run-level `global_errors` entry (exit 69). A row that is skipped for a
+    reason a human should look at carries `attention`: "conflict" or
+    "ambiguous". `--strict` restores the pre-boot-restore exit codes (75 for
+    any conflict, 69 for any missing evidence) for external callers.
+    """
     snapshot = load(args.snapshot)
     if snapshot.get("schema_version") == 1:
         snapshot = adapt_v1(snapshot, args.host_id, args.hostname)
@@ -597,10 +765,25 @@ def plan(args: argparse.Namespace) -> int:
     rows = catalogue.get("rows") if isinstance(catalogue, dict) else None
     if not isinstance(rows, list):
         raise RuntimeError("live catalogue is unavailable")
+    process_ok = (
+        isinstance(process, dict)
+        and process.get("status") == "available"
+        and not process.get("error")
+        and bool(text(process.get("source_cursor")))
+        and isinstance(process.get("processes"), list)
+    )
 
     results = []
-    evidence_missing = False
-    conflict = False
+    global_errors: list[dict[str, str]] = []
+
+    def add_global(source: str, error: str) -> None:
+        entry = {"source": source, "error": error}
+        if entry not in global_errors:
+            global_errors.append(entry)
+
+    # The pre-boot-restore exit codes, kept for `plan --strict`.
+    strict_evidence_missing = False
+    strict_conflict = False
     for source in snapshot["tasks"]:
         if not isinstance(source, dict):
             continue
@@ -609,41 +792,61 @@ def plan(args: argparse.Namespace) -> int:
         task_id = text(row.get("provider_task_id"))
         disposition, reason = "insufficient-evidence", "closed restore predicate not satisfied"
         capability = {"supported": False, "reason": reason}
+        attention: str | None = None
+        snapshot_conflict = "conflict" in (row.get("control_owner"), row.get("execution_runtime"), row.get("lifecycle_state"))
+        snapshot_provider_managed = not snapshot_conflict and (
+            row.get("control_owner") == "app" or row.get("execution_runtime") == "app-server"
+            or row.get("restore_strategy") == "provider-managed" or row.get("lifecycle_state") == "released"
+        )
+        running = None
+        live_names: list[str] = []
+        if task_id and not snapshot_provider_managed and row.get("host_id") == args.host_id:
+            if process_ok:
+                running = process_running(process, [task_id] + [i for i in row.get("shadowed_task_ids") or [] if isinstance(i, str)])
+            live_names = [n for n in live_catalogue_names(rows, provider, task_id, args.host_id) if n != (text(row.get("tmux_session")) or "")]
 
         if row.get("host_id") != args.host_id:
-            disposition, reason, conflict = "insufficient-evidence", "durable host id mismatch", True
-        elif "conflict" in (row.get("control_owner"), row.get("execution_runtime"), row.get("lifecycle_state")):
-            disposition, reason, conflict = "conflict", "snapshot ownership conflict", True
-        elif row.get("control_owner") == "app" or row.get("execution_runtime") == "app-server" or row.get("restore_strategy") == "provider-managed" or row.get("lifecycle_state") == "released":
+            disposition, reason, strict_conflict, attention = "insufficient-evidence", "durable host id mismatch", True, "conflict"
+        elif running:
+            pid, matched = running
+            disposition = "already-live"
+            reason = f"conversation already running (pid {pid})" if matched == task_id else f"a sibling record is running (pid {pid})"
+        elif live_names:
+            disposition, reason = "already-live", "live under " + ", ".join(n or "an unnamed session" for n in live_names)
+        elif snapshot_conflict:
+            disposition, reason, strict_conflict, attention = "conflict", "snapshot ownership conflict", True, "conflict"
+        elif snapshot_provider_managed:
             disposition, reason = "provider-managed", "provider owns persistence; no cctrl spawn"
         elif row.get("control_owner") == "unknown" or row.get("execution_runtime") == "unknown":
             disposition, reason = "unknown", "snapshot owner or runtime is unknown"
+            recorded = text(row.get("recovery_reason")) or ""
+            if recorded.startswith("ambiguous-tmux-claim"):
+                reason, attention = recorded, "ambiguous"
         elif not task_id:
             reason = "provider task id is missing"
-        elif (
-            process.get("status") != "available"
-            or process.get("error")
-            or not text(process.get("source_cursor"))
-            or not isinstance(process.get("processes"), list)
-        ):
-            reason, evidence_missing = "mandatory process evidence unavailable", True
+        elif not process_ok:
+            reason = "mandatory process evidence unavailable"
+            strict_evidence_missing = True
+            add_global("process", reason)
         else:
             available, source_reason = source_available(catalogue, provider)
             if not available:
-                reason, evidence_missing = source_reason, True
+                reason, strict_evidence_missing = source_reason, True
+                add_global("catalogue", source_reason)
             else:
                 matches = [item for item in rows if isinstance(item, dict) and item.get("provider") == provider and item.get("provider_task_id") == task_id and item.get("host_id") == args.host_id]
                 if len(matches) != 1:
                     disposition = "conflict" if len(matches) > 1 else "insufficient-evidence"
                     reason = "live identity is ambiguous" if len(matches) > 1 else "live identity is absent"
-                    conflict = conflict or len(matches) > 1
-                    evidence_missing = evidence_missing or len(matches) == 0
+                    attention = "conflict" if len(matches) > 1 else "ambiguous"
+                    strict_conflict = strict_conflict or len(matches) > 1
+                    strict_evidence_missing = strict_evidence_missing or len(matches) == 0
                 else:
                     current = matches[0]
                     if provider == "codex":
                         reconciled, reconcile_error = reconcile_record(reconcile, task_id, args.host_id)
                         if reconcile_error:
-                            reason, evidence_missing = reconcile_error, True
+                            reason, strict_evidence_missing, attention = reconcile_error, True, "ambiguous"
                             current_outcome = {}
                         else:
                             current_outcome = reconciled.get("chosen_outcome") if isinstance(reconciled.get("chosen_outcome"), dict) else {}
@@ -667,7 +870,7 @@ def plan(args: argparse.Namespace) -> int:
                         state = current_outcome.get("lifecycle_state")
                         live = current.get("action_capabilities", {}).get("tmux_attach", {}).get("supported") is True
                         if "conflict" in (owner, runtime, state):
-                            disposition, reason, conflict = "conflict", "current ownership evidence conflicts", True
+                            disposition, reason, strict_conflict, attention = "conflict", "current ownership evidence conflicts", True, "conflict"
                         elif state in {"archived", "closed"}:
                             disposition, reason = "insufficient-evidence", f"current lifecycle state is {state}"
                         elif owner == "app" or runtime == "app-server" or current_outcome.get("restore_strategy") == "provider-managed" or state == "released":
@@ -676,9 +879,10 @@ def plan(args: argparse.Namespace) -> int:
                             disposition, reason = "already-live", "exact provider task already has a live cctrl tmux owner"
                         elif owner == "unknown" or runtime == "unknown":
                             if not (provider == "codex" and codex_absence_proven and owner == "unknown" and runtime == "unknown"):
-                                disposition, reason = "unknown", "current ownership evidence is unknown or ambiguous"
+                                disposition, reason, attention = "unknown", "current ownership evidence is unknown or ambiguous", "ambiguous"
                                 row["disposition"] = disposition
                                 row["reason"] = reason
+                                row["attention"] = attention
                                 row["action_capabilities"] = {"restore": {"supported": False, "reason": reason}}
                                 results.append(row)
                                 continue
@@ -711,6 +915,8 @@ def plan(args: argparse.Namespace) -> int:
             capability = {"supported": False, "reason": reason}
         row["disposition"] = disposition
         row["reason"] = reason
+        if attention:
+            row["attention"] = attention
         row["action_capabilities"] = {"restore": capability}
         results.append(row)
 
@@ -721,14 +927,17 @@ def plan(args: argparse.Namespace) -> int:
         "host_id": args.host_id,
         "rows": results,
         "counts": {name: sum(1 for row in results if row["disposition"] == name) for name in sorted(VALID_DISPOSITIONS)},
+        "global_errors": global_errors,
         "source_errors": catalogue.get("source_errors", []) if isinstance(catalogue, dict) else [],
     }
     dump(document)
-    if conflict:
-        return 75
-    if evidence_missing:
-        return 69
-    return 0
+    if args.strict:
+        if strict_conflict:
+            return 75
+        if strict_evidence_missing:
+            return 69
+        return 0
+    return 69 if global_errors else 0
 
 
 def launch_flags_cmd(args: argparse.Namespace) -> int:
@@ -751,6 +960,8 @@ def main() -> int:
     capture_parser.add_argument("--hostname", required=True)
     capture_parser.add_argument("--generated-at", required=True)
     capture_parser.add_argument("--metadata-dir", required=True)
+    capture_parser.add_argument("--claude-projects-dir", action="append", default=[], help="Claude transcript root (repeatable); evidence for the duplicate-claim tie-break")
+    capture_parser.add_argument("--tie-margin", type=int, default=TIE_MARGIN_DEFAULT, help="seconds the newest claim must lead the runner-up")
     capture_parser.set_defaults(func=capture)
     adapt_parser = sub.add_parser("adapt-v1")
     adapt_parser.add_argument("--snapshot", required=True)
@@ -764,6 +975,7 @@ def main() -> int:
     plan_parser.add_argument("--codex-evidence")
     plan_parser.add_argument("--host-id", required=True)
     plan_parser.add_argument("--hostname", required=True)
+    plan_parser.add_argument("--strict", action="store_true", help="exit 75 on any conflict and 69 on any missing evidence (pre-boot-restore behaviour)")
     plan_parser.set_defaults(func=plan)
     flags_parser = sub.add_parser("launch-flags")
     flags_parser.add_argument("--metadata-dir", required=True)
