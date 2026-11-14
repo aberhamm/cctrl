@@ -18696,6 +18696,230 @@ test_restore_exit_codes() {
     echo "ok: exit codes"
 }
 
+# --- boot restore, step 1: per-row classification, source pinning, exit codes ---
+
+_restore_iso_ago() { # hours ago as RFC 3339 UTC
+    date -u -v-"$1"H +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d "$1 hours ago" +"%Y-%m-%dT%H:%M:%SZ"
+}
+_restore_epoch_ago() { # hours ago as epoch seconds
+    date -u -v-"$1"H +%s 2>/dev/null || date -u -d "$1 hours ago" +%s
+}
+
+test_restore_conflict_row_does_not_block_others() {
+    local dir="$TMPDIR/restore-conflict-row" out rc=0
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict" | .execution_runtime="conflict" | .lifecycle_state="conflict")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "one conflict row must give 75 (partial), got $rc: $out"
+    [[ "$(_restore_spawn_count "$dir")" -eq 3 ]] || fail "the three other restorable rows must launch, got: $(cat "$dir/launch.log")"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "the conflict row was launched"
+    jq -e '.outcome=="partial" and .exit_code==75 and .ok==false
+        and any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="skipped" and .evidence.attention=="conflict")
+        and ([.results[] | select(.result=="restored")] | length)==3
+        and .result_counts.restored==3 and .result_counts.conflict==1
+        and .source_snapshot.selection=="explicit"' <<< "$out" >/dev/null || fail "partial outcome/results wrong: $out"
+    echo "ok: a conflict row is skipped alone"
+}
+
+test_restore_live_fm_with_conflict_record_is_already_live() {
+    local dir="$TMPDIR/restore-live-fm" out rc=0
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict" | .execution_runtime="conflict" | .lifecycle_state="conflict")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    jq '(.rows[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict" | .execution_runtime="conflict" | .lifecycle_state="conflict")' \
+        "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[{"pid":4242,"ppid":1,"started":"x","command":"claude --model m --resume conv-aaa-111 --chrome"}],"error":null}' > "$dir/process.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a running conversation with a conflicted record is already live: expected 0, got $rc: $out"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "the running conversation was launched"
+    [[ "$(_restore_spawn_count "$dir")" -eq 3 ]] || fail "the other rows must launch, got: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="already-live" and (.reason|contains("conversation already running (pid 4242)")))' <<< "$out" >/dev/null \
+        || fail "the FM row was not reported already-live: $out"
+    echo "ok: a live conversation beats a conflicted record"
+}
+
+test_restore_process_match_is_token_exact() {
+    local dir="$TMPDIR/restore-token-exact" out rc=0
+    _restore_fixture "$dir"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[
+      {"pid":1,"ppid":1,"started":"x","command":"grep conv-aaa-111"},
+      {"pid":2,"ppid":1,"started":"x","command":"bash -c \"cctrl start -r conv-aaa-111\""},
+      {"pid":3,"ppid":1,"started":"x","command":"claude --resume conv-aaa-1110"},
+      {"pid":4,"ppid":1,"started":"x","command":"claude --name conv-aaa-111 --resume"}],"error":null}' > "$dir/process.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "decoy process lines must not block anything (rc=$rc): $out"
+    grep -q "conv-aaa-111" "$dir/launch.log" || fail "a grep/bash/longer-id/name line wrongly counted as running: $(cat "$dir/launch.log")"
+    echo "ok: process matching is whole-token"
+}
+
+test_restore_live_under_other_name_already_live() {
+    local dir="$TMPDIR/restore-other-name" out
+    _restore_fixture "$dir"
+    jq '(.rows[] | select(.provider_task_id=="conv-aaa-111")) |= (.tmux_session="TMUX--other" | .action_capabilities.tmux_attach={supported:true,reason:"available"})' \
+        "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || fail "restore failed: $out"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="already-live" and (.reason|contains("live under TMUX--other")))' <<< "$out" >/dev/null \
+        || fail "live-elsewhere row not reported: $out"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "a conversation live under another name was launched"
+    echo "ok: live under another name is already-live"
+}
+
+test_restore_identity_absent_row_is_per_row() {
+    local dir="$TMPDIR/restore-absent-row" out rc=0
+    _restore_fixture "$dir"
+    jq 'del(.rows[] | select(.provider_task_id=="conv-bbb-222"))' "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "one absent identity must be partial (75), not 69; got $rc: $out"
+    [[ "$(_restore_spawn_count "$dir")" -eq 3 ]] || fail "the other rows must launch, got: $(cat "$dir/launch.log")"
+    jq -e 'any(.plan[]; .provider_task_id=="conv-bbb-222" and .disposition=="insufficient-evidence" and .reason=="live identity is absent")
+        and .outcome=="partial" and .result_counts.ambiguous==1' <<< "$out" >/dev/null || fail "absent row not reported: $out"
+    echo "ok: an absent identity is per row"
+}
+
+test_restore_global_evidence_missing_still_69() {
+    local dir="$TMPDIR/restore-global-69" out rc=0
+    _restore_fixture "$dir"
+    printf '%s\n' '{"schema_version":1,"status":"unavailable","observed_at":"2026-08-05T12:00:00Z","source_cursor":null,"processes":[],"error":"ps failed"}' > "$dir/process.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "an unavailable process table must exit 69, got $rc: $out"
+    [[ "$(_restore_spawn_count "$dir")" -eq 0 ]] || fail "nothing may launch without the process table"
+    jq -e '.outcome=="refused" and .exit_code==69 and (.global_errors|length)>=1 and .global_errors[0].source=="process"' <<< "$out" >/dev/null \
+        || fail "global error not reported: $out"
+    echo "ok: missing global evidence is still 69"
+}
+
+test_restore_all_already_live_exits_0_fast_even_under_pressure() {
+    local dir="$TMPDIR/restore-all-live" out rc=0
+    _restore_fixture "$dir"
+    jq '.rows[].action_capabilities.tmux_attach={supported:true,reason:"available"}' "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+    out="$(CCTRL_FAKE_MEM_FREE_PCT=3 _restore_run "$dir" --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "everything already live must exit 0 even when memory is tight, got $rc: $out"
+    assert_contains "$out" "Nothing to restore"
+    [[ "$(_restore_spawn_count "$dir")" -eq 0 ]] || fail "nothing may launch"
+    out="$(CCTRL_FAKE_MEM_FREE_PCT=3 _restore_run "$dir" --yes --json 2>/dev/null)" || fail "json run failed"
+    jq -e '.outcome=="complete" and .exit_code==0 and .result_counts.already_live>=4' <<< "$out" >/dev/null || fail "nothing-to-restore json wrong: $out"
+    echo "ok: all already live exits 0 without touching the gate"
+}
+
+test_restore_failed_launch_exits_1_and_others_still_attempted() {
+    local dir="$TMPDIR/restore-fail-others" out rc=0
+    _restore_role_fixture "$dir"
+    jq '(.tasks[] | select(.tmux_session=="TMUX--cctrl") | .launch_flags) += {profile:"no-such-profile"}' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    : > "$dir/tmux.log"
+    out="$(TMUX_LOG="$dir/tmux.log" _restore_run_real "$dir" --only cctrl --only homelab --yes --json 2>/dev/null </dev/null)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "a failed launch must exit 1, got $rc: $out"
+    jq -e '.outcome=="failed" and .exit_code==1
+        and any(.results[]; .tmux_session=="TMUX--cctrl" and .result=="failed" and .attempts==1)
+        and any(.results[]; .tmux_session=="TMUX--homelab" and .result=="restored" and .phase=="wave-1")' <<< "$out" >/dev/null \
+        || fail "failed/restored results wrong: $out"
+    echo "ok: a failed launch is exit 1 and the other row was still attempted"
+}
+
+test_restore_pre_boot_source_selection() {
+    local dir="$TMPDIR/restore-preboot" out rc=0 snaps
+    _restore_fixture "$dir"
+    snaps="$dir/data/snapshots"; mkdir -p "$snaps"
+    local pre_name
+    pre_name="$(date -u -v-3H +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -d '3 hours ago' +%Y%m%dT%H%M%SZ)"
+    jq --arg t "$(_restore_iso_ago 3)" '.generated_at=$t | .tasks |= map(.live=true)' "$dir/snapshots/latest.json" > "$snaps/$pre_name.json"
+    jq --arg t "$(_restore_iso_ago 1)" '.generated_at=$t | .tasks=[.tasks[0] | .live=true] | .task_reference_count=1' "$dir/snapshots/latest.json" > "$snaps/post.json"
+    cp "$snaps/post.json" "$snaps/latest.json"
+    out="$(CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 2)" SR_FROM=pre-boot _restore_run "$dir" --dry-run --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "pre-boot dry run failed (rc=$rc): $out"
+    jq -e '.source_snapshot.selection=="pre-boot" and (.source_snapshot.path|test("/20[0-9]{6}T[0-9]{6}Z\\.json$"))
+        and .source_snapshot.live_count==5 and (.plan|length)==5
+        and (.source_snapshot.why|contains("newest pre-boot snapshot with 5 live"))
+        and (.source_snapshot.why|contains("latest.json rejected: captured after boot, 1 live"))' <<< "$out" >/dev/null \
+        || fail "pre-boot source wrong: $(jq -c .source_snapshot <<< "$out")"
+    echo "ok: --from pre-boot picks the newest snapshot captured before the boot"
+}
+
+test_restore_pre_boot_none_found() {
+    local dir="$TMPDIR/restore-preboot-none" out rc=0 snaps
+    _restore_fixture "$dir"
+    snaps="$dir/data/snapshots"; mkdir -p "$snaps"
+    jq --arg t "$(_restore_iso_ago 1)" '.generated_at=$t | .tasks |= map(.live=true)' "$dir/snapshots/latest.json" > "$snaps/latest.json"
+    out="$(CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 2)" SR_FROM=pre-boot _restore_run "$dir" --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "no pre-boot snapshot must exit 69, got $rc: $out"
+    assert_contains "$out" "before this boot"
+    assert_contains "$out" "captured after boot"
+    [[ "$(_restore_spawn_count "$dir")" -eq 0 ]] || fail "nothing may launch"
+    # A pre-boot snapshot with no live sessions, or older than the max age, is no better.
+    jq --arg t "$(_restore_iso_ago 3)" '.generated_at=$t | .tasks |= map(.live=false)' "$dir/snapshots/latest.json" > "$snaps/latest.json"
+    rc=0; CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 2)" SR_FROM=pre-boot _restore_run "$dir" --yes >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "a pre-boot snapshot with no live sessions must not be used (rc=$rc)"
+    jq --arg t "$(_restore_iso_ago 3)" '.generated_at=$t | .tasks |= map(.live=true)' "$dir/snapshots/latest.json" > "$snaps/latest.json"
+    rc=0; CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 2)" CCTRL_RESTORE_BOOT_MAX_AGE=60 SR_FROM=pre-boot _restore_run "$dir" --yes >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "a snapshot over CCTRL_RESTORE_BOOT_MAX_AGE must not be used (rc=$rc)"
+    echo "ok: --from pre-boot refuses when nothing qualifies"
+}
+
+test_restore_sibling_running_blocks_name() {
+    local dir="$TMPDIR/restore-sibling" out rc=0
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.shadowed_task_ids=["conv-loser-999"])' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[{"pid":777,"ppid":1,"started":"x","command":"claude --resume conv-loser-999"}],"error":null}' > "$dir/process.json"
+    out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "sibling running is already-live, expected 0, got $rc: $out"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "the name was relaunched while a sibling record runs"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="already-live" and (.reason|contains("a sibling record is running")))' <<< "$out" >/dev/null \
+        || fail "sibling-running not reported: $out"
+    echo "ok: a running sibling record blocks the name"
+}
+
+test_restore_never_mints_host_id() {
+    local dir="$TMPDIR/restore-no-hostid" out rc=0
+    _restore_fixture "$dir"
+    rm -f "$dir/host-id"
+    out="$(_restore_run "$dir" --yes 2>&1 </dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "a missing host id must exit 69, got $rc: $out"
+    [[ ! -e "$dir/host-id" ]] || fail "restore created a host id"
+    [[ "$(_restore_spawn_count "$dir")" -eq 0 ]] || fail "nothing may launch without a host id"
+    assert_contains "$out" "host id"
+    rc=0; out="$(_restore_run "$dir" --dry-run --json 2>/dev/null </dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "dry-run must refuse too, got $rc"
+    jq -e '.ok==false' <<< "$out" >/dev/null || fail "json refusal body: $out"
+    [[ ! -e "$dir/host-id" ]] || fail "dry-run created a host id"
+    echo "ok: restore never mints a host id"
+}
+
+test_restore_plan_strict_keeps_old_codes_cli() {
+    local dir="$TMPDIR/restore-strict-cli" rc=0
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict")' "$dir/snapshots/latest.json" > "$dir/snap.tmp"
+    local -a argv=(plan --snapshot "$dir/snap.tmp" --catalogue "$dir/catalogue.json" --process "$dir/process.json" --codex-evidence "$dir/codex.json" --host-id "$_SR_HOST_ID" --hostname test-host)
+    python3 "$ROOT/lib/snapshot_restore.py" "${argv[@]}" >/dev/null || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "plan without --strict must not turn a per-row conflict into an exit code (got $rc)"
+    rc=0; python3 "$ROOT/lib/snapshot_restore.py" "${argv[@]}" --strict >/dev/null || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "plan --strict must keep exit 75 on a conflict (got $rc)"
+    echo "ok: plan --strict keeps the old exit codes"
+}
+
+test_snapshot_passes_projects_dir_for_tie_break() {
+    # `session snapshot` hands its Claude projects dir to capture, so two open
+    # records on a dead tmux name are settled by transcript activity.
+    local root="$TMPDIR/snapshot-tiebreak" host="0123456789abcdef0123456789abcdef" out
+    mkdir -p "$root/data" "$root/snapshots" "$root/projects/slug" "$root/meta"
+    printf '%s\n' "$host" > "$root/data/host-id"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-09-24T10:00:00Z","source_cursor":"p","processes":[],"error":null}' > "$root/process.json"
+    row() { printf '{"provider":"claude","provider_task_id":"%s","host_id":"%s","origin":"cctrl","execution_runtime":"tmux","control_owner":"cctrl","lifecycle_state":"active","restore_strategy":"tmux","registered_by_cctrl":true,"launched_by_cctrl":true,"cwd":"/tmp/x","display_title":"%s","tmux_session":"TMUX--dead","action_capabilities":{"tmux_attach":{"supported":false}}}' "$1" "$host" "$1"; }
+    printf '{"schema_version":2,"host_id":"%s","source_status":{"registry":"available","tmux":"available","codex_provider":"available"},"source_errors":[],"rows":[%s,%s]}\n' "$host" "$(row older-1)" "$(row newer-1)" > "$root/catalogue.json"
+    printf '[]\n' > "$root/sessions.json"
+    : > "$root/projects/slug/older-1.jsonl"; : > "$root/projects/slug/newer-1.jsonl"
+    touch -t 202601010000 "$root/projects/slug/older-1.jsonl"
+    out="$(CCTRL_DATA_DIR="$root/data" CCTRL_HOST_ID_FILE="$root/data/host-id" CCTRL_SNAPSHOT_CATALOGUE_FILE="$root/catalogue.json" \
+      CCTRL_SNAPSHOT_SESSIONS_FILE="$root/sessions.json" CCTRL_SNAPSHOT_PROCESS_FILE="$root/process.json" CCTRL_SESSION_METADATA_DIR="$root/meta" \
+      CCTRL_CLAUDE_PROJECTS_DIR="$root/projects" CCTRL_FAKE_MEM_FREE_PCT=50 CCTRL_FAKE_SWAP_MB=0 \
+      "$ROOT/cctrl" session snapshot --dir "$root/snapshots" --json)" || fail "snapshot failed: $out"
+    jq -e '[.tasks[] | select(.tmux_session=="TMUX--dead")] | length==1 and .[0].provider_task_id=="newer-1"
+        and .[0].shadowed_task_ids==["older-1"] and .[0].tie_break.basis=="transcript-mtime" and .[0].tie_break.chosen=="newer-1"' <<< "$out" >/dev/null \
+        || fail "the tie-break did not pick the newer transcript: $out"
+    echo "ok: snapshot passes the Claude projects dir to the capture tie-break"
+}
+
 # --- plan 068: ownership-aware snapshot / restore --------------------------
 
 test_snapshot_tmux_row_selection() {
@@ -19035,7 +19259,7 @@ JSON
     rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$absent" \
       CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" \
       "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --dry-run --json 2>/dev/null)" || rc=$?
-    [[ "$rc" -eq 69 ]] || fail "absent live identity did not exit 69 (rc=$rc)"
+    [[ "$rc" -eq 75 ]] || fail "absent live identity is a per-row skip: expected 75 (partial), got $rc"
     jq -e 'any(.plan[]; .provider_task_id=="claude-1" and .disposition=="insufficient-evidence")' <<< "$out" >/dev/null || fail "absent identity was not explained"
     jq '.rows += [.rows[] | select(.provider_task_id=="claude-1")]' "$current" > "$duplicate"
     rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$duplicate" \
@@ -19091,7 +19315,7 @@ JSON
     rc=0; out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$codex_restore_catalog" \
       CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex_ambiguous" \
       "$ROOT/cctrl" session restore --from "$codex_restore_snap" --dry-run --json 2>/dev/null)" || rc=$?
-    [[ "$rc" -eq 69 ]] || fail "ambiguous Codex evidence did not exit 69 (rc=$rc)"
+    [[ "$rc" -eq 75 ]] || fail "ambiguous Codex evidence is a per-row skip: expected 75 (partial), got $rc"
     jq -e 'any(.plan[]; .provider_task_id=="codex-restore-1" and .disposition=="insufficient-evidence" and .action_capabilities.restore.supported==false)' <<< "$out" >/dev/null \
       || fail "ambiguous Codex evidence left restore executable: $out"
 

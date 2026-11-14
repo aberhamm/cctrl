@@ -47,6 +47,7 @@ class RestoreTests(unittest.TestCase):
                        CCTRL_RESTORE_WAVE_SIZE='1', TEST_ROOT=str(root), SWITCH_AT=str(switch_at))
             script = '''source "$0"
 _cctrl_host_id() { echo 0123456789abcdef0123456789abcdef; }
+_cctrl_host_id_read() { echo 0123456789abcdef0123456789abcdef; }
 _task_list_json() { cat "$TEST_ROOT/catalogue.json"; }
 _snapshot_process_source() { cp "$TEST_ROOT/process.json" "$1"; }
 _res_mem_free_pct() { echo 90; }
