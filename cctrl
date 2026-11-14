@@ -3829,15 +3829,36 @@ cmd_start() {
         return
     fi
     local detach=false arg
-    local foreground=false
-    [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]] && foreground=true
+    local foreground=false explicit_foreground=false nested_no_tty=false
+    # CCTRL_TMUX_CONTEXT=1 is inherited by everything an agent runs (its Bash
+    # tool), so it cannot by itself mean "run inline": a non-interactive
+    # `cctrl start` from inside a session would run the agent in the caller's
+    # pane under the caller's identity. The pane's own launch command passes
+    # --foreground explicitly; otherwise inline needs a real terminal, and
+    # without one start goes detached.
+    if [[ "${CCTRL_TMUX_CONTEXT:-}" == "1" ]]; then
+        if [[ -t 0 && -t 1 ]]; then
+            foreground=true
+        else
+            nested_no_tty=true
+        fi
+    fi
     for arg in "$@"; do
         [[ "$arg" == "--" ]] && break   # rest is a literal prompt; stop scanning
         case "$arg" in
             -d|--detach) detach=true; break ;;
-            --foreground|--no-tmux) foreground=true ;;
+            --foreground|--no-tmux) foreground=true; explicit_foreground=true ;;
         esac
     done
+    if $nested_no_tty && ! $explicit_foreground && ! $detach; then
+        echo "cctrl: start from inside a session with no terminal never runs the agent inline; starting detached (use --foreground to force inline)." >&2
+        if _start_args_have_explicit_target "$@"; then
+            _launch_detached "$@"
+        else
+            _launch_detached "$PWD" "$@"
+        fi
+        return
+    fi
 
     if $detach; then
         _launch_detached "$@"
@@ -19210,7 +19231,7 @@ _session_restore() {
             -h|--help|help)
                 echo "Usage: cctrl session restore [--from PATH] [--only PATTERN] [--dry-run] [--limit N] [--yes] [--stale-ok] [--force-host] [--json] [--quiet]"
                 echo "Plan or execute ownership-aware tmux resumes. Provider-managed tasks are never relaunched."
-                echo "Exit codes: 0 complete; 64 invalid input/schema; 69 evidence unavailable/absent; 75 ownership conflict; 1 execution failure."
+                echo "Exit codes: 0 complete; 64 invalid input/schema/host mismatch; 78 needs --yes (no terminal); 69 evidence unavailable/absent; 75 ownership conflict; 1 execution failure."
                 return 0 ;;
             *) echo -e "${RED}Unknown restore flag: $1${RESET}" >&2; return 64 ;;
         esac
@@ -19233,13 +19254,36 @@ _session_restore() {
             fi
         fi
     fi
-    local_hostname="${CCTRL_HOST_PREFIX:-$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)}"
+    # Host identity is the durable cctrl host id, never the display prefix
+    # (CCTRL_HOST_PREFIX is a label: a prefixed host's `hostname -s` differs from
+    # what snapshots record). Snapshots without a host id (legacy) fall back to
+    # the hostname: the real `hostname -s` or the configured prefix, whichever
+    # that snapshot was written with.
+    local real_hostname snap_host_id host_mismatch=false
+    real_hostname="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+    local_hostname="${CCTRL_HOST_PREFIX:-$real_hostname}"
     snap_hostname="$(jq -r '.hostname // empty' "$snapshot_path")"
-    if [[ -n "$snap_hostname" && "$snap_hostname" != "$local_hostname" ]] && ! $force_host; then
-        $json && jq -n --arg snapshot "$snap_hostname" --arg local "$local_hostname" '{ok:false,error:"snapshot hostname mismatch",snapshot_hostname:$snapshot,local_hostname:$local}'
+    snap_host_id="$(jq -r '.host_id // empty' "$snapshot_path")"
+    host_id="$(_cctrl_host_id)" || return 69
+    if [[ -n "$snap_host_id" ]]; then
+        [[ "$snap_host_id" == "$host_id" ]] || host_mismatch=true
+    elif [[ -n "$snap_hostname" && "$snap_hostname" != "$real_hostname" && "$snap_hostname" != "$local_hostname" ]]; then
+        host_mismatch=true
+    fi
+    if [[ -n "$snap_hostname" && ( "$snap_hostname" == "$real_hostname" || "$snap_hostname" == "$local_hostname" ) ]]; then
+        local_hostname="$snap_hostname"   # the planner's v1 adapter matches by name
+    else
+        local_hostname="$real_hostname"
+    fi
+    if $host_mismatch && ! $force_host; then
+        if $json; then
+            jq -n --arg snapshot "$snap_hostname" --arg local "$real_hostname" --arg sid "$snap_host_id" --arg lid "$host_id" \
+                '{ok:false,error:"snapshot host mismatch",snapshot_hostname:$snapshot,local_hostname:$local,snapshot_host_id:(if $sid=="" then null else $sid end),local_host_id:$lid}'
+        else
+            echo "Refusing to restore: snapshot is from a different host (snapshot hostname '${snap_hostname:-unknown}', host id ${snap_host_id:-none}; this host '$real_hostname', host id $host_id). Re-run with --force-host to override." >&2
+        fi
         return 64
     fi
-    host_id="$(_cctrl_host_id)" || return 69
 
     local scratch catalogue_file process_file codex_file plan_file plan_rc=0 catalogue_rc=0 process_rc=0 codex_rc=0
     scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-restore-v2.XXXXXX")" || return 1
@@ -19298,7 +19342,15 @@ _session_restore() {
     fi
     if (( plan_rc != 0 )); then rm -rf "$scratch"; return "$plan_rc"; fi
     $dry_run && { rm -rf "$scratch"; return 0; }
-    if ! $assume_yes && [[ ! -t 0 || ! -t 1 ]]; then rm -rf "$scratch"; return 64; fi
+    if ! $assume_yes && [[ ! -t 0 || ! -t 1 ]]; then
+        # A restore launches agents, so it needs a human yes: no terminal means
+        # the repo's needs-user-decision convention (exit 78, marker first).
+        rm -rf "$scratch"
+        { echo "cctrl: needs-user-decision: restore-confirmation"
+          echo "session restore needs confirmation and there is no terminal; nothing was launched."
+          echo "Ask the user, then re-run with --yes (use --dry-run to preview)."; } >&2
+        return 78
+    fi
     if ! $assume_yes; then
         printf 'Proceed with restore? [y/N] '; local answer; IFS= read -r answer || answer=""
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
