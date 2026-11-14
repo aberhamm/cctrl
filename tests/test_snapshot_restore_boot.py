@@ -38,7 +38,8 @@ def catalogue(rows):
 def process_doc(commands=(), status="available"):
     return {"schema_version": 1, "status": status, "observed_at": NOW,
             "source_cursor": "c" if status == "available" else None,
-            "processes": [{"pid": 100 + i, "ppid": 1, "started": "x", "command": c} for i, c in enumerate(commands)],
+            "processes": [dict({"pid": 100 + i, "ppid": 1, "started": "x"}, **(c if isinstance(c, dict) else {"command": c}))
+                          for i, c in enumerate(commands)],
             "error": None if status == "available" else "boom"}
 
 
@@ -72,12 +73,17 @@ class Fixture:
         self.test.assertEqual(done.returncode, 0, done.stderr)
         return json.loads(done.stdout)
 
-    def plan(self, snapshot_tasks, cat_rows, process=None, strict=False):
+    def plan(self, snapshot_tasks, cat_rows, process=None, strict=False, sessions=None):
         snapshot = {"schema_version": 2, "host_id": HOST, "hostname": "fixture", "tasks": snapshot_tasks}
         args = ["plan", "--snapshot", self.write("snap.json", snapshot), "--catalogue", self.write("cat.json", catalogue(cat_rows)),
                 "--process", self.write("proc.json", process or process_doc()), "--host-id", HOST, "--hostname", "fixture"]
         if strict:
             args.append("--strict")
+        sessions_dir = self.root / "claude-sessions"
+        sessions_dir.mkdir(exist_ok=True)
+        for pid, session_id in (sessions or {}).items():
+            (sessions_dir / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session_id, "cwd": "/tmp/work"}))
+        args += ["--claude-sessions-dir", str(sessions_dir)]
         done = self.run(*args)
         return done.returncode, json.loads(done.stdout) if done.stdout.strip() else None
 
@@ -142,7 +148,7 @@ class PlanTests(unittest.TestCase):
         fx = Fixture(self)
         tasks = [snap_task("conv-aaa-111", "TMUX--a")]
         decoys = ["grep conv-aaa-111", 'bash -c "cctrl start -r conv-aaa-111"', "claude --resume conv-aaa-1110",
-                  "claude --name conv-aaa-111", "claude --resume", "python3 claude --resume conv-aaa-111",
+                  "claude --name conv-aaa-111", "python3 claude --resume conv-aaa-111",
                   "/usr/bin/vim /tmp/--resume conv-aaa-111"]
         rc, doc = fx.plan(tasks, [claim("conv-aaa-111", "TMUX--a")], process=process_doc(decoys))
         self.assertEqual(rc, 0)
@@ -187,6 +193,64 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(by_id["conv-a"]["disposition"], "restore")
 
 
+class BareResumeTests(unittest.TestCase):
+    """S1: a conversation resumed through the picker has no id in argv."""
+
+    FM = "claude --name homelab --resume --chrome"
+
+    def fixture_a(self, fx, process, sessions=None):
+        tasks = [snap_task("conv-fm", "TMUX--fm-old")]
+        # the live name belongs to another conversation, so the catalogue never shows conv-fm live
+        rows = [claim("conv-fm", "TMUX--fm-old"), claim("conv-other", "TMUX--homelab", action_capabilities={"tmux_attach": {"supported": True}})]
+        return fx.plan(tasks, rows, process=process, sessions=sessions)
+
+    def test_session_file_names_the_conversation(self):
+        fx = Fixture(self)
+        rc, doc = self.fixture_a(fx, process_doc([self.FM]), sessions={100: "conv-fm"})
+        self.assertEqual(doc["rows"][0]["disposition"], "already-live")
+        self.assertIn("conversation already running (pid 100)", doc["rows"][0]["reason"])
+
+    def test_unidentified_bare_resume_in_the_same_cwd_blocks_the_row(self):
+        fx = Fixture(self)
+        rc, doc = self.fixture_a(fx, process_doc([{"command": self.FM, "cwd": "/tmp/work"}]))
+        row = doc["rows"][0]
+        self.assertNotEqual(row["disposition"], "restore")
+        self.assertEqual(row["attention"], "ambiguous")
+        self.assertIn("unidentified live claude (pid 100", row["reason"])
+
+    def test_unidentified_bare_resume_elsewhere_does_not_block(self):
+        fx = Fixture(self)
+        rc, doc = self.fixture_a(fx, process_doc([{"command": self.FM, "cwd": "/tmp/elsewhere"}]))
+        self.assertEqual(doc["rows"][0]["disposition"], "restore")
+
+    def test_unknown_cwd_fails_closed(self):
+        fx = Fixture(self)
+        for command in (self.FM, "claude --continue", "claude -r --chrome"):
+            rc, doc = self.fixture_a(fx, process_doc([command]))
+            self.assertEqual(doc["rows"][0]["attention"], "ambiguous", command)
+
+    def test_a_session_file_for_another_conversation_clears_the_pid(self):
+        fx = Fixture(self)
+        rc, doc = self.fixture_a(fx, process_doc([self.FM]), sessions={100: "conv-someone-else"})
+        self.assertEqual(doc["rows"][0]["disposition"], "restore")
+
+    def test_session_file_in_a_launch_record_config_dir(self):
+        fx = Fixture(self)
+        config = fx.root / "profile-config"
+        (config / "sessions").mkdir(parents=True)
+        (config / "sessions" / "100.json").write_text(json.dumps({"pid": 100, "sessionId": "conv-fm"}))
+        meta = fx.root / "meta"
+        meta.mkdir()
+        (meta / "r.json").write_text(json.dumps({"tmux_session": "TMUX--x", "claude_config_dir": str(config)}))
+        tasks = [snap_task("conv-fm", "TMUX--fm-old")]
+        args = ["plan", "--snapshot", fx.write("snap.json", {"schema_version": 2, "host_id": HOST, "tasks": tasks}),
+                "--catalogue", fx.write("cat.json", catalogue([claim("conv-fm", "TMUX--fm-old")])),
+                "--process", fx.write("proc.json", process_doc([self.FM])), "--host-id", HOST, "--hostname", "fixture",
+                "--claude-sessions-dir", str(fx.root / "none"), "--metadata-dir", str(meta)]
+        done = fx.run(*args)
+        self.assertEqual(json.loads(done.stdout)["rows"][0]["disposition"], "already-live")
+
+
 class TieBreakTests(unittest.TestCase):
     def transcripts(self, fx, ages):
         """ages: {task_id: seconds old}; one <projects>/<slug>/<id>.jsonl each."""
@@ -228,6 +292,18 @@ class TieBreakTests(unittest.TestCase):
         row = self.row_for(fx.capture(self.dup_rows(), projects=[projects]))
         self.assertEqual(row["provider_task_id"], "new-1")
         self.assertIsNone(row["tie_break"]["margin_s"])
+
+    def test_refuses_when_an_untimed_claim_has_a_newer_record(self):
+        # Fixture D: the old claim has a 3-day-old transcript, the newer claim (record today) has none.
+        fx = Fixture(self)
+        projects = self.transcripts(fx, {"old-1": 3 * 86400})
+        rows = [claim("old-1", "TMUX--dup", recency="2026-10-29T10:00:00Z"), claim("new-1", "TMUX--dup", recency="2099-01-01T00:00:00Z")]
+        row = self.row_for(fx.capture(rows, projects=[projects]))
+        self.assertIsNone(row.get("tie_break"))
+        self.assertIn("newer record than the winner", row["recovery_reason"])
+        # an untimed claim with an OLDER record does not stop the pick
+        rows = [claim("old-1", "TMUX--dup", recency="2026-10-29T10:00:00Z"), claim("new-1", "TMUX--dup", recency="2000-01-01T00:00:00Z")]
+        self.assertEqual(self.row_for(fx.capture(rows, projects=[projects]))["provider_task_id"], "old-1")
 
     def test_refuses_when_close_cwd_differs_or_no_transcripts(self):
         fx = Fixture(self)

@@ -361,6 +361,16 @@ def tie_break(claims: list[dict[str, Any]], host_id: str, projects_dirs: list[st
     if len({text(c.get("cwd")) for _, c in timed}) > 1:
         return None, None, "candidates with activity evidence have different cwds"
     timed.sort(key=lambda item: item[0], reverse=True)
+    # An eligible claim with no activity evidence of its own (its transcript
+    # may live in a config dir nobody searched) but a newer record than the
+    # winner's moment could be the real current conversation: refuse.
+    timed_ids = {id(c) for _, c in timed}
+    for candidate in candidates:
+        if id(candidate) in timed_ids:
+            continue
+        recency = _parse_time(candidate.get("recency"))
+        if recency is not None and recency > timed[0][0]:
+            return None, None, "an eligible claim without activity evidence has a newer record than the winner"
     lead = None if len(timed) == 1 else timed[0][0] - timed[1][0]
     if lead is not None and lead < margin:
         return None, None, f"the two newest candidates are within {margin}s of each other"
@@ -400,6 +410,66 @@ def process_running(process: dict[str, Any], task_ids: list[str]) -> tuple[int, 
             if token.startswith(("--resume=", "--session-id=")) and token.split("=", 1)[1] in wanted:
                 return int(item.get("pid") or 0), token.split("=", 1)[1]
     return None
+
+
+BARE_RESUME_FLAGS = {"--resume", "-r", "--continue", "-c"}
+
+
+def claude_config_sessions_dirs(explicit: list[str], metadata_dir: str | None) -> list[str]:
+    """Directories that may hold <pid>.json for a live claude: the given ones plus
+    <claude_config_dir>/sessions for every config dir a launch record names."""
+    dirs: list[str] = [d for d in explicit if d]
+    if metadata_dir:
+        for record in launch_records(metadata_dir).values():
+            config = text(record.get("claude_config_dir"))
+            if config and os.path.isabs(config):
+                dirs.append(os.path.join(config, "sessions"))
+    seen: list[str] = []
+    for directory in dirs:
+        if directory not in seen:
+            seen.append(directory)
+    return seen
+
+
+def claude_live_view(process: dict[str, Any], sessions_dirs: list[str]) -> tuple[dict[str, int], list[tuple[int, str | None]]]:
+    """For every live claude pid: the conversation it runs, read from
+    <sessions dir>/<pid>.json (field sessionId). A claude resumed through the
+    picker or --continue (no id in argv) with no readable session file is
+    "unknown": (pid, cwd or None). Returns ({session id: pid}, [unknown])."""
+    known: dict[str, int] = {}
+    unknown: list[tuple[int, str | None]] = []
+    for item in process.get("processes") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("command"), str):
+            continue
+        tokens = item["command"].split()
+        if not tokens or os.path.basename(tokens[0]) != "claude":
+            continue
+        try:
+            pid = int(item.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        session_id = None
+        for directory in sessions_dirs:
+            path = Path(directory) / f"{pid}.json"
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if isinstance(value, dict) and text(value.get("sessionId")) and value.get("pid", pid) == pid:
+                session_id = text(value.get("sessionId"))
+                break
+        if session_id:
+            known[session_id] = pid
+            continue
+        bare = False
+        for index, token in enumerate(tokens[1:], start=1):
+            if token in BARE_RESUME_FLAGS:
+                following = tokens[index + 1] if index + 1 < len(tokens) else None
+                if following is None or following.startswith("-"):
+                    bare = True
+        if bare:
+            unknown.append((pid, text(item.get("cwd"))))
+    return known, unknown
 
 
 def capture(args: argparse.Namespace) -> int:
@@ -773,6 +843,9 @@ def plan(args: argparse.Namespace) -> int:
         and isinstance(process.get("processes"), list)
     )
 
+    sessions_dirs = claude_config_sessions_dirs(getattr(args, "claude_sessions_dir", None) or [], getattr(args, "metadata_dir", None))
+    claude_known, claude_unknown = claude_live_view(process, sessions_dirs) if process_ok else ({}, [])
+
     results = []
     global_errors: list[dict[str, str]] = []
 
@@ -799,10 +872,23 @@ def plan(args: argparse.Namespace) -> int:
             or row.get("restore_strategy") == "provider-managed" or row.get("lifecycle_state") == "released"
         )
         running = None
+        unidentified: tuple[int, str | None] | None = None
         live_names: list[str] = []
         if task_id and not snapshot_provider_managed and row.get("host_id") == args.host_id:
             if process_ok:
-                running = process_running(process, [task_id] + [i for i in row.get("shadowed_task_ids") or [] if isinstance(i, str)])
+                all_ids = [task_id] + [i for i in row.get("shadowed_task_ids") or [] if isinstance(i, str)]
+                running = process_running(process, all_ids)
+                if not running and provider == "claude":
+                    for candidate_id in all_ids:
+                        if candidate_id in claude_known:
+                            running = (claude_known[candidate_id], candidate_id)
+                            break
+                    if not running:
+                        row_cwd = text(row.get("cwd"))
+                        for unknown_pid, unknown_cwd in claude_unknown:
+                            if unknown_cwd is None or unknown_cwd == row_cwd:
+                                unidentified = (unknown_pid, unknown_cwd)
+                                break
             live_names = [n for n in live_catalogue_names(rows, provider, task_id, args.host_id) if n != (text(row.get("tmux_session")) or "")]
 
         if row.get("host_id") != args.host_id:
@@ -813,6 +899,10 @@ def plan(args: argparse.Namespace) -> int:
             reason = f"conversation already running (pid {pid})" if matched == task_id else f"a sibling record is running (pid {pid})"
         elif live_names:
             disposition, reason = "already-live", "live under " + ", ".join(n or "an unnamed session" for n in live_names)
+        elif unidentified:
+            where = unidentified[1] or "an unknown directory"
+            disposition, attention = "insufficient-evidence", "ambiguous"
+            reason = f"an unidentified live claude (pid {unidentified[0]}, resumed without a session id) in {where} may be running this conversation"
         elif snapshot_conflict:
             disposition, reason, strict_conflict, attention = "conflict", "snapshot ownership conflict", True, "conflict"
         elif snapshot_provider_managed:
@@ -975,6 +1065,8 @@ def main() -> int:
     plan_parser.add_argument("--codex-evidence")
     plan_parser.add_argument("--host-id", required=True)
     plan_parser.add_argument("--hostname", required=True)
+    plan_parser.add_argument("--claude-sessions-dir", action="append", default=[], help="a Claude <config dir>/sessions (repeatable): <pid>.json names the conversation a live claude runs")
+    plan_parser.add_argument("--metadata-dir", help="launch records; their claude_config_dir adds more sessions dirs")
     plan_parser.add_argument("--strict", action="store_true", help="exit 75 on any conflict and 69 on any missing evidence (pre-boot-restore behaviour)")
     plan_parser.set_defaults(func=plan)
     flags_parser = sub.add_parser("launch-flags")
