@@ -85,6 +85,9 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   `cctrl session restore` itself (`--dry-run` first, `--limit N` to gate on
   resources), not to ask the human to. `--yes`, `--stale-ok` and `--force-host`
   are human decisions: never add them to get past a refusal.
+  Restore exit `75` is **partial**, not a refusal: the other rows were restored and the
+  skipped ones (a conflict or ambiguous record) are named in `--json` (`outcome`, `results`);
+  `1` means a launch failed, `69` means nothing launched for lack of evidence.
 
 This skill is a **reference role**, not a turnkey command — **generic doctrine
 only**, no hostnames, URLs, IPs, tokens, ports, or repo names. Pair it with your own

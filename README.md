@@ -937,6 +937,7 @@ cctrl session restore --dry-run          # show the plan; spawn nothing
 cctrl session restore --yes              # run non-interactively (required for no TTY)
 cctrl session restore --only homelab     # filter by name/label/purpose/cwd
 cctrl session restore --from <path>      # use a specific snapshot file
+cctrl session restore --from pre-boot     # the newest complete snapshot with live sessions taken before this boot
 cctrl session restore --limit 4          # cap spawns in this invocation
 ```
 
@@ -955,6 +956,53 @@ host exits `64`. Without a terminal and without `--yes`, restore launches
 nothing and exits **78**; the first stderr line is
 `cctrl: needs-user-decision: restore-confirmation`, followed by the reason. A
 caller that gets 78 must ask the human, then re-run with `--yes`.
+
+**Rows are judged one at a time.** A row with a conflict, a duplicate or absent
+catalogue identity, a foreign host id or an ambiguous tmux claim is skipped on
+its own; every other row still restores, and the exit code is chosen after all
+rows were attempted. Only evidence no row can be judged without (the process
+table, a mandatory registry/tmux source, the `data/host-id` file) stops the run
+before anything launches. Before the usual checks, a row is already live when a
+`claude`/`codex` process carries its id as a whole argv token after
+`--resume`/`-r`/`--session-id` (or `codex resume <id>`), or when the current
+catalogue shows the same task live under another tmux name (a live fleet
+manager with a conflicted record is reported already live, not as a blocker).
+When every row is already live, restore prints "Nothing to restore" and exits 0
+without consulting the memory gate. Restore reads the durable host id and never
+creates one (`data/host-id` missing: exit 69).
+
+| Exit | Meaning |
+|---|---|
+| `0` | complete: every candidate restored or already live, nothing skipped for a conflict or ambiguity |
+| `1` | at least one launch failed (the other rows were still attempted) |
+| `75` | partial: finished, but at least one row was skipped as conflict or ambiguous |
+| `69` | mandatory evidence unavailable, no usable pre-boot snapshot, or no `data/host-id`; nothing launched |
+| `64` | invalid input, schema, stale snapshot or host mismatch |
+| `78` | needs `--yes` and there is no terminal |
+
+`--json` prints one document at the end: `ok`, `outcome`
+(`complete|partial|failed|refused|dry-run`), `exit_code`, `source_snapshot`
+(`path`, `generated_at`, `content_digest`, `live_count`, `selection`, `why`),
+`plan` (the planner rows; `attention` is `conflict` or `ambiguous` on a row a
+human should look at), `results` (one entry per plan row: `result` is
+`restored|already-live|skipped|deferred|failed`, plus `planned` in a dry run),
+`result_counts` and `global_errors`. Read `outcome`, not only the exit code: `75`
+always means partial.
+
+`--from pre-boot` picks the newest of `latest.json` and the history files that
+was captured before this boot (`kern.boottime`), has live sessions, is a complete
+capture, belongs to this host and is at most `CCTRL_RESTORE_BOOT_MAX_AGE` seconds
+old (default 7 days); none qualifies: exit 69 with the reason for each file.
+That keeps a capture taken after the boot (one session, or none live) from
+becoming the restore source.
+
+Several open records can claim one tmux name that is not live (a resume leaves
+its predecessor open). `session snapshot` now settles that when the evidence is
+clear: the claim with the newest transcript activity wins if it leads the next by
+`--tie-margin` (120 s) and the claims share a cwd, and the row carries
+`tie_break` evidence and lists the losers in `shadowed_task_ids`. Thin evidence
+(no transcript, a close race, different cwds) still gives an `unknown` row.
+Restore skips a name whose losing sibling is running.
 
 Separately, `cctrl start -r <id>` and `cctrl @name -r <id>` run from inside a
 session with no terminal (an agent's Bash tool) never run the agent inline in
