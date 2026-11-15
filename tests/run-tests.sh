@@ -19287,7 +19287,7 @@ test_restore_boot_id_is_the_session_uuid() {
     # No uuid: fall back to the seconds, and the run log says so.
     local dir2="$TMPDIR/restore-boot-uuid-none"
     _restore_boot_fixture "$dir2"
-    CCTRL_FAKE_BOOT_UUID= CCTRL_FAKE_BOOTTIME=1780000000 _restore_run "$dir2" --boot --quiet >/dev/null 2>&1 || fail "fallback run failed"
+    CCTRL_FAKE_BOOT_UUID='' CCTRL_FAKE_BOOTTIME=1780000000 _restore_run "$dir2" --boot --quiet >/dev/null 2>&1 || fail "fallback run failed"
     [[ -s "$dir2/data/restore/boot-1780000000.json" ]] || fail "no fallback state file: $(ls "$dir2/data/restore")"
     grep -q '"boot_id_source":"epoch"' "$dir2/data/restore/restore.log" || fail "the fallback is not in the run log"
     echo "ok: the boot id is the boot session uuid, with a logged fallback"
@@ -19338,7 +19338,7 @@ test_restore_health_mark_only_marks_its_own_record() {
     # N4: the pre-launch mark touches a record only when its provider_task_id is the row's resume id.
     (
         CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
-        FAKE_STATUS=ready; FAKE_ID=other-conv
+        FAKE_STATUS=ready; FAKE_ID='other-conv'
         _session_metadata_field() { case "$2" in health_status) printf '%s' "$FAKE_STATUS" ;; provider_task_id) printf '%s' "$FAKE_ID" ;; esac; return 0; }
         _session_update_metadata_field() { FAKE_STATUS="$3"; return 0; }
         _restore_health_mark TMUX--x conv-mine
