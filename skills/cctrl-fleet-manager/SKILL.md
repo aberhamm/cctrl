@@ -81,13 +81,26 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   renames; the guard does not apply to it). If that leaves two live fleet
   managers (`session ls` prints a footer), the human decides which one to close
   **before** any handover, because `--succeeds` needs exactly one.
-- The first job of a new fleet manager after a power cycle is to run
-  `cctrl session restore` itself (`--dry-run` first, `--limit N` to gate on
-  resources), not to ask the human to. `--yes`, `--stale-ok` and `--force-host`
-  are human decisions: never add them to get past a refusal.
-  Restore exit `75` is **partial**, not a refusal: the other rows were restored and the
-  skipped ones (a conflict or ambiguous record) are named in `--json` (`outcome`, `results`);
-  `1` means a launch failed, `69` means nothing launched for lack of evidence.
+- After a **power cycle**, read `cctrl session restore status` first. The
+  boot LaunchAgent runs `cctrl session restore --boot`, and that invocation
+  carries the human approval for the boot restore (mdec-1114): it brings back
+  the sessions that were live before the boot, the fleet manager first, in
+  waves that wait on load and memory, and writes its result under the restore
+  directory. If `status` shows the boot run `complete`, there is nothing to do.
+  If it shows `partial` (restore exit `75`), the rows that did not come back
+  are listed: a conflict, an ambiguous record, a second fleet manager row or a
+  recorded name held by another session needs a human decision (report it, do
+  not re-run for it); rows still `deferred` or `failed` are what a re-run is
+  for. Re-run only when `status` shows the boot run **missing** or **partial**,
+  and only as `cctrl session restore --boot --background` (from inside a
+  session `--boot` needs `--background`; read `status` again for the result; the
+  same boot never restores a row twice). Never run a bare `--yes`, and never
+  add `--stale-ok` or `--force-host`: those are human
+  decisions. `--dry-run` is always safe. Restore exit `75` is **partial** or
+  **locked**, not a refusal (read `outcome` in `--json`: another restore holds
+  the lock and nothing launched); `1` means a launch failed twice; `69` means
+  nothing launched for lack of evidence (no pre-boot snapshot within 7 days,
+  the primary tmux server down, no host id).
 
 This skill is a **reference role**, not a turnkey command — **generic doctrine
 only**, no hostnames, URLs, IPs, tokens, ports, or repo names. Pair it with your own

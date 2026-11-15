@@ -969,9 +969,15 @@ catalogue shows the same task live under another tmux name. A conversation
 resumed through the picker (`claude --resume` with no id) is found through
 `<claude config dir>/sessions/<pid>.json` (`sessionId`), for the default config
 dir and every `claude_config_dir` a launch record names. A live bare `--resume`
-whose conversation cannot be read that way is an unidentified claude: any
-candidate row in its working directory is skipped as `ambiguous` (exit 75)
-rather than launched beside it. A live fleet manager whose record is conflicted
+whose conversation cannot be read that way is an unidentified claude: any row
+in its working directory that would otherwise be restored is skipped as
+`ambiguous` (exit 75) rather than launched beside it, and the reason names the
+pid. Session files are read for every live pid whose `procStart` matches
+`LC_ALL=C TZ=UTC ps -o lstart=` (a stale or reused-pid file is ignored), whatever
+the process is called. Bare means `-c`/`--continue`, `--resume` with no value, or
+`--resume <value>` where the value is neither a UUID nor a conversation id the
+snapshot or catalogue knows (a picker search term); `node .../cli.js --resume`
+counts. Working directories are compared as real paths. A live fleet manager whose record is conflicted
 is reported already live only when its id is in argv or in such a session file
 or the catalogue; otherwise the row is skipped as a conflict (75), never
 launched. `--only` limits which rows count toward the exit code. When no row
@@ -982,21 +988,24 @@ creates one (`data/host-id` missing: exit 69).
 
 | Exit | Meaning |
 |---|---|
-| `0` | complete: every candidate restored or already live, nothing skipped for a conflict or ambiguity. A row deferred by `CCTRL_RESTORE_MAX_ACTIVE` or `--limit` also exits 0 for now (`result: deferred`); boot restore step 2 will make a deferral that survives to the end exit 75 |
-| `1` | at least one launch failed (the other rows were still attempted) |
-| `75` | partial: finished, but at least one row was skipped as conflict or ambiguous |
-| `69` | mandatory evidence unavailable, no usable pre-boot snapshot, or no `data/host-id`; nothing launched |
+| `0` | complete: every candidate restored or already live, nothing skipped for a conflict or ambiguity, nothing left deferred |
+| `1` | at least one launch failed twice (the other rows were still attempted), or the live session count could not be read mid-run (stopped, fail closed), or a memory refusal before the first launch outside `--boot` |
+| `75` | partial: finished, but a row was skipped as conflict or ambiguous, a row is still deferred (live ceiling, `--limit` or the total timeout), or the fleet manager did not come up; also `outcome: locked`: another restore holds the lock and nothing launched. Read `outcome` |
+| `69` | mandatory evidence unavailable, the primary tmux server is down, no usable pre-boot snapshot (none within `CCTRL_RESTORE_BOOT_MAX_AGE`), or no `data/host-id`; nothing launched |
 | `64` | invalid input, schema, stale snapshot or host mismatch |
 | `78` | needs `--yes` and there is no terminal |
 
 `--json` prints one document at the end: `ok`, `outcome`
-(`complete|partial|failed|refused|dry-run`), `exit_code`, `source_snapshot`
+(`complete|partial|failed|locked|refused|dry-run`; `background` for a detached start), `exit_code`, `run_id`, `boot_id`, `source_snapshot`
 (`path`, `generated_at`, `content_digest`, `live_count`, `selection`, `why`),
 `plan` (the planner rows; `attention` is `conflict` or `ambiguous` on a row a
 human should look at), `results` (one entry per plan row: `result` is
 `restored|already-live|skipped|deferred|failed`, plus `planned` in a dry run),
-`result_counts` and `global_errors`. Read `outcome`, not only the exit code: `75`
-always means partial.
+`result_counts`, `gates` (one entry per resource gate sample: `load1`,
+`compressed_pct`, `swapins_per_s`, `mem_free_pct`, `verdict`, `reason`), `fm`
+(the fleet manager row: `result`, `health_status`, `waited_s`) and
+`global_errors`. Read `outcome`, not only the exit code: `75` means partial or
+locked.
 
 `--from pre-boot` picks the newest of `latest.json` and the history files that
 was captured before this boot (`kern.boottime`), has live sessions, is a complete
@@ -1031,14 +1040,59 @@ complete (including honest provider-managed skips), `64` means invalid input or
 schema, `69` means mandatory evidence was unavailable or absent, `75` means
 ownership conflict/stale evidence, and `1` means an internal or launch failure.
 
-**Waves and the resource gate.** Sessions spawn in waves of
-`CCTRL_RESTORE_WAVE_SIZE` (default 2). In interactive mode, the operator
-releases each wave (`y` to proceed, `N` or `q` to stop at the boundary).
-In non-interactive mode (`--yes`), waves advance after a fixed pause
-(`CCTRL_RESTORE_WAVE_PAUSE`, default 60s) and a memory/swap re-check.
-The cap stops when live managed sessions plus planned restores reach
-`CCTRL_RESTORE_MAX_ACTIVE` (default 8); deferred rows show as
-`insufficient-evidence`.
+**Waves and the resource gate.** Rows launch in waves of
+`CCTRL_RESTORE_WAVE_SIZE` (default 2) while the live cctrl sessions stay under
+`CCTRL_RESTORE_MAX_ACTIVE` (default 20, re-read from a fresh catalogue before
+every wave, counting sessions this run launched that the catalogue does not
+show yet). A row past the ceiling stays queued for a later wave; it is deferred
+only when the run ends (the total timeout) with it still queued, and that exit
+is 75. Before every wave the gates must pass, sampled twice
+`CCTRL_RESTORE_GATE_SAMPLE` (5) seconds apart: 1-minute load
+<= `CCTRL_RESTORE_MAX_LOAD1` (40); compressed memory <= 
+`CCTRL_RESTORE_MAX_COMPRESSED_PCT` (15) % of RAM, or not growing; swap-ins (pages)
+<= `CCTRL_RESTORE_MAX_SWAPINS_PER_S` (50) per second; and the `cctrl start`
+memory rule (`_res_pressure_reason`). A gate that trips holds the run and
+re-samples every `CCTRL_RESTORE_GATE_POLL` (30) seconds, logging the number that
+tripped; it never gives up on its own. An unreadable metric does not hold. A
+pause of `CCTRL_RESTORE_WAVE_PAUSE` (default 30 s) separates waves.
+`CCTRL_RESTORE_TIMEOUT` caps the whole run (default 2700 s with `--boot`, none
+otherwise). A launch that fails is retried once at the end of the queue
+(`CCTRL_RESTORE_MAX_ATTEMPTS`, 2). Outside `--boot`, memory pressure before the
+first launch is refused (exit 1) as `cctrl start` would. Test seams:
+`CCTRL_FAKE_LOAD1[_FILE]`, `CCTRL_FAKE_COMPRESSED_PCT[_FILE]`,
+`CCTRL_FAKE_SWAPINS[_FILE]`.
+
+**Boot restore (`--boot`, mdec-1114).** `cctrl session restore --boot` is what a
+LaunchAgent runs after a power cycle once the tmux server is up. It is the
+human approval for that one invocation: it implies `--yes` and `--from pre-boot`
+(never `--stale-ok` or `--force-host`), so a snapshot older than
+`CCTRL_RESTORE_BOOT_MAX_AGE` (7 days) or none at all exits 69 with nothing
+launched. Only rows that were live in the source snapshot are restored; every
+other row is informational and never counts toward the exit code. Order: the
+fleet manager first (launched with `--health-check-timeout`
+`CCTRL_RESTORE_FM_BOOT_TIMEOUT`, 180 s; "booted" means the launch returned, the
+receipt names the session and its metadata `health_status` was written by this
+launch and is `ready`; retried once; if it still does not come up the waves run
+anyway and the exit is 75), then orchestrators, then workers. Of several fleet
+manager rows of one runtime only the newest restores; the others are skipped as
+conflicts. A recorded tmux name another live session holds is skipped and
+reported (no `--N` suffix at boot). During `--boot` only, the health check
+picks option 1 ("Resume from summary") of the large-transcript resume picker.
+Every launch runs with `TMUX`, `CCTRL_TMUX_CONTEXT` and the caller's session
+identity removed. Inside a session, `--boot` needs `--background` (a detached
+re-run that prints its run id and returns at once; a tool timeout cannot kill
+it). One restore runs at a time (`<data>/restore/.restore.lock`: exit 75,
+`outcome: locked`; a lock whose pid is dead or older than the timeout plus 10
+minutes is taken over). State lives in `<data>/restore/` (mode 600): the pinned
+source and per-row results in `boot-<boot id>.json` (a second run in the same
+boot reads the same snapshot, never resurrects a row it restored, and a
+finished boot exits 0 at once; `--rerun` ignores the stored row results),
+`restore.log` (JSONL events, rotated at 5 MB), `runs/<run id>.json` and
+`last-run.json`. `session snapshot` never replaces `latest.json` while a restore
+runs or this boot's restore has not finished; it writes history only.
+`cctrl session restore status [--json]` prints the last run, the rows that did
+not come back, the fleet manager line and whether this boot's run is
+`complete`, `partial`, `failed`, `running` or `missing`.
 
 **Launch configuration replay.** Restore threads `model`, `permission-mode`,
 `profile`, `peer`, `sandbox`, `--no-bridge`, and `agent` from the snapshot's
