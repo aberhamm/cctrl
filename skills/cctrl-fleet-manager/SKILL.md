@@ -96,9 +96,15 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   session `--boot` needs `--background`; read `status` again for the result; the
   same boot never restores a row twice). Never run a bare `--yes`, and never
   add `--stale-ok` or `--force-host`: those are human
-  decisions. `--dry-run` is always safe. Restore exit `75` is **partial** or
+  decisions. `--dry-run` is always safe. If `status` shows the boot run
+  **running**, wait and read it again; check how old the run is (started_at in
+  `--json`): past the 45 minute cap plus 10 minutes it is stale, and a
+  `--boot --background` re-run takes over. If it shows **failed** (or the last
+  run is a refusal), report it to the human with the reason `status` prints;
+  do not loop re-runs. Restore exit `75` is **partial** or
   **locked**, not a refusal (read `outcome` in `--json`: another restore holds
-  the lock and nothing launched); `1` means a launch failed twice; `69` means
+  the lock and nothing launched); `1` means a launch of a worker row failed twice (a fleet manager that fails
+  twice is `75`, named in the results); `69` means
   nothing launched for lack of evidence (no pre-boot snapshot within 7 days,
   the primary tmux server down, no host id).
 

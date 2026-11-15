@@ -1055,8 +1055,8 @@ memory rule (`_res_pressure_reason`). A gate that trips holds the run and
 re-samples every `CCTRL_RESTORE_GATE_POLL` (30) seconds, logging the number that
 tripped; it never gives up on its own. An unreadable metric does not hold. A
 pause of `CCTRL_RESTORE_WAVE_PAUSE` (default 30 s) separates waves.
-`CCTRL_RESTORE_TIMEOUT` caps the whole run (default 2700 s with `--boot`, none
-otherwise). A launch that fails is retried once at the end of the queue
+`CCTRL_RESTORE_TIMEOUT` caps the whole run (default 2700 s with `--boot`, 900 s
+otherwise so an interactive run never waits for ever; `0` means no cap). A launch that fails is retried once at the end of the queue
 (`CCTRL_RESTORE_MAX_ATTEMPTS`, 2). Outside `--boot`, memory pressure before the
 first launch is refused (exit 1) as `cctrl start` would. Test seams:
 `CCTRL_FAKE_LOAD1[_FILE]`, `CCTRL_FAKE_COMPRESSED_PCT[_FILE]`,
@@ -1067,24 +1067,30 @@ LaunchAgent runs after a power cycle once the tmux server is up. It is the
 human approval for that one invocation: it implies `--yes` and `--from pre-boot`
 (never `--stale-ok` or `--force-host`), so a snapshot older than
 `CCTRL_RESTORE_BOOT_MAX_AGE` (7 days) or none at all exits 69 with nothing
-launched. Only rows that were live in the source snapshot are restored; every
+launched; the cap holds for every source (`--from latest` or a path as well). Only rows that were live in the source snapshot are restored; every
 other row is informational and never counts toward the exit code. Order: the
 fleet manager first (launched with `--health-check-timeout`
 `CCTRL_RESTORE_FM_BOOT_TIMEOUT`, 180 s; "booted" means the launch returned, the
 receipt names the session and its metadata `health_status` was written by this
-launch and is `ready`; retried once; if it still does not come up the waves run
-anyway and the exit is 75), then orchestrators, then workers. Of several fleet
+launch and is `ready`; retried once; if it still does not come up, or its launch
+fails twice, the other rows are still restored and the exit is 75 with the
+fleet manager named in `results`), then orchestrators, then workers. Of several fleet
 manager rows of one runtime only the newest restores; the others are skipped as
-conflicts. A recorded tmux name another live session holds is skipped and
+conflicts, and when the newest is already live nothing of that runtime is
+launched. A recorded tmux name another live session holds is skipped and
 reported (no `--N` suffix at boot). During `--boot` only, the health check
 picks option 1 ("Resume from summary") of the large-transcript resume picker.
 Every launch runs with `TMUX`, `CCTRL_TMUX_CONTEXT` and the caller's session
 identity removed. Inside a session, `--boot` needs `--background` (a detached
 re-run that prints its run id and returns at once; a tool timeout cannot kill
 it). One restore runs at a time (`<data>/restore/.restore.lock`: exit 75,
-`outcome: locked`; a lock whose pid is dead or older than the timeout plus 10
-minutes is taken over). State lives in `<data>/restore/` (mode 600): the pinned
-source and per-row results in `boot-<boot id>.json` (a second run in the same
+`outcome: locked`; a lock whose pid is dead, older than the timeout plus 10
+minutes, or made before this boot began is taken over, and the steal is logged;
+an interactive run takes the lock only after you confirm, and `--boot` refuses
+(exit 1) rather than run unlocked). `--rerun` needs `--boot` (else exit 64). State lives in `<data>/restore/` (mode 600): the pinned
+source and per-row results in `boot-<boot id>.json` (the boot id is
+`kern.bootsessionuuid`, stable for the whole boot; only when macOS does not give
+one is the boot-time in seconds used, and `restore.log` says so; a second run in the same
 boot reads the same snapshot, never resurrects a row it restored, and a
 finished boot exits 0 at once; `--rerun` ignores the stored row results),
 `restore.log` (JSONL events, rotated at 5 MB), `runs/<run id>.json` and
