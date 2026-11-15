@@ -385,6 +385,9 @@ _cctrl() {
                     '--yes[Skip interactive confirmation]' \
                     '--stale-ok[Accept snapshots older than 24h]' \
                     '--force-host[Accept snapshots from a different host]' \
+                    '--boot[Boot-time restore: pre-boot snapshot, fleet manager first, waits on gates]' \
+                    '--background[Re-run detached and return the run id]' \
+                    '--rerun[With --boot: ignore this boot'"'"'s stored row results]' \
                     '--json[Machine-readable output]' \
                     '--quiet[Suppress informational output]'
             elif (( CURRENT >= 4 )) && [[ "${words[3]}" == say ]]; then

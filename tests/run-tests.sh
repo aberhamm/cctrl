@@ -6001,6 +6001,7 @@ _restore_run_real() {
     PATH="$dir/bin:$PATH" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
         CCTRL_RESTORE_CATALOGUE_FILE="$dir/catalogue.json" CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
         CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 \
+        CCTRL_FAKE_LOAD1=1 CCTRL_FAKE_COMPRESSED_PCT=1 CCTRL_FAKE_SWAPINS=0 CCTRL_RESTORE_GATE_SAMPLE=0 CCTRL_DATA_DIR="$dir/data" \
         CCTRL_RESTORE_MAX_ACTIVE=10 CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=0 CCTRL_NO_HEALTH_CHECK=1 \
         CCTRL_PURPOSE_PROMPT=never \
         "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" "$@"
@@ -6037,6 +6038,7 @@ test_restore_unknown_kind_row_never_asks() {
     run_with_pty_input $'1\n' env PATH="$dir/bin:$PATH" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_SESSION_METADATA_DIR="$dir/session-metadata" \
         CCTRL_RESTORE_CATALOGUE_FILE="$dir/catalogue.json" CCTRL_RESTORE_PROCESS_FILE="$dir/process.json" \
         CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 \
+        CCTRL_FAKE_LOAD1=1 CCTRL_FAKE_COMPRESSED_PCT=1 CCTRL_FAKE_SWAPINS=0 CCTRL_RESTORE_GATE_SAMPLE=0 \
         CCTRL_RESTORE_MAX_ACTIVE=10 CCTRL_RESTORE_WAVE_PAUSE=0 CCTRL_NO_HEALTH_CHECK=1 CCTRL_PURPOSE_PROMPT=never TMUX_LOG="$dir/tmux.log" \
         "$ROOT/cctrl" session restore --from "$dir/snapshots/latest.json" --only cctrl --yes > "$out_file" 2>&1 || rc=$?
     [[ "$rc" -eq 0 ]] || fail "restore of an unknown-kind orchestrator failed ($rc): $(cat "$out_file")"
@@ -18113,6 +18115,16 @@ case "${1:-}" in
     show-option) echo 1; exit 0 ;;
     new-session) exit 0 ;;
     set-option) exit 0 ;;
+    has-session)
+        # Live only when the target (`-t =NAME`) is in TMUX_FAKE_SESSIONS.
+        target=""
+        while [[ $# -gt 0 ]]; do
+            if [[ "$1" == -t ]]; then target="${2:-}"; break; fi
+            shift
+        done
+        target="${target#=}"; target="${target%:}"
+        for s in ${TMUX_FAKE_SESSIONS:-}; do [[ "$s" == "$target" ]] && exit 0; done
+        exit 1 ;;
     *) exit 0 ;;
 esac
 SH
@@ -18201,6 +18213,8 @@ _restore_run() {
         CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$dir/codex.json" \
         CCTRL_RESTORE_LAUNCH_LOG="$dir/launch.log" \
         CCTRL_FAKE_MEM_FREE_PCT="${CCTRL_FAKE_MEM_FREE_PCT-80}" CCTRL_FAKE_SWAP_MB="${CCTRL_FAKE_SWAP_MB:-0}" \
+        CCTRL_FAKE_LOAD1="${CCTRL_FAKE_LOAD1-1}" CCTRL_FAKE_COMPRESSED_PCT="${CCTRL_FAKE_COMPRESSED_PCT-1}" CCTRL_FAKE_SWAPINS="${CCTRL_FAKE_SWAPINS-0}" \
+        CCTRL_RESTORE_GATE_SAMPLE="${CCTRL_RESTORE_GATE_SAMPLE:-0}" CCTRL_DATA_DIR="$dir/data" \
         CCTRL_RESTORE_MAX_ACTIVE="${CCTRL_RESTORE_MAX_ACTIVE:-10}" \
         CCTRL_RESTORE_WAVE_SIZE="${CCTRL_RESTORE_WAVE_SIZE:-2}" CCTRL_RESTORE_WAVE_PAUSE="${CCTRL_RESTORE_WAVE_PAUSE:-0}" \
         "$ROOT/cctrl" session restore --from "${SR_FROM:-$dir/snapshots/latest.json}" "$@"
@@ -18344,9 +18358,14 @@ test_restore_cap_on_total() {
     [[ "$restore_count" -eq 2 ]] || fail "expected exactly 2 restores with 6 live and max 8, got $restore_count"
     [[ "$deferred_count" -eq 2 ]] || fail "expected exactly 2 deferred candidates with cap at 8, got $deferred_count"
 
-    SR_CATALOGUE="$dir/catalogue-live6.json" CCTRL_RESTORE_MAX_ACTIVE=8 _restore_run "$dir" --yes --quiet >/dev/null 2>&1 \
-        || fail "capped restore failed"
+    # A real run keeps the rows past the ceiling queued for later waves; with no
+    # room ever appearing they are still deferred when the run ends, which is a 75.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/bin/sleep"; chmod +x "$dir/bin/sleep"
+    local cap_rc=0
+    out="$(SR_CATALOGUE="$dir/catalogue-live6.json" CCTRL_RESTORE_MAX_ACTIVE=8 CCTRL_RESTORE_TIMEOUT=60 _restore_run "$dir" --yes --json 2>/dev/null)" || cap_rc=$?
+    [[ "$cap_rc" -eq 75 ]] || fail "rows deferred by the ceiling at the end of the run must give 75, got $cap_rc"
     [[ "$(_restore_spawn_count "$dir")" -eq 2 ]] || fail "capped restore should spawn exactly 2: $(cat "$dir/launch.log")"
+    jq -e '.outcome=="partial" and .result_counts.deferred==2 and .result_counts.restored==2' <<< "$out" >/dev/null || fail "ceiling deferral not reported: $(jq -c .result_counts <<< "$out")"
     echo "ok: restore cap on total managed count"
 }
 
@@ -18442,11 +18461,13 @@ printf '5\n' > "${RESTORE_TEST_MEM_FILE:?}"
 SH
     chmod +x "$dir/bin/sleep"
     RESTORE_TEST_MEM_FILE="$dir/mem" CCTRL_FAKE_MEM_FREE_PCT= CCTRL_FAKE_MEM_FREE_PCT_FILE="$dir/mem" \
-        CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=1 \
-        _restore_run "$dir" --yes --quiet >/dev/null 2>"$dir/err" || rc=$?
-    [[ "$rc" -eq 1 ]] || fail "expected exit 1 when memory drops between waves, got $rc"
+        CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=1 CCTRL_RESTORE_TIMEOUT=60 \
+        _restore_run "$dir" --yes >/dev/null 2>"$dir/err" || rc=$?
+    # The gate now WAITS for the number to recover; with it stuck, the run ends
+    # at its total timeout with the rest deferred (75).
+    [[ "$rc" -eq 75 ]] || fail "expected exit 75 when memory stays low between waves, got $rc"
     [[ "$(_restore_spawn_count "$dir")" -eq 2 ]] || fail "expected only the first wave (2) spawned, got $(_restore_spawn_count "$dir")"
-    assert_contains "$(cat "$dir/err")" "stopped: 2 of 4 restored, free memory 5% is below 15%; re-run to continue"
+    assert_contains "$(cat "$dir/err")" "holding: free memory 5% is below 15%"
     echo "ok: restore gate re-checks between waves"
 }
 
@@ -18474,7 +18495,9 @@ test_res_pressure_reason_rule() {
 test_restore_limit_caps_spawns() {
     local dir="$TMPDIR/restore-limit"
     _restore_fixture "$dir"
-    _restore_run "$dir" --limit 2 --yes --quiet >/dev/null 2>&1 || fail "restore --limit 2 --yes failed"
+    local limit_rc=0
+    _restore_run "$dir" --limit 2 --yes --quiet >/dev/null 2>&1 || limit_rc=$?
+    [[ "$limit_rc" -eq 75 ]] || fail "rows deferred by --limit are still pending at the end: expected 75, got $limit_rc"
     local spawn_count
     spawn_count="$(_restore_spawn_count "$dir")"
     [[ "$spawn_count" -le 2 ]] || fail "expected at most 2 spawns with --limit 2, got $spawn_count"
@@ -18933,7 +18956,7 @@ test_restore_failed_launch_exits_1_and_others_still_attempted() {
     out="$(TMUX_LOG="$dir/tmux.log" _restore_run_real "$dir" --only cctrl --only homelab --yes --json 2>/dev/null </dev/null)" || rc=$?
     [[ "$rc" -eq 1 ]] || fail "a failed launch must exit 1, got $rc: $out"
     jq -e '.outcome=="failed" and .exit_code==1
-        and any(.results[]; .tmux_session=="TMUX--cctrl" and .result=="failed" and .attempts==1)
+        and any(.results[]; .tmux_session=="TMUX--cctrl" and .result=="failed" and .attempts==2)
         and any(.results[]; .tmux_session=="TMUX--homelab" and .result=="restored" and .phase=="wave-1")' <<< "$out" >/dev/null \
         || fail "failed/restored results wrong: $out"
     echo "ok: a failed launch is exit 1 and the other row was still attempted"
@@ -19018,6 +19041,496 @@ test_restore_plan_strict_keeps_old_codes_cli() {
     rc=0; python3 "$ROOT/lib/snapshot_restore.py" "${argv[@]}" --strict >/dev/null || rc=$?
     [[ "$rc" -eq 75 ]] || fail "plan --strict must keep exit 75 on a conflict (got $rc)"
     echo "ok: plan --strict keeps the old exit codes"
+}
+
+# --- boot restore, step 2: the engine (waves, gates, FM first, lock, state, logs) ---
+
+_restore_boot_fixture() {
+    # _restore_fixture with every task live before the boot, and the last task
+    # (conv-ddd-444) tagged as the fleet manager. A fixed boot time and a
+    # per-test data dir keep one test's boot state out of another's.
+    local dir="$1"
+    _restore_fixture "$dir"
+    jq '.tasks |= map(.live = true)
+        | (.tasks[] | select(.provider_task_id=="conv-ddd-444") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-ddd-444")) |= (.last_active="2026-08-05T12:30:00Z")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+}
+
+_restore_boot_run() { # dir [flags]: --boot against the fixture snapshot, quiet stdout
+    local dir="$1"
+    shift
+    CCTRL_FAKE_BOOTTIME="${CCTRL_FAKE_BOOTTIME:-1780000000}" _restore_run "$dir" --boot "$@"
+}
+
+_restore_sleep_stub() { # dir script-body: a `sleep` that runs BODY (its first arg is "$1")
+    cat > "$1/bin/sleep" <<SH
+#!/usr/bin/env bash
+$2
+SH
+    chmod +x "$1/bin/sleep"
+}
+
+_restore_log_has() { # dir event-substring
+    grep -q -- "$2" "$1/data/restore/restore.log" 2>/dev/null
+}
+
+test_restore_boot_name_taken_skips() {
+    local dir="$TMPDIR/restore-boot-name" out rc=0
+    _restore_boot_fixture "$dir"
+    out="$(TMUX_FAKE_SESSIONS="TMUX--homelab" _restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a held name at boot must give 75, got $rc: $out"
+    ! grep -q "conv-bbb-222" "$dir/launch.log" || fail "the held name was launched anyway: $(cat "$dir/launch.log")"
+    [[ "$(_restore_spawn_count "$dir")" -eq 3 ]] || fail "the other rows must launch: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .tmux_session=="TMUX--homelab" and .result=="skipped" and .evidence.attention=="conflict" and (.reason|contains("held by another live session")))' <<< "$out" >/dev/null \
+        || fail "held-name row not reported: $out"
+    # Interactive restore keeps the next-free-index behaviour inside start: it still launches the row.
+    : > "$dir/launch.log"
+    rc=0; TMUX_FAKE_SESSIONS="TMUX--homelab" _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "plain restore must not skip a held name (rc=$rc): $(cat "$dir/launch.log")"
+    echo "ok: boot skips a recorded name another session holds; plain restore does not"
+}
+
+test_restore_fm_first() {
+    local dir="$TMPDIR/restore-fm-first" out rc=0
+    _restore_boot_fixture "$dir"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "boot restore failed (rc=$rc): $out"
+    [[ "$(sed -n 1p "$dir/launch.log")" == *"conv-ddd-444"* ]] || fail "the fleet manager must launch first: $(cat "$dir/launch.log")"
+    assert_contains "$(sed -n 1p "$dir/launch.log")" "--health-check-timeout 180"
+    ! sed -n '2,$p' "$dir/launch.log" | grep -q -- "--health-check-timeout" || fail "only the fleet manager carries the long health timeout: $(cat "$dir/launch.log")"
+    jq -e '.results[0].provider_task_id == "conv-ddd-444" or any(.results[]; .provider_task_id=="conv-ddd-444" and .phase=="fm")' <<< "$out" >/dev/null || fail "fm phase not reported: $out"
+    jq -e '.fm.result == "restored" and .fm.health_status == "ready" and .run_id != null and .boot_id == "1780000000"' <<< "$out" >/dev/null || fail "fm summary wrong: $(jq -c '.fm,.run_id,.boot_id' <<< "$out")"
+    echo "ok: the fleet manager launches first with its own health timeout"
+}
+
+test_restore_fm_health_from_this_launch_only() {
+    local dir="$TMPDIR/restore-fm-health" out rc=0
+    _restore_boot_fixture "$dir"
+    printf 'timeout\n' > "$dir/health"
+    out="$(CCTRL_RESTORE_FAKE_HEALTH_FILE="$dir/health" _restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a fleet manager that did not become ready must give 75, got $rc: $out"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "the rest must still restore: $(cat "$dir/launch.log")"
+    jq -e '.fm.result == "timeout" and .fm.health_status == "timeout"' <<< "$out" >/dev/null || fail "fm result wrong: $(jq -c .fm <<< "$out")"
+    # The freshness rule itself: a status written before this launch started is never read.
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        _session_metadata_field() {
+            case "$2" in
+                created_at) printf '%s' "$FAKE_CREATED" ;;
+                health_status) printf 'ready' ;;
+            esac
+        }
+        FAKE_CREATED="$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+        [[ -z "$(_restore_fresh_health TMUX--x "$(date +%s)")" ]] || fail "a stale health_status was trusted"
+        FAKE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        [[ "$(_restore_fresh_health TMUX--x "$(( $(date +%s) - 5 ))")" == ready ]] || fail "a fresh health_status was not read"
+        FAKE_CREATED=""
+        [[ -z "$(_restore_fresh_health TMUX--x "$(date +%s)")" ]] || fail "an undated record was trusted"
+    ) || fail "freshness rule"
+    echo "ok: the fleet manager's health comes from this launch only"
+}
+
+test_restore_two_fm_rows_one_restored() {
+    local dir="$TMPDIR/restore-two-fm" out rc=0
+    _restore_boot_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.last_active="2026-08-05T09:00:00Z")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a second fleet manager row is a conflict (75), got $rc: $out"
+    grep -q "conv-ddd-444" "$dir/launch.log" || fail "the newest fleet manager row was not restored"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "the older fleet manager row was launched"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="skipped" and .evidence.attention=="conflict" and (.reason|contains("second fleet manager row")))' <<< "$out" >/dev/null \
+        || fail "second fleet manager row not reported: $out"
+    echo "ok: two fleet manager rows restore only the newest"
+}
+
+_restore_many_fixture() { # dir workers: boot fixture with N live workers plus the fleet manager
+    local dir="$1" n="$2"
+    _restore_boot_fixture "$dir"
+    jq --argjson n "$n" --arg host "$_SR_HOST_ID" '
+      .tasks = ([.tasks[] | select(.provider_task_id == "conv-ddd-444")]
+        + [range(0; $n) | {provider:"claude", provider_task_id:("conv-w-" + tostring), host_id:$host, origin:"cctrl", execution_runtime:"tmux",
+            control_owner:"cctrl", lifecycle_state:"active", restore_strategy:"tmux-resume", registered_by_cctrl:true, launched_by_cctrl:true,
+            tmux_session:("TMUX--w" + tostring), resume_identity_kind:"claude-session-id", resume_identity:("conv-w-" + tostring),
+            cwd:"/Users/test/dev/w", purpose:"worker", display_label:("w" + tostring), agent:"claude", launch_flags:{}, last_active:"2026-08-05T11:00:00Z", live:true}])
+      | .task_reference_count = (.tasks | length) | .catalogue_task_count = (.tasks | length)' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    jq --arg host "$_SR_HOST_ID" --slurpfile snap "$dir/snapshots/latest.json" '
+      .rows = [$snap[0].tasks[] | {task_key:("provider:claude:" + $host + ":" + .provider_task_id), provider, provider_task_id, host_id:$host,
+          origin:"cctrl", execution_runtime:"tmux", control_owner:"cctrl", lifecycle_state:"active", restore_strategy:"tmux",
+          registered_by_cctrl:true, launched_by_cctrl:true, registration_provenance:[{source:"registry"}], launch_provenance:[{source:"launch-receipt"}],
+          lineage:{forked_from_id:null,parent_thread_id:null,derived_root_id:null,derived_root_basis:null}, ownership_evidence:[], cwd, display_title:.display_label, tmux_session,
+          action_capabilities:{tmux_attach:{supported:false,reason:"no-live-cctrl-tmux-owner"}}}]' \
+        "$dir/catalogue.json" > "$dir/cat.tmp" && mv "$dir/cat.tmp" "$dir/catalogue.json"
+}
+
+test_restore_deferred_rows_restored_in_later_waves() {
+    local dir="$TMPDIR/restore-waves" out rc=0
+    _restore_many_fixture "$dir" 12
+    _restore_sleep_stub "$dir" 'exit 0'
+    out="$(CCTRL_RESTORE_MAX_ACTIVE=20 CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=1 CCTRL_RESTORE_TIMEOUT=600 _restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "13 rows with a ceiling of 20 must all restore (rc=$rc): $(jq -c '.result_counts' <<< "$out")"
+    [[ "$(_restore_spawn_count "$dir")" -eq 13 ]] || fail "expected 13 spawns, got $(_restore_spawn_count "$dir")"
+    jq -e '.result_counts.deferred == 0 and .result_counts.restored == 13
+        and ([.results[] | select(.phase | startswith("wave-")) | .phase] | unique | length) == 6
+        and any(.results[]; .phase == "fm")' <<< "$out" >/dev/null || fail "waves wrong: $(jq -c '[.results[]|.phase]' <<< "$out")"
+    echo "ok: rows past the first wave restore in later waves"
+}
+
+test_restore_ceiling_holds_then_releases() {
+    local dir="$TMPDIR/restore-ceiling" out rc=0
+    _restore_fixture "$dir"
+    jq --arg host "$_SR_HOST_ID" '.rows += [range(1;5) | tostring | {provider:"claude", provider_task_id:("live-" + .), host_id:$host,
+        origin:"cctrl", execution_runtime:"tmux", control_owner:"cctrl", lifecycle_state:"active", restore_strategy:"tmux",
+        registered_by_cctrl:true, launched_by_cctrl:true, cwd:"/tmp", tmux_session:("TMUX--live" + .),
+        action_capabilities:{tmux_attach:{supported:true}}}]' "$dir/catalogue.json" > "$dir/catalogue-live.json"
+    cp "$dir/catalogue.json" "$dir/catalogue-free.json"
+    cp "$dir/catalogue-live.json" "$dir/catalogue-now.json"
+    # The first sleep frees the four live sessions (ceiling 4, so no room until then).
+    _restore_sleep_stub "$dir" "cp '$dir/catalogue-free.json' '$dir/catalogue-now.json'"
+    out="$(SR_CATALOGUE="$dir/catalogue-now.json" CCTRL_RESTORE_MAX_ACTIVE=4 CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=1 CCTRL_RESTORE_TIMEOUT=600 \
+        _restore_run "$dir" --yes --json 2>"$dir/err")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "rows must wait for room and then restore (rc=$rc): $(cat "$dir/err")"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "expected all 4 rows to spawn after the ceiling cleared, got $(_restore_spawn_count "$dir")"
+    assert_contains "$(cat "$dir/err")" "holding: live ceiling 4 reached"
+    jq -e '.result_counts.deferred == 0' <<< "$out" >/dev/null || fail "nothing may be deferred: $(jq -c .result_counts <<< "$out")"
+    echo "ok: the live ceiling holds the queue and then releases it"
+}
+
+test_restore_gate_waits_on_load() {
+    local dir="$TMPDIR/restore-load" out rc=0
+    _restore_boot_fixture "$dir"
+    printf '55\n' > "$dir/load"
+    _restore_sleep_stub "$dir" "printf '12\n' > '$dir/load'"
+    out="$(CCTRL_FAKE_LOAD1='' CCTRL_FAKE_LOAD1_FILE="$dir/load" _restore_boot_run "$dir" --json 2>"$dir/err")" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a busy box must delay the restore, not fail it (rc=$rc): $(cat "$dir/err")"
+    assert_contains "$(cat "$dir/err")" "holding: load 55 > 40"
+    _restore_log_has "$dir" '"event":"gate-hold"' || fail "no gate-hold event logged"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "all rows must restore once the load drops"
+    jq -e 'any(.gates[]; .verdict=="hold" and .load1==55) and any(.gates[]; .verdict=="pass")' <<< "$out" >/dev/null || fail "gate samples not reported: $(jq -c .gates <<< "$out")"
+    echo "ok: the gate waits while load is above the limit"
+}
+
+test_restore_gate_compressor_and_swapins() {
+    local dir="$TMPDIR/restore-comp" out rc=0
+    _restore_boot_fixture "$dir"
+    # Compressed memory above the limit AND growing across the sample holds; flat does not.
+    printf '30\n' > "$dir/comp"; printf '0\n' > "$dir/n"
+    _restore_sleep_stub "$dir" "n=\$(cat '$dir/n'); printf '%s\n' \$((n+1)) > '$dir/n'; [ \"\$n\" = 0 ] && printf '35\n' > '$dir/comp'; exit 0"
+    CCTRL_FAKE_COMPRESSED_PCT='' CCTRL_FAKE_COMPRESSED_PCT_FILE="$dir/comp" CCTRL_RESTORE_GATE_SAMPLE=5 _restore_boot_run "$dir" --quiet >/dev/null 2>"$dir/err" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "compressor hold must clear when the number stops growing (rc=$rc): $(cat "$dir/err")"
+    _restore_log_has "$dir" 'compressed memory 35' || fail "growing compressor not held: $(cat "$dir/data/restore/restore.log")"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "rows must restore after the hold"
+    # Flat at 30 % never holds.
+    _restore_boot_fixture "$dir"; : > "$dir/launch.log"; rm -rf "$dir/data"
+    printf '30\n' > "$dir/comp"; _restore_sleep_stub "$dir" 'exit 0'
+    rc=0; CCTRL_FAKE_COMPRESSED_PCT='' CCTRL_FAKE_COMPRESSED_PCT_FILE="$dir/comp" CCTRL_RESTORE_GATE_SAMPLE=5 CCTRL_RESTORE_TIMEOUT=60 _restore_boot_run "$dir" --quiet >/dev/null 2>"$dir/err" || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "a flat compressor must not hold (rc=$rc): $(cat "$dir/err")"
+    # Swap-ins per second over the sample.
+    _restore_boot_fixture "$dir"; : > "$dir/launch.log"; rm -rf "$dir/data"
+    printf '0\n' > "$dir/swapins"; printf '0\n' > "$dir/n"
+    _restore_sleep_stub "$dir" "n=\$(cat '$dir/n'); printf '%s\n' \$((n+1)) > '$dir/n'; [ \"\$n\" = 0 ] && printf '600\n' > '$dir/swapins'; exit 0"
+    rc=0; CCTRL_FAKE_SWAPINS='' CCTRL_FAKE_SWAPINS_FILE="$dir/swapins" CCTRL_RESTORE_GATE_SAMPLE=5 _restore_boot_run "$dir" --quiet >/dev/null 2>"$dir/err" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "swap-in hold must clear (rc=$rc): $(cat "$dir/err")"
+    _restore_log_has "$dir" 'swap-ins 120/s' || fail "swap-in rate not held: $(cat "$dir/data/restore/restore.log")"
+    echo "ok: the gate holds on a growing compressor and on swap-ins, and only then"
+}
+
+test_restore_timeout_defers_rest() {
+    local dir="$TMPDIR/restore-timeout" out rc=0 started="$SECONDS"
+    _restore_boot_fixture "$dir"
+    _restore_sleep_stub "$dir" 'exit 0'
+    out="$(CCTRL_FAKE_LOAD1=90 CCTRL_RESTORE_TIMEOUT=60 CCTRL_RESTORE_GATE_POLL=30 _restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    (( SECONDS - started < 20 )) || fail "the run did not end by the virtual clock (took $(( SECONDS - started )) s)"
+    [[ "$rc" -eq 75 ]] || fail "a timeout with rows still queued must give 75, got $rc: $out"
+    [[ ! -s "$dir/launch.log" ]] || fail "nothing may launch under load 90: $(cat "$dir/launch.log")"
+    jq -e '.outcome=="partial" and .result_counts.deferred == 4 and all(.results[] | select(.disposition=="restore"); .result=="deferred" and (.reason|contains("timeout after")) and (.reason|contains("load 90 > 40")))' <<< "$out" >/dev/null \
+        || fail "deferred rows wrong: $(jq -c '[.results[]|{result,reason}]' <<< "$out")"
+    echo "ok: a total timeout defers what is left and exits 75"
+}
+
+test_restore_unreadable_live_count_fails_closed() {
+    local dir="$TMPDIR/restore-failclosed" out rc=0
+    _restore_fixture "$dir"
+    cp "$dir/catalogue.json" "$dir/catalogue-now.json"
+    _restore_sleep_stub "$dir" "printf 'not json' > '$dir/catalogue-now.json'"
+    out="$(SR_CATALOGUE="$dir/catalogue-now.json" CCTRL_RESTORE_WAVE_SIZE=2 CCTRL_RESTORE_WAVE_PAUSE=1 CCTRL_RESTORE_TIMEOUT=600 \
+        _restore_run "$dir" --yes --json 2>"$dir/err")" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "an unreadable live count must stop the run with 1, got $rc: $(cat "$dir/err")"
+    [[ "$(_restore_spawn_count "$dir")" -eq 2 ]] || fail "only the first wave may have launched, got $(_restore_spawn_count "$dir")"
+    assert_contains "$(cat "$dir/err")" "live session count could not be read"
+    jq -e '.outcome=="failed" and .result_counts.deferred == 2' <<< "$out" >/dev/null || fail "stop not reported: $(jq -c '.outcome,.result_counts' <<< "$out")"
+    echo "ok: an unreadable live count fails closed"
+}
+
+test_restore_failed_launch_retried_once() {
+    local dir="$TMPDIR/restore-retry" out rc=0
+    _restore_fixture "$dir"
+    out="$(CCTRL_RESTORE_FAKE_FAIL="conv-bbb-222:1" _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a launch that works on the second try is a complete restore (rc=$rc): $out"
+    [[ "$(grep -c -- '-r conv-bbb-222 ' "$dir/launch.log")" -eq 2 ]] || fail "expected exactly 2 attempts: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .provider_task_id=="conv-bbb-222" and .result=="restored" and .attempts==2)' <<< "$out" >/dev/null || fail "retry not reported: $out"
+    : > "$dir/launch.log"; rc=0
+    out="$(CCTRL_RESTORE_FAKE_FAIL="conv-bbb-222:5" _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "a row that fails twice is failed (1), got $rc"
+    [[ "$(grep -c -- '-r conv-bbb-222 ' "$dir/launch.log")" -eq 2 ]] || fail "a failing row is tried twice and no more: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .provider_task_id=="conv-bbb-222" and .result=="failed" and .attempts==2)' <<< "$out" >/dev/null || fail "failure not reported: $out"
+    echo "ok: a failed launch is retried once at the end of the queue"
+}
+
+test_snapshot_does_not_replace_latest_during_restore() {
+    local bin="$TMPDIR/sl-bin" sdir="$TMPDIR/sl-sess" pdir="$TMPDIR/sl-proj" meta="$TMPDIR/sl-meta"
+    local snapdir="$TMPDIR/sl-snapshots" ev="$TMPDIR/sl-ev" data="$TMPDIR/sl-data" holder
+    mkdir -p "$snapdir" "$data/restore/.restore.lock"
+    _snapshot_fixture "$bin" "$sdir" "$pdir" "$meta"
+    _snapshot_v2_evidence "$ev"
+    cat > "$snapdir/latest.json" <<'JSON'
+{"schema_version":2,"task_reference_count":0,"tasks":[],"marker":"before"}
+JSON
+    sleep 30 & holder=$!
+    printf '%s\n' "$holder" > "$data/restore/.restore.lock/pid"; date +%s > "$data/restore/.restore.lock/created"
+    local out rc=0
+    out="$(CCTRL_DATA_DIR="$data" _snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "snapshot during a restore failed ($rc): $out"
+    [[ "$(jq -r .marker "$snapdir/latest.json")" == before ]] || fail "latest.json was replaced while a restore holds the lock"
+    assert_contains "$out" "restore is running"
+    [[ -n "$(find "$snapdir" -maxdepth 1 -name '[0-9]*.json' -print | head -1)" ]] || fail "the capture was not kept in history"
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    # A dead holder is stale: the capture replaces latest.json again.
+    printf '%s\n' "$holder" > "$data/restore/.restore.lock/pid"
+    out="$(CCTRL_DATA_DIR="$data" _snapshot_run "$ev" "$bin" "$sdir" "$pdir" "$meta" "$snapdir" 2>&1)" || fail "snapshot after the restore failed: $out"
+    [[ "$(jq -r '.marker // "none"' "$snapdir/latest.json")" == none ]] || fail "latest.json was not replaced once the lock was stale"
+    echo "ok: a snapshot never replaces latest.json while a restore runs"
+}
+
+test_restore_boot_idempotent_second_run() {
+    local dir="$TMPDIR/restore-idem" out rc=0
+    _restore_boot_fixture "$dir"
+    _restore_boot_run "$dir" --quiet >/dev/null 2>&1 || fail "first boot restore failed"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "first run must restore 4"
+    : > "$dir/launch.log"
+    out="$(_restore_boot_run "$dir" --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 && ! -s "$dir/launch.log" ]] || fail "second run in the same boot must do nothing (rc=$rc): $out"
+    assert_contains "$out" "already completed for boot 1780000000"
+    jq -e '.ok == true and .outcome == "complete" and .already_completed == true' <<< "$out" >/dev/null || fail "already-completed document wrong: $out"
+    # --rerun ignores the stored row results but keeps the pinned source.
+    out="$(_restore_boot_run "$dir" --rerun --json 2>/dev/null)" || rc=$?
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "--rerun must ask the planner again, got $(_restore_spawn_count "$dir") spawns"
+    # A partial boot: rows restored once are never resurrected by the next run, a skipped row stays skipped.
+    local dir2="$TMPDIR/restore-idem2"
+    _restore_boot_fixture "$dir2"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict" | .execution_runtime="conflict" | .lifecycle_state="conflict")' \
+        "$dir2/snapshots/latest.json" > "$dir2/snap.tmp" && mv "$dir2/snap.tmp" "$dir2/snapshots/latest.json"
+    rc=0; _restore_boot_run "$dir2" --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 && "$(_restore_spawn_count "$dir2")" -eq 3 ]] || fail "first partial run: rc=$rc spawns=$(_restore_spawn_count "$dir2")"
+    : > "$dir2/launch.log"; rc=0
+    out="$(_restore_boot_run "$dir2" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 && ! -s "$dir2/launch.log" ]] || fail "second partial run must launch nothing and stay 75 (rc=$rc): $(cat "$dir2/launch.log")"
+    jq -e '.result_counts.restored == 3 and .result_counts.conflict == 1' <<< "$out" >/dev/null || fail "second partial run counts: $(jq -c .result_counts <<< "$out")"
+    echo "ok: a second boot run does nothing more; rerun and partial states behave"
+}
+
+test_restore_lock_held_exit_75() {
+    local dir="$TMPDIR/restore-lock" out rc=0 holder
+    _restore_boot_fixture "$dir"
+    mkdir -p "$dir/data/restore/.restore.lock"
+    sleep 30 & holder=$!
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; date +%s > "$dir/data/restore/.restore.lock/created"; printf 'other-run\n' > "$dir/data/restore/.restore.lock/run_id"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    [[ "$rc" -eq 75 && ! -s "$dir/launch.log" ]] || fail "a held lock must give 75 and launch nothing (rc=$rc)"
+    jq -e '.outcome == "locked" and .exit_code == 75 and .holder.run_id == "other-run"' <<< "$out" >/dev/null || fail "locked document wrong: $out"
+    # A dead pid is a stale lock: stolen, and the run proceeds.
+    rc=0; out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "a stale lock must be taken over (rc=$rc): $out"
+    [[ ! -d "$dir/data/restore/.restore.lock" ]] || fail "the lock was not released"
+    echo "ok: a held lock exits 75 and a stale one is taken over"
+}
+
+test_restore_log_and_status() {
+    local dir="$TMPDIR/restore-status" out rc=0 mode run_id
+    _restore_boot_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.control_owner="conflict" | .execution_runtime="conflict" | .lifecycle_state="conflict")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "mixed run should be partial, got $rc"
+    run_id="$(jq -r .run_id <<< "$out")"
+    _restore_log_has "$dir" '"event":"run-start"' || fail "no run-start event"
+    _restore_log_has "$dir" '"event":"run-end"' || fail "no run-end event"
+    [[ "$(jq -S . "$dir/data/restore/runs/$run_id.json")" == "$(jq -S . <<< "$out")" ]] || fail "the run file differs from the --json document"
+    cmp -s "$dir/data/restore/last-run.json" "$dir/data/restore/runs/$run_id.json" || fail "last-run.json is not the newest run"
+    for f in "$dir/data/restore/restore.log" "$dir/data/restore/last-run.json" "$dir/data/restore/runs/$run_id.json" "$dir/data/restore/boot-1780000000.json"; do
+        mode="$(stat -f %Lp "$f" 2>/dev/null || stat -c %a "$f")"
+        [[ "$mode" == 600 ]] || fail "$f is mode $mode, want 600"
+    done
+    local st
+    st="$(CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME=1780000000 "$ROOT/cctrl" session restore status --json)" || fail "restore status failed"
+    jq -e --arg run "$run_id" '.found == true and .run_id == $run and .outcome == "partial" and .result_counts.restored == 3 and .result_counts.conflict == 1
+        and .run_is_this_boot == true and .boot_run == "partial" and (.rows_not_back | length) == 1' <<< "$st" >/dev/null || fail "status json wrong: $st"
+    st="$(CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME=1780000000 "$ROOT/cctrl" session restore status)"
+    assert_contains "$st" "outcome partial, exit 75"
+    assert_contains "$st" "[skipped] TMUX--cctrl"
+    assert_contains "$st" "this boot (1780000000): partial"
+    st="$(CCTRL_DATA_DIR="$dir/empty" CCTRL_FAKE_BOOTTIME=1780000000 "$ROOT/cctrl" session restore status --json)"
+    jq -e '.found == false and .boot_run == "missing"' <<< "$st" >/dev/null || fail "empty status wrong: $st"
+    [[ ! -e "$dir/empty/restore" ]] || fail "status created files"
+    echo "ok: the run log, run files, state and status agree and are private"
+}
+
+test_restore_boot_inside_session_requires_background() {
+    local dir="$TMPDIR/restore-bg" out rc=0
+    _restore_boot_fixture "$dir"
+    out="$(CCTRL_SESSION_NAME=TMUX--ms--fm _restore_boot_run "$dir" --json 2>"$dir/err")" || rc=$?
+    [[ "$rc" -eq 64 && ! -s "$dir/launch.log" ]] || fail "--boot inside a session without --background must give 64 (rc=$rc)"
+    assert_contains "$(cat "$dir/err")" "--background"
+    jq -e '.exit_code == 64' <<< "$out" >/dev/null || fail "refusal document wrong: $out"
+    rc=0; : > "$dir/bg.log"
+    out="$(CCTRL_SESSION_NAME=TMUX--ms--fm CCTRL_RESTORE_BACKGROUND_EXEC_LOG="$dir/bg.log" _restore_boot_run "$dir" --background --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && ! -s "$dir/launch.log" ]] || fail "--background must return at once without launching (rc=$rc)"
+    jq -e '.ok == true and .outcome == "background" and (.run_id | length) > 4' <<< "$out" >/dev/null || fail "background document wrong: $out"
+    assert_contains "$(cat "$dir/bg.log")" "--boot"
+    assert_not_contains "$(cat "$dir/bg.log")" "--background"
+    assert_contains "$(cat "$dir/bg.log")" "run_id=$(jq -r .run_id <<< "$out")"
+    echo "ok: --boot inside a session needs --background, which re-runs detached"
+}
+
+test_restore_launch_env_scrubbed() {
+    local dir="$TMPDIR/restore-scrub"
+    _restore_fixture "$dir"
+    TMUX=/tmp/fake,1,0 CCTRL_TMUX_CONTEXT=1 CCTRL_SESSION_NAME=TMUX--ms--caller _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "restore failed"
+    [[ "$(wc -l < "$dir/launch.log.env" | tr -d ' ')" -eq 4 ]] || fail "expected one env record per launch: $(cat "$dir/launch.log.env")"
+    ! grep -v 'TMUX=\[\] CCTRL_TMUX_CONTEXT=\[\] CCTRL_SESSION_NAME=\[\]' "$dir/launch.log.env" | grep -q . || fail "a launch inherited the caller's session identity: $(cat "$dir/launch.log.env")"
+    assert_contains "$(head -n 1 "$dir/launch.log.env")" "CCTRL_HC_AUTO_RESUME_SUMMARY=[]"
+    echo "ok: every launch runs with the caller's session identity removed"
+}
+
+test_restore_no_inline_structural() {
+    # No restore code path may launch inline or exec: only detached launches.
+    local body fn
+    body="$(awk '/^(_session_restore|_session_restore_core|_restore_[a-z_]*)\(\) \{/{p=1} p{print} /^}/{p=0}' "$ROOT/cctrl" | grep -v '^[[:space:]]*#')"
+    [[ -n "$body" ]] || fail "could not extract the restore functions"
+    for fn in '--foreground' 'cmd_start' '_shortcut_jump' 'exec ' '--no-tmux'; do
+        if grep -q -- "$fn" <<<"$body"; then fail "a restore function contains '$fn': $(grep -n -- "$fn" <<<"$body" | head -3)"; fi
+    done
+    grep -q -- '--force' <<<"$(grep -v 'force-host\|force_host' <<<"$body")" && fail "a restore function passes --force"
+    grep -Eq 'send-keys|paste-buffer|load-buffer|capture-pane' <<<"$body" && fail "a restore function infers from the pane"
+    echo "ok: no restore function can launch inline"
+}
+
+test_restore_tmux_primary_down_69() {
+    local dir="$TMPDIR/restore-primary" out rc=0
+    _restore_fixture "$dir"
+    cat > "$dir/bin/tmux" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+    chmod +x "$dir/bin/tmux"
+    out="$(CCTRL_TMUX_SERVER="$dir/dead.sock" _restore_run "$dir" --yes --json 2>"$dir/err")" || rc=$?
+    [[ "$rc" -eq 69 && ! -s "$dir/launch.log" ]] || fail "a dead primary must give 69 before anything launches (rc=$rc): $(cat "$dir/err")"
+    assert_contains "$(cat "$dir/err")" "primary tmux server"
+    jq -e '.outcome=="refused" and .exit_code==69' <<< "$out" >/dev/null || fail "refusal document wrong: $out"
+    [[ ! -d "$dir/data/restore" ]] || fail "a refused run must not create run files"
+    echo "ok: a dead primary tmux server refuses the restore with 69"
+}
+
+test_restore_boot_targets_only_live_before() {
+    local dir="$TMPDIR/restore-liveonly" out rc=0
+    _restore_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111" or .provider_task_id=="conv-bbb-222" or .provider_task_id=="conv-ddd-444")) |= (.live=true)' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "boot restore of live-before rows failed (rc=$rc): $out"
+    [[ "$(_restore_spawn_count "$dir")" -eq 3 ]] || fail "boot must restore only the 3 live-before rows: $(cat "$dir/launch.log")"
+    ! grep -q "conv-ccc-333" "$dir/launch.log" || fail "an inactive row was restored at boot"
+    jq -e 'any(.results[]; .provider_task_id=="conv-ccc-333" and .result=="skipped" and .reason=="not live before boot")' <<< "$out" >/dev/null || fail "inactive row not reported: $out"
+    : > "$dir/launch.log"; rm -rf "$dir/data"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || fail "plain restore failed"
+    [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "plain --yes must keep restoring every candidate"
+    echo "ok: --boot restores only what was live before the boot"
+}
+
+test_restore_boot_attention_only_from_live_before_rows() {
+    local dir="$TMPDIR/restore-attn" out rc=0
+    _restore_boot_fixture "$dir"
+    # An old dead row with an ambiguous claim: informational at boot, a 75 otherwise.
+    jq '.tasks += [{provider:"claude", provider_task_id:"conv-old", host_id:.host_id, origin:"cctrl", execution_runtime:"unknown", control_owner:"unknown",
+          lifecycle_state:"unknown", restore_strategy:"tmux-resume", registered_by_cctrl:true, launched_by_cctrl:true, tmux_session:"TMUX--old",
+          resume_identity:"conv-old", cwd:"/Users/test/dev/old", agent:"claude", live:false,
+          recovery_reason:"ambiguous-tmux-claim: several open records claim a tmux name that is not live (x)"}]' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a dead old row must not make a boot restore partial (rc=$rc): $(jq -c '.result_counts' <<< "$out")"
+    rc=0; rm -rf "$dir/data"
+    _restore_run "$dir" --yes --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "outside --boot the same row still counts (75), got $rc"
+    # A live-before ambiguous row counts at boot.
+    jq '(.tasks[] | select(.provider_task_id=="conv-old")) |= (.live=true)' "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    rc=0; rm -rf "$dir/data"; : > "$dir/launch.log"
+    _restore_boot_run "$dir" --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a live-before ambiguous row must give 75 at boot, got $rc"
+    echo "ok: under --boot only rows live before the boot count toward the exit code"
+}
+
+test_restore_boot_after_days_off() {
+    local dir="$TMPDIR/restore-daysoff" out rc=0 snaps
+    _restore_boot_fixture "$dir"
+    snaps="$dir/data/snapshots"; mkdir -p "$snaps"
+    jq --arg t "$(_restore_iso_ago 72)" '.generated_at=$t' "$dir/snapshots/latest.json" > "$snaps/20260101T000000Z.json"
+    cp "$snaps/20260101T000000Z.json" "$snaps/latest.json"
+    # Three days old, boot one hour ago, cap one day: nothing is launched.
+    out="$(CCTRL_RESTORE_BOOT_MAX_AGE=86400 CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 1)" SR_FROM=pre-boot _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 && ! -s "$dir/launch.log" ]] || fail "an old pre-boot snapshot must give 69 and launch nothing (rc=$rc): $out"
+    jq -e '.outcome=="refused" and (.why|contains("older than"))' <<< "$out" >/dev/null || fail "refusal reason wrong: $out"
+    # The same snapshot inside the cap proceeds.
+    rc=0; out="$(CCTRL_RESTORE_BOOT_MAX_AGE=604800 CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 1)" SR_FROM=pre-boot _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "a snapshot inside the cap must restore (rc=$rc): $(jq -c .result_counts <<< "$out")"
+    # An explicit path obeys the same cap, and --boot alone means pre-boot.
+    rc=0; : > "$dir/launch.log"
+    out="$(CCTRL_RESTORE_BOOT_MAX_AGE=86400 SR_FROM="$snaps/latest.json" _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "an explicit old path must obey the cap too (rc=$rc)"
+    echo "ok: boot after days off refuses an old pre-boot snapshot"
+}
+
+test_restore_scratch_rm_is_canonical() {
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        local base="$TMPDIR/scratch-rm" outside="$TMPDIR/scratch-rm-outside"
+        mkdir -p "$base/a/b" "$outside"
+        TMPDIR="$base" _scratch_rm "$base/a/../../scratch-rm-outside"
+        [[ -d "$outside" ]] || fail "a .. escape removed a directory outside TMPDIR"
+        TMPDIR="$base" _scratch_rm "$base/a/b/.."
+        [[ -d "$base/a" ]] || fail "a path ending in .. was removed"
+        ln -s "$outside" "$base/link"
+        TMPDIR="$base" _scratch_rm "$base/link"
+        [[ -d "$outside" ]] || fail "a symlink was followed"
+        TMPDIR="$base" _scratch_rm "$base/a/b"
+        [[ ! -d "$base/a/b" ]] || fail "a plain scratch dir was not removed"
+        TMPDIR="$base" _scratch_rm "$base"
+        [[ -d "$base" ]] || fail "TMPDIR itself was removed"
+    ) || fail "_scratch_rm canonical"
+    echo "ok: scratch cleanup compares canonical paths"
+}
+
+test_health_check_resume_summary_picker() {
+    # D7: the large-transcript picker needs a human everywhere except a boot restore.
+    local i hit=""
+    (
+        source "$ROOT/lib/health-check-patterns.sh"
+        _hc_patterns_for_agent claude
+        for i in "${!HC_LABEL[@]}"; do [[ "${HC_LABEL[$i]}" == resume-summary ]] && hit="$i"; done
+        [[ -n "$hit" ]] || fail "no resume-summary pattern"
+        printf '%s\n' '  ❯ 1. Resume from summary (recommended)' '    2. Resume full session as-is' | grep -E "${HC_PATTERN[$hit]}" >/dev/null || fail "picker not matched"
+        printf '%s\n' 'Next we could resume from summary of last week' | grep -E "${HC_PATTERN[$hit]}" >/dev/null && fail "prose matched the picker"
+        [[ "${HC_ACTION[$hit]}" == needs-human ]] || fail "outside a boot restore the picker must need a human, got ${HC_ACTION[$hit]}"
+        CCTRL_HC_AUTO_RESUME_SUMMARY=1 _hc_patterns_for_agent claude
+        [[ "${HC_ACTION[$hit]}" == auto-select && "${HC_KEYS[$hit]}" == '1\. Resume from summary' ]] || fail "under --boot the picker must auto-select option 1"
+        printf '%s\n' '❯ 1. Resume from summary (recommended)' | grep -E "^[[:space:]│|]*[❯›][[:space:]]+${HC_KEYS[$hit]}" >/dev/null || fail "the selected-line check would not see option 1"
+        _hc_patterns_for_agent codex
+        [[ "${#HC_PATTERN[@]}" -eq "${#HC_ACTION[@]}" && "${#HC_PATTERN[@]}" -eq "${#HC_HINT[@]}" ]] || fail "codex table arrays differ in length"
+    ) || fail "resume-summary pattern"
+    echo "ok: the resume-from-summary picker is auto-selected only for a boot restore"
 }
 
 test_snapshot_passes_projects_dir_for_tie_break() {
@@ -19340,6 +19853,7 @@ JSON
     CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
       CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" CCTRL_RESTORE_LAUNCH_LOG="$launch_log" \
       CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 CCTRL_RESTORE_WAVE_PAUSE=0 \
+      CCTRL_FAKE_LOAD1=1 CCTRL_FAKE_COMPRESSED_PCT=1 CCTRL_FAKE_SWAPINS=0 CCTRL_RESTORE_GATE_SAMPLE=0 \
       "$ROOT/cctrl" session restore --from "$snapshots/latest.json" --yes --quiet >/dev/null
     [[ "$(wc -l < "$launch_log" | tr -d ' ')" == 1 ]] || fail "restore executed more than the exact eligible row"
     assert_contains "$(cat "$launch_log")" "claude-1"
@@ -19356,7 +19870,8 @@ JSON
       || fail "--only did not demote the non-matching restore candidate: $out"
     CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" CCTRL_RESTORE_CATALOGUE_FILE="$current" \
       CCTRL_RESTORE_PROCESS_FILE="$process" CCTRL_RESTORE_CODEX_EVIDENCE_FILE="$codex" CCTRL_RESTORE_LAUNCH_LOG="$launch_log" \
-      CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 "$ROOT/cctrl" session restore --from "$snapshots/latest.json" \
+      CCTRL_FAKE_MEM_FREE_PCT=80 CCTRL_FAKE_SWAP_MB=0 CCTRL_FAKE_LOAD1=1 CCTRL_FAKE_COMPRESSED_PCT=1 CCTRL_FAKE_SWAPINS=0 CCTRL_RESTORE_GATE_SAMPLE=0 \
+      "$ROOT/cctrl" session restore --from "$snapshots/latest.json" \
       --only definitely-not-claude --yes --quiet >/dev/null
     [[ ! -s "$launch_log" ]] || fail "--only launched a non-matching restore candidate"
 
