@@ -431,14 +431,16 @@ def is_claude_command(tokens: list[str]) -> bool:
     return False
 
 
-def bare_resume_command(command: str) -> bool:
+def bare_resume_command(command: str, known_ids: set[str] | frozenset[str] | None = None) -> bool:
     """True when this claude resumes a conversation without naming it in argv.
 
     -c/--continue never takes a value, so it is always bare. --resume/-r is
     bare when it has no value, a flag after it, or a value that is not a
     conversation UUID (a picker search term). --resume=<value> follows the
-    same rule. node .../cli.js --resume counts.
+    same rule. node .../cli.js --resume counts. A value that is a conversation
+    id the snapshot or catalogue knows names its conversation, UUID or not.
     """
+    known = known_ids or ()
     tokens = command.split()
     if not is_claude_command(tokens):
         return False
@@ -447,10 +449,11 @@ def bare_resume_command(command: str) -> bool:
             return True
         if token in ("--resume", "-r"):
             following = tokens[index + 1] if index + 1 < len(tokens) else None
-            if following is None or following.startswith("-") or not UUID_RE.match(following):
+            if following is None or following.startswith("-") or not (UUID_RE.match(following) or following in known):
                 return True
         elif token.startswith("--resume="):
-            if not UUID_RE.match(token.split("=", 1)[1]):
+            value = token.split("=", 1)[1]
+            if not (UUID_RE.match(value) or value in known):
                 return True
     return False
 
@@ -484,7 +487,7 @@ def claude_config_sessions_dirs(explicit: list[str], metadata_dir: str | None) -
     return seen
 
 
-def claude_live_view(process: dict[str, Any], sessions_dirs: list[str]) -> tuple[dict[str, int], list[tuple[int, str | None]]]:
+def claude_live_view(process: dict[str, Any], sessions_dirs: list[str], known_ids: set[str] | None = None) -> tuple[dict[str, int], list[tuple[int, str | None]]]:
     """The conversations live claudes run, read from session files.
 
     Every <sessions dir>/<pid>.json whose pid is alive (it is in the process
@@ -532,7 +535,7 @@ def claude_live_view(process: dict[str, Any], sessions_dirs: list[str]) -> tuple
             known.setdefault(text(value.get("sessionId")) or "", pid)
             valid_pids.add(pid)
     for pid, item in by_pid.items():
-        if pid in valid_pids or not bare_resume_command(item["command"]):
+        if pid in valid_pids or not bare_resume_command(item["command"], known_ids):
             continue
         unknown.append((pid, _real(text(item.get("cwd")))))
     return known, unknown
@@ -910,7 +913,16 @@ def plan(args: argparse.Namespace) -> int:
     )
 
     sessions_dirs = claude_config_sessions_dirs(getattr(args, "claude_sessions_dir", None) or [], getattr(args, "metadata_dir", None))
-    claude_known, claude_unknown = claude_live_view(process, sessions_dirs) if process_ok else ({}, [])
+    known_task_ids = {text(t.get("provider_task_id")) for t in snapshot["tasks"] if isinstance(t, dict)}
+    known_task_ids |= {text(r.get("provider_task_id")) for r in rows if isinstance(r, dict)}
+    for t in snapshot["tasks"]:
+        if isinstance(t, dict):
+            known_task_ids |= {i for i in t.get("shadowed_task_ids") or [] if isinstance(i, str)}
+    # A one-row re-plan (restore re-checks each row right before launching it)
+    # still has to know every other conversation of the run.
+    known_task_ids |= {i for i in snapshot.get("known_task_ids") or [] if isinstance(i, str)}
+    known_task_ids.discard(None)
+    claude_known, claude_unknown = claude_live_view(process, sessions_dirs, known_task_ids) if process_ok else ({}, [])
 
     results = []
     global_errors: list[dict[str, str]] = []

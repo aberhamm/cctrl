@@ -284,6 +284,16 @@ class BareResumeWideningTests(unittest.TestCase):
         doc = self.plan(fx, process_doc([{"command": "claude --resume 99999999-9999-4999-8999-999999999999", "cwd": "/tmp/work"}]))
         self.assertEqual(doc["rows"][0]["disposition"], "restore")
 
+    def test_a_known_non_uuid_id_names_its_conversation(self):
+        fx = Fixture(self)
+        # a shadowed sibling id and a catalogue id are conversations, not picker search terms
+        doc = self.plan(fx, process_doc([{"command": "claude --resume conv-other", "cwd": "/tmp/work"}]),
+                        cat=[claim("conv-fm", "TMUX--fm-old"), claim("conv-other", "TMUX--x")])
+        self.assertEqual(doc["rows"][0]["disposition"], "restore")
+        tasks = [snap_task("conv-fm", "TMUX--fm-old", shadowed_task_ids=["conv-loser"])]
+        doc = self.plan(fx, process_doc([{"command": "claude --resume conv-loser", "cwd": "/tmp/work"}]), tasks=tasks)
+        self.assertEqual(doc["rows"][0]["disposition"], "already-live")
+
     def test_node_cli_js_resume_counts(self):
         fx = Fixture(self)
         doc = self.plan(fx, process_doc([{"command": "node /opt/claude/lib/cli.js --resume", "cwd": "/tmp/work"}]))

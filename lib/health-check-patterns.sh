@@ -24,6 +24,7 @@ CLAUDE_HC_PATTERN=(
     'Is this a project you created or one you trust|Yes, I trust this folder'
     'Allow external CLAUDE\.md file imports|Yes, allow external imports'
     'Do you trust the files|❯ 1\. Yes'
+    '[❯›][[:space:]]+1\.[[:space:]]+Resume from summary'
     'Continue from a previous|❯ 1\.'
     '❯ 1\..*(login|sign.in|authenticate)'
     'login isn.t available|auth.* required'
@@ -33,6 +34,7 @@ CLAUDE_HC_LABEL=(
     "folder-trust"
     "external-imports"
     "workspace-trust"
+    "resume-summary"
     "conversation-picker"
     "auth-login"
     "login-unavailable"
@@ -42,6 +44,7 @@ CLAUDE_HC_ACTION=(
     "auto-select"
     "needs-human"
     "auto-dismiss"
+    "needs-human"
     "auto-dismiss"
     "needs-human"
     "needs-human"
@@ -51,6 +54,7 @@ CLAUDE_HC_KEYS=(
     "Yes, I trust this folder"
     ""
     "Enter"
+    ""
     "Enter"
     'https://[^ ]*'
     ""
@@ -60,6 +64,7 @@ CLAUDE_HC_HINT=(
     'choose "Yes, I trust this folder" to keep the session; the default "No, exit" quits Claude'
     'both options keep the session: "Yes, allow external imports" loads them, the default "No, disable external imports" continues without them'
     ""
+    'a large-transcript resume picker is waiting; option 1 "Resume from summary" is the preselected, cheaper choice (only a boot restore picks it unattended)'
     ""
     ""
     ""
@@ -117,6 +122,21 @@ _hc_patterns_for_agent() {
             HC_ACTION=("${CLAUDE_HC_ACTION[@]}")
             HC_KEYS=("${CLAUDE_HC_KEYS[@]}")
             HC_HINT=("${CLAUDE_HC_HINT[@]}")
+            # The large-transcript "resume from summary" picker needs a human
+            # everywhere except a boot restore (cctrl session restore --boot,
+            # decision D7), which exports CCTRL_HC_AUTO_RESUME_SUMMARY=1 into
+            # its launches only. Then the health check selects the
+            # preselected option 1, and presses Enter only once the screen
+            # shows it selected.
+            if [[ "${CCTRL_HC_AUTO_RESUME_SUMMARY:-}" == "1" ]]; then
+                local _hc_i
+                for _hc_i in "${!HC_LABEL[@]}"; do
+                    if [[ "${HC_LABEL[$_hc_i]}" == "resume-summary" ]]; then
+                        HC_ACTION[$_hc_i]="auto-select"
+                        HC_KEYS[$_hc_i]='1\. Resume from summary'
+                    fi
+                done
+            fi
             ;;
     esac
 }
