@@ -9,6 +9,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shlex
 import sys
 from pathlib import Path
@@ -412,7 +413,59 @@ def process_running(process: dict[str, Any], task_ids: list[str]) -> tuple[int, 
     return None
 
 
-BARE_RESUME_FLAGS = {"--resume", "-r", "--continue", "-c"}
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+NODE_RUNNERS = {"node", "nodejs", "bun"}
+
+
+def is_claude_command(tokens: list[str]) -> bool:
+    """A claude CLI: argv0 `claude`, or node/bun running a claude cli.js."""
+    if not tokens:
+        return False
+    first = os.path.basename(tokens[0])
+    if first == "claude":
+        return True
+    if first in NODE_RUNNERS:
+        for token in tokens[1:4]:
+            if os.path.basename(token) == "cli.js" and "claude" in token.lower():
+                return True
+    return False
+
+
+def bare_resume_command(command: str) -> bool:
+    """True when this claude resumes a conversation without naming it in argv.
+
+    -c/--continue never takes a value, so it is always bare. --resume/-r is
+    bare when it has no value, a flag after it, or a value that is not a
+    conversation UUID (a picker search term). --resume=<value> follows the
+    same rule. node .../cli.js --resume counts.
+    """
+    tokens = command.split()
+    if not is_claude_command(tokens):
+        return False
+    for index, token in enumerate(tokens[1:], start=1):
+        if token in ("--continue", "-c"):
+            return True
+        if token in ("--resume", "-r"):
+            following = tokens[index + 1] if index + 1 < len(tokens) else None
+            if following is None or following.startswith("-") or not UUID_RE.match(following):
+                return True
+        elif token.startswith("--resume="):
+            if not UUID_RE.match(token.split("=", 1)[1]):
+                return True
+    return False
+
+
+def _real(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return path
+
+
+def _squash(value: Any) -> str:
+    return " ".join(str(value or "").split())
 
 
 def claude_config_sessions_dirs(explicit: list[str], metadata_dir: str | None) -> list[str]:
@@ -432,43 +485,56 @@ def claude_config_sessions_dirs(explicit: list[str], metadata_dir: str | None) -
 
 
 def claude_live_view(process: dict[str, Any], sessions_dirs: list[str]) -> tuple[dict[str, int], list[tuple[int, str | None]]]:
-    """For every live claude pid: the conversation it runs, read from
-    <sessions dir>/<pid>.json (field sessionId). A claude resumed through the
-    picker or --continue (no id in argv) with no readable session file is
-    "unknown": (pid, cwd or None). Returns ({session id: pid}, [unknown])."""
+    """The conversations live claudes run, read from session files.
+
+    Every <sessions dir>/<pid>.json whose pid is alive (it is in the process
+    table) and whose procStart equals that process's start time (a pid-reuse
+    guard; the process table is read with LC_ALL=C TZ=UTC) names the
+    conversation in sessionId, whatever argv0 is (a versioned binary, a
+    desktop entrypoint). Stale or mismatched files are ignored.
+
+    A claude resumed without naming a conversation (bare --resume, -c, a
+    picker search term) whose pid has no valid session file is "unknown":
+    (pid, realpath of its cwd or None). Returns ({session id: pid}, [unknown]).
+    """
     known: dict[str, int] = {}
     unknown: list[tuple[int, str | None]] = []
+    by_pid: dict[int, dict[str, Any]] = {}
     for item in process.get("processes") or []:
         if not isinstance(item, dict) or not isinstance(item.get("command"), str):
             continue
-        tokens = item["command"].split()
-        if not tokens or os.path.basename(tokens[0]) != "claude":
-            continue
         try:
-            pid = int(item.get("pid") or 0)
+            by_pid[int(item.get("pid") or 0)] = item
         except (TypeError, ValueError):
             continue
-        session_id = None
-        for directory in sessions_dirs:
-            path = Path(directory) / f"{pid}.json"
+    valid_pids: set[int] = set()
+    for directory in sessions_dirs:
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            if not name.endswith(".json") or not name[:-5].isdigit():
+                continue
+            pid = int(name[:-5])
+            item = by_pid.get(pid)
+            if item is None:
+                continue
             try:
-                value = json.loads(path.read_text(encoding="utf-8"))
+                value = json.loads((Path(directory) / name).read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if isinstance(value, dict) and text(value.get("sessionId")) and value.get("pid", pid) == pid:
-                session_id = text(value.get("sessionId"))
-                break
-        if session_id:
-            known[session_id] = pid
+            if not isinstance(value, dict) or not text(value.get("sessionId")) or value.get("pid", pid) != pid:
+                continue
+            started = _squash(item.get("started"))
+            if not started or _squash(value.get("procStart")) != started:
+                continue
+            known.setdefault(text(value.get("sessionId")) or "", pid)
+            valid_pids.add(pid)
+    for pid, item in by_pid.items():
+        if pid in valid_pids or not bare_resume_command(item["command"]):
             continue
-        bare = False
-        for index, token in enumerate(tokens[1:], start=1):
-            if token in BARE_RESUME_FLAGS:
-                following = tokens[index + 1] if index + 1 < len(tokens) else None
-                if following is None or following.startswith("-"):
-                    bare = True
-        if bare:
-            unknown.append((pid, text(item.get("cwd"))))
+        unknown.append((pid, _real(text(item.get("cwd")))))
     return known, unknown
 
 
@@ -884,7 +950,7 @@ def plan(args: argparse.Namespace) -> int:
                             running = (claude_known[candidate_id], candidate_id)
                             break
                     if not running:
-                        row_cwd = text(row.get("cwd"))
+                        row_cwd = _real(text(row.get("cwd")))
                         for unknown_pid, unknown_cwd in claude_unknown:
                             if unknown_cwd is None or unknown_cwd == row_cwd:
                                 unidentified = (unknown_pid, unknown_cwd)
@@ -899,10 +965,6 @@ def plan(args: argparse.Namespace) -> int:
             reason = f"conversation already running (pid {pid})" if matched == task_id else f"a sibling record is running (pid {pid})"
         elif live_names:
             disposition, reason = "already-live", "live under " + ", ".join(n or "an unnamed session" for n in live_names)
-        elif unidentified:
-            where = unidentified[1] or "an unknown directory"
-            disposition, attention = "insufficient-evidence", "ambiguous"
-            reason = f"an unidentified live claude (pid {unidentified[0]}, resumed without a session id) in {where} may be running this conversation"
         elif snapshot_conflict:
             disposition, reason, strict_conflict, attention = "conflict", "snapshot ownership conflict", True, "conflict"
         elif snapshot_provider_managed:
@@ -996,7 +1058,14 @@ def plan(args: argparse.Namespace) -> int:
                                 and text(row.get("cwd")) is not None
                                 and os.path.isabs(row["cwd"])
                             )
-                            if closed:
+                            if closed and unidentified:
+                                # Only a row that would otherwise get `restore` is held back, and the
+                                # reason names the pid so a human can resolve it in one step.
+                                where = unidentified[1] or "an unknown directory"
+                                disposition, attention = "insufficient-evidence", "ambiguous"
+                                reason = f"an unidentified live claude (pid {unidentified[0]}, resumed without a session id) in {where} may be running this conversation"
+                                row["blocked_by_pid"] = unidentified[0]
+                            elif closed:
                                 disposition, reason = "restore", "exact inactive cctrl tmux task satisfies the closed restore predicate"
                                 capability = {"supported": True, "reason": "tmux-resume"}
                             else:

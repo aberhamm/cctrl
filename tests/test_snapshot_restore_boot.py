@@ -82,7 +82,7 @@ class Fixture:
         sessions_dir = self.root / "claude-sessions"
         sessions_dir.mkdir(exist_ok=True)
         for pid, session_id in (sessions or {}).items():
-            (sessions_dir / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session_id, "cwd": "/tmp/work"}))
+            (sessions_dir / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session_id, "cwd": "/tmp/work", "procStart": "x"}))
         args += ["--claude-sessions-dir", str(sessions_dir)]
         done = self.run(*args)
         return done.returncode, json.loads(done.stdout) if done.stdout.strip() else None
@@ -147,7 +147,7 @@ class PlanTests(unittest.TestCase):
     def test_process_match_is_token_exact(self):
         fx = Fixture(self)
         tasks = [snap_task("conv-aaa-111", "TMUX--a")]
-        decoys = ["grep conv-aaa-111", 'bash -c "cctrl start -r conv-aaa-111"', "claude --resume conv-aaa-1110",
+        decoys = ["grep conv-aaa-111", 'bash -c "cctrl start -r conv-aaa-111"', "claude --resume 99999999-9999-4999-8999-999999999999",
                   "claude --name conv-aaa-111", "python3 claude --resume conv-aaa-111",
                   "/usr/bin/vim /tmp/--resume conv-aaa-111"]
         rc, doc = fx.plan(tasks, [claim("conv-aaa-111", "TMUX--a")], process=process_doc(decoys))
@@ -238,7 +238,7 @@ class BareResumeTests(unittest.TestCase):
         fx = Fixture(self)
         config = fx.root / "profile-config"
         (config / "sessions").mkdir(parents=True)
-        (config / "sessions" / "100.json").write_text(json.dumps({"pid": 100, "sessionId": "conv-fm"}))
+        (config / "sessions" / "100.json").write_text(json.dumps({"pid": 100, "sessionId": "conv-fm", "procStart": "x"}))
         meta = fx.root / "meta"
         meta.mkdir()
         (meta / "r.json").write_text(json.dumps({"tmux_session": "TMUX--x", "claude_config_dir": str(config)}))
@@ -249,6 +249,95 @@ class BareResumeTests(unittest.TestCase):
                 "--claude-sessions-dir", str(fx.root / "none"), "--metadata-dir", str(meta)]
         done = fx.run(*args)
         self.assertEqual(json.loads(done.stdout)["rows"][0]["disposition"], "already-live")
+
+
+class BareResumeWideningTests(unittest.TestCase):
+    """NEW-S1/S2/S3/N2: which argv shapes count as bare, who is blocked, and how session files are trusted."""
+
+    def plan(self, fx, process, tasks=None, cat=None, sessions=None, session_files=None):
+        tasks = tasks or [snap_task("conv-fm", "TMUX--fm-old")]
+        cat = cat or [claim("conv-fm", "TMUX--fm-old")]
+        sessions_dir = fx.root / "claude-sessions"
+        sessions_dir.mkdir(exist_ok=True)
+        for name, body in (session_files or {}).items():
+            (sessions_dir / name).write_text(json.dumps(body))
+        snapshot = {"schema_version": 2, "host_id": HOST, "hostname": "fixture", "tasks": tasks}
+        args = ["plan", "--snapshot", fx.write("snap.json", snapshot), "--catalogue", fx.write("cat.json", catalogue(cat)),
+                "--process", fx.write("proc.json", process), "--host-id", HOST, "--hostname", "fixture",
+                "--claude-sessions-dir", str(sessions_dir)]
+        done = fx.run(*args)
+        self.assertIn(done.returncode, (0, 69), done.stderr)
+        return json.loads(done.stdout)
+
+    def test_continue_never_takes_a_value(self):
+        fx = Fixture(self)
+        for command in ("claude -c fix the tests", "claude --continue", "claude --model m -c --chrome"):
+            doc = self.plan(fx, process_doc([{"command": command, "cwd": "/tmp/work"}]))
+            self.assertEqual(doc["rows"][0]["attention"], "ambiguous", command)
+
+    def test_resume_with_a_non_uuid_value_is_bare(self):
+        fx = Fixture(self)
+        for command in ("claude --resume homelab", "claude -r fix-the-tests", "claude --resume=homelab"):
+            doc = self.plan(fx, process_doc([{"command": command, "cwd": "/tmp/work"}]))
+            self.assertEqual(doc["rows"][0]["attention"], "ambiguous", command)
+        # a UUID value names a conversation, so the process is identified and elsewhere
+        doc = self.plan(fx, process_doc([{"command": "claude --resume 99999999-9999-4999-8999-999999999999", "cwd": "/tmp/work"}]))
+        self.assertEqual(doc["rows"][0]["disposition"], "restore")
+
+    def test_node_cli_js_resume_counts(self):
+        fx = Fixture(self)
+        doc = self.plan(fx, process_doc([{"command": "node /opt/claude/lib/cli.js --resume", "cwd": "/tmp/work"}]))
+        self.assertEqual(doc["rows"][0]["attention"], "ambiguous")
+        doc = self.plan(fx, process_doc([{"command": "node /opt/other/server.js --resume", "cwd": "/tmp/work"}]))
+        self.assertEqual(doc["rows"][0]["disposition"], "restore")
+
+    def test_only_rows_that_would_restore_are_demoted_and_the_pid_is_reported(self):
+        fx = Fixture(self)
+        tasks = [snap_task("conv-a", "TMUX--a"), snap_task("conv-old", "TMUX--old", control_owner="unknown", execution_runtime="unknown", lifecycle_state="unknown"),
+                 snap_task("conv-other", "TMUX--other", cwd="/tmp/elsewhere")]
+        cat = [claim("conv-a", "TMUX--a"), claim("conv-old", "TMUX--old"), claim("conv-other", "TMUX--other", cwd="/tmp/elsewhere")]
+        doc = self.plan(fx, process_doc([{"command": "claude --resume", "cwd": "/tmp/work"}]), tasks=tasks, cat=cat)
+        by_id = {r["provider_task_id"]: r for r in doc["rows"]}
+        self.assertEqual(by_id["conv-a"]["attention"], "ambiguous")
+        self.assertEqual(by_id["conv-a"]["blocked_by_pid"], 100)
+        self.assertIn("pid 100", by_id["conv-a"]["reason"])
+        self.assertEqual(by_id["conv-old"]["disposition"], "unknown")
+        self.assertNotIn("attention", by_id["conv-old"])  # an old dead row stays informational
+        self.assertEqual(by_id["conv-other"]["disposition"], "restore")
+
+    def test_cwd_comparison_uses_realpaths(self):
+        fx = Fixture(self)
+        real = fx.root / "real"
+        real.mkdir()
+        link = fx.root / "link"
+        link.symlink_to(real)
+        tasks = [snap_task("conv-fm", "TMUX--fm-old", cwd=str(link))]
+        doc = self.plan(fx, process_doc([{"command": "claude --resume", "cwd": str(real)}]), tasks=tasks, cat=[claim("conv-fm", "TMUX--fm-old", cwd=str(link))])
+        self.assertEqual(doc["rows"][0]["attention"], "ambiguous")
+
+    def test_session_file_is_found_for_any_argv0_when_procstart_matches(self):
+        fx = Fixture(self)
+        versioned = {"command": "/opt/claude/versions/2.1.9 --resume=abc", "started": "Sat Nov 14 15:22:58 2026"}
+        files = {"100.json": {"pid": 100, "sessionId": "conv-fm", "procStart": "Sat Nov 14 15:22:58 2026"}}
+        doc = self.plan(fx, process_doc([versioned]), session_files=files)
+        self.assertEqual(doc["rows"][0]["disposition"], "already-live")
+        self.assertIn("pid 100", doc["rows"][0]["reason"])
+
+    def test_stale_or_mismatched_session_files_are_ignored(self):
+        fx = Fixture(self)
+        proc = {"command": "claude --chrome", "started": "Sat Nov 14 15:22:58 2026"}
+        files = {"100.json": {"pid": 100, "sessionId": "conv-fm", "procStart": "Fri Nov 13 01:00:00 2026"},   # pid reused
+                 "555.json": {"pid": 555, "sessionId": "conv-fm", "procStart": "Sat Nov 14 15:22:58 2026"},   # pid not alive
+                 "100.key": {"pid": 100}}
+        doc = self.plan(fx, process_doc([proc]), session_files=files)
+        self.assertEqual(doc["rows"][0]["disposition"], "restore")
+
+    def test_a_bare_resume_with_a_stale_session_file_still_blocks(self):
+        fx = Fixture(self)
+        proc = {"command": "claude --resume", "started": "Sat Nov 14 15:22:58 2026", "cwd": "/tmp/work"}
+        files = {"100.json": {"pid": 100, "sessionId": "conv-someone", "procStart": "Fri Nov 13 01:00:00 2026"}}
+        doc = self.plan(fx, process_doc([proc]), session_files=files)
+        self.assertEqual(doc["rows"][0]["attention"], "ambiguous")
 
 
 class TieBreakTests(unittest.TestCase):

@@ -18746,7 +18746,7 @@ test_restore_process_match_is_token_exact() {
     printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[
       {"pid":1,"ppid":1,"started":"x","command":"grep conv-aaa-111"},
       {"pid":2,"ppid":1,"started":"x","command":"bash -c \"cctrl start -r conv-aaa-111\""},
-      {"pid":3,"ppid":1,"started":"x","command":"claude --resume conv-aaa-1110"},
+      {"pid":3,"ppid":1,"started":"x","command":"claude --resume 99999999-9999-4999-8999-999999999999"},
       {"pid":4,"ppid":1,"started":"x","command":"claude --name conv-aaa-111 --model m"}],"error":null}' > "$dir/process.json"
     out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "decoy process lines must not block anything (rc=$rc): $out"
@@ -18852,7 +18852,7 @@ test_restore_bare_resume_claude_blocks_its_cwd() {
         || fail "unidentified-claude row not reported: $out"
     # The same process, but its session file names the conversation: already live, not ambiguous.
     : > "$dir/launch.log"
-    printf '%s\n' '{"pid":777,"sessionId":"conv-aaa-111","cwd":"/Users/test/dev/cctrl"}' > "$dir/claude-sessions/777.json"
+    printf '%s\n' '{"pid":777,"sessionId":"conv-aaa-111","cwd":"/Users/test/dev/cctrl","procStart":"x"}' > "$dir/claude-sessions/777.json"
     rc=0; out="$(_restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
     [[ "$rc" -eq 0 ]] || fail "a session file naming the conversation makes it already live (rc=$rc): $out"
     jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="already-live")' <<< "$out" >/dev/null || fail "session-file match not reported: $out"

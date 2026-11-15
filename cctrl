@@ -19047,24 +19047,21 @@ _snapshot_process_source() {
     elif [[ -n "${CCTRL_RESTORE_PROCESS_FILE:-}" ]]; then
         cp "$CCTRL_RESTORE_PROCESS_FILE" "$output" || rc=$?
     else
-        ps -axo pid=,ppid=,lstart=,command= > "${output}.rows" 2> "${output}.err" || rc=$?
-        python3 - "${output}.rows" "${output}.err" "$observed_at" "$rc" > "$output" <<'PY'
+        # C locale and UTC: the start time is compared with the procStart a
+        # claude session file records (the same `ps -o lstart=` form).
+        LC_ALL=C TZ=UTC ps -axo pid=,ppid=,lstart=,command= > "${output}.rows" 2> "${output}.err" || rc=$?
+        python3 - "${output}.rows" "${output}.err" "$observed_at" "$rc" "$SCRIPT_DIR/lib" > "$output" <<'PY'
 import hashlib,json,os,subprocess,sys
 from pathlib import Path
 rows_path,error_path,observed_at,rc=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3],int(sys.argv[4])
+sys.path.insert(0,sys.argv[5])
+from snapshot_restore import bare_resume_command
 rows=[]
 def bare_resume(command):
-    # A claude resumed through the picker or --continue carries no id in argv;
-    # restore planning needs its cwd to know which conversations it may hold.
-    tokens=command.split()
-    if not tokens or os.path.basename(tokens[0]) != "claude":
-        return False
-    for i,tok in enumerate(tokens[1:],start=1):
-        if tok in ("--resume","-r","--continue","-c"):
-            nxt=tokens[i+1] if i+1 < len(tokens) else None
-            if nxt is None or nxt.startswith("-"):
-                return True
-    return False
+    # A claude resumed through the picker, -c or a search term carries no id
+    # in argv; restore planning needs its cwd to know which conversations it
+    # may hold. One definition, shared with the planner.
+    return bare_resume_command(command)
 def cwd_of(pid):
     try:
         out=subprocess.run(["lsof","-a","-d","cwd","-Fn","-p",str(pid)],capture_output=True,text=True,timeout=5).stdout
@@ -19120,10 +19117,16 @@ _restore_plan_json() {
 
 _scratch_rm() {
     # Remove a mktemp -d scratch dir: only a non-empty, non-symlink directory
-    # under $TMPDIR (or /tmp), and then only that exact path. Always succeeds.
-    local dir="${1:-}" base="${TMPDIR:-/tmp}"
-    [[ -n "$dir" && "$dir" == "$base"/* && -d "$dir" && ! -L "$dir" ]] || return 0
-    rm -rf -- "$dir"
+    # whose CANONICAL path is under the canonical $TMPDIR (or /tmp), and then
+    # only that canonical path. A `..` component is refused outright. Always
+    # succeeds.
+    local dir="${1:-}" base="${TMPDIR:-/tmp}" dreal breal
+    [[ -n "$dir" && -d "$dir" && ! -L "$dir" ]] || return 0
+    case "/$dir/" in */../*|*/./*) return 0 ;; esac
+    dreal="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
+    breal="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    [[ -n "$dreal" && -n "$breal" && "$dreal" == "$breal"/* ]] || return 0
+    rm -rf -- "$dreal"
     return 0
 }
 
