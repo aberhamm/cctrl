@@ -19117,19 +19117,19 @@ test_restore_fm_health_from_this_launch_only() {
     (
         CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
         FAKE_STATUS=ready; FAKE_WRITE_OK=true
-        _session_metadata_field() { [[ "$2" == health_status ]] && printf '%s' "$FAKE_STATUS"; return 0; }
+        _session_metadata_field() { case "$2" in health_status) printf '%s' "$FAKE_STATUS" ;; provider_task_id) printf 'conv-x' ;; esac; return 0; }
         _session_update_metadata_field() { [[ "$FAKE_WRITE_OK" == true ]] || return 1; FAKE_STATUS="$3"; return 0; }
-        _restore_health_mark TMUX--x
+        _restore_health_mark TMUX--x conv-x
         [[ "$FAKE_STATUS" == pending-launch ]] || fail "the stale status was not overwritten before the launch"
         [[ -z "$(_restore_fresh_health TMUX--x TMUX--x)" ]] || fail "a status nobody wrote this launch was trusted"
         FAKE_STATUS=ready   # this launch's health check ran
         [[ "$(_restore_fresh_health TMUX--x TMUX--x)" == ready ]] || fail "this launch's own status was not read"
         [[ -z "$(_restore_fresh_health TMUX--x TMUX--x--2)" ]] || fail "a status under another name than the marked one was trusted"
         FAKE_STATUS=ready; FAKE_WRITE_OK=false
-        _restore_health_mark TMUX--x
+        _restore_health_mark TMUX--x conv-x
         [[ -z "$(_restore_fresh_health TMUX--x TMUX--x)" ]] || fail "a stale status was trusted after the mark failed"
         FAKE_STATUS=""; FAKE_WRITE_OK=false
-        _restore_health_mark TMUX--y
+        _restore_health_mark TMUX--y conv-x
         FAKE_STATUS=ready
         [[ "$(_restore_fresh_health TMUX--y TMUX--y)" == ready ]] || fail "a name with no earlier status must read this launch's"
     ) || fail "freshness rule"
@@ -19673,7 +19673,9 @@ SH
     [[ "$rc" -eq 69 && ! -s "$dir/launch.log" ]] || fail "a dead primary must give 69 before anything launches (rc=$rc): $(cat "$dir/err")"
     assert_contains "$(cat "$dir/err")" "primary tmux server"
     jq -e '.outcome=="refused" and .exit_code==69' <<< "$out" >/dev/null || fail "refusal document wrong: $out"
-    [[ ! -d "$dir/data/restore" ]] || fail "a refused run must not create run files"
+    # A refused run plans, locks and logs nothing; it only leaves the status-visible refusal record.
+    [[ ! -e "$dir/data/restore/.restore.lock" && ! -e "$dir/data/restore/restore.log" ]] || fail "a refused run must not lock or log"
+    jq -e '.outcome=="refused" and .exit_code==69 and .results==[]' "$dir/data/restore/last-run.json" >/dev/null || fail "the refusal is not visible to status"
     echo "ok: a dead primary tmux server refuses the restore with 69"
 }
 
