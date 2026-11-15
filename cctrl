@@ -19184,7 +19184,7 @@ _restore_busy() {
         [[ "$created" =~ ^[0-9]+$ ]] || created="$now"
         # A lock made before this boot began belongs to a run the reboot killed,
         # whatever process now holds its pid number.
-        if [[ "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch )); then :
+        if _restore_lock_pre_boot "$lock" "$created"; then :
         elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && (( now - created <= max_age )); then return 0; fi
     fi
     boot="$(_restore_boot_id)"
@@ -19518,16 +19518,32 @@ _restore_log() { # event [key value]...  one JSONL line; best effort, never fail
 
 _restore_lock_dir() { printf '%s/.restore.lock' "$(_restore_dir)"; }
 
-_restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by another run, 2 = no restore dir
-    local run_id="$1" max_age="$2" dir attempt now created pid age stale boot_epoch why=""
-    dir="$(_restore_lock_dir)"
+_restore_lock_pre_boot() { # lock_dir created: 0 when the lock was made before this boot began
+    # A lock that carries a boot id is judged by that id (the session uuid does
+    # not move when the clock is corrected); only a lock without one (made by an
+    # older cctrl) falls back to comparing its creation time with the boot time.
+    local dir="$1" created="$2" lock_boot boot_epoch
+    lock_boot="$(cat "$dir/boot_id" 2>/dev/null || true)"
+    if [[ -n "$lock_boot" ]]; then
+        _restore_boot_id_resolve
+        if [[ -n "$_RR_BOOT_ID" ]]; then [[ "$lock_boot" != "$_RR_BOOT_ID" ]]; return; fi
+    fi
     boot_epoch="$(_restore_boot_epoch)"
+    [[ "$created" =~ ^[0-9]+$ && "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch ))
+}
+
+_restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by another run, 2 = no restore dir
+    local run_id="$1" max_age="$2" dir attempt now created pid age stale why=""
+    dir="$(_restore_lock_dir)"
     _restore_dir_init || return 2
     for attempt in 1 2; do
         if mkdir "$dir" 2>/dev/null; then
             date +%s > "$dir/created" 2>/dev/null || true
             printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
             printf '%s\n' "$run_id" > "$dir/run_id" 2>/dev/null || true
+            date -u +%Y-%m-%dT%H:%M:%SZ > "$dir/started_at" 2>/dev/null || true
+            _restore_boot_id_resolve
+            printf '%s\n' "$_RR_BOOT_ID" > "$dir/boot_id" 2>/dev/null || true
             return 0
         fi
         now="$(date +%s)"
@@ -19539,7 +19555,7 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
         age=$(( now - created ))
         pid="$(cat "$dir/pid" 2>/dev/null || true)"
         stale=0
-        if [[ "$created" =~ ^[0-9]+$ && "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch )); then stale=1; why=", made before this boot"
+        if _restore_lock_pre_boot "$dir" "$created"; then stale=1; why=", made before this boot"
         elif (( age > max_age )); then stale=1
         elif [[ -z "$pid" ]]; then (( age >= 5 )) && stale=1
         elif ! kill -0 "$pid" 2>/dev/null; then stale=1
@@ -19548,7 +19564,7 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
         # Only one run can move a stale lock away; the loser retries mkdir.
         if mv "$dir" "$dir.stale.$$" 2>/dev/null; then
             _RS_LOCK_STOLEN="pid ${pid:-none}, age ${age}s${why}"
-            rm -f "$dir.stale.$$/pid" "$dir.stale.$$/created" "$dir.stale.$$/run_id" 2>/dev/null || true
+            rm -f "$dir.stale.$$/pid" "$dir.stale.$$/created" "$dir.stale.$$/run_id" "$dir.stale.$$/boot_id" "$dir.stale.$$/started_at" 2>/dev/null || true
             rmdir "$dir.stale.$$" 2>/dev/null || true
         fi
     done
@@ -19559,7 +19575,7 @@ _restore_lock_release() {
     local dir
     dir="$(_restore_lock_dir)"
     [[ "$(cat "$dir/pid" 2>/dev/null || true)" == "$$" ]] || return 0
-    rm -f "$dir/pid" "$dir/created" "$dir/run_id" 2>/dev/null || true
+    rm -f "$dir/pid" "$dir/created" "$dir/run_id" "$dir/boot_id" "$dir/started_at" 2>/dev/null || true
     rmdir "$dir" 2>/dev/null || true
     return 0
 }
@@ -20147,7 +20163,9 @@ _restore_finish() {
             "$scratch/plan.json" > "$doc" 2>/dev/null || : > "$doc"
         if [[ "$json" == true && -s "$doc" ]]; then cat "$doc"; fi
         if [[ "$dry_run" != true && -s "$doc" ]]; then _RS_FINISHED=true; fi
-        if [[ "$dry_run" != true && "${_RS_LOG_ON:-false}" == true && -s "$doc" ]]; then
+        # Only the run that holds the lock writes run documents: a declined
+        # prompt or a refused interactive run must not replace a boot run's record.
+        if [[ "$dry_run" != true && "${_RS_LOG_ON:-false}" == true && "${_RS_HAVE_LOCK:-false}" == true && -s "$doc" ]]; then
             dir="$(_restore_dir)"
             ( umask 077
               cp "$doc" "$dir/runs/${_RS_RUN_ID}.json" && cp "$doc" "$dir/last-run.json.tmp" && mv -f "$dir/last-run.json.tmp" "$dir/last-run.json" ) 2>/dev/null || true
@@ -20186,21 +20204,31 @@ _restore_status() {
             boot_state="$(jq -r '.final.outcome // "running"' "$state_file" 2>/dev/null || echo unknown)"
         fi
     fi
+    # The run in progress right now (if any) comes from the lock, not from
+    # last-run.json: that file still belongs to an earlier run until this one ends.
+    local cur_run="" cur_started="" lockd
+    lockd="$(_restore_lock_dir)"
+    if [[ -d "$lockd" ]] && _restore_busy; then
+        cur_run="$(cat "$lockd/run_id" 2>/dev/null || true)"; cur_started="$(cat "$lockd/started_at" 2>/dev/null || true)"
+    fi
+    local cur_json
+    cur_json="$(jq -n --arg run "$cur_run" --arg started "$cur_started" 'if $run == "" and $started == "" then null else {run_id:(if $run == "" then null else $run end), started_at:(if $started == "" then null else $started end)} end')"
     if [[ ! -s "$last" ]] || ! jq -e 'type == "object"' "$last" >/dev/null 2>&1; then
         if $json; then
-            jq -n --arg boot "$boot_epoch" --arg state "$boot_state" '{found:false, boot_id:(if $boot == "" then null else $boot end), boot_run:$state}'
+            jq -n --arg boot "$boot_epoch" --arg state "$boot_state" --argjson cur "$cur_json" '{found:false, boot_id:(if $boot == "" then null else $boot end), boot_run:$state, current_run:$cur}'
         else
             echo "No restore run recorded."; echo "this boot (${boot_epoch:-unknown}): $boot_state"
+            [[ -z "$cur_run$cur_started" ]] || echo "running now: run ${cur_run:-?} started ${cur_started:-?}"
         fi
         return 0
     fi
     run_boot="$(jq -r '.boot_id // empty' "$last")"
     [[ -n "$boot_epoch" && "$run_boot" == "$boot_epoch" ]] && this_boot=true
     if $json; then
-        jq --arg state "$boot_state" --arg boot "$boot_epoch" --argjson this "$this_boot" '
+        jq --arg state "$boot_state" --arg boot "$boot_epoch" --argjson this "$this_boot" --argjson cur "$cur_json" '
             {found:true, run_id, boot_id, outcome, exit_code, boot, started_at, finished_at, result_counts, fm, source_snapshot:{path:.source_snapshot.path, generated_at:.source_snapshot.generated_at, selection:.source_snapshot.selection},
              rows_not_back:[.results[] | select(.result == "failed" or .result == "deferred" or .evidence.attention != null) | {tmux_session, provider_task_id, result, reason, attention:.evidence.attention}],
-             run_is_this_boot:$this, current_boot_id:(if $boot == "" then null else $boot end), boot_run:$state}' "$last"
+             run_is_this_boot:$this, current_boot_id:(if $boot == "" then null else $boot end), boot_run:$state, current_run:$cur}' "$last"
         return 0
     fi
     jq -r --arg state "$boot_state" --arg boot "$boot_epoch" --argjson this "$this_boot" '
@@ -20209,6 +20237,7 @@ _restore_status() {
         (if .fm then "fleet manager: \(.fm.tmux_session // "?") \(.fm.result) (health \(.fm.health_status // "unknown"))" else "fleet manager: not part of this run" end),
         (.results[] | select(.result == "failed" or .result == "deferred" or .evidence.attention != null) | "  [\(.result)] \(.tmux_session // .provider_task_id // "unnamed"): \(.reason)"),
         "this boot (\($boot)): \($state)\(if $this then " (this is that run)" else "" end)"' "$last"
+    [[ -z "$cur_run$cur_started" ]] || echo "running now: run ${cur_run:-?} started ${cur_started:-?}"
     return 0
 }
 
@@ -20277,7 +20306,14 @@ _session_restore() {
         $json && _restore_refusal_json "$primary_rc" "primary tmux server is not running" "$(jq -n --arg d "$(printf '%s' "$primary_msg" | head -c 400)" '{detail:$d}')"
         printf '%s\n' "$primary_msg" >&2
         _RS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        _restore_record_early "$run_id" "$primary_rc" "$boot"
+        # Leave a record only if no other run holds the lock right now.
+        _RS_HAVE_LOCK=false
+        if _restore_lock_acquire "$run_id" 900; then
+            _RS_HAVE_LOCK=true
+            _restore_record_early "$run_id" "$primary_rc" "$boot"
+            _restore_lock_release
+            _RS_HAVE_LOCK=false
+        fi
         return "$primary_rc"
     fi
     local timeout="${CCTRL_RESTORE_TIMEOUT:-}" max_age lock_rc=0 rc=0
@@ -20336,8 +20372,10 @@ _restore_record_early() {
         64) reason="refused: invalid input, stale snapshot, schema or host mismatch (see runs/${run_id}.out)" ;;
         69) reason="refused: mandatory evidence unavailable (see runs/${run_id}.out)" ;;
         78) reason="refused: confirmation needed and no terminal" ;;
+        75) reason="locked: another restore run holds the lock (see runs/${run_id}.out)"; outcome=locked ;;
         *) reason="ended with exit $rc before a run document was written (see runs/${run_id}.out)"; outcome=failed ;;
     esac
+    [[ "${_RS_HAVE_LOCK:-false}" == true ]] || return 0   # never write run files without the lock
     dir="$(_restore_dir)"
     [[ -d "$dir/runs" ]] || _restore_dir_init 2>/dev/null || return 0
     _restore_boot_id_resolve
@@ -20698,6 +20736,9 @@ _session_restore_core() {
     local late_rc=0
     _restore_lock_late "$json" || late_rc=$?
     if (( late_rc != 0 )); then _scratch_rm "$scratch"; return "$late_rc"; fi
+    # The total timeout counts from the yes, not from the question: time a human
+    # spent at the prompt is not the run's.
+    if ! $assume_yes; then _RS_WAITED=0; _RS_START="$(date +%s)"; fi
 
     # Same memory rule as `cctrl start` (_res_pressure_reason): outside --boot
     # a box already under pressure is refused before the first launch (exit 1,
@@ -20749,17 +20790,18 @@ _session_restore_core() {
     if $boot; then
         local -a t_row=() t_att=() t_role=() t_kind=() t_agent=() t_last=()
         local fm_claude=-1 fm_codex=-1 last live_fm_claude="" live_fm_codex="" live_row live_agent live_last
-        # D6 looks at EVERY fleet-manager row of a runtime, including one that is
-        # already live: when the newest is live, every older row still to be
-        # restored is a conflict and is never launched.
+        # D6 (never two fleet managers) looks at EVERY fleet-manager row of a
+        # runtime, including one that is already live (older, newer, or with no
+        # last_active): when any is live, no row of that runtime is launched and
+        # every one still to be restored is a conflict for a human to decide.
         while IFS= read -r live_row; do
             [[ -n "$live_row" ]] || continue
             _restore_row_role "$live_row"
             [[ "$_RR_ROLE" == orchestrator && "$_RR_KIND" == fleet ]] || continue
             live_agent="$(jq -r '.agent // .provider // ""' <<< "$live_row")"; live_last="$(jq -r '.last_active // ""' <<< "$live_row")"
             case "$live_agent" in
-                codex) if [[ -z "$live_fm_codex" || "$live_last" > "$live_fm_codex" ]]; then live_fm_codex="${live_last:-0}"; fi ;;
-                *) if [[ -z "$live_fm_claude" || "$live_last" > "$live_fm_claude" ]]; then live_fm_claude="${live_last:-0}"; fi ;;
+                codex) live_fm_codex="${live_last:-0}" ;;
+                *) live_fm_claude="${live_last:-0}" ;;
             esac
         done < <(jq -c '.rows[] | select(.disposition == "already-live")' "$plan_file")
         for item in ${todo[@]+"${todo[@]}"}; do
@@ -20778,9 +20820,9 @@ _session_restore_core() {
                 *) if (( fm_claude < 0 )) || [[ "$last" > "${t_last[$fm_claude]}" ]]; then fm_claude=$i; fi ;;
             esac
         done
-        # A live fleet manager row at least as new as the newest candidate wins.
-        if (( fm_claude >= 0 )) && [[ -n "$live_fm_claude" && ! "${t_last[$fm_claude]}" > "$live_fm_claude" ]]; then fm_claude=-1; fi
-        if (( fm_codex >= 0 )) && [[ -n "$live_fm_codex" && ! "${t_last[$fm_codex]}" > "$live_fm_codex" ]]; then fm_codex=-1; fi
+        # Any live fleet manager row of a runtime means none of its rows launches.
+        if [[ -n "$live_fm_claude" ]]; then fm_claude=-1; fi
+        if [[ -n "$live_fm_codex" ]]; then fm_codex=-1; fi
         local -a orch_q=() work_q=()
         for (( i = 0; i < n; i++ )); do
             if [[ "${t_role[$i]}" == orchestrator && "${t_kind[$i]}" == fleet ]]; then

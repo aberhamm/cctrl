@@ -19273,6 +19273,172 @@ PY
     echo "ok: an interactive restore takes the lock only after the answer"
 }
 
+test_restore_fm_live_older_row_blocks_every_fm_launch() {
+    # S1 (D6, fix 2): if ANY fleet manager row of a runtime is already live (an older one,
+    # or one with no last_active), no fleet manager row of that runtime launches; the
+    # others are conflicts (exit 75). With none live the newest still launches.
+    local dir="$TMPDIR/restore-fm-live-older" out rc=0
+    _restore_boot_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.last_active="2026-08-05T09:00:00Z")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[{"pid":4242,"ppid":1,"started":"x","command":"claude --model m --resume conv-aaa-111 --chrome"}],"error":null}' > "$dir/process.json"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a live older fleet manager must make the newer row a conflict (75), got $rc: $out"
+    ! grep -q "conv-ddd-444" "$dir/launch.log" || fail "a second fleet manager was launched beside the live older one: $(cat "$dir/launch.log")"
+    ! grep -q -- "--health-check-timeout" "$dir/launch.log" || fail "no row may take the fm phase: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .provider_task_id=="conv-ddd-444" and .result=="skipped" and .evidence.attention=="conflict")' <<< "$out" >/dev/null \
+        || fail "the newer fleet manager row is not reported as a conflict: $out"
+    # A live fleet manager row without last_active counts too.
+    local dir2="$TMPDIR/restore-fm-live-nolast"
+    _restore_boot_fixture "$dir2"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= del(.last_active)' \
+        "$dir2/snapshots/latest.json" > "$dir2/snap.tmp" && mv "$dir2/snap.tmp" "$dir2/snapshots/latest.json"
+    cp "$dir/process.json" "$dir2/process.json"
+    rc=0; out="$(_restore_boot_run "$dir2" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] && ! grep -q "conv-ddd-444" "$dir2/launch.log" || fail "a live fleet manager row with no last_active must also block (rc=$rc): $(cat "$dir2/launch.log")"
+    # None live: the newest launches, the older one is the conflict.
+    local dir3="$TMPDIR/restore-fm-none-live"
+    _restore_boot_fixture "$dir3"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.last_active="2026-08-05T09:00:00Z")' \
+        "$dir3/snapshots/latest.json" > "$dir3/snap.tmp" && mv "$dir3/snap.tmp" "$dir3/snapshots/latest.json"
+    rc=0; out="$(_restore_boot_run "$dir3" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] && grep -q "conv-ddd-444" "$dir3/launch.log" && ! grep -q "conv-aaa-111" "$dir3/launch.log" \
+        || fail "with no live fleet manager the newest launches and the older is a conflict (rc=$rc): $(cat "$dir3/launch.log")"
+    echo "ok: any live fleet manager row of a runtime blocks all its fleet manager launches"
+}
+
+_restore_pty_driver() { # dir: writes $dir/pty2.py, a pty that answers the [y/N] prompt after a delay
+    cat > "$1/pty2.py" <<'PY'
+import os, pty, select, sys, time
+report, answer, delay, takelock = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+argv = sys.argv[5:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+buf = b""
+asked = None
+deadline = time.time() + 90
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if r:
+        try:
+            d = os.read(fd, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        buf += d
+        if asked is None and b"Proceed with restore?" in buf:
+            asked = time.time()
+            if takelock != "-":
+                os.makedirs(takelock)
+                open(takelock + "/pid", "w").write(str(os.getpid()) + "\n")
+                open(takelock + "/created", "w").write(str(int(time.time())) + "\n")
+                open(takelock + "/run_id", "w").write("other-run\n")
+    if asked is not None and time.time() - asked >= delay and not os.path.exists(report):
+        os.write(fd, (answer + "\n").encode())
+        open(report, "w").write("answered\n")
+_, st = os.waitpid(pid, 0)
+sys.exit(os.WEXITSTATUS(st))
+PY
+}
+
+test_restore_prompt_time_does_not_count_toward_the_cap() {
+    # N-a: the non-boot total timeout starts after the [y/N] answer.
+    local dir="$TMPDIR/restore-prompt-cap" rc=0
+    _restore_fixture "$dir"; _restore_pty_driver "$dir"
+    SR_WRAP="python3 -I $dir/pty2.py $dir/report y 6 -" CCTRL_RESTORE_TIMEOUT=4 _restore_run "$dir" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "time at the prompt ate the run's cap (rc=$rc, launches $(_restore_spawn_count "$dir"))"
+    echo "ok: the non-boot cap starts after the confirmation"
+}
+
+test_restore_unlocked_runs_never_write_last_run() {
+    # N-b: a declined prompt, a bad flag and a late-lock collision all leave a boot run's
+    # last-run.json alone; the collision exits 75, and an early record at 75 says `locked`.
+    local dir="$TMPDIR/restore-nolock-write" rc=0 holder before
+    _restore_fixture "$dir"; _restore_pty_driver "$dir"
+    mkdir -p "$dir/data/restore/.restore.lock" "$dir/data/restore/runs"
+    sleep 60 & holder=$!
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; date +%s > "$dir/data/restore/.restore.lock/created"; printf 'boot-run\n' > "$dir/data/restore/.restore.lock/run_id"
+    printf '%s\n' '{"run_id":"sentinel","outcome":"partial","exit_code":75}' > "$dir/data/restore/last-run.json"
+    before="$(cat "$dir/data/restore/last-run.json")"
+    SR_WRAP="python3 -I $dir/pty2.py $dir/r1 n 0 -" _restore_run "$dir" >/dev/null 2>&1 || true
+    [[ "$(cat "$dir/data/restore/last-run.json")" == "$before" ]] || { kill "$holder" 2>/dev/null; fail "a declined prompt replaced last-run.json"; }
+    _restore_run "$dir" --limit x >/dev/null 2>&1 || true
+    [[ "$(cat "$dir/data/restore/last-run.json")" == "$before" ]] || { kill "$holder" 2>/dev/null; fail "a bad flag replaced last-run.json"; }
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    rm -rf "$dir/data/restore/.restore.lock"
+    # Late-lock collision: another run takes the lock while the human is at the prompt.
+    SR_WRAP="python3 -I $dir/pty2.py $dir/r3 y 0 $dir/data/restore/.restore.lock" _restore_run "$dir" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a late-lock collision must exit 75, got $rc"
+    [[ "$(cat "$dir/data/restore/last-run.json")" == "$before" ]] || fail "the late-lock collision replaced last-run.json"
+    [[ ! -s "$dir/launch.log" ]] || fail "the collision launched something"
+    rm -rf "$dir/data/restore/.restore.lock"
+    # The early record for exit 75 is `locked`, not `failed`; without the lock it writes nothing.
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        export CCTRL_DATA_DIR="$dir/data"
+        _RS_HAVE_LOCK=false; _restore_record_early run-x 75 false
+        [[ "$(cat "$dir/data/restore/last-run.json")" == "$before" ]] || exit 3
+        _RS_HAVE_LOCK=true; _restore_record_early run-x 75 false
+        [[ "$(jq -r .outcome "$dir/data/restore/last-run.json")" == locked ]] || exit 4
+    ) || fail "early record at 75 (exit $?)"
+    echo "ok: runs without the lock never write last-run.json; a collision is locked (75)"
+}
+
+test_restore_status_shows_the_running_runs_start() {
+    # N-c: while a run holds the lock, `status` reports ITS started_at, not the previous run's.
+    local dir="$TMPDIR/restore-status-running" out holder
+    _restore_fixture "$dir"
+    mkdir -p "$dir/data/restore/.restore.lock"
+    sleep 60 & holder=$!
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; date +%s > "$dir/data/restore/.restore.lock/created"
+    printf 'cur-run\n' > "$dir/data/restore/.restore.lock/run_id"; printf '2026-11-15T10:00:00Z\n' > "$dir/data/restore/.restore.lock/started_at"
+    printf '%s\n' '{"run_id":"old-run","outcome":"complete","exit_code":0,"boot":true,"started_at":"2026-11-01T01:00:00Z","finished_at":"2026-11-01T01:05:00Z","result_counts":{},"results":[],"source_snapshot":{}}' > "$dir/data/restore/last-run.json"
+    out="$(CCTRL_DATA_DIR="$dir/data" "$ROOT/cctrl" session restore status --json 2>&1)" || { kill "$holder" 2>/dev/null; fail "status failed: $out"; }
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    jq -e '.current_run.run_id == "cur-run" and .current_run.started_at == "2026-11-15T10:00:00Z" and .started_at == "2026-11-01T01:00:00Z"' <<< "$out" >/dev/null \
+        || fail "status does not expose the running run's start: $out"
+    out="$(CCTRL_DATA_DIR="$dir/data" "$ROOT/cctrl" session restore status --json 2>&1)"
+    jq -e '.current_run == null' <<< "$out" >/dev/null || fail "no run is in progress but current_run is set: $out"
+    echo "ok: status exposes the current run's started_at"
+}
+
+test_restore_lock_staleness_follows_the_boot_id() {
+    # N-d: a lock carrying a boot id is stale when the id differs from this boot's, whatever the
+    # clocks say; the same id is never stale even when the boot time moved past its creation.
+    local dir="$TMPDIR/restore-lock-bootid" out rc=0 holder now
+    _restore_boot_fixture "$dir"
+    now="$(date +%s)"
+    sleep 60 & holder=$!
+    mkdir -p "$dir/data/restore/.restore.lock"
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; date +%s > "$dir/data/restore/.restore.lock/created"
+    printf 'old-run\n' > "$dir/data/restore/.restore.lock/run_id"; printf 'aaaaaaaa-0000-0000-0000-000000000001\n' > "$dir/data/restore/.restore.lock/boot_id"
+    out="$(CCTRL_FAKE_BOOT_UUID=bbbbbbbb-0000-0000-0000-000000000002 CCTRL_FAKE_BOOTTIME=$(( now - 5000 )) _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || { kill "$holder" 2>/dev/null; fail "a lock from another boot id must be stolen (rc=$rc): $(jq -c '[.outcome,.error]' <<< "$out")"; }
+    # Same boot id, boot time stepped past the lock's creation: still a live lock.
+    local dir2="$TMPDIR/restore-lock-bootid-same"
+    _restore_boot_fixture "$dir2"
+    mkdir -p "$dir2/data/restore/.restore.lock"
+    printf '%s\n' "$holder" > "$dir2/data/restore/.restore.lock/pid"; printf '%s\n' "$(( now - 100 ))" > "$dir2/data/restore/.restore.lock/created"
+    printf 'live-run\n' > "$dir2/data/restore/.restore.lock/run_id"; printf 'bbbbbbbb-0000-0000-0000-000000000002\n' > "$dir2/data/restore/.restore.lock/boot_id"
+    rc=0; out="$(CCTRL_FAKE_BOOT_UUID=bbbbbbbb-0000-0000-0000-000000000002 CCTRL_FAKE_BOOTTIME=$(( now - 50 )) _restore_run "$dir2" --boot --json 2>/dev/null)" || rc=$?
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    [[ "$rc" -eq 75 && ! -s "$dir2/launch.log" ]] || fail "a live lock of this boot id was stolen after a clock step (rc=$rc)"
+    # A new lock records the boot id.
+    local dir3="$TMPDIR/restore-lock-bootid-written"
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        export CCTRL_DATA_DIR="$dir3/data"
+        CCTRL_FAKE_BOOT_UUID=cccccccc-0000-0000-0000-000000000003 _restore_lock_acquire r1 600 || exit 3
+        [[ "$(cat "$dir3/data/restore/.restore.lock/boot_id")" == cccccccc-0000-0000-0000-000000000003 ]] || exit 4
+    ) || fail "the lock does not record the boot id (exit $?)"
+    echo "ok: lock staleness follows the boot id"
+}
+
 test_restore_boot_id_is_the_session_uuid() {
     # SF5: the boot id is kern.bootsessionuuid, so a clock correction (a new boot-time second)
     # in the middle of a boot does not lose the boot state.

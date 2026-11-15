@@ -1076,8 +1076,9 @@ launch and is `ready`; retried once; if it still does not come up, or its launch
 fails twice, the other rows are still restored and the exit is 75 with the
 fleet manager named in `results`), then orchestrators, then workers. Of several fleet
 manager rows of one runtime only the newest restores; the others are skipped as
-conflicts, and when the newest is already live nothing of that runtime is
-launched. A recorded tmux name another live session holds is skipped and
+conflicts, and when ANY fleet manager row of that runtime is already live (older,
+newer, or without a `last_active`) none of its rows is launched: they are all
+conflicts and the run exits 75 naming them. A recorded tmux name another live session holds is skipped and
 reported (no `--N` suffix at boot). During `--boot` only, the health check
 picks option 1 ("Resume from summary") of the large-transcript resume picker.
 Every launch runs with `TMUX`, `CCTRL_TMUX_CONTEXT` and the caller's session
@@ -1098,7 +1099,12 @@ finished boot exits 0 at once; `--rerun` ignores the stored row results),
 runs or this boot's restore has not finished; it writes history only.
 `cctrl session restore status [--json]` prints the last run, the rows that did
 not come back, the fleet manager line and whether this boot's run is
-`complete`, `partial`, `failed`, `running` or `missing`.
+`complete`, `partial`, `failed`, `running` or `missing`. While a run holds the
+lock, `current_run` (`run_id`, `started_at`, from the lock) says when that run
+started; the top-level `started_at` is still the last finished run's. The lock
+records the boot id, and a lock from another boot id is stale whatever the clocks
+say. The non-boot 900 s cap starts after the `[y/N]` answer; only a run that holds
+the lock writes `last-run.json`.
 
 **Launch configuration replay.** Restore threads `model`, `permission-mode`,
 `profile`, `peer`, `sandbox`, `--no-bridge`, and `agent` from the snapshot's
