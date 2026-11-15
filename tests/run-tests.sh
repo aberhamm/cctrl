@@ -19343,7 +19343,7 @@ test_restore_health_mark_only_marks_its_own_record() {
         _session_update_metadata_field() { FAKE_STATUS="$3"; return 0; }
         _restore_health_mark TMUX--x conv-mine
         [[ "$FAKE_STATUS" == ready && "$_RR_HEALTH_MARKED" == false ]] || fail "a record of another conversation was marked or trusted"
-        FAKE_ID=conv-mine
+        FAKE_ID='conv-mine'
         _restore_health_mark TMUX--x conv-mine
         [[ "$FAKE_STATUS" == pending-launch && "$_RR_HEALTH_MARKED" == true ]] || fail "the row's own record was not marked"
     ) || fail "health mark ownership"
