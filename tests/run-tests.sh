@@ -19112,21 +19112,26 @@ test_restore_fm_health_from_this_launch_only() {
     [[ "$rc" -eq 75 ]] || fail "a fleet manager that did not become ready must give 75, got $rc: $out"
     [[ "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "the rest must still restore: $(cat "$dir/launch.log")"
     jq -e '.fm.result == "timeout" and .fm.health_status == "timeout"' <<< "$out" >/dev/null || fail "fm result wrong: $(jq -c .fm <<< "$out")"
-    # The freshness rule itself: a status written before this launch started is never read.
+    # The freshness rule itself: a status left by the pre-boot incarnation is overwritten with a
+    # mark before the launch, so only this launch's health check can supply a value.
     (
         CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
-        _session_metadata_field() {
-            case "$2" in
-                created_at) printf '%s' "$FAKE_CREATED" ;;
-                health_status) printf 'ready' ;;
-            esac
-        }
-        FAKE_CREATED="$(date -u -v-2H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
-        [[ -z "$(_restore_fresh_health TMUX--x "$(date +%s)")" ]] || fail "a stale health_status was trusted"
-        FAKE_CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        [[ "$(_restore_fresh_health TMUX--x "$(( $(date +%s) - 5 ))")" == ready ]] || fail "a fresh health_status was not read"
-        FAKE_CREATED=""
-        [[ -z "$(_restore_fresh_health TMUX--x "$(date +%s)")" ]] || fail "an undated record was trusted"
+        FAKE_STATUS=ready; FAKE_WRITE_OK=true
+        _session_metadata_field() { [[ "$2" == health_status ]] && printf '%s' "$FAKE_STATUS"; return 0; }
+        _session_update_metadata_field() { [[ "$FAKE_WRITE_OK" == true ]] || return 1; FAKE_STATUS="$3"; return 0; }
+        _restore_health_mark TMUX--x
+        [[ "$FAKE_STATUS" == pending-launch ]] || fail "the stale status was not overwritten before the launch"
+        [[ -z "$(_restore_fresh_health TMUX--x TMUX--x)" ]] || fail "a status nobody wrote this launch was trusted"
+        FAKE_STATUS=ready   # this launch's health check ran
+        [[ "$(_restore_fresh_health TMUX--x TMUX--x)" == ready ]] || fail "this launch's own status was not read"
+        [[ -z "$(_restore_fresh_health TMUX--x TMUX--x--2)" ]] || fail "a status under another name than the marked one was trusted"
+        FAKE_STATUS=ready; FAKE_WRITE_OK=false
+        _restore_health_mark TMUX--x
+        [[ -z "$(_restore_fresh_health TMUX--x TMUX--x)" ]] || fail "a stale status was trusted after the mark failed"
+        FAKE_STATUS=""; FAKE_WRITE_OK=false
+        _restore_health_mark TMUX--y
+        FAKE_STATUS=ready
+        [[ "$(_restore_fresh_health TMUX--y TMUX--y)" == ready ]] || fail "a name with no earlier status must read this launch's"
     ) || fail "freshness rule"
     echo "ok: the fleet manager's health comes from this launch only"
 }
@@ -19394,6 +19399,16 @@ test_restore_boot_inside_session_requires_background() {
     assert_not_contains "$(cat "$dir/bg.log")" "--background"
     assert_contains "$(cat "$dir/bg.log")" "run_id=$(jq -r .run_id <<< "$out")"
     echo "ok: --boot inside a session needs --background, which re-runs detached"
+}
+
+test_restore_help_documents_boot() {
+    local out
+    out="$("$ROOT/cctrl" session restore --help)"
+    assert_contains "$out" "--boot        boot-time restore:"
+    assert_contains "$out" "restore status"
+    assert_contains "$out" "75 partial or locked"
+    assert_contains "$out" "CCTRL_RESTORE_MAX_ACTIVE (20)"
+    echo "ok: restore --help documents --boot, status, the gates and the exit codes"
 }
 
 test_restore_launch_env_scrubbed() {

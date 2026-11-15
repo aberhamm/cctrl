@@ -19717,22 +19717,34 @@ _restore_name_live() { # tmux session name: is a session of exactly this name li
     _tmux_run_with_timeout has-session -t "=$name" 2>/dev/null
 }
 
+_restore_health_mark() {
+    # Before a launch: a health_status left on the record by the pre-boot
+    # incarnation of this name must never be read back as this launch's. Mark
+    # it; only the launch's own health check can replace the mark. Sets
+    # _RR_HEALTH_MARKED (false when a stale status could not be overwritten).
+    # arg: the recorded tmux session name
+    local name="$1" existing
+    _RR_HEALTH_MARKED=true
+    [[ -n "$name" ]] || return 0
+    existing="$(_session_metadata_field "$name" health_status 2>/dev/null || true)"
+    [[ -n "$existing" ]] || return 0
+    _session_update_metadata_field "$name" health_status "pending-launch" >/dev/null 2>&1 || _RR_HEALTH_MARKED=false
+    return 0
+}
+
 _restore_fresh_health() {
-    # health_status of THIS launch only. The metadata of the launched session
-    # is trusted only when it was created after the launch started: a status
-    # left over from the pre-boot incarnation of the same name is never read.
-    # args: session started_epoch. Prints the status ("" when unknown).
-    local name="$1" started="$2" created created_epoch
+    # health_status written by THIS launch, or "" when unknown (no health
+    # check ran, the mark could not be placed, or the launch landed under
+    # another name than the one marked). args: launched_name recorded_name
+    local name="$1" recorded="$2" value
     if [[ -n "${CCTRL_RESTORE_FAKE_HEALTH_FILE:-}" ]]; then   # TEST SEAM: the status this launch produced
         head -n 1 "$CCTRL_RESTORE_FAKE_HEALTH_FILE" 2>/dev/null || true
         return 0
     fi
-    [[ -n "$name" ]] || return 0
-    created="$(_session_metadata_field "$name" created_at 2>/dev/null || true)"
-    if [[ "$created" =~ ^[0-9]+$ ]]; then created_epoch="$created"; else created_epoch="$(_restore_iso_epoch "$created")"; fi
-    [[ "$created_epoch" =~ ^[0-9]+$ ]] || return 0
-    (( created_epoch >= started )) || return 0
-    _session_metadata_field "$name" health_status 2>/dev/null || true
+    [[ -n "$name" && "$name" == "$recorded" && "${_RR_HEALTH_MARKED:-false}" == true ]] || return 0
+    value="$(_session_metadata_field "$name" health_status 2>/dev/null || true)"
+    [[ "$value" == pending-launch ]] && value=""
+    printf '%s' "$value"
     return 0
 }
 
@@ -19783,9 +19795,9 @@ _restore_do_row() {
     # (restored | failed | skipped | already-live), _RR_HEALTH, _RR_NAME.
     # args: row_json phase attempt
     local row="$1" phase="$2" attempt="$3"
-    local started started_epoch cwd resume purpose label agent spawn_rc=0 key value recorded
+    local started cwd resume purpose label agent spawn_rc=0 key value recorded
     local receipt launch_err flag_role flag_kind
-    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; started_epoch="$(date +%s)"
+    started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     _RR_RESULT=failed; _RR_HEALTH=""; _RR_NAME=""
     cwd="$(jq -r '.cwd' <<< "$row")"; resume="$(jq -r '.resume_identity' <<< "$row")"
     purpose="$(jq -r '.purpose // "restored task"' <<< "$row")"; label="$(jq -r '.display_label // empty' <<< "$row")"
@@ -19866,6 +19878,8 @@ _restore_do_row() {
         rs_pred="$(_fleet_live_managers "${rs_agent:-claude}" || true)"
         rs_pred="${rs_pred%%$'\n'*}"
     fi
+    _RR_HEALTH_MARKED=true
+    [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]] || _restore_health_mark "$recorded"
     _restore_log launch task "$resume" name "$recorded" phase "$phase" attempt "$attempt"
     # Every launch runs in a subshell with the caller's session identity
     # removed, so a restore started from inside a session (or a re-exec of
@@ -19904,7 +19918,7 @@ _restore_do_row() {
     fi
     _RR_NAME="$(jq -r '.session // empty' "$receipt" 2>/dev/null || true)"
     [[ -n "$_RR_NAME" ]] || _RR_NAME="$recorded"
-    _RR_HEALTH="$(_restore_fresh_health "$_RR_NAME" "$started_epoch")"
+    _RR_HEALTH="$(_restore_fresh_health "$_RR_NAME" "$recorded")"
     if [[ -z "$_RR_HEALTH" && -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then _RR_HEALTH=ready; fi
     [[ -n "$_RR_NAME" ]] && printf '%s\n' "$_RR_NAME" >> "$_RS_SCRATCH/launched.names"
     if [[ -n "$rs_pred" ]]; then
@@ -20448,7 +20462,7 @@ _session_restore_core() {
                 --argjson source "$(jq -c '{path, content_digest, selection, why, generated_at}' "$scratch/source.json")" || true
         fi
     fi
-    _restore_log run-start boot "$boot" source "$snapshot_path" selection "$from_mode" why "$source_why"
+    _restore_log run-start boot "$boot" source "$snapshot_path" selection "$from_mode" why "$source_why" lock_stolen "${_RS_LOCK_STOLEN:-}"
     if [[ -n "${CCTRL_RESTORE_CATALOGUE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CATALOGUE_FILE" "$catalogue_file" || catalogue_rc=$?; else _task_list_json > "$catalogue_file" || catalogue_rc=$?; fi
     _snapshot_process_source "$process_file" || process_rc=$?
     if jq -e 'any((.tasks // .sessions // [])[]?; (.provider == "codex") or (.agent == "codex"))' "$snapshot_path" >/dev/null 2>&1; then
