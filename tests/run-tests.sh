@@ -10246,7 +10246,7 @@ $hits"
     assert_contains "$body" "unset TMUX TMUX_PANE; _peer_whois_list_panes"
     assert_contains "$body" "i < 12"
     # Bodies into variables, not `sed | grep -q` (SIGPIPE under pipefail).
-    body="$(sed -n '/^_session_restore() {/,/^}/p' "$ROOT/cctrl")"
+    body="$(sed -n '/^_restore_do_row() {/,/^}/p' "$ROOT/cctrl")"
     assert_contains "$body" '_launch_detached "${launch_argv[@]}"'
     body="$(sed -n '/^_launch_detached() {/,/^}/p' "$ROOT/cctrl")"
     assert_contains "$body" '_session_capture_tmux_attestation_anchor "$session_name"'
@@ -18659,7 +18659,7 @@ test_restore_no_force_structural() {
     # Structural: the _session_restore function body (excluding comments and
     # --force-host references) must not contain --force.
     local body
-    body="$(sed -n '/_session_restore()/,/^}/p' "$ROOT/cctrl" | grep -v '^\s*#' | grep -v 'force-host\|force_host')"
+    body="$(sed -En '/^_session_restore(_core)?\(\) \{/,/^}/p' "$ROOT/cctrl" | grep -v '^\s*#' | grep -v 'force-host\|force_host')"
     if grep -q -- '--force' <<<"$body"; then
         fail "_session_restore contains --force (must never pass --force to cctrl start)"
     fi
@@ -18670,7 +18670,7 @@ test_restore_no_pane_inference_structural() {
     # Structural: _session_restore must contain no send-keys, paste-buffer,
     # load-buffer, or capture-pane.
     local body
-    body="$(sed -n '/_session_restore()/,/^}/p' "$ROOT/cctrl" | grep -v '^\s*#')"
+    body="$(sed -En '/^_session_restore(_core)?\(\) \{/,/^}/p' "$ROOT/cctrl" | grep -v '^\s*#')"
     if grep -Eq 'send-keys|paste-buffer|load-buffer|capture-pane' <<<"$body"; then
         fail "_session_restore contains pane inference commands"
     fi
