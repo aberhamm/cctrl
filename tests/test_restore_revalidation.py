@@ -44,7 +44,10 @@ class RestoreTests(unittest.TestCase):
             env.update(HOME=str(root), CCTRL_NO_MAIN='1', CCTRL_HOST_PREFIX='fixture',
                        CCTRL_DEFAULT_AGENT='codex', CCTRL_AGENT='codex',
                        CCTRL_RESTORE_LAUNCH_LOG=str(root / 'launch.log'), CCTRL_RESTORE_WAVE_PAUSE='0',
-                       CCTRL_RESTORE_WAVE_SIZE='1', TEST_ROOT=str(root), SWITCH_AT=str(switch_at))
+                       CCTRL_RESTORE_WAVE_SIZE='1', TEST_ROOT=str(root), SWITCH_AT=str(switch_at),
+                       # the resource gates read fixed numbers and never sleep
+                       CCTRL_FAKE_LOAD1='1', CCTRL_FAKE_COMPRESSED_PCT='1', CCTRL_FAKE_SWAPINS='0', CCTRL_RESTORE_GATE_SAMPLE='0',
+                       CCTRL_DATA_DIR=str(root / 'data'))
             script = '''source "$0"
 _cctrl_host_id() { echo 0123456789abcdef0123456789abcdef; }
 _cctrl_host_id_read() { echo 0123456789abcdef0123456789abcdef; }

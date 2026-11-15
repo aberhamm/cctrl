@@ -19755,7 +19755,7 @@ _restore_recheck_row() {
     # closed restore predicate still grants it. Sets _RR_CHECK to ok,
     # already-live, skipped or failed, with _RR_CHECK_REASON and _RR_CHECK_ATTENTION.
     local row="$1" current_plan="$_RS_SCRATCH/current-plan.json" current_snapshot="$_RS_SCRATCH/current-snapshot.json" rc=0
-    _RR_CHECK=ok; _RR_CHECK_REASON=""; _RR_CHECK_ATTENTION=""
+    _RR_CHECK=ok; _RR_CHECK_REASON=""; _RR_CHECK_ATTENTION=""; _RR_RETRY=true
     if [[ -n "${CCTRL_RESTORE_CATALOGUE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CATALOGUE_FILE" "$_RS_CATALOGUE" || rc=$?; else _task_list_json > "$_RS_CATALOGUE" || rc=$?; fi
     _snapshot_process_source "$_RS_PROCESS" || rc=$?
     if [[ "$(jq -r '.provider // empty' <<< "$row")" == codex ]]; then
@@ -19782,7 +19782,8 @@ _restore_recheck_row() {
         _RR_CHECK=already-live; _RR_CHECK_REASON="$(jq -r '.rows[0].reason' "$current_plan")"
         return 0
     fi
-    _RR_CHECK=failed; _RR_CHECK_REASON="fresh exact-task ownership no longer authorizes the restore"
+    # The evidence was read and says no: asking again would not change it.
+    _RR_CHECK=failed; _RR_CHECK_REASON="fresh exact-task ownership no longer authorizes the restore"; _RR_RETRY=false
     _RR_CHECK_ATTENTION="$(jq -r '.rows[0].attention // empty' "$current_plan")"
     if [[ -n "$_RR_CHECK_ATTENTION" ]]; then
         _RR_CHECK=skipped; _RR_CHECK_REASON="$(jq -r '.rows[0].reason' "$current_plan")"
@@ -19798,7 +19799,7 @@ _restore_do_row() {
     local started cwd resume purpose label agent spawn_rc=0 key value recorded
     local receipt launch_err flag_role flag_kind
     started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    _RR_RESULT=failed; _RR_HEALTH=""; _RR_NAME=""
+    _RR_RESULT=failed; _RR_HEALTH=""; _RR_NAME=""; _RR_RETRY=true
     cwd="$(jq -r '.cwd' <<< "$row")"; resume="$(jq -r '.resume_identity' <<< "$row")"
     purpose="$(jq -r '.purpose // "restored task"' <<< "$row")"; label="$(jq -r '.display_label // empty' <<< "$row")"
     agent="$(jq -r '.agent // .provider // empty' <<< "$row")"
@@ -19807,7 +19808,8 @@ _restore_do_row() {
     if [[ -n "$label" ]]; then launch_argv+=(--name "$label"); fi
     case "$agent" in
         claude|codex) launch_argv+=(--agent "$agent") ;;
-        *) _restore_record_attempt "$_RS_SCRATCH/attempts.jsonl" "$row" failed "no supported agent for this row" "$started" "$phase" "" "" "$attempt"
+        *) _RR_RETRY=false
+           _restore_record_attempt "$_RS_SCRATCH/attempts.jsonl" "$row" failed "no supported agent for this row" "$started" "$phase" "" "" "$attempt"
            return 0 ;;
     esac
     while IFS=$'\t' read -r key value; do
@@ -19935,7 +19937,7 @@ _restore_settle_row() { # row_json phase attempt: launch, note it in the boot st
     _restore_do_row "$row" "$phase" "$attempt"
     case "$_RR_RESULT" in
         failed)
-            if (( attempt < _RS_MAX_ATTEMPTS )); then
+            if [[ "$_RR_RETRY" == true ]] && (( attempt < _RS_MAX_ATTEMPTS )); then
                 _restore_state_row "$id" pending "$attempt" ""
                 return 1
             fi
@@ -19967,12 +19969,13 @@ _restore_fm_phase() { # row_json: bring the fleet manager up first, retry once, 
         jq -n --arg name "$name" '{tmux_session:$name, result:"deferred", health_status:null, waited_s:0}' > "$_RS_SCRATCH/fm.json"
         return 0
     fi
-    if ! _restore_settle_row "$row" fm 1; then
+    local a0="${_RS_FM_ATTEMPTS:-0}"
+    if ! _restore_settle_row "$row" fm $(( a0 + 1 )); then
         local poll="${CCTRL_RESTORE_GATE_POLL:-30}"
         [[ "$poll" =~ ^[0-9]+$ ]] || poll=30
         _restore_wait "$poll"
         _restore_wait_gate || true
-        _restore_settle_row "$row" fm 2 || true
+        _restore_settle_row "$row" fm $(( a0 + 2 )) || true
     fi
     result="$_RR_RESULT"; health="$_RR_HEALTH"
     if [[ "$result" == restored && "$health" != ready ]]; then _RS_FM_PROBLEM=true; fi
