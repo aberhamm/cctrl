@@ -19174,21 +19174,28 @@ _restore_busy() {
     # cap plus 10 minutes) or this boot's restore state exists with no final
     # outcome yet (same age bound, so a crashed run cannot freeze latest.json
     # for good). Read-only.
-    local dir lock pid created now timeout max_age boot state mtime
+    local dir lock pid created now timeout max_age boot state mtime boot_epoch
     dir="$(_restore_dir)"; lock="$dir/.restore.lock"; now="$(date +%s)"
+    boot_epoch="$(_restore_boot_epoch)"
     timeout="${CCTRL_RESTORE_TIMEOUT:-2700}"; [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=2700
     if (( timeout > 0 )); then max_age=$(( timeout + 600 )); else max_age=86400; fi
     if [[ -d "$lock" ]]; then
         pid="$(cat "$lock/pid" 2>/dev/null || true)"; created="$(cat "$lock/created" 2>/dev/null || true)"
         [[ "$created" =~ ^[0-9]+$ ]] || created="$now"
-        if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && (( now - created <= max_age )); then return 0; fi
+        # A lock made before this boot began belongs to a run the reboot killed,
+        # whatever process now holds its pid number.
+        if [[ "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch )); then :
+        elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && (( now - created <= max_age )); then return 0; fi
     fi
-    boot="$(_restore_boot_epoch)"
+    boot="$(_restore_boot_id)"
     if [[ -n "$boot" ]]; then
         state="$(_restore_state_file "$boot")"
         if [[ -s "$state" && -z "$(jq -r '.final.outcome // empty' "$state" 2>/dev/null)" ]]; then
             mtime="$(stat -f %m "$state" 2>/dev/null || stat -c %Y "$state" 2>/dev/null || true)"
-            [[ "$mtime" =~ ^[0-9]+$ ]] && (( now - mtime <= max_age )) && return 0
+            if [[ "$mtime" =~ ^[0-9]+$ ]] && (( now - mtime <= max_age )); then
+                # Written before this boot began: the run it belonged to died with the boot.
+                [[ "$boot_epoch" =~ ^[0-9]+$ ]] && (( mtime < boot_epoch )) || return 0
+            fi
         fi
     fi
     return 1
@@ -19386,6 +19393,34 @@ _restore_boot_epoch() {
     return 0
 }
 
+_restore_boot_id_resolve() {
+    # Sets _RR_BOOT_ID and _RR_BOOT_ID_SRC (uuid | epoch | fake): the key for
+    # this boot's state file and run documents. macOS moves kern.boottime when
+    # the clock is corrected, so the id is kern.bootsessionuuid (stable for the
+    # whole boot); Linux uses /proc/sys/kernel/random/boot_id. Only when no
+    # such id exists does it fall back to the boot-time seconds, and the
+    # source says so (the run log records it). TEST SEAMS: CCTRL_FAKE_BOOT_UUID
+    # (empty = unavailable); CCTRL_FAKE_BOOTTIME and CCTRL_FAKE_BOOTTIME_SYSCTL
+    # (the epoch is then the id, as before).
+    local uuid="" epoch=""
+    _RR_BOOT_ID=""; _RR_BOOT_ID_SRC=""
+    if [[ -n "${CCTRL_FAKE_BOOT_UUID+x}" ]]; then uuid="$CCTRL_FAKE_BOOT_UUID"
+    elif [[ -z "${CCTRL_FAKE_BOOTTIME:-}" && -z "${CCTRL_FAKE_BOOTTIME_SYSCTL+x}" ]]; then
+        uuid="$(sysctl -n kern.bootsessionuuid 2>/dev/null || true)"
+        if [[ -z "$uuid" && -r /proc/sys/kernel/random/boot_id ]]; then uuid="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"; fi
+    fi
+    if [[ "$uuid" =~ ^[A-Za-z0-9-]{8,64}$ ]]; then
+        _RR_BOOT_ID="$uuid"; _RR_BOOT_ID_SRC=uuid
+        [[ -n "${CCTRL_FAKE_BOOT_UUID+x}" ]] && _RR_BOOT_ID_SRC=fake
+        return 0
+    fi
+    epoch="$(_restore_boot_epoch)"
+    if [[ -n "$epoch" ]]; then _RR_BOOT_ID="$epoch"; _RR_BOOT_ID_SRC=epoch; fi
+    return 0
+}
+
+_restore_boot_id() { _restore_boot_id_resolve; printf '%s' "$_RR_BOOT_ID"; }
+
 _restore_select_preboot() {
     # Pick the snapshot a boot restore must read: the newest of latest.json and
     # the history files that was captured before this boot, had live sessions,
@@ -19484,8 +19519,9 @@ _restore_log() { # event [key value]...  one JSONL line; best effort, never fail
 _restore_lock_dir() { printf '%s/.restore.lock' "$(_restore_dir)"; }
 
 _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by another run, 2 = no restore dir
-    local run_id="$1" max_age="$2" dir attempt now created pid age stale
+    local run_id="$1" max_age="$2" dir attempt now created pid age stale boot_epoch why=""
     dir="$(_restore_lock_dir)"
+    boot_epoch="$(_restore_boot_epoch)"
     _restore_dir_init || return 2
     for attempt in 1 2; do
         if mkdir "$dir" 2>/dev/null; then
@@ -19503,14 +19539,15 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
         age=$(( now - created ))
         pid="$(cat "$dir/pid" 2>/dev/null || true)"
         stale=0
-        if (( age > max_age )); then stale=1
+        if [[ "$created" =~ ^[0-9]+$ && "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch )); then stale=1; why=", made before this boot"
+        elif (( age > max_age )); then stale=1
         elif [[ -z "$pid" ]]; then (( age >= 5 )) && stale=1
         elif ! kill -0 "$pid" 2>/dev/null; then stale=1
         fi
         (( stale )) || return 1
         # Only one run can move a stale lock away; the loser retries mkdir.
         if mv "$dir" "$dir.stale.$$" 2>/dev/null; then
-            _RS_LOCK_STOLEN="pid ${pid:-none}, age ${age}s"
+            _RS_LOCK_STOLEN="pid ${pid:-none}, age ${age}s${why}"
             rm -f "$dir.stale.$$/pid" "$dir.stale.$$/created" "$dir.stale.$$/run_id" 2>/dev/null || true
             rmdir "$dir.stale.$$" 2>/dev/null || true
         fi
@@ -19722,12 +19759,17 @@ _restore_health_mark() {
     # incarnation of this name must never be read back as this launch's. Mark
     # it; only the launch's own health check can replace the mark. Sets
     # _RR_HEALTH_MARKED (false when a stale status could not be overwritten).
-    # arg: the recorded tmux session name
-    local name="$1" existing
+    # The record is marked only when it is this row's own conversation
+    # (provider_task_id equals the resume id): a name-keyed record of an older
+    # conversation that used the same name is never touched.
+    # args: the recorded tmux session name, the row's resume id
+    local name="$1" resume="${2:-}" existing rec_id
     _RR_HEALTH_MARKED=true
     [[ -n "$name" ]] || return 0
     existing="$(_session_metadata_field "$name" health_status 2>/dev/null || true)"
     [[ -n "$existing" ]] || return 0
+    rec_id="$(_session_metadata_field "$name" provider_task_id 2>/dev/null || true)"
+    if [[ -z "$resume" || "$rec_id" != "$resume" ]]; then _RR_HEALTH_MARKED=false; return 0; fi
     _session_update_metadata_field "$name" health_status "pending-launch" >/dev/null 2>&1 || _RR_HEALTH_MARKED=false
     return 0
 }
@@ -19881,7 +19923,7 @@ _restore_do_row() {
         rs_pred="${rs_pred%%$'\n'*}"
     fi
     _RR_HEALTH_MARKED=true
-    [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]] || _restore_health_mark "$recorded"
+    [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]] || _restore_health_mark "$recorded" "$resume"
     _restore_log launch task "$resume" name "$recorded" phase "$phase" attempt "$attempt"
     # Every launch runs in a subshell with the caller's session identity
     # removed, so a restore started from inside a session (or a re-exec of
@@ -19889,7 +19931,10 @@ _restore_do_row() {
     # not $TMUX.
     (
         unset TMUX TMUX_PANE CCTRL_TMUX_CONTEXT CCTRL_SESSION_NAME CCTRL_SESSION_KIND CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE
-        if [[ "$_RS_BOOT" == true ]]; then export CCTRL_HC_AUTO_RESUME_SUMMARY=1; fi
+        # A plain (unexported) variable: the health check runs in this process and
+        # reads it, but a tmux server started from here never inherits it.
+        unset CCTRL_HC_AUTO_RESUME_SUMMARY
+        if [[ "$_RS_BOOT" == true ]]; then CCTRL_HC_AUTO_RESUME_SUMMARY=1; fi
         export CCTRL_LAUNCH_RECEIPT_FILE="$receipt"
         if [[ -n "${CCTRL_RESTORE_LAUNCH_LOG:-}" ]]; then
             # TEST SEAMS: the launch is only logged. CCTRL_RESTORE_FAKE_FAIL=<task id>:<n>
@@ -19969,7 +20014,7 @@ _restore_fm_phase() { # row_json: bring the fleet manager up first, retry once, 
         jq -n --arg name "$name" '{tmux_session:$name, result:"deferred", health_status:null, waited_s:0}' > "$_RS_SCRATCH/fm.json"
         return 0
     fi
-    local a0="${_RS_FM_ATTEMPTS:-0}"
+    local a0="${_RS_FM_ATTEMPTS:-0}" failed0="$_RS_FAILED"
     if ! _restore_settle_row "$row" fm $(( a0 + 1 )); then
         local poll="${CCTRL_RESTORE_GATE_POLL:-30}"
         [[ "$poll" =~ ^[0-9]+$ ]] || poll=30
@@ -19978,6 +20023,10 @@ _restore_fm_phase() { # row_json: bring the fleet manager up first, retry once, 
         _restore_settle_row "$row" fm $(( a0 + 2 )) || true
     fi
     result="$_RR_RESULT"; health="$_RR_HEALTH"
+    # D4: a fleet manager that failed twice is named in the results and makes
+    # the run partial (75); it does not turn the run into a failed one (1),
+    # because the rest was still restored.
+    if [[ "$result" == failed ]]; then _RS_FAILED="$failed0"; fi
     if [[ "$result" == restored && "$health" != ready ]]; then _RS_FM_PROBLEM=true; fi
     if [[ "$result" == failed || "$result" == skipped ]]; then _RS_FM_PROBLEM=true; fi
     waited_s=$(( $(_restore_elapsed) - fm_start ))
@@ -20097,6 +20146,7 @@ _restore_finish() {
                    not_restorable: ([$results[] | select(.result == "skipped" and .evidence.attention == null)] | length)}}' \
             "$scratch/plan.json" > "$doc" 2>/dev/null || : > "$doc"
         if [[ "$json" == true && -s "$doc" ]]; then cat "$doc"; fi
+        if [[ "$dry_run" != true && -s "$doc" ]]; then _RS_FINISHED=true; fi
         if [[ "$dry_run" != true && "${_RS_LOG_ON:-false}" == true && -s "$doc" ]]; then
             dir="$(_restore_dir)"
             ( umask 077
@@ -20129,7 +20179,7 @@ _restore_status() {
     done
     local dir last boot_epoch boot_state="missing" state_file this_boot=false run_boot
     dir="$(_restore_dir)"; last="$dir/last-run.json"
-    boot_epoch="$(_restore_boot_epoch)"
+    boot_epoch="$(_restore_boot_id)"
     if [[ -n "$boot_epoch" ]]; then
         state_file="$(_restore_state_file "$boot_epoch")"
         if [[ -s "$state_file" ]]; then
@@ -20195,7 +20245,7 @@ _session_restore() {
     # Front door: status, the detached re-run, and the one-run-at-a-time lock
     # around the real work in _session_restore_core. A dry run and --help
     # never take the lock.
-    local a boot=false background=false dry=false json=false helpf=false skip=false
+    local a boot=false background=false dry=false json=false helpf=false skip=false yes=false
     if [[ "${1:-}" == status ]]; then shift; _restore_status "$@"; return $?; fi
     for a in "$@"; do
         if $skip; then skip=false; continue; fi
@@ -20205,6 +20255,7 @@ _session_restore() {
             --background) background=true ;;
             --dry-run) dry=true ;;
             --json) json=true ;;
+            --yes|-y) yes=true ;;
             -h|--help|help) helpf=true ;;
         esac
     done
@@ -20225,33 +20276,94 @@ _session_restore() {
     if (( primary_rc != 0 )); then
         $json && _restore_refusal_json "$primary_rc" "primary tmux server is not running" "$(jq -n --arg d "$(printf '%s' "$primary_msg" | head -c 400)" '{detail:$d}')"
         printf '%s\n' "$primary_msg" >&2
+        _RS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        _restore_record_early "$run_id" "$primary_rc" "$boot"
         return "$primary_rc"
     fi
     local timeout="${CCTRL_RESTORE_TIMEOUT:-}" max_age lock_rc=0 rc=0
-    [[ "$timeout" =~ ^[0-9]+$ ]] || { if $boot; then timeout=2700; else timeout=0; fi; }
+    # A run never waits on the gates for ever: --boot has 45 minutes, any other
+    # real run 15 (an explicit CCTRL_RESTORE_TIMEOUT=0 opts out).
+    [[ "$timeout" =~ ^[0-9]+$ ]] || { if $boot; then timeout=2700; else timeout=900; fi; }
     if (( timeout > 0 )); then max_age=$(( timeout + 600 )); else max_age=31536000; fi
-    _RS_LOCK_STOLEN=""
-    _restore_lock_acquire "$run_id" "$max_age" || lock_rc=$?
-    if (( lock_rc == 1 )); then
-        local dir holder_pid holder_run holder_created
-        dir="$(_restore_lock_dir)"
-        holder_pid="$(cat "$dir/pid" 2>/dev/null || true)"; holder_run="$(cat "$dir/run_id" 2>/dev/null || true)"
-        holder_created="$(cat "$dir/created" 2>/dev/null || true)"
-        if $json; then
-            _restore_refusal_json 75 "another restore is running" \
-                "$(jq -n --arg pid "$holder_pid" --arg run "$holder_run" --arg created "$holder_created" '{holder:{pid:$pid, run_id:$run, created:$created}}')" \
-                | jq '.outcome = "locked"'
+    _RS_RUN_ID="$run_id"; _RS_TIMEOUT="$timeout"; _RS_LOCK_MAX_AGE="$max_age"
+    _RS_HAVE_LOCK=false; _RS_LOCK_LATE=false; _RS_FINISHED=false; _RS_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if ! $boot && ! $yes; then
+        # An interactive run sits at a [y/N] prompt first: it takes the lock
+        # only once the answer is yes (_restore_lock_late in the core), so a
+        # waiting human does not freeze latest.json or block a boot run.
+        _RS_LOCK_LATE=true
+    else
+        _RS_LOCK_STOLEN=""
+        _restore_lock_acquire "$run_id" "$max_age" || lock_rc=$?
+        if (( lock_rc == 1 )); then _restore_lock_refusal "$json"; return 75; fi
+        if (( lock_rc == 0 )); then _RS_HAVE_LOCK=true
+        elif $boot; then
+            # Never run a boot restore unlocked: two LaunchAgent fires could race.
+            $json && _restore_refusal_json 1 "restore directory unavailable: cannot take the restore lock"
+            echo "cctrl: restore --boot refused: the restore directory cannot be created, so the run cannot be locked; nothing launched." >&2
+            return 1
         fi
-        echo "restore: another restore run holds the lock (pid ${holder_pid:-?}, run ${holder_run:-?}); nothing launched." >&2
-        return 75
+        # lock_rc 2 outside --boot (no restore dir): carry on without a lock or run files.
     fi
-    # lock_rc 2 (no restore dir): carry on without a lock or run files rather than refuse.
-    _RS_RUN_ID="$run_id"
-    if (( lock_rc == 0 )); then _RS_HAVE_LOCK=true; else _RS_HAVE_LOCK=false; fi
-    _RS_TIMEOUT="$timeout"
     _session_restore_core "$@" || rc=$?
+    if (( rc != 0 )) && [[ "$_RS_FINISHED" != true ]]; then _restore_record_early "$run_id" "$rc" "$boot"; fi
     if [[ "$_RS_HAVE_LOCK" == true ]]; then _restore_lock_release; fi
     return "$rc"
+}
+
+_restore_lock_refusal() { # json: another run holds the lock; print why (exit code 75 is the caller's)
+    local json="$1" dir holder_pid holder_run holder_created
+    dir="$(_restore_lock_dir)"
+    holder_pid="$(cat "$dir/pid" 2>/dev/null || true)"; holder_run="$(cat "$dir/run_id" 2>/dev/null || true)"
+    holder_created="$(cat "$dir/created" 2>/dev/null || true)"
+    if [[ "$json" == true ]]; then
+        _restore_refusal_json 75 "another restore is running" \
+            "$(jq -n --arg pid "$holder_pid" --arg run "$holder_run" --arg created "$holder_created" '{holder:{pid:$pid, run_id:$run, created:$created}}')" \
+            | jq '.outcome = "locked"'
+    fi
+    echo "restore: another restore run holds the lock (pid ${holder_pid:-?}, run ${holder_run:-?}); nothing launched." >&2
+    return 0
+}
+
+_restore_record_early() {
+    # A real run that ended before it wrote a run document (refused on input,
+    # evidence, the primary tmux server, ...) still leaves a record, so
+    # `restore status` and the FM see it instead of an older run. A re-run
+    # started with --background otherwise shows only in runs/<id>.out.
+    # args: run_id rc boot
+    local run_id="$1" rc="$2" boot="$3" dir reason outcome=refused doc
+    case "$rc" in
+        64) reason="refused: invalid input, stale snapshot, schema or host mismatch (see runs/${run_id}.out)" ;;
+        69) reason="refused: mandatory evidence unavailable (see runs/${run_id}.out)" ;;
+        78) reason="refused: confirmation needed and no terminal" ;;
+        *) reason="ended with exit $rc before a run document was written (see runs/${run_id}.out)"; outcome=failed ;;
+    esac
+    dir="$(_restore_dir)"
+    [[ -d "$dir/runs" ]] || _restore_dir_init 2>/dev/null || return 0
+    _restore_boot_id_resolve
+    doc="$dir/runs/${run_id}.json"
+    ( umask 077
+      jq -n --arg run "$run_id" --arg boot_id "$_RR_BOOT_ID" --argjson boot "$boot" --arg outcome "$outcome" --argjson rc "$rc" --arg reason "$reason" \
+            --arg started "${_RS_STARTED_AT:-}" --arg finished "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        {ok:false, outcome:$outcome, exit_code:$rc, dry_run:false, error:$reason, reason:$reason, run_id:$run,
+         boot_id:(if $boot_id == "" then null else $boot_id end), boot:$boot, started_at:$started, finished_at:$finished,
+         source_snapshot:{}, plan:[], results:[], gates:[], fm:null,
+         result_counts:{restored:0,already_live:0,conflict:0,ambiguous:0,deferred:0,failed:0,not_restorable:0}}' > "$doc.tmp" \
+        && mv -f "$doc.tmp" "$doc" && cp "$doc" "$dir/last-run.json.tmp" && mv -f "$dir/last-run.json.tmp" "$dir/last-run.json" ) 2>/dev/null || true
+    chmod 600 "$dir/runs/${run_id}.json" "$dir/last-run.json" 2>/dev/null || true
+    return 0
+}
+
+_restore_lock_late() {
+    # Interactive run, confirmed: take the lock now. 0 = held (or no restore
+    # dir: carry on without one), 75 = another run holds it.
+    local json="$1" lock_rc=0
+    [[ "${_RS_LOCK_LATE:-false}" == true && "${_RS_HAVE_LOCK:-false}" != true ]] || return 0
+    _RS_LOCK_STOLEN=""
+    _restore_lock_acquire "$_RS_RUN_ID" "$_RS_LOCK_MAX_AGE" || lock_rc=$?
+    if (( lock_rc == 1 )); then _restore_lock_refusal "$json"; return 75; fi
+    if (( lock_rc == 0 )); then _RS_HAVE_LOCK=true; fi
+    return 0
 }
 
 _session_restore_core() {
@@ -20292,11 +20404,11 @@ _session_restore_core() {
                 echo "--from pre-boot reads the newest complete snapshot with live sessions captured before this boot (max age CCTRL_RESTORE_BOOT_MAX_AGE, default 7 days)."
                 echo "  --boot        boot-time restore: implies --yes and --from pre-boot; only sessions live before the boot; fleet manager first; waits on load/memory gates; 45 min cap; exit 0 complete, 75 partial or locked (read outcome)"
                 echo "  --background  re-run detached and return at once with the run id (required for --boot inside a session)"
-                echo "  --rerun       with --boot: ignore this boot's stored row results (the pinned snapshot is kept)"
+                echo "  --rerun       only with --boot (else exit 64): ignore this boot's stored row results (the pinned snapshot is kept)"
                 echo "  status        print the last restore run and whether this boot's run finished (read-only)"
                 echo "Rows launch in waves of CCTRL_RESTORE_WAVE_SIZE (2) while live cctrl sessions stay under CCTRL_RESTORE_MAX_ACTIVE (20); each wave waits for the gates: load1 <= CCTRL_RESTORE_MAX_LOAD1 (40),"
                 echo "  compressed memory <= CCTRL_RESTORE_MAX_COMPRESSED_PCT (15) % of RAM or not growing, swap-ins <= CCTRL_RESTORE_MAX_SWAPINS_PER_S (50), and the memory_pressure floor."
-                echo "  CCTRL_RESTORE_TIMEOUT caps the whole run (default 2700 s with --boot, none otherwise); rows still queued then are deferred."
+                echo "  CCTRL_RESTORE_TIMEOUT caps the whole run (default 2700 s with --boot, 900 s otherwise, 0 = none); rows still queued then are deferred."
                 echo "Exit codes: 0 complete (every candidate restored or already live; nothing skipped for a conflict or ambiguity; nothing deferred; or nothing to restore);"
                 echo "  1 at least one launch failed (the other rows were still attempted), or a resource-gate refusal before the first launch;"
                 echo "  75 partial or locked: finished, but a row was skipped as conflict or ambiguous, a row is still deferred (cap, --limit or timeout), or the fleet manager did not come up;"
@@ -20310,6 +20422,11 @@ _session_restore_core() {
     done
     # --boot is the approval for this one invocation (mdec-1114): --yes plus
     # the pre-boot snapshot. --stale-ok and --force-host are never implied.
+    if $rerun && ! $boot; then
+        $json && _restore_refusal_json 64 "--rerun only applies with --boot"
+        echo -e "${RED}--rerun only applies with --boot (it re-runs this boot's restore); a plain restore is just run again.${RESET}" >&2
+        return 64
+    fi
     if $boot; then
         assume_yes=true
         $from_set || from_mode="pre-boot"
@@ -20322,7 +20439,7 @@ _session_restore_core() {
     : "${_RS_TIMEOUT:=}"
     if [[ ! "$_RS_TIMEOUT" =~ ^[0-9]+$ ]]; then
         _RS_TIMEOUT="${CCTRL_RESTORE_TIMEOUT:-}"
-        [[ "$_RS_TIMEOUT" =~ ^[0-9]+$ ]] || { if $boot; then _RS_TIMEOUT=2700; else _RS_TIMEOUT=0; fi; }
+        [[ "$_RS_TIMEOUT" =~ ^[0-9]+$ ]] || { if $boot; then _RS_TIMEOUT=2700; else _RS_TIMEOUT=900; fi; }
     fi
     [[ -n "${_RS_RUN_ID:-}" ]] || _RS_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
     _RS_MAX_ATTEMPTS="${CCTRL_RESTORE_MAX_ATTEMPTS:-2}"; [[ "$_RS_MAX_ATTEMPTS" =~ ^[0-9]+$ ]] && (( _RS_MAX_ATTEMPTS >= 1 )) || _RS_MAX_ATTEMPTS=2
@@ -20338,9 +20455,8 @@ _session_restore_core() {
     host_id="$(_cctrl_host_id_read 2>&1)" || { host_id_err="${host_id:-data/host-id is missing}"; host_id=""; }
     _RS_HOST_ID="$host_id"
     if $boot; then
-        local boot_epoch_early
-        boot_epoch_early="$(_restore_boot_epoch)"
-        _RS_BOOT_ID="${boot_epoch_early:-unknown}"
+        _restore_boot_id_resolve
+        _RS_BOOT_ID="${_RR_BOOT_ID:-unknown}"; _RS_BOOT_ID_SRC="${_RR_BOOT_ID_SRC:-none}"
         _RS_STATE="$(_restore_state_file "$_RS_BOOT_ID")"
         # A finished boot restore has nothing left to do (unless --rerun).
         if ! $rerun && ! $dry_run && [[ -s "$_RS_STATE" ]] && [[ "$(jq -r '.final.outcome // empty' "$_RS_STATE" 2>/dev/null)" == complete ]]; then
@@ -20391,8 +20507,9 @@ _session_restore_core() {
     schema="$(jq -r '.schema_version // empty' "$snapshot_path" 2>/dev/null)"
     [[ "$schema" == 1 || "$schema" == 2 ]] || { $json && _restore_refusal_json 64 "unsupported snapshot schema" "$(jq -n --arg schema "$schema" '{schema:$schema}')"; return 64; }
     generated_at="$(jq -r '.generated_at // empty' "$snapshot_path")"
-    if $boot && [[ "$from_mode" == explicit ]]; then
-        # --boot never reads an old snapshot (D9), whichever way it was named.
+    if $boot && [[ "$from_mode" != pre-boot ]]; then
+        # --boot never reads an old snapshot (D9), whichever way it was named
+        # (--from latest and --from PATH alike; pre-boot has the cap built in).
         local boot_snap_epoch boot_cap="${CCTRL_RESTORE_BOOT_MAX_AGE:-604800}"
         [[ "$boot_cap" =~ ^[0-9]+$ ]] || boot_cap=604800
         boot_snap_epoch="$(_restore_iso_epoch "$generated_at")"
@@ -20465,7 +20582,10 @@ _session_restore_core() {
                 --argjson source "$(jq -c '{path, content_digest, selection, why, generated_at}' "$scratch/source.json")" || true
         fi
     fi
-    _restore_log run-start boot "$boot" source "$snapshot_path" selection "$from_mode" why "$source_why" lock_stolen "${_RS_LOCK_STOLEN:-}"
+    local boot_id_note=""
+    if [[ "${_RS_BOOT_ID_SRC:-}" == epoch ]]; then boot_id_note="kern.bootsessionuuid unavailable: the boot-time seconds key this boot"; fi
+    _restore_log run-start boot "$boot" source "$snapshot_path" selection "$from_mode" why "$source_why" lock_stolen "${_RS_LOCK_STOLEN:-}" \
+        boot_id "${_RS_BOOT_ID:-}" boot_id_source "${_RS_BOOT_ID_SRC:-}" boot_id_note "$boot_id_note"
     if [[ -n "${CCTRL_RESTORE_CATALOGUE_FILE:-}" ]]; then cp "$CCTRL_RESTORE_CATALOGUE_FILE" "$catalogue_file" || catalogue_rc=$?; else _task_list_json > "$catalogue_file" || catalogue_rc=$?; fi
     _snapshot_process_source "$process_file" || process_rc=$?
     if jq -e 'any((.tasks // .sessions // [])[]?; (.provider == "codex") or (.agent == "codex"))' "$snapshot_path" >/dev/null 2>&1; then
@@ -20573,6 +20693,11 @@ _session_restore_core() {
         answer="$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]')"
         [[ "$answer" == y || "$answer" == yes ]] || { _restore_finish "$scratch" "$json" "$dry_run" refused 0 "declined"; return $?; }
     fi
+    # Confirmed (or --yes): now this run is the one restore. An interactive
+    # run did not hold the lock while it waited at the prompt.
+    local late_rc=0
+    _restore_lock_late "$json" || late_rc=$?
+    if (( late_rc != 0 )); then _scratch_rm "$scratch"; return "$late_rc"; fi
 
     # Same memory rule as `cctrl start` (_res_pressure_reason): outside --boot
     # a box already under pressure is refused before the first launch (exit 1,
@@ -20623,7 +20748,20 @@ _session_restore_core() {
     local item i n
     if $boot; then
         local -a t_row=() t_att=() t_role=() t_kind=() t_agent=() t_last=()
-        local fm_claude=-1 fm_codex=-1 last
+        local fm_claude=-1 fm_codex=-1 last live_fm_claude="" live_fm_codex="" live_row live_agent live_last
+        # D6 looks at EVERY fleet-manager row of a runtime, including one that is
+        # already live: when the newest is live, every older row still to be
+        # restored is a conflict and is never launched.
+        while IFS= read -r live_row; do
+            [[ -n "$live_row" ]] || continue
+            _restore_row_role "$live_row"
+            [[ "$_RR_ROLE" == orchestrator && "$_RR_KIND" == fleet ]] || continue
+            live_agent="$(jq -r '.agent // .provider // ""' <<< "$live_row")"; live_last="$(jq -r '.last_active // ""' <<< "$live_row")"
+            case "$live_agent" in
+                codex) if [[ -z "$live_fm_codex" || "$live_last" > "$live_fm_codex" ]]; then live_fm_codex="${live_last:-0}"; fi ;;
+                *) if [[ -z "$live_fm_claude" || "$live_last" > "$live_fm_claude" ]]; then live_fm_claude="${live_last:-0}"; fi ;;
+            esac
+        done < <(jq -c '.rows[] | select(.disposition == "already-live")' "$plan_file")
         for item in ${todo[@]+"${todo[@]}"}; do
             t_att+=("${item%% *}"); row_file="${item#* }"; t_row+=("$row_file")
             _restore_row_role "$row_file"
@@ -20640,6 +20778,9 @@ _session_restore_core() {
                 *) if (( fm_claude < 0 )) || [[ "$last" > "${t_last[$fm_claude]}" ]]; then fm_claude=$i; fi ;;
             esac
         done
+        # A live fleet manager row at least as new as the newest candidate wins.
+        if (( fm_claude >= 0 )) && [[ -n "$live_fm_claude" && ! "${t_last[$fm_claude]}" > "$live_fm_claude" ]]; then fm_claude=-1; fi
+        if (( fm_codex >= 0 )) && [[ -n "$live_fm_codex" && ! "${t_last[$fm_codex]}" > "$live_fm_codex" ]]; then fm_codex=-1; fi
         local -a orch_q=() work_q=()
         for (( i = 0; i < n; i++ )); do
             if [[ "${t_role[$i]}" == orchestrator && "${t_kind[$i]}" == fleet ]]; then
@@ -20647,7 +20788,7 @@ _session_restore_core() {
                     fm_rows+=("${t_att[$i]} ${t_row[$i]}")
                 else
                     _RS_EXTRA_ATTENTION=$(( _RS_EXTRA_ATTENTION + 1 ))
-                    echo "Skipping restore of $(jq -r '.tmux_session // .provider_task_id' <<< "${t_row[$i]}"): a second fleet manager row for this runtime; a human decides" >&2
+                    echo "Skipping restore of $(jq -r '.tmux_session // .provider_task_id' <<< "${t_row[$i]}"): another fleet manager row for this runtime is newer or already live; a human decides" >&2
                     _restore_record_attempt "$scratch/attempts.jsonl" "${t_row[$i]}" skipped "second fleet manager row; human decides" "" "" "$_RR_ROLE" "fleet" "${t_att[$i]}" "" "" conflict
                     _restore_state_row "$(jq -r '.provider_task_id // ""' <<< "${t_row[$i]}")" skipped "${t_att[$i]}" ""
                 fi

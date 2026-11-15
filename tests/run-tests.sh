@@ -18217,7 +18217,7 @@ _restore_run() {
         CCTRL_RESTORE_GATE_SAMPLE="${CCTRL_RESTORE_GATE_SAMPLE:-0}" CCTRL_DATA_DIR="$dir/data" \
         CCTRL_RESTORE_MAX_ACTIVE="${CCTRL_RESTORE_MAX_ACTIVE:-10}" \
         CCTRL_RESTORE_WAVE_SIZE="${CCTRL_RESTORE_WAVE_SIZE:-2}" CCTRL_RESTORE_WAVE_PAUSE="${CCTRL_RESTORE_WAVE_PAUSE:-0}" \
-        "$ROOT/cctrl" session restore --from "${SR_FROM:-$dir/snapshots/latest.json}" "$@"
+        ${SR_WRAP:+$SR_WRAP} "$ROOT/cctrl" session restore --from "${SR_FROM:-$dir/snapshots/latest.json}" "$@"
 }
 
 _restore_spawn_count() { wc -l < "$1/launch.log" | tr -d ' '; }
@@ -19149,6 +19149,233 @@ test_restore_two_fm_rows_one_restored() {
     jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="skipped" and .evidence.attention=="conflict" and (.reason|contains("second fleet manager row")))' <<< "$out" >/dev/null \
         || fail "second fleet manager row not reported: $out"
     echo "ok: two fleet manager rows restore only the newest"
+}
+
+test_restore_fm_pick_counts_a_live_fleet_manager_row() {
+    # SF1 (D6): the newest fleet manager row is chosen over EVERY row of the runtime,
+    # live ones included. Newest live: the older row is a conflict and never launches.
+    local dir="$TMPDIR/restore-fm-live" out rc=0
+    _restore_boot_fixture "$dir"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.last_active="2026-08-05T09:00:00Z")' \
+        "$dir/snapshots/latest.json" > "$dir/snap.tmp" && mv "$dir/snap.tmp" "$dir/snapshots/latest.json"
+    printf '%s\n' '{"schema_version":1,"status":"available","observed_at":"2026-08-05T12:00:00Z","source_cursor":"p","processes":[{"pid":4242,"ppid":1,"started":"x","command":"claude --model m --resume conv-ddd-444 --chrome"}],"error":null}' > "$dir/process.json"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "an older fleet manager row beside a live newest one must be a conflict (75), got $rc: $out"
+    ! grep -q "conv-aaa-111" "$dir/launch.log" || fail "a second fleet manager was launched beside the live one: $(cat "$dir/launch.log")"
+    ! grep -q -- "--health-check-timeout" "$dir/launch.log" || fail "no row may take the fm phase: $(cat "$dir/launch.log")"
+    jq -e 'any(.results[]; .provider_task_id=="conv-aaa-111" and .result=="skipped" and .evidence.attention=="conflict")' <<< "$out" >/dev/null \
+        || fail "the older fleet manager row is not reported as a conflict: $out"
+    # --rerun after a normal first run: the newest is live now, the older row must stay down.
+    local dir2="$TMPDIR/restore-fm-live-rerun"
+    _restore_boot_fixture "$dir2"
+    jq '(.tasks[] | select(.provider_task_id=="conv-aaa-111") | .launch_flags) += {role:"orchestrator",orch_kind:"fleet"}
+        | (.tasks[] | select(.provider_task_id=="conv-aaa-111")) |= (.last_active="2026-08-05T09:00:00Z")' \
+        "$dir2/snapshots/latest.json" > "$dir2/snap.tmp" && mv "$dir2/snap.tmp" "$dir2/snapshots/latest.json"
+    _restore_boot_run "$dir2" --quiet >/dev/null 2>&1 || true
+    grep -q "conv-ddd-444" "$dir2/launch.log" || fail "the first run did not restore the newest fleet manager"
+    : > "$dir2/launch.log"
+    cp "$dir/process.json" "$dir2/process.json"
+    rc=0; out="$(_restore_boot_run "$dir2" --rerun --json 2>/dev/null)" || rc=$?
+    ! grep -q "conv-aaa-111" "$dir2/launch.log" || fail "--rerun launched the older fleet manager beside the live one: $(cat "$dir2/launch.log")"
+    echo "ok: a live newest fleet manager row makes the older rows conflicts"
+}
+
+test_restore_lock_from_before_the_boot_is_stale() {
+    # SF2: a lock made before this boot belongs to a run the reboot killed, even when its
+    # pid number now belongs to a live process.
+    local dir="$TMPDIR/restore-lock-preboot" out rc=0 holder now
+    _restore_boot_fixture "$dir"
+    now="$(date +%s)"
+    mkdir -p "$dir/data/restore/.restore.lock"
+    sleep 60 & holder=$!
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; printf '%s\n' "$(( now - 600 ))" > "$dir/data/restore/.restore.lock/created"
+    printf 'old-run\n' > "$dir/data/restore/.restore.lock/run_id"
+    out="$(CCTRL_FAKE_BOOTTIME=$(( now - 300 )) _restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || { kill "$holder" 2>/dev/null; fail "a pre-boot lock must be stolen (rc=$rc): $(jq -c '[.outcome,.error]' <<< "$out")"; }
+    grep -q 'made before this boot' "$dir/data/restore/restore.log" || { kill "$holder" 2>/dev/null; fail "the steal was not logged"; }
+    # _restore_busy ignores such a lock too, and a lock made after the boot still counts.
+    mkdir -p "$dir/data/restore/.restore.lock"
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; printf '%s\n' "$(( now - 600 ))" > "$dir/data/restore/.restore.lock/created"
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        export CCTRL_DATA_DIR="$dir/data"
+        CCTRL_FAKE_BOOTTIME=$(( now - 300 )) _restore_busy && fail "a pre-boot lock still froze latest.json"
+        CCTRL_FAKE_BOOTTIME=$(( now - 900 )) _restore_busy || fail "a live lock made after the boot must still count as busy"
+    ) || { kill "$holder" 2>/dev/null; fail "restore_busy check"; }
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    echo "ok: a lock from before the boot is stale whatever holds its pid"
+}
+
+test_restore_boot_from_latest_obeys_the_age_cap() {
+    # SF3 (D9): --boot refuses an old snapshot whichever way --from names it.
+    local dir="$TMPDIR/restore-boot-latest-old" out rc=0 snaps
+    _restore_boot_fixture "$dir"
+    snaps="$dir/data/snapshots"; mkdir -p "$snaps"
+    jq --arg t "$(_restore_iso_ago 1800)" '.generated_at=$t' "$dir/snapshots/latest.json" > "$snaps/latest.json"
+    out="$(SR_FROM=latest CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 1)" _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 69 && ! -s "$dir/launch.log" ]] || fail "--boot --from latest over the cap must give 69 and launch nothing (rc=$rc): $(jq -c .error <<< "$out")"
+    rc=0; out="$(SR_FROM=latest CCTRL_RESTORE_BOOT_MAX_AGE=999999999 CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 1)" _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "inside the cap --from latest must restore (rc=$rc)"
+    echo "ok: --boot --from latest obeys CCTRL_RESTORE_BOOT_MAX_AGE"
+}
+
+test_restore_nonboot_gate_wait_is_bounded() {
+    # SF4: a plain restore with no CCTRL_RESTORE_TIMEOUT still ends (default 900 s on the
+    # virtual clock), defers the rows and reports partial.
+    local dir="$TMPDIR/restore-nonboot-gate" out rc=0
+    _restore_fixture "$dir"
+    _restore_sleep_stub "$dir" 'echo x >> "'"$dir"'/sleeps"; if [[ "$(wc -l < "'"$dir"'/sleeps")" -gt 400 ]]; then kill -9 $PPID; fi; exit 0'
+    out="$(CCTRL_FAKE_LOAD1=90 _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a stuck gate outside --boot must end partial (75), got $rc"
+    [[ ! -s "$dir/launch.log" ]] || fail "nothing may launch while the gate holds"
+    jq -e '.outcome == "partial" and .result_counts.deferred == 4' <<< "$out" >/dev/null || fail "deferred rows not reported: $(jq -c '[.outcome,.result_counts]' <<< "$out")"
+    [[ ! -d "$dir/data/restore/.restore.lock" ]] || fail "the lock was left behind"
+    echo "ok: a plain restore's gate wait is bounded by a default timeout"
+}
+
+test_restore_interactive_run_locks_only_after_confirmation() {
+    # SF4: a human at the [y/N] prompt holds no lock (it would freeze latest.json and
+    # block a boot run); the lock is taken once they answer yes.
+    local dir="$TMPDIR/restore-prompt-lock" rc=0
+    _restore_fixture "$dir"
+    cat > "$dir/pty.py" <<'PY'
+import os, pty, select, sys, time
+lock, report, answer = sys.argv[1], sys.argv[2], sys.argv[3]
+argv = sys.argv[4:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+buf = b""
+seen = None
+deadline = time.time() + 90
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if r:
+        try:
+            d = os.read(fd, 4096)
+        except OSError:
+            break
+        if not d:
+            break
+        buf += d
+        if seen is None and b"Proceed with restore?" in buf:
+            seen = os.path.isdir(lock)
+            os.write(fd, (answer + "\n").encode())
+_, st = os.waitpid(pid, 0)
+open(report, "w").write("lock_at_prompt=%s\n" % seen)
+sys.exit(os.WEXITSTATUS(st))
+PY
+    SR_WRAP="python3 -I $dir/pty.py $dir/data/restore/.restore.lock $dir/report y" _restore_run "$dir" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "confirmed interactive run did not restore (rc=$rc): $(cat "$dir/launch.log")"
+    grep -q 'lock_at_prompt=False' "$dir/report" || fail "the lock was held while waiting at the prompt: $(cat "$dir/report")"
+    [[ ! -d "$dir/data/restore/.restore.lock" ]] || fail "the lock was left behind"
+    echo "ok: an interactive restore takes the lock only after the answer"
+}
+
+test_restore_boot_id_is_the_session_uuid() {
+    # SF5: the boot id is kern.bootsessionuuid, so a clock correction (a new boot-time second)
+    # in the middle of a boot does not lose the boot state.
+    local dir="$TMPDIR/restore-boot-uuid" out rc=0
+    _restore_boot_fixture "$dir"
+    CCTRL_FAKE_BOOT_UUID=11111111-2222-3333-4444-555555555555 CCTRL_FAKE_BOOTTIME=1780000000 _restore_run "$dir" --boot --quiet >/dev/null 2>&1 || fail "first run failed"
+    [[ -s "$dir/data/restore/boot-11111111-2222-3333-4444-555555555555.json" ]] || fail "the state is not keyed on the session uuid: $(ls "$dir/data/restore")"
+    : > "$dir/launch.log"
+    out="$(CCTRL_FAKE_BOOT_UUID=11111111-2222-3333-4444-555555555555 CCTRL_FAKE_BOOTTIME=1780000001 _restore_run "$dir" --boot --json 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 && ! -s "$dir/launch.log" ]] || fail "a boot-time step lost the state: a second run launched (rc=$rc): $(cat "$dir/launch.log")"
+    assert_contains "$out" "already completed for boot 11111111-2222-3333-4444-555555555555"
+    # No uuid: fall back to the seconds, and the run log says so.
+    local dir2="$TMPDIR/restore-boot-uuid-none"
+    _restore_boot_fixture "$dir2"
+    CCTRL_FAKE_BOOT_UUID= CCTRL_FAKE_BOOTTIME=1780000000 _restore_run "$dir2" --boot --quiet >/dev/null 2>&1 || fail "fallback run failed"
+    [[ -s "$dir2/data/restore/boot-1780000000.json" ]] || fail "no fallback state file: $(ls "$dir2/data/restore")"
+    grep -q '"boot_id_source":"epoch"' "$dir2/data/restore/restore.log" || fail "the fallback is not in the run log"
+    echo "ok: the boot id is the boot session uuid, with a logged fallback"
+}
+
+test_restore_fm_failing_twice_is_partial_not_failed() {
+    # N1 (D4): the fleet manager failing twice still restores the rest: exit 75, partial.
+    local dir="$TMPDIR/restore-fm-fails" out rc=0
+    _restore_boot_fixture "$dir"
+    out="$(CCTRL_RESTORE_GATE_POLL=1 CCTRL_RESTORE_FAKE_FAIL="conv-ddd-444:5" _restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 ]] || fail "a fleet manager that fails twice must give 75, got $rc"
+    [[ "$(grep -c -- '-r conv-ddd-444 ' "$dir/launch.log")" -eq 2 ]] || fail "the fleet manager is tried twice: $(cat "$dir/launch.log")"
+    [[ "$(grep -vc -- 'conv-ddd-444' "$dir/launch.log")" -eq 3 ]] || fail "the other rows must still launch: $(cat "$dir/launch.log")"
+    jq -e '.outcome == "partial" and any(.results[]; .provider_task_id=="conv-ddd-444" and .result=="failed" and .phase=="fm") and .fm.result=="failed"' <<< "$out" >/dev/null \
+        || fail "the fleet manager failure is not named: $(jq -c '[.outcome,.fm]' <<< "$out")"
+    echo "ok: a fleet manager that fails twice leaves the run partial"
+}
+
+test_health_check_boot_unrecognized_picker_needs_human() {
+    # N2: under --boot only the exact D7 picker auto-answers; the generic preselected-Enter
+    # rule must not fire for an unrecognized picker.
+    local out
+    out="$(
+        source "$ROOT/lib/health-check-patterns.sh"
+        _hc_patterns_for_agent claude
+        for i in "${!HC_LABEL[@]}"; do [[ "${HC_LABEL[$i]}" == conversation-picker ]] && printf 'plain=%s\n' "${HC_ACTION[$i]}"; done
+        CCTRL_HC_AUTO_RESUME_SUMMARY=1 _hc_patterns_for_agent claude
+        for i in "${!HC_LABEL[@]}"; do [[ "${HC_LABEL[$i]}" == conversation-picker ]] && printf 'boot=%s\n' "${HC_ACTION[$i]}"; done
+        true
+    )"
+    assert_contains "$out" "plain=auto-dismiss"
+    assert_contains "$out" "boot=needs-human"
+    echo "ok: under --boot an unrecognized picker ends needs-human"
+}
+
+test_restore_boot_refuses_when_the_lock_cannot_be_taken() {
+    # N3: --boot never runs unlocked.
+    local dir="$TMPDIR/restore-boot-nolock" out rc=0
+    _restore_boot_fixture "$dir"
+    mkdir -p "$dir/data"; : > "$dir/data/restore"
+    out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 1 && ! -s "$dir/launch.log" ]] || fail "--boot without a lock must refuse with 1 and launch nothing (rc=$rc): $out"
+    jq -e '.ok == false and (.error | contains("lock"))' <<< "$out" >/dev/null || fail "refusal reason missing: $out"
+    echo "ok: --boot refuses to run without the lock"
+}
+
+test_restore_health_mark_only_marks_its_own_record() {
+    # N4: the pre-launch mark touches a record only when its provider_task_id is the row's resume id.
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        FAKE_STATUS=ready; FAKE_ID=other-conv
+        _session_metadata_field() { case "$2" in health_status) printf '%s' "$FAKE_STATUS" ;; provider_task_id) printf '%s' "$FAKE_ID" ;; esac; return 0; }
+        _session_update_metadata_field() { FAKE_STATUS="$3"; return 0; }
+        _restore_health_mark TMUX--x conv-mine
+        [[ "$FAKE_STATUS" == ready && "$_RR_HEALTH_MARKED" == false ]] || fail "a record of another conversation was marked or trusted"
+        FAKE_ID=conv-mine
+        _restore_health_mark TMUX--x conv-mine
+        [[ "$FAKE_STATUS" == pending-launch && "$_RR_HEALTH_MARKED" == true ]] || fail "the row's own record was not marked"
+    ) || fail "health mark ownership"
+    echo "ok: the health mark only touches the row's own conversation record"
+}
+
+test_restore_rerun_needs_boot_and_early_failures_are_visible() {
+    # N5: --rerun without --boot is 64; a run that ends before it writes a run document
+    # (here a 69 refusal) is visible to `restore status`.
+    local dir="$TMPDIR/restore-early" out rc=0 st snaps
+    _restore_boot_fixture "$dir"
+    out="$(_restore_run "$dir" --yes --rerun 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 && ! -s "$dir/launch.log" ]] || fail "--rerun without --boot must give 64 (rc=$rc)"
+    assert_contains "$out" "--rerun only applies with --boot"
+    snaps="$dir/data/snapshots"; mkdir -p "$snaps"
+    jq --arg t "$(_restore_iso_ago 2400)" '.generated_at=$t' "$dir/snapshots/latest.json" > "$snaps/latest.json"
+    rc=0; CCTRL_RESTORE_RUN_ID=early-run-1 SR_FROM=latest CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 1)" _restore_run "$dir" --boot --quiet >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 69 ]] || fail "setup: expected the 69 refusal, got $rc"
+    st="$(CCTRL_DATA_DIR="$dir/data" CCTRL_FAKE_BOOTTIME="$(_restore_epoch_ago 1)" "$ROOT/cctrl" session restore status --json)" || fail "status failed"
+    jq -e '.found == true and .run_id == "early-run-1" and .outcome == "refused" and .exit_code == 69' <<< "$st" >/dev/null || fail "status does not show the refused run: $st"
+    echo "ok: --rerun needs --boot; a run refused early is visible to status"
+}
+
+test_restore_auto_resume_summary_is_not_exported() {
+    # N6: the variable is a plain variable in the launch subshell, so a tmux server started
+    # from it never inherits it.
+    ! grep -n 'export CCTRL_HC_AUTO_RESUME_SUMMARY' "$ROOT/cctrl" || fail "CCTRL_HC_AUTO_RESUME_SUMMARY is exported"
+    local dir="$TMPDIR/restore-hc-env"
+    _restore_boot_fixture "$dir"
+    _restore_boot_run "$dir" --quiet >/dev/null 2>&1 || fail "boot restore failed"
+    assert_contains "$(head -n 1 "$dir/launch.log.env")" "CCTRL_HC_AUTO_RESUME_SUMMARY=[1]"
+    echo "ok: the boot picker switch is not exported"
 }
 
 _restore_many_fixture() { # dir workers: boot fixture with N live workers plus the fleet manager

@@ -134,6 +134,12 @@ _hc_patterns_for_agent() {
                     if [[ "${HC_LABEL[$_hc_i]}" == "resume-summary" ]]; then
                         HC_ACTION[$_hc_i]="auto-select"
                         HC_KEYS[$_hc_i]='1\. Resume from summary'
+                    elif [[ "${HC_LABEL[$_hc_i]}" == "conversation-picker" ]]; then
+                        # Only the exact D7 picker auto-answers. A picker this table does
+                        # not know must not get the generic "Enter on the preselected
+                        # option" under --boot: it ends needs-human.
+                        HC_ACTION[$_hc_i]="needs-human"
+                        HC_HINT[$_hc_i]="an unrecognized resume picker is waiting during a boot restore; attach and choose (nothing is pressed unattended)"
                     fi
                 done
             fi
