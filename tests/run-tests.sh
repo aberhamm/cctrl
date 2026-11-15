@@ -19439,6 +19439,68 @@ test_restore_lock_staleness_follows_the_boot_id() {
     echo "ok: lock staleness follows the boot id"
 }
 
+test_restore_lock_judged_by_holders_max_age() {
+    # zv3_g / zv3_h: a live holder within ITS OWN recorded max age is never stolen, by a
+    # non-boot --yes run or by the primary-down early record. An old lock without the field
+    # falls back to 3300 s.
+    local dir="$TMPDIR/restore-holder-age" out rc=0 holder now bid
+    _restore_boot_fixture "$dir"
+    now="$(date +%s)"; bid=bbbbbbbb-0000-0000-0000-000000000002
+    sleep 60 & holder=$!
+    mkdir -p "$dir/data/restore/.restore.lock"
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; printf '%s\n' "$(( now - 1600 ))" > "$dir/data/restore/.restore.lock/created"
+    printf 'boot-run\n' > "$dir/data/restore/.restore.lock/run_id"; printf '%s\n' "$bid" > "$dir/data/restore/.restore.lock/boot_id"
+    printf '3300\n' > "$dir/data/restore/.restore.lock/max_age"
+    out="$(CCTRL_FAKE_BOOT_UUID=$bid CCTRL_FAKE_BOOTTIME=$(( now - 5000 )) _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 && ! -s "$dir/launch.log" && -d "$dir/data/restore/.restore.lock" ]] || { kill "$holder" 2>/dev/null; fail "zv3_h: a non-boot --yes run stole a live boot lock (rc=$rc)"; }
+    # Same lock without the max_age field: the 3300 s fallback still protects it.
+    rm -f "$dir/data/restore/.restore.lock/max_age"
+    rc=0; out="$(CCTRL_FAKE_BOOT_UUID=$bid CCTRL_FAKE_BOOTTIME=$(( now - 5000 )) _restore_run "$dir" --yes --json 2>/dev/null)" || rc=$?
+    [[ "$rc" -eq 75 && ! -s "$dir/launch.log" ]] || { kill "$holder" 2>/dev/null; fail "a lock without max_age was stolen inside the fallback (rc=$rc)"; }
+    # zv3_g: primary tmux down, live holder: exit 69, nothing written, lock untouched.
+    cat > "$dir/bin/tmux" <<'SH'
+#!/usr/bin/env bash
+exit 1
+SH
+    chmod +x "$dir/bin/tmux"
+    printf '3300\n' > "$dir/data/restore/.restore.lock/max_age"
+    rm -f "$dir/data/restore/last-run.json"
+    rc=0; out="$(CCTRL_TMUX_SERVER="$dir/dead.sock" CCTRL_FAKE_BOOT_UUID=$bid CCTRL_FAKE_BOOTTIME=$(( now - 5000 )) _restore_run "$dir" --boot --json 2>/dev/null)" || rc=$?
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    [[ "$rc" -eq 69 ]] || fail "zv3_g: primary down must still exit 69 (rc=$rc)"
+    [[ -d "$dir/data/restore/.restore.lock" && "$(cat "$dir/data/restore/.restore.lock/run_id")" == boot-run ]] || fail "zv3_g: the live holder's lock was taken or removed"
+    [[ ! -e "$dir/data/restore/last-run.json" ]] || fail "zv3_g: the primary-down path wrote last-run.json over a live run"
+    # The lock records the taker's max age.
+    local dir3="$TMPDIR/restore-lock-maxage-written"
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        export CCTRL_DATA_DIR="$dir3/data"
+        _restore_lock_acquire r1 3300 || exit 3
+        [[ "$(cat "$dir3/data/restore/.restore.lock/max_age")" == 3300 ]] || exit 4
+    ) || fail "the lock does not record its max age (exit $?)"
+    echo "ok: lock staleness is judged by the holder's recorded max age"
+}
+
+test_restore_status_current_run_from_lock() {
+    # N-2: boot run "running" always comes with current_run (from the live lock); without a
+    # live holder it is "unfinished".
+    local dir="$TMPDIR/restore-status-cur" out holder bid=bbbbbbbb-0000-0000-0000-000000000002
+    _restore_fixture "$dir"
+    mkdir -p "$dir/data/restore/.restore.lock"
+    printf '%s\n' '{"run_id":"old","outcome":"complete","exit_code":0,"boot":true,"started_at":"2026-11-01T01:00:00Z","finished_at":"2026-11-01T01:05:00Z","result_counts":{},"results":[],"source_snapshot":{}}' > "$dir/data/restore/last-run.json"
+    printf '{}\n' > "$dir/data/restore/boot-$bid.json"
+    sleep 60 & holder=$!
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; date +%s > "$dir/data/restore/.restore.lock/created"
+    printf 'cur\n' > "$dir/data/restore/.restore.lock/run_id"; printf '2026-11-15T10:00:00Z\n' > "$dir/data/restore/.restore.lock/started_at"
+    printf '%s\n' "$bid" > "$dir/data/restore/.restore.lock/boot_id"; printf '3300\n' > "$dir/data/restore/.restore.lock/max_age"
+    out="$(CCTRL_FAKE_BOOT_UUID=$bid CCTRL_DATA_DIR="$dir/data" "$ROOT/cctrl" session restore status --json 2>&1)"
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    jq -e --argjson p "$holder" '.boot_run == "running" and .current_run.pid == $p and .current_run.boot_id == "'"$bid"'" and .current_run.max_age_seconds == 3300' <<< "$out" >/dev/null || fail "live lock: current_run incomplete: $out"
+    out="$(CCTRL_FAKE_BOOT_UUID=$bid CCTRL_DATA_DIR="$dir/data" "$ROOT/cctrl" session restore status --json 2>&1)"
+    jq -e '.boot_run == "unfinished" and .current_run == null' <<< "$out" >/dev/null || fail "dead holder: must not be running with null current_run: $out"
+    echo "ok: status never shows running with a null current_run"
+}
+
 test_restore_boot_id_is_the_session_uuid() {
     # SF5: the boot id is kern.bootsessionuuid, so a clock correction (a new boot-time second)
     # in the middle of a boot does not lose the boot state.

@@ -19185,7 +19185,7 @@ _restore_busy() {
         # A lock made before this boot began belongs to a run the reboot killed,
         # whatever process now holds its pid number.
         if _restore_lock_pre_boot "$lock" "$created"; then :
-        elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && (( now - created <= max_age )); then return 0; fi
+        elif [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && (( now - created <= $(_restore_lock_holder_max_age "$lock") )); then return 0; fi
     fi
     boot="$(_restore_boot_id)"
     if [[ -n "$boot" ]]; then
@@ -19532,8 +19532,23 @@ _restore_lock_pre_boot() { # lock_dir created: 0 when the lock was made before t
     [[ "$created" =~ ^[0-9]+$ && "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch ))
 }
 
+_restore_lock_holder_max_age() { # lock_dir: the max age the lock's holder recorded (largest cap, 3300 s, for a lock without one)
+    local v
+    v="$(cat "$1/max_age" 2>/dev/null || true)"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then printf '%s' "$v"; else printf '3300'; fi
+}
+
+_restore_lock_live() { # lock_dir: 0 when a live run holds it (pid alive, this boot, within the holder's own max age)
+    local dir="$1" pid created now
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"; created="$(cat "$dir/created" 2>/dev/null || true)"; now="$(date +%s)"
+    [[ "$pid" =~ ^[0-9]+$ && "$created" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    _restore_lock_pre_boot "$dir" "$created" && return 1
+    (( now - created <= $(_restore_lock_holder_max_age "$dir") ))
+}
+
 _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by another run, 2 = no restore dir
-    local run_id="$1" max_age="$2" dir attempt now created pid age stale why=""
+    local run_id="$1" max_age="$2" dir attempt now created pid age stale why="" holder_max
     dir="$(_restore_lock_dir)"
     _restore_dir_init || return 2
     for attempt in 1 2; do
@@ -19542,6 +19557,7 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
             printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
             printf '%s\n' "$run_id" > "$dir/run_id" 2>/dev/null || true
             date -u +%Y-%m-%dT%H:%M:%SZ > "$dir/started_at" 2>/dev/null || true
+            printf '%s\n' "$max_age" > "$dir/max_age" 2>/dev/null || true
             _restore_boot_id_resolve
             printf '%s\n' "$_RR_BOOT_ID" > "$dir/boot_id" 2>/dev/null || true
             return 0
@@ -19554,9 +19570,12 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
         fi
         age=$(( now - created ))
         pid="$(cat "$dir/pid" 2>/dev/null || true)"
+        # Judge by the HOLDER's recorded max age, never the caller's: a boot
+        # run holds its lock longer than a non-boot run would.
+        holder_max="$(_restore_lock_holder_max_age "$dir")"
         stale=0
         if _restore_lock_pre_boot "$dir" "$created"; then stale=1; why=", made before this boot"
-        elif (( age > max_age )); then stale=1
+        elif (( age > holder_max )); then stale=1
         elif [[ -z "$pid" ]]; then (( age >= 5 )) && stale=1
         elif ! kill -0 "$pid" 2>/dev/null; then stale=1
         fi
@@ -19564,7 +19583,7 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
         # Only one run can move a stale lock away; the loser retries mkdir.
         if mv "$dir" "$dir.stale.$$" 2>/dev/null; then
             _RS_LOCK_STOLEN="pid ${pid:-none}, age ${age}s${why}"
-            rm -f "$dir.stale.$$/pid" "$dir.stale.$$/created" "$dir.stale.$$/run_id" "$dir.stale.$$/boot_id" "$dir.stale.$$/started_at" 2>/dev/null || true
+            rm -f "$dir.stale.$$/pid" "$dir.stale.$$/created" "$dir.stale.$$/run_id" "$dir.stale.$$/boot_id" "$dir.stale.$$/started_at" "$dir.stale.$$/max_age" 2>/dev/null || true
             rmdir "$dir.stale.$$" 2>/dev/null || true
         fi
     done
@@ -19575,7 +19594,7 @@ _restore_lock_release() {
     local dir
     dir="$(_restore_lock_dir)"
     [[ "$(cat "$dir/pid" 2>/dev/null || true)" == "$$" ]] || return 0
-    rm -f "$dir/pid" "$dir/created" "$dir/run_id" "$dir/boot_id" "$dir/started_at" 2>/dev/null || true
+    rm -f "$dir/pid" "$dir/created" "$dir/run_id" "$dir/boot_id" "$dir/started_at" "$dir/max_age" 2>/dev/null || true
     rmdir "$dir" 2>/dev/null || true
     return 0
 }
@@ -20208,11 +20227,18 @@ _restore_status() {
     # last-run.json: that file still belongs to an earlier run until this one ends.
     local cur_run="" cur_started="" lockd
     lockd="$(_restore_lock_dir)"
-    if [[ -d "$lockd" ]] && _restore_busy; then
+    local cur_pid="" cur_boot="" cur_max=""
+    if [[ -d "$lockd" ]] && _restore_lock_live "$lockd"; then
         cur_run="$(cat "$lockd/run_id" 2>/dev/null || true)"; cur_started="$(cat "$lockd/started_at" 2>/dev/null || true)"
+        cur_pid="$(cat "$lockd/pid" 2>/dev/null || true)"; cur_boot="$(cat "$lockd/boot_id" 2>/dev/null || true)"
+        cur_max="$(_restore_lock_holder_max_age "$lockd")"
+        [[ -n "$cur_run$cur_started" ]] || cur_run="unknown"
     fi
+    # "running" means a live run holds the lock; a state file with no final
+    # outcome and no live holder is an unfinished (crashed or between) run.
+    if [[ "$boot_state" == running && -z "$cur_run$cur_started" ]]; then boot_state="unfinished"; fi
     local cur_json
-    cur_json="$(jq -n --arg run "$cur_run" --arg started "$cur_started" 'if $run == "" and $started == "" then null else {run_id:(if $run == "" then null else $run end), started_at:(if $started == "" then null else $started end)} end')"
+    cur_json="$(jq -n --arg run "$cur_run" --arg started "$cur_started" --arg pid "$cur_pid" --arg boot "$cur_boot" --arg max "$cur_max" 'if $run == "" and $started == "" then null else {run_id:(if $run == "" then null else $run end), started_at:(if $started == "" then null else $started end), pid:(if $pid == "" then null else ($pid|tonumber? // null) end), boot_id:(if $boot == "" then null else $boot end), max_age_seconds:(if $max == "" then null else ($max|tonumber? // null) end)} end')"
     if [[ ! -s "$last" ]] || ! jq -e 'type == "object"' "$last" >/dev/null 2>&1; then
         if $json; then
             jq -n --arg boot "$boot_epoch" --arg state "$boot_state" --argjson cur "$cur_json" '{found:false, boot_id:(if $boot == "" then null else $boot end), boot_run:$state, current_run:$cur}'

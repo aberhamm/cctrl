@@ -97,9 +97,11 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   same boot never restores a row twice). Never run a bare `--yes`, and never
   add `--stale-ok` or `--force-host`: those are human
   decisions. `--dry-run` is always safe. If `status` shows the boot run
-  **running**, wait and read it again; check how old it is (`current_run.started_at` in
+  **running** (a live run holds the lock; `current_run` then carries its pid,
+  `started_at`, boot id and `max_age_seconds`), wait and read it again; check how old it is (`current_run.started_at` in
   `--json`; the top-level `started_at` belongs to the previous finished run): past the 45 minute cap plus 10 minutes it is stale, and a
-  `--boot --background` re-run takes over. If it shows **failed** (or the last
+  `--boot --background` re-run takes over. **unfinished** means a state file with no
+  live holder (a crashed run): treat it like partial. If it shows **failed** (or the last
   run is a refusal), report it to the human with the reason `status` prints;
   do not loop re-runs. Restore exit `75` is **partial** or
   **locked**, not a refusal (read `outcome` in `--json`: another restore holds
