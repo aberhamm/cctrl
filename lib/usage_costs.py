@@ -11,7 +11,9 @@ from __future__ import annotations
 import bisect
 import glob
 import json
+import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -72,7 +74,11 @@ ANTHROPIC_PRICING = {
 # USD per 1M tokens, Standard tier (short context <=272K / long >272K).
 # Source: https://developers.openai.com/api/docs/pricing
 # (platform.openai.com/docs/pricing redirects there), fetched 2026-11-16.
-# The page says GPT-5.6 Sol promotional pricing runs until 2026-11-30.
+# The page says GPT-5.6 Sol promotional pricing runs until 2026-11-30; the
+# gpt-5.6-sol row below is a flat rate with no date logic. RE-CHECK the page
+# after 2026-11-30 and update the row (and this note) if the rate changed.
+# Rows named in ANCHORED_PRICING match the exact name or a dated snapshot
+# suffix (-YYYY-MM-DD) only, so unlisted gpt-5.x names fall to LiteLLM/fallback.
 # Models not on that page (codex-auto-review, gpt-daybreak-blue-latest) are
 # deliberately absent so they fall through to LiteLLM or the counted fallback.
 # Keep specific aliases before broader prefixes.
@@ -100,8 +106,23 @@ OPENAI_PRICING = [
     ("codex-mini-latest", {"input": 1.50, "cached": 0.375, "output": 6.0}),
     ("gpt-5-mini", {"input": 0.25, "cached": 0.025, "output": 2.0}),
     ("gpt-5-nano", {"input": 0.05, "cached": 0.005, "output": 0.40}),
+    ("gpt-5.2-pro", {"input": 21.0, "cached": None, "output": 168.0}),
+    ("gpt-5.2", {"input": 1.75, "cached": 0.175, "output": 14.0}),
+    ("gpt-5-pro", {"input": 15.0, "cached": None, "output": 120.0}),
     ("gpt-5", {"input": 1.25, "cached": 0.125, "output": 10.0}),
 ]
+
+ANCHORED_PRICING = {"gpt-5", "gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5-pro", "gpt-5.2-pro"}
+_SNAPSHOT_RE = re.compile(r"^-\d{4}-\d{2}-\d{2}$")
+
+
+def _official_match(m, prefix):
+    if not m.startswith(prefix):
+        return False
+    if prefix in ANCHORED_PRICING:
+        rest = m[len(prefix):]
+        return rest == "" or bool(_SNAPSHOT_RE.match(rest))
+    return True
 
 
 def parse_ts(value):
@@ -204,6 +225,9 @@ def load_litellm_prices(path=None):
                     rates["long_output"] = float(e["output_cost_per_token_above_272k_tokens"]) * 1e6
                     lc = e.get("cache_read_input_token_cost_above_272k_tokens")
                     rates["long_cached"] = None if lc is None else float(lc) * 1e6
+                vals = [v for v in rates.values() if v is not None]
+                if any(not math.isfinite(v) or v < 0 for v in vals):
+                    continue
                 out[str(name).lower()] = rates
             except (KeyError, TypeError, ValueError):
                 continue  # skip one bad row, keep the rest
@@ -227,7 +251,7 @@ def openai_rates_and_source(model_name, raw_input_tokens):
     """Return (rates, source) with source in official|litellm|fallback."""
     m = (model_name or "").lower()
     for prefix, rates in OPENAI_PRICING:
-        if m.startswith(prefix):
+        if _official_match(m, prefix):
             return _tier_rates(rates, raw_input_tokens), "official"
     lite = load_litellm_prices()
     if m.startswith("openai/"):
@@ -523,8 +547,8 @@ class Aggregates:
     def record(self, rec):
         usage = rec["usage"]
         cost, is_fallback = estimate_cost_ex(rec["agent"], rec["model"], usage)
-        if is_fallback:
-            tokens = usage["input"] + usage["output"] + usage["cache_write"] + usage["cache_read"]
+        tokens = usage["input"] + usage["output"] + usage["cache_write"] + usage["cache_read"]
+        if is_fallback and tokens > 0 and rec["model"] != "<synthetic>":
             fb = self.fallback
             fb["tokens"] += tokens
             fb["cost"] += cost
@@ -630,6 +654,8 @@ def costs_json(agg, num_periods):
 
 def print_fallback(fb):
     if not fb["turns"]:
+        print("\033[1mPriced at fallback rate\033[0m: none (0 tokens, $0.00, 0 turns)")
+        print()
         return
     print("\033[1mPriced at fallback rate\033[0m \033[2m(model not in any price table; cost is a guess)\033[0m")
     print(f"  {fmt(fb['tokens'])} tokens  {usd(fb['cost'])}  {fb['turns']} turns")

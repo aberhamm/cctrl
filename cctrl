@@ -3426,6 +3426,10 @@ cmd_costs() {
         case "$arg" in
             --json) fmt_arg=json ;;
             --refresh-prices)
+                if [[ ! -e "$SCRIPT_DIR/.git" ]]; then
+                    echo "cctrl costs --refresh-prices only works in a git checkout of cctrl; this install ($SCRIPT_DIR) is not one. Run it from a checkout and re-release." >&2
+                    return 1
+                fi
                 python3 "$SCRIPT_DIR/lib/refresh_prices.py"
                 return $?
                 ;;
@@ -23626,7 +23630,7 @@ cmd_help() {
     echo -e "${BOLD}Usage Tracking${RESET}"
     echo "  cctrl usage [weeks]     Claude/Codex rate limits + billing week breakdown (default: 2)"
     echo "  cctrl costs [range] [project] [--json]  Token usage and estimated API-equivalent cost; reports fallback-priced usage"
-    echo "  cctrl costs --refresh-prices  Refresh share/litellm-openai-prices.json from LiteLLM's public list (network)"
+    echo "  cctrl costs --refresh-prices  Refresh share/litellm-openai-prices.json from LiteLLM's public list (network; git checkout only)"
     echo "  cctrl codex capabilities [--json]  Inspect desktop App Server support (read-only)"
     echo "    ranges: --today, --week, --month, --all [project-filter]"
     echo "  cctrl log [count]       Show profile switch history"
