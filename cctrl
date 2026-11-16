@@ -21344,6 +21344,17 @@ _session_autoheal() {
 # closest live names (same name with or without a --N suffix, either prefix
 # direction, or the same name without the TMUX-- prefix), and a one-line hint.
 # Writes to stderr; the caller returns non-zero.
+# printf %q for a remote-shell re-parse. %q leaves a leading "=" (zsh command
+# path expansion) and, on bash 3.2, a leading "~" unescaped; backslash them.
+_remote_quote() {
+    local q
+    q="$(printf '%q' "$1")"
+    case "$q" in
+        =*|~*) q="\\$q" ;;
+    esac
+    printf '%s' "$q"
+}
+
 _session_attach_not_found() {
     local target="$1"; shift
     local server_desc="the default tmux server"
@@ -21357,7 +21368,7 @@ _session_attach_not_found() {
     for s in "$@"; do
         _tmux_is_placeholder "$s" && continue
         sbase="${s%--[0-9]*}"; sbare="${s#TMUX--}"; sbare="${sbare%--[0-9]*}"
-        if [[ "$s" == "$target"* || "$target" == "$s"* || "$sbase" == "$base" || ( -n "$tbare" && "$sbare" == "$tbare" ) ]]; then
+        if [[ "$s" == *"$target"* || "$target" == "$s"* || "$sbase" == "$base" || ( -n "$tbare" && "$sbare" == "$tbare" ) ]]; then
             close+=("$s")
         fi
     done
@@ -21444,18 +21455,18 @@ _session_attach() {
         _tmux_exec attach-session -t "=$attach_target"
     fi
 
-    # Partial match
+    # Partial matches (offered as suggestions or a picker, never auto-attached)
     local -a matches=()
     for s in "${sessions[@]}"; do
         _tmux_is_placeholder "$s" && continue
         [[ "$s" == *"$attach_target"* ]] && matches+=("$s")
     done
 
-    if [[ ${#matches[@]} -eq 0 ]]; then
+    if [[ ${#matches[@]} -le 1 ]]; then
+        # Never land on a different session silently: a single partial match
+        # (e.g. NAME--2 for a stale NAME) is offered as a suggestion, not attached.
         _session_attach_not_found "$attach_target" "${sessions[@]}"
         return 1
-    elif [[ ${#matches[@]} -eq 1 ]]; then
-        _tmux_exec attach-session -t "=${matches[0]}"
     else
         echo -e "${BOLD}Multiple sessions matching '$attach_target':${RESET}"
         i=1
@@ -25015,7 +25026,7 @@ _remote_exec() {
     # metadata has been injected into the forwarded cctrl invocation.
     local quoted_args=""
     for arg in "$@"; do
-        quoted_args+=" $(printf '%q' "$arg")"
+        quoted_args+=" $(_remote_quote "$arg")"
     done
 
     if $detach_and_attach; then
@@ -25038,19 +25049,11 @@ _remote_exec() {
         fi
         echo -e "${DIM}Attaching to remote session: $remote_session${RESET}" >&2
         local sess_q
-        sess_q="$(printf '%q' "$remote_session")"
-        # "=$sess_q" gives tmux's exact-match target (see tmux-target-prefix-match
-        # memory), but this whole string is re-parsed by the remote login shell
-        # (zsh), where a word starting with an unquoted "=" triggers zsh's own
-        # command-path filename generation. printf '%q' quotes for the LOCAL
-        # bash re-parse, not the remote one, so the "=" needs its own backslash
-        # here rather than relying on that quoting (plan 085). This line is
-        # outside test_tmux_exact_target_lint's reach (its target isn't a
-        # literal `-t "$VAR"` clause the static check can anchor on); its
-        # regression coverage is test_remote_detach_attach_escapes_exact_target.
+        sess_q="$(_remote_quote "$remote_session")"
         # Attach through the REMOTE cctrl, not raw tmux: the remote's own
         # tmuxServer routing (e.g. the "fleet" server) and exact-name matching
-        # then apply. The name is %q-quoted for the remote zsh re-parse.
+        # then apply. The name is quoted (_remote_quote) for the remote zsh re-parse.
+        # Regression coverage: test_remote_detach_attach_escapes_exact_target.
         exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; $(_remote_cctrl_guard "$host_alias") cctrl session attach $sess_q"
     fi
 

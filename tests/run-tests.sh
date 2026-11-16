@@ -5108,6 +5108,17 @@ SH
     echo "ok: remote attach quotes the session name for the remote shell re-parse"
 }
 
+test_remote_quote_survives_zsh_reparse_leading_eq_tilde() {
+    command -v zsh >/dev/null 2>&1 || { echo "skip: no zsh"; return 0; }
+    local name q out
+    for name in '=NAME' '~NAME' '=' '~'; do
+        q="$(cctrl_source_eval '_remote_quote "$1"' "$name")"
+        out="$(zsh -f -c "printf '%s' $q" 2>&1)" || fail "zsh re-parse of '$name' failed: $out"
+        [[ "$out" == "$name" ]] || fail "zsh re-parse of '$name' gave '$out'"
+    done
+    echo "ok: leading = and ~ names survive the remote zsh re-parse"
+}
+
 test_remote_attach_guard_fails_clearly_without_remote_cctrl() {
     # The remote command opens with a guard: no cctrl on the remote means a
     # clear message naming the fix and exit 127, never a raw-tmux fallback.
@@ -5174,6 +5185,12 @@ test_session_attach_not_found_is_helpful() (
     [[ "$rc" -ne 0 ]] || fail "attach exited 0: $out"
     assert_contains "$out" "TMUX--ms--orch-demo--3"
     assert_contains "$out" "TMUX--ms--orch-demo"
+    # Live NAME--2 only, asked for NAME: must not attach silently; suggests NAME--2.
+    "$tt" -S "$SRV2_NEW" new-session -d -s TMUX--ms--solo--2 'sleep 120'
+    rc=0; out="$("$ROOT/cctrl" session attach TMUX--ms--solo 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "attach to NAME silently landed on NAME--2: $out"
+    assert_contains "$out" "No session matching 'TMUX--ms--solo'"
+    assert_contains "$out" "Did you mean TMUX--ms--solo--2?"
     # No close match still names the server and exits non-zero.
     rc=0; out="$("$ROOT/cctrl" session attach zzz-nothing 2>&1)" || rc=$?
     [[ "$rc" -ne 0 ]] || fail "attach exited 0: $out"
