@@ -199,11 +199,13 @@ input in a newly created thread, observed the exact correlated user-message
 client ID, completed a model turn with the expected test answer, and consumed
 the queue. The owned Codex test thread was archived afterward.
 
-These verify Claude ingress/wakeup and Codex queue-to-model execution in the
-tested configurations. A full real Claude↔Codex model-driven reply/ACK round
-trip remains blocked by Claude login. Isolated module/subprocess tests and a
-simulated two-direction integration verify plumbing, not every provider
-configuration. See [evidence and limits](findings/native-agent-messaging-evidence.md).
+A later live test passed both Claude→Codex and Codex→Claude model-driven
+requests, correlated replies, and all four explicit ACK receipts. It used two
+new test sessions, normal Claude admission, installed bridge commands/tools,
+and the macOS GUI context needed to access the valid Keychain login. The test
+sessions, endpoints, sockets and one-shot GUI job were cleaned up afterward.
+This verifies the tested builds/configuration, not every CLI/extension or
+admission mode. See [evidence and limits](findings/native-agent-messaging-evidence.md#live-bidirectional-reply-and-receipt-test).
 
 Enable starts a per-session bridge daemon; repeating enable reuses a live
 endpoint. If startup reports pending or exits, inspect its reported diagnostic

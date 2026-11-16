@@ -4,8 +4,9 @@ For bridge implementation or diagnosis. Start with the
 [messaging overview](native-agent-messaging-protocols.md) to choose the right
 surface and distinguish implemented cctrl behavior from bridge proposals.
 This reference describes installed Claude Code `2.1.325`; findings are static,
-with later isolated native-ingress verification described in the evidence file;
-model-driven outbound replies remain unverified. [Evidence and limitations](native-agent-messaging-evidence.md).
+with later live verification of native sends, correlated cross-provider replies,
+and explicit ACK receipts in the tested macOS configuration.
+[Evidence and limitations](native-agent-messaging-evidence.md#live-bidirectional-reply-and-receipt-test).
 
 
 ## Discovery and framing

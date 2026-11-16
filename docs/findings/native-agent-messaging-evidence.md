@@ -56,7 +56,7 @@ The test record reported no endpoint errors and no timeout.
 The spawned session's expired authentication prevented model execution: both
 turns returned an authentication error. Native model-driven `ListAgents` /
 `SendMessage`, an outbound reply, and a complete Claude/Codex model round trip
-therefore remain unverified. The retained private `live-smoke/result-transport.json`
+were unverified in that smoke. The retained private `live-smoke/result-transport.json`
 records ingress and the authentication limitation; no private session content,
 credentials, or machine-specific paths are included here.
 
@@ -71,8 +71,38 @@ records these observations without publishing local paths or session contents.
 This verifies native queue submission, correlation, consumption, and model
 execution in that tested Codex server configuration. It does not establish all
 independently running CLI/extension configurations or a full Claude↔Codex
-model-driven reply/ACK round trip. That cross-provider round trip still depends
-on restoring Claude authentication.
+model-driven reply/ACK round trip. The later test below establishes that narrower
+cross-provider claim.
+
+### Live bidirectional reply and receipt test
+
+A later test on 2026-11-16 passed with actual Claude Code `2.1.325` and Codex
+`0.167.0` model sessions, using the installed cctrl native bridge:
+
+| Direction | Verified behavior |
+|---|---|
+| Claude → Codex | Claude used native `SendMessage` to the exact Codex bridge endpoint; Codex consumed the input, explicitly ACKed it, and sent a correlated reply |
+| Codex → Claude | Codex initiated a native bridge send; Claude consumed native peer input, explicitly ACKed it through cctrl MCP, and sent a correlated reply |
+| Reply handling | Each original sender explicitly ACKed the reply's own message ID; both `reply_to` links matched their original requests |
+| Receipts | All four explicit ACK notifications reached the corresponding sender's provider input, identified by the original message ID |
+| Duplicate and cleanup checks | Exactly four message records and four receipt attempts remained; all four messages were acknowledged, test endpoints/sockets were removed, and the owned Codex test chat was archived |
+
+Claude used its normal default/prompting admission mode and the actual native
+`SendMessage` and cctrl MCP tools. The owned Codex test chat used a custom tool
+handler bound to that exact thread to invoke installed bridge commands. The
+test did not resume another writer, message existing sessions, override native
+admission, or copy authentication tokens. No duplicate or fallback send occurred.
+
+The background execution context initially saw an expired credential fallback
+even after interactive login succeeded. Launching the test in the user's
+existing macOS GUI session made the valid Keychain login visible. Keychain
+permissions and credential contents were not changed. An expired background
+fallback alone therefore does not prove the interactive login is invalid.
+
+The retained private `run-47e2e5f32c/result.json` contains provider events,
+correlation checks, and cleanup results; its `bridge-evidence` directory retains
+the test ledger. The test used native Codex events because immediate full turn
+history reads returned `list_turns is not supported yet` in this configuration.
 
 Isolated Claude adapter, Codex queue, bridge-ledger, and subprocess tests cover
 the implemented boundaries. A simulated two-direction bridge integration tests
@@ -103,12 +133,12 @@ substitute a third-party recovered source tree or historical team schema for
 the installed build. No bundled code or credential files need to be committed
 to cctrl to record these findings.
 
-Real-provider compatibility verification still needs Claude model-driven
-outbound messages and replies, both providers completing a reply/ACK round trip, and
-configuration-specific admission, callback, lifecycle, and authentication
-coverage. The ingress smoke verifies one default-mode Claude configuration;
-isolated module tests do not establish those real-provider cases. Existing user
-sessions were not delivery targets for this investigation.
+The live test establishes normal-admission bidirectional model replies and
+explicit ACK receipts for the tested provider builds. It does not establish
+every independent CLI/extension configuration, held/refused admission behavior,
+Windows support, or every lifecycle/authentication variant. Those need separate
+real-provider coverage; isolated module tests do not establish them. Existing
+user sessions were not delivery targets for this investigation.
 
 ## Source and evidence references
 

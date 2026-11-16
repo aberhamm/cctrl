@@ -23,6 +23,9 @@ A subsequent isolated installed-Claude smoke verified native ingress/turn wakeup
 expired authentication blocked Claude model-driven outbound messages and replies.
 A subsequent isolated Codex smoke verified queued input, exact client correlation,
 queue consumption and a completed model answer in an owned test thread.
+A later live test passed both model-driven directions with correlated replies
+and all four explicit ACK receipts; see the
+[round-trip record](native-agent-messaging-evidence.md#live-bidirectional-reply-and-receipt-test).
 See [verification scope](native-agent-messaging-evidence.md#evidence-and-verification-scope) before relying on a
 runtime or compatibility claim.
 
@@ -104,8 +107,10 @@ immediate admission sends no positive delivery receipt; its native delivered
 status reports held-message release. Bridge received/replied stages require an
 explicit recipient action. Ambiguous native submissions must not be replayed or
 sent through fallback. Current implementation and live verification evidence
-must be checked separately; the original read-only investigation and later ingress smoke did not establish
-a complete real-provider bridge round trip.
+must be checked separately; the original read-only investigation and ingress
+smoke did not establish a complete round trip. A later live test did establish
+both model-driven directions, correlated replies, and explicit ACK receipts in
+the tested macOS configuration.
 
 The bridge supports Claude→Codex, Codex→Claude and Codex→Codex. Claude→Claude
 uses actual native tools to preserve provider admission context; bridge sends
