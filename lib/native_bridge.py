@@ -12,6 +12,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import queue
 import signal
@@ -33,6 +34,12 @@ NATIVE_OWNED = ("persisted", "submitting", "submitted", "queued", "held", "relea
 # Policy outcomes that are not authorized work either.
 NOT_WORK = ("refused", "denied", "expired", "dropped")
 VIEWS = ("actionable", "stranded", "history")
+# Daemon protocol: 1 = pre-retirement daemons (no capabilities action);
+# 2 = native queue retirement, sender envelopes and the admission gate.
+PROTOCOL = 2
+BASIS = re.compile(r"^[A-Za-z0-9:_./-]{1,60}$")
+NOT_ADMITTED = ("held",) + NOT_WORK
+WITHHELD = "[NOT ADMITTED: body withheld. Native delivery has not admitted this message; it is not authorized work and cannot be ACKed or replied to from the ledger.]"
 RETIRED_FINAL = {"retired", "absent", "already_consumed", "unsupported", "not_applicable"}
 
 
@@ -137,7 +144,8 @@ def envelope_from_request(value, who):
     for key in ("display_name", "harness", "reported_source", "host"):
         item = value.get(key)
         item = item if isinstance(item, dict) else {}
-        out[key] = known(item.get("value"), clean_text(item.get("basis"), 60) or "claimed")
+        basis = clean_text(item.get("basis"), 60)
+        out[key] = known(item.get("value"), basis if basis and BASIS.match(basis) else "claimed")
     return out
 
 
@@ -358,6 +366,10 @@ class Store:
         for row in page:
             row["envelope"] = json.loads(row["envelope"]) if row.get("envelope") else None
             row["actionable"] = view == "actionable"
+            if view == "stranded":
+                row["admitted"] = "unknown" if row["status"] not in NOT_ADMITTED else False
+                if row["status"] in NOT_ADMITTED:
+                    row["body"] = WITHHELD
             row["queued_submission_id"] = self.queued_identity(row["id"])
         return {"actor": who, "view": view, "messages": page,
                 "next_cursor": rows[limit - 1]["cursor"] if len(rows) > limit else None}
@@ -377,12 +389,17 @@ class Store:
 
 
 def envelope_line(envelope):
+    """Always one Sender line. Values are JSON-quoted so a claimed value cannot
+    close its own field and forge a basis or another field; bases are charset-limited."""
     if not envelope:
-        return ""
+        return "Sender: unknown (no envelope recorded)\n"
     def show(key):
         item = envelope.get(key) or {}
         value, basis = item.get("value"), item.get("basis") or "unknown"
-        return "unknown" if not value else (f"{value} ({basis})")
+        if not isinstance(value, str) or not value:
+            return "unknown"
+        basis = basis if isinstance(basis, str) and BASIS.match(basis) else "claimed"
+        return json.dumps(value, ensure_ascii=False) + f" ({basis})"
     return ("Sender: name=" + show("display_name") + "; provider=" + str(envelope.get("provider")) +
             "; session=" + str(envelope.get("session_id")) + "; harness=" + show("harness") +
             "; reported_source=" + show("reported_source") + "; host=" + show("host") + "\n")
@@ -560,10 +577,29 @@ class Daemon:
         self.store.note(mid, "native-retire", outcome)
         return outcome
 
+    @staticmethod
+    def admission_problem(row):
+        """Why this message may not be ACKed/replied yet, or None.
+
+        Handling is only meaningful once native delivery admitted the message.
+        Reading a body from the ledger is not delivery.
+        """
+        status = row["status"]
+        if status in NOT_ADMITTED:
+            return (f"message {row['id']} is {status}: native delivery has not admitted it, so it is not delivered or authorized work. "
+                    "It cannot be ACKed or replied to from the ledger; no receipt was sent and it is not marked handled. "
+                    "Wait for native admission (release) or ask the sender to resend.")
+        if status == "submitted" and row["recipient"].startswith("claude:"):
+            return (f"message {row['id']} is submitted to Claude with no release recorded: admission is unconfirmed, so it cannot be ACKed or replied to yet. "
+                    "No receipt was sent and it is not marked handled.")
+        return None
+
     def handle(self, request):
         if request.get("actor") != self.who:
             raise ValueError("bridge endpoint belongs to a different session")
         action = request.get("action")
+        if action == "capabilities":
+            return {"protocol": PROTOCOL, "features": ["native_retirement", "sender_envelope", "admission_gate"]}
         if action == "send":
             return self.send(request["to"], request["body"], mid=request.get("id"), envelope=request.get("envelope"))
         if action in {"ack", "reply"}:
@@ -572,6 +608,9 @@ class Daemon:
                 raise ValueError("only the actual recipient may reply")
             if original["kind"] == "receipt":
                 raise ValueError("a receipt is a control fact: it needs no ACK and cannot be replied to")
+            problem = self.admission_problem(original)
+            if problem:
+                raise ValueError(problem)
             if action == "reply":
                 value = self.send(original["sender"], request["body"], reply_to=original["id"], mid=request.get("reply_id"), envelope=request.get("envelope"))
                 # A failed/ambiguous reply is not proof of handling.
@@ -737,6 +776,23 @@ def ensure_daemon(store, who):
     raise ValueError(f"bridge startup pending; inspect {log} before retrying")
 
 
+def daemon_protocol(row, who):
+    """Protocol version the live daemon speaks; 1 for daemons that predate the handshake."""
+    try:
+        response = rpc(row, {"actor": who, "action": "capabilities"})
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"bridge daemon for {who} is unreachable ({exc}); not sending anything") from exc
+    data = response.get("data") if response.get("ok") else None
+    version = data.get("protocol") if isinstance(data, dict) else 1
+    return version if isinstance(version, int) else 1
+
+
+def stale_message(row, who, version, command):
+    return (f"bridge daemon for {who} (pid {row.get('pid')}) speaks protocol {version}; this cctrl requires protocol {PROTOCOL} "
+            f"(native queue retirement, sender envelopes, admission gate). Refusing to {command} through it. That daemon still owns this "
+            "session's held and ambiguous items, so it is NOT restarted automatically. Controlled migration: see 'Daemon upgrade' in docs/peer-messaging.md.")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.environ.get("CCTRL_NATIVE_BRIDGE_DIR", str(Path.home() / ".local/state/cctrl/native-bridge")))
@@ -788,8 +844,13 @@ def main(argv=None):
                 result = store.inbox(who, args.view, args.after, args.limit)
             else:
                 row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
+                version = daemon_protocol(row, who) if row is not None and args.command != "stop" else PROTOCOL
                 if args.command == "enable":
-                    result = row
+                    result = {**row, "protocol": version, "protocol_required": PROTOCOL, "compatible": version >= PROTOCOL}
+                    if version < PROTOCOL:
+                        result["warning"] = stale_message(row, who, version, "send, reply or ack")
+                elif row is not None and version < PROTOCOL and args.command != "stop":
+                    raise ValueError(stale_message(row, who, version, args.command))
                 elif row is None:
                     result = {"stopped": True}
                 else:

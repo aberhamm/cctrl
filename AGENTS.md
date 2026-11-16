@@ -99,7 +99,7 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
 - **Admission:** Codex bridges speak prompting to Claude; bypass may hold it.
   Never spoof modes or override admission. Claude proxies refuse raw native ingress.
 - **Handle:** `bridge inbox` never re-lists accepted native input; `bridge reply|ack ID`
-  retires a pending Codex queue item. Never ACK a receipt. See the guide's envelope/history.
+  retires a pending Codex queue item. Never ACK a receipt or a held/unadmitted item (refused). See the guide.
 - **Receipts:** submitted means socket write completed, not native admission ACK;
   queued proves Codex queue acceptance; received/replied requires explicit action.
   Claude immediate accepts have no positive receipt; native delivered means held

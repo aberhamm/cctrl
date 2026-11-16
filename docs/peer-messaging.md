@@ -56,9 +56,12 @@ do not share an internal collaboration tree.
 These are three different things; keep them apart.
 
 - **Delivery** is the native provider surface. A Codex message accepted by the
-  server's queue (`queued`) and a Claude message written to its native socket
-  (`submitted`, `held`, `released`) reaches the model as ordinary native input.
-  Native delivery owns every message it accepted.
+  server's queue (`queued`) and a Claude message that Claude admitted
+  (`released`, or an immediate accept recorded as `submitted`) reaches the model
+  as ordinary native input. `held` is NOT delivered: Claude admission is waiting
+  for the receiver's approval, so the text has not reached the model, is not
+  authorized work, and must never be handled from the ledger. Native delivery
+  owns every message it accepted.
 - **Inbox** is the handling surface and must never show the same work a second
   time. The default view (`actionable`) lists only messages native delivery did
   not accept (`failed`). Anything `queued`, `submitted`, `held` or `released`
@@ -93,16 +96,66 @@ text is never consulted and no other queue entry is touched. The result carries
 | `not_applicable` | no native queue item was ever accepted (for example `failed`) |
 | `unsupported` | Claude recipient (see limit below) |
 
+**Admission gate.** `bridge ack` and `bridge reply` refuse (exit 1, error says
+the message is not admitted) while the status is `held`, `refused`, `denied`,
+`expired` or `dropped`, and for a Claude recipient while it is only `submitted`
+with no release recorded. A refusal sends no receipt and no reply and does not
+mark the message handled. `inbox --view stranded` rows for those statuses carry
+`admitted: false` and the body is replaced by `[NOT ADMITTED: body withheld ...]`;
+`history` and `status` still show the stored text for inspection only. Consequence:
+a Claude recipient can ACK or reply only after a release is recorded; a plain
+immediate accept has no positive receipt and stays unACKable through the bridge
+until that gap is closed.
+
 `retired`, `absent`, `already_consumed`, `not_applicable` and `unsupported`
 are final and recorded once as a `native-retire` event.
 
 Limit: native Claude input cannot be retracted once written to its socket, and
 held input is released by Claude's own admission decision. cctrl therefore
-records the handling and, if a release (`delivered`) arrives afterwards, adds a
+records the handling and, if a release (`delivered`) is reported for an item that
+was already handled (only possible for items handled before the admission gate),
+adds a
 `late-native-delivery-after-handled` event, shown as `late_native_delivery:
 true` by `bridge status`. This marks the late arrival as already handled in the
 ledger; it cannot remove text a Claude session already received. Do not act on
 it again: check `bridge status ID`.
+
+## Daemon protocol and controlled upgrade
+
+Each endpoint daemon answers a `capabilities` request with `protocol: 2`
+(features `native_retirement`, `sender_envelope`, `admission_gate`). Daemons from
+before this change reject the request, which reads as protocol 1. The CLI (and
+therefore the MCP tools, which run the CLI) checks this before every `send`,
+`reply` and `ack` and fails closed:
+
+```
+bridge daemon for ACTOR (pid N) speaks protocol 1; this cctrl requires protocol 2
+(native queue retirement, sender envelopes, admission gate). Refusing to ack through it.
+That daemon still owns this session's held and ambiguous items, so it is NOT restarted
+automatically. Controlled migration: see 'Daemon upgrade' in docs/peer-messaging.md.
+```
+
+An unreachable daemon also refuses (`... is unreachable ...; not sending anything`).
+`bridge enable` still returns the endpoint row, plus `protocol`, `protocol_required`,
+`compatible` and, when stale, a `warning`. `inbox`, `status` and `list` are
+read-only ledger reads and keep working.
+
+### Daemon upgrade
+
+cctrl never restarts a daemon by itself. A stale daemon is the owner of this
+session's pending held and ambiguous items (provider callbacks bind its PID), so
+replacing it blindly can orphan them. Migrate deliberately, per session:
+
+1. `cctrl bridge inbox --view stranded --json` and `--view history`: note every
+   `held`, `ambiguous`, `submitting` or `persisted` item. Resolve or record them;
+   do not resend an ambiguous one.
+2. Install the new cctrl (a separate, approved step), then in that session run
+   `cctrl bridge stop --json` and wait until it reports `stopped`. If it reports
+   pending cleanup, stop and investigate; do not kill the PID.
+3. Run `cctrl bridge enable --json` and confirm `compatible: true`.
+4. Re-check `bridge status ID` for each noted item. Held items whose provider
+   callbacks died with the old process stay `held`; handle them natively, never
+   by ACK from the ledger.
 
 ## Receipts are control facts
 
@@ -126,7 +179,9 @@ recorded as claims and a provider-reported title wins over them.
 Every bridge message carries one sender snapshot, taken once where the session is
 owned (the sending CLI/MCP call, or the daemon for native ingress) and persisted
 with the message. A retry keeps the first snapshot. The wire text shows it on a
-`Sender:` line; `status` and `inbox` return it as `envelope`:
+`Sender:` line (always present: `Sender: unknown (no envelope recorded)` when none
+was recorded; every claimed or reported value is JSON-quoted, so it cannot forge a
+basis or another field); `status` and `inbox` return it as `envelope`:
 
 | field | meaning |
 |---|---|
