@@ -5075,9 +5075,111 @@ SH
 
     local ssh_log; ssh_log="$(cat "$log")"
     assert_contains "$ssh_log" "SSH -t tester@example.invalid"
-    assert_contains "$ssh_log" 'tmux\ attach-session\ -t\ \\=TMUX--fake-remote'
-    echo "ok: remote detach-and-attach escapes tmux's exact-match \"=\" so a remote zsh login shell won't equals-expand it"
+    # The attach runs the REMOTE cctrl (its own tmuxServer routing and exact
+    # name matching), never raw tmux on the default server.
+    assert_contains "$ssh_log" 'cctrl\ session\ attach\ TMUX--fake-remote'
+    assert_not_contains "$ssh_log" 'tmux\ attach-session'
+    assert_not_contains "$ssh_log" 'attach-session'
+    echo "ok: remote detach-and-attach runs cctrl session attach on the remote (no raw tmux)"
 }
+
+test_remote_attach_quotes_name_for_remote_shell() {
+    # A session name with shell-special characters must survive the remote
+    # login shell's re-parse: it is %q-quoted, and the remote command carries
+    # no bare "=NAME" word for zsh to equals-expand.
+    local bin="$TMPDIR/remote-attach-q-bin" hosts="$TMPDIR/remote-attach-q-hosts.json" log="$TMPDIR/remote-attach-q-ssh.log"
+    mkdir -p "$bin"
+    cat > "$bin/ssh" <<'SH'
+#!/usr/bin/env bash
+{ printf 'SSH'; for arg in "$@"; do printf ' %q' "$arg"; done; printf '\n'; } >> "${SSH_LOG:?}"
+[[ "${1:-}" == "-t" ]] && exit 0
+printf 'CCTRL_SESSION=TMUX--a b;c\n'
+exit 0
+SH
+    chmod +x "$bin/ssh"
+    printf '{"remote":{"hostname":"example.invalid","user":"tester"}}\n' > "$hosts"
+    : > "$log"
+    # shellcheck disable=SC2016
+    PATH="$(_test_path "$bin")" SSH_LOG="$log" cctrl_source_eval \
+        'HOSTS_FILE="$1"; _remote_exec remote start -d' "$hosts" >/dev/null 2>&1 || true
+    local ssh_log; ssh_log="$(cat "$log")"
+    assert_contains "$ssh_log" 'cctrl\ session\ attach\ TMUX--a\\\ b\\\;c'
+    assert_not_contains "$ssh_log" '\\='
+    echo "ok: remote attach quotes the session name for the remote shell re-parse"
+}
+
+test_remote_attach_guard_fails_clearly_without_remote_cctrl() {
+    # The remote command opens with a guard: no cctrl on the remote means a
+    # clear message naming the fix and exit 127, never a raw-tmux fallback.
+    local guard empty="$TMPDIR/remote-guard-empty-bin" out rc
+    mkdir -p "$empty"
+    guard="$(cctrl_source_eval '_remote_cctrl_guard fleet-host')"
+    rc=0; out="$(PATH="$empty" "$BASH" -c "$guard echo reached-attach" 2>&1)" || rc=$?
+    [[ "$rc" -eq 127 ]] || fail "guard rc $rc (want 127): $out"
+    assert_contains "$out" "cctrl is not installed or not on PATH on host fleet-host"
+    assert_contains "$out" "install or update cctrl there"
+    assert_contains "$out" "Not falling back to raw tmux"
+    assert_not_contains "$out" "reached-attach"
+    if command -v zsh >/dev/null 2>&1; then
+        rc=0; out="$(PATH="$empty" zsh -f -c "$guard echo reached-attach" 2>&1)" || rc=$?
+        [[ "$rc" -eq 127 ]] || fail "zsh guard rc $rc (want 127): $out"
+        assert_not_contains "$out" "reached-attach"
+    fi
+    # With a cctrl on PATH the guard is transparent.
+    printf '#!/bin/sh\nexit 0\n' > "$empty/cctrl"; chmod +x "$empty/cctrl"
+    rc=0; out="$(PATH="$empty" "$BASH" -c "$guard echo reached-attach" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 && "$out" == "reached-attach" ]] || fail "guard blocked a present cctrl (rc $rc): $out"
+    # And plain `cctrl --host H session attach NAME` carries the guard and TTY.
+    local bin="$TMPDIR/remote-guard-bin" hosts="$TMPDIR/remote-guard-hosts.json" log="$TMPDIR/remote-guard-ssh.log"
+    mkdir -p "$bin"
+    cat > "$bin/ssh" <<'SH'
+#!/usr/bin/env bash
+{ printf 'SSH'; for arg in "$@"; do printf ' %q' "$arg"; done; printf '\n'; } >> "${SSH_LOG:?}"
+exit 0
+SH
+    chmod +x "$bin/ssh"
+    printf '{"remote":{"hostname":"example.invalid","user":"tester"}}\n' > "$hosts"
+    : > "$log"
+    # shellcheck disable=SC2016
+    PATH="$(_test_path "$bin")" SSH_LOG="$log" cctrl_source_eval \
+        'HOSTS_FILE="$1"; _remote_exec remote session attach TMUX--x' "$hosts" >/dev/null 2>&1 || true
+    local ssh_log; ssh_log="$(cat "$log")"
+    assert_contains "$ssh_log" "SSH -t tester@example.invalid"
+    assert_contains "$ssh_log" "command\\ -v\\ cctrl"
+    assert_contains "$ssh_log" "session\\ attach\\ TMUX--x"
+    assert_not_contains "$ssh_log" "tmux"'\\ attach'
+    echo "ok: remote attach guards against a missing remote cctrl (clear message, exit 127)"
+}
+
+test_session_attach_not_found_is_helpful() (
+    # Real tmux on an isolated named-server socket; no real sessions touched.
+    _srv2_setup
+    trap _srv2_cleanup EXIT
+    local tt="$SRV2_TT" out rc
+    "$tt" -S "$SRV2_NEW" new-session -d -s TMUX--ms--orch-demo 'sleep 120'
+    "$tt" -S "$SRV2_NEW" new-session -d -s TMUX--ms--other 'sleep 120'
+    export CCTRL_TMUX_SERVER=fleet
+    # Wrong suffix: asked for NAME--2, live is NAME.
+    rc=0; out="$("$ROOT/cctrl" session attach TMUX--ms--orch-demo--2 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "attach to a missing session exited 0: $out"
+    assert_contains "$out" "No session matching 'TMUX--ms--orch-demo--2' on tmux server 'fleet'"
+    assert_contains "$out" "Closest live sessions:"
+    assert_contains "$out" "Did you mean TMUX--ms--orch-demo?"
+    assert_contains "$out" "Sessions live on tmux server 'fleet'; use 'cctrl session attach <name>'"
+    assert_contains "$out" "not raw tmux"
+    # Live NAME--2, asked for NAME (exact-prefix variant): the partial match
+    # attaches only when it is the single match, so ask for a name that has none.
+    "$tt" -S "$SRV2_NEW" new-session -d -s TMUX--ms--orch-demo--3 'sleep 120'
+    rc=0; out="$("$ROOT/cctrl" session attach TMUX--ms--orch-demo--9 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "attach exited 0: $out"
+    assert_contains "$out" "TMUX--ms--orch-demo--3"
+    assert_contains "$out" "TMUX--ms--orch-demo"
+    # No close match still names the server and exits non-zero.
+    rc=0; out="$("$ROOT/cctrl" session attach zzz-nothing 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "attach exited 0: $out"
+    assert_contains "$out" "No close match. Sessions live on tmux server 'fleet'"
+    echo "ok: session attach not-found names the server, the closest sessions, and a hint"
+)
 
 test_attach_prompt_after_start() {
     make_fake_tmux "$TMPDIR/tmux"

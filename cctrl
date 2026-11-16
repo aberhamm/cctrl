@@ -21340,6 +21340,40 @@ _session_autoheal() {
     return 0
 }
 
+# Explain a failed `session attach NAME`: which tmux server was searched, the
+# closest live names (same name with or without a --N suffix, either prefix
+# direction, or the same name without the TMUX-- prefix), and a one-line hint.
+# Writes to stderr; the caller returns non-zero.
+_session_attach_not_found() {
+    local target="$1"; shift
+    local server_desc="the default tmux server"
+    if _tmux_routing_active; then
+        server_desc="tmux server '$_CCTRL_TMUX_SERVER_VALUE'"
+    fi
+    echo -e "${RED}No session matching '$target' on $server_desc.${RESET}" >&2
+    local base="${target%--[0-9]*}" tbare="${target#TMUX--}" s sbase sbare
+    tbare="${tbare%--[0-9]*}"
+    local -a close=()
+    for s in "$@"; do
+        _tmux_is_placeholder "$s" && continue
+        sbase="${s%--[0-9]*}"; sbare="${s#TMUX--}"; sbare="${sbare%--[0-9]*}"
+        if [[ "$s" == "$target"* || "$target" == "$s"* || "$sbase" == "$base" || ( -n "$tbare" && "$sbare" == "$tbare" ) ]]; then
+            close+=("$s")
+        fi
+    done
+    if (( ${#close[@]} > 0 )); then
+        echo -e "${BOLD}Closest live sessions:${RESET}" >&2
+        for s in "${close[@]}"; do echo "  $s" >&2; done
+        echo -e "${DIM}Did you mean ${close[0]}? Sessions live on $server_desc; use 'cctrl session attach <name>' (or 'cctrl --host <host> session attach <name>' from another machine), not raw tmux.${RESET}" >&2
+    else
+        echo -e "${DIM}No close match. Sessions live on $server_desc; list them with 'cctrl session ls'; use 'cctrl session attach <name>', not raw tmux.${RESET}" >&2
+    fi
+    if (( $# > 0 )); then
+        echo -e "${BOLD}Active sessions:${RESET}" >&2
+        for s in "$@"; do _tmux_is_placeholder "$s" || echo "  $s" >&2; done
+    fi
+}
+
 _session_attach() {
     _session_require_tmux || return 1
     local attach_target="$1"
@@ -21377,7 +21411,11 @@ _session_attach() {
     done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
 
     if [[ ${#sessions[@]} -eq 0 ]]; then
-        echo -e "${DIM}No active sessions.${RESET}"
+        if [[ "$attach_target" != "__picker__" ]]; then
+            _session_attach_not_found "$attach_target"
+        else
+            echo -e "${DIM}No active sessions.${RESET}"
+        fi
         return 1
     fi
 
@@ -21414,9 +21452,7 @@ _session_attach() {
     done
 
     if [[ ${#matches[@]} -eq 0 ]]; then
-        echo -e "${RED}No session matching '$attach_target'.${RESET}" >&2
-        echo -e "${BOLD}Active sessions:${RESET}"
-        for s in "${sessions[@]}"; do _tmux_is_placeholder "$s" || echo "  $s"; done
+        _session_attach_not_found "$attach_target" "${sessions[@]}"
         return 1
     elif [[ ${#matches[@]} -eq 1 ]]; then
         _tmux_exec attach-session -t "=${matches[0]}"
@@ -23653,6 +23689,7 @@ cmd_help() {
     echo "  cctrl host doctor <alias>             Check SSH, tmux, selected agent, cctrl on remote"
     echo "  cctrl --host <alias> <command>         Run a command on a host (local/self = this machine)"
     echo "  cctrl --host <alias> start -d @<name>  Start a detached session there, then attach"
+    echo "  cctrl --host <alias> session attach <name>  THE recipe to open a tab on another host (uses its tmuxServer; no raw tmux)"
     echo "  cctrl fleet [--json|--json-v2]         Aggregate provider-neutral tasks across all hosts"
     echo "  cctrl needs-me [--json]                Digest of sessions that NEWLY need you since last run"
     echo ""
@@ -24683,6 +24720,14 @@ _host_lookup() {
     return 0
 }
 
+# Remote-side guard for attach: fail clearly when cctrl is missing there,
+# instead of falling back to raw tmux on the default server. Emitted into the
+# command string the remote login shell re-parses; no quotes or backticks.
+_remote_cctrl_guard() {
+    local h="${1//[^A-Za-z0-9._-]/_}"
+    printf '%s' "command -v cctrl >/dev/null 2>&1 || { echo cctrl-attach-failed: cctrl is not installed or not on PATH on host $h - install or update cctrl there, then retry. Not falling back to raw tmux. >&2; exit 127; };"
+}
+
 _remote_exec() {
     # Execute a cctrl command on a remote host over SSH.
     # Usage: _remote_exec <host-alias> <args...>
@@ -25003,11 +25048,18 @@ _remote_exec() {
         # outside test_tmux_exact_target_lint's reach (its target isn't a
         # literal `-t "$VAR"` clause the static check can anchor on); its
         # regression coverage is test_remote_detach_attach_escapes_exact_target.
-        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; tmux attach-session -t \\=$sess_q"
+        # Attach through the REMOTE cctrl, not raw tmux: the remote's own
+        # tmuxServer routing (e.g. the "fleet" server) and exact-name matching
+        # then apply. The name is %q-quoted for the remote zsh re-parse.
+        exec ssh -t "$ssh_target" "source ~/.zprofile 2>/dev/null; $(_remote_cctrl_guard "$host_alias") cctrl session attach $sess_q"
     fi
 
+    local remote_guard=""
+    case "$first_arg:${2:-}" in
+        session:attach|session:a|peer:attach|peer:a) remote_guard="$(_remote_cctrl_guard "$host_alias") " ;;
+    esac
     echo -e "${DIM}ssh ${ssh_opts[*]+${ssh_opts[*]}} $ssh_target cctrl$quoted_args${RESET}" >&2
-    exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "source ~/.zprofile 2>/dev/null; $env_prefix cctrl$quoted_args"
+    exec ssh ${ssh_opts[@]+"${ssh_opts[@]}"} "$ssh_target" "source ~/.zprofile 2>/dev/null; $remote_guard$env_prefix cctrl$quoted_args"
 }
 
 # ── Fleet (cross-host aggregation) ───────────────────────────────────

@@ -181,7 +181,12 @@ memory and attention. One session = one purpose.
 5. **Open it in a tab (optional).** If a human will watch/consult it, open a
    terminal tab that **attaches** to the now-live session, using the mechanism in
    your private env brief. Attaching to an already-booted session is rock-solid;
-   confirm with `tmux list-clients -t <id>` afterward.
+   confirm with `tmux list-clients -t <id>` afterward. For a session on another
+   machine, the one recipe for the tab's command is
+   `cctrl --host <host> session attach <exact-name>`. Never hand-build
+   `ssh <host> tmux attach-session ...`: raw tmux hits the default server (not the
+   named `tmuxServer`) and zsh expands a bare `=NAME`. A wrong name prints the
+   server searched and the closest live names (e.g. `NAME--2`) and exits non-zero.
 
 ## Gotchas (generic — learned the hard way)
 

@@ -2145,6 +2145,8 @@ cctrl --host studio costs --week             # view remote cost data
 
 `cctrl --host studio start -d @homelab` is the "start a session on my Mac from my phone" workflow: it SSHes in, starts the detached session, then attaches to that exact session over a second connection. The remote prints its resolved session name so the attach targets the right one even with auto-increment suffixes.
 
+**The recipe for opening a tab on another machine** is one command: `cctrl --host <host> session attach <exact-name>`. It runs `cctrl session attach` on the remote over `ssh -t`, so the remote's own `tmuxServer` routing (for example the named `fleet` server) and exact-name matching apply. Do not hand-build `ssh host tmux attach-session ...`: raw tmux talks to the default server (so it finds no session when sessions live on a named server) and a bare `=NAME` word is expanded by zsh (`zsh:1: =NAME not found`). If cctrl is missing on the remote, the attach fails with a message naming the fix (exit 127) rather than falling back to raw tmux. If the name is wrong, `session attach` prints the server it searched, the closest live names (for example `NAME--2`), and a hint, and exits non-zero.
+
 **TTY handling:** Interactive commands (`start` foreground, `start -d` auto-attach, `@shortcut`, `session attach`, `edit`) use `ssh -t`. Non-interactive commands (`session ls`, `costs`, `usage`, `ls`) use plain `ssh`.
 
 **Host doctor** checks SSH connectivity, brew, tmux, the selected agent, cctrl availability, `~/.tmux.conf`, shared Skillshare targets, and the selected agent's common instruction file (`~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`) — with interactive auto-fix offers for missing dependencies.
