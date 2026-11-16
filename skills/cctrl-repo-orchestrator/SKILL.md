@@ -188,7 +188,15 @@ Hand a worker off at a clean boundary, never mid-task.
   Never borrow another session's identity or resume a second Codex writer.
 - **Handle and correlate.** Use `cctrl bridge inbox`, `bridge reply MESSAGE_ID
   -- "<body>"`, or `bridge ack MESSAGE_ID` after handling; inspect `bridge status
-  MESSAGE_ID`. Submitted/queued is transport acceptance, not handling. Native
+  MESSAGE_ID`. Submitted/queued is transport acceptance, not handling.
+  A message native delivery accepted (queued, submitted, held, released) is never
+  listed as actionable in `bridge inbox`: act on the native input, quote its
+  `message=` ID, then `reply`/`ack` (which also retires a still-pending Codex queue
+  item; read `native_retirement.outcome`). `inbox --view stranded|history` is
+  inspection only. A receipt is a control fact: never ACK or reply to one. Reply to a
+  mailbox message with `reply_message` (MCP) or `cctrl peer reply ID`, never with
+  `send_message`, which acks nothing.
+  Native
   Claude delivered means held-mail release; immediate accepts have no positive
   receipt. Only explicit received/replied confirms handling. Stop your endpoint
   with `cctrl bridge stop` when finished.

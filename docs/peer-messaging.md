@@ -51,12 +51,99 @@ replaces its history writer. Existing same-tree collaboration and exposed deskto
 usable for targets they actually support; independently launched CLI sessions
 do not share an internal collaboration tree.
 
+## Delivery, inbox, history, and handling
+
+These are three different things; keep them apart.
+
+- **Delivery** is the native provider surface. A Codex message accepted by the
+  server's queue (`queued`) and a Claude message written to its native socket
+  (`submitted`, `held`, `released`) reaches the model as ordinary native input.
+  Native delivery owns every message it accepted.
+- **Inbox** is the handling surface and must never show the same work a second
+  time. The default view (`actionable`) lists only messages native delivery did
+  not accept (`failed`). Anything `queued`, `submitted`, `held` or `released`
+  is not actionable in the inbox, and neither is refused input, a receipt, or
+  anything already handled. Act on the native input itself, quoting its
+  `message=` ID.
+- **History** is inspection only. `inbox --view stranded` lists unhandled
+  items native delivery did not cleanly take (`held`, `refused`, `denied`,
+  `expired`, `dropped`, `ambiguous`, `submitting`, never dispatched); each
+  row has `actionable: false` and is not authorized work. `inbox --view history`
+  lists everything this session sent or received, receipts included, and
+  `bridge status ID` shows one message with its events, `handled`,
+  `late_native_delivery` and envelope.
+
+When handling finishes (`bridge reply ID` or `bridge ack ID`) cctrl also retires
+the recipient's still-pending native Codex queue item, so it cannot surface
+again as a fresh user turn after the model has answered. It uses the supported
+`thread/queue/delete` request, only for the exact item this bridge submitted:
+`thread/queue/list` must show one entry whose `clientUserMessageId` is the
+message ID AND whose queue ID equals the persisted `queued_submission_id`. Body
+text is never consulted and no other queue entry is touched. The result carries
+`native_retirement.outcome` (`original.native_retirement` on a reply):
+
+| outcome | meaning |
+|---|---|
+| `retired` | the item was pending and the server deleted it |
+| `absent` | not in the queue; it may already have been consumed (final, never replay) |
+| `already_consumed` | delete found nothing and a re-list shows it gone: the owner consumed it in the window |
+| `race` | delete reported nothing but the item is still queued; untouched, repeat the ACK to retry |
+| `identity_mismatch` | the queue holds this client ID under another queue ID or several entries; nothing deleted |
+| `unknown` / `unknown_identity` | transport failure or no persisted queue ID (run `status --reconcile`); retryable |
+| `not_applicable` | no native queue item was ever accepted (for example `failed`) |
+| `unsupported` | Claude recipient (see limit below) |
+
+`retired`, `absent`, `already_consumed`, `not_applicable` and `unsupported`
+are final and recorded once as a `native-retire` event.
+
+Limit: native Claude input cannot be retracted once written to its socket, and
+held input is released by Claude's own admission decision. cctrl therefore
+records the handling and, if a release (`delivered`) arrives afterwards, adds a
+`late-native-delivery-after-handled` event, shown as `late_native_delivery:
+true` by `bridge status`. This marks the late arrival as already handled in the
+ledger; it cannot remove text a Claude session already received. Do not act on
+it again: check `bridge status ID`.
+
+## Receipts are control facts
+
+A receipt (`[cctrl-bridge receipt ... control=true]`) tells the original sender
+that the recipient explicitly handled a message. It is not work: it is stored
+as `kind: receipt`, born handled, never dispatched, never listed by the default
+or `stranded` inbox views (only `history`), and cannot be ACKed, replied to, or
+sent as a message (those return an error). Receipt submission is idempotent and
+an ambiguous receipt is never replayed, so there are no receipt/ACK loops.
+
+## Sender envelope
+
+Every bridge message carries one sender snapshot, taken once where the session is
+owned (the sending CLI/MCP call, or the daemon for native ingress) and persisted
+with the message. A retry keeps the first snapshot. The wire text shows it on a
+`Sender:` line; `status` and `inbox` return it as `envelope`:
+
+| field | meaning |
+|---|---|
+| `provider`, `session_id` | routing identity from the actual session, never from the request |
+| `identity_basis` | how the session was established (`environment-claimed`, `ancestor-registry`, `verified-native-socket`) |
+| `display_name` | `{value, basis}`: `CCTRL_SESSION_NAME` (`claimed:CCTRL_SESSION_NAME`) or the provider's own registry name for the exact session (`provider-registry`); otherwise `unknown` |
+| `harness` | `{value, basis}`: only a caller claim (`CCTRL_HARNESS`, `claimed:CCTRL_HARNESS`); otherwise `unknown` |
+| `reported_source` | `{value, basis}`: what the provider's registry says (for example `vscode`); never treated as the harness |
+| `host` | `{value, basis}`: the local host name, observed |
+
+Nothing is inferred from cwd, title or labels, the environment is never copied
+(only the named variables are read), and the envelope grants no approval. The
+mailbox `sender` object (name, label, agent, `external_identity`, host) is the
+same snapshot idea for mailbox mail; it does not carry `harness` or
+`reported_source`, which are native-bridge fields.
+
 ## Receive, reply, and inspect receipts
 
 ```sh
 cctrl bridge inbox --limit 20
 # If next_cursor is non-null, fetch the next page:
 cctrl bridge inbox --after NEXT_CURSOR --limit 20
+# Inspection views (never handling surfaces):
+cctrl bridge inbox --view stranded
+cctrl bridge inbox --view history
 cctrl bridge reply MESSAGE_ID -- "Reviewed; here is the result"
 # After handling without a reply:
 cctrl bridge ack MESSAGE_ID
@@ -171,7 +258,14 @@ mailbox tools:
 | `native_reply` | original `id`, `body`; optional stable UUID `reply_id` |
 | `native_ack` | `id` of handled mail |
 | `native_status` | `id`; optional `reconcile: true` for read-only Codex queue lookup |
-| `native_inbox` | optional nonnegative integer `after`, `limit` 1..100 (default 20); follow `next_cursor` |
+| `native_inbox` | optional nonnegative integer `after`, `limit` 1..100 (default 20); optional `view`: `actionable` (default), `stranded`, `history`; follow `next_cursor` |
+| `reply_message` | mailbox reply by original message `id`, `body`; optional `subject` |
+
+Mailbox replies: `reply_message` (CLI `cctrl peer reply ID --as ME -- body`)
+binds the recipient to the original message's sender, requires the message to be
+addressed to you and already received, queues the reply and acks exactly that
+original. `send_message` is a free-form send: it is never treated as a reply and
+acks nothing, so the original stays `delivered_unacked`.
 
 Use CLI `cctrl bridge stop` to stop the endpoint. For sends/replies, generate and
 retain an optional UUID before the first attempt when client retries may occur.

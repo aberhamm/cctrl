@@ -56,8 +56,9 @@ If the session was drafting an email, PR, message, or any outward-facing
 artifact that hasn't been sent/created yet — surface it to the user before
 closing. Don't let drafts evaporate with the session.
 
-If this session enabled a native messaging endpoint, inspect `cctrl bridge inbox`
-and the status of outstanding messages. Reply or acknowledge only work actually
+If this session enabled a native messaging endpoint, inspect `cctrl bridge inbox
+--view stranded` (the default view lists only unaccepted work) and the status of
+outstanding messages. Reply or acknowledge only work actually
 handled; preserve unresolved/ambiguous message IDs in the handoff. Submitted or
 queued is not a handling receipt. After final authorized replies, run
 `cctrl bridge stop` before the final self-close so its advertised endpoint no

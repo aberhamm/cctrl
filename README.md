@@ -2018,6 +2018,7 @@ native_reply
 native_ack
 native_status
 native_inbox
+reply_message
 route_message
 peer_overview
 whoami
@@ -2034,6 +2035,10 @@ ack_message
 The `native_enable`, `native_list`, `native_send`, `native_reply`, `native_ack`,
 `native_status`, and `native_inbox` tools expose the native bridge lifecycle.
 See the [argument reference](docs/peer-messaging.md#mailbox-mcp-setup-and-startup).
+Use `reply_message` (mailbox) or `native_reply` (bridge) with the original message ID
+to reply: a plain `send_message` is uncorrelated and acknowledges nothing. `native_inbox`
+never re-lists input native delivery already accepted; see
+[delivery vs inbox vs history](docs/peer-messaging.md#delivery-inbox-history-and-handling).
 Use `native_reply` with the original message ID for correlation; a raw native
 Claude reply arrives as a new message. CLI `cctrl bridge stop` stops the endpoint.
 

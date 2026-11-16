@@ -210,8 +210,9 @@ memory and attention. One session = one purpose.
   exact `claude:SESSION_ID` / `codex:THREAD_ID` addresses. Native Claude tools can
   address the advertised Codex bridge endpoint. Claude→Claude must use actual
   Claude native tools; bridge rejects that route. Codex→Claude declares prompting
-  and may be held; never spoof modes or bypass admission. Use `bridge inbox`, `reply`,
-  `ack`, and `status` to handle correlated work. Submitted/queued is not handling;
+  and may be held; never spoof modes or bypass admission. Accepted native input is not
+  re-listed by `bridge inbox` (stranded/history views are inspection only); handle it with
+  `reply`/`ack` by message ID and use `status` to correlate. Never ACK a receipt. Submitted/queued is not handling;
   only explicit received/replied confirms it. Never resume a second Codex writer,
   borrow another session's ID, or replay an ambiguous send through fallback.
   Existing mailbox work still needs its own receive/ACK lifecycle. Stop the
