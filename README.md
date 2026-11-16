@@ -1336,6 +1336,13 @@ and exit 78, handover with `--succeeds`) lives in
 
 ### Peers
 
+For version-pinned findings on Claude Code's native cross-session sockets,
+Codex's internal collaboration and external App Server protocols, and the
+existing cctrl adapters, see
+[Native agent messaging protocols](docs/findings/native-agent-messaging-protocols.md).
+That investigation distinguishes transport acceptance from model delivery and
+handling acknowledgements, and records the remaining bridge gaps.
+
 Peers are named coding agents that other cctrl workflows can address. The peer
 registry combines manual entries from `data/peers.json` with live cctrl-managed
 tmux sessions derived from `cctrl session ls --json`. An app-owned Codex peer
