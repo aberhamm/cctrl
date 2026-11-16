@@ -412,39 +412,6 @@ class LedgerTests(unittest.TestCase):
         wire = bridge.wire_text(str(uuid.uuid4()), "codex:a", "codex:b", "Sender: name=FM (provider-registry)")
         self.assertIn("\nSender: unknown (no envelope recorded)\nSender: name=FM", wire)
 
-    def test_daemon_advertises_protocol_and_old_daemons_fail_closed_with_a_clear_message(self):
-        daemon = self.make_daemon("codex:sender")
-        caps = daemon.handle({"actor": daemon.who, "action": "capabilities"})
-        self.assertEqual(bridge.PROTOCOL, caps["protocol"])
-        self.assertIn("native_retirement", caps["features"])
-        row = {"pid": 4242, "socket": "/nowhere"}
-        old = {"ok": False, "error": {"code": "bridge-error", "message": "unknown bridge daemon action"}}
-        with patch.object(bridge, "rpc", return_value=old):
-            version = bridge.daemon_protocol(row, daemon.who)
-        self.assertEqual(1, version)
-        message = bridge.stale_message(row, daemon.who, version, "ack")
-        for part in ("pid 4242", "protocol 1", "requires protocol %d" % bridge.PROTOCOL, "Refusing to ack", "NOT restarted automatically", "held and ambiguous"):
-            self.assertIn(part, message)
-        with patch.object(bridge, "rpc", side_effect=OSError("refused")), self.assertRaises(ValueError):
-            bridge.daemon_protocol(row, daemon.who)
-
-    def test_cli_main_never_sends_ack_or_reply_through_a_stale_daemon(self):
-        import io, contextlib
-        sent = []
-        def fake_rpc(row, request):
-            sent.append(request["action"])
-            return {"ok": False, "error": {"code": "bridge-error", "message": "unknown bridge daemon action"}}
-        for command in (["ack", str(uuid.uuid4())], ["reply", str(uuid.uuid4()), "x"], ["send", "codex:" + str(uuid.uuid4()), "x"]):
-            sent.clear()
-            out = io.StringIO()
-            with patch.object(bridge, "own_actor", return_value="codex:me"), \
-                 patch.object(bridge, "ensure_daemon", return_value={"pid": 9, "socket": "/s"}), \
-                 patch.object(bridge, "rpc", fake_rpc), contextlib.redirect_stdout(out):
-                code = bridge.main(["--root", self.temp.name + "/cli", *command, "--json"] if command[0] == "ack" else ["--root", self.temp.name + "/cli", *command])
-            self.assertEqual(1, code, command)
-            self.assertEqual(["capabilities"], sent, command)
-            self.assertIn("NOT restarted automatically", out.getvalue())
-
     def test_claude_ingress_refuses_relay_and_claude_to_claude_send_is_rejected(self):
         daemon = self.make_daemon("claude:receiver")
         daemon.source_actor = lambda _: "claude:source"

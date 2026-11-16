@@ -34,9 +34,6 @@ NATIVE_OWNED = ("persisted", "submitting", "submitted", "queued", "held", "relea
 # Policy outcomes that are not authorized work either.
 NOT_WORK = ("refused", "denied", "expired", "dropped")
 VIEWS = ("actionable", "stranded", "history")
-# Daemon protocol: 1 = pre-retirement daemons (no capabilities action);
-# 2 = native queue retirement, sender envelopes and the admission gate.
-PROTOCOL = 2
 BASIS = re.compile(r"^[A-Za-z0-9:_./-]{1,60}$")
 NOT_ADMITTED = ("held",) + NOT_WORK
 WITHHELD = "[NOT ADMITTED: body withheld. Native delivery has not admitted this message; it is not authorized work and cannot be ACKed or replied to from the ledger.]"
@@ -598,8 +595,6 @@ class Daemon:
         if request.get("actor") != self.who:
             raise ValueError("bridge endpoint belongs to a different session")
         action = request.get("action")
-        if action == "capabilities":
-            return {"protocol": PROTOCOL, "features": ["native_retirement", "sender_envelope", "admission_gate"]}
         if action == "send":
             return self.send(request["to"], request["body"], mid=request.get("id"), envelope=request.get("envelope"))
         if action in {"ack", "reply"}:
@@ -776,23 +771,6 @@ def ensure_daemon(store, who):
     raise ValueError(f"bridge startup pending; inspect {log} before retrying")
 
 
-def daemon_protocol(row, who):
-    """Protocol version the live daemon speaks; 1 for daemons that predate the handshake."""
-    try:
-        response = rpc(row, {"actor": who, "action": "capabilities"})
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"bridge daemon for {who} is unreachable ({exc}); not sending anything") from exc
-    data = response.get("data") if response.get("ok") else None
-    version = data.get("protocol") if isinstance(data, dict) else 1
-    return version if isinstance(version, int) else 1
-
-
-def stale_message(row, who, version, command):
-    return (f"bridge daemon for {who} (pid {row.get('pid')}) speaks protocol {version}; this cctrl requires protocol {PROTOCOL} "
-            f"(native queue retirement, sender envelopes, admission gate). Refusing to {command} through it. That daemon still owns this "
-            "session's held and ambiguous items, so it is NOT restarted automatically. Controlled migration: see 'Daemon upgrade' in docs/peer-messaging.md.")
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.environ.get("CCTRL_NATIVE_BRIDGE_DIR", str(Path.home() / ".local/state/cctrl/native-bridge")))
@@ -844,13 +822,8 @@ def main(argv=None):
                 result = store.inbox(who, args.view, args.after, args.limit)
             else:
                 row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
-                version = daemon_protocol(row, who) if row is not None and args.command != "stop" else PROTOCOL
                 if args.command == "enable":
-                    result = {**row, "protocol": version, "protocol_required": PROTOCOL, "compatible": version >= PROTOCOL}
-                    if version < PROTOCOL:
-                        result["warning"] = stale_message(row, who, version, "send, reply or ack")
-                elif row is not None and version < PROTOCOL and args.command != "stop":
-                    raise ValueError(stale_message(row, who, version, args.command))
+                    result = row
                 elif row is None:
                     result = {"stopped": True}
                 else:

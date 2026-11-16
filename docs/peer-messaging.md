@@ -120,43 +120,6 @@ true` by `bridge status`. This marks the late arrival as already handled in the
 ledger; it cannot remove text a Claude session already received. Do not act on
 it again: check `bridge status ID`.
 
-## Daemon protocol and controlled upgrade
-
-Each endpoint daemon answers a `capabilities` request with `protocol: 2`
-(features `native_retirement`, `sender_envelope`, `admission_gate`). Daemons from
-before this change reject the request, which reads as protocol 1. The CLI (and
-therefore the MCP tools, which run the CLI) checks this before every `send`,
-`reply` and `ack` and fails closed:
-
-```
-bridge daemon for ACTOR (pid N) speaks protocol 1; this cctrl requires protocol 2
-(native queue retirement, sender envelopes, admission gate). Refusing to ack through it.
-That daemon still owns this session's held and ambiguous items, so it is NOT restarted
-automatically. Controlled migration: see 'Daemon upgrade' in docs/peer-messaging.md.
-```
-
-An unreachable daemon also refuses (`... is unreachable ...; not sending anything`).
-`bridge enable` still returns the endpoint row, plus `protocol`, `protocol_required`,
-`compatible` and, when stale, a `warning`. `inbox`, `status` and `list` are
-read-only ledger reads and keep working.
-
-### Daemon upgrade
-
-cctrl never restarts a daemon by itself. A stale daemon is the owner of this
-session's pending held and ambiguous items (provider callbacks bind its PID), so
-replacing it blindly can orphan them. Migrate deliberately, per session:
-
-1. `cctrl bridge inbox --view stranded --json` and `--view history`: note every
-   `held`, `ambiguous`, `submitting` or `persisted` item. Resolve or record them;
-   do not resend an ambiguous one.
-2. Install the new cctrl (a separate, approved step), then in that session run
-   `cctrl bridge stop --json` and wait until it reports `stopped`. If it reports
-   pending cleanup, stop and investigate; do not kill the PID.
-3. Run `cctrl bridge enable --json` and confirm `compatible: true`.
-4. Re-check `bridge status ID` for each noted item. Held items whose provider
-   callbacks died with the old process stay `held`; handle them natively, never
-   by ACK from the ledger.
-
 ## Receipts are control facts
 
 A receipt (`[cctrl-bridge receipt ... control=true]`) tells the original sender
