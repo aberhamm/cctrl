@@ -8945,13 +8945,22 @@ test_mailbox_restore_and_repair() {
 test_mailbox_concurrent_senders_ack_gc() {
     _a1_sandbox concurrent
     _a1_register_peers
+    # Atomicity stress, not a requirement that 65 contending CLI operations
+    # finish inside the production 10s lock deadline. That deadline can refuse
+    # sends without losing a write; test finite timeout behavior separately.
+    A1_ENV+=(CCTRL_MAILBOX_LOCK_TIMEOUT=60)
     local mbx="$A1_DATA/messages.jsonl" i failed=0 pid
     local -a pids=()
     local delivered
     delivered="$("${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "to ack" | jq -r '.id')"
     "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "old, to gc" >/dev/null
     for i in $(seq 1 50); do
-        "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "parallel $i" >/dev/null 2>&1 &
+        (
+            local send_rc=0
+            "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "parallel $i" \
+                >"$A1_SB/send-$i.out" 2>"$A1_SB/send-$i.err" || send_rc=$?
+            printf '%s\n' "$send_rc" > "$A1_SB/send-$i.rc"
+        ) &
         pids+=("$!")
         if (( i % 10 == 0 )); then
             "${A1_ENV[@]}" "$A1_CCTRL" peer recv --as comet --json >/dev/null 2>&1 &
@@ -8963,6 +8972,14 @@ test_mailbox_concurrent_senders_ack_gc() {
         fi
     done
     for pid in "${pids[@]}"; do wait "$pid" || true; done
+    for i in $(seq 1 50); do
+        if [[ "$(cat "$A1_SB/send-$i.rc" 2>/dev/null)" != 0 ]]; then
+            printf 'sender %s failed: ' "$i" >&2
+            cat "$A1_SB/send-$i.out" "$A1_SB/send-$i.err" >&2
+            failed=1
+        fi
+    done
+    [[ "$failed" == 0 ]] || fail "one or more stress senders failed (operations logged above)"
     jq -e . "$mbx" >/dev/null || fail "mailbox corrupt after concurrent writers"
     out="$(jq -s '[.[] | select(.body | startswith("parallel "))] | length' "$mbx")"
     [[ "$out" == 50 ]] || fail "lost messages under concurrency: $out of 50 senders landed"
