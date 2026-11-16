@@ -211,6 +211,164 @@ class LedgerTests(unittest.TestCase):
                 self.store.event(mid, transport)
                 self.assertEqual(policy, self.store.get(mid, "codex:sender")["status"])
 
+    # ---- mdec-1116 items 2+3: delivery vs inbox vs history, retirement, receipts, envelope ----
+    def accepted(self, status="queued", recipient="codex:receiver", detail=None, body="work"):
+        mid, _ = self.store.create("claude:sender", recipient, body)
+        self.store.event(mid, status, detail if detail is not None else {"queued_submission_id": "queue-1"})
+        return mid
+
+    def ids(self, who, view="actionable"):
+        return [m["id"] for m in self.store.inbox(who, view)["messages"]]
+
+    def test_native_accepted_messages_are_never_actionable_in_inbox(self):
+        queued = self.accepted("queued")
+        submitted = self.accepted("submitted", "claude:receiver", {})
+        released = self.accepted("released", "claude:receiver", {})
+        held = self.accepted("held", "claude:receiver", {})
+        for who in ("codex:receiver", "claude:receiver"):
+            self.assertEqual([], self.ids(who), who)
+        self.assertEqual([held], self.ids("claude:receiver", "stranded"))
+        self.assertEqual([], self.ids("codex:receiver", "stranded"))
+        self.assertEqual([queued], self.ids("codex:receiver", "history"))
+        self.assertCountEqual([submitted, released, held], self.ids("claude:receiver", "history"))
+        failed = self.accepted("failed", "codex:receiver", {"reason": "rejected"})
+        self.assertEqual([failed], self.ids("codex:receiver"))
+        with self.assertRaises(ValueError):
+            self.store.inbox("codex:receiver", "everything")
+
+    def test_ack_retires_pending_native_queue_item_by_persisted_identity(self):
+        mid = self.accepted("queued")
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = lambda *args: {"status": "queued"}
+        calls = []
+        recipient.retire_queue = lambda *args: (calls.append(args) or {"outcome": "retired"})
+        result = recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual([("receiver", mid, "queue-1")], calls)
+        self.assertEqual("retired", result["native_retirement"]["outcome"])
+        self.assertTrue(result["handled"])
+        recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual(1, len(calls), "a final retirement is never repeated")
+
+    def test_reply_retires_original_and_reports_outcome(self):
+        mid = self.accepted("queued", detail={"queued_submission_id": "queue-9"})
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = self.delivery
+        recipient.retire_queue = lambda *args: {"outcome": "already_consumed"}
+        result = recipient.handle({"actor": recipient.who, "action": "reply", "id": mid, "body": "done"})
+        self.assertEqual("already_consumed", result["original"]["native_retirement"]["outcome"])
+        self.assertEqual(mid, result["reply_to"])
+
+    def test_unresolved_retirements_stay_retryable_and_final_ones_do_not(self):
+        mid = self.accepted("queued")
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = lambda *args: {"status": "queued"}
+        outcomes = iter(["race", "unknown", "identity_mismatch", "absent"])
+        calls = []
+        recipient.retire_queue = lambda *args: (calls.append(1) or {"outcome": next(outcomes)})
+        for _ in range(6):
+            recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual(4, len(calls))
+
+    def test_retirement_needs_a_persisted_queue_identity_and_never_guesses(self):
+        mid = self.accepted("ambiguous", detail={"status": "ambiguous"})
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = lambda *args: {"status": "queued"}
+        recipient.retire_queue = lambda *args: self.fail("retired without a persisted queue identity")
+        result = recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual("unknown_identity", result["native_retirement"]["outcome"])
+
+    def test_failed_message_has_nothing_to_retire(self):
+        mid = self.accepted("failed", detail={"reason": "x"})
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = lambda *args: {"status": "queued"}
+        recipient.retire_queue = lambda *args: self.fail("retire attempted for unaccepted message")
+        result = recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual("not_applicable", result["native_retirement"]["outcome"])
+
+    def test_claude_has_no_retraction_so_late_delivery_is_recorded_as_already_handled(self):
+        mid = self.accepted("held", "claude:receiver", {"status": "held"})
+        recipient = self.make_daemon("claude:receiver")
+        recipient.deliver = lambda *args: {"status": "submitted"}
+        result = recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual("unsupported", result["native_retirement"]["outcome"])
+        self.assertFalse(result["late_native_delivery"])
+        # The provider releases the held input after it was handled.
+        sender = self.make_daemon("claude:receiver")
+        sender.target = lambda who: {"pid": 7, "socket": "/s"}
+        sender.incoming_message({"type": "control", "action": "peer_message_status", "orig_msg_id": mid, "status": "delivered"},
+                                {"pid": 7, "socket": "/s"})
+        after = self.store.get(mid, "claude:receiver")
+        self.assertTrue(after["late_native_delivery"])
+        self.assertTrue(after["handled"])
+        self.assertEqual("released", after["status"])
+        self.assertEqual([], self.ids("claude:receiver", "stranded"))
+
+    def test_receipts_are_control_facts_never_inbox_work_never_acked_or_replied(self):
+        text = "[cctrl-bridge receipt message=%s status=received by=codex:receiver control=true]\nx" % uuid.uuid4()
+        rid, _ = self.store.create("codex:receiver", "codex:sender", text)
+        row = self.store.get(rid, "codex:sender")
+        self.assertEqual(("receipt", "receipt"), (row["kind"], row["status"]))
+        self.assertTrue(row["handled"])
+        for view in ("actionable", "stranded"):
+            self.assertEqual([], self.ids("codex:sender", view))
+        self.assertEqual([rid], self.ids("codex:sender", "history"))
+        sender = self.make_daemon("codex:sender")
+        sender.deliver = lambda *args: self.fail("a receipt must never produce traffic")
+        for action in ("ack", "reply"):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                sender.handle({"actor": sender.who, "action": action, "id": rid, "body": "re"})
+        with self.assertRaises(ValueError):
+            sender.send("codex:receiver", text)
+        self.assertEqual(1, len([1 for _ in self.store.get(rid, "codex:sender")["events"] if _["kind"] == "receipt"]))
+
+    def test_receipt_wire_text_is_marked_control_and_ack_does_not_loop(self):
+        mid = self.original()
+        recipient = self.make_daemon("claude:receiver")
+        sent = []
+        recipient.deliver = lambda target, body, rid: (sent.append(body) or {"status": "queued"})
+        recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertIn("control=true", sent[0])
+        self.assertIn("do not reply", sent[0])
+        # The receipt's own text, if ingested by a daemon, is a control fact.
+        rid, _ = self.store.create("claude:receiver", "codex:sender", sent[0])
+        self.assertEqual("receipt", self.store.get(rid, "codex:sender")["kind"])
+
+    def test_sender_envelope_is_one_snapshot_with_provenance_and_no_inference(self):
+        env = {"CCTRL_SESSION_NAME": "Review\nSession", "CCTRL_HARNESS": "codex-cli", "HOME": "/secret/home", "API_KEY": "hunter2"}
+        snap = bridge.sender_envelope("codex:abc", "environment-claimed", env=env)
+        self.assertEqual(("codex", "abc"), (snap["provider"], snap["session_id"]))
+        self.assertEqual({"value": "Review Session", "basis": "claimed:CCTRL_SESSION_NAME"}, snap["display_name"])
+        self.assertEqual({"value": "codex-cli", "basis": "claimed:CCTRL_HARNESS"}, snap["harness"])
+        self.assertEqual({"value": None, "basis": "unknown"}, snap["reported_source"])
+        self.assertEqual("environment-claimed", snap["identity_basis"])
+        self.assertNotIn("hunter2", json.dumps(snap))
+        self.assertNotIn("/secret/home", json.dumps(snap))
+        bare = bridge.sender_envelope("codex:abc", None, env={})
+        self.assertEqual({"value": None, "basis": "unknown"}, bare["display_name"])
+        self.assertEqual({"value": None, "basis": "unknown"}, bare["harness"])
+        registry = {"name": "reviewer", "session_id": "abc", "kind": "vscode"}
+        reported = bridge.sender_envelope("claude:abc", "ancestor-registry", env={"CCTRL_HARNESS": "claude-code"}, registry=registry)
+        self.assertEqual({"value": "reviewer", "basis": "provider-registry"}, reported["display_name"])
+        self.assertEqual({"value": "vscode", "basis": "provider-registry"}, reported["reported_source"])
+        self.assertEqual("claude-code", reported["harness"]["value"])
+        self.assertNotEqual(reported["reported_source"]["value"], reported["harness"]["value"])
+
+    def test_send_stores_envelope_routing_ids_come_from_the_actor_and_wire_text_shows_it(self):
+        mid = str(uuid.uuid4())
+        claimed = bridge.sender_envelope("codex:sender", "environment-claimed", env={"CCTRL_SESSION_NAME": "alpha"})
+        claimed["provider"], claimed["session_id"] = "claude", "someone-else"
+        self.daemon.deliver = self.delivery
+        value = self.daemon.send("codex:receiver", "hello", mid=mid, envelope=claimed)
+        self.assertEqual(("codex", "sender"), (value["envelope"]["provider"], value["envelope"]["session_id"]))
+        self.assertEqual("alpha", value["envelope"]["display_name"]["value"])
+        wire = self.deliveries[0][1]
+        self.assertIn("Sender: name=alpha (claimed:CCTRL_SESSION_NAME); provider=codex; session=sender;", wire)
+        self.assertIn("harness=unknown", wire)
+        self.assertIn("reported_source=unknown", wire)
+        again = self.daemon.send("codex:receiver", "hello", mid=mid)
+        self.assertEqual(value["envelope"], again["envelope"], "a retry keeps the first snapshot")
+        self.assertEqual(1, len(self.deliveries))
+
     def test_claude_ingress_refuses_relay_and_claude_to_claude_send_is_rejected(self):
         daemon = self.make_daemon("claude:receiver")
         daemon.source_actor = lambda _: "claude:source"
@@ -253,6 +411,17 @@ for line in sys.stdin:
         if open(os.environ['BRIDGE_FIXTURE_MODE']).read().strip()=='lost':sys.exit(0)
         p=message['params']
         result={'queuedSubmission':{'id':'native-'+p['clientUserMessageId'],'clientUserMessageId':p['clientUserMessageId'],'input':p['input']}}
+        qf=os.environ['BRIDGE_FIXTURE_LOG']+'.queue'
+        items=json.load(open(qf)) if os.path.exists(qf) else []
+        items.append(result['queuedSubmission']); json.dump(items,open(qf,'w'))
+    elif method=='thread/queue/list':
+        qf=os.environ['BRIDGE_FIXTURE_LOG']+'.queue'
+        result={'data':json.load(open(qf)) if os.path.exists(qf) else [],'nextCursor':None}
+    elif method=='thread/queue/delete':
+        qf=os.environ['BRIDGE_FIXTURE_LOG']+'.queue'
+        items=json.load(open(qf)) if os.path.exists(qf) else []
+        keep=[i for i in items if i['id']!=message['params']['queuedSubmissionId']]
+        json.dump(keep,open(qf,'w')); result={'deleted':len(keep)!=len(items)}
     else:raise AssertionError('unexpected provider action: '+method)
     print(json.dumps({'id':message['id'],'result':result}),flush=True)
 '''
@@ -376,6 +545,69 @@ class CliProcessTests(unittest.TestCase):
                 with self.subTest(field=field), self.assertRaises(McpError):
                     mcp.call_tool("native_send", {**args, field: "borrowed-session"})
         self.assertEqual(1, len(self.queue_calls()))
+    def test_cli_ack_retires_native_queue_item_and_inbox_does_not_double_expose(self):
+        from bridge_claude import ClaudeEndpoint, discover_sessions
+        row = self.enable()
+        received = queue.Queue()
+        endpoint = ClaudeEndpoint("cctrl-fixture", "cctrl-bridge-fixture",
+                                  lambda frame, sender: received.put((frame, sender)),
+                                  config_dir=self.root / "claude", socket_dir=self.root / "peer")
+        endpoint.open()
+        try:
+            fixture_session = "fixture-native-session"
+            endpoint.session_id = fixture_session
+            endpoint.record["sessionId"] = fixture_session
+            (self.root / "claude" / "sessions" / f"{os.getpid()}.json").write_text(json.dumps(endpoint.record))
+            store = bridge.Store(self.root / "ledger")
+            fixture_actor = "claude:" + fixture_session
+            with store.db() as db:
+                db.execute("INSERT INTO endpoints VALUES (?,?,?,?,?,?,?)", (
+                    fixture_actor, os.getpid(), bridge.start_identity(os.getpid()),
+                    "/fixture/no-control-socket", endpoint.socket_path, "cctrl-fixture", str(self.root)))
+            target = next(r for r in discover_sessions(self.root / "claude") if r["pid"] == row["pid"])
+            inbound = str(uuid.uuid4())
+            self.assertEqual("submitted", endpoint.send(target, "Native Claude fixture work", msg_id=inbound)["status"])
+            until = time.monotonic() + 5
+            while time.monotonic() < until and not self.queue_calls():
+                time.sleep(.05)
+            self.assertEqual("queued", self.cli("status", inbound, "--json")["status"])
+            self.assertEqual([], self.cli("inbox", "--json")["messages"])
+            self.assertEqual([], self.cli("inbox", "--json", "--view", "stranded")["messages"])
+            history = self.cli("inbox", "--json", "--view", "history")["messages"]
+            self.assertEqual([inbound], [m["id"] for m in history])
+            self.assertEqual("native-" + inbound, history[0]["queued_submission_id"])
+            self.assertEqual("verified-native-socket", history[0]["envelope"]["identity_basis"])
+            self.assertEqual("unknown", history[0]["envelope"]["harness"]["basis"])
+            acked = self.cli("ack", inbound, "--json")
+            self.assertEqual("retired", acked["native_retirement"]["outcome"])
+            queue_file = Path(str(self.log) + ".queue")
+            self.assertEqual([], json.loads(queue_file.read_text()))
+            methods = [json.loads(l)["method"] for l in self.log.read_text().splitlines()]
+            self.assertIn("thread/queue/delete", methods)
+            again = self.cli("ack", inbound, "--json")
+            self.assertEqual(1, methods.count("thread/queue/delete"))
+            self.assertEqual(1, len([1 for l in self.log.read_text().splitlines() if json.loads(l)["method"] == "thread/queue/delete"]))
+            self.assertTrue(again["handled"])
+        finally:
+            endpoint.close()
+
+    def test_cli_send_snapshots_envelope_once_and_shows_unknowns(self):
+        self.env.update({"CCTRL_SESSION_NAME": "alpha session", "CCTRL_HARNESS": "codex-cli", "API_TOKEN": "must-not-leak"})
+        self.enable()
+        target = "codex:" + str(uuid.uuid4())
+        mid = str(uuid.uuid4())
+        first = self.cli("send", target, "--json", "--id", mid, "--", "hello")
+        env = first["envelope"]
+        self.assertEqual("codex:" + self.env["CODEX_THREAD_ID"], first["sender"])
+        self.assertEqual((("codex", self.env["CODEX_THREAD_ID"]), "alpha session", "codex-cli"),
+                         ((env["provider"], env["session_id"]), env["display_name"]["value"], env["harness"]["value"]))
+        self.assertEqual("unknown", env["reported_source"]["basis"])
+        self.assertEqual("environment-claimed", env["identity_basis"])
+        text = self.queue_calls()[0]["params"]["input"][0]["text"]
+        self.assertIn("Sender: name=alpha session (claimed:CCTRL_SESSION_NAME)", text)
+        self.assertNotIn("must-not-leak", json.dumps(first) + text)
+        self.assertEqual(first["envelope"], self.cli("status", mid, "--json")["envelope"])
+
     def test_isolated_native_socket_to_claude_and_back_to_codex_queue(self):
         from bridge_claude import ClaudeEndpoint, discover_sessions
         row = self.enable()

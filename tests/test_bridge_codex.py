@@ -113,6 +113,46 @@ class QueueTests(unittest.TestCase):
         self.assertIn("cleanup_error", result)
 
 
+class RetireTests(unittest.TestCase):
+    def test_retire_deletes_only_the_exactly_identified_item(self):
+        client = Client([{"data": [item(client="other", queue_id="o")], "nextCursor": "n"},
+                         {"data": [item()], "nextCursor": None}, {"deleted": True}])
+        result = bridge_codex.retire("thread", "attempt", "queued-1", client=client)
+        self.assertEqual("retired", result["outcome"])
+        self.assertEqual(("thread/queue/delete", {"threadId": "thread", "queuedSubmissionId": "queued-1"}), client.calls[-1])
+        self.assertEqual(["thread/queue/list"] * 2 + ["thread/queue/delete"], [c[0] for c in client.calls])
+
+    def test_retire_absent_never_deletes(self):
+        client = Client([{"data": [item(client="other")], "nextCursor": None}])
+        self.assertEqual("absent", bridge_codex.retire("thread", "attempt", "queued-1", client=client)["outcome"])
+        self.assertEqual(["thread/queue/list"], [c[0] for c in client.calls])
+
+    def test_retire_refuses_identity_mismatch_without_touching_the_queue(self):
+        for entries in ([item(queue_id="someone-elses")], [item(), item(queue_id="queued-2")]):
+            client = Client([{"data": entries, "nextCursor": None}])
+            self.assertEqual("identity_mismatch", bridge_codex.retire("thread", "attempt", "queued-1", client=client)["outcome"])
+            self.assertEqual(["thread/queue/list"], [c[0] for c in client.calls])
+
+    def test_retire_never_matches_on_text(self):
+        client = Client([{"data": [item(text="other body")], "nextCursor": None}, {"deleted": True}])
+        self.assertEqual("retired", bridge_codex.retire("thread", "attempt", "queued-1", client=client)["outcome"])
+        client = Client([{"data": [item(client="other", text="hello")], "nextCursor": None}])
+        self.assertEqual("absent", bridge_codex.retire("thread", "attempt", "queued-1", client=client)["outcome"])
+
+    def test_retire_race_outcomes(self):
+        gone = Client([{"data": [item()], "nextCursor": None}, {"deleted": False}, {"data": [], "nextCursor": None}])
+        self.assertEqual("already_consumed", bridge_codex.retire("thread", "attempt", "queued-1", client=gone)["outcome"])
+        still = Client([{"data": [item()], "nextCursor": None}, {"deleted": False}, {"data": [item()], "nextCursor": None}])
+        self.assertEqual("race", bridge_codex.retire("thread", "attempt", "queued-1", client=still)["outcome"])
+
+    def test_retire_transport_loss_and_bad_identity_are_unknown_not_assumed(self):
+        lost = Client([{"data": [item()], "nextCursor": None}, TimeoutError("lost")])
+        self.assertEqual("unknown", bridge_codex.retire("thread", "attempt", "queued-1", client=lost)["outcome"])
+        bad = Client([])
+        self.assertEqual("unknown", bridge_codex.retire("thread", "a/b", "queued-1", client=bad)["outcome"])
+        self.assertEqual([], bad.calls)
+
+
 PROXY = r'''#!/usr/bin/env python3
 import json, os, sys
 for line in sys.stdin:

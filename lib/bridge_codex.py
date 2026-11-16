@@ -172,3 +172,89 @@ def reconcile(thread_id: str, text: str, client_id: str, runtime: Runtime | None
             return _failed(exc, ambiguous=True)
 
     return {**_with_client(find, runtime, client), **identity}
+
+
+def _list_matches(connection: Any, thread_id: str, client_id: str) -> list[dict[str, Any]]:
+    """Return queued submissions whose clientUserMessageId equals client_id."""
+    cursor = None
+    seen = set()
+    matches = []
+    for _ in range(100):
+        params = {"threadId": thread_id, "limit": 100}
+        if cursor is not None:
+            params["cursor"] = cursor
+        response = connection.request("thread/queue/list", params)
+        if not isinstance(response, dict) or not isinstance(response.get("data"), list):
+            raise ValueError("malformed native queue page")
+        for entry in response["data"]:
+            if not isinstance(entry, dict):
+                raise ValueError("malformed queued submission")
+            if entry.get("clientUserMessageId") == client_id:
+                matches.append(entry)
+        if "nextCursor" not in response:
+            raise ValueError("native queue page has no pagination state")
+        cursor = response["nextCursor"]
+        if cursor is None:
+            return matches
+        if not isinstance(cursor, str) or not cursor or cursor in seen:
+            raise ValueError("invalid native queue pagination cursor")
+        seen.add(cursor)
+    raise ValueError("native queue pagination limit reached")
+
+
+def retire(thread_id: str, client_id: str, queued_id: str, runtime: Runtime | None = None,
+           *, client: Any = None) -> dict[str, Any]:
+    """Retire one pending native queue item that this bridge itself submitted.
+
+    Uses the supported thread/queue/delete request, only after thread/queue/list
+    shows exactly one entry whose clientUserMessageId AND queued submission ID
+    both equal the persisted attempt identity. Message text is never consulted.
+    Outcomes (key "outcome"):
+      retired          the item was pending and the provider deleted it
+      absent           not in the queue; it may already have been consumed, and
+                       absence is not proof either way (never replay)
+      already_consumed delete reported nothing to delete and a re-list shows the
+                       item gone: the owner consumed it inside the window
+      race             delete reported nothing to delete yet the item is still
+                       listed; left untouched for a later explicit retry
+      identity_mismatch the queue holds this client ID under a different queue
+                       ID, or several entries: nothing deleted
+      unknown          transport or protocol failure; deletion may or may not
+                       have happened, so callers must not assume either
+    """
+    try:
+        _identity(thread_id, "x", client_id)
+        _identity(thread_id, "x", queued_id)
+    except Exception as exc:
+        return {"outcome": "unknown", "reason": str(exc)}
+
+    def act(connection: Any) -> dict[str, Any]:
+        try:
+            matches = _list_matches(connection, thread_id, client_id)
+            if not matches:
+                return {"outcome": "absent",
+                        "reason": "not in the native queue; it may already have been consumed"}
+            if len(matches) != 1 or matches[0].get("id") != queued_id:
+                return {"outcome": "identity_mismatch",
+                        "reason": "queue entry does not match the persisted submission identity; nothing deleted"}
+            response = connection.request("thread/queue/delete", {
+                "threadId": thread_id, "queuedSubmissionId": queued_id})
+            if not isinstance(response, dict) or not isinstance(response.get("deleted"), bool):
+                raise ValueError("malformed queue delete response")
+            if response["deleted"]:
+                return {"outcome": "retired"}
+            still = _list_matches(connection, thread_id, client_id)
+            if still:
+                return {"outcome": "race",
+                        "reason": "provider reported nothing deleted but the item is still queued"}
+            return {"outcome": "already_consumed",
+                    "reason": "item left the queue before delete took effect"}
+        except Exception as exc:
+            return {"outcome": "unknown", "reason": str(exc), "error": _error(exc)}
+
+    result = _with_client(act, runtime, client)
+    if "outcome" not in result:
+        result = {"outcome": "unknown", "reason": result.get("reason", "native queue unavailable"),
+                  "error": result.get("error")}
+    return {**result, "thread_id": thread_id, "client_id": client_id,
+            "queued_submission_id": queued_id}
