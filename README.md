@@ -2,6 +2,14 @@
 
 A CLI for managing local coding-agent sessions, profiles, costs, and developer environment. The default runtime is configurable, and `cctrl` prompts for an agent when no default is set. Built for power users who run multiple projects, track token spend, and sometimes SSH into their Mac to kick off sessions remotely.
 
+## Find the right documentation
+
+[Documentation by task](docs/README.md) routes to command guidance, agent
+contracts, role skills, and investigation findings. For messaging, start with
+[peer commands](#peers) or the [agent peer contract](AGENTS.md#peer-messaging);
+for provider integration, read the
+[Claude/Codex protocol overview](docs/findings/native-agent-messaging-protocols.md).
+
 ## What it does
 
 - **Profile switching** — swap between settings configs (API keys, models, hooks, permissions) with one command

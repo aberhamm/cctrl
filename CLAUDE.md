@@ -1,4 +1,12 @@
 
+## Documentation routing
+
+Start with the [task index](./docs/README.md). Use the
+[agent peer contract](./AGENTS.md#peer-messaging) for peer operation; use the
+[native messaging overview](./docs/findings/native-agent-messaging-protocols.md)
+for Claude/Codex protocol integration or diagnosis, opening deeper sections only
+when needed.
+
 ## Fleet roles
 
 See [AGENTS.md](./AGENTS.md) for the fleet role skills shipped with cctrl.

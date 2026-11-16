@@ -3,6 +3,15 @@
 cctrl is a CLI for managing coding-agent sessions (fleet view, per-session
 state, profiles, costs, peer messaging). See [README.md](./README.md).
 
+## Documentation routing
+
+Use the [task index](docs/README.md) to select the relevant reference. For
+ordinary peer operation, follow the [peer contract below](#peer-messaging).
+For Claude/Codex provider integration or messaging diagnosis, start with the
+[native protocol overview](docs/findings/native-agent-messaging-protocols.md),
+then its linked adapter, wire-format, or evidence section as needed. Findings
+describe version-pinned evidence; they do not override operating contracts.
+
 ## Fleet roles
 
 cctrl ships reusable, environment-agnostic **skills** (single source of truth —
