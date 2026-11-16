@@ -115,6 +115,14 @@ an ambiguous receipt is never replayed, so there are no receipt/ACK loops.
 
 ## Sender envelope
 
+Codex sessions started outside cctrl need no setup for a name: the sender's CLI/MCP
+call reads the thread title and origin with a read-only `thread/read` (no turns, no
+resume, no history writer); if that fails or the thread is untitled they stay
+`unknown`. To label a session explicitly, pass `--name`/`--harness` on `bridge
+send|reply` (MCP `native_send`/`native_reply` `name`, `harness`) or export
+`CCTRL_SESSION_NAME` / `CCTRL_HARNESS` once in the agent's startup; they are
+recorded as claims and a provider-reported title wins over them.
+
 Every bridge message carries one sender snapshot, taken once where the session is
 owned (the sending CLI/MCP call, or the daemon for native ingress) and persisted
 with the message. A retry keeps the first snapshot. The wire text shows it on a
@@ -124,9 +132,9 @@ with the message. A retry keeps the first snapshot. The wire text shows it on a
 |---|---|
 | `provider`, `session_id` | routing identity from the actual session, never from the request |
 | `identity_basis` | how the session was established (`environment-claimed`, `ancestor-registry`, `verified-native-socket`) |
-| `display_name` | `{value, basis}`: `CCTRL_SESSION_NAME` (`claimed:CCTRL_SESSION_NAME`) or the provider's own registry name for the exact session (`provider-registry`); otherwise `unknown` |
-| `harness` | `{value, basis}`: only a caller claim (`CCTRL_HARNESS`, `claimed:CCTRL_HARNESS`); otherwise `unknown` |
-| `reported_source` | `{value, basis}`: what the provider's registry says (for example `vscode`); never treated as the harness |
+| `display_name` | `{value, basis}`: the provider's own title for the exact session (Claude registry `provider-registry`; Codex read-only `thread/read` name, `provider-reported:thread/read`), else a caller claim (`--name`, then `CCTRL_SESSION_NAME`, basis `claimed:...`), else `unknown` |
+| `harness` | `{value, basis}`: only a caller claim (`--harness`, then `CCTRL_HARNESS`; `claimed:...`); otherwise `unknown` |
+| `reported_source` | `{value, basis}`: the provider's origin (for example Codex `thread/read` `source`: `vscode`, `cli`); never treated as the harness |
 | `host` | `{value, basis}`: the local host name, observed |
 
 Nothing is inferred from cwd, title or labels, the environment is never copied

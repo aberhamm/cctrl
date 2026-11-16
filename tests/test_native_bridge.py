@@ -414,6 +414,9 @@ for line in sys.stdin:
         qf=os.environ['BRIDGE_FIXTURE_LOG']+'.queue'
         items=json.load(open(qf)) if os.path.exists(qf) else []
         items.append(result['queuedSubmission']); json.dump(items,open(qf,'w'))
+    elif method=='thread/read':
+        assert message['params']['includeTurns'] is False
+        result={'thread':{'id':message['params']['threadId'],'name':os.environ.get('BRIDGE_FIXTURE_THREAD_NAME') or None,'source':'vscode'}}
     elif method=='thread/queue/list':
         qf=os.environ['BRIDGE_FIXTURE_LOG']+'.queue'
         result={'data':json.load(open(qf)) if os.path.exists(qf) else [],'nextCursor':None}
@@ -591,6 +594,25 @@ class CliProcessTests(unittest.TestCase):
         finally:
             endpoint.close()
 
+    def test_cli_codex_envelope_uses_provider_thread_name_and_keeps_harness_separate(self):
+        self.env.update({"BRIDGE_FIXTURE_THREAD_NAME": "Provider Title", "CCTRL_SESSION_NAME": "claimed title"})
+        self.enable()
+        target = "codex:" + str(uuid.uuid4())
+        sent = self.cli("send", target, "--json", "--harness", "codex-cli", "--", "hello")
+        env = sent["envelope"]
+        self.assertEqual({"value": "Provider Title", "basis": "provider-reported:thread/read"}, env["display_name"])
+        self.assertEqual({"value": "vscode", "basis": "provider-reported:thread/read"}, env["reported_source"])
+        self.assertEqual({"value": "codex-cli", "basis": "claimed:--harness"}, env["harness"])
+        calls = [json.loads(l) for l in self.log.read_text().splitlines()]
+        self.assertEqual(1, len([c for c in calls if c["method"] == "thread/read"]))
+        self.assertTrue(all(c["method"] != "thread/resume" for c in calls))
+
+    def test_cli_explicit_name_claim_is_marked_claimed_when_provider_has_no_title(self):
+        self.enable()
+        sent = self.cli("send", "codex:" + str(uuid.uuid4()), "--json", "--name", "ops reviewer", "--", "hello")
+        self.assertEqual({"value": "ops reviewer", "basis": "claimed:--name"}, sent["envelope"]["display_name"])
+        self.assertEqual("unknown", sent["envelope"]["harness"]["basis"])
+
     def test_cli_send_snapshots_envelope_once_and_shows_unknowns(self):
         self.env.update({"CCTRL_SESSION_NAME": "alpha session", "CCTRL_HARNESS": "codex-cli", "API_TOKEN": "must-not-leak"})
         self.enable()
@@ -601,7 +623,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual("codex:" + self.env["CODEX_THREAD_ID"], first["sender"])
         self.assertEqual((("codex", self.env["CODEX_THREAD_ID"]), "alpha session", "codex-cli"),
                          ((env["provider"], env["session_id"]), env["display_name"]["value"], env["harness"]["value"]))
-        self.assertEqual("unknown", env["reported_source"]["basis"])
+        self.assertEqual("provider-reported:thread/read", env["reported_source"]["basis"])
         self.assertEqual("environment-claimed", env["identity_basis"])
         text = self.queue_calls()[0]["params"]["input"][0]["text"]
         self.assertIn("Sender: name=alpha session (claimed:CCTRL_SESSION_NAME)", text)

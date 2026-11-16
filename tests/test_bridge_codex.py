@@ -122,6 +122,13 @@ class RetireTests(unittest.TestCase):
         self.assertEqual(("thread/queue/delete", {"threadId": "thread", "queuedSubmissionId": "queued-1"}), client.calls[-1])
         self.assertEqual(["thread/queue/list"] * 2 + ["thread/queue/delete"], [c[0] for c in client.calls])
 
+    def test_thread_facts_reads_title_and_source_only(self):
+        client = Client([{"thread": {"id": "t", "name": "Title", "source": "vscode"}}])
+        self.assertEqual({"status": "ok", "name": "Title", "source": "vscode"}, bridge_codex.thread_facts("t", client=client))
+        self.assertEqual([("thread/read", {"threadId": "t", "includeTurns": False})], client.calls)
+        self.assertEqual({}, bridge_codex.thread_facts("t", client=Client([TimeoutError("x")])))
+        self.assertEqual({}, bridge_codex.thread_facts("t", client=Client([{"thread": {"id": "other"}}])))
+
     def test_retire_absent_never_deletes(self):
         client = Client([{"data": [item(client="other")], "nextCursor": None}])
         self.assertEqual("absent", bridge_codex.retire("thread", "attempt", "queued-1", client=client)["outcome"])

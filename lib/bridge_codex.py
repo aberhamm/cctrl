@@ -258,3 +258,33 @@ def retire(thread_id: str, client_id: str, queued_id: str, runtime: Runtime | No
                   "error": result.get("error")}
     return {**result, "thread_id": thread_id, "client_id": client_id,
             "queued_submission_id": queued_id}
+
+
+def thread_facts(thread_id: str, runtime: Runtime | None = None, *, client: Any = None) -> dict[str, Any]:
+    """Read-only provider-reported thread title and origin (thread/read, no turns).
+
+    Never resumes the thread or takes its history writer. Any failure returns
+    {} so callers record the fields as unknown instead of guessing.
+    """
+    try:
+        _identity(thread_id, "x", "x")
+    except Exception:
+        return {}
+
+    def read(connection: Any) -> dict[str, Any]:
+        try:
+            response = connection.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+            thread = response.get("thread") if isinstance(response, dict) else None
+            if not isinstance(thread, dict) or thread.get("id", thread_id) != thread_id:
+                return {"status": "failed"}
+            source = thread.get("source")
+            if isinstance(source, dict):
+                source = next(iter(source), None)
+            return {"status": "ok",
+                    "name": thread.get("name") if isinstance(thread.get("name"), str) else None,
+                    "source": source if isinstance(source, str) else None}
+        except Exception:
+            return {"status": "failed"}
+
+    result = _with_client(read, runtime, client)
+    return result if result.get("status") == "ok" else {}

@@ -59,6 +59,14 @@ def own_actor():
 def own_registry(who):
     """The provider's own live record for this exact Claude session, if any."""
     provider, session = who.split(":", 1)
+    if provider == "codex":
+        try:
+            from bridge_codex import thread_facts
+            facts = thread_facts(session)
+        except Exception:
+            return None
+        return ({"name": facts.get("name"), "kind": facts.get("source"),
+                 "basis": "provider-reported:thread/read"} if facts else None)
     if provider != "claude":
         return None
     try:
@@ -83,7 +91,7 @@ def known(value, basis):
     return {"value": value, "basis": basis if value else "unknown"}
 
 
-def sender_envelope(who, identity_basis=None, env=None, registry=None):
+def sender_envelope(who, identity_basis=None, env=None, registry=None, name_claim=None, harness_claim=None):
     """One snapshot of what is genuinely known about the sending session.
 
     Taken once, at the boundary that owns the session (the CLI/MCP client for an
@@ -96,18 +104,24 @@ def sender_envelope(who, identity_basis=None, env=None, registry=None):
     """
     env = os.environ if env is None else env
     provider, session = who.split(":", 1)
-    name = known(env.get("CCTRL_SESSION_NAME"), "claimed:CCTRL_SESSION_NAME")
+    name = known(name_claim, "claimed:--name")
+    if not name["value"]:
+        name = known(env.get("CCTRL_SESSION_NAME"), "claimed:CCTRL_SESSION_NAME")
     source = known(None, "unknown")
     if registry:
-        # Exact provider-session match in the provider's own registry only.
+        # Exact provider-session match in the provider's own record only. A
+        # provider-reported title outranks a caller claim; the reported source
+        # (cli, vscode, ...) is the provider's origin, never the harness.
+        basis = registry.get("basis") or "provider-registry"
         if clean_text(registry.get("name")) and registry.get("name") != registry.get("session_id"):
-            name = known(registry.get("name"), "provider-registry")
-        source = known(registry.get("kind"), "provider-registry")
+            name = known(registry.get("name"), basis)
+        source = known(registry.get("kind"), basis)
     return {
         "v": 1, "provider": provider, "session_id": session,
         "identity_basis": clean_text(identity_basis) or "unknown",
         "display_name": name,
-        "harness": known(env.get("CCTRL_HARNESS"), "claimed:CCTRL_HARNESS"),
+        "harness": (known(harness_claim, "claimed:--harness") if clean_text(harness_claim)
+                    else known(env.get("CCTRL_HARNESS"), "claimed:CCTRL_HARNESS")),
         "reported_source": source,
         "host": known(socket.gethostname().split(".")[0], "observed:local-host"),
     }
@@ -743,6 +757,8 @@ def main(argv=None):
             item.add_argument("--reconcile", action="store_true", help="read-only native Codex queue lookup; absence never licenses replay")
         if name in {"send", "reply"}:
             item.add_argument("--id", help="stable UUID for idempotent client retries")
+            item.add_argument("--name", help="explicit display-name claim for the sender envelope (recorded as claimed)")
+            item.add_argument("--harness", help="explicit harness claim, e.g. codex-cli (recorded as claimed, never as the provider-reported source)")
             item.add_argument("body", nargs="+")
     service = sub.add_parser("_serve", help=argparse.SUPPRESS)
     service.add_argument("actor")
@@ -779,7 +795,8 @@ def main(argv=None):
                 else:
                     request = {"actor": who, "action": args.command}
                     if args.command in {"send", "reply"}:
-                        request["envelope"] = sender_envelope(who, own_identity().get("basis"), registry=own_registry(who))
+                        request["envelope"] = sender_envelope(who, own_identity().get("basis"), registry=own_registry(who),
+                                                        name_claim=args.name, harness_claim=args.harness)
                     if args.command in {"send", "reply", "ack"}:
                         request["to" if args.command == "send" else "id"] = args.target
                     if args.command in {"send", "reply"}:
