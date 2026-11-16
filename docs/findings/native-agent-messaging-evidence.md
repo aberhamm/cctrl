@@ -7,6 +7,9 @@ The [Claude reference](native-agent-messaging-claude.md) and
 
 ## Evidence and verification scope
 
+The table pins the original read-only investigation. Subsequent bridge tests
+and the isolated installed-Claude smoke are described separately below.
+
 | Target | Baseline | Evidence |
 |---|---|---|
 | Claude Code | `2.1.325`, embedded build commit `a360e7297ecfcddeae9ec99fb3c93153ed86aca4` | Static inspection of plaintext JavaScript embedded in the installed native executable; selected extracted chunks analyzed with REA |
@@ -33,13 +36,40 @@ generated schema advertised `thread/list`, `thread/read`, `thread/start`, and
 `turn/start`. This verifies transport initialization and schema availability,
 not execution of those task methods.
 
-No messages were sent to existing sessions. Turn submission, steering,
-authentication enforcement, reverse callbacks, and cross-provider round trips
-were not tested live. Windows behavior in the wire reference is source-derived, not tested on
-Windows. REA application coverage was partial: only selected shipped sources
+The original investigation sent no messages to existing sessions. Turn
+submission, steering, authentication enforcement, reverse callbacks, and
+cross-provider round trips were not tested live in that phase. Windows behavior
+in the wire reference is source-derived, not tested on Windows. REA application coverage was partial: only selected shipped sources
 were analyzed, and large chunks reached semantic-retention ceilings. Exact
 protocol fields were additionally checked directly in the preserved shipped
 text. Codex runtime implementation claims are release-source findings.
+
+## Subsequent native bridge verification
+
+An isolated smoke on the installed Claude Code `2.1.325` used only a newly
+spawned test Claude session and a bridge-owned endpoint. The native listener
+accepted a bridge frame, emitted the native cross-session peer input, and
+started a second turn. This establishes installed-Claude native ingress and
+turn wakeup for that tested configuration, beyond mere successful socket write.
+The test record reported no endpoint errors and no timeout.
+
+The spawned session's expired authentication prevented model execution: both
+turns returned an authentication error. Native model-driven `ListAgents` /
+`SendMessage`, an outbound reply, and a complete Claude/Codex model round trip
+therefore remain unverified. The retained private `live-smoke/result-transport.json`
+records ingress and the authentication limitation; no private session content,
+credentials, or machine-specific paths are included here.
+
+Isolated Claude adapter, Codex queue, bridge-ledger, and subprocess tests cover
+the implemented boundaries. A simulated two-direction bridge integration tests
+routing and reply/ACK plumbing; it does not establish real-provider model
+behavior. Read the executed test results for the current counts and scope rather
+than treating this evidence baseline as an evergreen test total.
+
+The current native endpoint implementation supports POSIX peer verification.
+Windows bridge operation fails closed when OS peer verification is unavailable;
+the source-derived Windows wire reference is not a Windows support claim.
+Native bridge discovery and IPC are local; no network messaging bridge is exposed.
 
 ## Refreshing the findings
 
@@ -59,11 +89,12 @@ substitute a third-party recovered source tree or historical team schema for
 the installed build. No bundled code or credential files need to be committed
 to cctrl to record these findings.
 
-Future compatibility verification still needs isolated end-to-end tests for
-authentication, permission-class admission, callback vetting, status/refusal
-correlation, duplicate/reconnect handling, shutdown, idle wakeup, and a full
-Claude-to-Codex reply/ACK round trip. Existing-session delivery was intentionally
-outside this read-only investigation.
+Real-provider compatibility verification still needs model-driven outbound
+messages and replies, both providers completing a reply/ACK round trip, and
+configuration-specific admission, callback, lifecycle, and authentication
+coverage. The ingress smoke verifies one default-mode Claude configuration;
+isolated module tests do not establish those real-provider cases. Existing user
+sessions were not delivery targets for this investigation.
 
 ## Source and evidence references
 

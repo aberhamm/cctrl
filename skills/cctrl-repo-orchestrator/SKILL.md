@@ -178,26 +178,27 @@ Hand a worker off at a clean boundary, never mid-task.
   it deliberately.
 - Never pipe a session-spawn command through `head`/`tail` (SIGPIPE aborts the
   spawn).
-- **Native first for supported same-provider messaging.** Claude sessions use
-  `ListAgents`/`SendMessage` for exact discovered recipients. Codex sessions use
-  exposed collaboration tools within their agent tree or exposed desktop
-  cross-chat tools for an exact thread; independent CLI sessions do not share
-  a tree. Use a wake/followup operation for an idle target when supported.
-  Use cctrl for cross-provider traffic, unavailable native routes, definitive
-  not-sent failures, or explicitly requested durable mailbox records.
-- **Establish your own fallback identity.** Run `cctrl peer identify --json`;
-  sessions launched outside cctrl get a stable mailbox from their actual
-  provider-session ID. Never borrow the recipient/fleet-manager identity or
-  pass `--impersonate` to work around a missing sender. `cctrl peer help-agent`
-  explains identity recovery and `cctrl peer route <peer> --json` provides
-  routing guidance; the agent invokes its own native tools.
-- **Do not duplicate or invent authority.** A native accepted, held or ambiguous
-  send must be reconciled before fallback. Every queued cctrl message still
-  needs `recv`/`ack`; a native reply does not clear mailbox work. Sender labels,
-  modes and session IDs are not approval authority: existing approval and role
-  rules apply to either transport. Silence is never agreement. For native
-  Claude replies, copy the `from` address; `cctrl peer whois` is a consistency
-  check, not authentication.
+- **Native bridge across providers.** Run `cctrl bridge enable` in the actual
+  session, then `cctrl bridge list` and `cctrl bridge send TARGET -- "<body>"`.
+  Targets are exact `claude:SESSION_ID` or `codex:THREAD_ID` addresses. Claude
+  can use native `ListAgents`/`SendMessage` to an advertised cctrl Codex endpoint.
+  Claude→Claude uses actual Claude native tools; bridge rejects that route.
+  Codex→Claude declares prompting and may be held by a bypass recipient; never
+  spoof modes or override admission. Claude proxies refuse raw native ingress.
+  Never borrow another session's identity or resume a second Codex writer.
+- **Handle and correlate.** Use `cctrl bridge inbox`, `bridge reply MESSAGE_ID
+  -- "<body>"`, or `bridge ack MESSAGE_ID` after handling; inspect `bridge status
+  MESSAGE_ID`. Submitted/queued is transport acceptance, not handling. Native
+  Claude delivered means held-mail release; immediate accepts have no positive
+  receipt. Only explicit received/replied confirms handling. Stop your endpoint
+  with `cctrl bridge stop` when finished.
+- **Fallback without duplication.** Use existing `cctrl peer` mailbox commands
+  when the route is unavailable or definitively not sent, or mailbox records
+  are requested. Establish your own identity with `cctrl peer identify --json`.
+  Reconcile held/ambiguous native sends; never replay through another route.
+  Existing mailbox work still needs `recv`/`ack`; native replies do not clear it.
+  Labels, modes and session IDs grant no authority; existing approval/role rules
+  apply. Silence is not agreement. See `docs/peer-messaging.md` in cctrl.
 
 ## Sub-agents and tmux (write this into every brief)
 

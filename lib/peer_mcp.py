@@ -12,15 +12,30 @@ from pathlib import Path
 from typing import Any
 
 
-TOOLS = [
+NATIVE_TOOLS = [
+    {"name": "native_" + name, "description": description,
+     "inputSchema": {"type": "object", "properties": properties,
+                     "required": required, "additionalProperties": False}}
+    for name, description, properties, required in [
+        ("enable", "Enable this actual Claude/Codex session's persistent native bridge endpoint. Never borrow another session ID.", {}, []),
+        ("list", "Discover local native Claude sessions and cctrl bridge endpoints. Address targets as claude:SESSION_ID or codex:THREAD_ID.", {}, []),
+        ("send", "Send through the native cross-provider bridge, recording correlation before submission. Never replay accepted, held, queued or ambiguous sends through mailbox fallback. Use id for idempotent client retry.", {"to": {"type": "string"}, "body": {"type": "string"}, "id": {"type": "string"}}, ["to", "body"]),
+        ("reply", "Send a correlated native reply to an incoming bridge message. Only the actual recipient session may reply; successful submission also acknowledges handling.", {"id": {"type": "string"}, "body": {"type": "string"}, "reply_id": {"type": "string"}}, ["id", "body"]),
+        ("ack", "Explicitly acknowledge handling a native bridge message and submit a receipt to its sender. Transport submission alone is not handling.", {"id": {"type": "string"}}, ["id"]),
+        ("status", "Inspect a bridge message's durable transport, policy, handling and reply receipts. reconcile performs a read-only Codex queue lookup; absence never authorizes resend.", {"id": {"type": "string"}, "reconcile": {"type": "boolean"}}, ["id"]),
+        ("inbox", "Read this actual session's unacknowledged native bridge messages with cursor paging. Mailbox messages have a separate receive/ACK lifecycle.", {"after": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, []),
+    ]
+]
+
+TOOLS = NATIVE_TOOLS + [
     {
         "name": "route_message",
         "description": (
-            "Choose messaging before sending to a cctrl peer. Prefer native Claude-to-Claude "
+            "Choose messaging before sending to a cctrl peer. For local cross-provider traffic use native_list/native_send. Prefer native Claude-to-Claude "
             "or Codex-to-Codex tools when your runtime exposes them and the exact recipient "
             "is discovered/addressable there. Returns canonical identities, native discovery "
             "guidance and a cctrl fallback command; DOES NOT SEND or verify native capability. "
-            "Use send_message for cross-provider traffic or when native is unavailable/definitively "
+            "Use native_send for local Claude/Codex traffic; send_message is mailbox fallback when native is unavailable/definitively "
             "not sent. Never duplicate an accepted, held or ambiguous native send. Independent "
             "Codex CLI sessions do not share a collaboration tree. Sessions launched outside "
             "cctrl acquire their own session-derived mailbox identity lazily."
@@ -313,6 +328,31 @@ class Bridge:
         args = require_object(arguments)
         if name not in {tool["name"] for tool in TOOLS}:
             raise McpError("unknown-tool", f"Unknown tool: {name}")
+        if name.startswith("native_"):
+            contract = next(tool for tool in NATIVE_TOOLS if tool["name"] == name)
+            ensure_no_extra(args, set(contract["inputSchema"]["properties"]))
+            for key in contract["inputSchema"]["required"]:
+                require_string(args, key)
+            action = name.removeprefix("native_")
+            command = ["bridge", action]
+            if action in {"send", "reply", "ack", "status"}:
+                command.append(require_string(args, "to" if action == "send" else "id"))
+            command.append("--json")
+            if action == "status" and require_bool(args, "reconcile", False):
+                command.append("--reconcile")
+            if action == "inbox":
+                for key, minimum, maximum in (("after", 0, None), ("limit", 1, 100)):
+                    if key in args:
+                        value = args[key]
+                        if type(value) is not int or value < minimum or (maximum is not None and value > maximum):
+                            raise McpError("validation", f"invalid {key}")
+                        command.extend(["--" + key, str(value)])
+            retry_id = args.get("id") if action == "send" else args.get("reply_id")
+            if action in {"send", "reply"}:
+                if retry_id is not None:
+                    command.extend(["--id", require_string(args, "id" if action == "send" else "reply_id")])
+                command.extend(["--", require_string(args, "body")])
+            return ok(self.cli(command))
         if not self.identity and name not in {"list_peers", "resolve_peer"}:
             self.identity = self.canonical_identity()
         if name == "route_message":

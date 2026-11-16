@@ -128,6 +128,7 @@ _cctrl() {
         'session:Manage detached sessions (ls/attach/close/kill)'
         'close:Gracefully close a tmux session (default: the one you are inside)'
         'peer:Manage addressable agent peers'
+        'bridge:Native Claude/Codex messages, replies and receipts'
         'host:Manage remote hosts'
         'whoami:Show this machine and which host aliases mean local'
         'costs:Token usage and cost breakdown'
@@ -420,6 +421,23 @@ _cctrl() {
                 '--now[Kill immediately, no grace period]' \
                 '--force[Allow closing non-cctrl sessions]' \
                 '*:session:_cctrl_tmux_sessions'
+            ;;
+        bridge)
+            if (( CURRENT == 3 )); then
+                local -a bridge_cmds=(
+                    'enable:Enable this session native endpoint'
+                    'list:Discover local native destinations'
+                    'send:Send to exact provider-qualified session'
+                    'reply:Reply to a bridge message ID'
+                    'ack:Acknowledge handling and send receipt'
+                    'status:Inspect durable delivery receipts'
+                    'inbox:Read unacknowledged native messages'
+                    'stop:Stop this session native endpoint'
+                )
+                _describe 'native bridge commands' bridge_cmds
+            else
+                _arguments '--json[Machine-readable result]' '--id[Idempotent client UUID]:UUID:' '*:target or message:'
+            fi
             ;;
         peer)
             if (( CURRENT == 3 )); then

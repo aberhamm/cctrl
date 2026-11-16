@@ -2,21 +2,25 @@
 
 Investigated 2026-11-16. These are version-pinned findings for cctrl bridge
 design, not a declaration that undocumented provider interfaces are stable.
-For current native-first routing and external-session identity, follow the
+For current native bridge operation and external-session identity, follow the
 [operating guide](../peer-messaging.md). The adapter inventory below records
-the investigation baseline; later operating policy does not change its wire evidence.
+the investigation baseline; the native bridge described in the operating guide
+is a later implementation and does not change that historical evidence.
 
 Claude Code exposes a local protocol for independently launched sessions.
 Codex's native subagent mailbox belongs to a runtime's agent tree; external
-clients use App Server or desktop host tools. cctrl already has a durable
+clients use App Server or desktop host tools. Its native queue API is distinct
+from the inter-agent mailbox. cctrl already has a durable
 mailbox and notification adapters for both providers. Completing native
 request/reply needs more than writing a prompt to either transport.
 
 ## Read only what you need
 
 Baseline: Claude Code `2.1.325`, Codex `0.167.0`, and cctrl commit `6d4adc3`.
-Protocol implementation findings are static/source-derived. Only the existing
-Codex daemon handshake was verified live; no session received a test message.
+Protocol implementation findings are static/source-derived. The original phase
+verified only the existing Codex daemon handshake live.
+A subsequent isolated installed-Claude smoke verified native ingress/turn wakeup;
+expired authentication blocked model-driven outbound messages and replies.
 See [verification scope](native-agent-messaging-evidence.md#evidence-and-verification-scope) before relying on a
 runtime or compatibility claim.
 
@@ -84,9 +88,24 @@ The bridge direction supported by this evidence is:
 5. Have the recipient use cctrl MCP/CLI to receive, reply, and ACK handled work.
    Preserve held, refused, deferred, and ambiguous outcomes separately.
 
-These are the original bridge design implications, not implemented callback
-capabilities. The later [native-first operating policy](../peer-messaging.md)
-uses the agent's exposed native tools directly where addressable, with cctrl
-as fallback. It does not require a new cctrl-owned Claude callback socket for
-every native exchange. Existing mailbox work retains its receive/ACK lifecycle;
-transport selection never grants approval authority.
+These are the original bridge design implications at `6d4adc3`, not the current
+feature inventory. The later [native bridge](../peer-messaging.md) owns a durable
+ledger and a persistent Claude-compatible endpoint for each enabled Codex
+thread. It translates native replies/status and submits Codex input through the
+connected server's native shared queue API; it does not join the internal collaboration tree or
+resume another writer. Existing peer mailbox commands remain a separate fallback
+with their original receive/ACK lifecycle.
+
+Native submitted/queued states do not establish model handling. Ordinary Claude
+immediate admission sends no positive delivery receipt; its native delivered
+status reports held-message release. Bridge received/replied stages require an
+explicit recipient action. Ambiguous native submissions must not be replayed or
+sent through fallback. Current implementation and live verification evidence
+must be checked separately; the original read-only investigation and later ingress smoke did not establish
+a complete real-provider bridge round trip.
+
+The bridge supports Claude→Codex, Codex→Claude and Codex→Codex. Claude→Claude
+uses actual native tools to preserve provider admission context; bridge sends
+reject it before submission, and Claude actor proxies refuse raw native ingress.
+Codex→Claude messages declare conservative prompting provenance, so a bypass
+recipient may hold them. No spoofed mode or admission override is used.

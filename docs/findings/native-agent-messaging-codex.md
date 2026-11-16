@@ -31,8 +31,28 @@ does not reproduce native identity, routing, or delivery.
 ## External App Server
 
 The installed binary generated an experimental `ClientRequest` schema with 180
-methods. It includes `turn/start` and `turn/steer`, but no native inter-agent
-message request. The external input sequence is:
+methods. It includes `turn/start` and `turn/steer`, but no request that joins
+an external process to the internal inter-agent mailbox. The native `thread/queue/add`
+input path is separate from that mailbox. The current cctrl bridge uses queued
+input through the connected server's native shared queue and never resumes a thread to acquire its writer.
+
+The bridge submits exactly once with a persisted correlation ID:
+
+```json
+{"id":2,"method":"thread/queue/add","params":{"threadId":"THREAD","clientUserMessageId":"BRIDGE_MESSAGE_ID","input":[{"type":"text","text":"Message"}]}}
+```
+
+The response's `queuedSubmission` supplies its native `id`, matching
+`clientUserMessageId`, and input. `thread/queue/list` supports read-only
+reconciliation. Queue absence does not prove that a submission failed: the
+owner may already have consumed it. `clientUserMessageId` is correlation data,
+not an established provider idempotency key. Neither operation resumes a thread
+or acquires its history writer. Shared-store queue consumption by an independent
+owner depends on provider support and liveness; successful insertion alone does
+not establish that a particular CLI/extension consumed it. See
+`lib/bridge_codex.py` for the current adapter.
+
+The historical notification adapter used this external input sequence:
 
 ```json
 {"id":1,"method":"initialize","params":{"clientInfo":{"name":"cctrl","version":"1"},"capabilities":{}}}
@@ -41,8 +61,10 @@ message request. The external input sequence is:
 {"id":3,"method":"turn/start","params":{"threadId":"THREAD","input":[{"type":"text","text":"Message"}]}}
 ```
 
-Resume an unloaded eligible thread through `thread/resume` before submitting
-input. Steering an active turn requires **`expectedTurnId`**, not `turnId`:
+That historical adapter resumes an eligible unloaded app-owned thread through
+`thread/resume` before submitting input. This is **not** the native bridge path:
+never resume a separately running CLI thread to deliver bridge mail. Steering
+an active turn requires **`expectedTurnId`**, not `turnId`:
 
 ```json
 {"id":4,"method":"turn/steer","params":{"threadId":"THREAD","expectedTurnId":"TURN","input":[{"type":"text","text":"Follow-up"}]}}

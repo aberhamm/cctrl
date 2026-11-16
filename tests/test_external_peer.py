@@ -112,7 +112,9 @@ class ExternalPeerTests(unittest.TestCase):
         self.assertTrue(same["native"]["requires_exact_runtime_target"])
         self.assertIn("Independent Codex CLI", same["native"]["note"])
         cross = self.cli("peer", "route", "claude-peer", "--json", identity=own)
-        self.assertEqual("cctrl-mailbox", cross["preferred_transport"])
+        self.assertEqual("native-bridge-if-available", cross["preferred_transport"])
+        self.assertTrue(cross["bridge"]["local_only"])
+        self.assertEqual(["cctrl", "bridge", "list", "--json"], cross["bridge"]["discovery"])
         self.assertIsNone(cross["native"])
         self.assertFalse((self.data / "messages.jsonl").exists())
 

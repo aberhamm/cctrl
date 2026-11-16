@@ -4,7 +4,8 @@ For bridge implementation or diagnosis. Start with the
 [messaging overview](native-agent-messaging-protocols.md) to choose the right
 surface and distinguish implemented cctrl behavior from bridge proposals.
 This reference describes installed Claude Code `2.1.325`; findings are static,
-not live delivery verification. [Evidence and limitations](native-agent-messaging-evidence.md).
+with later isolated native-ingress verification described in the evidence file;
+model-driven outbound replies remain unverified. [Evidence and limitations](native-agent-messaging-evidence.md).
 
 
 ## Discovery and framing
@@ -92,8 +93,11 @@ address**, correlated by `orig_msg_id`:
 Observed status vocabulary is `held`, `denied`, `expired`, `delivered`,
 `refused`, and `dropped`. Refusal can also be encoded as `status: "expired"`
 with `status_detail: "refused"`. Dropped receipts may include `drop_reason`
-and `dropped_msg_ids`. A native `delivered` receipt still is not a cctrl
-handling ACK.
+and `dropped_msg_ids`. Ordinary immediate admission does **not** emit a positive
+delivery receipt; native `delivered` reports release of a previously held
+message. It still is not a cctrl handling ACK. A bridge must obtain explicit
+received/replied acknowledgement instead of waiting for a positive receipt on
+every accepted send.
 
 Claude can reply with `SendMessage` to the sender address. A complete bridge
 therefore needs a persistent inbound endpoint, verified routing ownership, and

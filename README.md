@@ -15,7 +15,7 @@ for provider integration, read the
 - **Profile switching** — swap between settings configs (API keys, models, hooks, permissions) with one command
 - **Session launching** — start Claude Code or Codex with consistent flags, resume previous sessions, jump into projects via named shortcuts, or run detached so it survives SSH disconnect
 - **Session health** — provider-specific evidence for per-session STATE (waiting-input, blocked-dialog, unsent-draft, idle-done), plus `session doctor`/`autoheal` to repair Claude remote-control bridges and `session prune` to retire stale sessions
-- **Peer messaging** — sessions address each other by name: a durable local mailbox (`peer send`/`check`/`recv`/`ack`/`reply`) for async work, direct live-tmux chat (`peer say`) for a running agent, tmux doorbell nudges, and a stdio MCP bridge so tool-calling agents get the same surface
+- **Peer messaging** — native Claude/Codex bridge with exact session/thread addresses, correlated replies and handling receipts; plus a durable local mailbox (`peer send`/`check`/`recv`/`ack`/`reply`) for async work, direct live-tmux chat (`peer say`) for a running agent, tmux doorbell nudges, and a stdio MCP bridge so tool-calling agents get the same surface
 - **Fleet view** — `cctrl fleet` merges every host's sessions into one recency-sorted list; `cctrl needs-me` reports only what newly needs your attention since the last check
 - **Remote hosts** — run any cctrl command on another machine over SSH; start a detached session on your Mac from your phone and auto-attach
 - **Usage & cost tracking** — token spend by model/project/day, rate limit monitoring, billing week breakdowns
@@ -1344,31 +1344,50 @@ and exit 78, handover with `--succeeds`) lives in
 
 ### Peers
 
-**Native first for supported same-provider sessions; cctrl is the fallback.**
-Claude sessions use `ListAgents`/`SendMessage` for exact discovered recipients.
-Codex sessions use exposed collaboration tools within their agent tree or
-exposed desktop cross-chat tools; independent CLI sessions do not share that
-tree. Use cctrl for cross-provider traffic, unavailable/definitively-not-sent
-native routes, or explicitly requested durable mailbox records. Never duplicate
-an accepted, held, or ambiguous native send. The
-[operating guide](docs/peer-messaging.md) covers route selection and identity.
+**Native bridge across Claude Code and Codex sessions.** Enable the bridge in
+an actual session and discover exact addresses. Bridge sends support
+Claude→Codex, Codex→Claude, and Codex→Codex. Claude→Claude uses actual native
+`ListAgents`/`SendMessage`; bridge sends reject that route before submission. A Codex endpoint advertises a cctrl-owned Claude-compatible socket,
+so native Claude `ListAgents`/`SendMessage` can reach it too.
+Codex bridge messages to Claude declare prompting provenance; a bypass recipient
+may hold them. No mode spoofing or admission override is applied. Claude actor
+proxies refuse raw native ingress, preserving actual Claude admission context.
+
+```sh
+cctrl bridge enable
+cctrl bridge list
+# From Codex:
+cctrl bridge send claude:ACTUAL_SESSION_ID -- "Please review"
+# From Claude or Codex:
+cctrl bridge send codex:ACTUAL_THREAD_ID -- "Please review"
+cctrl bridge inbox
+cctrl bridge reply MESSAGE_ID -- "Reviewed"
+cctrl bridge ack MESSAGE_ID
+cctrl bridge status MESSAGE_ID
+cctrl bridge stop
+```
+
+Submitted/queued means transport acceptance. Explicit received/replied confirms
+handling; ordinary Claude accepts emit no positive receipt, and native delivered
+means release of previously held mail. Never replay an ambiguous send or fall
+back after possible submission. Codex delivery uses the connected server's native shared queue without resuming
+a second history writer; queue acceptance is not proof of owner consumption. See the
+[operating guide](docs/peer-messaging.md) for receipt semantics and recovery.
+
+Existing `cctrl peer` mailbox commands remain available for an unavailable route
+or explicitly requested mailbox records. Their identity, receive/reply/ACK and
+cross-host contracts are unchanged:
 
 ```sh
 cctrl peer identify --json        # own identity, even when launched outside cctrl
-cctrl peer route RECIPIENT --json # selection guidance only; no message is sent
+cctrl peer route RECIPIENT --json # guidance only; not a native bridge send
 ```
 
-External sessions auto-register a stable provider-session mailbox on first use.
-They receive no app ownership, role, or approval authority. See
-[identity recovery](docs/peer-messaging.md#sessions-started-outside-cctrl) if the
-client does not expose a native session ID.
-
-For version-pinned findings on Claude Code's native cross-session sockets,
-Codex's internal collaboration and external App Server protocols, and the
-existing cctrl adapters, see
-[Native agent messaging protocols](docs/findings/native-agent-messaging-protocols.md).
-That investigation distinguishes transport acceptance from model delivery and
-handling acknowledgements, and records the remaining bridge gaps.
+External mailbox identities receive no app ownership, role, or approval
+authority. See [identity recovery](docs/peer-messaging.md#sessions-started-outside-cctrl).
+For version-pinned wire evidence and the distinction between historical adapters
+and the new bridge, see the
+[native protocol overview](docs/findings/native-agent-messaging-protocols.md).
 
 Peers are named coding agents that other cctrl workflows can address. The peer
 registry combines manual entries from `data/peers.json` with live cctrl-managed
@@ -1517,9 +1536,10 @@ error.
 #### Agent operating contract (`peer help-agent`)
 
 Humans learn `peer say` from the examples above, but an agent needs a compact
-contract telling it when native same-provider messaging is addressable and when
-to use the mailbox fallback. `cctrl peer help-agent` describes route selection,
-identity establishment, and the `peer recv` / `peer ack` loop. Explicit `peer say`
+contract for selecting native routes and using the mailbox fallback. The
+[native bridge operating guide](docs/peer-messaging.md) covers `cctrl bridge`;
+`peer help-agent` describes route selection, identity establishment, and the
+existing `peer recv` / `peer ack` loop. Explicit `peer say`
 remains a low-level live-tmux operation.
 
 ```bash
@@ -1532,9 +1552,9 @@ cctrl peer help-agent --json          # structured contract for prompt builders/
 A bare `peer help-agent` prints generic guidance and never fails for a missing
 identity; `--as NAME` and `CCTRL_PEER` canonicalize the peer through the same
 resolver the mailbox and `peer say` use, then tailor the examples. The
-**default rule** is: native messaging for supported exact same-provider targets,
-with cctrl as fallback or for explicitly requested durable records. Use
-`peer route` for guidance; the agent invokes its own exposed native tools.
+**peer guidance** covers native same-provider tools and mailbox fallback. For
+cross-provider native delivery, use `cctrl bridge` as documented above;
+`peer route` itself does not perform a bridge send.
 
 This contract is **not** injected automatically. `cctrl start --peer` does not
 add any prompt text; an agent receives the contract only when it asks
@@ -1991,6 +2011,13 @@ cannot identify different chats from its own PID or working directory.
 Exposed tools:
 
 ```text
+native_enable
+native_list
+native_send
+native_reply
+native_ack
+native_status
+native_inbox
 route_message
 peer_overview
 whoami
@@ -2004,12 +2031,18 @@ show_message
 ack_message
 ```
 
+The `native_enable`, `native_list`, `native_send`, `native_reply`, `native_ack`,
+`native_status`, and `native_inbox` tools expose the native bridge lifecycle.
+See the [argument reference](docs/peer-messaging.md#mailbox-mcp-setup-and-startup).
+Use `native_reply` with the original message ID for correlation; a raw native
+Claude reply arrives as a new message. CLI `cctrl bridge stop` stops the endpoint.
+
 `route_message` gives same-provider native discovery guidance and fallback
 arguments; it does not send or certify native availability. The agent uses its
 own native tools when the exact recipient is addressable. `send_message` is the
-durable cctrl fallback for unavailable native routes, different providers, or
-explicitly requested mailbox work. Do not replay accepted, held or ambiguous
-native sends. Existing mailbox work still requires its cctrl ACK.
+durable mailbox fallback for unavailable native routes or explicitly requested
+mailbox work. Cross-provider native sends use `cctrl bridge` or `native_send`.
+Do not replay accepted, held or ambiguous native sends. Existing mailbox work still requires its cctrl ACK.
 
 `say_peer` remains an explicit live-tmux operation with `to`, `body`, optional
 `submit` (default true), and `force_busy`. It preserves the existing readiness

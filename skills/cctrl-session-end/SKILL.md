@@ -56,6 +56,15 @@ If the session was drafting an email, PR, message, or any outward-facing
 artifact that hasn't been sent/created yet — surface it to the user before
 closing. Don't let drafts evaporate with the session.
 
+If this session enabled a native messaging endpoint, inspect `cctrl bridge inbox`
+and the status of outstanding messages. Reply or acknowledge only work actually
+handled; preserve unresolved/ambiguous message IDs in the handoff. Submitted or
+queued is not a handling receipt. After final authorized replies, run
+`cctrl bridge stop` before the final self-close so its advertised endpoint no
+longer claims this session is available. Existing mailbox work still requires
+its separate `cctrl peer recv` / `cctrl peer ack` lifecycle. Do not replay pending
+native mail through the mailbox merely because this session is ending.
+
 ### 3. Harvest the session (soft dependency — skip silently if absent)
 
 Steps 1 and 2 catch what is *visible* in the tree. They cannot catch what only

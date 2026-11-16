@@ -8239,7 +8239,11 @@ _peer_cmd_route() {
     jq -n --argjson s "$sender" --argjson r "$recipient" '
         ($s.agent == $r.agent and ($s.agent == "claude" or $s.agent == "codex")) as $same
         | {ok:true, sent:false, identity:$s, recipient:$r,
-           preferred_transport:(if $same then "native-if-addressable" else "cctrl-mailbox" end),
+           preferred_transport:(if $same then "native-if-addressable" else "native-bridge-if-available" end),
+           bridge:{transport:"cctrl-native-bridge",local_only:true,
+             discovery:["cctrl","bridge","list","--json"],
+             recipient_session_id:($r.external_identity.session_id // $r.provider_task_id // null),
+             note:"Use cctrl bridge send PROVIDER:ACTUAL_ID for an exact local native recipient, or native_send MCP. Discover and verify the provider-session binding; a peer name or title is not a native address. Bridge replies and ACKs use bridge message IDs."},
            native:(if $same then {
              provider:$s.agent,
              discovery:(if $s.agent=="claude" then ["ListAgents"] else ["collaboration.list_agents","list_threads"] end),
@@ -23584,6 +23588,10 @@ cmd_help() {
     echo "  cctrl peer gc --older-than 7d       Archive retained mailbox messages"
     echo "  cctrl peer watch --once             Run one orchestrator pass"
     echo "  cctrl peer doctor [peer]            Check peer messaging dependencies"
+    echo "  cctrl bridge enable|list|inbox|stop Native Claude/Codex endpoints (local machine)"
+    echo "  cctrl bridge send PROVIDER:ID -- BODY  Send once through native provider transport"
+    echo "  cctrl bridge reply ID -- BODY       Correlated native reply and handling ACK"
+    echo "  cctrl bridge ack|status ID           Explicit handling receipt / durable delivery status"
     echo "  cctrl peer mcp [--as NAME]          Run stdio MCP tools for one peer identity"
     echo "  cctrl peer show <id> [--as NAME]    Show a full message envelope"
     echo "  cctrl peer ack <id> [--as NAME]     Acknowledge a delivered message"
@@ -26365,6 +26373,7 @@ _dispatch() {
             fi
             cmd_shortcut "$name" "$@"
             ;;
+        bridge) python3 "$SCRIPT_DIR/lib/native_bridge.py" --root "${CCTRL_NATIVE_BRIDGE_DIR:-$_CCTRL_P_STATE_ROOT/native-bridge}" "$@" ;;
         peer) cmd_peer "$@" ;;
         codex) cmd_codex "$@" ;;
         shortcuts) cmd_shortcut "$@" ;;

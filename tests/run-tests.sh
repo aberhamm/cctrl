@@ -26749,9 +26749,10 @@ test_codex_ownership_matrix_contract() {
         || fail "session-end skill omits verified app handoff"
     grep -Eq "provider-neutral.*cctrl task ls|cctrl task ls.*provider-neutral" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
         || fail "fleet-manager skill does not begin from provider-neutral task inventory"
-    if ! grep -Eq "Peer messaging for app tasks remains deferred" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
-        || ! grep -Eq "plans 028/029" "$ROOT/skills/cctrl-fleet-manager/SKILL.md"; then
-        fail "app-task peer identity deferral is undocumented"
+    if ! grep -Eq "Native bridge messaging binds the actual current provider" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
+        || ! grep -Eq "fallback|unavailable routes" "$ROOT/skills/cctrl-fleet-manager/SKILL.md" \
+        || ! grep -Eq "second writer" "$ROOT/skills/cctrl-fleet-manager/SKILL.md"; then
+        fail "app-task messaging must document exact identity, fallback, and writer ownership"
     fi
     grep -Eq "transport.*not ownership|transport option.*not a" "$ROOT/README.md" \
         || fail "README still implies --remote is simultaneous app access"

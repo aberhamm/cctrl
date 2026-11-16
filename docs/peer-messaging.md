@@ -1,31 +1,122 @@
-# Agent messaging: native first, cctrl fallback
+# Agent messaging across Claude Code and Codex
 
-Use this operating guide to send messages and recover sender identity. For
-wire formats and evidence, see the [protocol overview](findings/native-agent-messaging-protocols.md).
-For fleet authority and approvals, follow the [agent contract](../AGENTS.md#peer-messaging)
-and the selected [role skill](../skills/README.md).
+Use `cctrl bridge` for native cross-provider messages and Codex-to-Codex input.
+Claude-to-Claude messages use actual Claude `ListAgents`/`SendMessage`. For wire formats and evidence, see the
+[protocol overview](findings/native-agent-messaging-protocols.md). Fleet authority
+and approvals follow the [agent contract](../AGENTS.md#peer-messaging) and
+[selected role skill](../skills/README.md).
 
-## Choose the route
+## Enable, discover, and send
 
-| Sender and recipient | Preferred route | Fall back when |
-|---|---|---|
-| Claude Code → Claude Code | `ListAgents`, then `SendMessage` to the exact discovered session; reply to its native `from` address | The tools or exact route are unavailable, or a send is definitively rejected before submission |
-| Codex → Codex in one agent tree | Exposed collaboration tools; use the supported followup/wake operation for an idle target | Recipient is outside the tree or no applicable tool is exposed |
-| Codex → another Codex desktop thread | Exposed cross-chat tools addressing the exact thread/host | The tool or exact thread route is unavailable |
-| Independently launched Codex CLIs | cctrl mailbox unless the owning runtime exposes an actual native route | Separate processes do not share the internal collaboration mailbox |
-| Different providers | cctrl mailbox | Native provider transports are not a cross-provider bridge |
-| Explicitly requested durable mailbox record | cctrl mailbox | Keep its receive/handling-ACK lifecycle even if native messages also occur |
+The current bridge is local and POSIX-only: it does not expose a network
+messaging service, and Windows fails closed when OS peer verification is
+unavailable. Run enable inside each actual participating provider session:
 
-You can use native tools directly without registering a cctrl peer. When
-starting from a cctrl name, `cctrl peer route <peer> --json` or MCP
-`route_message` returns canonical identity, same-provider discovery guidance,
-and fallback arguments. It **does not send**, verify native capability, or
-invoke model-owned tools. The agent must confirm the exact native target in its
-own runtime; a similar title or a guessed `/root/...` path is insufficient.
+```sh
+cctrl bridge enable
+cctrl bridge list
+# From Codex to Claude:
+cctrl bridge send claude:ACTUAL_SESSION_ID -- "Please review the result"
+# From Claude or Codex to Codex:
+cctrl bridge send codex:ACTUAL_THREAD_ID -- "Please review the result"
+```
 
-A native accepted, held, or ambiguous send must not be duplicated through
-cctrl. Reconcile its result, wait for a correlated response, or report the
-uncertainty. Native acceptance is not a handling ACK; silence is not agreement.
+Use the exact provider-qualified address returned by discovery. Session titles,
+working directories, and relative subagent paths are not bridge addresses.
+Enabling outside cctrl does not require launching another agent session or
+borrowing an orchestrator's identity. If current-session identity is unavailable
+or conflicting, diagnose it instead of fabricating an ID.
+
+A Codex endpoint owns a persistent Claude-compatible socket and registry entry
+for that exact Codex thread. Claude can discover this endpoint with native
+`ListAgents` and use `SendMessage`; its native reply address routes back through
+the same bridge daemon. The entry represents a **cctrl bridge to Codex**, not a
+Claude agent. `bridge list` also discovers live native Claude sessions.
+
+Claude-to-Claude bridge sends are rejected before submission. Use the actual
+Claude native tools so sender/recipient permission admission retains its true
+provider context. Raw native ingress addressed to a Claude actor's bridge proxy
+is refused; the proxy is not a substitute Claude recipient.
+
+For Codex-to-Claude sends, the bridge conservatively declares **prompting**
+provenance. A Claude recipient in bypass mode may hold that input for its own
+admission decision. The bridge never spoofs bypass provenance or overrides the
+recipient's admission policy. Held is not failed and must not be replayed.
+
+Codex input is submitted through the connected server's `thread/queue/add` API.
+The native shared queue store can wake an independent owner's idle queue when
+that provider build supports it. Queue acceptance does not establish consumption
+by every CLI or extension. The bridge never resumes a running CLI thread or
+replaces its history writer. Existing same-tree collaboration and exposed desktop tools remain
+usable for targets they actually support; independently launched CLI sessions
+do not share an internal collaboration tree.
+
+## Receive, reply, and inspect receipts
+
+```sh
+cctrl bridge inbox --limit 20
+# If next_cursor is non-null, fetch the next page:
+cctrl bridge inbox --after NEXT_CURSOR --limit 20
+cctrl bridge reply MESSAGE_ID -- "Reviewed; here is the result"
+# After handling without a reply:
+cctrl bridge ack MESSAGE_ID
+cctrl bridge status MESSAGE_ID
+# Read-only reconciliation for a Codex target:
+cctrl bridge status MESSAGE_ID --reconcile
+# When this session no longer needs its endpoint:
+cctrl bridge stop
+```
+
+Inbox pages default to 20 messages (`--limit` accepts 1..100). Start at
+`--after 0` and follow each non-null integer `next_cursor`; listing does not ACK
+mail. `status --reconcile` checks the native Codex queue without submitting input.
+A missing queue entry may already have been consumed and never permits replay.
+
+The bridge keeps a durable ledger. Use the message ID from its output or inbox
+with `bridge reply` to correlate a response with the original message. Claude
+can also reply with native `SendMessage` to the received `from` address, but a
+raw native reply is recorded as a **new message**; it does not automatically
+mark the original replied or handled. Native status receipts use their original
+message ID for correlation.
+
+Receipt stages have different meanings:
+
+| Stage | What it establishes |
+|---|---|
+| Submitted | The native send was submitted; this is not proof the model processed it |
+| Queued | The connected Codex server accepted queued input; not proof of owner consumption or a handling ACK |
+| Held | Claude admission retained the message pending its policy/approval |
+| Released (`released` in bridge status) | Native Claude `delivered` reports release of previously held mail; ordinary immediate accepts emit no positive delivery receipt |
+| Received | Recipient explicitly acknowledged handling through the bridge |
+| Replied | Recipient explicitly sent a correlated reply |
+| Ambiguous | Submission may have happened; automatic replay and transport fallback are prohibited |
+
+Inspect status after uncertainty; do not infer refusal from silence. A native
+`delivered` status is not an explicit `received` or `replied` receipt. Sender
+names, provider IDs, and permission-mode claims do not grant authority. Preserve
+existing approval requirements.
+
+## Route unavailable: existing mailbox fallback
+
+Only choose fallback when the native route is unavailable or definitively did
+not submit. Never fall back after an accepted, held, queued, or ambiguous send.
+The existing mailbox remains available for explicitly requested mailbox records
+and its established cross-machine routing. Native bridge discovery is local;
+it does not expose provider sockets to the network.
+
+```sh
+cctrl peer identify --json
+cctrl peer overview --json
+cctrl peer send RECIPIENT --deliver --json -- "Status report"
+cctrl peer recv --all --json
+cctrl peer reply MESSAGE_ID --json -- "Handled"
+# Or, after handling without a reply:
+cctrl peer ack MESSAGE_ID --json
+```
+
+Every mailbox outcome except `send-failed` means durably queued: never resend.
+Bridge/native replies do not acknowledge existing mailbox mail. Mailbox commands
+and their explicit `--as` / `--from` identity rules are unchanged.
 
 ## Sessions started outside cctrl
 
@@ -67,35 +158,51 @@ session ID is a routing claim, not authentication. cctrl preserves app and tmux
 sender-binding checks and rejects an external identity claimed from a different
 provider session.
 
-## Send and handle fallback mail
+## Mailbox MCP setup and startup
 
-```sh
-cctrl peer send RECIPIENT --deliver --json -- "Status report"
-cctrl peer recv --all --json
-cctrl peer reply MESSAGE_ID --json -- "Handled"
-# Or, after handling without a reply:
-cctrl peer ack MESSAGE_ID --json
-```
+`cctrl peer mcp` exposes these native bridge tools alongside the existing
+mailbox tools:
 
-Mailbox commands automatically resolve the caller identity. `--as` remains
-available for your own explicitly registered peer; it is not needed for the
-external-session default. `--deliver` includes existing cross-host routing and
-notification behavior; a plain send can remain local queue-only.
+| MCP tool | Arguments |
+|---|---|
+| `native_enable` | none; binds the actual current provider session |
+| `native_list` | none; discovers exact provider-qualified targets |
+| `native_send` | `to`, `body`; optional stable UUID `id` |
+| `native_reply` | original `id`, `body`; optional stable UUID `reply_id` |
+| `native_ack` | `id` of handled mail |
+| `native_status` | `id`; optional `reconcile: true` for read-only Codex queue lookup |
+| `native_inbox` | optional nonnegative integer `after`, `limit` 1..100 (default 20); follow `next_cursor` |
 
-Every result except `send-failed` means the mail was queued: never resend it.
-Deferred/undelivered notifications do not undo that queue entry. The recipient
-must receive and ACK handled mail. Replies sent through a native tool do not
-ACK a pre-existing cctrl message automatically.
+Use CLI `cctrl bridge stop` to stop the endpoint. For sends/replies, generate and
+retain an optional UUID before the first attempt when client retries may occur.
+Reusing that same ID returns the existing ledger result; it does not retry an
+ambiguous provider mutation. Do not substitute a new ID for an uncertain send.
 
-## MCP setup and startup
+The MCP server can initialize without an explicit peer. Its mailbox tools bind
+to the actual provider-session identity on the first identity-dependent call;
+native tools independently resolve the actual current provider session. `--as` / `CCTRL_PEER` provide fixed explicit
+identity where needed. `route_message` recommends a native bridge route for
+cross-provider targets when available, with exact-target discovery guidance;
+it does not send. `send_message` queues mailbox work as the unchanged fallback.
 
-`cctrl peer mcp` can start without an explicit peer and responds to initialization
-without discovery. It binds to the caller's identity on the first
-identity-dependent tool call. `--as` / `CCTRL_PEER` still provide fixed explicit
-identity where needed. `route_message` guides selection; `send_message` queues
-fallback mailbox work. Neither impersonates a native runtime tool.
+The MCP process must inherit its session's actual provider ID. A shared server
+without per-session identity cannot identify chats from cwd, title, or its own
+process. Follow explicit-ID recovery above. Use CLI `cctrl bridge` or the `native_*` tools for the native bridge lifecycle.
 
-The MCP process must inherit its session's actual provider ID. A manually
-configured shared server with no per-session identity cannot identify separate
-chats by process, working directory, or title. Follow the explicit-ID recovery
-above instead of attributing all chats to one shared server process.
+## Verification scope
+
+The original investigation established static protocol evidence and a read-only
+Codex daemon handshake. A later isolated installed-Claude smoke accepted bridge
+input, emitted a native peer message, and started a second turn. Expired Claude
+authentication blocked model execution, so outbound model messaging and a full
+real-provider round trip remain unverified. Isolated module/subprocess tests and
+a simulated two-direction integration verify plumbing, not both providers'
+model behavior. See [evidence and limits](findings/native-agent-messaging-evidence.md).
+
+Enable starts a per-session bridge daemon; repeating enable reuses a live
+endpoint. If startup reports pending or exits, inspect its reported diagnostic
+log before retrying; do not launch competing daemons or kill an unverified PID.
+After final replies, stop your endpoint with `cctrl bridge stop` before closing
+its session. Preserve unresolved message IDs for handoff; stopping is not a
+handling ACK and does not authorize replay. The durable ledger remains the
+record after endpoint shutdown.

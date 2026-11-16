@@ -205,14 +205,18 @@ memory and attention. One session = one purpose.
   `tmux -S "$D/sock"` for every call, and never kills a tmux server; it kills
   its own sessions by exact name on its own socket. Full rule: "Sub-agents and
   tmux" in the `cctrl-repo-orchestrator` skill.
-- **Own identity and native routing.** A cctrl launch supplies its peer;
-  sessions launched elsewhere can run `cctrl peer identify --json` to get a
-  stable mailbox from their native session ID. Never copy another session's
-  identity or use `--impersonate` to work around a missing sender. Include in
-  briefs: use exposed native tools for exact same-provider recipients when
-  supported, with cctrl as fallback; independent Codex CLI sessions do not share
-  an agent tree. ACK existing mailbox work and reconcile ambiguous sends before
-  trying another transport.
+- **Own identity and native bridge.** Include in briefs: run `cctrl bridge enable`
+  inside the actual provider session, discover with `bridge list`, and send to
+  exact `claude:SESSION_ID` / `codex:THREAD_ID` addresses. Native Claude tools can
+  address the advertised Codex bridge endpoint. Claude→Claude must use actual
+  Claude native tools; bridge rejects that route. Codex→Claude declares prompting
+  and may be held; never spoof modes or bypass admission. Use `bridge inbox`, `reply`,
+  `ack`, and `status` to handle correlated work. Submitted/queued is not handling;
+  only explicit received/replied confirms it. Never resume a second Codex writer,
+  borrow another session's ID, or replay an ambiguous send through fallback.
+  Existing mailbox work still needs its own receive/ACK lifecycle. Stop the
+  endpoint with `cctrl bridge stop` when finished.
+
 
 ## Discipline (make "properly" mean disciplined)
 

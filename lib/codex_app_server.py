@@ -717,7 +717,7 @@ class AppServerClient:
             timeout_exit=EXIT_REQUEST_TIMEOUT,
         )
 
-    def initialize(self) -> dict[str, Any]:
+    def initialize(self, *, experimental: bool = False) -> dict[str, Any]:
         if self.process is None:
             self.connect()
         request_id = self._next_id
@@ -742,7 +742,7 @@ class AppServerClient:
                 "method": "initialize",
                 "params": {
                     "clientInfo": {"name": "cctrl", "version": "1"},
-                    "capabilities": {},
+                    "capabilities": {"experimentalApi": True} if experimental else {},
                 },
             },
             deadline=deadline,
