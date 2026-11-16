@@ -2199,6 +2199,8 @@ cctrl log                 # per-session log tagged with profile
 
 `cctrl costs` parses Claude session JSONLs from `~/.claude/projects/` and Codex session JSONLs from `~/.codex/sessions/` and `~/.codex/archived_sessions/` for detailed token breakdowns (input, output, cache write, cache read) with estimated USD. Codex costs are API-equivalent estimates; ChatGPT-plan sessions may consume included plan usage instead of API billing. No external API calls.
 
+**Codex/OpenAI price precedence** (first hit wins): (1) the table in `lib/usage_costs.py` (`OPENAI_PRICING`, from OpenAI's official pricing page, https://developers.openai.com/api/docs/pricing, fetched 2026-11-16); (2) `share/litellm-openai-prices.json`, a checked-in subset of LiteLLM's public price list (MIT licence, BerriAI/litellm), matched by exact model name; (3) the old gpt-5 fallback rate. A missing or corrupt LiteLLM file is skipped, so (1) and (3) still work. `cctrl costs` never fetches anything. Usage priced at (3) is reported (tokens, cost, models) as "Priced at fallback rate", and as `fallback_pricing` in `cctrl costs --json`. Refresh the data file with `cctrl costs --refresh-prices` (this is the only network call; it fetches only the LiteLLM raw GitHub URL, validates, and writes atomically).
+
 ### How tracking works
 
 1. A `Stop` hook runs `hooks/session-log.py` after each Claude assistant turn, summing deduplicated token usage per session
@@ -2654,6 +2656,7 @@ cctrl/
   lib/
     codex_app_server.py    # narrow desktop App Server protocol adapter
     usage_costs.py         # usage/cost aggregation for `cctrl usage` and `cctrl costs`
+    refresh_prices.py      # refreshes share/litellm-openai-prices.json (the only network call)
     peer_mcp.py            # stdio MCP server behind `cctrl peer mcp`
     helper_census.py       # read-only MCP-helper census behind `cctrl helpers`
   plugins/

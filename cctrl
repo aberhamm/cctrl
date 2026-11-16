@@ -3421,8 +3421,21 @@ cmd_profile() {
 }
 
 cmd_costs() {
-    local range="${1:---month}"
-    local project_filter="${2:-}"
+    local range="--month" project_filter="" fmt_arg="" arg have_range=0 have_proj=0
+    for arg in "$@"; do
+        case "$arg" in
+            --json) fmt_arg=json ;;
+            --refresh-prices)
+                python3 "$SCRIPT_DIR/lib/refresh_prices.py"
+                return $?
+                ;;
+            *)
+                if (( ! have_range )); then range="$arg"; have_range=1
+                elif (( ! have_proj )); then project_filter="$arg"; have_proj=1
+                fi
+                ;;
+        esac
+    done
 
     local num_periods
     case "$range" in
@@ -3439,7 +3452,8 @@ cmd_costs() {
         "$CODEX_ARCHIVED_SESSIONS_DIR" \
         "$num_periods" \
         "$project_filter" \
-        "$SPENDING_LOG"
+        "$SPENDING_LOG" \
+        "$fmt_arg"
 }
 
 cmd_log() {
@@ -23611,7 +23625,8 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}Usage Tracking${RESET}"
     echo "  cctrl usage [weeks]     Claude/Codex rate limits + billing week breakdown (default: 2)"
-    echo "  cctrl costs [range]     Token usage and estimated API-equivalent cost by agent/model/project"
+    echo "  cctrl costs [range] [project] [--json]  Token usage and estimated API-equivalent cost; reports fallback-priced usage"
+    echo "  cctrl costs --refresh-prices  Refresh share/litellm-openai-prices.json from LiteLLM's public list (network)"
     echo "  cctrl codex capabilities [--json]  Inspect desktop App Server support (read-only)"
     echo "    ranges: --today, --week, --month, --all [project-filter]"
     echo "  cctrl log [count]       Show profile switch history"

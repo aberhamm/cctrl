@@ -61,8 +61,30 @@ ANTHROPIC_PRICING = {
 }
 
 
-# USD per 1M tokens. Keep specific aliases before broader prefixes.
+# Precedence for Codex/OpenAI rates (first hit wins):
+#   1. OPENAI_PRICING below (official OpenAI pricing page, prefix match).
+#   2. share/litellm-openai-prices.json (LiteLLM public list, exact model
+#      name; offline, refreshed by lib/refresh_prices.py; MIT licence).
+#      Override the path with CCTRL_PRICE_FILE. Missing/corrupt -> skipped.
+#   3. FALLBACK_OPENAI_RATES (gpt-5 rates). Every turn priced this way is
+#      counted and reported by `cctrl costs` (text and --json).
+#
+# USD per 1M tokens, Standard tier (short context <=272K / long >272K).
+# Source: https://developers.openai.com/api/docs/pricing
+# (platform.openai.com/docs/pricing redirects there), fetched 2026-11-16.
+# The page says GPT-5.6 Sol promotional pricing runs until 2026-11-30.
+# Models not on that page (codex-auto-review, gpt-daybreak-blue-latest) are
+# deliberately absent so they fall through to LiteLLM or the counted fallback.
+# Keep specific aliases before broader prefixes.
 OPENAI_PRICING = [
+    ("gpt-6.1-sol", {"input": 2.0, "cached": 0.10, "output": 10.0, "long_input": 4.0, "long_cached": 0.20, "long_output": 15.0}),
+    ("gpt-6.1-terra", {"input": 1.0, "cached": 0.05, "output": 5.0, "long_input": 2.0, "long_cached": 0.10, "long_output": 7.5}),
+    ("gpt-6-astra", {"input": 10.0, "cached": 1.0, "output": 50.0, "long_input": 20.0, "long_cached": 2.0, "long_output": 75.0}),
+    ("gpt-6-luna", {"input": 0.10, "cached": 0.01, "output": 0.50, "long_input": 0.20, "long_cached": 0.02, "long_output": 0.75}),
+    ("gpt-6-sol", {"input": 2.0, "cached": 0.20, "output": 10.0, "long_input": 4.0, "long_cached": 0.40, "long_output": 15.0}),
+    ("gpt-5.6-sol", {"input": 4.0, "cached": 0.40, "output": 20.0, "long_input": 8.0, "long_cached": 0.80, "long_output": 30.0}),
+    ("gpt-5.6-terra", {"input": 2.0, "cached": 0.20, "output": 12.0, "long_input": 4.0, "long_cached": 0.40, "long_output": 18.0}),
+    ("gpt-5.6-luna", {"input": 0.20, "cached": 0.02, "output": 1.20, "long_input": 0.40, "long_cached": 0.04, "long_output": 1.80}),
     ("gpt-5.5-pro", {"input": 30.0, "cached": None, "output": 180.0, "long_input": 60.0, "long_cached": None, "long_output": 270.0}),
     ("gpt-5.5", {"input": 5.0, "cached": 0.50, "output": 30.0, "long_input": 10.0, "long_cached": 1.0, "long_output": 45.0}),
     ("gpt-5.4-mini", {"input": 0.75, "cached": 0.075, "output": 4.50}),
@@ -148,42 +170,108 @@ def anthropic_price_key(model_name):
     return "sonnet"
 
 
-def openai_rates_for(model_name, raw_input_tokens):
+FALLBACK_OPENAI_RATES = {"input": 1.25, "cached": 0.125, "output": 10.0}
+DEFAULT_PRICE_FILE = Path(__file__).resolve().parent.parent / "share" / "litellm-openai-prices.json"
+_LITELLM_CACHE = {}
+
+
+def load_litellm_prices(path=None):
+    """Return {model: rates-per-1M} from the checked-in LiteLLM file, or {}.
+
+    Offline only; any missing, unreadable or malformed file yields {} so the
+    caller falls back to the built-in behaviour.
+    """
+    path = str(path or os.environ.get("CCTRL_PRICE_FILE") or DEFAULT_PRICE_FILE)
+    if path in _LITELLM_CACHE:
+        return _LITELLM_CACHE[path]
+    out = {}
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+        models = doc["models"]
+        if not isinstance(models, dict):
+            raise ValueError("models is not an object")
+        for name, e in models.items():
+            try:
+                rates = {
+                    "input": float(e["input_cost_per_token"]) * 1e6,
+                    "output": float(e["output_cost_per_token"]) * 1e6,
+                }
+                cr = e.get("cache_read_input_token_cost")
+                rates["cached"] = None if cr is None else float(cr) * 1e6
+                if "input_cost_per_token_above_272k_tokens" in e and "output_cost_per_token_above_272k_tokens" in e:
+                    rates["long_input"] = float(e["input_cost_per_token_above_272k_tokens"]) * 1e6
+                    rates["long_output"] = float(e["output_cost_per_token_above_272k_tokens"]) * 1e6
+                    lc = e.get("cache_read_input_token_cost_above_272k_tokens")
+                    rates["long_cached"] = None if lc is None else float(lc) * 1e6
+                out[str(name).lower()] = rates
+            except (KeyError, TypeError, ValueError):
+                continue  # skip one bad row, keep the rest
+    except (OSError, ValueError, KeyError, TypeError):
+        out = {}
+    _LITELLM_CACHE[path] = out
+    return out
+
+
+def _tier_rates(rates, raw_input_tokens):
+    if raw_input_tokens > LONG_CONTEXT_THRESHOLD and "long_input" in rates:
+        return {
+            "input": rates["long_input"],
+            "cached": rates.get("long_cached"),
+            "output": rates["long_output"],
+        }
+    return rates
+
+
+def openai_rates_and_source(model_name, raw_input_tokens):
+    """Return (rates, source) with source in official|litellm|fallback."""
     m = (model_name or "").lower()
     for prefix, rates in OPENAI_PRICING:
         if m.startswith(prefix):
-            if raw_input_tokens > LONG_CONTEXT_THRESHOLD and "long_input" in rates:
-                return {
-                    "input": rates["long_input"],
-                    "cached": rates.get("long_cached"),
-                    "output": rates["long_output"],
-                }
-            return rates
-    return {"input": 1.25, "cached": 0.125, "output": 10.0}
+            return _tier_rates(rates, raw_input_tokens), "official"
+    lite = load_litellm_prices()
+    if m.startswith("openai/"):
+        m = m[len("openai/"):]
+    if m in lite:
+        return _tier_rates(lite[m], raw_input_tokens), "litellm"
+    return FALLBACK_OPENAI_RATES, "fallback"
 
 
-def estimate_cost(agent, model, usage):
+def openai_rates_for(model_name, raw_input_tokens):
+    return openai_rates_and_source(model_name, raw_input_tokens)[0]
+
+
+def estimate_cost_ex(agent, model, usage):
+    """Return (cost, is_fallback). is_fallback: priced by a default, not a table."""
     if agent == "codex":
         raw_input = usage["input"] + usage["cache_read"]
-        rates = openai_rates_for(model, raw_input)
+        rates, source = openai_rates_and_source(model, raw_input)
         cached_rate = rates["input"] if rates.get("cached") is None else rates["cached"]
-        return (
+        cost = (
             usage["input"] * rates["input"]
             + usage["cache_read"] * cached_rate
             + usage["output"] * rates["output"]
         ) / 1_000_000
+        return cost, source == "fallback"
 
+    m = (model or "").lower()
+    is_fallback = not any(k in m for k in ("opus", "sonnet", "haiku"))
     price_key = anthropic_price_key(model)
     ip = ANTHROPIC_PRICING["input"].get(price_key, 3.0)
     op = ANTHROPIC_PRICING["output"].get(price_key, 15.0)
     cwp = ANTHROPIC_PRICING["cache_write"].get(price_key, 3.75)
     crp = ANTHROPIC_PRICING["cache_read"].get(price_key, 0.30)
-    return (
+    cost = (
         usage["input"] * ip
         + usage["output"] * op
         + usage["cache_write"] * cwp
         + usage["cache_read"] * crp
     ) / 1_000_000
+    return cost, is_fallback
+
+
+def estimate_cost(agent, model, usage):
+    return estimate_cost_ex(agent, model, usage)[0]
 
 
 def normalize_claude_usage(raw):
@@ -430,10 +518,21 @@ class Aggregates:
         self.by_profile = {}
         self.by_agent = {}
         self.total = empty_totals()
+        self.fallback = {"tokens": 0, "cost": 0.0, "turns": 0, "models": {}}
 
     def record(self, rec):
         usage = rec["usage"]
-        cost = estimate_cost(rec["agent"], rec["model"], usage)
+        cost, is_fallback = estimate_cost_ex(rec["agent"], rec["model"], usage)
+        if is_fallback:
+            tokens = usage["input"] + usage["output"] + usage["cache_write"] + usage["cache_read"]
+            fb = self.fallback
+            fb["tokens"] += tokens
+            fb["cost"] += cost
+            fb["turns"] += 1
+            m = fb["models"].setdefault(f"{rec['agent']}/{rec['model']}", {"tokens": 0, "cost": 0.0, "turns": 0})
+            m["tokens"] += tokens
+            m["cost"] += cost
+            m["turns"] += 1
         period_key = billing_period_start(rec["ts"]).strftime("%Y-%m-%d")
         prof = self.session_profile.get(rec["session_id"]) or profile_at(rec["ts"], self.all_switches, self.switch_times)
 
@@ -450,6 +549,7 @@ def print_costs(argv):
     num_periods = int(argv[3])
     project_filter = argv[4] if len(argv) > 4 else ""
     spending_log = argv[5] if len(argv) > 5 else ""
+    as_json = len(argv) > 6 and argv[6] == "json"
 
     now = datetime.now(timezone.utc)
     current_period = billing_period_start(now)
@@ -464,6 +564,10 @@ def print_costs(argv):
         if project_filter and project_filter not in rec["project"]:
             continue
         agg.record(rec)
+
+    if as_json:
+        print(json.dumps(costs_json(agg, num_periods), indent=2, sort_keys=True))
+        return
 
     current_period_key = current_period.strftime("%Y-%m-%d")
     period_label = f"{num_periods} billing period{'s' if num_periods != 1 else ''}" if num_periods < 9999 else "all billing periods"
@@ -503,10 +607,35 @@ def print_costs(argv):
             print(f"  \033[2m{s['ts']}\033[0m  {s['from']} -> \033[1m{s['to']}\033[0m")
         print()
 
+    print_fallback(agg.fallback)
+
     if not agg.by_period:
         print("\033[2mNo session data found for this period.\033[0m")
     else:
         print("\033[2mCodex costs are API-equivalent estimates. ChatGPT-plan sessions may consume included plan usage instead of API billing.\033[0m")
+
+
+def costs_json(agg, num_periods):
+    return {
+        "periods": num_periods,
+        "total": agg.total,
+        "by_period": agg.by_period,
+        "by_agent": agg.by_agent,
+        "by_model": agg.by_model,
+        "by_profile": agg.by_profile,
+        "by_project": agg.by_project,
+        "fallback_pricing": agg.fallback,
+    }
+
+
+def print_fallback(fb):
+    if not fb["turns"]:
+        return
+    print("\033[1mPriced at fallback rate\033[0m \033[2m(model not in any price table; cost is a guess)\033[0m")
+    print(f"  {fmt(fb['tokens'])} tokens  {usd(fb['cost'])}  {fb['turns']} turns")
+    for key, d in sorted(fb["models"].items(), key=lambda x: x[1]["cost"], reverse=True):
+        print(f"  {key:<40} {fmt(d['tokens']):>10} tokens  {usd(d['cost']):>10}  {d['turns']:>5} turns")
+    print()
 
 
 def print_breakdown(title, bucket):
