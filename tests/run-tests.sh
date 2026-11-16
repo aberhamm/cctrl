@@ -16009,6 +16009,47 @@ test_peer_mcp_recv_all_ack_ids() {
     echo "ok: MCP recv_message all/limit and ack_message ids/all; ids are never flags"
 }
 
+test_peer_mcp_reply_message_acks_only_the_original() {
+    # Regression (mdec-1116): replying with send_message left the original
+    # delivered_unacked. reply_message binds the recipient to the original
+    # sender by ID and acks exactly that original; free-form sends ack nothing.
+    local data="$TMPDIR/mcp-reply" out req orig other
+    mkdir -p "$data"
+    _drain_setup "$data" 2
+    _mcp_call() { # name args-json
+        req="$(jq -cn --arg n "$1" --argjson a "$2" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$n,arguments:$a}}')"
+        printf '%s\n' "$req" | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as bob
+    }
+    _mcp_call recv_message '{"all":true}' >/dev/null
+    orig="$(jq -r 'select(.subject == "s1") | .id' "$data/messages.jsonl")"
+    other="$(jq -r 'select(.subject == "s2") | .id' "$data/messages.jsonl")"
+    # The old advertised pattern: a free-form send to the sender acks nothing.
+    out="$(_mcp_call send_message '{"to":"carol","body":"free-form"}')"
+    jq -e '.result.isError != true' <<< "$out" >/dev/null || fail "free-form send failed: $out"
+    [[ "$(jq -r --arg i "$orig" 'select(.id == $i) | .status' "$data/messages.jsonl")" == "delivered" ]] \
+        || fail "a free-form send_message must never ack the original"
+    # tools/list must advertise reply_message and no longer tell callers to reply with send_message.
+    out="$(printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+        | CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp --as bob)"
+    jq -e '[.result.tools[].name] | index("reply_message")' <<< "$out" >/dev/null || fail "reply_message not advertised"
+    jq -e '[.result.tools[] | select(.name == "send_message" or .name == "recv_message") | .description | test("set `to` to that message|`to` = `sender.name`|sender\\.name")] | any | not' <<< "$out" >/dev/null \
+        || fail "send_message/recv_message still advertise send_message as the reply path"
+    out="$(_mcp_call reply_message "$(jq -cn --arg i "$orig" '{id:$i,body:"the answer"}')")"
+    jq -e '.result.isError != true' <<< "$out" >/dev/null || fail "reply_message failed: $out"
+    [[ "$(jq -r --arg i "$orig" 'select(.id == $i) | .status' "$data/messages.jsonl")" == "acked" ]] \
+        || fail "reply_message must ack the original"
+    [[ "$(jq -r --arg i "$other" 'select(.id == $i) | .status' "$data/messages.jsonl")" == "delivered" ]] \
+        || fail "reply_message must not ack any other message"
+    [[ "$(jq -rs '[.[] | select(.to == "carol" and .body == "the answer")] | length' "$data/messages.jsonl")" == "1" ]] \
+        || fail "reply must be queued to the original sender exactly once"
+    # An ID this peer did not receive cannot be replied to, and flag-like ids are refused.
+    out="$(_mcp_call reply_message '{"id":"nope","body":"x"}')"
+    jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "unknown id must be an error: $out"
+    out="$(_mcp_call reply_message '{"id":"--all","body":"x"}')"
+    jq -e '.result.isError == true' <<< "$out" >/dev/null || fail "flag-like id must be refused: $out"
+    echo "ok: MCP reply_message acks only the original by ID; send_message never acks"
+}
+
 test_doorbell_real_tmux_pane_identity() (
     # One real-tmux test (eng review §5.13): the doorbell's exact %N pane
     # lookup and the derived-peer resolution against a live private server.

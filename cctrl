@@ -8261,7 +8261,7 @@ _peer_cmd_route() {
            bridge:{transport:"cctrl-native-bridge",local_only:true,
              discovery:["cctrl","bridge","list","--json"],
              recipient_session_id:($r.external_identity.session_id // $r.provider_task_id // null),
-             note:"Use cctrl bridge send PROVIDER:ACTUAL_ID for an exact local native recipient, or native_send MCP. Discover and verify the provider-session binding; a peer name or title is not a native address. Bridge replies and ACKs use bridge message IDs."},
+             note:"Use cctrl bridge send PROVIDER:ACTUAL_ID for an exact local native recipient, or native_send MCP. Discover and verify the provider-session binding; a peer name or title is not a native address. Bridge replies and ACKs use bridge message IDs. Reply to mailbox mail with reply_message / peer reply ID, never send_message."},
            native:(if $same then {
              provider:$s.agent,
              discovery:(if $s.agent=="claude" then ["ListAgents"] else ["collaboration.list_agents","list_threads"] end),

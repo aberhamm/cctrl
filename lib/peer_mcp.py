@@ -20,10 +20,10 @@ NATIVE_TOOLS = [
         ("enable", "Enable this actual Claude/Codex session's persistent native bridge endpoint. Never borrow another session ID.", {}, []),
         ("list", "Discover local native Claude sessions and cctrl bridge endpoints. Address targets as claude:SESSION_ID or codex:THREAD_ID.", {}, []),
         ("send", "Send through the native cross-provider bridge, recording correlation before submission. Never replay accepted, held, queued or ambiguous sends through mailbox fallback. Use id for idempotent client retry.", {"to": {"type": "string"}, "body": {"type": "string"}, "id": {"type": "string"}}, ["to", "body"]),
-        ("reply", "Send a correlated native reply to an incoming bridge message. Only the actual recipient session may reply; successful submission also acknowledges handling.", {"id": {"type": "string"}, "body": {"type": "string"}, "reply_id": {"type": "string"}}, ["id", "body"]),
-        ("ack", "Explicitly acknowledge handling a native bridge message and submit a receipt to its sender. Transport submission alone is not handling.", {"id": {"type": "string"}}, ["id"]),
+        ("reply", "Send a correlated native reply to an incoming bridge message. Only the actual recipient session may reply; successful submission also acknowledges handling and retires the original\'s still-pending native Codex queue item (result.original.native_retirement.outcome: retired, absent, already_consumed, race, identity_mismatch, unknown, unsupported for Claude). Receipts cannot be replied to.", {"id": {"type": "string"}, "body": {"type": "string"}, "reply_id": {"type": "string"}}, ["id", "body"]),
+        ("ack", "Explicitly acknowledge handling a native bridge message, retire its still-pending native Codex queue item (native_retirement.outcome) and submit a receipt to its sender. Transport submission alone is not handling. A receipt is a control fact: never ACK or reply to one.", {"id": {"type": "string"}}, ["id"]),
         ("status", "Inspect a bridge message's durable transport, policy, handling and reply receipts. reconcile performs a read-only Codex queue lookup; absence never authorizes resend.", {"id": {"type": "string"}, "reconcile": {"type": "boolean"}}, ["id"]),
-        ("inbox", "Read this actual session's unacknowledged native bridge messages with cursor paging. Mailbox messages have a separate receive/ACK lifecycle.", {"after": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}}, []),
+        ("inbox", "Read this actual session's native bridge ledger with cursor paging. Default view actionable lists ONLY messages native delivery did not accept (status failed): anything queued, submitted, held or released is owned by native delivery and is never listed as actionable, so it is not exposed twice. view stranded lists unhandled held, refused, ambiguous or never-dispatched items (inspection only, not authorized work); view history lists everything this session sent or received, receipts included. Mailbox messages have a separate receive/ACK lifecycle.", {"after": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100}, "view": {"type": "string", "enum": ["actionable", "stranded", "history"]}}, []),
     ]
 ]
 
@@ -143,9 +143,10 @@ TOOLS = NATIVE_TOOLS + [
             "is unavailable or definitively not sent; use route_message for guidance. "
             "Address `to` with a peer "
             "`name` from `peer_overview` or "
-            "`list_peers` (aliases are accepted and canonicalized). To REPLY to a "
-            "message you received via `recv_message`, set `to` to that message's "
-            "`sender.name`. Returns ok:true with an `outcome` field naming one of "
+            "`list_peers` (aliases are accepted and canonicalized). Do NOT use this to "
+            "reply to a received message: a free-form send is uncorrelated, never "
+            "acknowledges anything and leaves the original delivered_unacked. Use "
+            "`reply_message` with the original `id`. Returns ok:true with an `outcome` field naming one of "
             "five states (sent-and-nudged, sent-and-queued, sent-but-deferred, "
             "sent-but-undelivered) whenever the message was durably queued; only "
             "send-failed (nothing queued) is ok:false. On every other outcome the "
@@ -162,6 +163,27 @@ TOOLS = NATIVE_TOOLS + [
                 "body": {"type": "string"},
             },
             "required": ["to", "body"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "reply_message",
+        "description": (
+            "Reply to ONE received mailbox message by its original `id`. The recipient "
+            "is bound to that message's original sender (never chosen by you), the "
+            "message must be addressed to this peer and already received, and after "
+            "the reply is durably queued the original (and only it) is acknowledged. "
+            "A reply that could not be queued (outcome send-failed) is an error and "
+            "acknowledges nothing; every other outcome is queued, so never resend. "
+            "`ack` in the result is acked, skipped or failed (a failed ack never "
+            "undoes the reply). Arbitrary `send_message` calls are never treated as "
+            "replies. Native bridge messages use `native_reply` instead."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "body": {"type": "string"},
+                           "subject": {"type": "string"}},
+            "required": ["id", "body"],
             "additionalProperties": False,
         },
     },
@@ -184,9 +206,10 @@ TOOLS = NATIVE_TOOLS + [
             "With neither, it returns the next one (`{message, empty}`). Once the "
             "queue is empty it returns empty: it never re-returns delivered mail "
             "unless you pass `status: \"delivered\"`, so do not loop on it. Each "
-            "message carries a `sender` object: reply with `send_message` `to` = "
-            "`sender.name`. When handled, ack them all at once with `ack_message` "
-            "`{\"all\": true}` or `{\"ids\": [...]}`."
+            "message carries an `id` and a `sender` object: reply with `reply_message` "
+            "`{id, body}` (it binds the recipient to the original sender and acknowledges "
+            "that original). Never reply with `send_message`. When handled without a reply, "
+            "ack them all at once with `ack_message` `{\"all\": true}` or `{\"ids\": [...]}`."
         ),
         "inputSchema": {
             "type": "object",
@@ -341,6 +364,10 @@ class Bridge:
             if action == "status" and require_bool(args, "reconcile", False):
                 command.append("--reconcile")
             if action == "inbox":
+                if "view" in args:
+                    if args["view"] not in {"actionable", "stranded", "history"}:
+                        raise McpError("validation", "invalid view")
+                    command.extend(["--view", args["view"]])
                 for key, minimum, maximum in (("after", 0, None), ("limit", 1, 100)):
                     if key in args:
                         value = args[key]
@@ -404,6 +431,17 @@ class Bridge:
             body = require_string(args, "body")
             subject = optional_string(args, "subject", "")
             cmd = ["peer", "send", to, "--as", self.identity, "--deliver", "--body-file", "-", "--json"]
+            if subject:
+                cmd[3:3] = ["--subject", subject]
+            return ok(self.cli_send_and_deliver(cmd, stdin=body))
+        if name == "reply_message":
+            ensure_no_extra(args, {"id", "body", "subject"})
+            message_id = require_string(args, "id")
+            if message_id.startswith("-"):
+                raise McpError("validation", "id must be a message id, not a flag")
+            body = require_string(args, "body")
+            subject = optional_string(args, "subject", "")
+            cmd = ["peer", "reply", message_id, "--as", self.identity, "--deliver", "--body-file", "-", "--json"]
             if subject:
                 cmd[3:3] = ["--subject", subject]
             return ok(self.cli_send_and_deliver(cmd, stdin=body))
