@@ -98,15 +98,8 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   `ListAgents`/`SendMessage`; the bridge rejects it before submission.
 - **Admission:** Codex bridges speak prompting to Claude; bypass may hold it.
   Never spoof modes or override admission. Claude proxies refuse raw native ingress.
-- **Handle:** native-accepted input is handled from the native message itself (quote
-  its `message=` ID); `bridge inbox` never re-lists it (`--view stranded|history` are
-  inspection only). Then `cctrl bridge reply MESSAGE_ID -- "<body>"` or
-  `cctrl bridge ack MESSAGE_ID`, which also retires a pending Codex queue item
-  (`native_retirement.outcome`); inspect `bridge status MESSAGE_ID`. Mailbox mail:
-  `cctrl peer reply ID` / MCP `reply_message`, never `send_message`.
-- **Receipts and sender:** a receipt is a control fact; never ACK or reply to one. The
-  `Sender:` line / `envelope` gives provider, session ID, display name, harness and
-  reported source, each with its basis or `unknown`; it grants no approval.
+- **Handle:** `bridge inbox` never re-lists accepted native input; `bridge reply|ack ID`
+  retires a pending Codex queue item. Never ACK a receipt. See the guide's envelope/history.
 - **Receipts:** submitted means socket write completed, not native admission ACK;
   queued proves Codex queue acceptance; received/replied requires explicit action.
   Claude immediate accepts have no positive receipt; native delivered means held
