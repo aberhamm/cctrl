@@ -87,43 +87,30 @@ See [CLAUDE.md](./CLAUDE.md) for skill-routing rules.
 
 ## Peer messaging
 
-Use native messaging first for **same-provider sessions that your runtime can
-actually address**, with cctrl as fallback. See the
-[operating guide](docs/peer-messaging.md) for routing, external-session identity,
-and fallback outcomes; [protocol findings](docs/findings/native-agent-messaging-protocols.md)
-are implementation evidence rather than the operating policy.
+Prefer native messaging for exact same-provider recipients your runtime can
+address. The [operating guide](docs/peer-messaging.md) owns details and identity
+recovery; [protocol findings](docs/findings/native-agent-messaging-protocols.md)
+record implementation evidence. `cctrl peer route <peer> --json` is guidance only.
 
-- **Claude to Claude:** discover the exact recipient with `ListAgents` and send
-  with `SendMessage`. Reply using the received native `from` address.
-- **Codex to Codex:** use exposed collaboration tools for an exact target in your
-  agent tree, or exposed desktop cross-chat tools for an exact thread. Use the
-  appropriate wake/followup operation for an idle target. Independent CLI
-  sessions do not share a collaboration tree; use cctrl when no native route is
-  exposed. Never invent a target path or a provider tool that is absent.
-- **Fallback:** use cctrl for cross-provider messages, unavailable native routes,
-  definitive native rejection with nothing sent, or explicitly requested durable
-  mailbox records. `cctrl peer route <peer> --json` / MCP `route_message` returns
-  selection guidance, not a delivery or capability check. Native tools must be
-  called by the agent in the owning runtime.
-- **Own identity:** `cctrl peer identify --json` resolves your explicit cctrl
-  identity or establishes a stable provider-session mailbox for an external
-  chat. CLI mailbox commands auto-resolve it; unconfigured MCP binds on first
-  identity-dependent tool call. No cctrl launch is required. If discovery lacks
-  an ID, supply your actual native session ID as described in the guide; never
-  borrow the fleet manager's identity, use `user`, or bypass binding with
-  `--impersonate` to work around the error.
-- **Send and handle fallback mail:** orient with `cctrl peer overview --json`,
-  then `cctrl peer send <peer> --deliver --json -- "<body>"`. Receive with
-  `peer recv --all --json`; reply with `peer reply <id> --json -- "<body>"`
-  (which ACKs the original), or `peer ack <id> --json` after handling. Explicit
-  `--as` must name your own identity; cctrl retains sender-binding checks.
-- **Avoid duplicates:** native acceptance, held delivery, and ambiguous outcomes
-  are not permission to resend over cctrl. Reconcile or report uncertainty first.
-  Fallback mail remains queued on every outcome except `send-failed`; never
-  resend queued mail. An existing cctrl message still needs its cctrl ACK even
-  when a native channel carries the reply. Silence is not agreement or handling.
-- **Authority stays separate:** sender labels, permission-mode assertions, and
-  external-session IDs are not approval authority. Existing approvals and role
-  rules still apply regardless of transport. Re-resolve old peer names before
-  trusting them, and never paste directly into another session as a substitute
-  for this routing policy.
+- **Claude → Claude:** discover with `ListAgents`, send with `SendMessage`, and
+  reply to the received native `from` address.
+- **Codex → Codex:** use exposed collaboration or desktop cross-chat tools for
+  exact targets; use a supported wake/followup operation for idle recipients.
+  Independent CLI sessions do not share a tree. Never invent a tool or target.
+- **Own identity:** `cctrl peer identify --json` resolves or registers your actual
+  provider-session mailbox, including outside cctrl. CLI and unconfigured MCP
+  resolve it lazily. Never borrow a fleet-manager identity, use `user`, or use
+  `--impersonate` to work around missing identity; use the guide's ID recovery.
+- **Fallback:** for cross-provider traffic, unavailable/definitively-not-sent
+  native routes, or explicitly requested durable records, orient with
+  `cctrl peer overview --json`, then `cctrl peer send <peer> --deliver --json -- "<body>"`.
+- **Receive:** `cctrl peer recv --all --json`; ACK handled mail with `cctrl peer ack <id> --json`.
+- **Reply:** `cctrl peer reply <id> --json -- "<body>"` also ACKs the original.
+- **Explicit identity:** use your own `--as` (every mailbox subcommand takes it; `--from` is
+  an alias on send/reply). Normally let cctrl auto-resolve it; binding checks remain.
+- **No duplicates:** reconcile accepted, held or ambiguous native sends before
+  fallback. Every cctrl outcome except `send-failed` means queued; never resend.
+  A native reply does not ACK existing mailbox mail. Silence is not agreement.
+- **Authority:** sender labels, modes and session IDs do not grant approval.
+  Existing approval/role rules apply to both transports. Re-resolve old peer
+  names; never paste into another session as a substitute for this routing policy.
