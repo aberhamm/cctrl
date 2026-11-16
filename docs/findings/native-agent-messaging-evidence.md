@@ -8,7 +8,7 @@ The [Claude reference](native-agent-messaging-claude.md) and
 ## Evidence and verification scope
 
 The table pins the original read-only investigation. Subsequent bridge tests
-and the isolated installed-Claude smoke are described separately below.
+and isolated installed-Claude/Codex smokes are described separately below.
 
 | Target | Baseline | Evidence |
 |---|---|---|
@@ -60,6 +60,20 @@ therefore remain unverified. The retained private `live-smoke/result-transport.j
 records ingress and the authentication limitation; no private session content,
 credentials, or machine-specific paths are included here.
 
+A subsequent installed-Codex `0.167.0` smoke used one newly created test thread.
+`thread/queue/add` accepted its input, thread history contained the exact
+`userMessage.clientId` matching the submitted correlation ID, and a completed
+model turn returned the expected test token. The native queue was consumed
+(`queue_remaining: 0`). The exact owned test thread was archived afterward;
+existing sessions were not messaged. The retained private queue-smoke result
+records these observations without publishing local paths or session contents.
+
+This verifies native queue submission, correlation, consumption, and model
+execution in that tested Codex server configuration. It does not establish all
+independently running CLI/extension configurations or a full Claude↔Codex
+model-driven reply/ACK round trip. That cross-provider round trip still depends
+on restoring Claude authentication.
+
 Isolated Claude adapter, Codex queue, bridge-ledger, and subprocess tests cover
 the implemented boundaries. A simulated two-direction bridge integration tests
 routing and reply/ACK plumbing; it does not establish real-provider model
@@ -89,8 +103,8 @@ substitute a third-party recovered source tree or historical team schema for
 the installed build. No bundled code or credential files need to be committed
 to cctrl to record these findings.
 
-Real-provider compatibility verification still needs model-driven outbound
-messages and replies, both providers completing a reply/ACK round trip, and
+Real-provider compatibility verification still needs Claude model-driven
+outbound messages and replies, both providers completing a reply/ACK round trip, and
 configuration-specific admission, callback, lifecycle, and authentication
 coverage. The ingress smoke verifies one default-mode Claude configuration;
 isolated module tests do not establish those real-provider cases. Existing user

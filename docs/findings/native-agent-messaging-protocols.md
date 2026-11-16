@@ -20,7 +20,9 @@ Baseline: Claude Code `2.1.325`, Codex `0.167.0`, and cctrl commit `6d4adc3`.
 Protocol implementation findings are static/source-derived. The original phase
 verified only the existing Codex daemon handshake live.
 A subsequent isolated installed-Claude smoke verified native ingress/turn wakeup;
-expired authentication blocked model-driven outbound messages and replies.
+expired authentication blocked Claude model-driven outbound messages and replies.
+A subsequent isolated Codex smoke verified queued input, exact client correlation,
+queue consumption and a completed model answer in an owned test thread.
 See [verification scope](native-agent-messaging-evidence.md#evidence-and-verification-scope) before relying on a
 runtime or compatibility claim.
 
@@ -96,7 +98,8 @@ connected server's native shared queue API; it does not join the internal collab
 resume another writer. Existing peer mailbox commands remain a separate fallback
 with their original receive/ACK lifecycle.
 
-Native submitted/queued states do not establish model handling. Ordinary Claude
+Native submitted records completed socket write, not native admission ACK;
+queued proves Codex queue acceptance. Neither establishes explicit handling. Ordinary Claude
 immediate admission sends no positive delivery receipt; its native delivered
 status reports held-message release. Bridge received/replied stages require an
 explicit recipient action. Ambiguous native submissions must not be replayed or

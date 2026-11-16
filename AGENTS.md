@@ -100,9 +100,10 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   Never spoof modes or override admission. Claude proxies refuse raw native ingress.
 - **Handle:** `cctrl bridge inbox`, then `cctrl bridge reply MESSAGE_ID -- "<body>"`
   or `cctrl bridge ack MESSAGE_ID` after handling; inspect `bridge status MESSAGE_ID`.
-- **Receipts:** submitted/queued means transport acceptance; received/replied
-  requires an explicit action. Ordinary Claude accepts have no positive receipt;
-  native delivered reports held-message release, never handling. Silence is not agreement.
+- **Receipts:** submitted means socket write completed, not native admission ACK;
+  queued proves Codex queue acceptance; received/replied requires explicit action.
+  Claude immediate accepts have no positive receipt; native delivered means held
+  release, never handling. Silence is not agreement.
 - **No duplicates:** reconcile held/ambiguous sends; never replay or fall back
   after possible submission. Unavailable routes may use the existing mailbox.
 - **Mailbox fallback:** `cctrl peer identify --json`, `cctrl peer overview --json`,

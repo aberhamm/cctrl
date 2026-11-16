@@ -83,7 +83,7 @@ Receipt stages have different meanings:
 
 | Stage | What it establishes |
 |---|---|
-| Submitted | The native send was submitted; this is not proof the model processed it |
+| Submitted | Socket write completed; not a native admission ACK or proof the model processed it |
 | Queued | The connected Codex server accepted queued input; not proof of owner consumption or a handling ACK |
 | Held | Claude admission retained the message pending its policy/approval |
 | Released (`released` in bridge status) | Native Claude `delivered` reports release of previously held mail; ordinary immediate accepts emit no positive delivery receipt |
@@ -192,12 +192,18 @@ process. Follow explicit-ID recovery above. Use CLI `cctrl bridge` or the `nativ
 ## Verification scope
 
 The original investigation established static protocol evidence and a read-only
-Codex daemon handshake. A later isolated installed-Claude smoke accepted bridge
-input, emitted a native peer message, and started a second turn. Expired Claude
-authentication blocked model execution, so outbound model messaging and a full
-real-provider round trip remain unverified. Isolated module/subprocess tests and
-a simulated two-direction integration verify plumbing, not both providers'
-model behavior. See [evidence and limits](findings/native-agent-messaging-evidence.md).
+Codex daemon handshake. An isolated installed-Claude smoke accepted bridge input,
+emitted native peer input, and started a second turn; expired authentication
+blocked Claude model execution. An isolated installed-Codex smoke accepted queued
+input in a newly created thread, observed the exact correlated user-message
+client ID, completed a model turn with the expected test answer, and consumed
+the queue. The owned Codex test thread was archived afterward.
+
+These verify Claude ingress/wakeup and Codex queue-to-model execution in the
+tested configurations. A full real Claude↔Codex model-driven reply/ACK round
+trip remains blocked by Claude login. Isolated module/subprocess tests and a
+simulated two-direction integration verify plumbing, not every provider
+configuration. See [evidence and limits](findings/native-agent-messaging-evidence.md).
 
 Enable starts a per-session bridge daemon; repeating enable reuses a live
 endpoint. If startup reports pending or exits, inspect its reported diagnostic

@@ -1367,8 +1367,8 @@ cctrl bridge status MESSAGE_ID
 cctrl bridge stop
 ```
 
-Submitted/queued means transport acceptance. Explicit received/replied confirms
-handling; ordinary Claude accepts emit no positive receipt, and native delivered
+Submitted means completed socket write, not native admission ACK; queued proves
+Codex queue acceptance. Explicit received/replied confirms handling; ordinary Claude accepts emit no positive receipt, and native delivered
 means release of previously held mail. Never replay an ambiguous send or fall
 back after possible submission. Codex delivery uses the connected server's native shared queue without resuming
 a second history writer; queue acceptance is not proof of owner consumption. See the
