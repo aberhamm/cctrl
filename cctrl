@@ -480,6 +480,9 @@ _PEER_ORIGIN_ATTEST_IN="${CCTRL_ORIGIN_ATTEST-}"
 _PEER_ORIGIN_ATTEST_SET=false
 [[ -n "${CCTRL_ORIGIN_ATTEST+x}" ]] && _PEER_ORIGIN_ATTEST_SET=true
 unset CCTRL_ORIGIN_ATTEST
+unset _PEER_ORIGIN_EXTERNAL_IN
+_PEER_ORIGIN_EXTERNAL_IN="${CCTRL_ORIGIN_EXTERNAL-}"
+unset CCTRL_ORIGIN_EXTERNAL
 TASK_RECORD_SCHEMA_VERSION=2
 TASK_RECORD_MAX_EVIDENCE=32
 TASK_REGISTRY_MAX_EVENT_IDS=64
@@ -7117,7 +7120,16 @@ _peer_init() {
     # Plan 116 A1: never `mkdir -p` the data dir (it may be mid-migration);
     # wait out the sentinel and create only the leaf.
     _cctrl_data_dir_ensure "$(dirname "$PEERS_FILE")" || return $?
-    [[ -f "$PEERS_FILE" ]] || { echo "{}" > "$PEERS_FILE" && chmod 600 "$PEERS_FILE"; }
+    if [[ ! -f "$PEERS_FILE" ]]; then
+        local initial rc=0
+        initial="$(mktemp "$PEERS_FILE.init.XXXXXX")" || return 1
+        printf '{}\n' > "$initial" && chmod 600 "$initial" || rc=1
+        if [[ "$rc" == 0 ]]; then
+            ln "$initial" "$PEERS_FILE" 2>/dev/null || { [[ -f "$PEERS_FILE" ]] || rc=1; }
+        fi
+        rm -f "$initial"
+        return "$rc"
+    fi
 }
 
 _peer_now_utc() {
@@ -7317,8 +7329,10 @@ _peer_all_json_build() {
                 capabilities: ((($v.capabilities // []) + ($derived_merge.capabilities // [])) | unique),
                 registered_at: ($v.registered_at // null),
                 provider_task_id: ($v.provider_task_id // null),
+                external_identity: ($v.external_identity // null),
+                origin_external: ($v.origin_external // null),
                 created_at: ($v.created_at // null),
-                source: "manual"
+                source: (if $v.external_identity != null then "external-session" else "manual" end)
               }
               | with_tmux_target
               | if $shadow != "" then . + {shadows: $shadow} else . end
@@ -7347,7 +7361,7 @@ _peer_all_json_build() {
 # process-local and only primed by commands that opt in; every other caller
 # (and plain `peer send`) rebuilds fresh, byte-for-byte as before.
 _peer_all_json() {
-    if [[ "${_PEER_ALL_JSON_CACHED:-0}" == "1" ]]; then
+    if [[ "${_PEER_ALL_JSON_CACHED:-0}" == "1" && "${_PEER_ALL_JSON_REGISTRY:-}" == "$(cat "$PEERS_FILE" 2>/dev/null)" ]]; then
         printf '%s\n' "$_PEER_ALL_JSON_CACHE"
         return 0
     fi
@@ -7375,13 +7389,17 @@ _peer_fleet_peers() {
 
 _peer_all_json_cache_begin() {
     local doc
+    _peer_init || return $?
+    # Registration can occur during lazy sender resolution. Reuse session
+    # discovery only while the registry used to build it is still current.
+    _PEER_ALL_JSON_REGISTRY="$(cat "$PEERS_FILE" 2>/dev/null || true)"
     doc="$(_peer_all_json_build)" || return 1
     _PEER_ALL_JSON_CACHE="$doc"
     _PEER_ALL_JSON_CACHED=1
 }
 
 _peer_all_json_cache_end() {
-    unset _PEER_ALL_JSON_CACHE _PEER_ALL_JSON_CACHED
+    unset _PEER_ALL_JSON_CACHE _PEER_ALL_JSON_CACHED _PEER_ALL_JSON_REGISTRY
 }
 
 _peer_resolve_json() {
@@ -7519,6 +7537,10 @@ _peer_cmd_register() {
     done
 
     _peer_init
+    if jq -e --arg name "$name" '.[$name].external_identity != null' "$PEERS_FILE" >/dev/null; then
+        echo "An external session identity cannot be overwritten by manual registration" >&2
+        return 65
+    fi
     if [[ -n "$thread_id" ]]; then
         [[ "$agent" == codex && -n "$dir" && -z "$session" ]] || { echo "--thread-id requires --agent codex --dir and no --session" >&2; return 64; }
         [[ "$host" == local || "$host" == "${CCTRL_HOST_PREFIX:-local}" ]] || _host_is_local "$host" || { echo "Register app peers on their owning host" >&2; return 64; }
@@ -7585,7 +7607,9 @@ _peer_cmd_register() {
        --arg now "$now" \
        --argjson aliases "$aliases_json" \
        --argjson capabilities "$capabilities_json" '
-        . + {
+        if .[$name].external_identity != null then
+          error("external session identity cannot be overwritten by manual registration")
+        else . + {
           ($name): (
             {
               name: $name,
@@ -7600,7 +7624,7 @@ _peer_cmd_register() {
             + (if $purpose != "" then {purpose: $purpose} else {} end)
             + (if $thread_id != "" then {provider_task_id: $thread_id, created_at:(.[$name].created_at // $now)} else {} end)
           )
-        }'
+        } end' || return 65
 
     echo -e "${GREEN}Registered peer: ${BOLD}$name${RESET}"
 }
@@ -7921,7 +7945,7 @@ _peer_cmd_say() {
     app_peer="$(_peer_resolve_json "$identity" 2>/dev/null || true)"
     if [[ -n "$app_peer" ]] && jq -e '(.capabilities // []) | index("app-server") != null' <<< "$app_peer" >/dev/null; then
         local queue_only=false flag app_sender="${CCTRL_PEER:-}"
-        [[ -n "$app_sender" ]] || app_sender="$(_peer_app_self_identity 2>/dev/null || true)"
+        [[ -n "$app_sender" ]] || app_sender="$(_peer_self_identity 2>/dev/null || true)"
         if [[ -z "$app_sender" ]]; then
             if [[ -n "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" ]]; then
                 _json_error "missing-identity" "Register this exact app thread before sending as an agent"
@@ -8053,13 +8077,107 @@ _peer_cmd_resolve() {
 _peer_app_self_identity() {
     local thread="${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" matches name peer
     [[ -n "$thread" ]] || return 1
-    matches="$(_peer_all_json | jq -c --arg id "$thread" '[.peers[] | select(.provider_task_id==$id)]')" || return 1
+    # App bindings are registered records. Do not enumerate every tmux session
+    # just to decide whether an external chat has an existing app identity.
+    _peer_init || return $?
+    matches="$(jq -c --arg id "$thread" '[to_entries[] | select(.value.provider_task_id==$id)
+        | .value + {name:(.value.name // .key),host:(.value.host // "local")}]' "$PEERS_FILE")" || return 1
     [[ "$(jq length <<< "$matches")" == 1 ]] || return 1
     peer="$(jq -c '.[0]' <<< "$matches")"
     local host="$(jq -r '.host' <<< "$peer")"
     [[ "$host" == local || "$host" == "${CCTRL_HOST_PREFIX:-local}" ]] || _host_is_local "$host" || return 1
     _peer_sender_binding_mismatch "$(jq -r '.name' <<< "$peer")" "$peer" "" false false || return 1
     jq -r '.name' <<< "$peer"
+}
+
+# External sessions get a stable mailbox identity, never an app-server ownership
+# assertion or an alias borrowed from another session. Registration is locked,
+# additive and idempotent. Session claims remain claims, not approval authority.
+_peer_external_self_identity() {
+    local descriptor host_id name now
+    _peer_init || return $?
+    host_id="$(_cctrl_host_id)" || return $?
+    descriptor="$(python3 "$SCRIPT_DIR/lib/peer_identity.py" --host-id "$host_id" \
+        --sessions-dir "$CLAUDE_SESSIONS_DIR" "$@")" || return $?
+    name="$(jq -r '.name' <<< "$descriptor")" || return 66
+    now="$(_peer_now_utc)"
+    # Read-only fast path; the locked update below rechecks all identity fields
+    # on a miss/collision. Keep timestamps and operator metadata on reuse.
+    if ! jq -e --arg n "$name" --argjson d "$descriptor" '
+        .[$n].external_identity as $i | $i != null
+        and $i.provider==$d.provider and $i.session_id==$d.session_id
+        and $i.host_id==$d.host_id' "$PEERS_FILE" >/dev/null 2>&1; then
+        _cctrl_json_update "$PEERS_FILE" --arg n "$name" --argjson d "$descriptor" \
+            --arg host "${CCTRL_HOST_PREFIX:-local}" --arg now "$now" --arg dir "$PWD" '
+            if (has($n) or any(.[]; (.aliases // []) | index($n))) then
+                if .[$n].external_identity as $i | $i != null
+                    and $i.provider==$d.provider and $i.session_id==$d.session_id
+                    and $i.host_id==$d.host_id then .
+                else error("external session identity collides with an existing peer") end
+            else . + {($n): {name:$n, agent:$d.provider, host:$host,
+                capabilities:["mailbox"], external_identity:($d | del(.name)),
+                registered_at:$now, dir:$dir}} end' || return 66
+    fi
+    printf '%s\n' "$name"
+}
+
+_peer_self_identity() {
+    local identity peer
+    if [[ -n "${TMUX:-}" ]] && identity="$(_session_current_name 2>/dev/null)" \
+        && peer="$(_peer_resolve_json "$identity" 2>/dev/null)" \
+        && jq -e --arg s "$identity" '(.tmux_target // .session // "")==$s' <<< "$peer" >/dev/null; then
+        jq -r '.name' <<< "$peer"
+        return 0
+    fi
+    if identity="$(_peer_app_self_identity 2>/dev/null)"; then
+        printf '%s\n' "$identity"
+        return 0
+    fi
+    _peer_external_self_identity "$@"
+}
+
+_peer_external_import_origin() {
+    local name="$1" host="$2" peer now
+    [[ -n "${_PEER_ORIGIN_EXTERNAL_IN:-}" ]] || return 0
+    [[ -n "$host" && "$host" != local && "$host" != "${CCTRL_HOST_PREFIX:-local}" ]] || return 66
+    peer="$(python3 "$SCRIPT_DIR/lib/peer_identity.py" --origin-base64 "$_PEER_ORIGIN_EXTERNAL_IN" \
+        --origin-name "$name" --origin-host "$host")" || return 66
+    _peer_init || return $?
+    now="$(_peer_now_utc)"
+    _cctrl_json_update "$PEERS_FILE" --arg n "$name" --argjson p "$peer" --arg now "$now" '
+        if (has($n) or any(.[]; (.aliases // []) | index($n))) then
+            if .[$n].origin_external == true and .[$n].host==$p.host
+                and .[$n].external_identity == $p.external_identity then .
+            else error("external origin identity collides with an existing peer") end
+        else . + {($n):($p + {origin_external:true,capabilities:["mailbox"],registered_at:$now})} end' || return 66
+}
+
+_peer_cmd_identify() {
+    local json=false agent="" session_id="" identity
+    _arg_has_json "$@" && json=true
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --agent|--session-id)
+                [[ $# -ge 2 && -n "$2" ]] || return 64
+                if [[ "$1" == --agent ]]; then agent="$2"; else session_id="$2"; fi
+                shift 2 ;;
+            *) $json && _json_error validation "Unknown peer identify flag: $1"; return 64 ;;
+        esac
+    done
+    if [[ -n "$agent" || -n "$session_id" ]]; then
+        if [[ ( "$agent" != claude && "$agent" != codex ) || -z "$session_id" ]]; then
+            $json && _json_error validation "Use --agent claude|codex and --session-id together"
+            return 64
+        fi
+        identity="$(_peer_external_self_identity --agent "$agent" --session-id "$session_id")" || return $?
+    else
+        identity="${CCTRL_PEER:-}"
+        [[ -n "$identity" ]] || identity="$(_peer_self_identity)" || return $?
+        _peer_cmd_whoami --as "$identity" --json
+        return $?
+    fi
+    _peer_resolve_json "$identity"
 }
 
 _peer_cmd_whoami() {
@@ -8077,19 +8195,61 @@ _peer_cmd_whoami() {
         esac
     done
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
-    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
+    [[ -n "$identity" ]] || identity="$(_peer_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
+        if $json; then
+            _json_error missing-identity "Run cctrl peer identify --json; if discovery lacks an ID, supply --agent and --session-id with your actual native session ID."
+            return 66
+        fi
         echo -e "${RED}No peer identity provided.${RESET}" >&2
-        echo -e "${DIM}Use: cctrl peer whoami --as <peer>  or set CCTRL_PEER.${RESET}" >&2
+        echo -e "${DIM}Run cctrl peer identify --json, or use --as <your-peer> / CCTRL_PEER.${RESET}" >&2
         return 1
     fi
     peer_json="$(_peer_resolve_json "$identity")" || return 1
+    if jq -e '.external_identity != null' <<< "$peer_json" >/dev/null; then
+        _peer_sender_binding_mismatch "$identity" "$peer_json" "" false false || {
+            _json_error sender-mismatch "External mailbox identity does not match the current provider session"
+            return 66
+        }
+    fi
     if $json; then
         jq '.' <<< "$peer_json"
     else
         echo -e "${BOLD}Peer Identity${RESET}"
         jq '.' <<< "$peer_json" | _peer_print_human
     fi
+}
+
+# Selection guidance belongs to the agent that owns the native tools. This
+# command never sends or claims that a target is addressable in that runtime.
+_peer_cmd_route() {
+    local target="${1:-}" identity="" json=false sender recipient
+    [[ -n "$target" ]] || return 64
+    shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --as) [[ $# -ge 2 && -n "$2" ]] || return 64; identity="$2"; shift 2 ;;
+            --json) json=true; shift ;;
+            *) $json && _json_error validation "Unknown peer route flag: $1"; return 64 ;;
+        esac
+    done
+    _mailbox_resolve_identity_for_mode "$identity" true || return $?
+    sender="$(_peer_resolve_json "$MAILBOX_RESOLVED_IDENTITY")" || return 66
+    recipient="$(_peer_resolve_json "$target")" || return 66
+    jq -n --argjson s "$sender" --argjson r "$recipient" '
+        ($s.agent == $r.agent and ($s.agent == "claude" or $s.agent == "codex")) as $same
+        | {ok:true, sent:false, identity:$s, recipient:$r,
+           preferred_transport:(if $same then "native-if-addressable" else "cctrl-mailbox" end),
+           native:(if $same then {
+             provider:$s.agent,
+             discovery:(if $s.agent=="claude" then ["ListAgents"] else ["collaboration.list_agents","list_threads"] end),
+             send:(if $s.agent=="claude" then ["SendMessage"] else ["collaboration.send_message","collaboration.followup_task","send_message_to_thread"] end),
+             recipient_session_id:($r.external_identity.session_id // $r.provider_task_id // null),
+             requires_exact_runtime_target:true,
+             note:"Use only tools exposed by your runtime and an exact discovered target. Independent Codex CLI processes do not share an agent tree. This is guidance, not a native capability check."
+           } else null end),
+           fallback:{transport:"cctrl-mailbox", command:["cctrl","peer","send",$r.name,"--as",$s.name,"--deliver","--json","--","<body>"]},
+           retry_policy:"Fallback only when native is unavailable or definitively not sent. Do not replay an accepted, held, or ambiguous send; reconcile it first. Existing mailbox messages still require their cctrl ACK."}'
 }
 
 # ── Plan 114 (a): peer whois, a read-only consistency check ─────────
@@ -8512,7 +8672,7 @@ _peer_cmd_help_agent() {
         esac
     done
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
-    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
+    [[ -n "$identity" ]] || identity="$(_peer_self_identity 2>/dev/null || true)"
     if [[ -n "$identity" ]]; then
         if ! peer_json="$(_peer_resolve_json "$identity" 2>/dev/null)"; then
             if $json; then
@@ -8541,14 +8701,19 @@ _peer_help_agent_human() {
         sendfrom="--from <you> "
         echo -e "${BOLD}Peer operating contract${RESET} — no identity set (pass --as NAME or set CCTRL_PEER for tailored examples)"
     fi
-    echo "  Live tmux chat (acts now, writes no mailbox message):"
+    echo "  Prefer native messaging for exact addressable same-provider targets:"
+    echo "    Claude: ListAgents -> SendMessage. Codex: exposed collaboration or cross-chat tools."
+    echo "    Independent Codex CLI processes do not share an agent tree."
+    echo "    cctrl peer route <peer> --json  # guidance only; does not send"
+    echo "    cctrl peer identify --json      # stable fallback identity, including external sessions"
+    echo "  Explicit live tmux chat (writes no mailbox message):"
     echo "    cctrl peer say <peer> -- \"<message>\""
     echo "  Durable async work (survives the peer being away/offline):"
     echo "    cctrl peer send <peer> ${sendfrom}-- \"<message>\""
     echo "  Drain your mailbox:"
     echo "    cctrl peer recv --json        # read the next queued/delivered message"
     echo "    cctrl peer ack <id> --json    # mark it handled once you have acted"
-    echo -e "${DIM}Default rule: use 'peer say' for a live tmux agent you want to act now; use 'peer send' for durable/offline async work.${RESET}"
+    echo -e "${DIM}Default: native same-provider messaging when supported; cctrl mailbox otherwise or when a durable record is explicitly required. Never replay accepted, held or ambiguous native sends. ACK existing mailbox work separately.${RESET}"
     echo -e "${DIM}No auto-injection: 'cctrl start --peer' does not inject this contract; you receive it only via 'cctrl peer help-agent', a user prompt, or MCP tool metadata.${RESET}"
 }
 
@@ -8560,20 +8725,30 @@ _peer_help_agent_json() {
           ok: true,
           peer: $p,
           generic: ($p == null),
-          default_rule: "Use `peer say` for a live tmux agent you want to act now; use `peer send` for durable async work that must survive the recipient being away.",
+          default_rule: "Prefer exposed native tools for exact addressable Claude-to-Claude or Codex-to-Codex targets; use cctrl mailbox as fallback or for explicitly requested durable records. Independent Codex CLI processes do not share an agent tree. Never replay accepted, held or ambiguous native sends.",
           auto_injection: false,
           auto_injection_note: "cctrl start --peer does not auto-inject this contract; an agent receives it only via an explicit `cctrl peer help-agent` call, a user prompt, or MCP tool metadata.",
           commands: {
+            route: {
+              transport: "selection-guidance", mailbox: false,
+              when: "Choose native discovery or mailbox fallback for a canonical cctrl peer; this does not send.",
+              example: "cctrl peer route <peer> --json"
+            },
+            identify: {
+              transport: "identity", mailbox: false,
+              when: "Resolve your own identity, auto-registering a session-derived mailbox for external chats.",
+              example: "cctrl peer identify --json"
+            },
             say: {
               transport: "live-tmux",
               mailbox: false,
-              when: "The peer is a live tmux session and you want it to act now.",
+              when: "Explicit direct-chat operation; use native routing first for supported same-provider targets.",
               example: "cctrl peer say <peer> -- \"<message>\""
             },
             send: {
               transport: "mailbox",
               mailbox: true,
-              when: "Durable async work that must survive the peer being away/offline.",
+              when: "Native is unavailable or definitively not sent, providers differ, or durable mailbox work is explicitly requested.",
               example: ("cctrl peer send <peer> --from " + ($p // "<you>") + " -- \"<message>\"")
             },
             recv: {
@@ -8618,9 +8793,9 @@ _peer_cmd_overview() {
     done
     identity="$as_identity"
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
-    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
+    [[ -n "$identity" ]] || identity="$(_peer_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
-        if $json; then _json_error "missing-identity" "Use --as <peer> or set CCTRL_PEER."; return 66; fi
+        if $json; then _json_error "missing-identity" "Run cctrl peer identify --json to establish your session identity, or use --as <peer> / CCTRL_PEER."; return 66; fi
         echo -e "${RED}No peer identity provided.${RESET}" >&2
         echo -e "${DIM}Use: cctrl peer overview --as <peer>  or set CCTRL_PEER.${RESET}" >&2
         return 1
@@ -8658,6 +8833,12 @@ _peer_cmd_overview() {
     fi
     peer_json="$(jq -c '.[0]' <<< "$matches")"
     identity="$(jq -r '.name' <<< "$peer_json")"
+    if jq -e '.external_identity != null' <<< "$peer_json" >/dev/null; then
+        _peer_sender_binding_mismatch "$identity" "$peer_json" "" false false || {
+            _json_error sender-mismatch "External mailbox identity does not match the current provider session"
+            return 66
+        }
+    fi
 
     # Mailbox summary for the canonical identity, reusing `peer check`'s shape.
     _mailbox_read_json_or_error "$json" || return $?
@@ -9282,14 +9463,14 @@ _mailbox_resolve_identity_for_mode() {
     local explicit="$1" json="${2:-false}" identity
     identity="$explicit"
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
-    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
+    [[ -n "$identity" ]] || identity="$(_peer_self_identity 2>/dev/null || true)"
     if [[ -z "$identity" ]]; then
         if [[ "$json" == "true" ]]; then
-            _json_error "missing-identity" "Use --as <peer> or set CCTRL_PEER."
+            _json_error "missing-identity" "Run cctrl peer identify --json to establish your session identity, or use --as <peer> / CCTRL_PEER."
             return 66
         fi
         echo -e "${RED}No peer identity provided.${RESET}" >&2
-        echo -e "${DIM}Use --as <peer> or set CCTRL_PEER.${RESET}" >&2
+        echo -e "${DIM}Run cctrl peer identify --json to establish your session identity, or use --as <peer> / CCTRL_PEER.${RESET}" >&2
         return 1
     fi
     if [[ ! "$identity" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$identity" == "user" ]]; then
@@ -9309,8 +9490,9 @@ _mailbox_resolve_identity_for_mode() {
         _mailbox_require_peer "peer" "$identity" false
         return 1
     fi
-    if [[ -n "$(jq -r '.provider_task_id // empty' <<< "$peer_json")" ]] && ! _peer_sender_binding_mismatch "$identity" "$peer_json" "" false false; then
-        _json_error "sender-mismatch" "App mailbox identity does not match the exact caller thread"
+    if jq -e '.provider_task_id != null or .external_identity != null' <<< "$peer_json" >/dev/null \
+        && ! _peer_sender_binding_mismatch "$identity" "$peer_json" "" false false; then
+        _json_error "sender-mismatch" "Mailbox identity does not match the exact caller provider session"
         return 66
     fi
     MAILBOX_RESOLVED_IDENTITY="$(jq -r '.name' <<< "$peer_json")"
@@ -9381,6 +9563,23 @@ _peer_sender_binding_mismatch() {
     _PEER_BIND_TARGET=""
     [[ "$impersonate" == "true" ]] && return 0
     [[ "$from_name" != "user" && -n "$from_peer_json" ]] || return 0
+    if jq -e '.external_identity != null' <<< "$from_peer_json" >/dev/null; then
+        local descriptor
+        if jq -e '.origin_external == true' <<< "$from_peer_json" >/dev/null; then
+            descriptor="$(python3 "$SCRIPT_DIR/lib/peer_identity.py" --origin-base64 "${_PEER_ORIGIN_EXTERNAL_IN:-}" \
+                --origin-name "$from_name" --origin-host "$(jq -r .host <<< "$from_peer_json")" 2>/dev/null)" || return 1
+            jq -e --argjson p "$descriptor" '.external_identity==$p.external_identity and .host==$p.host' \
+                <<< "$from_peer_json" >/dev/null
+            return $?
+        fi
+        descriptor="$(python3 "$SCRIPT_DIR/lib/peer_identity.py" --host-id "$(_cctrl_host_id)" \
+            --sessions-dir "$CLAUDE_SESSIONS_DIR" 2>/dev/null)" || return 1
+        _PEER_BIND_TARGET="$(jq -r '.external_identity.session_id' <<< "$from_peer_json")"
+        jq -e --argjson d "$descriptor" '.external_identity as $i |
+            $i.provider==$d.provider and $i.session_id==$d.session_id and $i.host_id==$d.host_id' \
+            <<< "$from_peer_json" >/dev/null
+        return $?
+    fi
     local app_thread app_cwd
     app_thread="$(jq -r '.provider_task_id // empty' <<< "$from_peer_json")"
     if [[ -n "$app_thread" ]]; then
@@ -9905,6 +10104,35 @@ _peer_cmd_send_impl() {
         return 64
     fi
 
+    _peer_external_import_origin "${as_identity:-${from:-${CCTRL_PEER:-}}}" "$sender_host_override" || {
+        _json_error sender-mismatch "Could not establish the external origin sender"
+        return 66
+    }
+    # requested_from (plan 077): the identity string the caller literally asked
+    # for, BEFORE any alias/CCTRL_PEER resolution below — kept for the audit
+    # trail so a misroute like msg_20260927_175609_8f2f78 (both `--as` and the
+    # recipient name were stale) is diagnosable from the message itself.
+    local requested_from="$as_identity"
+    [[ -n "$requested_from" ]] || requested_from="$from"
+    [[ -n "$requested_from" ]] || requested_from="${CCTRL_PEER:-}"
+    [[ -n "$requested_from" ]] || requested_from="$(_peer_self_identity 2>/dev/null || true)"
+
+    if [[ -z "$from" ]]; then
+        if [[ -n "$as_identity" || -n "${CCTRL_PEER:-}" || -n "$requested_from" ]]; then
+            _mailbox_resolve_identity_for_mode "${as_identity:-$requested_from}" "$json" || return $?
+            from="$MAILBOX_RESOLVED_IDENTITY"
+        elif $json; then
+            _json_error "missing-identity" "Run cctrl peer identify --json, or use --as NAME / CCTRL_PEER. Never borrow another session identity."
+            return 66
+        elif [[ -t 0 && -t 1 ]]; then
+            from="user"
+        else
+            echo -e "${RED}No sender identity provided.${RESET}" >&2
+            echo -e "${DIM}Use --from NAME, --as NAME, or CCTRL_PEER.${RESET}" >&2
+            return 1
+        fi
+    fi
+
     if $deliver && $no_deliver; then
         $json && _json_error "validation" "Use either --deliver or --no-deliver, not both." || echo -e "${RED}Use either --deliver or --no-deliver, not both.${RESET}" >&2
         return 64
@@ -9955,31 +10183,6 @@ _peer_cmd_send_impl() {
         _peer_send_deliver_emit "$json" "${PEER_SD_TO:-$to}" send
         PEER_SD_IMPLICIT=""
         return "$_sd_rc"
-    fi
-
-    # requested_from (plan 077): the identity string the caller literally asked
-    # for, BEFORE any alias/CCTRL_PEER resolution below — kept for the audit
-    # trail so a misroute like msg_20260927_175609_8f2f78 (both `--as` and the
-    # recipient name were stale) is diagnosable from the message itself.
-    local requested_from="$as_identity"
-    [[ -n "$requested_from" ]] || requested_from="$from"
-    [[ -n "$requested_from" ]] || requested_from="${CCTRL_PEER:-}"
-    [[ -n "$requested_from" ]] || requested_from="$(_peer_app_self_identity 2>/dev/null || true)"
-
-    if [[ -z "$from" ]]; then
-        if [[ -n "$as_identity" || -n "${CCTRL_PEER:-}" || -n "$requested_from" ]]; then
-            _mailbox_resolve_identity_for_mode "${as_identity:-$requested_from}" "$json" || return $?
-            from="$MAILBOX_RESOLVED_IDENTITY"
-        elif $json; then
-            _json_error "missing-identity" "Use --from NAME, --as NAME, CCTRL_PEER, or --allow-unknown."
-            return 66
-        elif [[ -t 0 && -t 1 ]]; then
-            from="user"
-        else
-            echo -e "${RED}No sender identity provided.${RESET}" >&2
-            echo -e "${DIM}Use --from NAME, --as NAME, or CCTRL_PEER.${RESET}" >&2
-            return 1
-        fi
     fi
 
     local unknown_peer=false to_peer_json="" from_peer_json=""
@@ -10140,6 +10343,7 @@ _peer_cmd_send_impl() {
                       // $name),
               tmux_target: $peer.tmux_target,
               agent: $peer.agent,
+              external_identity: $peer.external_identity,
               host: (($meta_host | select(. != "")) // $peer.host)
             }
             | with_entries(select(.value != null))')"
@@ -11935,6 +12139,13 @@ _peer_send_and_deliver_remote() {
     # remote only and unsets the var once read. base64 is shell-safe.
     local origin_env=""
     [[ "${PEER_SD_ORIGIN_ATTEST_B64:-}" =~ ^[A-Za-z0-9+/]+=*$ ]] && origin_env=" CCTRL_ORIGIN_ATTEST=$PEER_SD_ORIGIN_ATTEST_B64"
+    local external_peer external_encoded
+    external_peer="$(_peer_resolve_json "$sender_as" 2>/dev/null || true)"
+    if [[ -n "$external_peer" ]] && jq -e '.external_identity != null and .origin_external != true' <<< "$external_peer" >/dev/null; then
+        external_encoded="$(jq -r --arg host "$sender_host" '{name,agent,host:$host,external_identity} | tojson | @base64' <<< "$external_peer")"
+        [[ "$external_encoded" =~ ^[A-Za-z0-9+/]+=*$ ]] || return 66
+        origin_env+=" CCTRL_ORIGIN_EXTERNAL=$external_encoded"
+    fi
     result="$(printf '%s' "$body" | ssh -o BatchMode=yes -o ConnectTimeout=8 "$ssh_target" \
         "source ~/.zprofile 2>/dev/null; CCTRL_HOST_PREFIX=$(printf '%q' "$remote_host")${origin_env} cctrl peer send${quoted_args}" 2>/dev/null)" || rc=$?
 
@@ -14965,11 +15176,6 @@ _peer_cmd_mcp() {
 
     identity="$as_identity"
     [[ -n "$identity" ]] || identity="${CCTRL_PEER:-}"
-    [[ -n "$identity" ]] || identity="$(_peer_app_self_identity 2>/dev/null || true)"
-    if [[ -z "$identity" ]]; then
-        echo "cctrl peer mcp needs --as <peer> or CCTRL_PEER" >&2
-        return 66
-    fi
     # Plan 106 P3b: no identity pre-resolve here (it ran a full session discovery,
     # ~22 s on a big fleet, before the server could answer `initialize`). The
     # server passes the identity to cctrl on every tool call, which resolves it.
@@ -15015,6 +15221,8 @@ cmd_peer() {
         alias) _peer_cmd_alias "$@" ;;
         unregister|rm|remove|delete) _peer_cmd_unregister "$@" ;;
         whoami|identity) _peer_cmd_whoami "$@" ;;
+        identify) _peer_cmd_identify "$@" ;;
+        route) _peer_cmd_route "$@" ;;
         whois) _peer_cmd_whois "$@" ;;
         native-log) _peer_cmd_native_log "$@" ;;
         help-agent) _peer_cmd_help_agent "$@" ;;
@@ -23360,7 +23568,9 @@ cmd_help() {
     echo "  cctrl peer register <name> [flags]  Register a manual peer"
     echo "  cctrl peer alias <name> <alias>     Add an alias to a manual peer"
     echo "  cctrl peer unregister <name>        Remove a manual peer"
-    echo "  cctrl peer whoami [--as NAME]       Resolve identity from --as or CCTRL_PEER"
+    echo "  cctrl peer identify [--agent AGENT --session-id ID] [--json]  Establish your own fallback identity"
+    echo "  cctrl peer route <peer> [--json]    Native-first route guidance; does not send"
+    echo "  cctrl peer whoami [--as NAME]       Resolve your own explicit or native-session identity"
     echo "  cctrl peer help-agent [--as NAME]   Agent contract: peer say (live) vs peer send (async)"
     echo "  cctrl peer send <to> -- <body>      Queue a mailbox message (--deliver to also nudge)"
     echo "  cctrl peer check [--as NAME]        Compact unread summary (--exit-on-empty exits 2)"

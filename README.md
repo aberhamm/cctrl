@@ -1344,6 +1344,25 @@ and exit 78, handover with `--succeeds`) lives in
 
 ### Peers
 
+**Native first for supported same-provider sessions; cctrl is the fallback.**
+Claude sessions use `ListAgents`/`SendMessage` for exact discovered recipients.
+Codex sessions use exposed collaboration tools within their agent tree or
+exposed desktop cross-chat tools; independent CLI sessions do not share that
+tree. Use cctrl for cross-provider traffic, unavailable/definitively-not-sent
+native routes, or explicitly requested durable mailbox records. Never duplicate
+an accepted, held, or ambiguous native send. The
+[operating guide](docs/peer-messaging.md) covers route selection and identity.
+
+```sh
+cctrl peer identify --json        # own identity, even when launched outside cctrl
+cctrl peer route RECIPIENT --json # selection guidance only; no message is sent
+```
+
+External sessions auto-register a stable provider-session mailbox on first use.
+They receive no app ownership, role, or approval authority. See
+[identity recovery](docs/peer-messaging.md#sessions-started-outside-cctrl) if the
+client does not expose a native session ID.
+
 For version-pinned findings on Claude Code's native cross-session sockets,
 Codex's internal collaboration and external App Server protocols, and the
 existing cctrl adapters, see
@@ -1498,10 +1517,10 @@ error.
 #### Agent operating contract (`peer help-agent`)
 
 Humans learn `peer say` from the examples above, but an agent needs a compact
-contract telling it *when* to direct-chat a live peer and *when* to queue durable
-async work. `cctrl peer help-agent` prints exactly that — distinguishing
-`peer say` (live tmux chat), `peer send` (durable async), and the
-`peer recv` / `peer ack` mailbox loop.
+contract telling it when native same-provider messaging is addressable and when
+to use the mailbox fallback. `cctrl peer help-agent` describes route selection,
+identity establishment, and the `peer recv` / `peer ack` loop. Explicit `peer say`
+remains a low-level live-tmux operation.
 
 ```bash
 cctrl peer help-agent                 # generic guidance (no identity needed)
@@ -1513,8 +1532,9 @@ cctrl peer help-agent --json          # structured contract for prompt builders/
 A bare `peer help-agent` prints generic guidance and never fails for a missing
 identity; `--as NAME` and `CCTRL_PEER` canonicalize the peer through the same
 resolver the mailbox and `peer say` use, then tailor the examples. The
-**default rule** is: use `peer say` for a live tmux agent you want to act now,
-and `peer send` for durable/offline async work.
+**default rule** is: native messaging for supported exact same-provider targets,
+with cctrl as fallback or for explicitly requested durable records. Use
+`peer route` for guidance; the agent invokes its own exposed native tools.
 
 This contract is **not** injected automatically. `cctrl start --peer` does not
 add any prompt text; an agent receives the contract only when it asks
@@ -1956,17 +1976,22 @@ Polling exit codes:
 Tool-calling agents can use the same mailbox through a stdio MCP server:
 
 ```bash
-cctrl peer mcp --as comet
+cctrl peer mcp                    # lazy identity from the caller provider session
+cctrl peer mcp --as comet         # explicitly bound registered peer
 CCTRL_PEER=comet cctrl peer mcp
 ```
 
-Each server is bound to one peer identity at startup. Tools do not accept
-`as` or `from` arguments; `send_message` always sends from the configured
-identity, and `recv_message`/`ack_message` always operate as that identity.
+A server has an explicitly configured peer or binds lazily to the caller's
+native session on its first identity-dependent tool call. Initialization does
+not wait for discovery or require prior cctrl registration. Tools do not accept
+`as` or `from`: fallback sends, receives, and ACKs use that bound identity.
+The process must inherit the actual per-session provider ID; a shared server
+cannot identify different chats from its own PID or working directory.
 
 Exposed tools:
 
 ```text
+route_message
 peer_overview
 whoami
 list_peers
@@ -1979,16 +2004,17 @@ show_message
 ack_message
 ```
 
-`say_peer` and `send_message` are the two ways to reach a peer, and the default
-rule mirrors the CLI: use `say_peer` for a live tmux agent you want to act **now**
-(direct chat, the tool-call form of `cctrl peer say`, no mailbox message), and
-`send_message` for durable async work that must survive the recipient being
-away/offline. `say_peer` takes `to` and `body` plus optional `submit` (defaults
-to true; `submit:false` types a draft without pressing Enter) and `force_busy`
-(override the readiness guard); the body is passed through
-`cctrl peer say --body-file -` so multi-line and trailing-newline bodies are
-preserved byte-for-byte. It fails rather than queueing when the peer has no live
-local tmux session — fall back to `send_message` there.
+`route_message` gives same-provider native discovery guidance and fallback
+arguments; it does not send or certify native availability. The agent uses its
+own native tools when the exact recipient is addressable. `send_message` is the
+durable cctrl fallback for unavailable native routes, different providers, or
+explicitly requested mailbox work. Do not replay accepted, held or ambiguous
+native sends. Existing mailbox work still requires its cctrl ACK.
+
+`say_peer` remains an explicit live-tmux operation with `to`, `body`, optional
+`submit` (default true), and `force_busy`. It preserves the existing readiness
+and push-eligibility guards. Use native routing or the durable fallback for
+ordinary agent messaging.
 
 `peer_overview` is the orientation entry point: one call returns your identity,
 the reachable peers, and an unread-mailbox summary, so a model new to peer

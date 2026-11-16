@@ -205,11 +205,14 @@ memory and attention. One session = one purpose.
   `tmux -S "$D/sock"` for every call, and never kills a tmux server; it kills
   its own sessions by exact name on its own socket. Full rule: "Sub-agents and
   tmux" in the `cctrl-repo-orchestrator` skill.
-- **Peer identity is derived from the tmux session name, and it's brittle.**
-  Once the new session is up, its own `cctrl peer send`/`reply` must run
-  `--as "$(tmux display -p '#S')"` (or a registered role alias), never a
-  literal name copied from this spawn or a brief — session names get recycled,
-  and a stale one is refused (exit 66) unless `--impersonate` is passed.
+- **Own identity and native routing.** A cctrl launch supplies its peer;
+  sessions launched elsewhere can run `cctrl peer identify --json` to get a
+  stable mailbox from their native session ID. Never copy another session's
+  identity or use `--impersonate` to work around a missing sender. Include in
+  briefs: use exposed native tools for exact same-provider recipients when
+  supported, with cctrl as fallback; independent Codex CLI sessions do not share
+  an agent tree. ACK existing mailbox work and reconcile ambiguous sends before
+  trying another transport.
 
 ## Discipline (make "properly" mean disciplined)
 

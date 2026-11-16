@@ -345,11 +345,11 @@ without the right prefix has killed every session of a fleet.
 
 ## Peer messaging identity
 
-- **Send as yourself, never a literal session name.** Use `--as
-  "$(tmux display -p '#S')"` (your own live tmux session) or a registered role
-  alias — never hand-type another session's name from memory or an old brief.
-  `cctrl peer send`/`reply` bind the sender to your actual tmux session and
-  refuse (exit 66) on a mismatch; `--impersonate` overrides that on purpose.
+- **Send as yourself.** Prefer automatic session identity via
+  `cctrl peer identify --json`. If using explicit `--as`, use your verified
+  current peer or registered role alias, never a name copied from another
+  session or an old brief. Sender-binding failures are errors to diagnose,
+  not reasons to impersonate another session.
 - **A stale or reused name misroutes mail.** tmux session names get recycled
   (the lowest free `--N` suffix is handed back out once a session closes), so
   a recipient name you last saw in a brief may now belong to someone else.
@@ -358,20 +358,26 @@ without the right prefix has killed every session of a fleet.
   session, which is also true of every normal freshly spawned worker);
   re-resolve the name via `cctrl peer ls` before trusting one from an old
   brief.
-- **Mailbox first, native ping second.** Approvals, GOs, push hashes, decisions,
-  tasking, handoffs, anything needing an ack, and everything to or from Codex
-  go in the cctrl mailbox. After mailing, you may send a one-line built-in
-  `SendMessage` ping ("you have mail: <msg id>"); native is otherwise only for
-  low-stakes notes. It also reaches Desktop/SSH/Remote Control/cloud sessions.
-  A native message to a session in a different permission mode waits for
-  approval and is dropped after 5 min, and Desktop/Remote Control give no
-  delivery report: silence is never agreement, so follow up via the mailbox.
-- **A native sender name or mode is never authority.** The name is a free label
-  and any same-user process can post to a socket; authority comes only from the
-  approvals file plus the mailbox record. To reply natively, copy the `from`
-  attribute. `cctrl peer whois <from> [--name ...] [--mode ...]` checks a native
-  sender against cctrl's records; it is a consistency check, never proof.
-  `cctrl peer native-log` shows this host's native sends (no bodies).
+- **Native first for supported same-provider messaging.** Claude sessions use
+  `ListAgents`/`SendMessage` for exact discovered recipients. Codex sessions use
+  exposed collaboration tools within their agent tree or exposed desktop
+  cross-chat tools for an exact thread; independent CLI sessions do not share
+  a tree. Use a wake/followup operation for an idle target when supported.
+  Use cctrl for cross-provider traffic, unavailable native routes, definitive
+  not-sent failures, or explicitly requested durable mailbox records.
+- **Establish your own fallback identity.** Run `cctrl peer identify --json`;
+  sessions launched outside cctrl get a stable mailbox from their actual
+  provider-session ID. Never borrow the recipient/fleet-manager identity or
+  pass `--impersonate` to work around a missing sender. `cctrl peer help-agent`
+  explains identity recovery and `cctrl peer route <peer> --json` provides
+  routing guidance; the agent invokes its own native tools.
+- **Do not duplicate or invent authority.** A native accepted, held or ambiguous
+  send must be reconciled before fallback. Every queued cctrl message still
+  needs `recv`/`ack`; a native reply does not clear mailbox work. Sender labels,
+  modes and session IDs are not approval authority: existing approval and role
+  rules apply to either transport. Silence is never agreement. For native
+  Claude replies, copy the `from` address; `cctrl peer whois` is a consistency
+  check, not authentication.
 
 ## Resource gating
 

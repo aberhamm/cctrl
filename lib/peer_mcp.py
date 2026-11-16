@@ -14,6 +14,21 @@ from typing import Any
 
 TOOLS = [
     {
+        "name": "route_message",
+        "description": (
+            "Choose messaging before sending to a cctrl peer. Prefer native Claude-to-Claude "
+            "or Codex-to-Codex tools when your runtime exposes them and the exact recipient "
+            "is discovered/addressable there. Returns canonical identities, native discovery "
+            "guidance and a cctrl fallback command; DOES NOT SEND or verify native capability. "
+            "Use send_message for cross-provider traffic or when native is unavailable/definitively "
+            "not sent. Never duplicate an accepted, held or ambiguous native send. Independent "
+            "Codex CLI sessions do not share a collaboration tree. Sessions launched outside "
+            "cctrl acquire their own session-derived mailbox identity lazily."
+        ),
+        "inputSchema": {"type": "object", "properties": {"to": {"type": "string"}},
+                        "required": ["to"], "additionalProperties": False},
+    },
+    {
         "name": "peer_overview",
         "description": (
             "START HERE if you have not used peer messaging before. One call answers "
@@ -24,7 +39,7 @@ TOOLS = [
             "to start a conversation, or `recv_message` then `ack_message` to handle "
             "incoming mail. When `mailbox.queued` is non-zero, read every queued "
             "message at once with `recv_message` `{\"all\": true}`. Takes no arguments; the "
-            "identity is fixed at server startup. If tmux peer discovery is skipped, "
+            "identity is explicitly bound at startup or resolved lazily from the caller session. If tmux peer discovery is skipped, "
             "`peers` may be empty and `derived_skipped` is true, but `identity` and "
             "`mailbox` are still returned."
         ),
@@ -34,7 +49,8 @@ TOOLS = [
         "name": "whoami",
         "description": (
             "Return this server's own peer identity (name, agent, capabilities) — the "
-            "identity every message is sent as. You rarely need this alone: "
+            "identity every fallback mailbox message is sent as. External sessions "
+            "auto-register from their provider session on first use. You rarely need this alone: "
             "`peer_overview` already includes it alongside the peer list and your "
             "mailbox counts. Reach for it only to re-confirm who you are."
         ),
@@ -74,7 +90,7 @@ TOOLS = [
             "tool-call form of `cctrl peer say`. Only for a recipient that has the "
             "doorbell enabled: any other tmux peer returns error code "
             "recipient-not-doorbell-enabled (use send_message). Prefer "
-            "`send_message` for all peer messaging. "
+            "native same-provider tools when addressable, with `send_message` as fallback. "
             "For tmux peers this creates NO mailbox message: it types the "
             "body straight into the peer's tmux session. For a verified app-owned "
             "Codex peer, it queues durable mailbox mail and attempts app delivery; "
@@ -107,7 +123,8 @@ TOOLS = [
             "pane only if the recipient has the doorbell enabled and is idle, "
             "otherwise it stays queued (outcome sent-and-queued, delivery_reason "
             "recipient-not-doorbell-enabled) and the recipient picks it up. Never "
-            "retry or resend. This is the default way to message any peer. "
+            "retry or resend. This is the fallback after native same-provider routing "
+            "is unavailable or definitively not sent; use route_message for guidance. "
             "Address `to` with a peer "
             "`name` from `peer_overview` or "
             "`list_peers` (aliases are accepted and canonicalized). To REPLY to a "
@@ -118,9 +135,8 @@ TOOLS = [
             "send-failed (nothing queued) is ok:false. On every other outcome the "
             "message is queued: never resend, or the message duplicates. Routes transparently across machines — local "
             "and remote peers are handled identically, no special flags needed. "
-            "Do NOT use Claude Code's built-in SendMessage/ListAgents for peer "
-            "messaging; those are local-only and cannot reach peers on other "
-            "machines."
+            "Prefer exposed native tools for exact addressable Claude-to-Claude or "
+            "Codex-to-Codex targets. cctrl does not invoke model-owned native tools on your behalf."
         ),
         "inputSchema": {
             "type": "object",
@@ -223,7 +239,7 @@ class Bridge:
         # so tools that compare names themselves (show_message) resolve the
         # identity on first use. An unknown identity raises the cctrl error.
         if not self._canonical:
-            peer = self.cli(["peer", "whoami", "--as", self.identity, "--json"])
+            peer = self.cli(["peer", "whoami", *(["--as", self.identity] if self.identity else []), "--json"])
             name = peer.get("name") if isinstance(peer, dict) else ""
             if not isinstance(name, str) or not name:
                 raise McpError("unknown-peer", f"Cannot resolve peer identity: {self.identity}")
@@ -294,6 +310,13 @@ class Bridge:
 
     def call_tool(self, name: str, arguments: Any) -> dict[str, Any]:
         args = require_object(arguments)
+        if name not in {tool["name"] for tool in TOOLS}:
+            raise McpError("unknown-tool", f"Unknown tool: {name}")
+        if not self.identity and name not in {"list_peers", "resolve_peer"}:
+            self.identity = self.canonical_identity()
+        if name == "route_message":
+            ensure_no_extra(args, {"to"})
+            return ok(self.cli(["peer", "route", require_string(args, "to"), "--as", self.identity, "--json"]))
         if name == "peer_overview":
             # Thin passthrough to `cctrl peer overview --json`, which resolves the
             # peer+session document ONCE and derives identity + peers + mailbox from
@@ -538,9 +561,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    if not args.identity:
-        print("cctrl peer mcp needs --as <peer> or CCTRL_PEER", file=sys.stderr)
-        return 66
     # Plan 106 P3b: answer `initialize` without waiting on session discovery
     # (`peer whoami` costs ~22 s on a big fleet; Claude gives up after 30 s). The
     # identity is passed to cctrl on every tool call, and cctrl resolves it and

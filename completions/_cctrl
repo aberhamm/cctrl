@@ -437,9 +437,11 @@ _cctrl() {
                     'unregister:Remove a manual peer'
                     'rm:Remove a manual peer'
                     'whoami:Resolve peer identity'
+                    'identify:Establish your own provider-session mailbox identity'
+                    'route:Native-first route guidance (does not send)'
                     'whois:Check a native sender address against cctrl records (not proof)'
                     'native-log:Read this host'\''s SendMessage log (no bodies)'
-                    'help-agent:Agent contract: peer say (live) vs peer send (async)'
+                    'help-agent:Agent contract: native first, mailbox fallback'
                     'send:Queue a mailbox message'
                     'reply:Reply to a message: send, deliver, and ack the original'
                     'inbox:List inbound mailbox messages'
@@ -516,6 +518,21 @@ _cctrl() {
                         _arguments \
                             '--as[Peer identity]:peer:_cctrl_peers' \
                             '--json[Machine-readable output]'
+                        ;;
+                    identify)
+                        _arguments \
+                            '--agent[Native provider]:agent:(claude codex)' \
+                            '--session-id[Your actual native session ID]:session-id:' \
+                            '--json[Machine-readable output]'
+                        ;;
+                    route)
+                        if (( CURRENT == 4 )); then
+                            _cctrl_peers
+                        else
+                            _arguments \
+                                '--as[Your own peer identity]:peer:_cctrl_peers' \
+                                '--json[Machine-readable output]'
+                        fi
                         ;;
                     native-log)
                         _arguments \

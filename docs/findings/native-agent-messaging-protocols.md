@@ -2,7 +2,9 @@
 
 Investigated 2026-11-16. These are version-pinned findings for cctrl bridge
 design, not a declaration that undocumented provider interfaces are stable.
-No runtime adapter was changed by this investigation.
+For current native-first routing and external-session identity, follow the
+[operating guide](../peer-messaging.md). The adapter inventory below records
+the investigation baseline; later operating policy does not change its wire evidence.
 
 Claude Code exposes a local protocol for independently launched sessions.
 Codex's native subagent mailbox belongs to a runtime's agent tree; external
@@ -53,7 +55,7 @@ The implementation anchors below describe the investigated cctrl commit:
 | `lib/codex_peer_delivery.py` | Checks exact thread/cwd, ownership, version, archive/busy state; persists attempt receipts before `turn/start` | Sends mailbox notifications; busy tasks defer and app inline delivery is unsupported |
 | `lib/peer_mcp.py` | Per-peer stdio MCP interface to the common mailbox | Common tools remain the receive/handling-ACK boundary across providers |
 
-The current Claude socket frame is:
+At the investigated baseline, the Claude socket frame is:
 
 ```json
 {"type":"user","message":{"role":"user","content":"<mailbox notification>"}}
@@ -82,7 +84,9 @@ The bridge direction supported by this evidence is:
 5. Have the recipient use cctrl MCP/CLI to receive, reply, and ACK handled work.
    Preserve held, refused, deferred, and ambiguous outcomes separately.
 
-These are design implications, not implemented capabilities or an integration
-approval. Follow the [peer contract](../../AGENTS.md#peer-messaging): native
-messages carry pings and low-stakes notes; approvals, decisions, tasking,
-handoffs, and ACK-requiring work belong in the durable mailbox.
+These are the original bridge design implications, not implemented callback
+capabilities. The later [native-first operating policy](../peer-messaging.md)
+uses the agent's exposed native tools directly where addressable, with cctrl
+as fallback. It does not require a new cctrl-owned Claude callback socket for
+every native exchange. Existing mailbox work retains its receive/ACK lifecycle;
+transport selection never grants approval authority.

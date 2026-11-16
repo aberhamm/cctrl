@@ -301,7 +301,8 @@ unset TMUX TMUX_PANE
 # CCTRL_PROFILE_SETTINGS_FILE instead of the fresh, unset value its fixture
 # expects. Individual tests still `export` these deliberately for their own
 # fixtures; this only clears what this shell brought in from outside the run.
-unset CCTRL_AGENT CCTRL_PEER CCTRL_TMUX_CONTEXT CCTRL_RESTART_MARKER \
+unset CODEX_THREAD_ID CODEX_SESSION_ID CLAUDE_CODE_SESSION_ID CLAUDECODE \
+    CCTRL_AGENT CCTRL_PEER CCTRL_TMUX_CONTEXT CCTRL_RESTART_MARKER \
     CCTRL_PROFILE_SETTINGS_FILE CCTRL_SESSION_KIND CCTRL_SESSION_NAME \
     CCTRL_SESSION_TARGET CCTRL_SESSION_PURPOSE CCTRL_SESSION_LAUNCH_ID \
     CCTRL_SESSION_PROFILE CCTRL_SESSION_PROFILE_SOURCE CCTRL_SESSION_AUTH_BACKEND
@@ -9591,8 +9592,7 @@ test_peer_mcp_bridge_stdio() {
     local out rc send_req recv_req show_req bad_req extra_req alias_req message_id shown
     rc=0
     out="$(CCTRL_DATA_DIR="$data" "$ROOT/cctrl" peer mcp 2>&1 </dev/null)" || rc=$?
-    [[ "$rc" -eq 66 ]] || fail "expected peer mcp without identity to exit 66, got $rc"
-    assert_contains "$out" "needs --as <peer> or CCTRL_PEER"
+    [[ "$rc" -eq 0 && -z "$out" ]] || fail "expected unconfigured peer mcp to start lazily and exit cleanly on EOF, got $rc: $out"
 
     out="$(
         {
