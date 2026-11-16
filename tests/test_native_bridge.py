@@ -9,6 +9,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 from unittest.mock import patch
 
@@ -212,8 +213,8 @@ class LedgerTests(unittest.TestCase):
                 self.assertEqual(policy, self.store.get(mid, "codex:sender")["status"])
 
     # ---- mdec-1116 items 2+3: delivery vs inbox vs history, retirement, receipts, envelope ----
-    def accepted(self, status="queued", recipient="codex:receiver", detail=None, body="work"):
-        mid, _ = self.store.create("claude:sender", recipient, body)
+    def accepted(self, status="queued", recipient="codex:receiver", detail=None, body="work", sender="claude:sender"):
+        mid, _ = self.store.create(sender, recipient, body)
         self.store.event(mid, status, detail if detail is not None else {"queued_submission_id": "queue-1"})
         return mid
 
@@ -287,7 +288,7 @@ class LedgerTests(unittest.TestCase):
 
     def test_held_and_unadmitted_items_cannot_be_acked_or_replied_from_the_ledger(self):
         cases = [("held", "claude:receiver"), ("refused", "claude:receiver"), ("denied", "claude:receiver"),
-                 ("expired", "claude:receiver"), ("dropped", "claude:receiver"), ("submitted", "claude:receiver"),
+                 ("expired", "claude:receiver"), ("dropped", "claude:receiver"),
                  ("held", "codex:receiver")]
         for status, who in cases:
             for action in ("ack", "reply"):
@@ -302,6 +303,44 @@ class LedgerTests(unittest.TestCase):
                     self.assertFalse(row["handled"])
                     self.assertIsNone(row["replied"])
                     self.assertEqual(status, row["status"])
+
+    def test_claude_submitted_message_is_admitted_and_can_be_acked_and_replied(self):
+        for action in ("ack", "reply"):
+            with self.subTest(action=action):
+                mid = self.accepted("submitted", "claude:receiver", {}, sender="codex:sender")
+                recipient = self.make_daemon("claude:receiver")
+                recipient.deliver = lambda *args: {"status": "submitted"}
+                result = recipient.handle({"actor": recipient.who, "action": action, "id": mid, "body": "answer"})
+                self.assertTrue(self.store.get(mid, "claude:receiver")["handled"])
+                self.assertNotIn("warning", result)
+
+    def test_late_held_callback_during_reply_does_not_mark_handled(self):
+        mid = self.accepted("submitted", "claude:receiver", {}, sender="codex:sender")
+        recipient = self.make_daemon("claude:receiver")
+        def deliver(*args):
+            self.store.event(mid, "held", {"status": "held"})
+            return {"status": "submitted"}
+        recipient.deliver = deliver
+        result = recipient.handle({"actor": recipient.who, "action": "reply", "id": mid, "body": "answer"})
+        self.assertIs(False, result["handled"])
+        self.assertFalse(self.store.get(mid, "claude:receiver")["handled"])
+
+    def test_client_supplied_provider_bases_are_rederived_not_trusted(self):
+        raw = {"display_name": {"value": "Fleet Manager", "basis": "provider-registry"},
+               "harness": {"value": "claude-code", "basis": "provider-reported:thread/read"},
+               "reported_source": {"value": "cli", "basis": "provider-registry"},
+               "host": {"value": "evilhost", "basis": "observed:local-host"}}
+        with mock.patch.object(bridge, "own_registry", return_value=None):
+            env = bridge.envelope_from_request(raw, "codex:abc")
+        self.assertEqual("claimed", env["display_name"]["basis"])
+        self.assertEqual("claimed", env["harness"]["basis"])
+        self.assertEqual("claimed", env["reported_source"]["basis"])
+        self.assertEqual("claimed", env["host"]["basis"])
+        with mock.patch.object(bridge, "own_registry", return_value={"name": "Fleet Manager", "kind": "cli", "basis": "provider-registry"}):
+            env = bridge.envelope_from_request(raw, "codex:abc")
+        self.assertEqual("provider-registry", env["display_name"]["basis"])
+        self.assertEqual("provider-registry", env["reported_source"]["basis"])
+        self.assertEqual("claimed", env["harness"]["basis"])
 
     def test_stranded_view_withholds_the_body_of_unadmitted_items(self):
         mid = self.accepted("held", "claude:receiver", {}, body="secret task result")
@@ -647,7 +686,8 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual({"value": "vscode", "basis": "provider-reported:thread/read"}, env["reported_source"])
         self.assertEqual({"value": "codex-cli", "basis": "claimed:--harness"}, env["harness"])
         calls = [json.loads(l) for l in self.log.read_text().splitlines()]
-        self.assertEqual(1, len([c for c in calls if c["method"] == "thread/read"]))
+        # the client reads once; the daemon re-derives the provider-reported fields once
+        self.assertEqual(2, len([c for c in calls if c["method"] == "thread/read"]))
         self.assertTrue(all(c["method"] != "thread/resume" for c in calls))
 
     def test_cli_explicit_name_claim_is_marked_claimed_when_provider_has_no_title(self):

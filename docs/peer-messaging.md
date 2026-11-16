@@ -98,14 +98,10 @@ text is never consulted and no other queue entry is touched. The result carries
 
 **Admission gate.** `bridge ack` and `bridge reply` refuse (exit 1, error says
 the message is not admitted) while the status is `held`, `refused`, `denied`,
-`expired` or `dropped`, and for a Claude recipient while it is only `submitted`
-with no release recorded. A refusal sends no receipt and no reply and does not
+`expired` or `dropped`. A refusal sends no receipt and no reply and does not
 mark the message handled. `inbox --view stranded` rows for those statuses carry
 `admitted: false` and the body is replaced by `[NOT ADMITTED: body withheld ...]`;
-`history` and `status` still show the stored text for inspection only. Consequence:
-a Claude recipient can ACK or reply only after a release is recorded; a plain
-immediate accept has no positive receipt and stays unACKable through the bridge
-until that gap is closed.
+`history` and `status` still show the stored text for inspection only.
 
 `retired`, `absent`, `already_consumed`, `not_applicable` and `unsupported`
 are final and recorded once as a `native-retire` event.

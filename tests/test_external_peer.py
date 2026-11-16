@@ -213,7 +213,7 @@ ssh() {
 }
 _peer_cmd_send manager --deliver --json -- 'outside remote status'
 '''
-        result = subprocess.run(["bash", "-c", script, "test", str(ROOT / "cctrl")],
+        result = subprocess.run(["bash", "-c", script, str(ROOT / "cctrl"), str(ROOT / "cctrl")],
                                 env={**self.env, "CCTRL_NO_MAIN": "1", "CODEX_THREAD_ID": "outside-remote"},
                                 text=True, capture_output=True, timeout=30)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)

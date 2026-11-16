@@ -35,6 +35,13 @@ NATIVE_OWNED = ("persisted", "submitting", "submitted", "queued", "held", "relea
 NOT_WORK = ("refused", "denied", "expired", "dropped")
 VIEWS = ("actionable", "stranded", "history")
 BASIS = re.compile(r"^[A-Za-z0-9:_./-]{1,60}$")
+ENVELOPE_BASES = {
+    "display_name": {"claimed:--name", "claimed:CCTRL_SESSION_NAME", "provider-registry", "provider-reported:thread/read", "unknown"},
+    "harness": {"claimed:--harness", "claimed:CCTRL_HARNESS", "unknown"},
+    "reported_source": {"provider-registry", "provider-reported:thread/read", "unknown"},
+    "host": {"observed:local-host", "unknown"},
+}
+DERIVED_BASES = {"provider-registry", "provider-reported:thread/read", "observed:local-host"}
 NOT_ADMITTED = ("held",) + NOT_WORK
 WITHHELD = "[NOT ADMITTED: body withheld. Native delivery has not admitted this message; it is not authorized work and cannot be ACKed or replied to from the ledger.]"
 RETIRED_FINAL = {"retired", "absent", "already_consumed", "unsupported", "not_applicable"}
@@ -138,11 +145,29 @@ def envelope_from_request(value, who):
         return None
     out = {"v": 1, "provider": provider, "session_id": session,
            "identity_basis": clean_text(value.get("identity_basis")) or "unknown"}
+    registry = None
     for key in ("display_name", "harness", "reported_source", "host"):
         item = value.get(key)
         item = item if isinstance(item, dict) else {}
         basis = clean_text(item.get("basis"), 60)
-        out[key] = known(item.get("value"), basis if basis and BASIS.match(basis) else "claimed")
+        text = clean_text(item.get("value"))
+        if basis not in ENVELOPE_BASES[key]:
+            basis = "claimed"
+        elif text and basis in DERIVED_BASES:
+            # Never trust a client-supplied provider-reported or observed
+            # basis: the daemon re-derives the fact itself and demotes the
+            # field to a plain claim unless it matches.
+            if basis == "observed:local-host":
+                expected = clean_text(socket.gethostname().split(".")[0])
+            else:
+                if registry is None:
+                    registry = own_registry(who) or {}
+                expected = clean_text(registry.get("kind" if key == "reported_source" else "name"))
+                if registry.get("basis", "provider-registry") != basis:
+                    expected = None
+            if text != expected:
+                basis = "claimed"
+        out[key] = known(text, basis)
     return out
 
 
@@ -586,9 +611,6 @@ class Daemon:
             return (f"message {row['id']} is {status}: native delivery has not admitted it, so it is not delivered or authorized work. "
                     "It cannot be ACKed or replied to from the ledger; no receipt was sent and it is not marked handled. "
                     "Wait for native admission (release) or ask the sender to resend.")
-        if status == "submitted" and row["recipient"].startswith("claude:"):
-            return (f"message {row['id']} is submitted to Claude with no release recorded: admission is unconfirmed, so it cannot be ACKed or replied to yet. "
-                    "No receipt was sent and it is not marked handled.")
         return None
 
     def handle(self, request):
@@ -608,6 +630,11 @@ class Daemon:
                 raise ValueError(problem)
             if action == "reply":
                 value = self.send(original["sender"], request["body"], reply_to=original["id"], mid=request.get("reply_id"), envelope=request.get("envelope"))
+                # A late `held` callback may have landed while sending: re-read
+                # the status and do not mark handled (retryable after release).
+                late = self.admission_problem(self.store.get(original["id"], self.who))
+                if late:
+                    return {**value, "handled": False, "warning": late}
                 # A failed/ambiguous reply is not proof of handling.
                 if value["status"] in {"queued", "submitted", "released"}:
                     self.store.acknowledge(original["id"], self.who, value["id"])
@@ -615,6 +642,9 @@ class Daemon:
                              "original": {"id": original["id"], "handled": True,
                                           "native_retirement": self.retire_native(original["id"])}}
                 return value
+            problem = self.admission_problem(self.store.get(original["id"], self.who))
+            if problem:
+                raise ValueError(problem)
             original, _ = self.store.acknowledge(original["id"], self.who)
             retirement = self.retire_native(original["id"])
             self.notify_receipt(original)
