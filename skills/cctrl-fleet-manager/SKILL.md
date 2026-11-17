@@ -101,9 +101,11 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   `started_at`, boot id and `max_age_seconds`), wait and read it again; check how old it is (`current_run.started_at` in
   `--json`; the top-level `started_at` belongs to the previous finished run): past the 45 minute cap plus 10 minutes it is stale, and a
   `--boot --background` re-run takes over. **unfinished** means a state file with no
-  live holder (a crashed run): treat it like partial. If it shows **failed** (or the last
-  run is a refusal), report it to the human with the reason `status` prints;
-  do not loop re-runs. Restore exit `75` is **partial** or
+  live holder (a crashed run): treat it like partial, unless the last run says
+  **failed** or is a refusal; then **failed wins** (a run can write its state and
+  return 1 before any final outcome, so `unfinished` and a `failed` last run appear
+  together). If it shows **failed** (or the last run is a refusal), report it to the
+  human with the reason `status` prints; do not loop re-runs. Restore exit `75` is **partial** or
   **locked**, not a refusal (read `outcome` in `--json`: another restore holds
   the lock and nothing launched); `1` means a launch of a worker row failed twice (a fleet manager that fails
   twice is `75`, named in the results); `69` means

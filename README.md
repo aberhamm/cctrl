@@ -1093,8 +1093,9 @@ Every launch runs with `TMUX`, `CCTRL_TMUX_CONTEXT` and the caller's session
 identity removed. Inside a session, `--boot` needs `--background` (a detached
 re-run that prints its run id and returns at once; a tool timeout cannot kill
 it). One restore runs at a time (`<data>/restore/.restore.lock`: exit 75,
-`outcome: locked`; a lock whose pid is dead, older than the timeout plus 10
-minutes, or made before this boot began is taken over, and the steal is logged;
+`outcome: locked`; a lock whose pid is dead, older than the holder's own recorded
+max age (its run cap plus 10 minutes, never more than a day), or made before this
+boot began is taken over, and the steal is logged;
 an interactive run takes the lock only after you confirm, and `--boot` refuses
 (exit 1) rather than run unlocked). `--rerun` needs `--boot` (else exit 64). State lives in `<data>/restore/` (mode 600): the pinned
 source and per-row results in `boot-<boot id>.json` (the boot id is
@@ -1107,9 +1108,10 @@ finished boot exits 0 at once; `--rerun` ignores the stored row results),
 runs or this boot's restore has not finished; it writes history only.
 `cctrl session restore status [--json]` prints the last run, the rows that did
 not come back, the fleet manager line and whether this boot's run is
-`complete`, `partial`, `failed`, `running` or `missing`. While a run holds the
-lock, `current_run` (`run_id`, `started_at`, from the lock) says when that run
-started; the top-level `started_at` is still the last finished run's. The lock
+`complete`, `partial`, `failed`, `running`, `unfinished` (this boot's state file
+has no final outcome and no live holder: a crashed run) or `missing`. While a run
+holds the lock, `current_run` (`run_id`, `started_at`, `pid`, `boot_id`,
+`max_age_seconds`, from the lock) says when that run started; the top-level `started_at` is still the last finished run's. The lock
 records the boot id, and a lock from another boot id is stale whatever the clocks
 say. The non-boot 900 s cap starts after the `[y/N]` answer; only a run that holds
 the lock writes `last-run.json`.
