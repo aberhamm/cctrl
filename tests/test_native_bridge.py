@@ -847,6 +847,16 @@ class DaemonVersionTests(unittest.TestCase):
             with self.assertRaises(bridge.DaemonOutdated):
                 bridge.check_daemon(row, "ack")
 
+    def test_protocol2_row_lacking_only_reply_acks_original_refuses_reply(self):
+        # What the intermediate cf42670 daemon wrote: protocol 2, capability named "original".
+        row = self.live_row(protocol=2, capabilities=["native_retirement", "original", "sender_envelope", "admission_gate"])
+        with self.assertRaisesRegex(bridge.DaemonOutdated, "reply_acks_original"):
+            bridge.check_daemon(row, "reply")
+        self.assertIsNone(bridge.check_daemon(row, "ack"))
+        code, out, rpc = self.run_cli(row, "reply", "m1", "--json", "--", "hi")
+        self.assertEqual((1, "daemon-outdated"), (code, out["error"]["code"]))
+        rpc.assert_not_called()
+
     def test_newer_protocol_with_capabilities_is_accepted(self):
         row = self.live_row(protocol=bridge.DAEMON_PROTOCOL + 5, capabilities=list(bridge.DAEMON_CAPABILITIES) + ["future"])
         self.assertIsNone(bridge.check_daemon(row, "reply"))

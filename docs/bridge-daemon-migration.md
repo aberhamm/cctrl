@@ -88,14 +88,15 @@ Run these as the session that owns the endpoint, with the **new** cctrl.
    and ownership record. If cleanup stays pending, inspect it; do not kill an
    unverified PID.
 5. Retire stale Codex queue copies. Messages the old daemon already marked
-   handled were never retired from your Codex queue. Find them (read-only; the
+   handled were never retired from your Codex queue. Find them (read-only; only a successful or final retirement excludes a message, so `unknown`, `race` and `identity_mismatch` outcomes, which are meant to be retried, are listed too; the
    ledger is `$CCTRL_NATIVE_BRIDGE_DIR/ledger.sqlite3`, default
    `~/.local/state/cctrl/native-bridge/ledger.sqlite3`):
    ```sh
    sqlite3 -readonly LEDGER "SELECT id FROM messages m
      WHERE recipient='codex:YOUR_THREAD_ID' AND kind='message' AND received IS NOT NULL
-       AND status='queued'
-       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='native-retire')"
+       AND status IN ('queued','ambiguous')
+       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='native-retire'
+         AND json_extract(e.detail,'\$.outcome') IN ('retired','absent','already_consumed','unsupported','not_applicable'))"
    ```
    Repeat the ACK for each with the new daemon; it is idempotent and only deletes
    the exact queue item this bridge submitted:
