@@ -116,6 +116,14 @@ true` by `bridge status`. This marks the late arrival as already handled in the
 ledger; it cannot remove text a Claude session already received. Do not act on
 it again: check `bridge status ID`.
 
+Codex recipients have no delivery signal, so the ACK records what the retirement
+outcome proves: `already_consumed` adds `late-native-delivery-after-handled`
+(`late_native_delivery: true`, the item reached the model while being handled);
+`absent`, `race`, `unknown`, `identity_mismatch` and `unknown_identity` add
+`late-native-delivery-possible` (`late_native_delivery_possible: true`, the item
+may still surface later as user input). Each marker is written once; neither
+marker changes handling, and neither can remove text the model already received.
+
 ## Receipts are control facts
 
 A receipt (`[cctrl-bridge receipt ... control=true]`) tells the original sender
@@ -158,6 +166,15 @@ same snapshot idea for mailbox mail; it does not carry `harness` or
 `reported_source`, which are native-bridge fields.
 
 ## Receive, reply, and inspect receipts
+
+Result shapes: `bridge inbox --json` returns `{actor, view, messages, next_cursor,
+...}`; `view` echoes the requested view (`actionable`, `stranded` or `history`).
+`bridge send` and `bridge reply` make one read-only `thread/read` round trip to the
+Codex app server before sending (the sender envelope, above); a failure there only
+leaves the fields `unknown`. Native ingress text that starts with
+`[cctrl-bridge receipt ` is classified as a receipt (a control fact, born handled,
+never dispatched) by its prefix, not by an explicit kind, so such a body from a
+native sender is stored as a receipt and is not shown as work.
 
 ```sh
 cctrl bridge inbox --limit 20

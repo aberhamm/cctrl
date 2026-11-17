@@ -67,6 +67,12 @@ ENVELOPE_BASES = {
 DERIVED_BASES = {"provider-registry", "provider-reported:thread/read", "observed:local-host"}
 NOT_ADMITTED = ("held",) + NOT_WORK
 WITHHELD = "[NOT ADMITTED: body withheld. Native delivery has not admitted this message; it is not authorized work and cannot be ACKed or replied to from the ledger.]"
+LATE_CODEX_MARKERS = {
+    "already_consumed": "late-native-delivery-after-handled",
+    "absent": "late-native-delivery-possible", "race": "late-native-delivery-possible",
+    "unknown": "late-native-delivery-possible", "identity_mismatch": "late-native-delivery-possible",
+    "unknown_identity": "late-native-delivery-possible",
+}
 RETIRED_FINAL = {"retired", "absent", "already_consumed", "unsupported", "not_applicable"}
 
 
@@ -364,6 +370,13 @@ class Store:
                 return value["queued_submission_id"]
         return None
 
+    def note_once(self, mid, kind, detail=None):
+        """Append an audit event unless one of this kind already exists."""
+        with self.db() as db:
+            if db.execute("SELECT 1 FROM events WHERE id=? AND kind=?", (mid, kind)).fetchone():
+                return
+            db.execute("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)", (mid, time.time(), kind, json.dumps(detail)))
+
     def retirement(self, mid):
         """Latest recorded native retirement outcome for a message, or None."""
         with self.db() as db:
@@ -402,6 +415,7 @@ class Store:
             value["envelope"] = json.loads(value["envelope"]) if value.get("envelope") else None
             value["handled"] = value["received"] is not None
             value["late_native_delivery"] = any(e["kind"] == "late-native-delivery-after-handled" for e in value["events"])
+            value["late_native_delivery_possible"] = any(e["kind"] == "late-native-delivery-possible" for e in value["events"])
             return value
 
     def inbox(self, who, view="actionable", after=0, limit=20):
@@ -638,6 +652,13 @@ class Daemon:
             else:
                 outcome = self.retire_queue(original["recipient"].split(":", 1)[1], mid, queued)
         self.store.note(mid, "native-retire", outcome)
+        if original["recipient"].startswith("codex:"):
+            # The daemon cannot see Codex consume a queue item, so mark what the
+            # retirement outcome proves: consumed means it reached the model
+            # after handling; an unresolved outcome means it still may.
+            kind = LATE_CODEX_MARKERS.get(outcome.get("outcome"))
+            if kind:
+                self.store.note_once(mid, kind, {"outcome": outcome.get("outcome")})
         return outcome
 
     @staticmethod

@@ -271,6 +271,22 @@ class LedgerTests(unittest.TestCase):
             recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
         self.assertEqual(4, len(calls))
 
+    def test_codex_retirement_outcomes_leave_late_delivery_markers(self):
+        for outcome, consumed, possible in (("retired", False, False), ("already_consumed", True, False),
+                                            ("race", False, True), ("unknown", False, True), ("absent", False, True)):
+            with self.subTest(outcome=outcome):
+                mid = self.accepted("queued", detail={"queued_submission_id": "q-" + outcome})
+                recipient = self.make_daemon("codex:receiver")
+                recipient.deliver = lambda *args: {"status": "queued"}
+                recipient.retire_queue = lambda *args, o=outcome: {"outcome": o}
+                for _ in range(2):
+                    recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+                row = self.store.get(mid, "codex:receiver")
+                self.assertEqual(consumed, row["late_native_delivery"])
+                self.assertEqual(possible, row["late_native_delivery_possible"])
+                kinds = [e["kind"] for e in row["events"] if e["kind"].startswith("late-native")]
+                self.assertEqual(1 if consumed or possible else 0, len(kinds), "marker written once")
+
     def test_retirement_needs_a_persisted_queue_identity_and_never_guesses(self):
         mid = self.accepted("ambiguous", detail={"status": "ambiguous"})
         recipient = self.make_daemon("codex:receiver")
