@@ -25525,12 +25525,19 @@ test_running_scripts_ignore_inplace_rewrite() {
     local dir="$TMPDIR/inplace" pid
     mkdir -p "$dir/lib"
     cp "$ROOT/lib/session-wrapper.sh" "$dir/lib/session-wrapper.sh"
-    printf '#!/usr/bin/env bash\nsleep 2\n' > "$dir/claude"
+    # The fake agent signals "started" then blocks until released, so the
+    # rewrite lands while the wrapper is provably mid-run at any machine load
+    # (a fixed sleep raced a slow bash start and a short agent).
+    rm -f "$dir/started" "$dir/go"
+    printf '#!/usr/bin/env bash\n: > "%s"\nfor _ in $(seq 1 600); do [ -e "%s" ] && exit 0; sleep 0.1; done\nexit 0\n' \
+        "$dir/started" "$dir/go" > "$dir/claude"
     chmod +x "$dir/claude" "$dir/lib/session-wrapper.sh"
     ( PATH="$dir:$PATH" CCTRL_EARLY_EXIT_WINDOW_SECONDS=0 \
         "$dir/lib/session-wrapper.sh" claude "$dir/marker" --x >/dev/null 2>&1 ) &
     pid=$!
-    sleep 0.5
+    local _i
+    for _i in $(seq 1 600); do [[ -e "$dir/started" ]] && break; sleep 0.1; done
+    [[ -e "$dir/started" ]] || { : > "$dir/go"; fail "fake agent never started under the wrapper"; }
     python3 - "$dir/lib/session-wrapper.sh" "$dir/PWNED" <<'PY'
 import sys
 path, flag = sys.argv[1], sys.argv[2]
@@ -25538,6 +25545,7 @@ old = open(path).read()
 with open(path, "w") as f:  # same inode, like cp or a shell redirect
     f.write("#" * len(old) + ("\ntouch %s\n" % flag) * 50)
 PY
+    : > "$dir/go"
     wait "$pid" || true
     [[ ! -e "$dir/PWNED" ]] || fail "running session wrapper executed bytes rewritten into its file"
 
