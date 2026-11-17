@@ -28699,6 +28699,41 @@ test_self_install_writes_installed_marker_after_gate() {
     echo "ok: self-install writes .installed after the gate and before the swap, with no env signal"
 }
 
+test_self_install_links_state_to_primary_checkout() {
+    # Installing from a detached worktree must link data/costs/profiles/
+    # .active-profile at the primary checkout, never at the worktree.
+    # Fixture-only: a scratch repo with a stub suite, a scratch install root.
+    local base="$TMPDIR/si-links" primary wt home bin link target
+    primary="$base/primary"
+    mkdir -p "$primary/install" "$primary/tests" "$base/home"
+    cp "$ROOT/install/self-install.sh" "$ROOT/install/cctrl-launcher.sh" "$primary/install/"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$primary/cctrl"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$primary/tests/run-tests.sh"
+    chmod +x "$primary/cctrl"
+    (cd "$primary" && git init -q && git config user.email t@t.co && git config user.name t \
+        && git add -A && git commit -q -m init)
+    wt="$base/wt"
+    (cd "$primary" && git worktree add -q --detach "$wt" HEAD)
+    home="$base/home/lib"
+    bin="$base/home/bin/cctrl"
+    (unset TMUX TMUX_PANE; CCTRL_HOME="$home" CCTRL_BIN="$bin" bash "$wt/install/self-install.sh") >"$base/out.log" 2>&1 \
+        || fail "self-install from a worktree fixture failed: $(tail -5 "$base/out.log")"
+    for link in data costs profiles .active-profile; do
+        target="$(readlink "$home/current/$link")"
+        [[ "$target" == "$(cd "$primary" && pwd -P)/$link" ]] \
+            || fail "release link $link -> $target, expected the primary checkout $primary/$link"
+    done
+    # A tree whose git common dir is not <checkout>/.git must refuse, not link.
+    local bare="$base/bare.git" bt="$base/bare-wt"
+    git clone -q --bare "$primary" "$bare"
+    git -C "$bare" worktree add -q --detach "$bt" HEAD
+    if (unset TMUX TMUX_PANE; CCTRL_HOME="$base/home2" CCTRL_BIN="$base/home2/bin" bash "$bt/install/self-install.sh") >"$base/out2.log" 2>&1; then
+        fail "self-install from a bare-repo worktree must refuse"
+    fi
+    grep -q 'cannot resolve the primary checkout' "$base/out2.log" || fail "refusal lacks the clear message"
+    echo "ok: self-install links state at the primary checkout from a worktree, refuses when unresolved"
+}
+
 # Groups as data (plan 105 P4): `_group_tests <group>` prints the tests a
 # CCTRL_TEST_ONLY group runs, in order. codex-ownership-matrix has its own
 # block below (live-store manifest around the run); provider-neutral and

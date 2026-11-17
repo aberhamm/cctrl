@@ -41,6 +41,21 @@ if [[ -n "$(cd "$ROOT" && git status --porcelain --untracked-files=no)" ]]; then
 fi
 
 SHA="$(cd "$ROOT" && git rev-parse HEAD)"
+
+# Mutable state (data/, costs/, profiles/, .active-profile) belongs to the
+# primary checkout, never to the tree the installer runs from: a release
+# linked into a detached worktree breaks as soon as that worktree is removed.
+# git's common dir is the primary checkout's .git, shared by every worktree.
+STATE_ROOT=""
+if COMMON_DIR="$(cd "$ROOT" && git rev-parse --git-common-dir 2>/dev/null)" \
+    && COMMON_DIR="$(cd "$ROOT" && cd "$COMMON_DIR" 2>/dev/null && pwd -P)" \
+    && [[ "$(basename "$COMMON_DIR")" == ".git" ]]; then
+    STATE_ROOT="$(dirname "$COMMON_DIR")"
+fi
+if [[ -z "$STATE_ROOT" || ! -d "$STATE_ROOT" ]]; then
+    echo "cctrl self-install: cannot resolve the primary checkout for $ROOT (git common dir is not a <checkout>/.git); refusing to link state into a temporary tree. Run it from the primary checkout." >&2
+    exit 1
+fi
 SHORT_SHA="${SHA:0:12}"
 
 echo "cctrl self-install: building release from $ROOT at $SHORT_SHA" >&2
@@ -95,15 +110,15 @@ rm -rf "$SCRATCH/data" "$SCRATCH/costs" "$SCRATCH/profiles" "$SCRATCH/.active-pr
 # Plan 116 A0 (review S5): untracking data/config.json deletes it from every
 # other checkout on fast-forward. New releases read share/config.default.json
 # instead, but a rollback to an older release would run without the file.
-if [[ ! -f "$ROOT/data/config.json" ]]; then
-    echo "cctrl self-install: WARNING: $ROOT/data/config.json is missing. This release falls back to share/config.default.json, but a rollback to a release older than plan 116 A0 would run without it. Restore it with install/data-config-runbook.sh restore <checkout>." >&2
+if [[ ! -f "$STATE_ROOT/data/config.json" ]]; then
+    echo "cctrl self-install: WARNING: $STATE_ROOT/data/config.json is missing. This release falls back to share/config.default.json, but a rollback to a release older than plan 116 A0 would run without it. Restore it with install/data-config-runbook.sh restore <checkout>." >&2
 fi
 
 # Mutable state lives in the repo, never duplicated into a release.
 for link in data costs profiles; do
-    ln -s "$ROOT/$link" "$SCRATCH/$link"
+    ln -s "$STATE_ROOT/$link" "$SCRATCH/$link"
 done
-ln -s "$ROOT/.active-profile" "$SCRATCH/.active-profile"
+ln -s "$STATE_ROOT/.active-profile" "$SCRATCH/.active-profile"
 
 # Plan 116 A0 (SH-S3): the installed-mode marker, written after every gate
 # and just before activation. A tree is "installed" only when this file sits
