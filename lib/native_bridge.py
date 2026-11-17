@@ -673,11 +673,12 @@ class Daemon:
                 value = self.send(original["sender"], request["body"], reply_to=original["id"], mid=request.get("reply_id"), envelope=request.get("envelope"))
                 # A late `held` callback may have landed while sending: re-read
                 # the status and do not mark handled (retryable after release).
-                late = self.admission_problem(self.store.get(original["id"], self.who))
+                late_row = self.store.get(original["id"], self.who)
+                late = self.admission_problem(late_row)
                 if late:
                     return {**value, "handled": False,
                             "original": {"id": original["id"], "handled": False},
-                            "warning": (f"reply {value['id']} WAS already sent to the original sender; the original message is now held and is NOT marked handled. "
+                            "warning": (f"reply {value['id']} WAS already sent to the original sender; the original message is now {late_row['status']} and is NOT marked handled. "
                                         f"Do not retry without --id {value['id']} (a plain retry sends a duplicate reply). "
                                         f"After native admission (release) run: bridge reply {original['id']} --id {value['id']} (deduplicated), or bridge ack {original['id']}.")}
                 # A failed/ambiguous reply is not proof of handling.

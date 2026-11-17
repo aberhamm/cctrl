@@ -315,14 +315,32 @@ class LedgerTests(unittest.TestCase):
                 self.assertTrue(self.store.get(mid, "claude:receiver")["handled"])
                 self.assertNotIn("warning", result)
 
+    def test_late_status_callback_names_the_actual_status_and_sends_no_receipt(self):
+        for late in ("held", "refused", "denied", "expired", "dropped"):
+            with self.subTest(late=late):
+                mid = self.accepted("submitted", "claude:receiver", {}, sender="codex:sender")
+                recipient = self.make_daemon("claude:receiver")
+                receipts = []
+                recipient.notify_receipt = lambda *args: receipts.append(args)
+                def deliver(*args, late=late, mid=mid):
+                    self.store.event(mid, late, {"status": late})
+                    return {"status": "submitted"}
+                recipient.deliver = deliver
+                result = recipient.handle({"actor": recipient.who, "action": "reply", "id": mid, "body": "answer"})
+                self.assertIn(f"the original message is now {late} and is NOT marked handled", result["warning"])
+                self.assertEqual([], receipts)
+
     def test_late_held_callback_during_reply_does_not_mark_handled(self):
         mid = self.accepted("submitted", "claude:receiver", {}, sender="codex:sender")
         recipient = self.make_daemon("claude:receiver")
+        receipts = []
+        recipient.notify_receipt = lambda *args: receipts.append(args)
         def deliver(*args):
             self.store.event(mid, "held", {"status": "held"})
             return {"status": "submitted"}
         recipient.deliver = deliver
         result = recipient.handle({"actor": recipient.who, "action": "reply", "id": mid, "body": "answer"})
+        self.assertEqual([], receipts)
         self.assertIs(False, result["handled"])
         self.assertFalse(self.store.get(mid, "claude:receiver")["handled"])
         self.assertIn("WAS already sent", result["warning"])
