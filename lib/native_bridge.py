@@ -42,12 +42,17 @@ VIEWS = ("actionable", "stranded", "history")
 # behavior is added; MIN_DAEMON_PROTOCOL is what the CLI needs to act safely.
 DAEMON_PROTOCOL = 2
 MIN_DAEMON_PROTOCOL = 2
-DAEMON_CAPABILITIES = ("native_retirement", "original", "sender_envelope", "admission_gate")
+DAEMON_CAPABILITIES = ("native_retirement", "reply_acks_original", "sender_envelope", "admission_gate")
 MIGRATION_DOC = "docs/bridge-daemon-migration.md"
-# Actions that would silently lose data (no queue retirement, no handled
-# original) on a daemon without the capability fail closed; others only warn.
-FAIL_CLOSED_ACTIONS = {"ack": ("native_retirement",), "reply": ("native_retirement", "original")}
-WARN_ACTIONS = {"send": ("sender_envelope",), "reply": ("sender_envelope",)}
+# An outdated daemon allows only stop, list, status and inbox. Every action that
+# goes through the daemon (send, ack, reply) is refused: ack/reply would drop the
+# retirement/handled original, send would lose the sender envelope (no Sender line).
+REQUIRED_CAPABILITIES = {
+    "send": ("sender_envelope",),
+    "ack": ("native_retirement",),
+    "reply": ("native_retirement", "reply_acks_original", "sender_envelope"),
+}
+ALL_REQUIRED = tuple(dict.fromkeys(c for caps in REQUIRED_CAPABILITIES.values() for c in caps))
 
 
 class DaemonOutdated(ValueError):
@@ -841,19 +846,16 @@ def daemon_problem(row):
 
 
 def check_daemon(row, action):
-    """Fail closed (or return a warning) when the live daemon is too old for `action`.
+    """Fail closed when the live daemon is too old for `action`.
 
     Never restarts anything: a daemon owns held/ambiguous items and callback
     bindings, so replacing it is an operator step (see MIGRATION_DOC).
     """
-    lacking = daemon_missing(row, FAIL_CLOSED_ACTIONS.get(action, ()))
+    lacking = daemon_missing(row, REQUIRED_CAPABILITIES.get(action, ()))
     if lacking:
         raise DaemonOutdated(f"{daemon_problem(row)}; it cannot do {', '.join(lacking)}, so `{action}` was NOT performed: nothing was sent, acknowledged or retired. "
-                             f"Migrate the daemon deliberately (drain, then `cctrl bridge stop`, then `cctrl bridge enable`); do not just retry. See {MIGRATION_DOC}.")
-    lacking = daemon_missing(row, WARN_ACTIONS.get(action, ()))
-    if lacking:
-        return (f"{daemon_problem(row)}; it lacks {', '.join(lacking)}, so this {action} went out without a sender envelope. See {MIGRATION_DOC}.")
-    return None
+                             f"Only stop, list, status and inbox work until it is migrated. Do not just stop and enable: drain held items first "
+                             f"(held/ambiguous items bind the old daemon's PID), then `cctrl bridge stop` and `cctrl bridge enable`. See {MIGRATION_DOC}.")
 
 
 def ensure_daemon(store, who):
@@ -910,7 +912,7 @@ def main(argv=None):
             return 0
         if args.command == "list":
             from bridge_claude import discover_sessions
-            result = {"endpoints": store.endpoints(), "claude": [{**r, "actor": actor("claude", r["session_id"])} for r in discover_sessions() if not r["session_id"].startswith("cctrl-bridge-")]}
+            result = {"endpoints": [{**e, "daemon_outdated": bool(daemon_missing(e, ALL_REQUIRED))} for e in store.endpoints()], "claude": [{**r, "actor": actor("claude", r["session_id"])} for r in discover_sessions() if not r["session_id"].startswith("cctrl-bridge-")]}
         else:
             who = own_actor()
             if args.command == "status":
@@ -927,14 +929,14 @@ def main(argv=None):
                 result = store.inbox(who, args.view, args.after, args.limit)
             else:
                 row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
-                warning = None
-                if row is not None and args.command in FAIL_CLOSED_ACTIONS | WARN_ACTIONS:
-                    warning = check_daemon(row, args.command)
+                if row is not None:
+                    check_daemon(row, args.command)
                 if args.command == "enable":
                     result = row
-                    if daemon_missing(row, FAIL_CLOSED_ACTIONS["reply"] + WARN_ACTIONS["send"]):
-                        result = {**row, "daemon_outdated": True,
-                                  "warning": f"{daemon_problem(row)}. ack/reply are refused until it is migrated; see {MIGRATION_DOC}."}
+                    outdated = bool(daemon_missing(row, ALL_REQUIRED))
+                    result = {**row, "daemon_outdated": outdated}
+                    if outdated:
+                        result["warning"] = f"{daemon_problem(row)}. send, ack and reply are refused until it is migrated (drain held items first); see {MIGRATION_DOC}."
                 elif row is None:
                     result = {"stopped": True}
                 else:
@@ -953,8 +955,6 @@ def main(argv=None):
                         print(json.dumps(response))
                         return 1
                     result = response["data"]
-                    if warning and isinstance(result, dict):
-                        result = {**result, "warning": warning}
                     if args.command == "stop":
                         for _ in range(100):
                             if store.endpoint(who) is None:

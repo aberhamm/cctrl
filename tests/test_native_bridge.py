@@ -780,7 +780,7 @@ class CliProcessTests(unittest.TestCase):
 
     def test_real_daemon_advertises_protocol_and_stale_row_fails_closed(self):
         row = self.enable()
-        self.assertEqual(bridge.DAEMON_PROTOCOL, row["protocol"])
+        self.assertEqual((bridge.DAEMON_PROTOCOL, False), (row["protocol"], row["daemon_outdated"]))
         self.assertIn("native_retirement", row["capabilities"])
         store = bridge.Store(self.root / "ledger")
         with store.db() as db:  # simulate a daemon started by a pre-protocol release
@@ -790,7 +790,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual(1, proc.returncode, proc.stdout)
         self.assertEqual("daemon-outdated", json.loads(proc.stdout)["error"]["code"])
         listed = self.cli("list", "--json")["endpoints"]
-        self.assertEqual(1, listed[0]["protocol"])
+        self.assertEqual((1, True), (listed[0]["protocol"], listed[0]["daemon_outdated"]))
 
 
 class DaemonVersionTests(unittest.TestCase):
@@ -829,14 +829,15 @@ class DaemonVersionTests(unittest.TestCase):
         row = self.live_row(protocol=bridge.DAEMON_PROTOCOL, capabilities=list(bridge.DAEMON_CAPABILITIES))
         self.assertEqual(bridge.DAEMON_PROTOCOL, row["protocol"])
         self.assertIn("native_retirement", row["capabilities"])
-        self.assertIn("original", row["capabilities"])
+        self.assertIn("reply_acks_original", row["capabilities"])
         for action in ("ack", "reply", "send"):
             self.assertIsNone(bridge.check_daemon(row, action))
+        self.assertFalse(bridge.daemon_missing(row, bridge.ALL_REQUIRED))
 
     def test_legacy_daemon_fails_closed_for_ack_and_reply_and_points_to_doc(self):
         row = self.live_row()
-        for action in ("ack", "reply"):
-            with self.subTest(action=action), self.assertRaisesRegex(bridge.DaemonOutdated, bridge.MIGRATION_DOC):
+        for action in ("ack", "reply", "send"):
+            with self.subTest(action=action), self.assertRaisesRegex(bridge.DaemonOutdated, "drain held items first"):
                 bridge.check_daemon(row, action)
 
     def test_too_old_or_capability_stripped_daemon_is_refused(self):
@@ -850,12 +851,9 @@ class DaemonVersionTests(unittest.TestCase):
         row = self.live_row(protocol=bridge.DAEMON_PROTOCOL + 5, capabilities=list(bridge.DAEMON_CAPABILITIES) + ["future"])
         self.assertIsNone(bridge.check_daemon(row, "reply"))
 
-    def test_legacy_daemon_send_warns_instead_of_failing(self):
-        self.assertIn(bridge.MIGRATION_DOC, bridge.check_daemon(self.live_row(), "send"))
-
     def test_cli_ack_reply_with_legacy_daemon_exit_1_and_never_reach_the_daemon(self):
         row = self.live_row()
-        for argv in (("ack", "m1", "--json"), ("reply", "m1", "--json", "--", "hi")):
+        for argv in (("ack", "m1", "--json"), ("reply", "m1", "--json", "--", "hi"), ("send", "codex:t", "--json", "--", "hi")):
             with self.subTest(argv=argv):
                 code, out, rpc = self.run_cli(row, *argv)
                 self.assertEqual(1, code)
@@ -863,12 +861,6 @@ class DaemonVersionTests(unittest.TestCase):
                 self.assertEqual("daemon-outdated", out["error"]["code"])
                 self.assertIn("NOT performed", out["error"]["message"])
                 rpc.assert_not_called()
-
-    def test_cli_send_with_legacy_daemon_warns_but_sends(self):
-        code, out, rpc = self.run_cli(self.live_row(), "send", "codex:t", "--json", "--", "hi")
-        self.assertEqual(0, code)
-        self.assertIn("warning", out)
-        rpc.assert_called_once()
 
     def test_cli_ack_with_new_daemon_takes_normal_path(self):
         row = self.live_row(protocol=bridge.DAEMON_PROTOCOL, capabilities=list(bridge.DAEMON_CAPABILITIES))
@@ -879,6 +871,8 @@ class DaemonVersionTests(unittest.TestCase):
 
     def test_cli_enable_flags_legacy_daemon_and_stop_still_works(self):
         row = self.live_row()
+        code, out, _ = self.run_cli(row, "list", "--json")
+        self.assertTrue(out["endpoints"][0]["daemon_outdated"])
         code, out, _ = self.run_cli(row, "enable", "--json")
         self.assertEqual((0, True), (code, out["daemon_outdated"]))
         self.assertIn(bridge.MIGRATION_DOC, out["warning"])
