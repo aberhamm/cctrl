@@ -1,4 +1,5 @@
 """Bridge ledger/lifecycle tests and isolated CLI/native-proxy process boundary."""
+import io
 import json
 import os
 from pathlib import Path
@@ -776,6 +777,129 @@ class CliProcessTests(unittest.TestCase):
                              (record["sender"], record["recipient"], record["status"]))
         finally:
             endpoint.close()
+
+    def test_real_daemon_advertises_protocol_and_stale_row_fails_closed(self):
+        row = self.enable()
+        self.assertEqual(bridge.DAEMON_PROTOCOL, row["protocol"])
+        self.assertIn("native_retirement", row["capabilities"])
+        store = bridge.Store(self.root / "ledger")
+        with store.db() as db:  # simulate a daemon started by a pre-protocol release
+            db.execute("DELETE FROM endpoint_protocol WHERE actor=?", (row["actor"],))
+        proc = subprocess.run([sys.executable, str(ROOT / "lib/native_bridge.py"), "ack", str(uuid.uuid4()), "--json"],
+                              cwd=ROOT, env=self.env, capture_output=True, text=True, timeout=15)
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        self.assertEqual("daemon-outdated", json.loads(proc.stdout)["error"]["code"])
+        listed = self.cli("list", "--json")["endpoints"]
+        self.assertEqual(1, listed[0]["protocol"])
+
+
+class DaemonVersionTests(unittest.TestCase):
+    """B2: a CLI must not trust a stale daemon from an older release."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = bridge.Store(Path(self.temp.name) / "ledger")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def live_row(self, who="codex:me", protocol=None, capabilities=None):
+        started = bridge.start_identity(os.getpid())
+        with self.store.db() as db:
+            db.execute("INSERT OR REPLACE INTO endpoints VALUES (?,?,?,?,?,?,?)", (who, os.getpid(), started, "/x", "/y", "n", "/tmp"))
+            if protocol is not None:
+                db.execute("INSERT OR REPLACE INTO endpoint_protocol VALUES (?,?,?,?,?)", (who, os.getpid(), started, protocol, json.dumps(capabilities)))
+        return self.store.endpoint(who)
+
+    def run_cli(self, row, *argv):
+        out = io.StringIO()
+        with patch.object(bridge, "ensure_daemon", return_value=row), patch.object(bridge, "own_actor", return_value=row["actor"]), \
+             patch.object(bridge, "own_identity", return_value={}), patch.object(bridge, "own_registry", return_value=None), \
+             patch.object(bridge, "sender_envelope", return_value={}), \
+             patch.object(bridge, "rpc", return_value={"ok": True, "data": {"id": "x"}}) as rpc, \
+             patch.object(sys, "stdout", out):
+            code = bridge.main(["--root", str(self.store.root), *argv])
+        return code, json.loads(out.getvalue()), rpc
+
+    def test_row_without_protocol_record_is_legacy(self):
+        row = self.live_row()
+        self.assertEqual((1, []), (row["protocol"], row["capabilities"]))
+
+    def test_new_daemon_row_advertises_protocol_and_capabilities(self):
+        row = self.live_row(protocol=bridge.DAEMON_PROTOCOL, capabilities=list(bridge.DAEMON_CAPABILITIES))
+        self.assertEqual(bridge.DAEMON_PROTOCOL, row["protocol"])
+        self.assertIn("native_retirement", row["capabilities"])
+        self.assertIn("original", row["capabilities"])
+        for action in ("ack", "reply", "send"):
+            self.assertIsNone(bridge.check_daemon(row, action))
+
+    def test_legacy_daemon_fails_closed_for_ack_and_reply_and_points_to_doc(self):
+        row = self.live_row()
+        for action in ("ack", "reply"):
+            with self.subTest(action=action), self.assertRaisesRegex(bridge.DaemonOutdated, bridge.MIGRATION_DOC):
+                bridge.check_daemon(row, action)
+
+    def test_too_old_or_capability_stripped_daemon_is_refused(self):
+        too_old = self.live_row(protocol=1, capabilities=list(bridge.DAEMON_CAPABILITIES))
+        stripped = self.live_row(protocol=bridge.DAEMON_PROTOCOL, capabilities=["sender_envelope"])
+        for row in (too_old, stripped):
+            with self.assertRaises(bridge.DaemonOutdated):
+                bridge.check_daemon(row, "ack")
+
+    def test_newer_protocol_with_capabilities_is_accepted(self):
+        row = self.live_row(protocol=bridge.DAEMON_PROTOCOL + 5, capabilities=list(bridge.DAEMON_CAPABILITIES) + ["future"])
+        self.assertIsNone(bridge.check_daemon(row, "reply"))
+
+    def test_legacy_daemon_send_warns_instead_of_failing(self):
+        self.assertIn(bridge.MIGRATION_DOC, bridge.check_daemon(self.live_row(), "send"))
+
+    def test_cli_ack_reply_with_legacy_daemon_exit_1_and_never_reach_the_daemon(self):
+        row = self.live_row()
+        for argv in (("ack", "m1", "--json"), ("reply", "m1", "--json", "--", "hi")):
+            with self.subTest(argv=argv):
+                code, out, rpc = self.run_cli(row, *argv)
+                self.assertEqual(1, code)
+                self.assertFalse(out["ok"])
+                self.assertEqual("daemon-outdated", out["error"]["code"])
+                self.assertIn("NOT performed", out["error"]["message"])
+                rpc.assert_not_called()
+
+    def test_cli_send_with_legacy_daemon_warns_but_sends(self):
+        code, out, rpc = self.run_cli(self.live_row(), "send", "codex:t", "--json", "--", "hi")
+        self.assertEqual(0, code)
+        self.assertIn("warning", out)
+        rpc.assert_called_once()
+
+    def test_cli_ack_with_new_daemon_takes_normal_path(self):
+        row = self.live_row(protocol=bridge.DAEMON_PROTOCOL, capabilities=list(bridge.DAEMON_CAPABILITIES))
+        code, out, rpc = self.run_cli(row, "ack", "m1", "--json")
+        self.assertEqual(0, code)
+        self.assertNotIn("warning", out)
+        rpc.assert_called_once()
+
+    def test_cli_enable_flags_legacy_daemon_and_stop_still_works(self):
+        row = self.live_row()
+        code, out, _ = self.run_cli(row, "enable", "--json")
+        self.assertEqual((0, True), (code, out["daemon_outdated"]))
+        self.assertIn(bridge.MIGRATION_DOC, out["warning"])
+        with patch.object(bridge, "own_actor", return_value=row["actor"]), \
+             patch.object(bridge, "rpc", return_value={"ok": True, "data": {"stopping": True}}) as rpc, \
+             patch.object(bridge.Store, "endpoint", side_effect=[row, None]), patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(0, bridge.main(["--root", str(self.store.root), "stop", "--json"]))
+        rpc.assert_called_once()
+
+    def test_hello_reports_protocol(self):
+        daemon = bridge.Daemon.__new__(bridge.Daemon)
+        daemon.store, daemon.who = self.store, "codex:me"
+        data = daemon.handle({"actor": "codex:me", "action": "hello"})
+        self.assertEqual(bridge.DAEMON_PROTOCOL, data["protocol"])
+        self.assertEqual(list(bridge.DAEMON_CAPABILITIES), data["capabilities"])
+
+    def test_old_daemon_positional_endpoint_insert_still_works(self):
+        # Old daemons INSERT 7 values positionally: the table shape is unchanged.
+        self.live_row()
+        with self.store.db() as db:
+            self.assertEqual(7, len(db.execute("PRAGMA table_info(endpoints)").fetchall()))
 
 
 if __name__ == "__main__":

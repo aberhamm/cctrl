@@ -34,6 +34,24 @@ NATIVE_OWNED = ("persisted", "submitting", "submitted", "queued", "held", "relea
 # Policy outcomes that are not authorized work either.
 NOT_WORK = ("refused", "denied", "expired", "dropped")
 VIEWS = ("actionable", "stranded", "history")
+
+# Daemon protocol. A daemon outlives the CLI that started it, so after an upgrade
+# the CLI may face a daemon from an older release. Daemons that predate this
+# check wrote no protocol record (treated as protocol 1: no native-queue
+# retirement, no sender envelope). Bump DAEMON_PROTOCOL when a CLI-visible daemon
+# behavior is added; MIN_DAEMON_PROTOCOL is what the CLI needs to act safely.
+DAEMON_PROTOCOL = 2
+MIN_DAEMON_PROTOCOL = 2
+DAEMON_CAPABILITIES = ("native_retirement", "original", "sender_envelope", "admission_gate")
+MIGRATION_DOC = "docs/bridge-daemon-migration.md"
+# Actions that would silently lose data (no queue retirement, no handled
+# original) on a daemon without the capability fail closed; others only warn.
+FAIL_CLOSED_ACTIONS = {"ack": ("native_retirement",), "reply": ("native_retirement", "original")}
+WARN_ACTIONS = {"send": ("sender_envelope",), "reply": ("sender_envelope",)}
+
+
+class DaemonOutdated(ValueError):
+    code = "daemon-outdated"
 BASIS = re.compile(r"^[A-Za-z0-9:_./-]{1,60}$")
 ENVELOPE_BASES = {
     "display_name": {"claimed:--name", "claimed:CCTRL_SESSION_NAME", "provider-registry", "provider-reported:thread/read", "unknown"},
@@ -206,6 +224,10 @@ class Store:
             CREATE TABLE IF NOT EXISTS receipt_attempts (
               original TEXT PRIMARY KEY, id TEXT NOT NULL, recipient TEXT NOT NULL,
               body TEXT NOT NULL, status TEXT NOT NULL, detail TEXT);
+            CREATE TABLE IF NOT EXISTS endpoint_protocol (
+              actor TEXT NOT NULL, pid INTEGER NOT NULL, started TEXT NOT NULL,
+              protocol INTEGER NOT NULL, capabilities TEXT NOT NULL,
+              PRIMARY KEY(actor,pid,started));
             CREATE TABLE IF NOT EXISTS ownership (
               actor TEXT NOT NULL,pid INTEGER NOT NULL,started TEXT NOT NULL,
               resources TEXT NOT NULL, PRIMARY KEY(actor,pid,started));
@@ -234,7 +256,20 @@ class Store:
         with self.db() as db:
             row = db.execute("SELECT * FROM endpoints WHERE actor=?", (who,)).fetchone()
         if row and isinstance(row["pid"], int) and row["pid"] > 1 and row["started"] and start_identity(row["pid"]) == row["started"]:
-            return dict(row)
+            value = dict(row)
+            # Kept in a side table: old daemons write the 7-column endpoints row
+            # positionally, so that table's shape must not change. A missing
+            # record means a daemon from before protocol versioning.
+            with self.db() as db:
+                info = db.execute("SELECT protocol,capabilities FROM endpoint_protocol WHERE actor=? AND pid=? AND started=?",
+                                  (who, row["pid"], row["started"])).fetchone()
+            value["protocol"], value["capabilities"] = 1, []
+            if info:
+                try:
+                    value["protocol"], value["capabilities"] = int(info["protocol"]), list(json.loads(info["capabilities"]))
+                except (TypeError, ValueError):
+                    pass
+            return value
         return None
 
     def endpoints(self):
@@ -279,6 +314,7 @@ class Store:
                 else:
                     db.execute("DELETE FROM ownership WHERE actor=? AND pid=? AND started=?", (who, row["pid"], row["started"]))
                     db.execute("DELETE FROM endpoints WHERE actor=? AND pid=? AND started=?", (who, row["pid"], row["started"]))
+                    db.execute("DELETE FROM endpoint_protocol WHERE actor=? AND pid=? AND started=?", (who, row["pid"], row["started"]))
             if unresolved:
                 raise ValueError("exited bridge cleanup failed; ownership manifest retained in ledger")
 
@@ -653,6 +689,8 @@ class Daemon:
             retirement = self.retire_native(original["id"])
             self.notify_receipt(original)
             return {**self.store.get(original["id"], self.who), "native_retirement": retirement}
+        if action == "hello":
+            return {"protocol": DAEMON_PROTOCOL, "capabilities": list(DAEMON_CAPABILITIES), "pid": os.getpid()}
         if action == "stop":
             self.stopping.set()
             return {"stopping": True}
@@ -724,6 +762,11 @@ class Daemon:
                 self.native.open()
                 persist_resources()
                 with self.store.db() as db:
+                    # Same transaction as the endpoint row: a CLI that sees the
+                    # row must also see the protocol, or it would misjudge this
+                    # daemon as legacy.
+                    db.execute("INSERT OR REPLACE INTO endpoint_protocol VALUES (?,?,?,?,?)",
+                               (self.who, os.getpid(), started, DAEMON_PROTOCOL, json.dumps(list(DAEMON_CAPABILITIES))))
                     db.execute("INSERT OR REPLACE INTO endpoints VALUES (?,?,?,?,?,?,?)", (self.who, os.getpid(), started, str(self.control_path), str(self.native.socket_path), self.native.record.get("name"), self.cwd))
                 signal.signal(signal.SIGTERM, lambda *_: self.stopping.set())
                 signal.signal(signal.SIGINT, lambda *_: self.stopping.set())
@@ -782,7 +825,35 @@ class Daemon:
                         pass
                 with self.store.db() as db:
                     db.execute("DELETE FROM endpoints WHERE actor=? AND pid=?", (self.who, os.getpid()))
+                    db.execute("DELETE FROM endpoint_protocol WHERE actor=? AND pid=?", (self.who, os.getpid()))
                     db.execute("DELETE FROM ownership WHERE actor=? AND pid=?", (self.who, os.getpid()))
+
+
+def daemon_missing(row, needs):
+    """Capabilities `needs` that this endpoint's daemon does not offer."""
+    have = set(row.get("capabilities") or []) if int(row.get("protocol") or 1) >= MIN_DAEMON_PROTOCOL else set()
+    return [c for c in needs if c not in have]
+
+
+def daemon_problem(row):
+    return (f"the running bridge daemon for {row['actor']} (pid {row['pid']}) is outdated "
+            f"(protocol {row.get('protocol') or 1}, needs {MIN_DAEMON_PROTOCOL}); it was started by an older cctrl and predates the required behavior")
+
+
+def check_daemon(row, action):
+    """Fail closed (or return a warning) when the live daemon is too old for `action`.
+
+    Never restarts anything: a daemon owns held/ambiguous items and callback
+    bindings, so replacing it is an operator step (see MIGRATION_DOC).
+    """
+    lacking = daemon_missing(row, FAIL_CLOSED_ACTIONS.get(action, ()))
+    if lacking:
+        raise DaemonOutdated(f"{daemon_problem(row)}; it cannot do {', '.join(lacking)}, so `{action}` was NOT performed: nothing was sent, acknowledged or retired. "
+                             f"Migrate the daemon deliberately (drain, then `cctrl bridge stop`, then `cctrl bridge enable`); do not just retry. See {MIGRATION_DOC}.")
+    lacking = daemon_missing(row, WARN_ACTIONS.get(action, ()))
+    if lacking:
+        return (f"{daemon_problem(row)}; it lacks {', '.join(lacking)}, so this {action} went out without a sender envelope. See {MIGRATION_DOC}.")
+    return None
 
 
 def ensure_daemon(store, who):
@@ -856,8 +927,14 @@ def main(argv=None):
                 result = store.inbox(who, args.view, args.after, args.limit)
             else:
                 row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
+                warning = None
+                if row is not None and args.command in FAIL_CLOSED_ACTIONS | WARN_ACTIONS:
+                    warning = check_daemon(row, args.command)
                 if args.command == "enable":
                     result = row
+                    if daemon_missing(row, FAIL_CLOSED_ACTIONS["reply"] + WARN_ACTIONS["send"]):
+                        result = {**row, "daemon_outdated": True,
+                                  "warning": f"{daemon_problem(row)}. ack/reply are refused until it is migrated; see {MIGRATION_DOC}."}
                 elif row is None:
                     result = {"stopped": True}
                 else:
@@ -876,6 +953,8 @@ def main(argv=None):
                         print(json.dumps(response))
                         return 1
                     result = response["data"]
+                    if warning and isinstance(result, dict):
+                        result = {**result, "warning": warning}
                     if args.command == "stop":
                         for _ in range(100):
                             if store.endpoint(who) is None:
@@ -886,7 +965,7 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (ValueError, OSError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
-        print(json.dumps({"ok": False, "error": {"code": "bridge-error", "message": str(exc)}}))
+        print(json.dumps({"ok": False, "error": {"code": getattr(exc, "code", "bridge-error"), "message": str(exc)}}))
         return 1
 
 

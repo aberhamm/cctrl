@@ -289,6 +289,8 @@ addressed to you and already received, queues the reply and acks exactly that
 original. `send_message` is a free-form send: it is never treated as a reply and
 acks nothing, so the original stays `delivered_unacked`.
 
+After upgrading cctrl, an endpoint enabled earlier keeps its old daemon; `ack` and `reply` are refused with `daemon-outdated` until you migrate it. See [bridge-daemon-migration.md](bridge-daemon-migration.md).
+
 Use CLI `cctrl bridge stop` to stop the endpoint. For sends/replies, generate and
 retain an optional UUID before the first attempt when client retries may occur.
 Reusing that same ID returns the existing ledger result; it does not retry an
