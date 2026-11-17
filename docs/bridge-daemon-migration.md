@@ -106,7 +106,7 @@ Run these as the session that owns the endpoint, with the **new** cctrl.
    Check `native_retirement.outcome` (see
    [peer-messaging.md](peer-messaging.md)).
 
-A repeated ACK does not resend a receipt that was already sent; a receipt that earlier failed is retried, which is intended.
+A repeated ACK does not resend a receipt that was already sent; a receipt that earlier failed is retried, which is intended. A receipt owed to a Claude sender is never submitted natively (recorded as `suppressed`, see peer-messaging.md), so it has nothing to retry.
 
 ## Not done on purpose
 
