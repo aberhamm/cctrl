@@ -221,6 +221,17 @@ class ConflictResolveTests(unittest.TestCase):
         doc = self.predecessors([record('p-id', 'TMUX--n', '%9', '900')], panes, procs, claude=claude)
         self.assertEqual(doc['by']['p-id']['action'], 'close')
 
+    def test_predecessor_desktop_app_processes_do_not_block_the_close(self):
+        # B2: Claude.app, its helpers and plugin workers have no session file and are not CLIs.
+        procs_extra = [
+            self.proc(710, 1, '/Applications/Claude.app/Contents/MacOS/Claude'),
+            self.proc(711, 710, '/Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer'),
+            self.proc(712, 1, '/opt/app/claude-mem/worker.js'),
+        ]
+        panes, procs, claude = self.live_x(procs_extra)
+        doc = self.predecessors([record('p-id', 'TMUX--n', '%9', '900')], panes, procs, claude=claude)
+        self.assertEqual(doc['by']['p-id']['action'], 'close')
+
     def test_a_session_file_with_a_mismatched_procstart_never_marks_the_task_running(self):
         panes, procs, claude = self.live_x([self.proc(700, 1, 'bash')], claude={700: 'p-id'})
         doc = self.predecessors([record('p-id', 'TMUX--n', '%9', '900')], panes, procs, claude=claude,

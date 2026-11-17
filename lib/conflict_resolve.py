@@ -64,18 +64,16 @@ def agent_of(command: str) -> str:
     return ""
 
 
-CLAUDE_PATH_PARTS = ("claude", "claude-code", "ccd-cli")
-
-
 def claude_like(command: str) -> bool:
     """True for a process that might be a Claude CLI whatever argv0 is.
 
     agent_of() only knows `claude` and node running claude-code. A versioned
-    binary (.../claude/versions/2.1.280) or a desktop entrypoint
-    (.../ccd-cli/<ver>) has neither name. Looking at the executable part of
-    the command only (up to the first option), any path component that is
-    claude, claude-code, ccd-cli or starts with `claude` makes it claude-like.
-    Over-matching only makes a closer skip (fails closed).
+    binary (.../claude/versions/<v>) or a desktop CLI entrypoint
+    (.../ccd-cli/<v>) has neither name. Only the executable part of the
+    command is read (up to the first option). Matches: argv0 `claude`, a
+    claude/versions/ path, a ccd-cli/ or claude-code/ component. A macOS app
+    bundle (*.app/Contents/, i.e. Claude.app and its helpers) is not a CLI
+    unless it sits under ccd-cli. Plain names like claude-mem do not match.
     """
     if agent_of(command) == "claude":
         return True
@@ -83,11 +81,15 @@ def claude_like(command: str) -> bool:
     cut = head.find(" -")
     if cut >= 0:
         head = head[:cut]
-    for part in head.replace("\\", "/").split("/"):
-        low = part.strip().lower()
-        if low in CLAUDE_PATH_PARTS or low.startswith("claude"):
+    parts = [part.strip().lower() for part in head.replace("\\", "/").split("/")]
+    if "ccd-cli" in parts:
+        return True
+    if ".app/contents/" in head.lower().replace("\\", "/"):
+        return False
+    for k in range(len(parts) - 1):
+        if parts[k] == "claude" and parts[k + 1] == "versions":
             return True
-    return False
+    return "claude-code" in parts
 
 
 class Evidence:

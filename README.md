@@ -680,9 +680,9 @@ launch's exit code. Every row, applied or skipped, appends a line to
 only). `CCTRL_PREDECESSOR_CLOSE=off` disables it (`sync` waits, for tests);
 `CCTRL_PREDECESSOR_WAIT` (default 90 s) and `CCTRL_PREDECESSOR_POLL` (3 s, minimum 1)
 bound the wait for proof. A task or launch file that does not parse is skipped and
-audited on its own; the other records are still retired. Any process whose
-executable path looks like Claude (`.../claude/versions/<v>`, `ccd-cli`, ...) and
-has no usable session file blocks the close. `cctrl task predecessor-undo [--since ISO] [RECORD...]
+audited on its own; the other records are still retired. A process that may be a Claude CLI (argv0 `claude`, `.../claude/versions/<v>`,
+`ccd-cli/` or `claude-code/`) with no usable session file blocks the close; the
+Claude desktop app bundle (`*.app/Contents/`) and plugin workers do not. `cctrl task predecessor-undo [--since ISO] [RECORD...]
 [--apply] [--json]` reopens retired task records (dry run by default; refuses
 a record something else touched since; provisional receipts are not
 undoable). Fallback for one record: `cctrl start -d <cwd> -r <id>`. The
