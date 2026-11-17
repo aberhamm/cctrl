@@ -18457,15 +18457,87 @@ _task_resolve_conflicts() {
     (( failed == 0 )) || return 75
 }
 
+# `task predecessor-undo`: reopen records closed by a predecessor retire (D10a).
+# Reads predecessor-retire.jsonl; a record is reopened only while it is still
+# closed and nothing but the retire wrote evidence after it (digest-guarded).
+# Provisional receipts are not undoable: they carry no resume identity.
+_task_predecessor_undo() {
+    local apply=false json=false since="" file rc=0
+    local -a only=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply) apply=true; shift ;;
+            --json) json=true; shift ;;
+            --since) [[ $# -ge 2 ]] || { echo -e "${RED}--since needs an ISO timestamp${RESET}" >&2; return 64; }; since="$2"; shift 2 ;;
+            -h|--help|help)
+                echo "Usage: cctrl task predecessor-undo [--since ISO] [RECORD...] [--apply] [--json]"
+                echo ""
+                echo "  Reopen task records that a relaunch retired (see predecessor-retire.jsonl)."
+                echo "  Dry run by default. A record is reopened only while it is still closed and"
+                echo "  nothing but the retire wrote evidence after it. Provisional receipts are"
+                echo "  never reopened. Fallback for one record: cctrl start -d <cwd> -r <id>."
+                return 0 ;;
+            -*) echo -e "${RED}Unknown predecessor-undo argument: $1${RESET}" >&2; return 64 ;;
+            *) only+=("$1"); shift ;;
+        esac
+    done
+    file="${_CCTRL_P_AUDIT_DIR:-}/predecessor-retire.jsonl"
+    local -a results=()
+    local line record name prior_runtime prior_owner prior_state prior_restore task path status why digest
+    if [[ -f "$file" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            record="$(jq -r '.record' <<< "$line")"; name="$(jq -r '.name' <<< "$line")"
+            task="$(jq -r '.provider_task_id // ""' <<< "$line")"
+            if (( ${#only[@]} > 0 )); then
+                local want=false o
+                for o in "${only[@]}"; do [[ "$o" == "$record" ]] && want=true; done
+                $want || continue
+            fi
+            path="$SESSION_METADATA_DIR/$record"; status=undone; why=""
+            if [[ -z "$task" ]]; then status=skipped; why="provisional receipts are not undoable"
+            elif [[ ! -f "$path" || -L "$path" ]]; then status=skipped; why="record is gone"
+            elif [[ "$(jq -r '.lifecycle_state' "$path")" != closed ]]; then status=skipped; why="record is no longer closed"
+            elif ! jq -e '[.ownership_evidence[]? | select(.source == "cctrl-predecessor")] as $p
+                    | ($p | length) > 0 and ([.ownership_evidence[]? | select(.source != "cctrl-predecessor" and .observed_at > ($p | map(.observed_at) | max))] | length) == 0' "$path" >/dev/null 2>&1; then
+                status=skipped; why="something other than the retire wrote evidence after it"
+            fi
+            prior_runtime="$(jq -r '.prior.runtime // "unknown"' <<< "$line")"; prior_owner="$(jq -r '.prior.owner // "unknown"' <<< "$line")"
+            prior_state="$(jq -r '.prior.state // "active"' <<< "$line")"; prior_restore="$(jq -r '.prior.restore_strategy // ""' <<< "$line")"
+            if [[ "$status" == undone && $apply == true ]]; then
+                digest="$(_task_registry_record_digest "$path")" || digest=""
+                _task_record_transition_file "$path" "$name" "$prior_runtime" "$prior_owner" "$prior_state" "$prior_restore" \
+                    cctrl-predecessor-undo authoritative "undo predecessor retire" "$digest" 2>/dev/null || { status=rejected; why="guarded write refused"; }
+            elif [[ "$status" == undone ]]; then
+                status=would-undo
+            fi
+            [[ "$status" != rejected ]] || rc=75
+            results+=("$(jq -nc --arg record "$record" --arg id "$task" --arg status "$status" --arg why "$why" --arg prior "$prior_state" \
+                '{record:$record, provider_task_id:$id, status:$status, reason:$why, restores_state:$prior}')")
+        done < <(jq -c --arg since "$since" 'select(.status == "applied" and .action == "close" and ($since == "" or .at >= $since))' "$file" 2>/dev/null)
+    fi
+    local doc
+    doc="$(if (( ${#results[@]} > 0 )); then printf '%s\n' "${results[@]}" | jq -s .; else printf '[]'; fi)"
+    if $json; then
+        jq -n --argjson rows "$doc" --argjson apply "$apply" '{kind:"predecessor_undo_v1", apply:$apply, rows:$rows}'
+    else
+        jq -r '.[] | "\(.status)\t\(.record)\t\(.reason)"' <<< "$doc"
+        $apply || echo -e "${DIM}Dry run. Apply with: cctrl task predecessor-undo --apply${RESET}"
+    fi
+    return "$rc"
+}
+
 cmd_task() {
     local action="${1:-ls}"
     shift 2>/dev/null || true
     case "$action" in
         ls|list) _task_list "$@" ;;
         resolve-conflicts) _task_resolve_conflicts "$@" ;;
+        predecessor-undo) _task_predecessor_undo "$@" ;;
         -h|--help|help)
             echo "Usage: cctrl task ls [--json]"
             echo "       cctrl task resolve-conflicts [--apply] [--json]"
+            echo "       cctrl task predecessor-undo [--since ISO] [RECORD...] [--apply] [--json]"
             echo "List the provider-neutral local task inventory, or settle stale"
             echo "ownership conflicts from live tmux, process, and provider evidence."
             ;;

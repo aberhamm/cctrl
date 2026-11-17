@@ -81,6 +81,7 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   renames; the guard does not apply to it). If that leaves two live fleet
   managers (`session ls` prints a footer), the human decides which one to close
   **before** any handover, because `--succeeds` needs exactly one.
+- A relaunch retires stale claims on its tmux name: see `predecessor-retire.jsonl` under the cctrl state audit dir; undo with `cctrl task predecessor-undo`; disable with `CCTRL_PREDECESSOR_CLOSE=off`. Never run `cctrl task resolve-conflicts --apply` on the live fleet without a supervised dry run first.
 - After a **power cycle**, read `cctrl session restore status` first. The
   boot LaunchAgent runs `cctrl session restore --boot`, and that invocation
   carries the human approval for the boot restore (mdec-1114): it brings back

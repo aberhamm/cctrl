@@ -660,6 +660,30 @@ It is dry-run by default. `--apply` collects evidence again, writes only the
 actions that still hold, and rejects any write whose record changed since the
 decision (exit `75`).
 
+Records live in the newest pre-boot snapshot or the newest snapshot are never
+closed by it (restore needs them); if snapshot files exist but none is
+readable, it refuses (exit `69`).
+
+**Predecessor retire (D10a).** When a launch puts conversation X into tmux
+name N and N's pane is proven to run X, cctrl closes every other open record
+on this host that still claims N and is provably not running (no process
+mentions it, no live session file names it, not live in a protected snapshot,
+not owned by the app, Codex needs App Server `confirmed-absence`). Provisional
+`launch-*.json` receipts count once they are past the 300 s start-up grace.
+Resume launches (`start -r`, `@name -r`, restore replay, realign) trigger it
+right after the health check; fresh and bare `-r` launches trigger it once the
+conversation id is learned. It runs in the background and never changes the
+launch's exit code. Every row, applied or skipped, appends a line to
+`$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl` (mode 600, ids and names
+only). `CCTRL_PREDECESSOR_CLOSE=off` disables it (`sync` waits, for tests);
+`CCTRL_PREDECESSOR_WAIT` (default 90 s) and `CCTRL_PREDECESSOR_POLL` (3 s) bound
+the wait for proof. `cctrl task predecessor-undo [--since ISO] [RECORD...]
+[--apply] [--json]` reopens retired task records (dry run by default; refuses
+a record something else touched since; provisional receipts are not
+undoable). Fallback for one record: `cctrl start -d <cwd> -r <id>`. The
+existing backlog of duplicate names is not cleaned automatically: run
+`cctrl task resolve-conflicts` as a supervised dry run first.
+
 Closing also makes sure the pane's processes exit. `tmux kill-session` only
 hangs up the pty, and an agent that ignores SIGTERM used to keep the wrapper
 and agent running after the session was gone. kill, close and stop-exact

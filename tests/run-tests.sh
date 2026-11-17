@@ -28964,6 +28964,45 @@ test_predecessor_retire_skips_during_a_data_migration() {
     echo "ok: the retire is skipped while a data migration is in progress"
 }
 
+test_predecessor_undo_restores_the_prior_state_and_refuses_changed_records() {
+    local dir="$TMPDIR/pred-u1" name="TMUX--ms--pred-u1-project" pf out
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-u1-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    pf="$(grep -l "\"provider_task_id\": \"$_PRED_P\"" "$dir"/meta/task-*.json | head -n 1)"
+    local prior_before
+    prior_before="$(jq -c '[.control_owner,.execution_runtime,.lifecycle_state,.restore_strategy]' "$pf")"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-u1-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "P not closed by the retire"
+    # dry run writes nothing
+    local before after
+    before="$(shasum "$pf")"
+    out="$(_pred_cctrl "$dir" -- task predecessor-undo --json 2>&1)" || fail "dry run failed: $out"
+    after="$(shasum "$pf")"
+    [[ "$before" == "$after" ]] || fail "the dry run wrote the record"
+    [[ "$(jq -r '.rows[0].status' <<< "$out")" == would-undo ]] || fail "dry run row: $out"
+    out="$(_pred_cctrl "$dir" -- task predecessor-undo --apply --json 2>&1)" || fail "apply failed: $out"
+    [[ "$(jq -r '.rows[0].status' <<< "$out")" == undone ]] || fail "apply row: $out"
+    [[ "$(jq -c '[.control_owner,.execution_runtime,.lifecycle_state,.restore_strategy]' "$pf")" == "$prior_before" ]] \
+        || fail "prior state not restored: $(jq -c '[.control_owner,.execution_runtime,.lifecycle_state,.restore_strategy]' "$pf") vs $prior_before"
+    echo "ok: predecessor-undo reopens a retired record with its prior owner, runtime, state and restore strategy"
+}
+
+test_predecessor_undo_refuses_a_record_something_else_touched() {
+    local dir="$TMPDIR/pred-u2" name="TMUX--ms--pred-u2-project" pf out
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-u2-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    pf="$(grep -l "\"provider_task_id\": \"$_PRED_P\"" "$dir"/meta/task-*.json | head -n 1)"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-u2-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    jq '.ownership_evidence += [{source:"someone-else",source_instance:"x",authority_class:"authoritative",observed_owner:"unknown",observed_runtime:"unknown",observed_state:"closed",observed_at:"2099-01-01T00:00:00Z",reason:"later"}]' \
+        "$pf" > "$pf.tmp" && mv "$pf.tmp" "$pf"
+    out="$(_pred_cctrl "$dir" -- task predecessor-undo --apply --json 2>&1)" || true
+    [[ "$(jq -r '.rows[0].status' <<< "$out")" == skipped ]] || fail "expected skipped: $out"
+    [[ "$(jq -r '.lifecycle_state' "$pf")" == closed ]] || fail "record was reopened"
+    echo "ok: predecessor-undo refuses a record whose evidence changed after the retire"
+}
+
 # Groups as data (plan 105 P4): `_group_tests <group>` prints the tests a
 # CCTRL_TEST_ONLY group runs, in order. codex-ownership-matrix has its own
 # block below (live-store manifest around the run); provider-neutral and
