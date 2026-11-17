@@ -15,8 +15,6 @@ RELEASES_DIR="$CCTRL_HOME/releases"
 CURRENT_LINK="$CCTRL_HOME/current"
 NEXT_LINK="$CCTRL_HOME/current.next"
 
-mkdir -p "$RELEASES_DIR"
-
 SCRATCH="$RELEASES_DIR/.tmp-$$"
 CLEANUP_SCRATCH=1
 cleanup() {
@@ -67,7 +65,8 @@ echo "cctrl self-install: building release from $ROOT at $SHORT_SHA" >&2
 # files) sneaks in. Three hand-kept-list gaps found and fixed across the
 # first four live installs (install.sh, install/, AGENTS.md/CLAUDE.md/
 # README.md/skills/, .githooks/) are exactly the failure mode this closes.
-mkdir -p "$SCRATCH"
+# First write: every refusal above exits before $CCTRL_HOME is created.
+mkdir -p "$RELEASES_DIR" "$SCRATCH"
 # Archive to a file rather than piping straight into `tar -x`: macOS's
 # bsdtar closes its stdin as soon as it has read the end-of-archive
 # markers, before consuming git archive's trailing record padding, so

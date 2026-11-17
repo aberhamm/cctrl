@@ -28731,6 +28731,18 @@ test_self_install_links_state_to_primary_checkout() {
         fail "self-install from a bare-repo worktree must refuse"
     fi
     grep -q 'cannot resolve the primary checkout' "$base/out2.log" || fail "refusal lacks the clear message"
+    [[ ! -e "$base/home2/releases" && ! -e "$base/home2/current" ]] \
+        || fail "refused self-install wrote into CCTRL_HOME (releases/ or current exists)"
+    # A refusal must also leave an existing install's current untouched.
+    local before after
+    before="$(readlink "$home/current")"
+    printf 'x\n' >> "$wt/cctrl"
+    if (unset TMUX TMUX_PANE; CCTRL_HOME="$home" CCTRL_BIN="$bin" bash "$wt/install/self-install.sh") >"$base/out3.log" 2>&1; then
+        fail "self-install of a dirty tree must refuse"
+    fi
+    after="$(readlink "$home/current")"
+    [[ "$before" == "$after" ]] || fail "refusal moved current: $before -> $after"
+    git -C "$wt" checkout -q -- cctrl
     echo "ok: self-install links state at the primary checkout from a worktree, refuses when unresolved"
 }
 
