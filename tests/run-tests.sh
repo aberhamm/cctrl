@@ -29003,6 +29003,32 @@ test_predecessor_undo_refuses_a_record_something_else_touched() {
     echo "ok: predecessor-undo refuses a record whose evidence changed after the retire"
 }
 
+test_predecessor_retire_fresh_launch_waits_for_the_conversation_id() {
+    # T2: a fresh launch has no id until the poll learns it. A record live in
+    # the pre-boot snapshot stays open; a stale unprotected claim closes.
+    local dir="$TMPDIR/pred-s5" name="TMUX--ms--pred-s5-project" i
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s5-project"
+    _pred_write_record "$dir" "$name" "$_PRED_H"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    mkdir -p "$dir/data/snapshots"
+    local boot_epoch gen
+    boot_epoch=$(( $(date +%s) - 3600 ))
+    gen="$(date -u -r $(( boot_epoch - 600 )) +"%Y-%m-%dT%H:%M:%SZ")"
+    jq -n --arg host "$_SR_HOST_ID" --arg gen "$gen" --arg h "$_PRED_H" \
+        '{schema_version:2, generated_at:$gen, host_id:$host, capture_quality:{status:"complete"},
+          tasks:[{provider:"claude", provider_task_id:$h, tmux_session:"x", live:true}]}' > "$dir/data/snapshots/latest.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync CCTRL_FAKE_BOOTTIME="$boot_epoch" TMUX_FAKE_PANE_PID=101 \
+        CCTRL_RESUME_POLL_TIMEOUT=6 CCTRL_RESUME_POLL_INTERVAL=1 -- start -d "$dir/pred-s5-project" >/dev/null 2>&1 || fail "launch failed"
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] && break
+        sleep 1
+    done
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "stale P not closed after the poll learned the id"
+    [[ "$(_pred_state_of "$dir" "$_PRED_H")" != closed ]] || fail "H, live in the pre-boot snapshot, was closed"
+    echo "ok: a fresh launch retires stale claims once its conversation id is proven, sparing protected records"
+}
+
 # Groups as data (plan 105 P4): `_group_tests <group>` prints the tests a
 # CCTRL_TEST_ONLY group runs, in order. codex-ownership-matrix has its own
 # block below (live-store manifest around the run); provider-neutral and

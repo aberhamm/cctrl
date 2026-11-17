@@ -7064,6 +7064,11 @@ _launch_detached() {
                     [[ "$_rec_created" == "$_poll_created_at" ]] || break
                     _session_update_metadata_field "$session_name" conversation_id "$_sid" 2>/dev/null
                     [[ -n "$_tpath" ]] && _session_update_metadata_field "$session_name" transcript_path "$_tpath" 2>/dev/null
+                    # D10a T2: the conversation id is now proven; retire the
+                    # other open claims on this name (never fails the poll).
+                    if [[ "$detach_agent" == claude ]]; then
+                        _launch_retire_predecessors "$session_name" "$_sid" "$detach_agent" "${CCTRL_LAST_LAUNCH_RECORD:-}" || true
+                    fi
                     break
                 fi
             done
