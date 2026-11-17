@@ -618,6 +618,15 @@ class Daemon:
             else:
                 rid = str(uuid.uuid4())
                 db.execute("INSERT INTO receipt_attempts VALUES (?,?,?,?,?,NULL)", (mid, rid, original["sender"], text, "submitting"))
+        if original["sender"].startswith("claude:"):
+            # A native submit to Claude raises an admission prompt on the
+            # user's screen for a control fact. Record it (bridge status and
+            # inbox history still show it) but never submit it.
+            result = {"status": "suppressed", "reason": "receipts to a Claude sender are recorded, not delivered natively"}
+            with self.store.db() as db:
+                db.execute("UPDATE receipt_attempts SET status='suppressed',detail=? WHERE original=?", (json.dumps(result), mid))
+            self.store.event(mid, "receipt-suppressed", {"id": rid, **result})
+            return
         result = self.deliver(original["sender"], text, rid)
         outcome = self.outcome(result)
         with self.store.db() as db:

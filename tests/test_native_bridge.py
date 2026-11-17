@@ -90,6 +90,21 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertIn("No ACK of this receipt is needed", calls[0][1])
 
+    def test_ack_to_claude_sender_records_receipt_without_native_submit(self):
+        mid, _ = self.store.create("claude:origin", "codex:receiver", "request")
+        self.store.event(mid, "released")
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = lambda *args: self.fail("a receipt must not be submitted natively to a Claude sender")
+        result = recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertIsNotNone(result["received"])
+        with self.store.db() as db:
+            attempt = db.execute("SELECT * FROM receipt_attempts WHERE original=?", (mid,)).fetchone()
+        self.assertEqual(("claude:origin", "suppressed"), (attempt["recipient"], attempt["status"]))
+        kinds = [e["kind"] for e in self.store.get(mid, "codex:receiver")["events"]]
+        self.assertIn("receipt-suppressed", kinds)
+        recipient.handle({"actor": recipient.who, "action": "ack", "id": mid})
+        self.assertEqual(1, kinds.count("receipt-suppressed"))
+
     def test_ambiguous_receipt_remains_durable_and_is_not_replayed(self):
         mid = self.original()
         recipient = self.make_daemon("claude:receiver")

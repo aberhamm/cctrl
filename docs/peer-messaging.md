@@ -133,6 +133,14 @@ or `stranded` inbox views (only `history`), and cannot be ACKed, replied to, or
 sent as a message (those return an error). Receipt submission is idempotent and
 an ambiguous receipt is never replayed, so there are no receipt/ACK loops.
 
+A receipt whose original sender is a Claude session is recorded but never
+submitted natively: a native submit would raise an admission prompt on the
+user's screen for a control fact. The ledger keeps a `receipt_attempts` row with
+status `suppressed` and a `receipt-suppressed` event, so `bridge status` and the
+inbox `history` view still show that the receipt happened. Receipts to Codex
+senders are still submitted (a queued item, not a prompt). The only Claude-side
+evidence of handling is therefore the ledger, not a message in the pane.
+
 ## Sender envelope
 
 Codex sessions started outside cctrl need no setup for a name: the sender's CLI/MCP
