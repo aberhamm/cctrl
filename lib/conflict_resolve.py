@@ -22,6 +22,7 @@ pane is gone, and those tasks are exactly what restore should bring back.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import re
@@ -29,6 +30,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+PROVISIONAL_GRACE_SECONDS = 300  # matches snapshot_restore.PROVISIONAL_STALE_GRACE_SECONDS
 ENDED = {"closed", "archived", "released"}
 UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
@@ -77,6 +79,7 @@ class Evidence:
         self.claude_dir = Path(claude_sessions) if claude_sessions else None
         self.codex_ok = isinstance(codex.get("records"), list)
         self.codex = {r.get("provider_task_id"): r for r in codex.get("records") or [] if isinstance(r, dict)}
+        self.protect: dict[str, str] = {}
 
     def pane(self, record: dict[str, Any]) -> dict[str, Any] | None:
         pane_id, pane_pid = str(record.get("pane_id") or ""), str(record.get("pane_pid") or "")
@@ -108,13 +111,7 @@ class Evidence:
             return None
         agent = agents[0]
         if provider == "claude" and self.claude_dir:
-            path = self.claude_dir / f"{agent['pid']}.json"
-            try:
-                session = json.loads(path.read_text())
-            except Exception:
-                return None
-            value = session.get("sessionId") if isinstance(session, dict) else None
-            return value if isinstance(value, str) and value else None
+            return self.session_file(int(agent["pid"]))
         if provider == "codex":
             ids = set(UUID.findall(str(agent.get("command", ""))))
             return ids.pop() if len(ids) == 1 else None
@@ -128,27 +125,40 @@ class Evidence:
 
         A conversation resumed with /resume, or relaunched in another pane,
         has no id on its command line; its session file is the only proof it
-        is running. A Claude process whose file can't be read proves nothing
-        either way.
+        is running. Every <pid>.json of a live pid counts, whatever argv0 is
+        (a versioned desktop binary is invisible to the argv test); a file
+        whose procStart differs from the process start time is a pid reused
+        after a reboot and is ignored. A claude-like process without a usable
+        file proves nothing either way.
         """
         if not hasattr(self, "_claude_ids"):
             ids: set[str] = set()
-            unreadable = 0
+            valid: set[int] = set()
             for pid, proc in self.proc.items():
-                if agent_of(str(proc.get("command", ""))) != "claude":
-                    continue
-                session = None
-                if self.claude_dir:
-                    try:
-                        session = json.loads((self.claude_dir / f"{pid}.json").read_text())
-                    except Exception:
-                        session = None
-                if isinstance(session, dict) and isinstance(session.get("sessionId"), str) and session["sessionId"]:
-                    ids.add(session["sessionId"])
-                else:
-                    unreadable += 1
+                session = self.session_file(pid)
+                if session is not None:
+                    ids.add(session)
+                    valid.add(pid)
+            unreadable = sum(1 for pid, proc in self.proc.items()
+                             if pid not in valid and agent_of(str(proc.get("command", ""))) == "claude")
             self._claude_ids = (ids, unreadable)
         return self._claude_ids
+
+    def session_file(self, pid: int) -> str | None:
+        """The sessionId in <claude sessions>/<pid>.json, when the file is usable for this live pid."""
+        if not self.claude_dir or pid not in self.proc:
+            return None
+        try:
+            session = json.loads((self.claude_dir / f"{pid}.json").read_text())
+        except Exception:
+            return None
+        value = session.get("sessionId") if isinstance(session, dict) else None
+        if not isinstance(value, str) or not value:
+            return None
+        proc_start = norm(session.get("procStart"))
+        if proc_start and proc_start != norm(self.proc[pid].get("started")):
+            return None
+        return value
 
     def task_running(self, provider: str, task_id: str) -> bool:
         """True unless no live process can be running the task (fails closed).
@@ -179,7 +189,22 @@ class Evidence:
         status = app.get("status")
         return status if status in ("claimed", "confirmed-absence", "ambiguous") else "unavailable"
 
+def protected_reason(ev: Evidence, task_id: str) -> str | None:
+    return ev.protect.get(task_id)
+
+
+def guard_protected(outcome: tuple[str, str, str | None], ev: Evidence, task_id: Any) -> tuple[str, str, str | None]:
+    """A close of a record live in the newest pre-boot or newest snapshot becomes a skip (restore needs it)."""
+    if outcome[0] == "close" and isinstance(task_id, str) and protected_reason(ev, task_id):
+        return "skip", protected_reason(ev, task_id) or "protected", outcome[2]
+    return outcome
+
+
 def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None]:
+    return guard_protected(_evaluate(record, ev), ev, record.get("provider_task_id"))
+
+
+def _evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None]:
     provider = record.get("provider")
     task_id = record.get("provider_task_id")
     name = record.get("tmux_session") or record.get("name")
@@ -224,6 +249,7 @@ def evaluate(record: dict[str, Any], ev: Evidence) -> tuple[str, str, str | None
 
 def plan(args: argparse.Namespace) -> int:
     ev = Evidence(load(args.panes), load(args.process), args.claude_sessions or "", load(args.codex) if args.codex else {})
+    ev.protect = load_protect(getattr(args, "protect", None))
     rows = []
     for path in sorted(Path(args.records_dir).glob("task-*.json")):
         if path.is_symlink():
@@ -262,6 +288,114 @@ def plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def load_protect(path: str | None) -> dict[str, str]:
+    """{task id: "protected: live in <snapshot> at <generated_at>"} from the shell-built protect list."""
+    if not path:
+        return {}
+    out: dict[str, str] = {}
+    for item in load(path):
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]:
+            out[item["id"]] = f"protected: live in {item.get('snapshot') or 'a snapshot'} at {item.get('generated_at') or 'an unknown time'}"
+    return out
+
+
+def parse_utc(value: Any) -> dt.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ"):
+        try:
+            return dt.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def predecessor_candidate(record: dict[str, Any], ev: Evidence, args: argparse.Namespace, live_pane: dict[str, Any],
+                          now: dt.datetime | None) -> tuple[str, str]:
+    """(action, reason) for one open record that claims the launch's tmux name."""
+    if record.get("control_owner") == "app" or record.get("execution_runtime") == "app-server":
+        return "skip", "owned by the app; provider-managed"
+    task_id = record.get("provider_task_id")
+    if isinstance(task_id, str) and task_id in ev.protect:
+        return "skip", ev.protect[task_id]
+    superseded = f"superseded-by {args.expect_task}"
+    if not task_id:
+        if record.get("name") != args.name:
+            return "skip", "receipt name differs"
+        if record.get("pane_id") and record.get("pane_id") == live_pane.get("pane_id") \
+                and str(record.get("pane_pid") or "") == str(live_pane.get("pane_pid") or ""):
+            return "skip", "shares the live pane"
+        observed = [t for t in (parse_utc(record.get("created_at")), parse_utc(record.get("last_observed_at"))) if t]
+        if not observed or now is None:
+            return "skip", "receipt age unknown"
+        if (now - max(observed)).total_seconds() <= PROVISIONAL_GRACE_SECONDS:
+            return "skip", "provisional receipt still within the start-up grace"
+        return "close", superseded
+    provider = record.get("provider")
+    if provider not in ("claude", "codex"):
+        return "skip", "record lacks provider identity"
+    if ev.task_running(provider, task_id):
+        return "skip", "the task may be running in another process"
+    if provider == "codex":
+        app = ev.codex_app(task_id)
+        if app != "confirmed-absence":
+            return "skip", f"Codex App Server evidence {app}; closing needs confirmed-absence"
+    return "close", superseded
+
+
+def plan_predecessors(args: argparse.Namespace) -> int:
+    ev = Evidence(load(args.panes), load(args.process), args.claude_sessions or "", load(args.codex) if args.codex else {})
+    ev.protect = load_protect(args.protect)
+    now = parse_utc(args.now) if args.now else dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    document: dict[str, Any] = {
+        "schema_version": 1, "kind": "predecessor_plan_v1", "name": args.name, "expect_task": args.expect_task,
+        "proved": False, "global_skip": None, "rows": [],
+    }
+
+    def finish() -> int:
+        json.dump(document, sys.stdout, sort_keys=True, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    if not ev.panes_ok or not ev.process_ok:
+        document["global_skip"] = "skip: evidence unavailable"
+        return finish()
+    live = [p for p in ev.panes if p.get("session_name") == args.name]
+    running = ev.running_task(live[0], args.provider) if len(live) == 1 else None
+    if running != args.expect_task:
+        document["global_skip"] = f"skip: cannot prove {args.name} runs {args.expect_task} (running: {running or 'none'})"
+        return finish()
+    document["proved"] = True
+    exclude = Path(args.exclude_record).name if args.exclude_record else None
+    paths = sorted(Path(args.records_dir).glob("task-*.json")) + sorted(Path(args.records_dir).glob("launch-*.json"))
+    for path in paths:
+        if path.is_symlink() or path.name == exclude:
+            continue
+        try:
+            record = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not isinstance(record, dict) or record.get("schema_version") != 2 or record.get("host_id") != args.host_id:
+            continue
+        if record.get("lifecycle_state") in ENDED or args.name not in (record.get("tmux_session"), record.get("name")):
+            continue
+        if record.get("provider_task_id") == args.expect_task:
+            continue
+        action, reason = predecessor_candidate(record, ev, args, live[0], now)
+        document["rows"].append({
+            "record": path.name,
+            "record_digest": record_digest(record),
+            "provider": record.get("provider"),
+            "provider_task_id": record.get("provider_task_id"),
+            "provisional": not record.get("provider_task_id"),
+            "current": {"owner": record.get("control_owner"), "runtime": record.get("execution_runtime"),
+                        "state": record.get("lifecycle_state"), "restore_strategy": record.get("restore_strategy")},
+            "action": action,
+            "reason": reason,
+        })
+    return finish()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -272,7 +406,14 @@ def main() -> int:
     p.add_argument("--claude-sessions")
     p.add_argument("--codex")
     p.add_argument("--host-id", required=True)
+    p.add_argument("--protect")
     p.set_defaults(func=plan)
+    q = sub.add_parser("plan-predecessors")
+    for flag in ("--records-dir", "--panes", "--process", "--host-id", "--name", "--expect-task", "--provider"):
+        q.add_argument(flag, required=True)
+    for flag in ("--claude-sessions", "--codex", "--exclude-record", "--protect", "--now"):
+        q.add_argument(flag)
+    q.set_defaults(func=plan_predecessors)
     args = parser.parse_args()
     try:
         return args.func(args)
