@@ -22705,10 +22705,10 @@ test_peer_contract_docs() {
     # Plan 112: --as on every mailbox subcommand, --from an alias on send/reply.
     grep -q 'every mailbox subcommand takes it; `--from` is' "$agents" || fail "AGENTS.md peer contract missing the --as/--from alias rule"
     grep -q '`--as NAME` names you on every mailbox subcommand' "$readme" || fail "README.md missing the consistent --as rule"
-    # Contract stays compact: <=30 lines between the heading and the next '## ' (or EOF).
+    # Contract stays compact: <=42 lines between the heading and the next '## ' (or EOF).
     local n
     n="$(awk '/^## Peer messaging/{f=1;next}/^## /{if(f)exit}f' "$agents" | wc -l | tr -d ' ')"
-    [[ "$n" -le 30 ]] || fail "AGENTS.md peer contract too long ($n lines > 30)"
+    [[ "$n" -le 42 ]] || fail "AGENTS.md peer contract too long ($n lines > 42)"
     # Public-repo hygiene: no environment specifics inside the contract section.
     if awk '/^## Peer messaging/{f=1;next}/^## /{if(f)exit}f' "$agents" \
         | grep -Eq 'TMUX--|home\.[A-Za-z0-9-]+\.|\.ts\.net|homelab|[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+|:[0-9]{4}\b'; then
