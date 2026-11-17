@@ -28849,8 +28849,12 @@ test_predecessor_retire_closes_stale_claim_on_resume_launch() {
     mv "$dir/project" "$dir/pred-s1-project"
     _pred_write_record "$dir" "$name" "$_PRED_P"
     [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "fixture P must start open"
-    out="$(_pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-s1-project" -r "$_PRED_X" 2>&1)" || fail "launch failed: $out"
+    mkdir -p "$dir/tmp"
+    out="$(_pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync TMPDIR="$dir/tmp" -- start -d "$dir/pred-s1-project" -r "$_PRED_X" 2>&1)" || fail "launch failed: $out"
     assert_contains "$out" "detached session started"
+    # B1: the run leaves neither its lock dir nor its scratch dir (a full process table) behind.
+    [[ -z "$(find "$dir/meta" -maxdepth 1 -name '.predecessor-*' 2>/dev/null)" ]] || fail "lock leaked: $(ls -a "$dir/meta")"
+    [[ -z "$(find "$dir/tmp" -maxdepth 1 -name 'cctrl-predecessor.*' 2>/dev/null)" ]] || fail "scratch dir leaked: $(ls "$dir/tmp")"
     [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "P not closed: audit=$(cat "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl" 2>&1) tmux=$(grep -c . "$dir/tmux.log")"
     local pf
     pf="$(grep -l "\"provider_task_id\": \"$_PRED_P\"" "$dir"/meta/task-*.json | head -n 1)"
@@ -28862,6 +28866,89 @@ test_predecessor_retire_closes_stale_claim_on_resume_launch() {
     [[ "$(jq -rs --arg n "$name" '[.[] | select(.name == $n and .status == "applied" and .prior.state != null)] | length' "$audit")" == 1 ]] || fail "audit line missing: $(cat "$audit")"
     [[ "$(stat -f %Lp "$audit" 2>/dev/null || stat -c %a "$audit")" == 600 ]] || fail "audit log must be mode 600"
     echo "ok: a resume launch closes the stale claim on its name and audits it"
+}
+
+test_predecessor_retire_second_relaunch_is_not_skipped_by_a_stale_lock() {
+    local dir="$TMPDIR/pred-b1b" name="TMUX--ms--pred-b1b-project"
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-b1b-project"
+    mkdir -p "$dir/tmp"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync TMPDIR="$dir/tmp" -- start -d "$dir/pred-b1b-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "first launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "P not closed by the first relaunch"
+    _pred_write_record "$dir" "$name" "$_PRED_H"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync TMPDIR="$dir/tmp" -- start -d "$dir/pred-b1b-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "second launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_H")" == closed ]] || fail "second relaunch skipped by a leaked lock: $(cat "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl")"
+    ! grep -q 'another retire run holds' "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl" || fail "a lock was held between two sequential runs"
+    echo "ok: a second relaunch into the same name inside 10 minutes is not blocked by the first run's lock"
+}
+
+test_predecessor_retire_one_unparseable_record_does_not_disable_the_others() {
+    local dir="$TMPDIR/pred-sf3" name="TMUX--ms--pred-sf3-project" audit
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-sf3-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    printf '{ not json' > "$dir/meta/task-0000000000000000000000000000000000000000000000000000000000000bad.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-sf3-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    audit="$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "a bad record disabled the retire: $(cat "$audit" 2>&1)"
+    grep -q 'does not parse' "$audit" || fail "the unparseable record was not audited: $(cat "$audit")"
+    echo "ok: an unparseable record is skipped and audited; the others are still retired"
+}
+
+test_predecessor_retire_poll_zero_cannot_spin_forever() {
+    local dir="$TMPDIR/pred-n2" name="TMUX--ms--pred-n2-project" pid i
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-n2-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    printf 'not json' > "$dir/panes.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync CCTRL_PREDECESSOR_WAIT=2 CCTRL_PREDECESSOR_POLL=0 -- start -d "$dir/pred-n2-project" -r "$_PRED_X" >/dev/null 2>&1 &
+    pid=$!
+    for i in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+    if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true; fail "CCTRL_PREDECESSOR_POLL=0 spun past the wait"; fi
+    wait "$pid" 2>/dev/null || true
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "P closed without evidence"
+    echo "ok: CCTRL_PREDECESSOR_POLL=0 is clamped and the wait ends"
+}
+
+test_predecessor_retire_spares_a_record_live_in_a_pre_boot_history_snapshot() {
+    # R1: latest.json is post-boot with another live id; the pre-boot snapshot
+    # that lists H live is only in history. H must still be protected.
+    local dir="$TMPDIR/pred-s4h" name="TMUX--ms--pred-s4h-project" boot_epoch gen_pre gen_post
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s4h-project"
+    _pred_write_record "$dir" "$name" "$_PRED_H"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    mkdir -p "$dir/data/snapshots"
+    boot_epoch=$(( $(date +%s) - 3600 ))
+    gen_pre="$(date -u -r $(( boot_epoch - 600 )) +"%Y-%m-%dT%H:%M:%SZ")"
+    gen_post="$(date -u -r $(( boot_epoch + 600 )) +"%Y-%m-%dT%H:%M:%SZ")"
+    jq -n --arg host "$_SR_HOST_ID" --arg gen "$gen_pre" --arg h "$_PRED_H" \
+        '{schema_version:2, generated_at:$gen, host_id:$host, capture_quality:{status:"complete"},
+          tasks:[{provider:"claude", provider_task_id:$h, tmux_session:"x", live:true}]}' \
+        > "$dir/data/snapshots/$(date -u -r $(( boot_epoch - 600 )) +"%Y%m%dT%H%M%SZ").json"
+    jq -n --arg host "$_SR_HOST_ID" --arg gen "$gen_post" \
+        '{schema_version:2, generated_at:$gen, host_id:$host, capture_quality:{status:"complete"},
+          tasks:[{provider:"claude", provider_task_id:"d1b2c3d4-e5f6-7890-abcd-ef1234567899", tmux_session:"y", live:true}]}' \
+        > "$dir/data/snapshots/latest.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync CCTRL_FAKE_BOOTTIME="$boot_epoch" -- start -d "$dir/pred-s4h-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_H")" != closed ]] || fail "H, live only in a pre-boot history snapshot, was closed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "unprotected P was not closed"
+    grep -q 'protected: live in' "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl" || fail "no protected skip audited"
+    echo "ok: a record live only in a pre-boot history snapshot is protected when latest.json is post-boot"
+}
+
+test_predecessor_retire_bare_resume_launch_does_not_retire_from_the_poll() {
+    # SF1: at a bare -r picker the first session id is not the user's pick.
+    local dir="$TMPDIR/pred-sf1" name="TMUX--ms--pred-sf1-project" i
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-sf1-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync TMUX_FAKE_PANE_PID=101 \
+        CCTRL_RESUME_POLL_TIMEOUT=4 CCTRL_RESUME_POLL_INTERVAL=1 -- start -d "$dir/pred-sf1-project" -r >/dev/null 2>&1 || fail "launch failed"
+    for i in 1 2 3 4 5 6 7 8; do sleep 1; done
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "a bare -r launch retired a predecessor from the poll"
+    echo "ok: a bare -r launch never retires from the poll (T2 is off for resume launches)"
 }
 
 test_predecessor_retire_off_leaves_record_bytes_unchanged() {

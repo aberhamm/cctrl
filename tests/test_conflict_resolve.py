@@ -211,6 +211,16 @@ class ConflictResolveTests(unittest.TestCase):
             self.assertEqual(doc['by']['p-id']['action'], 'skip')
             self.assertIn('may be running', doc['by']['p-id']['reason'])
 
+    def test_predecessor_versioned_claude_binary_without_a_session_file_blocks_the_close(self):
+        # SF2: argv0 is not "claude", the file is missing, P is not on argv.
+        for command in ('/opt/app/share/claude/versions/2.1.280 --flag', '/x/ccd-cli/2.1.280-abc'):
+            panes, procs, claude = self.live_x([self.proc(700, 1, command)])
+            doc = self.predecessors([record('p-id', 'TMUX--n', '%9', '900')], panes, procs, claude=claude)
+            self.assertEqual(doc['by']['p-id']['action'], 'skip', command)
+        panes, procs, claude = self.live_x([self.proc(700, 1, 'grep claude notes.txt'), self.proc(701, 1, '/usr/bin/vim')])
+        doc = self.predecessors([record('p-id', 'TMUX--n', '%9', '900')], panes, procs, claude=claude)
+        self.assertEqual(doc['by']['p-id']['action'], 'close')
+
     def test_a_session_file_with_a_mismatched_procstart_never_marks_the_task_running(self):
         panes, procs, claude = self.live_x([self.proc(700, 1, 'bash')], claude={700: 'p-id'})
         doc = self.predecessors([record('p-id', 'TMUX--n', '%9', '900')], panes, procs, claude=claude,

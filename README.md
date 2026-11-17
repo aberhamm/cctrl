@@ -671,13 +671,18 @@ mentions it, no live session file names it, not live in a protected snapshot,
 not owned by the app, Codex needs App Server `confirmed-absence`). Provisional
 `launch-*.json` receipts count once they are past the 300 s start-up grace.
 Resume launches (`start -r`, `@name -r`, restore replay, realign) trigger it
-right after the health check; fresh and bare `-r` launches trigger it once the
-conversation id is learned. It runs in the background and never changes the
+right after the health check. A fresh Claude launch (no resume flag) triggers it
+once the conversation id is learned, the id update is verified and the pane still
+names it. A bare `-r`, `-c` or `--resume=` launch, and any fresh Codex launch, does
+not trigger it (a picker's first session id is not the user's pick). It runs in the background and never changes the
 launch's exit code. Every row, applied or skipped, appends a line to
 `$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl` (mode 600, ids and names
 only). `CCTRL_PREDECESSOR_CLOSE=off` disables it (`sync` waits, for tests);
-`CCTRL_PREDECESSOR_WAIT` (default 90 s) and `CCTRL_PREDECESSOR_POLL` (3 s) bound
-the wait for proof. `cctrl task predecessor-undo [--since ISO] [RECORD...]
+`CCTRL_PREDECESSOR_WAIT` (default 90 s) and `CCTRL_PREDECESSOR_POLL` (3 s, minimum 1)
+bound the wait for proof. A task or launch file that does not parse is skipped and
+audited on its own; the other records are still retired. Any process whose
+executable path looks like Claude (`.../claude/versions/<v>`, `ccd-cli`, ...) and
+has no usable session file blocks the close. `cctrl task predecessor-undo [--since ISO] [RECORD...]
 [--apply] [--json]` reopens retired task records (dry run by default; refuses
 a record something else touched since; provisional receipts are not
 undoable). Fallback for one record: `cctrl start -d <cwd> -r <id>`. The

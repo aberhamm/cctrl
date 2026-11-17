@@ -7062,11 +7062,21 @@ _launch_detached() {
                     local _rec_created
                     _rec_created="$(_session_metadata_field "$session_name" created_at 2>/dev/null)"
                     [[ "$_rec_created" == "$_poll_created_at" ]] || break
-                    _session_update_metadata_field "$session_name" conversation_id "$_sid" 2>/dev/null
+                    local _id_written=0
+                    _session_update_metadata_field "$session_name" conversation_id "$_sid" 2>/dev/null && _id_written=1
                     [[ -n "$_tpath" ]] && _session_update_metadata_field "$session_name" transcript_path "$_tpath" 2>/dev/null
                     # D10a T2: the conversation id is now proven; retire the
                     # other open claims on this name (never fails the poll).
-                    if [[ "$detach_agent" == claude ]]; then
+                    # Only a launch with no resume flag: a --resume/-r/-c
+                    # launch may still be at its picker, where the first
+                    # session id Claude writes is not the conversation the
+                    # user ends up picking, so T2 stays off for them (a
+                    # resume by id is covered by T1). Fail closed unless the
+                    # id update succeeded and reads back, and the pane still
+                    # names the same session.
+                    if [[ "$detach_agent" == claude && -z "$resuming" && "$_id_written" == 1 \
+                          && "$(_session_metadata_field "$session_name" conversation_id 2>/dev/null)" == "$_sid" \
+                          && "$(_session_id "$session_name" 2>/dev/null)" == "$_sid" ]]; then
                         _launch_retire_predecessors "$session_name" "$_sid" "$detach_agent" "${CCTRL_LAST_LAUNCH_RECORD:-}" || true
                     fi
                     break
@@ -18221,7 +18231,7 @@ _predecessor_audit() { # NAME TASK ROW_JSON STATUS [REASON_OVERRIDE]
     [[ -n "$dir" ]] || return 0
     _cctrl_data_mkdir "$dir" 700 2>/dev/null || return 0
     file="$dir/predecessor-retire.jsonl"
-    [[ -f "$file" ]] || { : > "$file" && chmod 600 "$file"; } 2>/dev/null || return 0
+    [[ -f "$file" ]] || { ( umask 077; : > "$file" ) && chmod 600 "$file"; } 2>/dev/null || return 0
     jq -nc --arg at "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" --arg name "$1" --arg task "$2" --argjson row "$3" \
         --arg status "$4" --arg why "${5:-}" '
         {at:$at, name:$name, expect_task:$task, record:($row.record // null), provider_task_id:($row.provider_task_id // null),
@@ -18230,22 +18240,30 @@ _predecessor_audit() { # NAME TASK ROW_JSON STATUS [REASON_OVERRIDE]
 }
 
 # Open records on this host claiming NAME that are not TASK's: "record<TAB>provider" lines.
-_predecessor_candidates() { # NAME TASK HOST_ID EXCLUDE_BASENAME
-    local out
-    out="$(find "$SESSION_METADATA_DIR" -maxdepth 1 -type f \( -name 'task-*.json' -o -name 'launch-*.json' \) \
-        -exec jq -r --arg n "$1" --arg x "$2" --arg h "$3" '
-        select(type == "object" and .schema_version == 2 and .host_id == $h
-               and ((.lifecycle_state // "") as $s | (["closed","archived","released"] | index($s)) == null)
-               and (.tmux_session == $n or .name == $n) and ((.provider_task_id // "") != $x))
-        | [input_filename, (.provider // "")] | @tsv' {} + 2>/dev/null)" || out=""
-    local line
-    while IFS= read -r line; do
-        [[ -n "$line" && "${line%%$'\t'*}" != *"/$4" ]] || continue
-        printf '%s\t%s\n' "$(basename "${line%%$'\t'*}")" "${line#*$'\t'}"
-    done <<< "$out"
+# One jq per file: a record that does not parse is skipped on its own (and, with
+# AUDIT=audit, audited) and never hides the others.
+_predecessor_candidates() { # NAME TASK HOST_ID EXCLUDE_BASENAME [audit]
+    local f line
+    for f in "$SESSION_METADATA_DIR"/task-*.json "$SESSION_METADATA_DIR"/launch-*.json; do
+        [[ -f "$f" && ! -L "$f" && "${f##*/}" != "$4" ]] || continue
+        if ! line="$(jq -r --arg n "$1" --arg x "$2" --arg h "$3" '
+            select(type == "object" and .schema_version == 2 and .host_id == $h
+                   and ((.lifecycle_state // "") as $s | (["closed","archived","released"] | index($s)) == null)
+                   and (.tmux_session == $n or .name == $n) and ((.provider_task_id // "") != $x))
+            | [(.provider // "")] | @tsv' "$f" 2>/dev/null)"; then
+            [[ "${5:-}" != audit ]] || _predecessor_audit "$1" "$2" "$(jq -nc --arg r "${f##*/}" '{record:$r}')" skipped "skipped: record ${f##*/} does not parse"
+            continue
+        fi
+        [[ -n "$line" ]] || continue
+        printf '%s\t%s\n' "${f##*/}" "$line"
+    done
 }
 
-_predecessor_retire_run() { # NAME TASK PROVIDER EXCLUDE_RECORD HOST_ID  (runs in a subshell)
+_predecessor_retire_run() ( # NAME TASK PROVIDER EXCLUDE_RECORD HOST_ID
+    # Subshell body (as _task_record_close_provisional_file): the EXIT trap
+    # below fires when this call ends and still sees $lock and $scratch. In a
+    # plain function they were out of scope by then and, under set -u, the
+    # trap died and leaked the lock and a scratch dir holding a process table.
     local name="$1" task="$2" provider="$3" exclude="$4" host_id="$5"
     local lock scratch="" digest_name waited=0 wait_max poll plan="" fresh="" rc row record digest action reason st applied_reason
     digest_name="$(printf '%s' "$name" | shasum -a 256 | cut -c1-64)"
@@ -18255,14 +18273,17 @@ _predecessor_retire_run() { # NAME TASK PROVIDER EXCLUDE_RECORD HOST_ID  (runs i
         lock_mtime="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || echo 0)"
         now_epoch="$(date +%s)"
         if (( now_epoch - lock_mtime > 600 )); then
-            rm -rf "$lock"; mkdir "$lock" 2>/dev/null || { _predecessor_audit "$name" "$task" '{}' skipped "skipped: another retire run holds $name"; return 0; }
+            # Atomic steal: only one stealer wins the rename, none can remove
+            # another's fresh lock.
+            mv "$lock" "$lock.stale.$$" 2>/dev/null && rm -rf "$lock.stale.$$"
+            mkdir "$lock" 2>/dev/null || { _predecessor_audit "$name" "$task" '{}' skipped "skipped: another retire run holds $name"; return 0; }
         else
             _predecessor_audit "$name" "$task" '{}' skipped "skipped: another retire run holds $name"
             return 0
         fi
     fi
-    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-predecessor.XXXXXX")" || { rmdir "$lock" 2>/dev/null; return 0; }
-    trap 'rm -rf "$scratch"; rm -rf "$lock"' EXIT
+    trap '[[ -z "$scratch" ]] || rm -rf "$scratch"; rm -rf "$lock"' EXIT
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/cctrl-predecessor.XXXXXX")" || { scratch=""; return 0; }
     _tmux_check_unambiguous "$name" retire || { _predecessor_audit "$name" "$task" '{}' skipped "skipped: $name exists on several tmux servers"; return 0; }
     rc=0; _predecessor_protect_json "$scratch/protect.json" || rc=$?
     if (( rc != 0 )); then
@@ -18270,8 +18291,13 @@ _predecessor_retire_run() { # NAME TASK PROVIDER EXCLUDE_RECORD HOST_ID  (runs i
         return 0
     fi
     wait_max="${CCTRL_PREDECESSOR_WAIT:-90}"; poll="${CCTRL_PREDECESSOR_POLL:-3}"
+    # Integers only (10# keeps 08 decimal); a poll of 0 would spin forever.
+    if [[ "$wait_max" =~ ^[0-9]+$ ]]; then wait_max=$((10#$wait_max)); else wait_max=90; fi
+    if [[ "$poll" =~ ^[0-9]+$ ]] && (( 10#$poll >= 1 )); then poll=$((10#$poll)); else poll=3; fi
     local codex_mode=nocodex
-    if _predecessor_candidates "$name" "$task" "$host_id" "$exclude" | grep -q $'\tcodex$'; then
+    local candidates
+    candidates="$(_predecessor_candidates "$name" "$task" "$host_id" "$exclude" audit)"
+    if grep -q $'\tcodex$' <<< "$candidates"; then
         codex_mode=codex
     fi
     local -a plan_args
@@ -18311,7 +18337,7 @@ _predecessor_retire_run() { # NAME TASK PROVIDER EXCLUDE_RECORD HOST_ID  (runs i
         _predecessor_audit "$name" "$task" "$row" "$st" "$applied_reason"
     done < <(jq -c '.rows[]' <<< "$plan")
     return 0
-}
+)
 
 # Hook for a launch of TASK into tmux NAME. Never changes the launch's result.
 _launch_retire_predecessors() { # NAME TASK PROVIDER [EXCLUDE_RECORD_PATH]
@@ -18321,7 +18347,9 @@ _launch_retire_predecessors() { # NAME TASK PROVIDER [EXCLUDE_RECORD_PATH]
     [[ "$mode" != off && -n "$name" && -n "$task" && -n "$provider" ]] || return 0
     [[ "${_CCTRL_P_MIGRATING:-0}" != 1 ]] || return 0
     host_id="$(_cctrl_host_id_read 2>/dev/null)" || return 0
-    [[ -n "$(_predecessor_candidates "$name" "$task" "$host_id" "$exclude" | head -n 1)" ]] || return 0
+    local first_candidate
+    first_candidate="$(_predecessor_candidates "$name" "$task" "$host_id" "$exclude")"
+    [[ -n "$first_candidate" ]] || return 0
     if [[ "$mode" == sync ]]; then
         ( _predecessor_retire_run "$name" "$task" "$provider" "$exclude" "$host_id" ) || true
     else
