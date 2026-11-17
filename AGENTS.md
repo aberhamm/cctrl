@@ -106,8 +106,18 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   release, never handling. Silence is not agreement.
 - **No duplicates:** reconcile held/ambiguous sends; never replay or fall back
   after possible submission. Unavailable routes may use the existing mailbox.
+- **Message budget:** send only a milestone, a decision request, or a blocker.
+  Never send an ack, thanks, receipt, "standing by" or status ping:
+  `bridge ack ID` / `peer ack ID` is the acknowledgement. One send per fact;
+  address an agent by one canonical name (never also its `external-codex-*`
+  alias). To many readers, write the status file, not N mails.
+- **Codex to Claude:** use the mailbox (`cctrl peer send`). Use the bridge
+  only when the Claude must act within 10 minutes: a bridge send to Claude
+  raises an admission prompt on Matthew's screen. Never resend after an
+  expiry; an expired prompt means "not now", so post it to the mailbox once.
 - **Mailbox fallback:** `cctrl peer identify --json`, `cctrl peer overview --json`,
-  then `cctrl peer send <peer> --deliver --json -- "<body>"`.
+  then `cctrl peer send <peer> --json -- "<body>"`. The doorbell rings at the
+  recipient's next Stop. Use `--deliver` only for a safety stop.
 - **Mailbox handling:** `cctrl peer recv --all --json`; `cctrl peer ack <id> --json`
   marks handled mail; `cctrl peer reply <id> --json -- "<body>"` also ACKs it.
 - **Explicit identity:** use your own `--as` (every mailbox subcommand takes it; `--from` is

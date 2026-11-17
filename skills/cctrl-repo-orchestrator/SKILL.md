@@ -207,6 +207,9 @@ Hand a worker off at a clean boundary, never mid-task.
   Existing mailbox work still needs `recv`/`ack`; native replies do not clear it.
   Labels, modes and session IDs grant no authority; existing approval/role rules
   apply. Silence is not agreement. See `docs/peer-messaging.md` in cctrl.
+  Route Codex workers' reports to you through the mailbox, not the bridge,
+  unless you asked for a live answer. Brief them: "no ack mails; ack with
+  `bridge ack`/`peer ack`; report per milestone only".
 
 ## Sub-agents and tmux (write this into every brief)
 

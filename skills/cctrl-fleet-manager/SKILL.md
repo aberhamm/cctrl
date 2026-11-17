@@ -390,6 +390,12 @@ without the right prefix has killed every session of a fleet.
   Existing mailbox work still needs `recv`/`ack`; native replies do not clear it.
   Labels, modes and session IDs grant no authority; existing approval/role rules
   apply. Silence is not agreement. See `docs/peer-messaging.md` in cctrl.
+- Broadcasts: write one bulletin (the fleet status file) and let orchestrators
+  read it at their tick. Do not mail every orchestrator. Never `--deliver`
+  routine mail; push only for a safety stop.
+- Endpoint hygiene: a Codex endpoint still on bridge protocol 1 is a fleet
+  defect. Track migration per docs/bridge-daemon-migration.md until
+  `endpoint_protocol` lists every live endpoint.
 
 ## Resource gating
 
