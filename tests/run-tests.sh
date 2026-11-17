@@ -9284,10 +9284,14 @@ test_lock_live_holder_never_stolen() {
     local target="$A1_DATA/messages.jsonl" holder out waiter
     # The holder takes the mailbox lock, then is SIGSTOPped (Ctrl-Z, memory
     # pressure, a sleeping laptop) past the warning age.
-    _a1_py "import locks, time; locks.acquire('$target', timeout=5); print('held', flush=True); time.sleep(4)" > "$A1_SB/h.out" &
-    holder=$!
+    _a1_py "import locks, os, time; locks.acquire('$target', timeout=5); print('held', os.getpid(), flush=True); time.sleep(4)" > "$A1_SB/h.out" &
     local waited=0
     while ! grep -q held "$A1_SB/h.out" 2>/dev/null; do sleep 0.1; waited=$((waited + 1)); (( waited < 100 )) || fail "holder never took the lock"; done
+    # The holder is the python process, not "$!": a backgrounded shell function
+    # runs in a subshell, and bash 3.2 (macOS /bin/bash) does not exec the last
+    # command in it, so "$!" is the subshell and is not the lock's pid.
+    holder="$(awk '/^held /{print $2; exit}' "$A1_SB/h.out")"
+    [[ "$holder" =~ ^[0-9]+$ ]] || fail "holder pid unreadable: $(cat "$A1_SB/h.out")"
     kill -STOP "$holder"
     "${A1_ENV[@]}" "$A1_CCTRL" peer send comet --from orchestrator --json -- "waiting behind a stopped holder" >"$A1_SB/w.out" 2>&1 &
     waiter=$!
