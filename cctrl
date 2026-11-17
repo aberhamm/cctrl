@@ -20618,7 +20618,7 @@ _restore_lock_refusal() { # json: another run holds the lock; print why (exit co
     local json="$1" dir holder_pid holder_run holder_created
     dir="$(_restore_lock_dir)"
     holder_pid="$(cat "$dir/pid" 2>/dev/null || true)"; holder_run="$(cat "$dir/run_id" 2>/dev/null || true)"
-    holder_created="$(cat "$dir/created" 2>/dev/null || true)"
+    holder_created="$(_restore_lock_created "$dir")"
     if [[ "$json" == true ]]; then
         _restore_refusal_json 75 "another restore is running" \
             "$(jq -n --arg pid "$holder_pid" --arg run "$holder_run" --arg created "$holder_created" '{holder:{pid:$pid, run_id:$run, created:$created}}')" \

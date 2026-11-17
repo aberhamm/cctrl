@@ -20017,6 +20017,13 @@ test_restore_lock_held_exit_75() {
     kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
     [[ "$rc" -eq 75 && ! -s "$dir/launch.log" ]] || fail "a held lock must give 75 and launch nothing (rc=$rc)"
     jq -e '.outcome == "locked" and .exit_code == 75 and .holder.run_id == "other-run"' <<< "$out" >/dev/null || fail "locked document wrong: $out"
+    # A pid-only lock (no created file): the refusal shows the same created time the lock checks use (dir mtime), not empty.
+    mkdir -p "$dir/data/restore/.restore.lock"
+    sleep 30 & holder=$!
+    printf '%s\n' "$holder" > "$dir/data/restore/.restore.lock/pid"; rm -f "$dir/data/restore/.restore.lock/created"
+    rc=0; out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
+    kill "$holder" 2>/dev/null || true; wait "$holder" 2>/dev/null || true
+    jq -e '.exit_code == 75 and (.holder.created | tostring | test("^[0-9]+$"))' <<< "$out" >/dev/null || fail "pid-only lock refusal shows no created time: $out"
     # A dead pid is a stale lock: stolen, and the run proceeds.
     rc=0; out="$(_restore_boot_run "$dir" --json 2>/dev/null)" || rc=$?
     [[ "$rc" -eq 0 && "$(_restore_spawn_count "$dir")" -eq 4 ]] || fail "a stale lock must be taken over (rc=$rc): $out"
