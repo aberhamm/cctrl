@@ -63,6 +63,25 @@ ANTHROPIC_PRICING = {
 }
 
 
+# Claude Fable rows (USD per 1M tokens), exact ids only: no prefix, so unlisted
+# Fable ids (claude-fable-5, claude-fable-5-9, ...) stay on the counted fallback.
+# Optional context suffix "[1m]" is accepted. cache_write is the 5-minute rate
+# (1.25x input; the 1-hour rate is $16 on 5.2 and $20 on 5.1, not modelled).
+# Source: Anthropic claude-api skill, shared/models.md + shared/model-migration.md
+# (Anthropic first-party API rates), read 2026-11-17.
+ANTHROPIC_FABLE_PRICING = {
+    "claude-fable-5-2": {"input": 8.0, "output": 40.0, "cache_write": 10.0, "cache_read": 0.20},
+    "claude-fable-5-1": {"input": 10.0, "output": 50.0, "cache_write": 12.5, "cache_read": 0.25},
+}
+
+
+def fable_rates(model_name):
+    m = (model_name or "").lower()
+    if m.endswith("[1m]"):
+        m = m[:-4]
+    return ANTHROPIC_FABLE_PRICING.get(m)
+
+
 # Precedence for Codex/OpenAI rates (first hit wins):
 #   1. OPENAI_PRICING below (official OpenAI pricing page, prefix match).
 #   2. share/litellm-openai-prices.json (LiteLLM public list, exact model
@@ -277,6 +296,16 @@ def estimate_cost_ex(agent, model, usage):
             + usage["output"] * rates["output"]
         ) / 1_000_000
         return cost, source == "fallback"
+
+    fr = fable_rates(model)
+    if fr:
+        cost = (
+            usage["input"] * fr["input"]
+            + usage["output"] * fr["output"]
+            + usage["cache_write"] * fr["cache_write"]
+            + usage["cache_read"] * fr["cache_read"]
+        ) / 1_000_000
+        return cost, False
 
     m = (model or "").lower()
     is_fallback = not any(k in m for k in ("opus", "sonnet", "haiku"))

@@ -119,6 +119,27 @@ class PriceTables(unittest.TestCase):
             rates, src = u.openai_rates_and_source(model, 1000)
             self.assertEqual((src, rates["input"], rates["output"]), ("official", inp, out), model)
 
+    def test_fable_official_rates_and_unlisted_fallback(self):
+        from datetime import datetime, timezone
+        usage = {"input": 1_000_000, "output": 1_000_000, "cache_write": 1_000_000, "cache_read": 1_000_000, "reasoning": 0}
+        for model, total in [
+            ("claude-fable-5-2", 8.0 + 40.0 + 10.0 + 0.20),
+            ("claude-fable-5-2[1m]", 8.0 + 40.0 + 10.0 + 0.20),
+            ("claude-fable-5-1", 10.0 + 50.0 + 12.5 + 0.25),
+            ("claude-fable-5-1[1m]", 10.0 + 50.0 + 12.5 + 0.25),
+        ]:
+            cost, fb = u.estimate_cost_ex("claude", model, usage)
+            self.assertFalse(fb, model)
+            self.assertAlmostEqual(cost, total, places=6, msg=model)
+        for model in ("claude-fable-5-9", "claude-fable-5-20", "claude-fable-5-2x"):
+            self.assertTrue(u.estimate_cost_ex("claude", model, usage)[1], model)
+        agg = u.Aggregates("")
+        ts = datetime.now(timezone.utc)
+        for model in ("claude-fable-5-2", "claude-fable-5-1", "claude-fable-5-9"):
+            agg.record({"agent": "claude", "ts": ts, "model": model, "usage": usage, "project": "p", "session_id": "s"})
+        self.assertEqual(list(agg.fallback["models"]), ["claude/claude-fable-5-9"])
+        self.assertEqual(agg.fallback["turns"], 1)
+
     def test_fallback_skips_zero_token_and_synthetic(self):
         agg = u.Aggregates("")
         from datetime import datetime, timezone
