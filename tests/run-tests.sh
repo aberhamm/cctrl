@@ -7,6 +7,9 @@ set -euo pipefail
 # follow-up: a bare `LANG=`/`LC_ALL=` environment failed here).
 export LC_ALL=en_US.UTF-8
 export LANG=en_US.UTF-8
+# D10a: launches never spawn a real predecessor-retire background job; the
+# tests that exercise it set CCTRL_PREDECESSOR_CLOSE=sync explicitly.
+export CCTRL_PREDECESSOR_CLOSE=off
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # >>> test runner (plan 105 P3): per-test timing, filter, --list. Keep this
@@ -28793,6 +28796,172 @@ test_self_install_links_state_to_primary_checkout() {
     [[ "$before" == "$after" ]] || fail "refusal moved current: $before -> $after"
     git -C "$wt" checkout -q -- cctrl
     echo "ok: self-install links state at the primary checkout from a worktree, refuses when unresolved"
+}
+
+# ── D10a: predecessor retire ─────────────────────────────────────────
+_PRED_X="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+_PRED_P="b1b2c3d4-e5f6-7890-abcd-ef1234567891"
+_PRED_H="c1b2c3d4-e5f6-7890-abcd-ef1234567892"
+
+_pred_fixture() {
+    # args: dir name. Fixture-only: a private metadata/data dir, a fake tmux,
+    # and evidence seam files proving NAME runs _PRED_X (pane %0, pid 100,
+    # claude pid 101 with a session file). Nothing touches real records.
+    local dir="$1" name="$2"
+    mkdir -p "$dir/bin" "$dir/meta" "$dir/data" "$dir/claude-sessions" "$dir/project"
+    make_fake_tmux "$dir/bin/tmux"
+    printf '%s\n' "$_SR_HOST_ID" > "$dir/host-id"
+    printf '%s\n' '{"status":"available","panes":[{"session_name":"'"$name"'","pane_id":"%0","pane_pid":"100"}]}' > "$dir/panes.json"
+    printf '%s\n' '{"status":"available","source_cursor":"c","processes":[{"pid":100,"ppid":1,"started":"Wed Sep 23 17:40:22 2026","command":"bash wrapper"},{"pid":101,"ppid":100,"started":"Wed Sep 23 17:40:22 2026","command":"claude --resume '"$_PRED_X"'"}]}' > "$dir/process.json"
+    printf '%s\n' '{"pid":101,"sessionId":"'"$_PRED_X"'"}' > "$dir/claude-sessions/101.json"
+    printf '{}\n' > "$dir/codex.json"
+    : > "$dir/tmux.log"
+}
+
+_pred_write_record() { # dir name conversation_id
+    CCTRL_SESSION_METADATA_DIR="$1/meta" CCTRL_HOST_ID_FILE="$1/host-id" CCTRL_DATA_DIR="$1/data" \
+        cctrl_source_eval "_session_write_metadata $2 /tmp @pred @pred @pred p '' cmd '' claude $3" \
+        || fail "fixture record could not be written"
+}
+
+_pred_cctrl() { # dir env-assignments... -- cctrl args
+    local dir="$1"; shift
+    local -a envs=()
+    while [[ "$1" != -- ]]; do envs+=("$1"); shift; done
+    shift
+    env PATH="$dir/bin:$PATH" TMUX_LOG="$dir/tmux.log" CCTRL_AGENT=claude CCTRL_EMIT_SESSION=1 CCTRL_RESUME_POLL_TIMEOUT=0 \
+        CCTRL_SESSION_METADATA_DIR="$dir/meta" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_DATA_DIR="$dir/data" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$dir/claude-sessions" CCTRL_RESOLVE_PANES_FILE="$dir/panes.json" \
+        CCTRL_RESOLVE_PROCESS_FILE="$dir/process.json" CCTRL_RESOLVE_CODEX_EVIDENCE_FILE="$dir/codex.json" \
+        CCTRL_NO_HEALTH_CHECK=1 CCTRL_PREDECESSOR_WAIT=0 ${envs[@]+"${envs[@]}"} "$ROOT/cctrl" "$@"
+}
+
+_pred_state_of() { # dir conversation_id -> lifecycle_state
+    local f
+    f="$(grep -l "\"provider_task_id\": \"$2\"" "$1"/meta/task-*.json 2>/dev/null | head -n 1)"
+    [[ -n "$f" ]] || { echo "missing"; return 0; }
+    jq -r '.lifecycle_state' "$f"
+}
+
+test_predecessor_retire_closes_stale_claim_on_resume_launch() {
+    local dir="$TMPDIR/pred-s1" name="TMUX--ms--pred-s1-project" out audit
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s1-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "fixture P must start open"
+    out="$(_pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-s1-project" -r "$_PRED_X" 2>&1)" || fail "launch failed: $out"
+    assert_contains "$out" "detached session started"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "P not closed: audit=$(cat "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl" 2>&1) tmux=$(grep -c . "$dir/tmux.log")"
+    local pf
+    pf="$(grep -l "\"provider_task_id\": \"$_PRED_P\"" "$dir"/meta/task-*.json | head -n 1)"
+    [[ "$(jq -r '[.ownership_evidence[] | select(.source == "cctrl-predecessor")] | length' "$pf")" == 1 ]] || fail "no cctrl-predecessor evidence is not cctrl-predecessor: $(jq -c '[.ownership_evidence[] | [.source,.observed_at]]' "$pf")"
+    assert_contains "$(jq -r '.ownership_evidence[] | select(.source == "cctrl-predecessor") | .reason' "$pf")" "superseded-by $_PRED_X (relaunch into $name)"
+    [[ "$(_pred_state_of "$dir" "$_PRED_X")" != closed ]] || fail "X must stay open"
+    audit="$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl"
+    [[ -f "$audit" ]] || fail "no audit log at $audit"
+    [[ "$(jq -rs --arg n "$name" '[.[] | select(.name == $n and .status == "applied" and .prior.state != null)] | length' "$audit")" == 1 ]] || fail "audit line missing: $(cat "$audit")"
+    [[ "$(stat -f %Lp "$audit" 2>/dev/null || stat -c %a "$audit")" == 600 ]] || fail "audit log must be mode 600"
+    echo "ok: a resume launch closes the stale claim on its name and audits it"
+}
+
+test_predecessor_retire_off_leaves_record_bytes_unchanged() {
+    local dir="$TMPDIR/pred-s2" name="TMUX--ms--pred-s2-project" before after pf
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s2-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    pf="$(grep -l "\"provider_task_id\": \"$_PRED_P\"" "$dir"/meta/task-*.json | head -n 1)"
+    before="$(shasum "$pf")"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=off -- start -d "$dir/pred-s2-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    after="$(shasum "$pf")"
+    [[ "$before" == "$after" ]] || fail "CCTRL_PREDECESSOR_CLOSE=off changed P"
+    echo "ok: CCTRL_PREDECESSOR_CLOSE=off leaves the predecessor untouched"
+}
+
+test_predecessor_retire_is_backgrounded_and_never_changes_the_launch_result() {
+    local body
+    body="$(awk '/^_launch_retire_predecessors\(\)/,/^}/' "$ROOT/cctrl")"
+    assert_contains "$body" '</dev/null >/dev/null 2>&1 &'
+    assert_contains "$body" 'disown'
+    assert_contains "$body" 'return 0'
+    local hook
+    hook="$(grep -n '_launch_retire_predecessors "\$session_name"' "$ROOT/cctrl")"
+    assert_contains "$hook" '|| true'
+    # a failing retire cannot fail the launch: sync mode with unusable evidence
+    local dir="$TMPDIR/pred-s3" name="TMUX--ms--pred-s3-project" rc=0
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s3-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    printf 'not json' > "$dir/panes.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-s3-project" -r "$_PRED_X" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "launch exit changed by a failing retire: $rc"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "P closed without evidence"
+    echo "ok: the retire hook is backgrounded and cannot change the launch exit code"
+}
+
+test_predecessor_retire_never_closes_a_protected_record() {
+    local dir="$TMPDIR/pred-s4" name="TMUX--ms--pred-s4-project"
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s4-project"
+    _pred_write_record "$dir" "$name" "$_PRED_H"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    mkdir -p "$dir/data/snapshots"
+    local gen boot_epoch
+    boot_epoch=$(( $(date +%s) - 3600 ))
+    gen="$(date -u -r $(( boot_epoch - 600 )) +"%Y-%m-%dT%H:%M:%SZ")"
+    jq -n --arg host "$_SR_HOST_ID" --arg gen "$gen" --arg h "$_PRED_H" \
+        '{schema_version:2, generated_at:$gen, host_id:$host, capture_quality:{status:"complete"},
+          tasks:[{provider:"claude", provider_task_id:$h, tmux_session:"x", live:true}]}' > "$dir/data/snapshots/latest.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync CCTRL_FAKE_BOOTTIME="$boot_epoch" -- start -d "$dir/pred-s4-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_H")" != closed ]] || fail "H, live in the pre-boot snapshot, was closed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" == closed ]] || fail "unprotected P was not closed"
+    local audit="$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl"
+    grep -q 'protected: live in latest.json' "$audit" || fail "no protected skip in the audit: $(cat "$audit")"
+    echo "ok: a record live in the pre-boot snapshot is never closed; an unprotected one is"
+}
+
+test_predecessor_retire_digest_guard_rejects_a_changed_record() {
+    local dir="$TMPDIR/pred-s6" name="TMUX--ms--pred-s6-project" pf before
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s6-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    pf="$(grep -l "\"provider_task_id\": \"$_PRED_P\"" "$dir"/meta/task-*.json | head -n 1)"
+    cat > "$dir/mutate.sh" <<'SH'
+#!/usr/bin/env bash
+for f in "$1"/task-*.json; do
+    jq '.purpose = "mutated between plan and apply"' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
+SH
+    chmod +x "$dir/mutate.sh"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync CCTRL_PREDECESSOR_TEST_MUTATE_HOOK="$dir/mutate.sh" -- start -d "$dir/pred-s6-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "P closed despite a changed digest"
+    grep -q '"status":"changed"' "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl" || fail "audit lacks status changed"
+    echo "ok: the digest guard refuses a record that changed between plan and write"
+}
+
+test_predecessor_retire_skips_when_snapshot_evidence_is_unreadable() {
+    local dir="$TMPDIR/pred-s7" name="TMUX--ms--pred-s7-project"
+    _pred_fixture "$dir" "$name"
+    mv "$dir/project" "$dir/pred-s7-project"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    mkdir -p "$dir/data/snapshots"
+    printf 'garbage' > "$dir/data/snapshots/latest.json"
+    _pred_cctrl "$dir" CCTRL_PREDECESSOR_CLOSE=sync -- start -d "$dir/pred-s7-project" -r "$_PRED_X" >/dev/null 2>&1 || fail "launch failed"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "P closed with unreadable snapshot evidence"
+    grep -q 'snapshot evidence unreadable' "$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl" || fail "no skip reason audited"
+    echo "ok: unreadable snapshot evidence skips the whole run"
+}
+
+test_predecessor_retire_skips_during_a_data_migration() {
+    local dir="$TMPDIR/pred-s8" name="TMUX--ms--pred-s8-project" rc=0
+    _pred_fixture "$dir" "$name"
+    _pred_write_record "$dir" "$name" "$_PRED_P"
+    CCTRL_SESSION_METADATA_DIR="$dir/meta" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_DATA_DIR="$dir/data" \
+        CCTRL_PREDECESSOR_CLOSE=sync CCTRL_RESOLVE_PANES_FILE="$dir/panes.json" CCTRL_RESOLVE_PROCESS_FILE="$dir/process.json" \
+        CCTRL_CLAUDE_SESSIONS_DIR="$dir/claude-sessions" CCTRL_PREDECESSOR_WAIT=0 \
+        cctrl_source_eval "_CCTRL_P_MIGRATING=1; _launch_retire_predecessors $name $_PRED_X claude ''" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "retire during migration must return 0, got $rc"
+    [[ "$(_pred_state_of "$dir" "$_PRED_P")" != closed ]] || fail "P closed during a migration"
+    echo "ok: the retire is skipped while a data migration is in progress"
 }
 
 # Groups as data (plan 105 P4): `_group_tests <group>` prints the tests a
