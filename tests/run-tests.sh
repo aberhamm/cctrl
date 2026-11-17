@@ -19662,6 +19662,40 @@ SH
     echo "ok: lock staleness is judged by the holder's recorded max age"
 }
 
+test_restore_lock_max_age_capped_and_createdless_lock_consistent() {
+    # N4-1: a recorded max age (a CCTRL_RESTORE_TIMEOUT=0 holder writes a year, or a
+    # digit string that wraps bash) is clamped to a day. N4-2: a lock dir with a live pid
+    # but no created file is judged the same by status (live), busy and acquire (held),
+    # by the dir mtime, not "unfinished" in one place and held in the others.
+    local dir="$TMPDIR/restore-n4" old
+    mkdir -p "$dir/data/restore"
+    old="$(date -v-2H +%Y%m%d%H%M 2>/dev/null || date -d '2 hours ago' +%Y%m%d%H%M)"
+    (
+        CCTRL_NO_MAIN=1 source "$ROOT/cctrl"
+        export CCTRL_DATA_DIR="$dir/data"
+        lock="$dir/data/restore/.restore.lock"
+        mkdir -p "$lock"
+        for pair in "31536000:86400" "99999999999999999999:86400" "86400:86400" "4000:4000" "0:3300" "x:3300"; do
+            printf '%s\n' "${pair%%:*}" > "$lock/max_age"
+            [[ "$(_restore_lock_holder_max_age "$lock")" == "${pair##*:}" ]] || { echo "max_age ${pair%%:*} -> $(_restore_lock_holder_max_age "$lock"), want ${pair##*:}"; exit 3; }
+        done
+        rm -f "$lock/max_age"
+        [[ "$(_restore_lock_holder_max_age "$lock")" == 3300 ]] || { echo "missing max_age is not 3300"; exit 3; }
+        # pid but no created, fresh dir mtime: live and busy and not stealable.
+        printf '%s\n' "$$" > "$lock/pid"
+        _restore_lock_live "$lock" || { echo "createdless fresh lock not live"; exit 4; }
+        _restore_busy || { echo "createdless fresh lock not busy"; exit 5; }
+        _restore_lock_acquire r2 3300 && { echo "createdless fresh lock was taken"; exit 6; }
+        # pid but no created, dir mtime older than the holder max age: stale everywhere.
+        touch -t "$old" "$lock"
+        _restore_lock_live "$lock" && { echo "createdless old lock still live"; exit 7; }
+        _restore_busy && { echo "createdless old lock still busy"; exit 8; }
+        _restore_lock_acquire r3 3300 || { echo "createdless old lock not stolen"; exit 9; }
+        exit 0
+    ) || fail "N4 lock helpers (exit $?)"
+    echo "ok: recorded lock max age is capped; a created-less lock reads the same everywhere"
+}
+
 test_restore_status_current_run_from_lock() {
     # N-2: boot run "running" always comes with current_run (from the live lock); without a
     # live holder it is "unfinished".

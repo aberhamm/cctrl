@@ -19410,8 +19410,7 @@ _restore_busy() {
     timeout="${CCTRL_RESTORE_TIMEOUT:-2700}"; [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=2700
     if (( timeout > 0 )); then max_age=$(( timeout + 600 )); else max_age=86400; fi
     if [[ -d "$lock" ]]; then
-        pid="$(cat "$lock/pid" 2>/dev/null || true)"; created="$(cat "$lock/created" 2>/dev/null || true)"
-        [[ "$created" =~ ^[0-9]+$ ]] || created="$now"
+        pid="$(cat "$lock/pid" 2>/dev/null || true)"; created="$(_restore_lock_created "$lock")"
         # A lock made before this boot began belongs to a run the reboot killed,
         # whatever process now holds its pid number.
         if _restore_lock_pre_boot "$lock" "$created"; then :
@@ -19762,16 +19761,32 @@ _restore_lock_pre_boot() { # lock_dir created: 0 when the lock was made before t
     [[ "$created" =~ ^[0-9]+$ && "$boot_epoch" =~ ^[0-9]+$ ]] && (( created < boot_epoch ))
 }
 
-_restore_lock_holder_max_age() { # lock_dir: the max age the lock's holder recorded (largest cap, 3300 s, for a lock without one)
+_restore_lock_holder_max_age() { # lock_dir: the max age the lock's holder recorded (largest cap, 3300 s, for a lock without one; never above 86400 s)
     local v
     v="$(cat "$1/max_age" 2>/dev/null || true)"
-    if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then printf '%s' "$v"; else printf '3300'; fi
+    # A CCTRL_RESTORE_TIMEOUT=0 holder records a year; honouring that would let
+    # a reused pid hold the lock for the rest of the boot, so clamp to a day.
+    # Over 7 digits is above the cap already (and would wrap bash arithmetic).
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( ${#v} > 7 )); then printf '86400'
+    elif [[ "$v" =~ ^[0-9]+$ ]] && (( v > 86400 )); then printf '86400'
+    elif [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then printf '%s' "$v"
+    else printf '3300'; fi
+}
+
+_restore_lock_created() { # lock_dir: epoch the lock was made: its created file, else the dir mtime, else now (one reading for status, busy and acquire)
+    local c
+    c="$(cat "$1/created" 2>/dev/null || true)"
+    if ! [[ "$c" =~ ^[0-9]+$ ]]; then
+        c="$(stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true)"
+        [[ "$c" =~ ^[0-9]+$ ]] || c="$(date +%s)"
+    fi
+    printf '%s' "$c"
 }
 
 _restore_lock_live() { # lock_dir: 0 when a live run holds it (pid alive, this boot, within the holder's own max age)
     local dir="$1" pid created now
-    pid="$(cat "$dir/pid" 2>/dev/null || true)"; created="$(cat "$dir/created" 2>/dev/null || true)"; now="$(date +%s)"
-    [[ "$pid" =~ ^[0-9]+$ && "$created" =~ ^[0-9]+$ ]] || return 1
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"; created="$(_restore_lock_created "$dir")"; now="$(date +%s)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$pid" 2>/dev/null || return 1
     _restore_lock_pre_boot "$dir" "$created" && return 1
     (( now - created <= $(_restore_lock_holder_max_age "$dir") ))
@@ -19793,11 +19808,7 @@ _restore_lock_acquire() { # run_id max_age_seconds. 0 = held by us, 1 = held by 
             return 0
         fi
         now="$(date +%s)"
-        created="$(cat "$dir/created" 2>/dev/null || true)"
-        if ! [[ "$created" =~ ^[0-9]+$ ]]; then
-            created="$(stat -f %m "$dir" 2>/dev/null || stat -c %Y "$dir" 2>/dev/null || true)"
-            [[ "$created" =~ ^[0-9]+$ ]] || created="$now"
-        fi
+        created="$(_restore_lock_created "$dir")"
         age=$(( now - created ))
         pid="$(cat "$dir/pid" 2>/dev/null || true)"
         # Judge by the HOLDER's recorded max age, never the caller's: a boot
