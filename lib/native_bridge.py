@@ -634,7 +634,11 @@ class Daemon:
                 # the status and do not mark handled (retryable after release).
                 late = self.admission_problem(self.store.get(original["id"], self.who))
                 if late:
-                    return {**value, "handled": False, "warning": late}
+                    return {**value, "handled": False,
+                            "original": {"id": original["id"], "handled": False},
+                            "warning": (f"reply {value['id']} WAS already sent to the original sender; the original message is now held and is NOT marked handled. "
+                                        f"Do not retry without --id {value['id']} (a plain retry sends a duplicate reply). "
+                                        f"After native admission (release) run: bridge reply {original['id']} --id {value['id']} (deduplicated), or bridge ack {original['id']}.")}
                 # A failed/ambiguous reply is not proof of handling.
                 if value["status"] in {"queued", "submitted", "released"}:
                     self.store.acknowledge(original["id"], self.who, value["id"])

@@ -324,6 +324,18 @@ class LedgerTests(unittest.TestCase):
         result = recipient.handle({"actor": recipient.who, "action": "reply", "id": mid, "body": "answer"})
         self.assertIs(False, result["handled"])
         self.assertFalse(self.store.get(mid, "claude:receiver")["handled"])
+        self.assertIn("WAS already sent", result["warning"])
+        self.assertIn(f"--id {result['id']}", result["warning"])
+        self.assertNotIn("Wait for native admission (release) or ask the sender to resend", result["warning"])
+        self.assertIs(False, result["original"]["handled"])
+        # Retry with the same reply id after release: no second delivery, original handled.
+        self.store.event(mid, "released", {"status": "released"})
+        calls = []
+        recipient.deliver = lambda *args: calls.append(args) or {"status": "submitted"}
+        again = recipient.handle({"actor": recipient.who, "action": "reply", "id": mid, "body": "answer", "reply_id": result["id"]})
+        self.assertEqual(result["id"], again["id"])
+        self.assertEqual([], calls)
+        self.assertTrue(self.store.get(mid, "claude:receiver")["handled"])
 
     def test_client_supplied_provider_bases_are_rederived_not_trusted(self):
         raw = {"display_name": {"value": "Fleet Manager", "basis": "provider-registry"},
