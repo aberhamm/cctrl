@@ -8151,7 +8151,7 @@ _peer_self_identity() {
         printf '%s\n' "$identity"
         return 0
     fi
-    _peer_external_self_identity "$@"
+    _peer_external_self_identity
 }
 
 _peer_external_import_origin() {
@@ -11579,7 +11579,7 @@ _peer_app_deliver_locked() {
     receipt="$PEER_DATA_DIR/app-delivery/$attempt.json"
     body_file="$PEER_DATA_DIR/app-delivery/$attempt.body"
     if [[ "$reused" == false ]]; then printf '%s' "$payload" > "$body_file"; fi
-    [[ -f "$body_file" ]] || { PEER_DELIVER_STATUS=ambiguous; PEER_DELIVER_REASON=attempt-body-missing; _peer_delivery_result_json; return 1; }
+    [[ -f "$body_file" ]] || { PEER_DELIVER_STATUS=ambiguous; PEER_DELIVER_REASON="attempt-body-missing"; _peer_delivery_result_json; return 1; }
     updated="$(jq --arg peer "$PEER_DELIVER_PEER" --arg id "$inline_id" --arg attempt "$attempt" --argjson reused "$reused" '
         map(if ($reused|not) and .to==$peer and .status=="queued" and ($id=="" or .id==$id) then .app_delivery_attempt=$attempt else . end)
     ' <<< "$messages")"
@@ -14233,7 +14233,7 @@ _peer_push_eligibility() { # peer_json messages inline_id
         || summary='{"eligible":[],"ineligible":[{"reason":"sender-unattested","detail":"verify-failed"}]}'
     { IFS= read -r n_el; IFS= read -r n_inel; IFS= read -r reason; } < <(jq -r '(.eligible | length), (.ineligible | length),
         (if (.ineligible | length) > 0 and all(.ineligible[]; .reason == "sender-not-allowed") then "sender-not-allowed" else "sender-unattested" end)' <<< "$summary" 2>/dev/null) || true
-    [[ "$reason" == sender-not-allowed ]] || reason=sender-unattested
+    [[ "$reason" == sender-not-allowed ]] || reason="sender-unattested"
     [[ "$n_el" =~ ^[0-9]+$ ]] || n_el=0
     [[ "$n_inel" =~ ^[0-9]+$ ]] || n_inel=1
     if (( n_inel > 0 )); then
