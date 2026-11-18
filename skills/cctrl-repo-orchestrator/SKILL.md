@@ -164,6 +164,12 @@ Read worker reports **from the files they wrote**, not from pane scrollback.
 Pass the report path in the brief; never rely on the next session guessing it.
 Hand a worker off at a clean boundary, never mid-task.
 
+**Full test runs.** Tell workers to just run `tests/run-tests.sh`: a full run
+takes a host-wide lock and waits, printing the holder, so they need no
+`pgrep` check before it (and the install gate uses the same lock). A green full
+run on a clean tree also leaves a pass stamp that lets `install/self-install.sh`
+skip the 25-minute suite on that exact tree; say so when you brief an install.
+
 ## Driving workers (tmux gotchas)
 
 - **Three-step send:** `send-keys C-u` → `send-keys -l 'text'` → pause ~1s →

@@ -59,7 +59,32 @@ and only then atomically swaps in `~/.local/lib/cctrl/current` and
 `~/.local/bin/cctrl`. `data/`, `costs/`, `profiles/`, and `.active-profile`
 are symlinked back to this repo after validation, never copied, so nothing forks.
 The test gate runs against isolated staged state rather than the live registry.
-Re-run it after pulling or committing changes to update. Rollback to a
+Re-run it after pulling or committing changes to update.
+
+**Gate reuse and the suite lock.** The full suite takes about 25 minutes, so
+`self-install.sh` does not rerun it on a tree that already passed it on this
+host. A green, unfiltered `tests/run-tests.sh` (shell tests plus the Python
+tests) on a clean tree records a pass stamp in
+`~/.local/state/cctrl/suite-passes/` (override the directory with
+`CCTRL_SUITE_STATE_DIR`), keyed on the git tree hash of the tested content, the
+host, the bash major.minor and the python major.minor. The installer computes
+the same key for the commit it installs. With a matching stamp it runs the
+syntax checks and only the smoke subset in `tests/smoke-tests.txt` (the names CI
+smoke runs) and prints `gate path = STAMP REUSE`; with no stamp, any mismatch or
+a tree it cannot key it runs the full suite and prints `gate path = FULL SUITE`
+with the reason. `bash install/self-install.sh --full-gate` (or
+`CCTRL_INSTALL_FULL_GATE=1`) forces the full suite. A dirty tree is refused
+before any of this. With a stamp from the worker's final-commit run, an install
+takes about a minute of syntax and smoke checks instead of about 25 minutes.
+
+A full run of `tests/run-tests.sh`, including the install gate, takes a
+host-wide lock (`~/.local/state/cctrl/suite.lock/`, holding the pid and start
+time) and waits, printing `waiting for suite lock held by PID ... since ...`,
+instead of running concurrently with another full run. A lock is stale when its
+holder is dead or is alive but not a `run-tests.sh` process; a live holder is
+never broken. Filtered runs (`CCTRL_TEST_NAMES`, test names, `CCTRL_TEST_ONLY`)
+and `--list` take no lock and write no stamp, so smoke checks never queue.
+Workers need no `pgrep` loop before a full run: the lock does the waiting. Rollback to a
 plain symlink into the working tree:
 
 ```bash
