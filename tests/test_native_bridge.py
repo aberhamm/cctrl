@@ -1056,7 +1056,7 @@ class DaemonVersionTests(unittest.TestCase):
         skipped = self.handled("codex:me", None)
         self.fail_ids = (b,)
         code, out, _ = self.retire_cli(row, "--handled", "--json")
-        self.assertEqual(0, code)
+        self.assertEqual(3, code, "partial run: some rows errored")
         self.assertEqual({"retired": 2, "error": 1}, out["outcomes"])
         self.assertEqual([b], out["error_ids"])
         self.assertEqual([skipped], out["skipped_ids"])
@@ -1070,7 +1070,7 @@ class DaemonVersionTests(unittest.TestCase):
         out = io.StringIO()
         with patch.object(bridge, "ensure_daemon", return_value=row), patch.object(bridge, "own_actor", return_value="codex:me"), \
              patch.object(bridge, "rpc", side_effect=self.fake_rpc(None)), patch.object(sys, "stdout", out):
-            self.assertEqual(0, bridge.main(["--root", str(self.store.root), "retire", "--handled"]))
+            self.assertEqual(3, bridge.main(["--root", str(self.store.root), "retire", "--handled"]))
         text = out.getvalue()
         self.assertIn(b, text)
         self.assertIn(skipped, text)
@@ -1082,6 +1082,27 @@ class DaemonVersionTests(unittest.TestCase):
         self.assertEqual((1, "daemon-outdated"), (code, out["error"]["code"]))
         rpc.assert_not_called()
         self.assertFalse(bridge.daemon_missing(row, bridge.ALL_REQUIRED), "ack/send/reply still work on it")
+        message = out["error"]["message"]
+        self.assertIn("retire_handled", message)
+        self.assertIn("protocol 3", message)
+        self.assertIn("still work", message)
+        self.assertIn("cctrl bridge stop", message)
+        self.assertNotIn("needs 2", message)
+        self.assertNotIn("Only stop, list, status and inbox", message)
+
+    def test_protocol1_refusal_text_is_unchanged(self):
+        row = self.live_row("codex:me")
+        with self.assertRaises(bridge.DaemonOutdated) as caught:
+            bridge.check_daemon(row, "retire")
+        message = str(caught.exception)
+        self.assertIn("is outdated (protocol 1, needs 2)", message)
+        self.assertIn("Only stop, list, status and inbox work until it is migrated", message)
+
+    def test_retire_handled_clean_run_exits_zero(self):
+        row = self.current_row()
+        self.handled("codex:me", "q1")
+        code, out, _ = self.retire_cli(row, "--handled", "--json")
+        self.assertEqual((0, []), (code, out["error_ids"]))
 
     def test_retire_handled_dry_run_reports_daemon_outdated(self):
         row = self.live_row("codex:me")

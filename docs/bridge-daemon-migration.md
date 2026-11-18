@@ -102,7 +102,7 @@ Run these as the session that owns the endpoint, with the **new** cctrl.
    `daemon-outdated` otherwise. The output lists `skipped_ids` (no persisted
    queue identity: run `cctrl bridge status ID --reconcile`) and `error_ids`
    (rerun the sweep, or `cctrl bridge ack MESSAGE_ID` for one message). A
-   failed item does not stop the run. See [peer-messaging.md](peer-messaging.md).
+   failed item does not stop the run; the command exits 3 if any row errored. See [peer-messaging.md](peer-messaging.md).
 
 A repeated ACK does not resend a receipt that was already sent; a receipt that earlier failed is retried, which is intended. A receipt owed to a Claude sender is never submitted natively (recorded as `suppressed`, see peer-messaging.md), so it has nothing to retry.
 

@@ -57,6 +57,10 @@ REQUIRED_CAPABILITIES = {
 ALL_REQUIRED = tuple(dict.fromkeys(c for a, caps in REQUIRED_CAPABILITIES.items() if a != "retire" for c in caps))
 
 
+# Exit code of `bridge retire` when the run finished but some rows errored (1 stays "refused / failed").
+RETIRE_PARTIAL_EXIT = 3
+
+
 class DaemonOutdated(ValueError):
     code = "daemon-outdated"
 BASIS = re.compile(r"^[A-Za-z0-9:_./-]{1,60}$")
@@ -917,6 +921,11 @@ def check_daemon(row, action):
     bindings, so replacing it is an operator step (see MIGRATION_DOC).
     """
     lacking = daemon_missing(row, REQUIRED_CAPABILITIES.get(action, ()))
+    if lacking and int(row.get("protocol") or 1) >= MIN_DAEMON_PROTOCOL:
+        # Current enough for send/ack/reply; only a newer optional action is missing.
+        raise DaemonOutdated(f"the running bridge daemon for {row['actor']} (pid {row['pid']}) is protocol {row.get('protocol')}; `{action}` needs {', '.join(lacking)} "
+                             f"(protocol {DAEMON_PROTOCOL}), so `{action}` was NOT performed: nothing was retired. send, ack and reply still work on this endpoint. "
+                             f"To upgrade, run `cctrl bridge stop` then `cctrl bridge enable` (drain held items first). See {MIGRATION_DOC}.")
     if lacking:
         raise DaemonOutdated(f"{daemon_problem(row)}; it cannot do {', '.join(lacking)}, so `{action}` was NOT performed: nothing was sent, acknowledged or retired. "
                              f"Only stop, list, status and inbox work until it is migrated. Do not just stop and enable: drain held items first "
@@ -1026,7 +1035,7 @@ def main(argv=None):
                     lines += [f"  skipped (no queue identity; run bridge status ID --reconcile): {m}" for m in result["skipped_ids"]]
                     lines += [f"  error (retry with bridge retire --handled or bridge ack ID): {m}" for m in result["error_ids"]]
                     print("\n".join(lines))
-                    return 0
+                    return RETIRE_PARTIAL_EXIT if result["error_ids"] else 0
             elif args.command == "inbox":
                 if not 1 <= args.limit <= 100 or args.after < 0:
                     raise ValueError("inbox limit must be 1..100 and after must be nonnegative")
@@ -1067,6 +1076,8 @@ def main(argv=None):
                         else:
                             raise ValueError("bridge cleanup remains pending; endpoint ownership retained")
         print(json.dumps(result, ensure_ascii=False))
+        if args.command == "retire" and result.get("error_ids"):
+            return RETIRE_PARTIAL_EXIT
         return 0
     except (ValueError, OSError, sqlite3.Error, subprocess.TimeoutExpired) as exc:
         print(json.dumps({"ok": False, "error": {"code": getattr(exc, "code", "bridge-error"), "message": str(exc)}}))

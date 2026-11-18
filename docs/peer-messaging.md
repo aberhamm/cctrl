@@ -108,7 +108,7 @@ ledger only and lists the IDs. Output (text by default, JSON with `--json`):
 `candidates`, `outcomes` (count per `native_retirement.outcome`), `skipped_ids`
 (no persisted queue identity: run `bridge status ID --reconcile`) and
 `error_ids` (the daemon call failed or was refused: rerun the sweep or
-`bridge ack ID`). A failed item never aborts the run.
+`bridge ack ID`). A failed item never aborts the run; the command then exits 3 (partial run), 0 when every row succeeded, 1 when refused.
 
 **Admission gate.** `bridge ack` and `bridge reply` refuse (exit 1, error says
 the message is not admitted) while the status is `held`, `refused`, `denied`,
