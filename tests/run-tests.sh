@@ -9469,7 +9469,7 @@ test_mailbox_concurrent_senders_ack_gc() {
     # Atomicity stress, not a requirement that 65 contending CLI operations
     # finish inside the production 10s lock deadline. That deadline can refuse
     # sends without losing a write; test finite timeout behavior separately.
-    A1_ENV+=(CCTRL_MAILBOX_LOCK_TIMEOUT=60)
+    A1_ENV+=(CCTRL_MAILBOX_LOCK_TIMEOUT=300)
     local mbx="$A1_DATA/messages.jsonl" i failed=0 pid
     local -a pids=()
     local delivered
@@ -11851,6 +11851,10 @@ test_peer_attest_jq_15_compatible() {
     local hits cfg_jq v doc want got
     hits="$(grep -nE '(^|[^A-Za-z0-9_])(IN|INDEX|walk|pick|toarray|have_literal_numbers)\(|\$ENV([^A-Za-z0-9_]|$)|\| *(trim|ltrim|rtrim|abs|toarray)([^A-Za-z0-9_]|$)' "$ROOT/cctrl" || true)"
     [[ -z "$hits" ]] || fail "cctrl uses a jq builtin newer than jq 1.5: $hits"
+    # jq 1.8 dropped the undocumented internal _nwise (the hosted runner has 1.8.2): a
+    # jq error there silently emptied the restore run log. Use range() instead.
+    hits="$(grep -nE '(^|[^A-Za-z0-9_])_nwise\(' "$ROOT/cctrl" || true)"
+    [[ -z "$hits" ]] || fail "cctrl uses _nwise, which jq 1.8 removed: $hits"
     cfg_jq="$(sed -n "/^PEER_ATTEST_CFG_JQ='/,/'\$/p" "$ROOT/cctrl")"
     [[ "$cfg_jq" == "PEER_ATTEST_CFG_JQ='"*"'" ]] || fail "could not extract PEER_ATTEST_CFG_JQ"
     eval "$cfg_jq"
