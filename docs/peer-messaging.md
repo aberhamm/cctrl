@@ -50,11 +50,11 @@ for its next turn end. Either way there is no admission prompt on Matthew's
 screen.
 
 - The backing peer comes from `cctrl peer by-session claude:SESSION_ID`: the peer
-  registry (an external identity bound to that session) and managed-session
-  metadata (conversation id; only records whose lifecycle state is `active` count,
-  closed or archived ones are ignored), each of which must still resolve to a
-  Claude peer. Exactly one peer is required, and the peer must not now run a
-  different live conversation (error code `stale-backing-peer`). Zero or two is refused (exit 1, error code
+  registry (an external identity bound to that session) or the live process: the session id must be a live Claude (a `~/.claude/sessions`
+  file with a live pid and matching start time) in a tmux pane whose session
+  backs a registered Claude peer. Session records are never trusted, so a stale
+  "active" record can neither misroute nor block mail. Exactly one peer is
+  required; a session that is not live anywhere is refused as `not-live`. Zero or two is refused (exit 1, error code
   `mailbox-route-refused`, the message names `--urgent`); cctrl never guesses a
   peer. A refused send writes nothing: no mailbox item and no ledger row.
 - The result says which path ran. A routed send returns the ledger row with

@@ -8536,14 +8536,22 @@ _peer_cmd_by_session() {
         jq -r --arg id "$sid" 'to_entries[]
             | select((.value.agent // "") == "claude" and (.value.external_identity.session_id == $id or .value.provider_task_id == $id))
             | (.value.name // .key)' "$PEERS_FILE" 2>/dev/null
-        local f
-        for f in "$SESSION_METADATA_DIR"/*.json; do
-            [[ -f "$f" ]] || continue
-            jq -r --arg id "$sid" 'select(type == "object")
-                | select((.agent // .provider // "") == "claude" and (.lifecycle_state // "") == "active" and ((.provider_task_id // .conversation_id // "") == $id))
-                | (.peer // .name // empty)' "$f" 2>/dev/null
-        done
     )"
+    # Live process, not record status (session records can stay "active" for
+    # sessions that died): X counts only as a live Claude process (a
+    # ~/.claude/sessions file with a live pid and matching procStart) bound to a
+    # tmux pane, and the peer is the one registered for that pane's session.
+    # Reuses _peer_record_for_pid (the plan 111 resolver); nothing is sniffed twice.
+    local sf spid live_candidates=""
+    for sf in "$CLAUDE_SESSIONS_DIR"/*.json; do
+        [[ -f "$sf" && ! -L "$sf" ]] || continue
+        [[ "$(jq -r '.sessionId // ""' "$sf" 2>/dev/null)" == "$sid" ]] || continue
+        spid="${sf##*/}"; spid="${spid%.json}"
+        _peer_record_for_pid "$spid" || continue
+        [[ "$PEER_REC_ALIVE" == true && "$PEER_REC_PROC_START_MATCH" == true && "$PEER_REC_TMUX_BOUND" == true ]] || continue
+        live_candidates+="$PEER_REC_PEER_NAME"$'\n'
+    done
+    candidates+=$'\n'"$live_candidates"
     local -a names=()
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
@@ -8556,29 +8564,13 @@ _peer_cmd_by_session() {
     local count
     count="$(printf '%s\n' "$unique" | grep -c . || true)"
     if [[ "$count" == "0" ]]; then
-        if $json; then _json_error no-backing-peer "No live mailbox peer is bound to claude:$sid (closed or archived records are ignored)"; else echo -e "${RED}No live mailbox peer is bound to claude:$sid${RESET}" >&2; fi
+        if $json; then _json_error not-live "No mailbox peer backs a live claude:$sid (no live Claude process with that id sits in a registered peer pane); records are not trusted"; else echo -e "${RED}No live mailbox peer is bound to claude:$sid${RESET}" >&2; fi
         return 66
     fi
     if [[ "$count" != "1" ]]; then
         if $json; then _json_error ambiguous-backing-peer "Ambiguous: $count mailbox peers claim claude:$sid ($(printf '%s' "$unique" | paste -sd, -))"; else echo -e "${RED}Ambiguous: $count mailbox peers claim claude:$sid${RESET}" >&2; fi
         return 66
     fi
-    # A live session record for the same peer that runs a DIFFERENT conversation
-    # means the name was reused: the id asked for is stale. Never route to it.
-    local other f2
-    for f2 in "$SESSION_METADATA_DIR"/*.json; do
-        [[ -f "$f2" ]] || continue
-        other="$(jq -r --arg id "$sid" --arg peer "$unique" 'select(type == "object")
-            | select((.agent // .provider // "") == "claude" and (.lifecycle_state // "") == "active"
-                     and ((.peer // .name // "") == $peer)
-                     and ((.provider_task_id // .conversation_id // "") != "")
-                     and ((.provider_task_id // .conversation_id // "") != $id))
-            | (.provider_task_id // .conversation_id)' "$f2" 2>/dev/null | head -1)"
-        if [[ -n "$other" ]]; then
-            if $json; then _json_error stale-backing-peer "Stale: mailbox peer $unique now runs a different live conversation than claude:$sid"; else echo -e "${RED}Stale: mailbox peer $unique now runs a different live conversation than claude:$sid${RESET}" >&2; fi
-            return 66
-        fi
-    done
     if $json; then
         jq -n --arg sid "$sid" --arg peer "$unique" '{ok:true, session_id:$sid, peer:$peer}'
     else

@@ -914,60 +914,106 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual([], self.mailbox_messages())
         self.assertEqual(0, self.ledger_count())
 
-    def meta_record(self, name, conversation, peer, state):
-        sessions = self.root / "sessions"
+    def fake_pane(self, tmux_session, conversation, live=True):
+        """A fake Claude in a fake tmux pane: a real process, its ~/.claude/sessions
+        file (pid + procStart) and a stub tmux listing the pane. The peer backing the
+        tmux session is a registry entry with no session-id binding of its own."""
+        proc = subprocess.Popen(["sleep", "300"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        started = subprocess.run(["ps", "-o", "lstart=", "-p", str(proc.pid)], capture_output=True, text=True,
+                                 env={**os.environ, "LC_ALL": "C", "TZ": "UTC"}).stdout
+        started = " ".join(started.split())
+        pane = "%" + str(proc.pid)
+        sessions = self.root / "claude" / "sessions"
         sessions.mkdir(parents=True, exist_ok=True)
-        record = {"agent": "claude", "provider": "claude", "name": name, "peer": peer,
-                  "conversation_id": conversation, "provider_task_id": conversation, "lifecycle_state": state}
-        (sessions / (name + "-" + conversation + ".json")).write_text(json.dumps(record))
+        (sessions / (str(proc.pid) + ".json")).write_text(json.dumps({
+            "pid": proc.pid, "sessionId": conversation, "name": tmux_session, "procStart": started,
+            "tmux": tmux_session + ":@1." + pane, "messagingSocketPath": ""}))
+        if not live:
+            proc.kill()
+            proc.wait()
+        panes = self.root / "panes.tsv"
+        with panes.open("a") as handle:
+            handle.write(f"{tmux_session}\t{pane}\t{proc.pid}\n")
+        bindir = self.root / "bin"
+        bindir.mkdir(exist_ok=True)
+        stub = bindir / "tmux"
+        stub.write_text('#!/bin/sh\ncase "$*" in *list-panes*) cat "' + str(panes) + '" ;; *) exit 1 ;; esac\n')
+        stub.chmod(0o755)
+        self.env["PATH"] = str(bindir) + os.pathsep + self.env["PATH"]
+        _, template = self.claude_backing_peer()
+        peers_file = self.root / "data" / "peers.json"
+        peers = json.loads(peers_file.read_text())
+        entry = {k: v for k, v in peers[template].items() if k not in ("external_identity", "provider_task_id")}
+        name = "peer-" + tmux_session
+        peers[name] = {**entry, "name": name, "tmux_target": tmux_session, "session": tmux_session}
+        peers_file.write_text(json.dumps(peers))
+        return name
 
     def by_session(self, sid):
         proc = self.cctrl("peer", "by-session", "claude:" + sid, "--json", check=False)
         return proc.returncode, json.loads(proc.stdout)
 
-    def test_by_session_ignores_a_closed_record_when_the_name_now_runs_another_conversation(self):
-        live_sid, peer = self.claude_backing_peer()
-        old = str(uuid.uuid4())
-        self.meta_record("TMUX--reused", old, peer, "closed")
-        self.meta_record("TMUX--reused", live_sid, peer, "active")
+    def test_by_session_resolves_a_live_claude_in_the_peers_pane(self):
+        conv = str(uuid.uuid4())
+        peer = self.fake_pane("TMUX--live", conv)
+        rc, out = self.by_session(conv)
+        self.assertEqual((0, peer), (rc, out.get("peer")), out)
+        sent = self.raw("send", "claude:" + conv, "--json", "--", "hello live")
+        self.assertEqual(0, sent.returncode, sent.stdout + sent.stderr)
+        self.assertEqual(peer, json.loads(sent.stdout)["mailbox_peer"])
+
+    def test_by_session_refuses_a_stale_active_record_when_the_pane_runs_another_conversation(self):
+        old, running = str(uuid.uuid4()), str(uuid.uuid4())
+        peer = self.fake_pane("TMUX--reused", running)
+        sessions = self.root / "sessions"
+        sessions.mkdir(exist_ok=True)
+        (sessions / "stale.json").write_text(json.dumps({
+            "agent": "claude", "name": "TMUX--reused", "peer": peer, "tmux_session": "TMUX--reused",
+            "conversation_id": old, "provider_task_id": old, "lifecycle_state": "active"}))
         rc, out = self.by_session(old)
-        self.assertEqual(66, rc, out)
-        self.assertIn(out["error"]["code"], ("no-backing-peer", "stale-backing-peer"))
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+        self.assertNotIn("different live conversation", out["error"]["message"])
         proc = self.raw("send", "claude:" + old, "--json", "--", "to the old conversation")
         self.assertEqual(1, proc.returncode, proc.stdout)
         self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
         self.assertEqual([], self.mailbox_messages())
 
-    def test_by_session_ignores_archived_records_too(self):
-        _, peer = self.claude_backing_peer()
-        old = str(uuid.uuid4())
-        self.meta_record("TMUX--arch", old, peer, "archived")
-        rc, out = self.by_session(old)
-        self.assertEqual(66, rc, out)
-
-    def test_by_session_resolves_an_active_session_record(self):
-        _, peer = self.claude_backing_peer()
+    def test_by_session_a_dead_active_record_does_not_block_the_live_conversation(self):
         conv = str(uuid.uuid4())
-        self.meta_record("TMUX--live", conv, peer, "active")
+        live_peer = self.fake_pane("TMUX--twin", conv)
+        self.fake_pane("TMUX--twin-dead", conv, live=False)
+        sessions = self.root / "sessions"
+        sessions.mkdir(exist_ok=True)
+        for name in ("TMUX--twin", "TMUX--twin-dead"):
+            (sessions / (name + ".json")).write_text(json.dumps({
+                "agent": "claude", "name": name, "peer": "peer-" + name, "tmux_session": name,
+                "conversation_id": conv, "provider_task_id": conv, "lifecycle_state": "active"}))
         rc, out = self.by_session(conv)
-        self.assertEqual((0, peer), (rc, out["peer"]), out)
+        self.assertEqual((0, live_peer), (rc, out.get("peer")), out)
 
-    def test_by_session_refuses_two_live_candidates(self):
-        _, peer_a = self.claude_backing_peer()
-        _, peer_b = self.claude_backing_peer()
+    def test_by_session_refuses_when_the_conversation_is_not_live_anywhere(self):
+        self.fake_pane("TMUX--other", str(uuid.uuid4()))
+        missing = str(uuid.uuid4())
+        rc, out = self.by_session(missing)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+        proc = self.raw("send", "claude:" + missing, "--json", "--", "nobody home")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
+        self.assertEqual([], self.mailbox_messages())
+
+    def test_by_session_refuses_a_dead_process_for_the_conversation(self):
         conv = str(uuid.uuid4())
-        self.meta_record("TMUX--a", conv, peer_a, "active")
-        self.meta_record("TMUX--b", conv, peer_b, "active")
+        self.fake_pane("TMUX--gone", conv, live=False)
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+
+    def test_by_session_refuses_two_live_panes_for_one_conversation(self):
+        conv = str(uuid.uuid4())
+        self.fake_pane("TMUX--a", conv)
+        self.fake_pane("TMUX--b", conv)
         rc, out = self.by_session(conv)
         self.assertEqual((66, "ambiguous-backing-peer"), (rc, out["error"]["code"]), out)
-
-    def test_by_session_refuses_when_the_peer_now_runs_a_different_live_conversation(self):
-        live_sid, peer = self.claude_backing_peer()
-        conv = str(uuid.uuid4())
-        self.meta_record("TMUX--same", conv, peer, "active")
-        self.meta_record("TMUX--same-newer", live_sid, peer, "active")
-        rc, out = self.by_session(conv)
-        self.assertEqual((66, "stale-backing-peer"), (rc, out["error"]["code"]), out)
 
     def test_claude_to_codex_and_codex_to_codex_are_unchanged_and_claude_to_claude_stays_rejected(self):
         claude = str(uuid.uuid4())
