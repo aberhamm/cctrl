@@ -5044,7 +5044,11 @@ PY
     case "$(jq -r '.status' <<< "$result")" in created|applied|duplicate) ;; *) return 1 ;; esac
     local indexed_session
     indexed_session="$(jq -r '.tmux_session // .name // empty' "$canonical" 2>/dev/null || true)"
-    [[ -n "$indexed_session" ]] && _session_record_index_update "$indexed_session" "$canonical" 2>/dev/null || true
+    # A launch write repoints the index of the name it actually launches into
+    # itself (_session_write_metadata). The record's stored tmux_session can be
+    # an earlier execution's name, possibly held by another session now, so
+    # repointing it here would claim that session for this conversation.
+    [[ -n "$indexed_session" && "${_PROMOTE_SKIP_INDEX:-}" != 1 ]] && _session_record_index_update "$indexed_session" "$canonical" 2>/dev/null || true
     if [[ "$source" != "$canonical" && "$source_version" == "$TASK_RECORD_SCHEMA_VERSION" ]]; then
         rm -f "$source" 2>/dev/null || true
     fi
@@ -5507,7 +5511,7 @@ _session_write_metadata() {
     if [[ -n "$provider_task_id" ]]; then
         # Canonical schema-v2 creation and merge both cross the registry event
         # boundary; provisional launch records remain identity-less staging.
-        _task_record_promote_legacy "$tmp" "$provider_task_id" >/dev/null || { rm -f "$tmp"; return 1; }
+        _PROMOTE_SKIP_INDEX=1 _task_record_promote_legacy "$tmp" "$provider_task_id" >/dev/null || { rm -f "$tmp"; return 1; }
     else
         mv "$tmp" "$output_file"
     fi
@@ -6396,43 +6400,53 @@ _launch_resume_record_file() {
 # _launch_resume_live_holder AGENT ID: print the name of a live tmux session
 # that is, or may be, this conversation, and return 0; return 1 when none is
 # found. A session counts when EITHER signal says so:
-#   - its session-index entry resolves to the conversation's record (the index
-#     is repointed by every cctrl launch into that name, so it survives the
-#     record keeping an earlier execution's name and pane anchor), or
+#   - its session-index entry resolves to the conversation's record AND that
+#     name is the one the record's latest cctrl-launch evidence names (the index
+#     survives the record keeping an earlier execution's name and anchor, but a
+#     stale entry on a name held by another session must not count), or
 #   - its live pane is the pane the record anchors (id and pid, plus the start
 #     time when one is recorded).
 # It scans every live session, not just the recorded name, so a conversation
 # resumed under another name (work--2 while the record says work--3) is found.
 # Fails toward refusing: an unprovable-but-indexed session is treated as X.
 _launch_resume_live_holder() {
-    local file base s ref pane_id pane_pid pane_started live live_started run_bound
+    local file base s ref pane_id pane_pid pane_started live live_started run_bound last_name sessions
     file="$(_launch_resume_record_file "$1" "$2")" || return 1
     base="${file##*/}"
     pane_id="$(jq -r '.pane_id // ""' "$file" 2>/dev/null || true)"
     pane_pid="$(jq -r '.pane_pid // ""' "$file" 2>/dev/null || true)"
     pane_started="$(jq -r '.pane_started // ""' "$file" 2>/dev/null || true)"
+    # The name this conversation was last launched into: an index entry is
+    # trusted only for that name. Older launches (and the pre-fix repoint of the
+    # recorded name) leave index entries naming X on sessions that are not X's.
+    last_name="$(jq -r '[(.ownership_evidence // [])[] | select(type == "object" and .source == "cctrl-launch")]
+        | sort_by(.observed_at // "") | (last // {}) | .source_instance // ""' "$file" 2>/dev/null || true)"
     run_bound="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}"
     [[ "$run_bound" =~ ^[1-9][0-9]*$ ]] || run_bound=5
+    # Bounded (CCTRL_TMUX_TIMEOUT_SECONDS): a wedged tmux server must not hang
+    # the launch. A timeout or failure reads as no live sessions.
+    _tmux_run_with_timeout list-sessions -F '#{session_name}' >/dev/null 2>&1 || return 1
+    sessions="$TMUX_RUN_OUTPUT"
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         ref="$(head -1 "$(_session_record_index_file "$s" 2>/dev/null)" 2>/dev/null || true)"
-        if [[ "$ref" == "$base" ]]; then
+        if [[ "$ref" == "$base" && "$s" == "$last_name" ]]; then
             printf '%s' "$s"
             return 0
         fi
         [[ -n "$pane_id" && -n "$pane_pid" ]] || continue
-        live="$(tmux display-message -p -t "=$s:" '#{pane_id} #{pane_pid}' 2>/dev/null || true)"
+        _tmux_run_with_timeout display-message -p -t "=$s:" '#{pane_id} #{pane_pid}' >/dev/null 2>&1 || continue
+        live="$TMUX_RUN_OUTPUT"
         [[ "$live" == "$pane_id $pane_pid" ]] || continue
         if [[ -n "$pane_started" ]]; then
-            # Bounded: a wedged tmux server must not hang the launch. An
-            # unreadable start time cannot prove a different pane, so the
+            # An unreadable start time cannot prove a different pane, so the
             # matching id and pid stand.
             live_started="$(_session_tmux_host_process_started "$s" "$pane_pid" "$run_bound" 2>/dev/null || true)"
             [[ -z "$live_started" || "$live_started" == "$pane_started" ]] || continue
         fi
         printf '%s' "$s"
         return 0
-    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    done <<< "$sessions"
     return 1
 }
 

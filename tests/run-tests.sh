@@ -6300,6 +6300,34 @@ test_d10b_real_flow_live_in_second_name_refuses_65() {
     echo "ok: a conversation live under a second name is refused whether the recorded name is free or taken"
 }
 
+test_d10b_foreign_holder_of_recorded_name_is_not_taken_for_x() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10bb5 conv-d10bb-5-0001 TMUX--ms--work--3
+    local out rc=0 idx3
+    idx3="$CCTRL_SESSION_METADATA_DIR/.session-index-$(printf '%s' TMUX--ms--work--3 | shasum -a 256 | awk '{print $1}').ref"
+    # Foreign F (index: its own record) holds the recorded name; X resumes into work--2.
+    printf 'launch-foreign-record.json\n' > "$idx3"
+    printf '$1:TMUX--ms--work--3\n$2:TMUX--ms--work\n' > "$RF_STATE"
+    out="$(TMUX_FAKE_ANCHOR='%9 1' TMUX_FAKE_NEW_SESSION_LIVE=1 _d10b_resume conv-d10bb-5-0001)"
+    [[ "$(_rf_session "$out")" == TMUX--ms--work--2 ]] || fail "expected work--2: $out"
+    [[ "$(head -1 "$idx3")" == launch-foreign-record.json ]] \
+        || fail "a suffixed resume repointed the foreign holder's index entry: $(head -1 "$idx3")"
+    # X exits; only F (work--3) and work remain. Resuming X must launch, not
+    # refuse and point at F.
+    printf '$1:TMUX--ms--work--3\n$2:TMUX--ms--work\n' > "$RF_STATE"
+    : > "$RF_LOG"
+    out="$(TMUX_FAKE_ANCHOR='%9 1' _d10b_resume conv-d10bb-5-0001)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "X is not live; a foreign holder of its recorded name must not block the resume (rc=$rc): $out"
+    assert_not_contains "$out" "already live"
+    grep -q 'new-session' "$RF_LOG" || fail "the resume did not launch"
+    # A stale index entry from older cctrl (work--3 -> X while F holds it) is also ignored.
+    printf '%s\n' "${RF_REC##*/}" > "$idx3"
+    rc=0
+    out="$(TMUX_FAKE_ANCHOR='%9 1' _d10b_resume conv-d10bb-5-0001)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "a stale index entry on a foreign session must not count as X (rc=$rc): $out"
+    echo "ok: a foreign session holding X's recorded name is never taken for X, and its index is not repointed"
+}
+
 test_d10b_anchor_only_match_refuses_65() {
     unset TMUX TMUX_PANE
     _d10b_fixture d10bb3 conv-d10bb-3-0001 TMUX--ms--work--3
@@ -6337,6 +6365,8 @@ test_d10b_held_proof_start_time_is_bounded() {
     body="$(sed -n '/^_launch_resume_live_holder() {/,/^_launch_detached() {/p' "$ROOT/cctrl")"
     [[ "$body" == *'_session_tmux_host_process_started "$s" "$pane_pid" "$run_bound"'* ]] \
         || fail "the start-time lookup in the live-holder proof is unbounded"
+    [[ "$body" == *'_tmux_run_with_timeout list-sessions'* && "$body" == *'_tmux_run_with_timeout display-message'* ]] \
+        || fail "the live-holder tmux probes are unbounded"
     echo "ok: the live-holder start-time lookup carries a bound"
 }
 
@@ -29702,7 +29732,8 @@ test_predecessor_retire_fresh_launch_waits_for_the_conversation_id() {
 # codex-adapter add a python unittest step next to their tests.
 _group_tests() {
     case "$1" in
-        d10b) printf '%s\n' test_d10b_failed_new_session_keeps_canonical_record test_d10b_resume_reuses_free_recorded_name test_d10b_prefix_trap_uses_exact_probes test_d10b_held_by_self_refuses_65 test_d10b_held_by_another_takes_suffix test_d10b_real_flow_second_resume_while_live_refuses_65 test_d10b_real_flow_live_in_second_name_refuses_65 test_d10b_anchor_only_match_refuses_65 test_d10b_failed_first_resume_leaves_no_new_record test_d10b_held_proof_start_time_is_bounded test_d10b_different_cwd_uses_derived_name test_d10b_repo_orchestrator_family_check test_d10b_fleet_record_is_unchanged test_d10b_keep_name_off_switch test_d10b_inline_resume_forms_keep_the_name test_d10b_missing_host_id_is_silent_and_writes_nothing test_d10b_foreign_device_and_placeholder_names_declined test_d10b_bare_resume_prints_hint_only ;;
+        d10b) printf '%s
+' test_d10b_failed_new_session_keeps_canonical_record test_d10b_resume_reuses_free_recorded_name test_d10b_prefix_trap_uses_exact_probes test_d10b_held_by_self_refuses_65 test_d10b_held_by_another_takes_suffix test_d10b_real_flow_second_resume_while_live_refuses_65 test_d10b_real_flow_live_in_second_name_refuses_65 test_d10b_foreign_holder_of_recorded_name_is_not_taken_for_x test_d10b_anchor_only_match_refuses_65 test_d10b_failed_first_resume_leaves_no_new_record test_d10b_held_proof_start_time_is_bounded test_d10b_different_cwd_uses_derived_name test_d10b_repo_orchestrator_family_check test_d10b_fleet_record_is_unchanged test_d10b_keep_name_off_switch test_d10b_inline_resume_forms_keep_the_name test_d10b_missing_host_id_is_silent_and_writes_nothing test_d10b_foreign_device_and_placeholder_names_declined test_d10b_bare_resume_prints_hint_only ;;
         role-skills) printf '%s\n' test_role_skills_ask_rule ;;
         bash-leg) printf '%s\n' test_bash_leg_is_honest test_no_shimless_test_path test_profile_settings_gc_portable_membership ;;
         session-prune) printf '%s\n' test_session_prune_never_prompted_claude test_session_prune_fresh_active_not_candidate test_session_prune_codex_no_claude_transcript_bug_guard test_session_prune_codex_never_prompted test_session_prune_dry_run_closes_nothing test_session_prune_claude_long_transcript_user_turn_not_flagged test_session_prune_yes_caps_large_batch ;;
