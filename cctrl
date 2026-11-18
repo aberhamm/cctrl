@@ -6302,6 +6302,106 @@ _fleet_refuse() {
     echo "  Override:                 CCTRL_ALLOW_SECOND_FLEET_MANAGER=1" >&2
 }
 
+# D10b: a manual resume by id keeps the conversation's recorded tmux name.
+# _launch_resume_kept_name AGENT ID CWD ROLE_KIND CONTEXT_NAME
+# Read-only: never mints a host id, never writes. Returns 0 and sets
+# _LAUNCH_KEPT_NAME / _LAUNCH_KEPT_FILE when the recorded name is acceptable;
+# otherwise returns 1 with _LAUNCH_KEPT_WHY set (empty when there was simply no
+# record to read, which stays silent). Every check fails closed.
+_launch_known_device_tag() { # SEGMENT
+    case "$1" in ms|mbp) return 0 ;; esac
+    [[ -f "${HOSTS_FILE:-}" ]] || return 1
+    jq -e --arg k "$1" 'type == "object" and has($k)' "$HOSTS_FILE" >/dev/null 2>&1
+}
+
+_launch_resume_kept_name() {
+    _LAUNCH_KEPT_NAME="" _LAUNCH_KEPT_FILE="" _LAUNCH_KEPT_WHY=""
+    local agent="$1" id="$2" cwd="$3" role_kind="$4" context="$5"
+    local prov host file fields rec_host state owner rec tag seg base rec_cwd a b
+    prov="$(_normalize_agent "$agent" 2>/dev/null || true)"
+    [[ -n "$prov" ]] || return 1
+    host="$(_cctrl_host_id_read 2>/dev/null)" || return 1
+    file="$(_task_record_file "$prov" "$host" "$id" 2>/dev/null)" || return 1
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    fields="$(jq -r 'select(.schema_version == 2)
+        | [(.host_id // ""), (.lifecycle_state // ""), (.control_owner // ""), (.tmux_session // .name // "")]
+        | join("\u001f")' "$file" 2>/dev/null)" || fields=""
+    if [[ -z "$fields" ]]; then
+        _LAUNCH_KEPT_WHY="the record of $id is not a readable v2 record"
+        return 1
+    fi
+    IFS=$'\037' read -r rec_host state owner rec <<< "$fields"
+    if [[ "$rec_host" != "$host" ]]; then
+        _LAUNCH_KEPT_WHY="the record of $id belongs to another host"
+        return 1
+    fi
+    if [[ "$state" == archived || "$owner" == app ]]; then
+        _LAUNCH_KEPT_WHY="the record of $id is archived or app-owned"
+        return 1
+    fi
+    if [[ "$rec" != TMUX--* || ${#rec} -gt 200 || "$rec" =~ [[:space:]:.] ]]; then
+        _LAUNCH_KEPT_WHY="the recorded name is not a usable tmux name"
+        return 1
+    fi
+    tag="$(_device_tag 2>/dev/null || true)"
+    if [[ -n "$tag" ]]; then
+        if [[ "$rec" != "TMUX--$tag--"* ]]; then
+            _LAUNCH_KEPT_WHY="the recorded name $rec was minted under another device tag"
+            return 1
+        fi
+    else
+        seg="${rec#TMUX--}"
+        if [[ "$seg" == *--* ]] && _launch_known_device_tag "${seg%%--*}"; then
+            _LAUNCH_KEPT_WHY="the recorded name $rec was minted under another device tag"
+            return 1
+        fi
+    fi
+    if _tmux_is_placeholder "$rec"; then
+        _LAUNCH_KEPT_WHY="the recorded name $rec is a reserved placeholder"
+        return 1
+    fi
+    rec_cwd="$(jq -r '.cwd // ""' "$file" 2>/dev/null || true)"
+    a="$(cd -P -- "$rec_cwd" 2>/dev/null && pwd -P)" || a=""
+    b="$(cd -P -- "$cwd" 2>/dev/null && pwd -P)" || b=""
+    if [[ -z "$a" || -z "$b" || "$a" != "$b" ]]; then
+        _LAUNCH_KEPT_WHY="the recorded cwd differs from this launch's cwd"
+        return 1
+    fi
+    if [[ "$role_kind" == repo ]]; then
+        base="$rec"
+        [[ "$rec" =~ ^(.+)--[0-9]+$ ]] && base="${BASH_REMATCH[1]}"
+        if [[ "$base" != "$context" ]]; then
+            _LAUNCH_KEPT_WHY="the recorded name $rec is not in the $context family"
+            return 1
+        fi
+    fi
+    _LAUNCH_KEPT_NAME="$rec"
+    _LAUNCH_KEPT_FILE="$file"
+    return 0
+}
+
+# _launch_resume_name_held_by_self REC RECORD_FILE: true only when the live
+# session REC provably is the pane this conversation's own record anchors:
+# the session index resolves REC to RECORD_FILE, the record carries a pane
+# anchor, and the live pane (and its start time, when recorded) matches it.
+# Anything unprovable returns 1 (treated as another session's).
+_launch_resume_name_held_by_self() {
+    local rec="$1" file="$2" found pane_id pane_pid pane_started live live_started
+    found="$(_task_record_find_by_session "$rec" 2>/dev/null || true)"
+    [[ -n "$found" && "$found" == "$file" ]] || return 1
+    pane_id="$(jq -r '.pane_id // ""' "$file" 2>/dev/null || true)"
+    pane_pid="$(jq -r '.pane_pid // ""' "$file" 2>/dev/null || true)"
+    pane_started="$(jq -r '.pane_started // ""' "$file" 2>/dev/null || true)"
+    [[ -n "$pane_id" && -n "$pane_pid" ]] || return 1
+    live="$(tmux display-message -p -t "=$rec:" '#{pane_id} #{pane_pid}' 2>/dev/null || true)"
+    [[ "$live" == "$pane_id $pane_pid" ]] || return 1
+    if [[ -n "$pane_started" ]]; then
+        live_started="$(_session_tmux_host_process_started "$rec" "$pane_pid" 2>/dev/null || true)"
+        [[ "$live_started" == "$pane_started" ]] || return 1
+    fi
+    return 0
+}
+
 _launch_detached() {
     # Quote each shell argument byte-for-byte in the C locale. Older Bash
     # multibyte %q can mix raw UTF-8 bytes with octal escapes; jq then replaces
@@ -6495,7 +6595,16 @@ _launch_detached() {
                 shift
                 ;;
             -*)
-                case "$1" in -c|--continue|--resume=*|-r=*) resuming=1 ;; esac
+                case "$1" in
+                    -c|--continue) resuming=1 ;;
+                    --resume=*|-r=*)
+                        resuming=1
+                        # D10b: an inline id is a resume by id, like `-r <id>`.
+                        # Only an id-shaped value counts (never `--resume=--foo`).
+                        local _inline_resume="${1#*=}"
+                        [[ "$_inline_resume" =~ ^[0-9A-Za-z][0-9A-Za-z._-]{7,127}$ ]] && resume_id="$_inline_resume"
+                        ;;
+                esac
                 passthrough+=("$1")
                 passthrough_count=$((passthrough_count + 1))
                 shift
@@ -6872,13 +6981,43 @@ _launch_detached() {
     local base_name="$session_name" picked_name
     # A restore never renames (plan 100 D7/D9): the recorded tmux name is
     # reused when it is free; when it is live, the next free --N of its base.
+    # D10b: a manual resume by id (-r <id>) does the same for a non-fleet
+    # conversation, except that a name held by the conversation itself refuses.
+    # Every probe is exact-match (=NAME): a bare NAME prefix-matches NAME--2.
+    local name_source=derived kept_tmux="" kept_from="" kept_live=false
     if [[ -n "${_CCTRL_REPLAY:-}" && "${_CCTRL_REPLAY_TMUX:-}" == TMUX--* ]]; then
-        if tmux has-session -t "=$_CCTRL_REPLAY_TMUX" 2>/dev/null; then
-            base_name="$_CCTRL_REPLAY_TMUX"
+        kept_tmux="$_CCTRL_REPLAY_TMUX"; kept_from=replay
+    elif [[ -z "${_CCTRL_REPLAY:-}" && -n "$resume_id" && "$role_kind" != fleet \
+            && "${CCTRL_RESUME_KEEP_NAME:-1}" != 0 ]]; then
+        if _launch_resume_kept_name "$detach_agent" "$resume_id" "$metadata_cwd" "$role_kind" "$context_name"; then
+            kept_tmux="$_LAUNCH_KEPT_NAME"; kept_from=resume
+        elif [[ -n "$_LAUNCH_KEPT_WHY" ]]; then
+            echo -e "${DIM}cctrl: not reusing a recorded tmux name: $_LAUNCH_KEPT_WHY.${RESET}" >&2
+        fi
+    fi
+    if [[ -n "$kept_tmux" ]]; then
+        if tmux has-session -t "=$kept_tmux" 2>/dev/null; then
+            kept_live=true
+        elif [[ "$kept_from" == resume ]] && ! _tmux_check_unambiguous "$kept_tmux" resume; then
+            kept_live=true   # on two tmux servers: never adopt an ambiguous name
+        fi
+        if [[ "$kept_live" == true ]]; then
+            if [[ "$kept_from" == resume ]] && _launch_resume_name_held_by_self "$kept_tmux" "$_LAUNCH_KEPT_FILE"; then
+                [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
+                echo -e "${RED}Refusing to launch: conversation $resume_id is already live in $kept_tmux. Attach: cctrl session attach $kept_tmux${RESET}" >&2
+                return 65
+            fi
+            base_name="$kept_tmux"
             if [[ "$base_name" =~ ^(TMUX--.+)--[0-9]+$ ]]; then base_name="${BASH_REMATCH[1]}"; fi
+            name_source=recorded-suffixed
+            [[ "$kept_from" == resume ]] \
+                && echo -e "${DIM}cctrl: the recorded name $kept_tmux is held by another session; resuming under a free --N of $base_name.${RESET}" >&2
         else
-            base_name="$_CCTRL_REPLAY_TMUX"
+            base_name="$kept_tmux"
             fleet_exact_name=true
+            name_source=recorded
+            [[ "$kept_from" == resume ]] \
+                && echo -e "${DIM}cctrl: resuming under the recorded name $kept_tmux.${RESET}" >&2
         fi
     fi
     if [[ "$fleet_exact_name" == true ]]; then
@@ -6891,6 +7030,7 @@ _launch_detached() {
     session_name="$picked_name"
     if [[ -n "$pinned_name" ]] && ! tmux has-session -t "=$pinned_name" 2>/dev/null; then
         session_name="$pinned_name"
+        name_source=pinned
     fi
     # mdec-1110: never launch into a placeholder (server keeper) name, and
     # never start a missing primary server (B2): refuse before writing anything.
@@ -7021,8 +7161,8 @@ _launch_detached() {
         _launch_receipt_tmp="$(mktemp "${CCTRL_LAUNCH_RECEIPT_FILE}.XXXXXX")" || return 1
         chmod 600 "$_launch_receipt_tmp" 2>/dev/null || true
         if ! jq -n --arg session "$session_name" --arg launch_id "${CCTRL_LAST_LAUNCH_ID:-}" \
-            --arg record "${CCTRL_LAST_LAUNCH_RECORD:-}" \
-            '{schema_version:1,session:$session,launch_id:$launch_id,record:$record}' > "$_launch_receipt_tmp"; then
+            --arg record "${CCTRL_LAST_LAUNCH_RECORD:-}" --arg name_source "$name_source" \
+            '{schema_version:1,session:$session,launch_id:$launch_id,record:$record,name_source:$name_source}' > "$_launch_receipt_tmp"; then
             rm -f "$_launch_receipt_tmp"
             return 1
         fi

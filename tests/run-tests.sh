@@ -1305,6 +1305,10 @@ case "${1:-}" in
             elif [[ "$*" == *session_id* ]]; then
                 printf '%s\n' "${match%%:*}"
                 exit 0
+            elif [[ "$*" == *'#{pane_id} #{pane_pid}'* ]]; then
+                # D10b seam: the live pane anchor of a resolved session.
+                printf '%s\n' "${TMUX_FAKE_ANCHOR:-%0 12345}"
+                exit 0
             fi
         fi
         if [[ "$*" == *session_name* ]]; then
@@ -6153,6 +6157,171 @@ test_d10b_failed_new_session_keeps_canonical_record() {
     after_n="$({ ls "$CCTRL_SESSION_METADATA_DIR"/launch-*.json 2>/dev/null || true; } | wc -l | tr -d ' ')"
     [[ "$before_n" == "$after_n" ]] || fail "a failed fresh launch left a provisional launch record ($before_n -> $after_n): $out"
     echo "ok: a failed new-session keeps the canonical record and still removes a fresh launch record"
+}
+
+_d10b_fixture() {
+    # args: tag conv-id recorded-name [extra start flags...]
+    # Seeds the conversation's canonical record with one launch, rewrites its
+    # tmux name and pane anchor, and points the session index at it. Sets
+    # RF_REC (record), RF_STATE (fake-tmux live state, empty) and D10B_SEED.
+    local tag="$1" conv="$2" rec_name="$3" out digest
+    shift 3
+    _rf_setup "$tag" '{}'
+    out="$(_rf start -d --agent claude "$@" -r "$conv" --purpose p "$RF_PROJ")"
+    D10B_SEED="$(_rf_session "$out")"
+    [[ -n "$D10B_SEED" ]] || fail "d10b seed launch failed: $out"
+    RF_REC="$(grep -l "\"provider_task_id\": \"$conv\"" "$CCTRL_SESSION_METADATA_DIR"/task-*.json | head -n 1)"
+    [[ -f "$RF_REC" ]] || fail "d10b: no canonical record for $conv"
+    jq --arg n "$rec_name" --arg c "$(cd -P "$RF_PROJ" && pwd -P)" \
+        '.tmux_session = $n | .name = $n | .cwd = $c | .pane_id = "%7" | .pane_pid = "4242"' \
+        "$RF_REC" > "$RF_REC.tmp" && mv "$RF_REC.tmp" "$RF_REC"
+    digest="$(printf '%s' "$rec_name" | shasum -a 256 | awk '{print $1}')"
+    printf '%s\n' "${RF_REC##*/}" > "$CCTRL_SESSION_METADATA_DIR/.session-index-$digest.ref"
+    RF_STATE="$TMPDIR/rf-$tag.state"
+    : > "$RF_STATE"
+    : > "$RF_LOG"
+}
+
+_d10b_resume() {
+    # args: conv-id [more start args]; runs a resume under the fake live state
+    local conv="$1"; shift
+    TMUX_FAKE_STATE="$RF_STATE" CCTRL_LAUNCH_RECEIPT_FILE="$RF_PROJ.receipt" \
+        _rf start -d --agent claude "$@" -r "$conv" --purpose p "$RF_PROJ"
+}
+
+test_d10b_resume_reuses_free_recorded_name() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b1 conv-d10b-t1-0001 TMUX--ms--work--3
+    local out
+    out="$(_d10b_resume conv-d10b-t1-0001)"
+    [[ "$(_rf_session "$out")" == TMUX--ms--work--3 ]] || fail "expected the recorded name TMUX--ms--work--3: $out"
+    grep -q 'new-session -d -s TMUX--ms--work--3' "$RF_LOG" || fail "tmux log has no new-session under the recorded name"
+    [[ "$(jq -r .name_source "$RF_PROJ.receipt")" == recorded ]] || fail "receipt name_source: $(cat "$RF_PROJ.receipt")"
+    assert_contains "$out" "resuming under the recorded name TMUX--ms--work--3"
+    echo "ok: a resume by id keeps a free recorded name and says so in the receipt"
+}
+
+test_d10b_prefix_trap_uses_exact_probes() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b2 conv-d10b-t2-0001 TMUX--ms--work
+    printf '$1:TMUX--ms--work--2\n' > "$RF_STATE"
+    local out body
+    out="$(_d10b_resume conv-d10b-t2-0001)"
+    [[ "$(_rf_session "$out")" == TMUX--ms--work ]] \
+        || fail "a live work--2 must not make the free recorded name look taken: $out"
+    body="$(sed -n '/^_launch_resume_kept_name() {/,/^_launch_detached() {/p' "$ROOT/cctrl")"
+    [[ "$body" == *'has-session'* || "$body" == *'display-message'* ]] || fail "helper extraction found no tmux probe"
+    if grep -nE 'has-session -t "?\$|display-message[^|]* -t "?\$|has-session -t [A-Za-z]' <<< "$body" >/dev/null; then
+        fail "a new tmux probe is not exact-match (=NAME)"
+    fi
+    echo "ok: the recorded-name probe is exact-match; a live NAME--2 does not shadow a free NAME"
+}
+
+test_d10b_held_by_self_refuses_65() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b3 conv-d10b-t3-0001 TMUX--ms--work--3
+    printf '$1:TMUX--ms--work--3\n' > "$RF_STATE"
+    local out rc=0 before after
+    before="$(cksum < "$RF_REC")"
+    out="$(TMUX_FAKE_ANCHOR='%7 4242' _d10b_resume conv-d10b-t3-0001)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "expected exit 65, got $rc: $out"
+    assert_contains "$out" "cctrl session attach TMUX--ms--work--3"
+    ! grep -q 'new-session' "$RF_LOG" || fail "a refused resume must not start a session"
+    after="$(cksum < "$RF_REC")"
+    [[ "$before" == "$after" ]] || fail "a refused resume changed the record"
+    echo "ok: a resume of a conversation already live in its recorded name refuses with 65 and an attach hint"
+}
+
+test_d10b_held_by_another_takes_suffix() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b4 conv-d10b-t4-0001 TMUX--ms--work--3
+    printf '$1:TMUX--ms--work--3\n$2:TMUX--ms--work\n' > "$RF_STATE"
+    local out
+    out="$(TMUX_FAKE_ANCHOR='%9 1' _d10b_resume conv-d10b-t4-0001)"
+    [[ "$(_rf_session "$out")" == TMUX--ms--work--2 ]] || fail "expected TMUX--ms--work--2: $out"
+    assert_contains "$out" "held by another session"
+    [[ "$(jq -r .name_source "$RF_PROJ.receipt")" == recorded-suffixed ]] || fail "receipt: $(cat "$RF_PROJ.receipt")"
+    echo "ok: a recorded name held by another session resumes under the next free --N of its base"
+}
+
+test_d10b_different_cwd_uses_derived_name() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b5 conv-d10b-t5-0001 TMUX--ms--work--3
+    jq --arg c "$TMPDIR" '.cwd = $c' "$RF_REC" > "$RF_REC.tmp" && mv "$RF_REC.tmp" "$RF_REC"
+    local out
+    out="$(_d10b_resume conv-d10b-t5-0001)"
+    [[ "$(_rf_session "$out")" == "$D10B_SEED" ]] || fail "a different cwd must use the derived name ($D10B_SEED): $out"
+    assert_contains "$out" "cwd"
+    [[ "$(jq -r .name_source "$RF_PROJ.receipt")" == derived ]] || fail "receipt: $(cat "$RF_PROJ.receipt")"
+    echo "ok: a recorded name from another cwd is not adopted"
+}
+
+test_d10b_repo_orchestrator_family_check() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b6 conv-d10b-t6-0001 TMUX--ms--work --orch-kind repo
+    local out derived="$D10B_SEED"
+    [[ "$derived" == TMUX--ms--orch-* ]] || fail "seed should be an orch name: $derived"
+    out="$(_d10b_resume conv-d10b-t6-0001)"
+    [[ "$(_rf_session "$out")" == "$derived" ]] || fail "a worker-shaped recorded name must not propagate to a repo orchestrator: $out"
+    jq --arg n "$derived--2" '.tmux_session = $n | .name = $n' "$RF_REC" > "$RF_REC.tmp" && mv "$RF_REC.tmp" "$RF_REC"
+    out="$(_d10b_resume conv-d10b-t6-0001)"
+    [[ "$(_rf_session "$out")" == "$derived--2" ]] || fail "an orch-family recorded name should be kept: $out"
+    echo "ok: a repo orchestrator keeps only orch-family recorded names"
+}
+
+test_d10b_fleet_record_is_unchanged() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b7 conv-d10b-t7-0001 TMUX--ms--work --orch-kind fleet
+    local out
+    out="$(_d10b_resume conv-d10b-t7-0001)"
+    [[ "$(_rf_session "$out")" == TMUX--ms--fleet-claude ]] || fail "a fleet record must keep the fleet-<agent> name: $out"
+    echo "ok: a fleet manager resume still names itself fleet-<agent>"
+}
+
+test_d10b_keep_name_off_switch() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b8 conv-d10b-t8-0001 TMUX--ms--work--3
+    local out
+    out="$(CCTRL_RESUME_KEEP_NAME=0 _d10b_resume conv-d10b-t8-0001)"
+    [[ "$(_rf_session "$out")" == "$D10B_SEED" ]] || fail "CCTRL_RESUME_KEEP_NAME=0 must use the derived name: $out"
+    echo "ok: CCTRL_RESUME_KEEP_NAME=0 restores the derived name"
+}
+
+test_d10b_inline_resume_forms_keep_the_name() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b9 conv-d10b-t9-0001 TMUX--ms--work--3
+    local out form
+    for form in --resume=conv-d10b-t9-0001 -r=conv-d10b-t9-0001; do
+        out="$(TMUX_FAKE_STATE="$RF_STATE" CCTRL_LAUNCH_RECEIPT_FILE="$RF_PROJ.receipt" _rf start -d --agent claude "$form" --purpose p "$RF_PROJ")"
+        [[ "$(_rf_session "$out")" == TMUX--ms--work--3 ]] || fail "$form should keep the recorded name: $out"
+    done
+    out="$(TMUX_FAKE_STATE="$RF_STATE" _rf start -d --agent claude --resume=--foo-bar-baz1 --purpose p "$RF_PROJ")"
+    [[ "$(_rf_session "$out")" != TMUX--ms--work--3 ]] || fail "--resume=--foo must not be taken as an id: $out"
+    echo "ok: --resume=<id> and -r=<id> resume by id; a flag-shaped value does not"
+}
+
+test_d10b_missing_host_id_is_silent_and_writes_nothing() {
+    local d="$TMPDIR/d10b-nohost" rc=0
+    mkdir -p "$d"
+    rm -f "$d/host-id"
+    cctrl_source_eval 'CCTRL_HOST_ID_FILE="$1/host-id"; _launch_resume_kept_name claude conv-d10b-t10-0001 "$1" "" ctx' "$d" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "missing host id must decline the recorded name (rc=$rc)"
+    [[ ! -e "$d/host-id" ]] || fail "the read-only name lookup created a host-id file"
+    echo "ok: a missing host id declines the recorded name and creates nothing"
+}
+
+test_d10b_foreign_device_and_placeholder_names_declined() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10b12 conv-d10b-t12-0001 TMUX--mbp--work--3
+    local out
+    out="$(_d10b_resume conv-d10b-t12-0001)"
+    [[ "$(_rf_session "$out")" == "$D10B_SEED" ]] || fail "a name minted under another device tag must not be adopted: $out"
+    assert_contains "$out" "another device tag"
+    jq '.tmux_session = "TMUX--ms--keeper" | .name = "TMUX--ms--keeper"' "$RF_REC" > "$RF_REC.tmp" && mv "$RF_REC.tmp" "$RF_REC"
+    local rc=0
+    cctrl_source_eval '_tmux_routing_active() { return 0; }; _CCTRL_TMUX_PLACEHOLDERS="TMUX--ms--keeper"$'\n'; CCTRL_HOST_PREFIX=ms; _launch_resume_kept_name claude conv-d10b-t12-0001 "$1" "" ctx' "$RF_PROJ" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "a placeholder recorded name must be declined (rc=$rc)"
+    echo "ok: foreign-device and placeholder recorded names are not adopted"
 }
 
 test_snapshot_launch_flags_carry_role_and_kind() {
