@@ -29422,7 +29422,7 @@ test_self_install_gate_reuses_a_matching_pass_stamp() {
     # 4. Mismatch (other bash, other python, other tree): the full suite runs.
     local variant vb vp vt
     # The other bash is 2.0, never 3.2: the CI bash-3.2 leg runs this suite under 3.2.
-    for variant in "2.0 $pmm $tree""$bmm 2.7 $tree" "$bmm $pmm 0000000000000000000000000000000000000000"; do
+    for variant in "2.0 $pmm $tree" "$bmm 2.7 $tree" "$bmm $pmm 0000000000000000000000000000000000000000"; do
         rm -rf "$base/state"; : > "$log"
         read -r vb vp vt <<< "$variant"
         ( source "$ROOT/lib/suite-gate.sh"; export CCTRL_SUITE_STATE_DIR="$base/state"; suite_stamp_write "$vt" "$vb" "$vp" >/dev/null )
@@ -29462,7 +29462,7 @@ _pred_fixture() {
 }
 
 _pred_write_record() { # dir name conversation_id
-    CCTRL_SESSION_METADATA_DIR="$1/meta" CCTRL_HOST_ID_FILE="$1/host-id" CCTRL_DATA_DIR="$1/data" \
+    CCTRL_DEVICE_TAG=ms CCTRL_SESSION_METADATA_DIR="$1/meta" CCTRL_HOST_ID_FILE="$1/host-id" CCTRL_DATA_DIR="$1/data" \
         cctrl_source_eval "_session_write_metadata $2 /tmp @pred @pred @pred p '' cmd '' claude $3" \
         || fail "fixture record could not be written"
 }
@@ -29472,7 +29472,7 @@ _pred_cctrl() { # dir env-assignments... -- cctrl args
     local -a envs=()
     while [[ "$1" != -- ]]; do envs+=("$1"); shift; done
     shift
-    env PATH="$dir/bin:$PATH" TMUX_LOG="$dir/tmux.log" CCTRL_AGENT=claude CCTRL_EMIT_SESSION=1 CCTRL_RESUME_POLL_TIMEOUT=0 \
+    env PATH="$dir/bin:$PATH" TMUX_LOG="$dir/tmux.log" CCTRL_AGENT=claude CCTRL_DEVICE_TAG=ms CCTRL_EMIT_SESSION=1 CCTRL_RESUME_POLL_TIMEOUT=0 \
         CCTRL_SESSION_METADATA_DIR="$dir/meta" CCTRL_HOST_ID_FILE="$dir/host-id" CCTRL_DATA_DIR="$dir/data" \
         CCTRL_CLAUDE_SESSIONS_DIR="$dir/claude-sessions" CCTRL_RESOLVE_PANES_FILE="$dir/panes.json" \
         CCTRL_RESOLVE_PROCESS_FILE="$dir/process.json" CCTRL_RESOLVE_CODEX_EVIDENCE_FILE="$dir/codex.json" \
