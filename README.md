@@ -1082,9 +1082,9 @@ becoming the restore source.
 **Resuming by id keeps the recorded tmux name (D10b).** `cctrl start -d -r <id>`
 (also `--resume=<id>`, `-r=<id>` and `cctrl @key -r <id>`) reuses the tmux name
 the conversation's record holds, checked exact-match (`=NAME`), when that name is
-free. If the conversation is already live in that name (the record's pane
-anchor matches the live pane) the launch refuses with exit 65 and an attach hint,
-so there is never a second writer. If another session holds the name, the launch
+free. If the conversation is already live in ANY session (a live session whose index
+entry resolves to the record, or whose pane is the recorded pane) the launch
+refuses with exit 65 and an attach hint, so there is never a second writer. If another session holds the name, the launch
 takes the next free `--N` of the recorded base, as restore does. The recorded
 name is declined (derived name, one dim stderr reason) for an archived or
 app-owned record, another device tag or host, a placeholder name, a different

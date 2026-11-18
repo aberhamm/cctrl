@@ -108,7 +108,7 @@ memory and attention. One session = one purpose.
    To bring back a known conversation, resume it by id (`cctrl start -d <dir>
    -r <id>`), not with a bare `--resume`: by-id resumes keep the conversation's
    recorded tmux name when it is free, a bare picker cannot (ids:
-   `cctrl session ls --json`). If the conversation is already live in that name
+   `cctrl session ls --json`). If the conversation is already live in any session
    the launch refuses with exit 65; attach instead.
 
    Add `--profile <name>` when the new session should run on a different

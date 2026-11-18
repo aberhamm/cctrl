@@ -1239,6 +1239,16 @@ case "${1:-}" in
                 fi
             done
         fi
+        # D10b seam: a started session becomes live in TMUX_FAKE_STATE, so a
+        # real second launch sees the first one (real-flow tests).
+        if [[ "${TMUX_FAKE_NEW_SESSION_LIVE:-}" == 1 && -n "${TMUX_FAKE_STATE:-}" ]]; then
+            for ((_i = 1; _i < $#; _i++)); do
+                if [[ "${!_i}" == "-s" ]]; then
+                    _j=$((_i + 1))
+                    printf '$%s:%s\n' "$((RANDOM + 100))" "${!_j}" >> "$TMUX_FAKE_STATE"
+                fi
+            done
+        fi
         exit 0
         ;;
     has-session)
@@ -6237,11 +6247,97 @@ test_d10b_held_by_another_takes_suffix() {
     _d10b_fixture d10b4 conv-d10b-t4-0001 TMUX--ms--work--3
     printf '$1:TMUX--ms--work--3\n$2:TMUX--ms--work\n' > "$RF_STATE"
     local out
+    # A session that is not this conversation's: its index entry is not X's.
+    rm -f "$CCTRL_SESSION_METADATA_DIR/.session-index-$(printf '%s' TMUX--ms--work--3 | shasum -a 256 | awk '{print $1}').ref"
     out="$(TMUX_FAKE_ANCHOR='%9 1' _d10b_resume conv-d10b-t4-0001)"
     [[ "$(_rf_session "$out")" == TMUX--ms--work--2 ]] || fail "expected TMUX--ms--work--2: $out"
     assert_contains "$out" "held by another session"
     [[ "$(jq -r .name_source "$RF_PROJ.receipt")" == recorded-suffixed ]] || fail "receipt: $(cat "$RF_PROJ.receipt")"
     echo "ok: a recorded name held by another session resumes under the next free --N of its base"
+}
+
+test_d10b_real_flow_second_resume_while_live_refuses_65() {
+    unset TMUX TMUX_PANE
+    _rf_setup d10bb1 '{}'
+    local state="$TMPDIR/rf-d10bb1.state" out rc=0 first nlog
+    : > "$state"
+    # No hand-written anchors or index: resume X, then resume X again while the
+    # first is still live.
+    out="$(TMUX_FAKE_STATE="$state" TMUX_FAKE_NEW_SESSION_LIVE=1 _rf start -d --agent claude -r conv-d10bb-1-0001 --purpose p "$RF_PROJ")"
+    first="$(_rf_session "$out")"
+    [[ -n "$first" ]] || fail "first resume failed: $out"
+    grep -q "$first" "$state" || fail "fake tmux did not record the first session as live"
+    nlog="$(grep -c 'new-session' "$RF_LOG" || true)"
+    out="$(TMUX_FAKE_STATE="$state" TMUX_FAKE_NEW_SESSION_LIVE=1 _rf start -d --agent claude -r conv-d10bb-1-0001 --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a second resume while the conversation is live must exit 65, got $rc: $out"
+    assert_contains "$out" "cctrl session attach $first"
+    [[ "$(grep -c 'new-session' "$RF_LOG" || true)" == "$nlog" ]] || fail "the refused resume started a session"
+    echo "ok: resuming a conversation that a previous real resume left live refuses with 65"
+}
+
+test_d10b_real_flow_live_in_second_name_refuses_65() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10bb2 conv-d10bb-2-0001 TMUX--ms--work--3
+    local out rc=0
+    # work--3 and work are held by foreign sessions, so X resumes into work--2.
+    rm -f "$CCTRL_SESSION_METADATA_DIR/.session-index-$(printf '%s' TMUX--ms--work--3 | shasum -a 256 | awk '{print $1}').ref"
+    printf '$1:TMUX--ms--work--3\n$2:TMUX--ms--work\n' > "$RF_STATE"
+    out="$(TMUX_FAKE_ANCHOR='%9 1' TMUX_FAKE_NEW_SESSION_LIVE=1 _d10b_resume conv-d10bb-2-0001)"
+    [[ "$(_rf_session "$out")" == TMUX--ms--work--2 ]] || fail "expected work--2: $out"
+    # work--3 frees up; X is still live in work--2: no second writer in work--3.
+    printf '$7:TMUX--ms--work--2\n' > "$RF_STATE"
+    : > "$RF_LOG"
+    out="$(TMUX_FAKE_ANCHOR='%9 1' TMUX_FAKE_NEW_SESSION_LIVE=1 _d10b_resume conv-d10bb-2-0001)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "X is live in work--2; a resume must exit 65, got $rc: $out"
+    assert_contains "$out" "cctrl session attach TMUX--ms--work--2"
+    ! grep -q 'new-session' "$RF_LOG" || fail "a refused resume started a session"
+    # And with work--3 live again (foreign) the answer is the same: still 65.
+    printf '$7:TMUX--ms--work--2\n$8:TMUX--ms--work--3\n' > "$RF_STATE"
+    rc=0
+    out="$(TMUX_FAKE_ANCHOR='%9 1' _d10b_resume conv-d10bb-2-0001)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "X live in work--2 with work--3 taken: expected 65, got $rc: $out"
+    ! grep -q 'new-session' "$RF_LOG" || fail "a refused resume started a session"
+    echo "ok: a conversation live under a second name is refused whether the recorded name is free or taken"
+}
+
+test_d10b_anchor_only_match_refuses_65() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10bb3 conv-d10bb-3-0001 TMUX--ms--work--3
+    # The live pane is the recorded pane, but the index entry points elsewhere.
+    rm -f "$CCTRL_SESSION_METADATA_DIR/.session-index-$(printf '%s' TMUX--ms--work--3 | shasum -a 256 | awk '{print $1}').ref"
+    printf '$1:TMUX--ms--elsewhere\n' > "$RF_STATE"
+    local out rc=0
+    out="$(TMUX_FAKE_ANCHOR='%7 4242' _d10b_resume conv-d10bb-3-0001)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "a live pane matching the record anchor must refuse, got $rc: $out"
+    assert_contains "$out" "cctrl session attach TMUX--ms--elsewhere"
+    echo "ok: a live pane matching the recorded anchor refuses even when no index entry says so"
+}
+
+test_d10b_failed_first_resume_leaves_no_new_record() {
+    unset TMUX TMUX_PANE
+    _rf_setup d10bb4 '{}'
+    local out derived rc=0 n idx
+    # Learn the derived name with a throwaway resume of another conversation.
+    out="$(_rf start -d --agent claude -r conv-d10bb-4-other --purpose p "$RF_PROJ")"
+    derived="$(_rf_session "$out")"
+    n="$({ ls "$CCTRL_SESSION_METADATA_DIR"/task-*.json 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    out="$(TMUX_FAKE_FAIL_NEW_SESSION="$derived" _rf start -d --agent claude -r conv-d10bb-4-0001 --purpose p "$RF_PROJ")" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "the failed launch must fail: $out"
+    ! grep -l '"provider_task_id": "conv-d10bb-4-0001"' "$CCTRL_SESSION_METADATA_DIR"/task-*.json >/dev/null 2>&1 \
+        || fail "a failed first resume left a new active record for a session that is not running"
+    [[ "$({ ls "$CCTRL_SESSION_METADATA_DIR"/task-*.json 2>/dev/null || true; } | wc -l | tr -d ' ')" == "$n" ]] || fail "record count changed"
+    idx="$(head -1 "$CCTRL_SESSION_METADATA_DIR/.session-index-$(printf '%s' "$derived" | shasum -a 256 | awk '{print $1}').ref" 2>/dev/null || true)"
+    [[ -z "$idx" || -f "$CCTRL_SESSION_METADATA_DIR/$idx" ]] || fail "the session index dangles at $idx"
+    assert_not_contains "$out" "now names"
+    echo "ok: a failed resume that created the record removes it and leaves no dangling index"
+}
+
+test_d10b_held_proof_start_time_is_bounded() {
+    local body
+    body="$(sed -n '/^_launch_resume_live_holder() {/,/^_launch_detached() {/p' "$ROOT/cctrl")"
+    [[ "$body" == *'_session_tmux_host_process_started "$s" "$pane_pid" "$run_bound"'* ]] \
+        || fail "the start-time lookup in the live-holder proof is unbounded"
+    echo "ok: the live-holder start-time lookup carries a bound"
 }
 
 test_d10b_different_cwd_uses_derived_name() {
@@ -29606,6 +29702,7 @@ test_predecessor_retire_fresh_launch_waits_for_the_conversation_id() {
 # codex-adapter add a python unittest step next to their tests.
 _group_tests() {
     case "$1" in
+        d10b) printf '%s\n' test_d10b_failed_new_session_keeps_canonical_record test_d10b_resume_reuses_free_recorded_name test_d10b_prefix_trap_uses_exact_probes test_d10b_held_by_self_refuses_65 test_d10b_held_by_another_takes_suffix test_d10b_real_flow_second_resume_while_live_refuses_65 test_d10b_real_flow_live_in_second_name_refuses_65 test_d10b_anchor_only_match_refuses_65 test_d10b_failed_first_resume_leaves_no_new_record test_d10b_held_proof_start_time_is_bounded test_d10b_different_cwd_uses_derived_name test_d10b_repo_orchestrator_family_check test_d10b_fleet_record_is_unchanged test_d10b_keep_name_off_switch test_d10b_inline_resume_forms_keep_the_name test_d10b_missing_host_id_is_silent_and_writes_nothing test_d10b_foreign_device_and_placeholder_names_declined test_d10b_bare_resume_prints_hint_only ;;
         role-skills) printf '%s\n' test_role_skills_ask_rule ;;
         bash-leg) printf '%s\n' test_bash_leg_is_honest test_no_shimless_test_path test_profile_settings_gc_portable_membership ;;
         session-prune) printf '%s\n' test_session_prune_never_prompted_claude test_session_prune_fresh_active_not_candidate test_session_prune_codex_no_claude_transcript_bug_guard test_session_prune_codex_never_prompted test_session_prune_dry_run_closes_nothing test_session_prune_claude_long_transcript_user_turn_not_flagged test_session_prune_yes_caps_large_batch ;;

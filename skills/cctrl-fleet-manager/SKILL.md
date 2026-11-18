@@ -81,7 +81,7 @@ cctrl start -d <dir> --orch-kind fleet --succeeds <old-session> -n "<label>" -m 
   renames; the guard does not apply to it). If that leaves two live fleet
   managers (`session ls` prints a footer), the human decides which one to close
   **before** any handover, because `--succeeds` needs exactly one.
-- To resume a known conversation under its own tmux name, use `cctrl start -d <dir> -r <id>`, not a bare `--resume` (the picker cannot know the record; it prints a hint). A by-id resume reuses a free recorded name, refuses with exit 65 if the conversation is already live in it, and takes the next `--N` if another session holds it; `CCTRL_RESUME_KEEP_NAME=0` turns that off. Fleet managers keep `fleet-<runtime>`.
+- To resume a known conversation under its own tmux name, use `cctrl start -d <dir> -r <id>`, not a bare `--resume` (the picker cannot know the record; it prints a hint). A by-id resume reuses a free recorded name, refuses with exit 65 if the conversation is already live in any session, and takes the next `--N` if another session holds it; `CCTRL_RESUME_KEEP_NAME=0` turns that off. Fleet managers keep `fleet-<runtime>`.
 - A relaunch retires stale claims on its tmux name: see `predecessor-retire.jsonl` under the cctrl state audit dir; undo with `cctrl task predecessor-undo`; disable with `CCTRL_PREDECESSOR_CLOSE=off`. Never run `cctrl task resolve-conflicts --apply` on the live fleet without a supervised dry run first.
 - After a **power cycle**, read `cctrl session restore status` first. The
   boot LaunchAgent runs `cctrl session restore --boot`, and that invocation

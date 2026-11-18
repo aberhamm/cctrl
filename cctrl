@@ -6380,26 +6380,60 @@ _launch_resume_kept_name() {
     return 0
 }
 
-# _launch_resume_name_held_by_self REC RECORD_FILE: true only when the live
-# session REC provably is the pane this conversation's own record anchors:
-# the session index resolves REC to RECORD_FILE, the record carries a pane
-# anchor, and the live pane (and its start time, when recorded) matches it.
-# Anything unprovable returns 1 (treated as another session's).
-_launch_resume_name_held_by_self() {
-    local rec="$1" file="$2" found pane_id pane_pid pane_started live live_started
-    found="$(_task_record_find_by_session "$rec" 2>/dev/null || true)"
-    [[ -n "$found" && "$found" == "$file" ]] || return 1
+# _launch_resume_record_file AGENT ID: print the conversation's canonical
+# task record path when one exists on this host. Read-only: never mints a host
+# id and never writes.
+_launch_resume_record_file() {
+    local prov host file
+    prov="$(_normalize_agent "$1" 2>/dev/null || true)"
+    [[ -n "$prov" ]] || return 1
+    host="$(_cctrl_host_id_read 2>/dev/null)" || return 1
+    file="$(_task_record_file "$prov" "$host" "$2" 2>/dev/null)" || return 1
+    [[ -f "$file" && ! -L "$file" ]] || return 1
+    printf '%s' "$file"
+}
+
+# _launch_resume_live_holder AGENT ID: print the name of a live tmux session
+# that is, or may be, this conversation, and return 0; return 1 when none is
+# found. A session counts when EITHER signal says so:
+#   - its session-index entry resolves to the conversation's record (the index
+#     is repointed by every cctrl launch into that name, so it survives the
+#     record keeping an earlier execution's name and pane anchor), or
+#   - its live pane is the pane the record anchors (id and pid, plus the start
+#     time when one is recorded).
+# It scans every live session, not just the recorded name, so a conversation
+# resumed under another name (work--2 while the record says work--3) is found.
+# Fails toward refusing: an unprovable-but-indexed session is treated as X.
+_launch_resume_live_holder() {
+    local file base s ref pane_id pane_pid pane_started live live_started run_bound
+    file="$(_launch_resume_record_file "$1" "$2")" || return 1
+    base="${file##*/}"
     pane_id="$(jq -r '.pane_id // ""' "$file" 2>/dev/null || true)"
     pane_pid="$(jq -r '.pane_pid // ""' "$file" 2>/dev/null || true)"
     pane_started="$(jq -r '.pane_started // ""' "$file" 2>/dev/null || true)"
-    [[ -n "$pane_id" && -n "$pane_pid" ]] || return 1
-    live="$(tmux display-message -p -t "=$rec:" '#{pane_id} #{pane_pid}' 2>/dev/null || true)"
-    [[ "$live" == "$pane_id $pane_pid" ]] || return 1
-    if [[ -n "$pane_started" ]]; then
-        live_started="$(_session_tmux_host_process_started "$rec" "$pane_pid" 2>/dev/null || true)"
-        [[ "$live_started" == "$pane_started" ]] || return 1
-    fi
-    return 0
+    run_bound="${CCTRL_TMUX_TIMEOUT_SECONDS:-5}"
+    [[ "$run_bound" =~ ^[1-9][0-9]*$ ]] || run_bound=5
+    while IFS= read -r s; do
+        [[ -n "$s" ]] || continue
+        ref="$(head -1 "$(_session_record_index_file "$s" 2>/dev/null)" 2>/dev/null || true)"
+        if [[ "$ref" == "$base" ]]; then
+            printf '%s' "$s"
+            return 0
+        fi
+        [[ -n "$pane_id" && -n "$pane_pid" ]] || continue
+        live="$(tmux display-message -p -t "=$s:" '#{pane_id} #{pane_pid}' 2>/dev/null || true)"
+        [[ "$live" == "$pane_id $pane_pid" ]] || continue
+        if [[ -n "$pane_started" ]]; then
+            # Bounded: a wedged tmux server must not hang the launch. An
+            # unreadable start time cannot prove a different pane, so the
+            # matching id and pid stand.
+            live_started="$(_session_tmux_host_process_started "$s" "$pane_pid" "$run_bound" 2>/dev/null || true)"
+            [[ -z "$live_started" || "$live_started" == "$pane_started" ]] || continue
+        fi
+        printf '%s' "$s"
+        return 0
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
+    return 1
 }
 
 _launch_detached() {
@@ -6992,6 +7026,18 @@ _launch_detached() {
     # conversation, except that a name held by the conversation itself refuses.
     # Every probe is exact-match (=NAME): a bare NAME prefix-matches NAME--2.
     local name_source=derived kept_tmux="" kept_from="" kept_live=false
+    # D10b-2: a conversation already live in ANY session is never started a
+    # second time. The record's own name and pane anchor describe its first
+    # execution only, so look at every live session (index or pane), not at the
+    # recorded name. Independent of CCTRL_RESUME_KEEP_NAME: it is a safety check.
+    if [[ -z "${_CCTRL_REPLAY:-}" && -n "$resume_id" && "$role_kind" != fleet ]]; then
+        local live_holder=""
+        if live_holder="$(_launch_resume_live_holder "$detach_agent" "$resume_id")"; then
+            [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
+            echo -e "${RED}Refusing to launch: conversation $resume_id is already live in $live_holder. Attach: cctrl session attach $live_holder${RESET}" >&2
+            return 65
+        fi
+    fi
     if [[ -n "${_CCTRL_REPLAY:-}" && "${_CCTRL_REPLAY_TMUX:-}" == TMUX--* ]]; then
         kept_tmux="$_CCTRL_REPLAY_TMUX"; kept_from=replay
     elif [[ -z "${_CCTRL_REPLAY:-}" && -n "$resume_id" && "$role_kind" != fleet \
@@ -7009,11 +7055,6 @@ _launch_detached() {
             kept_live=true   # on two tmux servers: never adopt an ambiguous name
         fi
         if [[ "$kept_live" == true ]]; then
-            if [[ "$kept_from" == resume ]] && _launch_resume_name_held_by_self "$kept_tmux" "$_LAUNCH_KEPT_FILE"; then
-                [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
-                echo -e "${RED}Refusing to launch: conversation $resume_id is already live in $kept_tmux. Attach: cctrl session attach $kept_tmux${RESET}" >&2
-                return 65
-            fi
             base_name="$kept_tmux"
             if [[ "$base_name" =~ ^(TMUX--.+)--[0-9]+$ ]]; then base_name="${BASH_REMATCH[1]}"; fi
             name_source="recorded-suffixed"
@@ -7106,9 +7147,10 @@ _launch_detached() {
     # D10b 3.5: remember what this call is about to overwrite, so a failed
     # new-session below only ever undoes what THIS call wrote. A resume merges
     # into the conversation's canonical task-*.json and repoints the index.
-    local _prev_index_ref=""
+    local _prev_index_ref="" _rec_preexisted=false
     CCTRL_LAST_LAUNCH_RECORD=""
     if [[ -n "$resume_id" ]]; then
+        _launch_resume_record_file "$detach_agent" "$resume_id" >/dev/null && _rec_preexisted=true
         _prev_index_ref="$(head -1 "$(_session_record_index_file "$session_name" 2>/dev/null)" 2>/dev/null || true)"
     fi
     if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
@@ -7138,9 +7180,26 @@ _launch_detached() {
         case "${_failed_rec##*/}" in
             launch-*.json) rm -f "$_failed_rec" 2>/dev/null || true ;;
             task-*.json)
-                echo -e "${YELLOW}cctrl: could not start tmux session; the record of ${resume_id:-this conversation} now names $session_name, which is not live.${RESET}" >&2
-                if [[ -n "$_prev_index_ref" && -f "$SESSION_METADATA_DIR/$_prev_index_ref" ]]; then
-                    _session_record_index_update "$session_name" "$SESSION_METADATA_DIR/$_prev_index_ref" 2>/dev/null || true
+                if [[ "$_rec_preexisted" == true ]]; then
+                    # The conversation's own record is never deleted here (R5).
+                    echo -e "${YELLOW}cctrl: could not start tmux session $session_name (not live); the record of ${resume_id:-this conversation} was kept, not deleted.${RESET}" >&2
+                    if [[ -n "$_prev_index_ref" && -f "$SESSION_METADATA_DIR/$_prev_index_ref" ]]; then
+                        _session_record_index_update "$session_name" "$SESSION_METADATA_DIR/$_prev_index_ref" 2>/dev/null || true
+                    fi
+                else
+                    # This call created the record: leave nothing claiming a
+                    # session that is not running (same as a fresh launch).
+                    local _idx_file
+                    _idx_file="$(_session_record_index_file "$session_name" 2>/dev/null || true)"
+                    if [[ -n "$_idx_file" && "$(head -1 "$_idx_file" 2>/dev/null || true)" == "${_failed_rec##*/}" ]]; then
+                        if [[ -n "$_prev_index_ref" && -f "$SESSION_METADATA_DIR/$_prev_index_ref" ]]; then
+                            _session_record_index_update "$session_name" "$SESSION_METADATA_DIR/$_prev_index_ref" 2>/dev/null || true
+                        else
+                            rm -f "$_idx_file" 2>/dev/null || true
+                        fi
+                    fi
+                    rm -f "$_failed_rec" 2>/dev/null || true
+                    echo -e "${YELLOW}cctrl: could not start tmux session $session_name; the new record of ${resume_id:-this conversation} was removed.${RESET}" >&2
                 fi
                 ;;
         esac
@@ -24040,7 +24099,9 @@ cmd_help() {
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
     echo "                              Resuming by id keeps the session's recorded tmux name when free"
-    echo "                              (CCTRL_RESUME_KEEP_NAME=0 disables); a bare --resume cannot"
+    echo "                              (CCTRL_RESUME_KEEP_NAME=0 disables). A conversation"
+    echo "                              already live in any session is refused (exit 65); a bare"
+    echo "                              --resume cannot keep a name (use -r <id>)"
     echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
     echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"
