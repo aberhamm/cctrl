@@ -581,7 +581,7 @@ class CliProcessTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.env = dict(os.environ)
         for key in ["CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDECODE",
-                    "CCTRL_EXTERNAL_IDENTITY", "CCTRL_CALLER_UMASK"]:
+                    "CCTRL_EXTERNAL_IDENTITY", "CCTRL_CALLER_UMASK", "TMUX", "TMUX_PANE", "CCTRL_PEER", "CCTRL_SESSION_NAME"]:
             self.env.pop(key, None)
         self.proxy = self.root / "codex"
         self.proxy.write_text(PROXY)
@@ -594,6 +594,12 @@ class CliProcessTests(unittest.TestCase):
                          "CCTRL_NATIVE_BRIDGE_DIR": str(self.root / "ledger"),
                          "CCTRL_NATIVE_BRIDGE_SOCKET_DIR": str(self.root / "s"),
                          "CCTRL_STATE_DIR": str(self.root / "state"),
+                         "XDG_CONFIG_HOME": str(self.root / "config"),
+                         "XDG_STATE_HOME": str(self.root / "xdg-state"),
+                         "CCTRL_DATA_DIR": str(self.root / "data"),
+                         "CCTRL_HOST_ID_FILE": str(self.root / "data" / "host-id"),
+                         "CCTRL_PEER_SEAL_KEY_FILE": str(self.root / "seal.key"),
+                         "CCTRL_SESSION_METADATA_DIR": str(self.root / "sessions"),
                          "CCTRL_CODEX_BIN": str(self.proxy),
                          "CCTRL_CODEX_APP_SERVER_SOCKET": "/fixture/no-live-socket",
                          "CCTRL_CODEX_APP_SERVER_TRANSPORT": "jsonl",
@@ -801,7 +807,7 @@ class CliProcessTests(unittest.TestCase):
                     fixture_actor, os.getpid(), bridge.start_identity(os.getpid()),
                     "/fixture/no-control-socket", endpoint.socket_path, "cctrl-fixture", str(self.root)))
             outbound_id = str(uuid.uuid4())
-            outbound = self.cli("send", fixture_actor, "--json", "--id", outbound_id,
+            outbound = self.cli("send", fixture_actor, "--json", "--urgent", "--id", outbound_id,
                                 "--", "Codex to native Claude fixture")
             self.assertEqual("submitted", outbound["status"], outbound)
             frame, sender = received.get(timeout=3)
@@ -827,6 +833,152 @@ class CliProcessTests(unittest.TestCase):
         finally:
             endpoint.close()
 
+    # ---- non-urgent Codex -> Claude goes to the mailbox (mdec-1118) ----------
+
+    def cctrl(self, *args, extra=None, drop=(), check=True):
+        env = {k: v for k, v in {**self.env, **(extra or {})}.items() if k not in drop}
+        proc = subprocess.run([str(ROOT / "cctrl"), *args], env=env, capture_output=True, text=True, timeout=45)
+        if check:
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        return proc
+
+    def raw(self, *args, extra=None, drop=()):
+        env = {k: v for k, v in {**self.env, **(extra or {})}.items() if k not in drop}
+        return subprocess.run([sys.executable, str(ROOT / "lib/native_bridge.py"), *args],
+                              cwd=ROOT, env=env, capture_output=True, text=True, timeout=45)
+
+    def claude_backing_peer(self):
+        """A Claude session with a mailbox identity; returns (session id, peer name)."""
+        sid = str(uuid.uuid4())
+        proc = self.cctrl("peer", "whoami", "--json", extra={"CLAUDE_CODE_SESSION_ID": sid}, drop=("CODEX_THREAD_ID",))
+        return sid, json.loads(proc.stdout)["name"]
+
+    def mailbox_messages(self):
+        path = self.root / "data" / "messages.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def ledger_count(self):
+        with bridge.Store(self.root / "ledger").db() as db:
+            return db.execute("SELECT count(*) FROM messages").fetchone()[0]
+
+    def test_non_urgent_codex_to_claude_writes_a_mailbox_item_with_no_native_submit(self):
+        sid, peer = self.claude_backing_peer()
+        mid = str(uuid.uuid4())
+        proc = self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "status for the claude")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(("mailbox", peer, "mailbox", mid), (out["routed"], out["mailbox_peer"], out["status"], out["id"]))
+        sent = self.mailbox_messages()
+        self.assertEqual([out["mailbox_id"]], [m["id"] for m in sent])
+        self.assertEqual((peer, "status for the claude"), (sent[0]["to"], sent[0]["body"]))
+        store = bridge.Store(self.root / "ledger")
+        self.assertEqual([], store.endpoints(), "routing must not start a bridge daemon")
+        row = store.get(mid, "codex:" + self.env["CODEX_THREAD_ID"])
+        self.assertEqual(("routed", "mailbox"), (row["kind"], row["status"]))
+        self.assertNotIn("submitting", [e["kind"] for e in row["events"]])
+        self.assertEqual([], self.queue_calls())
+
+    def test_urgent_codex_to_claude_keeps_the_native_path_and_writes_no_mailbox_item(self):
+        sid, _ = self.claude_backing_peer()
+        self.enable()
+        mid = str(uuid.uuid4())
+        out = self.cli("send", "claude:" + sid, "--json", "--urgent", "--id", mid, "--", "needs an answer now")
+        self.assertEqual("native", out["routed"])
+        self.assertNotIn("mailbox_id", out)
+        kinds = [e["kind"] for e in bridge.Store(self.root / "ledger").get(mid, out["sender"])["events"]]
+        self.assertIn("submitting", kinds)  # the native admission path was attempted
+        self.assertEqual([], self.mailbox_messages())
+
+    def test_unresolvable_backing_peer_is_refused_naming_urgent_and_leaves_no_trace(self):
+        proc = self.raw("send", "claude:" + str(uuid.uuid4()), "--json", "--", "hello")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        error = json.loads(proc.stdout)["error"]
+        self.assertIn("--urgent", error["message"])
+        self.assertEqual([], self.mailbox_messages())
+        self.assertEqual(0, self.ledger_count())
+        self.assertEqual([], bridge.Store(self.root / "ledger").endpoints())
+
+    def test_ambiguous_backing_peer_is_refused_never_guessed(self):
+        sid, peer = self.claude_backing_peer()
+        peers_file = self.root / "data" / "peers.json"
+        peers = json.loads(peers_file.read_text())
+        peers["twin-of-" + peer] = {**peers[peer], "name": "twin-of-" + peer}
+        peers_file.write_text(json.dumps(peers))
+        proc = self.raw("send", "claude:" + sid, "--json", "--", "hello")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        message = json.loads(proc.stdout)["error"]["message"]
+        self.assertIn("--urgent", message)
+        self.assertIn("ambiguous", message.lower())
+        self.assertEqual([], self.mailbox_messages())
+        self.assertEqual(0, self.ledger_count())
+
+    def test_claude_to_codex_and_codex_to_codex_are_unchanged_and_claude_to_claude_stays_rejected(self):
+        claude = str(uuid.uuid4())
+        extra = {"CLAUDE_CODE_SESSION_ID": claude}
+        row = json.loads(self.raw("enable", "--json", extra=extra, drop=("CODEX_THREAD_ID",)).stdout)
+        self.rows.append(row)
+        target = "codex:" + str(uuid.uuid4())
+        sent = self.raw("send", target, "--json", "--", "claude to codex", extra=extra, drop=("CODEX_THREAD_ID",))
+        self.assertEqual(0, sent.returncode, sent.stdout + sent.stderr)
+        out = json.loads(sent.stdout)
+        self.assertEqual(("native", "queued"), (out["routed"], out["status"]))
+        both = self.raw("send", "claude:" + str(uuid.uuid4()), "--json", "--", "no", extra=extra, drop=("CODEX_THREAD_ID",))
+        self.assertEqual(1, both.returncode, both.stdout)
+        self.assertIn("Claude-to-Claude", json.loads(both.stdout)["error"]["message"])
+        self.assertEqual([], self.mailbox_messages())
+        self.assertEqual(1, len(self.queue_calls()))
+        self.enable()
+        again = self.cli("send", "codex:" + str(uuid.uuid4()), "--json", "--", "codex to codex")
+        self.assertEqual(("native", "queued"), (again["routed"], again["status"]))
+        self.assertEqual([], self.mailbox_messages())
+
+    def test_reply_to_a_routed_mailbox_item_reaches_the_codex_sender(self):
+        sid, peer = self.claude_backing_peer()
+        claude_env = {"CLAUDE_CODE_SESSION_ID": sid}
+        sent = json.loads(self.raw("send", "claude:" + sid, "--json", "--", "please look at the plan").stdout)
+        mailbox_id = sent["mailbox_id"]
+        codex_peer = self.mailbox_messages()[0]["from"]
+        self.assertNotEqual(peer, codex_peer)
+        self.cctrl("peer", "recv", "--all", "--as", peer, "--json", extra=claude_env, drop=("CODEX_THREAD_ID",))
+        reply = self.cctrl("peer", "reply", mailbox_id, "--as", peer, "--no-deliver", "--json", "--", "looks fine",
+                           extra=claude_env, drop=("CODEX_THREAD_ID",))
+        self.assertIn(reply.returncode, (0,))
+        inbox = json.loads(self.cctrl("peer", "inbox", "--as", codex_peer, "--json").stdout)
+        items = inbox if isinstance(inbox, list) else inbox.get("messages", inbox.get("items", []))
+        replies = [m for m in items if m.get("body") == "looks fine"]
+        self.assertEqual(1, len(replies), inbox)
+        self.assertEqual((peer, codex_peer), (replies[0]["from"], replies[0]["to"]))
+
+    def test_routed_send_is_idempotent_for_a_stable_id(self):
+        sid, _ = self.claude_backing_peer()
+        mid = str(uuid.uuid4())
+        first = json.loads(self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "once").stdout)
+        again = json.loads(self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "once").stdout)
+        self.assertEqual(first["mailbox_id"], again["mailbox_id"])
+        self.assertEqual(1, len(self.mailbox_messages()))
+
+    def test_mcp_native_send_routes_to_the_mailbox_unless_urgent(self):
+        from peer_mcp import Bridge, McpError, NATIVE_TOOLS
+        send = next(t for t in NATIVE_TOOLS if t["name"] == "native_send")
+        self.assertIn("urgent", send["inputSchema"]["properties"])
+        self.assertIn("mailbox", send["description"].lower())
+        self.assertNotIn("urgent", next(t for t in NATIVE_TOOLS if t["name"] == "native_reply")["inputSchema"]["properties"])
+        sid, peer = self.claude_backing_peer()
+        mcp = Bridge(str(ROOT / "cctrl"), "unrelated-mailbox-identity")
+        with patch.dict(os.environ, self.env, clear=True):
+            out = mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "via mcp"})["data"]
+            self.assertEqual(("mailbox", peer), (out["routed"], out["mailbox_peer"]))
+            self.assertEqual(1, len(self.mailbox_messages()))
+            with self.assertRaises(McpError):
+                mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "x", "urgent": "yes"})
+            endpoint = mcp.call_tool("native_enable", {})["data"]
+            self.rows.append(endpoint)
+            urgent = mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "now", "urgent": True})["data"]
+            self.assertEqual("native", urgent["routed"])
+            self.assertEqual(1, len(self.mailbox_messages()))
+
     def test_real_daemon_advertises_protocol_and_stale_row_fails_closed(self):
         row = self.enable()
         self.assertEqual((bridge.DAEMON_PROTOCOL, False), (row["protocol"], row["daemon_outdated"]))
@@ -840,6 +992,62 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual("daemon-outdated", json.loads(proc.stdout)["error"]["code"])
         listed = self.cli("list", "--json")["endpoints"]
         self.assertEqual((1, True), (listed[0]["protocol"], listed[0]["daemon_outdated"]))
+
+
+class MailboxRouteUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = bridge.Store(Path(self.temp.name) / "ledger")
+        self.who = "codex:" + str(uuid.uuid4())
+        self.target = "claude:" + str(uuid.uuid4())
+
+    def test_routing_decision_covers_only_non_urgent_codex_to_claude(self):
+        decide = bridge.routes_to_mailbox
+        self.assertTrue(decide("codex:t", "claude:s", False))
+        self.assertFalse(decide("codex:t", "claude:s", True))
+        self.assertFalse(decide("codex:t", "codex:u", False))
+        self.assertFalse(decide("claude:s", "codex:t", False))
+        self.assertFalse(decide("claude:s", "claude:r", False))
+
+    def test_failed_mailbox_write_is_recorded_and_the_same_id_can_retry(self):
+        mid = str(uuid.uuid4())
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", side_effect=bridge.RouteRefused("mailbox write failed")):
+            with self.assertRaises(bridge.RouteRefused):
+                bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        self.assertEqual("failed", self.store.get(mid, self.who)["status"])
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", return_value={"id": "msg_1"}) as send:
+            out = bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+            again = bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        self.assertEqual(("mailbox", "msg_1", "mailbox"), (out["routed"], out["mailbox_id"], out["status"]))
+        self.assertEqual(out["mailbox_id"], again["mailbox_id"])
+        self.assertEqual(1, send.call_count)
+
+    def test_a_crash_between_ledger_and_mailbox_write_is_never_resent_blindly(self):
+        mid = str(uuid.uuid4())
+        self.store.create(self.who, self.target, "body", message_id=mid, initial_status="routing", kind="routed")
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send") as send:
+            with self.assertRaises(bridge.RouteRefused) as caught:
+                bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        send.assert_not_called()
+        self.assertIn("--urgent", str(caught.exception))
+
+    def test_a_routed_record_cannot_be_acked_or_replied_through_the_bridge(self):
+        mid = str(uuid.uuid4())
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", return_value={"id": "msg_1"}):
+            bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        daemon = bridge.Daemon.__new__(bridge.Daemon)
+        daemon.store, daemon.who = self.store, self.target
+        for action in ("ack", "reply"):
+            with self.assertRaises(ValueError) as caught:
+                daemon.handle({"actor": self.target, "action": action, "id": mid, "body": "x"})
+            self.assertIn("mailbox", str(caught.exception))
+        listed = self.store.inbox(self.target, "actionable")["messages"] + self.store.inbox(self.target, "stranded")["messages"]
+        self.assertEqual([], listed)
 
 
 class DaemonVersionTests(unittest.TestCase):

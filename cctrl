@@ -8511,6 +8511,64 @@ _peer_cmd_whoami() {
     fi
 }
 
+# Which mailbox peer backs a native Claude session? Used by `bridge send` to route
+# a non-urgent Codex-to-Claude message to the mailbox. Candidates come from the
+# peer registry (an external identity bound to the session) and from managed
+# session metadata (conversation id); each must still resolve to a live or
+# registered peer. Exactly one distinct peer, or nothing: never a guess.
+_peer_cmd_by_session() {
+    local target="${1:-}" json=false sid candidates name peer_json a
+    [[ -n "$target" && "$target" != -* ]] || { echo -e "${RED}Usage: cctrl peer by-session claude:SESSION_ID [--json]${RESET}" >&2; return 64; }
+    shift
+    for a in "$@"; do
+        case "$a" in
+            --json) json=true ;;
+            *) $json && _json_error validation "Unknown peer by-session flag: $a" || echo -e "${RED}Unknown peer by-session flag: $a${RESET}" >&2; return 64 ;;
+        esac
+    done
+    sid="${target#claude:}"
+    if [[ ! "$sid" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
+        $json && _json_error validation "A Claude session id is 1-128 of A-Za-z0-9._-" || echo -e "${RED}Not a Claude session id: $target${RESET}" >&2
+        return 64
+    fi
+    _peer_init || return $?
+    candidates="$(
+        jq -r --arg id "$sid" 'to_entries[]
+            | select((.value.agent // "") == "claude" and (.value.external_identity.session_id == $id or .value.provider_task_id == $id))
+            | (.value.name // .key)' "$PEERS_FILE" 2>/dev/null
+        local f
+        for f in "$SESSION_METADATA_DIR"/*.json; do
+            [[ -f "$f" ]] || continue
+            jq -r --arg id "$sid" 'select(type == "object")
+                | select((.agent // .provider // "") == "claude" and ((.provider_task_id // .conversation_id // "") == $id))
+                | (.peer // .name // empty)' "$f" 2>/dev/null
+        done
+    )"
+    local -a names=()
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        peer_json="$(_peer_resolve_json "$name" 2>/dev/null)" || continue
+        names+=("$(jq -r '.name' <<< "$peer_json")")
+    done <<< "$candidates"
+    local unique
+    unique="$(printf '%s\n' ${names[@]+"${names[@]}"} | sed '/^$/d' | sort -u)"
+    local count
+    count="$(printf '%s\n' "$unique" | grep -c . || true)"
+    if [[ "$count" == "0" ]]; then
+        $json && _json_error no-backing-peer "No mailbox peer is bound to claude:$sid" || echo -e "${RED}No mailbox peer is bound to claude:$sid${RESET}" >&2
+        return 66
+    fi
+    if [[ "$count" != "1" ]]; then
+        $json && _json_error ambiguous-backing-peer "Ambiguous: $count mailbox peers claim claude:$sid ($(printf '%s' "$unique" | paste -sd, -))" || echo -e "${RED}Ambiguous: $count mailbox peers claim claude:$sid${RESET}" >&2
+        return 66
+    fi
+    if $json; then
+        jq -n --arg sid "$sid" --arg peer "$unique" '{ok:true, session_id:$sid, peer:$peer}'
+    else
+        printf '%s\n' "$unique"
+    fi
+}
+
 # Selection guidance belongs to the agent that owns the native tools. This
 # command never sends or claims that a target is addressable in that runtime.
 _peer_cmd_route() {
@@ -15518,6 +15576,7 @@ cmd_peer() {
         whoami|identity) _peer_cmd_whoami "$@" ;;
         identify) _peer_cmd_identify "$@" ;;
         route) _peer_cmd_route "$@" ;;
+        by-session) _peer_cmd_by_session "$@" ;;
         whois) _peer_cmd_whois "$@" ;;
         native-log) _peer_cmd_native_log "$@" ;;
         help-agent) _peer_cmd_help_agent "$@" ;;
@@ -15550,6 +15609,8 @@ cmd_peer() {
             echo "  cctrl peer register <name> [--alias NAME] [--host HOST] [--dir DIR] [--agent AGENT] [--session SESSION] [--thread-id ID] [--purpose TEXT] [--capability NAME]"
             echo "  cctrl peer alias <name> <alias>"
             echo "  cctrl peer unregister <name>"
+            echo "  cctrl peer by-session claude:SESSION_ID [--json]"
+            echo "                                     The one mailbox peer backing a native Claude session (refuses 0 or 2+)"
             echo "  cctrl peer whoami [--as NAME] [--json]"
             echo "  cctrl peer whois <uds:/path.sock|pid:N> [--name NAME] [--mode MODE] [--no-tmux] [--json]"
             echo "                                     Read-only consistency check of a native sender (never proof of identity)"

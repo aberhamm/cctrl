@@ -92,8 +92,8 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   session or Codex thread. Never borrow an ID, sender identity, or role.
 - **Discover:** `cctrl bridge list`; address exact `claude:SESSION_ID` or
   `codex:THREAD_ID` targets, never a title or guessed agent path.
-- **Send:** bridge supports Claude→Codex, Codex→Claude, and Codex→Codex.
-  Use `cctrl bridge send TARGET -- "<body>"`; Claude can use native `SendMessage`
+- **Send:** bridge supports Claude→Codex, Codex→Claude (`--urgent` only), and
+  Codex→Codex. Use `cctrl bridge send TARGET -- "<body>"`; Claude can use native `SendMessage`
   to the advertised Codex endpoint. Claude→Claude requires actual native
   `ListAgents`/`SendMessage`; the bridge rejects it before submission.
 - **Admission:** Codex bridges speak prompting to Claude; bypass may hold it.
@@ -111,10 +111,11 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   `bridge ack ID` / `peer ack ID` is the acknowledgement. One send per fact;
   address an agent by one canonical name (never also its `external-codex-*`
   alias). To many readers, write the status file, not N mails.
-- **Codex to Claude:** use the mailbox (`cctrl peer send`). Use the bridge
-  only when the Claude must act within 10 minutes: a bridge send to Claude
-  raises an admission prompt on Matthew's screen. Never resend after an
-  expiry; an expired prompt means "not now", so post it to the mailbox once.
+- **Codex to Claude:** `bridge send claude:ID` now writes the Claude's mailbox
+  item (result `routed: mailbox`, reply via `peer reply`); no peer found, refused.
+  `--urgent` (MCP `urgent: true`) is the bridge: it raises an admission prompt on
+  Matthew's screen, so only when the Claude must act within 10 minutes. Never
+  resend after an expiry; an expired prompt means "not now".
 - **Mailbox fallback:** `cctrl peer identify --json`, `cctrl peer overview --json`,
   then `cctrl peer send <peer> --json -- "<body>"`. The doorbell rings at the
   recipient's next Stop. Use `--deliver` only for a safety stop.

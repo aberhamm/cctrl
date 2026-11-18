@@ -82,6 +82,94 @@ LATE_CODEX_MARKERS = {
 RETIRED_FINAL = {"retired", "absent", "already_consumed", "unsupported", "not_applicable"}
 
 
+class RouteRefused(ValueError):
+    code = "mailbox-route-refused"
+
+
+def routes_to_mailbox(who, target, urgent):
+    """True for a non-urgent Codex-to-Claude send: it goes to the mailbox.
+
+    Every other direction, and --urgent, keeps the native bridge path.
+    """
+    return who.startswith("codex:") and target.startswith("claude:") and not urgent
+
+
+def cctrl_command():
+    return str(Path(__file__).resolve().parent.parent / "cctrl")
+
+
+def _run_cctrl(args, body=None):
+    # Same environment as the caller, so the mailbox sender identity is the
+    # caller's own. The body travels on stdin, never in argv.
+    return subprocess.run([cctrl_command(), *args], input=body, capture_output=True, text=True, timeout=60)
+
+
+def backing_peer(session_id):
+    """The one mailbox peer backed by this Claude session, or RouteRefused."""
+    hint = "Resend with --urgent to use the native bridge (it raises an admission prompt on the recipient's screen)."
+    try:
+        proc = _run_cctrl(["peer", "by-session", "claude:" + session_id, "--json"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RouteRefused(f"cannot resolve a mailbox peer for claude:{session_id} ({exc.__class__.__name__}); nothing was sent. {hint}")
+    try:
+        value = json.loads(proc.stdout)
+    except ValueError:
+        value = None
+    if proc.returncode != 0 or not isinstance(value, dict) or value.get("ok") is False or not value.get("peer"):
+        reason = ((value or {}).get("error") or {}).get("message") if isinstance(value, dict) else None
+        raise RouteRefused(f"no unambiguous mailbox peer backs claude:{session_id} ({reason or 'lookup failed'}); nothing was sent. {hint}")
+    return value["peer"]
+
+
+def mailbox_send(peer, body):
+    """Write one mailbox item to `peer` (the plain `peer send`) and return its JSON."""
+    try:
+        proc = _run_cctrl(["peer", "send", peer, "--json", "--body-file", "-"], body)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RouteRefused(f"mailbox send to {peer} did not complete ({exc.__class__.__name__}); it may or may not have been written. Check cctrl peer outbox before retrying.")
+    try:
+        value = json.loads(proc.stdout)
+    except ValueError:
+        value = None
+    if proc.returncode != 0 or not isinstance(value, dict) or not value.get("id"):
+        reason = ((value or {}).get("error") or {}).get("message") if isinstance(value, dict) else None
+        raise RouteRefused(f"mailbox send to {peer} failed ({reason or 'exit ' + str(proc.returncode)}); nothing was delivered. Retry, or resend with --urgent to use the native bridge.")
+    return value
+
+
+def route_to_mailbox(store, who, recipient, body, mid=None):
+    """Send a non-urgent Codex-to-Claude message to the Claude's backing mailbox peer.
+
+    The ledger row (kind routed) is written before the mailbox write, so a retry
+    with the same --id never writes a second mailbox item.
+    """
+    if isinstance(body, str) and body.startswith(RECEIPT_PREFIX):
+        raise ValueError("receipt text is a control fact and cannot be sent as a message")
+    provider, session = recipient.split(":", 1)
+    if session.startswith("cctrl-bridge-"):
+        raise ValueError("address the actual provider session, not a bridge registry identity")
+    recipient = actor(provider, session)
+    peer = backing_peer(session_value(session))
+    mid, fresh = store.create(who, recipient, body, message_id=mid, initial_status="routing", kind="routed")
+    if not fresh:
+        row = store.get(mid, who)
+        if row["status"] == "failed":
+            store.event(mid, "routing", {"retry": True})
+        elif row["status"] != "mailbox":
+            raise RouteRefused(f"message {mid} was routed but its mailbox write is unconfirmed; check cctrl peer outbox before resending. Or resend with --urgent under a new id.")
+    if fresh or store.get(mid, who)["status"] == "routing":
+        try:
+            sent = mailbox_send(peer, body)
+        except RouteRefused as exc:
+            store.event(mid, "failed", {"routed": "mailbox", "peer": peer, "reason": str(exc)})
+            raise
+        store.event(mid, "mailbox", {"routed": "mailbox", "peer": peer, "mailbox_id": sent["id"]})
+    row = store.get(mid, who)
+    detail = next((json.loads(e["detail"]) for e in reversed(row["events"]) if e["kind"] == "mailbox" and e["detail"]), {})
+    return {**row, "routed": "mailbox", "mailbox_id": detail.get("mailbox_id"), "mailbox_peer": detail.get("peer", peer),
+            "note": "Sent to the recipient's mailbox, not the native bridge: no admission prompt. Its reply arrives in your mailbox (cctrl peer recv --all)."}
+
+
 def actor(provider, session):
     if provider not in {"claude", "codex"}:
         raise ValueError("provider must be claude or codex")
@@ -335,8 +423,8 @@ class Store:
             if unresolved:
                 raise ValueError("exited bridge cleanup failed; ownership manifest retained in ledger")
 
-    def create(self, sender, recipient, body, reply_to=None, message_id=None, dispatcher=None, initial_status="persisted", envelope=None):
-        if initial_status not in {"persisted", "refused"}:
+    def create(self, sender, recipient, body, reply_to=None, message_id=None, dispatcher=None, initial_status="persisted", envelope=None, kind="message"):
+        if initial_status not in {"persisted", "refused", "routing"} or kind not in {"message", "routed"}:
             raise ValueError("invalid initial bridge status")
         if not isinstance(body, str) or not body or len(body.encode()) > LIMIT // 2:
             raise ValueError("body must be nonempty UTF-8 text of at most 512 KiB")
@@ -354,7 +442,7 @@ class Store:
             now = time.time()
             db.execute("INSERT INTO messages(id,sender,recipient,body,reply_to,created,status,dispatcher,kind,envelope,received) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                        (mid, sender, recipient, body, reply_to, now, "receipt" if receipt else initial_status, dispatcher or sender,
-                        "receipt" if receipt else "message", json.dumps(envelope) if envelope else None, now if receipt else None))
+                        "receipt" if receipt else kind, json.dumps(envelope) if envelope else None, now if receipt else None))
             db.execute("INSERT INTO events(id,at,kind) VALUES (?,?,?)", (mid, now, "receipt" if receipt else initial_status))
         return mid, True
 
@@ -722,6 +810,8 @@ class Daemon:
                 raise ValueError("only the actual recipient may reply")
             if original["kind"] == "receipt":
                 raise ValueError("a receipt is a control fact: it needs no ACK and cannot be replied to")
+            if original["kind"] == "routed":
+                raise ValueError("this was routed to your mailbox, not the native bridge: use cctrl peer reply ID / cctrl peer ack ID with the mailbox ID")
             problem = self.admission_problem(original)
             if problem:
                 raise ValueError(problem)
@@ -979,6 +1069,9 @@ def main(argv=None):
             item.add_argument("--name", help="explicit display-name claim for the sender envelope (recorded as claimed)")
             item.add_argument("--harness", help="explicit harness claim, e.g. codex-cli (recorded as claimed, never as the provider-reported source)")
             item.add_argument("body", nargs="+")
+        if name == "send":
+            item.add_argument("--urgent", action="store_true",
+                              help="Codex to Claude only: use the native bridge (an admission prompt on the recipient's screen) instead of the mailbox")
     service = sub.add_parser("_serve", help=argparse.SUPPRESS)
     service.add_argument("actor")
     service.add_argument("--cwd", required=True)
@@ -1040,6 +1133,8 @@ def main(argv=None):
                 if not 1 <= args.limit <= 100 or args.after < 0:
                     raise ValueError("inbox limit must be 1..100 and after must be nonnegative")
                 result = store.inbox(who, args.view, args.after, args.limit)
+            elif args.command == "send" and routes_to_mailbox(who, args.target, args.urgent):
+                result = route_to_mailbox(store, who, args.target, " ".join(args.body), str(uuid.UUID(args.id)) if args.id else None)
             else:
                 row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
                 if row is not None:
@@ -1068,6 +1163,8 @@ def main(argv=None):
                         print(json.dumps(response))
                         return 1
                     result = response["data"]
+                    if args.command == "send":
+                        result = {**result, "routed": "native"}
                     if args.command == "stop":
                         for _ in range(100):
                             if store.endpoint(who) is None:
