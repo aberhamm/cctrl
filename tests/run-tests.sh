@@ -29421,7 +29421,8 @@ test_self_install_gate_reuses_a_matching_pass_stamp() {
     grep -q 'call names=\[\] ' "$log" || fail "CCTRL_INSTALL_FULL_GATE=1 ran a filtered suite: $(cat "$log")"
     # 4. Mismatch (other bash, other python, other tree): the full suite runs.
     local variant vb vp vt
-    for variant in "3.2 $pmm $tree" "$bmm 2.7 $tree" "$bmm $pmm 0000000000000000000000000000000000000000"; do
+    # The other bash is 2.0, never 3.2: the CI bash-3.2 leg runs this suite under 3.2.
+    for variant in "2.0 $pmm $tree""$bmm 2.7 $tree" "$bmm $pmm 0000000000000000000000000000000000000000"; do
         rm -rf "$base/state"; : > "$log"
         read -r vb vp vt <<< "$variant"
         ( source "$ROOT/lib/suite-gate.sh"; export CCTRL_SUITE_STATE_DIR="$base/state"; suite_stamp_write "$vt" "$vb" "$vp" >/dev/null )
