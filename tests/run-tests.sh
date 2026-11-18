@@ -6319,7 +6319,7 @@ test_d10b_foreign_device_and_placeholder_names_declined() {
     assert_contains "$out" "another device tag"
     jq '.tmux_session = "TMUX--ms--keeper" | .name = "TMUX--ms--keeper"' "$RF_REC" > "$RF_REC.tmp" && mv "$RF_REC.tmp" "$RF_REC"
     local rc=0
-    cctrl_source_eval '_tmux_routing_active() { return 0; }; _CCTRL_TMUX_PLACEHOLDERS="TMUX--ms--keeper"$'\n'; CCTRL_HOST_PREFIX=ms; _launch_resume_kept_name claude conv-d10b-t12-0001 "$1" "" ctx' "$RF_PROJ" || rc=$?
+    cctrl_source_eval '_tmux_routing_active() { return 0; }; _CCTRL_TMUX_PLACEHOLDERS="TMUX--ms--keeper$2"; CCTRL_HOST_PREFIX=ms; _launch_resume_kept_name claude conv-d10b-t12-0001 "$1" "" ctx' "$RF_PROJ" $'\n' || rc=$?
     [[ "$rc" -eq 1 ]] || fail "a placeholder recorded name must be declined (rc=$rc)"
     echo "ok: foreign-device and placeholder recorded names are not adopted"
 }

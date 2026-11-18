@@ -7016,7 +7016,7 @@ _launch_detached() {
             fi
             base_name="$kept_tmux"
             if [[ "$base_name" =~ ^(TMUX--.+)--[0-9]+$ ]]; then base_name="${BASH_REMATCH[1]}"; fi
-            name_source=recorded-suffixed
+            name_source="recorded-suffixed"
             [[ "$kept_from" == resume ]] \
                 && echo -e "${DIM}cctrl: the recorded name $kept_tmux is held by another session; resuming under a free --N of $base_name.${RESET}" >&2
         else
