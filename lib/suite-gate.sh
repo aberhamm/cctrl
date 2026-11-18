@@ -211,12 +211,11 @@ suite_stamp_prune() { # keep-count
     local keep="${1:-20}" dir f n=0
     dir="$(suite_pass_dir)"
     [[ -d "$dir" ]] || return 0
-    # Newest first; names are made only of [A-Za-z0-9._-], so word splitting
-    # on ls output is safe.
-    for f in $(ls -1t "$dir" 2>/dev/null); do
+    # Newest first; names are made only of [A-Za-z0-9._-].
+    while IFS= read -r f; do
         n=$(( n + 1 ))
         if (( n > keep )); then rm -f "$dir/$f"; fi
-    done
+    done < <(ls -1t "$dir" 2>/dev/null)
     return 0
 }
 

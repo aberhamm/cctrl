@@ -208,6 +208,10 @@ if [[ "$_RT_LIST" -eq 0 && "$_RT_FILTER" -eq 0 && -z "${CCTRL_TEST_ONLY:-}" ]]; 
     source "$ROOT/lib/suite-gate.sh"
     _SUITE_FULL=1
     suite_lock_acquire
+    # Pin the environment the stamp is written under: tests export their own
+    # HOME/XDG_STATE_HOME/PATH, which must not redirect or re-key the stamp.
+    _SUITE_STATE0="$(suite_gate_dir)"
+    _SUITE_PATH0="$PATH"
     _SUITE_TREE0="$(suite_gate_tree "$ROOT" || true)"
     _SUITE_BMM="$(suite_gate_bash_mm "$BASH")"
     _SUITE_PMM="$(suite_gate_py_mm)"
@@ -29435,5 +29439,6 @@ _runner_report || exit 1
 # Every gate above passed (shell tests, python tests, report). Record the pass
 # stamp for the install gate; never fatal.
 if [[ "$_SUITE_FULL" -eq 1 ]]; then
-    suite_record_pass "$ROOT" "$_SUITE_FULL" "$_SUITE_TREE0" "$_SUITE_BMM" "$_SUITE_PMM" || true
+    CCTRL_SUITE_STATE_DIR="$_SUITE_STATE0" PATH="$_SUITE_PATH0" \
+        suite_record_pass "$ROOT" "$_SUITE_FULL" "$_SUITE_TREE0" "$_SUITE_BMM" "$_SUITE_PMM" || true
 fi
