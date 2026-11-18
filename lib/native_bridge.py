@@ -40,9 +40,9 @@ VIEWS = ("actionable", "stranded", "history")
 # check wrote no protocol record (treated as protocol 1: no native-queue
 # retirement, no sender envelope). Bump DAEMON_PROTOCOL when a CLI-visible daemon
 # behavior is added; MIN_DAEMON_PROTOCOL is what the CLI needs to act safely.
-DAEMON_PROTOCOL = 2
+DAEMON_PROTOCOL = 3
 MIN_DAEMON_PROTOCOL = 2
-DAEMON_CAPABILITIES = ("native_retirement", "reply_acks_original", "sender_envelope", "admission_gate")
+DAEMON_CAPABILITIES = ("native_retirement", "reply_acks_original", "sender_envelope", "admission_gate", "retire_handled")
 MIGRATION_DOC = "docs/bridge-daemon-migration.md"
 # An outdated daemon allows only stop, list, status and inbox. Every action that
 # goes through the daemon (send, ack, reply) is refused: ack/reply would drop the
@@ -50,10 +50,11 @@ MIGRATION_DOC = "docs/bridge-daemon-migration.md"
 REQUIRED_CAPABILITIES = {
     "send": ("sender_envelope",),
     "ack": ("native_retirement",),
-    "retire": ("native_retirement",),
+    "retire": ("native_retirement", "retire_handled"),
     "reply": ("native_retirement", "reply_acks_original", "sender_envelope"),
 }
-ALL_REQUIRED = tuple(dict.fromkeys(c for caps in REQUIRED_CAPABILITIES.values() for c in caps))
+# `retire` is an optional sweep: a daemon lacking it is not "outdated" for send/ack/reply.
+ALL_REQUIRED = tuple(dict.fromkeys(c for a, caps in REQUIRED_CAPABILITIES.items() if a != "retire" for c in caps))
 
 
 class DaemonOutdated(ValueError):
@@ -393,8 +394,10 @@ class Store:
                 "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='native-retire' "
                 f"AND json_extract(e.detail,'$.outcome') IN ({final})) ORDER BY m.created",
                 (who, *sorted(RETIRED_FINAL))).fetchall()
-        ids = [r[0] for r in rows]
-        return ([i for i in ids if self.queued_identity(i)], [i for i in ids if not self.queued_identity(i)])
+        identified, anonymous = [], []
+        for (mid,) in rows:
+            (identified if self.queued_identity(mid) else anonymous).append(mid)
+        return identified, anonymous
 
     def retirement(self, mid):
         """Latest recorded native retirement outcome for a message, or None."""
@@ -744,6 +747,18 @@ class Daemon:
             retirement = self.retire_native(original["id"])
             self.notify_receipt(original)
             return {**self.store.get(original["id"], self.who), "native_retirement": retirement}
+        if action == "retire":
+            # Sweep-only path: retire the native queue copy of a message already
+            # handled. Never acknowledges, never replies, never sends a receipt.
+            original = self.store.get(request["id"], self.who)
+            if original["recipient"] != self.who or original["kind"] != "message":
+                raise ValueError("only the actual recipient may retire a message")
+            if not original["handled"]:
+                raise ValueError(f"message {original['id']} is not handled; ACK or reply to it first")
+            problem = self.admission_problem(original)
+            if problem:
+                raise ValueError(problem)
+            return {"id": original["id"], "native_retirement": self.retire_native(original["id"])}
         if action == "hello":
             return {"protocol": DAEMON_PROTOCOL, "capabilities": list(DAEMON_CAPABILITIES), "pid": os.getpid()}
         if action == "stop":
@@ -981,22 +996,37 @@ def main(argv=None):
                 if not args.handled:
                     raise ValueError("retire needs --handled (the only supported selection)")
                 ids, no_identity = store.pending_retirements(who)
-                result = {"actor": who, "dry_run": args.dry_run, "candidates": len(ids), "skipped_no_identity": len(no_identity)}
+                result = {"actor": who, "dry_run": args.dry_run, "candidates": len(ids), "skipped_no_identity": len(no_identity),
+                          "skipped_ids": no_identity, "outcomes": {}, "error_ids": []}
+                existing = store.endpoint(who)
                 if args.dry_run:
-                    result.update(ids=ids, outcomes={})
+                    result.update(ids=ids, daemon_outdated=bool(existing and daemon_missing(existing, REQUIRED_CAPABILITIES["retire"])))
                 else:
-                    outcomes = {}
-                    row = store.endpoint(who) or (ensure_daemon(store, who) if ids else None)
+                    row = existing or (ensure_daemon(store, who) if ids else None)
                     if row is not None:
                         check_daemon(row, "retire")
-                    if ids:
-                        for mid in ids:
-                            # The daemon's idempotent ACK path: it retires only the
-                            # exact queue item this bridge submitted for this message.
-                            response = rpc(row, {"actor": who, "action": "ack", "id": mid})
-                            outcome = ((response.get("data") or {}).get("native_retirement") or {}).get("outcome") if response.get("ok") else "error"
-                            outcomes[outcome or "error"] = outcomes.get(outcome or "error", 0) + 1
-                    result["outcomes"] = outcomes
+                    for mid in ids:
+                        # The daemon's retire action: it retires only the exact queue
+                        # item this bridge submitted and never sends a receipt.
+                        try:
+                            response = rpc(row, {"actor": who, "action": "retire", "id": mid})
+                        except (OSError, ValueError, subprocess.TimeoutExpired):
+                            response = {"ok": False}
+                        outcome = ((response.get("data") or {}).get("native_retirement") or {}).get("outcome") if response.get("ok") else None
+                        if not outcome:
+                            outcome = "error"
+                            result["error_ids"].append(mid)
+                        result["outcomes"][outcome] = result["outcomes"].get(outcome, 0) + 1
+                if not args.json:
+                    lines = [f"retire --handled{' (dry run)' if args.dry_run else ''}: {result['candidates']} candidate(s), {result['skipped_no_identity']} skipped without queue identity"]
+                    lines += [f"  {k}: {v}" for k, v in sorted(result["outcomes"].items())]
+                    if result.get("daemon_outdated"):
+                        lines.append(f"  daemon outdated: a live run will be refused; see {MIGRATION_DOC}")
+                    lines += [f"  would retire: {m}" for m in result.get("ids", [])]
+                    lines += [f"  skipped (no queue identity; run bridge status ID --reconcile): {m}" for m in result["skipped_ids"]]
+                    lines += [f"  error (retry with bridge retire --handled or bridge ack ID): {m}" for m in result["error_ids"]]
+                    print("\n".join(lines))
+                    return 0
             elif args.command == "inbox":
                 if not 1 <= args.limit <= 100 or args.after < 0:
                     raise ValueError("inbox limit must be 1..100 and after must be nonnegative")

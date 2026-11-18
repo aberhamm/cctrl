@@ -941,23 +941,33 @@ class DaemonVersionTests(unittest.TestCase):
             self.assertEqual(0, bridge.main(["--root", str(self.store.root), "stop", "--json"]))
         rpc.assert_called_once()
 
-    def handled(self, who, qid="q", sender="claude:sender", handle=True, status="queued"):
+    def handled(self, who, qid="q", sender="claude:sender", handle=True, status="queued", reply=None):
         mid, _ = self.store.create(sender, who, "work")
         self.store.event(mid, status, {"queued_submission_id": qid} if qid else {})
         if handle:
-            self.store.acknowledge(mid, who)
+            self.store.acknowledge(mid, who, reply)
         return mid
+
+    fail_ids = ()
+
+    def fake_rpc(self, daemon):
+        def call(row, req):
+            if req.get("id") in self.fail_ids:
+                raise OSError("timed out")
+            return {"ok": True, "data": daemon.handle(req)}
+        return call
 
     def retire_cli(self, row, *flags):
         who = row["actor"]
         daemon = bridge.Daemon.__new__(bridge.Daemon)
         daemon.store, daemon.who = self.store, who
-        daemon.deliver = lambda *args: {"status": "queued"}
+        self.delivered = []
+        daemon.deliver = lambda *args: (self.delivered.append(args) or {"status": "queued"})
         self.retired = []
         daemon.retire_queue = lambda *args: (self.retired.append(args) or {"outcome": "retired"})
         out = io.StringIO()
         with patch.object(bridge, "ensure_daemon", return_value=row), patch.object(bridge, "own_actor", return_value=who), \
-             patch.object(bridge, "rpc", side_effect=lambda r, req: {"ok": True, "data": daemon.handle(req)}) as rpc, \
+             patch.object(bridge, "rpc", side_effect=self.fake_rpc(daemon)) as rpc, \
              patch.object(sys, "stdout", out):
             code = bridge.main(["--root", str(self.store.root), "retire", *flags])
         return code, json.loads(out.getvalue()), rpc
@@ -1016,6 +1026,69 @@ class DaemonVersionTests(unittest.TestCase):
         code, out, rpc = self.run_cli(row, "retire", "--handled", "--json")
         self.assertEqual((1, "daemon-outdated"), (code, out["error"]["code"]))
         rpc.assert_not_called()
+
+    def test_retire_handled_never_sends_receipts_for_replied_rows(self):
+        row = self.current_row()
+        mid = self.handled("codex:me", "q-r", sender="codex:asker", reply="reply-1")
+        plain = self.handled("codex:me", "q-p", sender="codex:asker")
+        code, out, _ = self.retire_cli(row, "--handled", "--json")
+        self.assertEqual({"retired": 2}, out["outcomes"])
+        self.assertEqual([], self.delivered, "retire must not create native receipts")
+        with self.store.db() as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM receipt_attempts").fetchone()[0])
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM messages WHERE kind='receipt'").fetchone()[0])
+
+    def test_retire_action_refuses_unhandled_and_foreign_messages(self):
+        daemon = bridge.Daemon.__new__(bridge.Daemon)
+        daemon.store, daemon.who = self.store, "codex:me"
+        daemon.retire_queue = lambda *a: self.fail("retired")
+        open_id = self.handled("codex:me", "q1", handle=False)
+        foreign = self.handled("codex:other", "q2")
+        for mid in (open_id, foreign):
+            with self.assertRaises(ValueError):
+                daemon.handle({"actor": "codex:me", "action": "retire", "id": mid})
+
+    def test_retire_handled_rpc_error_does_not_abort_and_ids_are_reported(self):
+        row = self.current_row()
+        a = self.handled("codex:me", "q-a")
+        b = self.handled("codex:me", "q-b")
+        c = self.handled("codex:me", "q-c")
+        skipped = self.handled("codex:me", None)
+        self.fail_ids = (b,)
+        code, out, _ = self.retire_cli(row, "--handled", "--json")
+        self.assertEqual(0, code)
+        self.assertEqual({"retired": 2, "error": 1}, out["outcomes"])
+        self.assertEqual([b], out["error_ids"])
+        self.assertEqual([skipped], out["skipped_ids"])
+        self.assertEqual([a, c], [m for _, m, _ in self.retired])
+
+    def test_retire_handled_text_output_lists_skipped_and_error_ids(self):
+        row = self.current_row()
+        b = self.handled("codex:me", "q-b")
+        skipped = self.handled("codex:me", None)
+        self.fail_ids = (b,)
+        out = io.StringIO()
+        with patch.object(bridge, "ensure_daemon", return_value=row), patch.object(bridge, "own_actor", return_value="codex:me"), \
+             patch.object(bridge, "rpc", side_effect=self.fake_rpc(None)), patch.object(sys, "stdout", out):
+            self.assertEqual(0, bridge.main(["--root", str(self.store.root), "retire", "--handled"]))
+        text = out.getvalue()
+        self.assertIn(b, text)
+        self.assertIn(skipped, text)
+
+    def test_retire_handled_refuses_protocol2_daemon_without_retire_capability(self):
+        row = self.live_row("codex:me", protocol=2, capabilities=["native_retirement", "reply_acks_original", "sender_envelope", "admission_gate"])
+        self.handled("codex:me", "q1")
+        code, out, rpc = self.run_cli(row, "retire", "--handled", "--json")
+        self.assertEqual((1, "daemon-outdated"), (code, out["error"]["code"]))
+        rpc.assert_not_called()
+        self.assertFalse(bridge.daemon_missing(row, bridge.ALL_REQUIRED), "ack/send/reply still work on it")
+
+    def test_retire_handled_dry_run_reports_daemon_outdated(self):
+        row = self.live_row("codex:me")
+        self.handled("codex:me", "q1")
+        code, out, _ = self.run_cli(row, "retire", "--handled", "--dry-run", "--json")
+        self.assertEqual(0, code)
+        self.assertTrue(out["daemon_outdated"])
 
     def test_retire_requires_handled_flag(self):
         row = self.current_row()

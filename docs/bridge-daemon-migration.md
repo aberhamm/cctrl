@@ -8,8 +8,9 @@ pending work, and replacing it blindly can lose track of that work.
 ## How cctrl detects an old daemon
 
 Each daemon writes a protocol record (`protocol` and `capabilities`) next to its
-endpoint row, in the same transaction. Current daemons advertise protocol 2 with
-`native_retirement`, `reply_acks_original`, `sender_envelope` and `admission_gate`. A daemon
+endpoint row, in the same transaction. Current daemons advertise protocol 3 with
+`native_retirement`, `reply_acks_original`, `sender_envelope`, `admission_gate` and `retire_handled`
+(only the `bridge retire` sweep needs the last one; protocol-2 daemons still run send, ack and reply). A daemon
 started by an older cctrl wrote no record and counts as protocol 1.
 
 `cctrl bridge list` shows `protocol` and `capabilities` per endpoint. The daemon
@@ -82,7 +83,7 @@ Run these as the session that owns the endpoint, with the **new** cctrl.
    ```sh
    cctrl bridge stop
    cctrl bridge list --json      # your endpoint is gone
-   cctrl bridge enable --json    # no daemon_outdated; protocol 2
+   cctrl bridge enable --json    # no daemon_outdated; protocol 3
    ```
    Use `bridge stop`, never `kill`: it lets the daemon remove its own sockets
    and ownership record. If cleanup stays pending, inspect it; do not kill an
@@ -95,13 +96,13 @@ Run these as the session that owns the endpoint, with the **new** cctrl.
    ```
    It selects your received messages whose native retirement is not final (so
    `unknown`, `race` and `identity_mismatch` outcomes, which are meant to be
-   retried, are included), and retires each through the new daemon's idempotent
-   ACK path. It only deletes the exact queue item this bridge submitted, and
-   refuses with `daemon-outdated` on an old daemon. Messages with no persisted
-   queue identity are reported as `skipped_no_identity`; run
-   `cctrl bridge status ID --reconcile` for those. Check the per-outcome counts
-   (see [peer-messaging.md](peer-messaging.md)); a single message can be retried
-   with `cctrl bridge ack MESSAGE_ID`.
+   retried, are included) and retires each through the daemon's retire-only
+   action: it deletes only the exact queue item this bridge submitted and never
+   sends a receipt. It needs a current (protocol 3) daemon and refuses with
+   `daemon-outdated` otherwise. The output lists `skipped_ids` (no persisted
+   queue identity: run `cctrl bridge status ID --reconcile`) and `error_ids`
+   (rerun the sweep, or `cctrl bridge ack MESSAGE_ID` for one message). A
+   failed item does not stop the run. See [peer-messaging.md](peer-messaging.md).
 
 A repeated ACK does not resend a receipt that was already sent; a receipt that earlier failed is retried, which is intended. A receipt owed to a Claude sender is never submitted natively (recorded as `suppressed`, see peer-messaging.md), so it has nothing to retry.
 

@@ -85,16 +85,6 @@ message ID AND whose queue ID equals the persisted `queued_submission_id`. Body
 text is never consulted and no other queue entry is touched. The result carries
 `native_retirement.outcome` (`original.native_retirement` on a reply):
 
-`cctrl bridge retire --handled [--dry-run] [--json]` sweeps the backlog: it
-finds this session's received messages (`received` or `replied` set, status
-`queued` or `ambiguous`) with no final native retirement, and sends each through
-the same idempotent ACK/retire path. It only touches queue items this bridge
-submitted (persisted queue ID plus message ID); messages with no persisted queue
-identity are counted as `skipped_no_identity` and left alone. It is refused with
-`daemon-outdated` on a protocol-1 daemon. `--dry-run` lists the IDs and writes
-nothing. Output: `candidates`, `skipped_no_identity` and `outcomes` (count per
-`native_retirement.outcome`; `error` for an item the daemon refused).
-
 | outcome | meaning |
 |---|---|
 | `retired` | the item was pending and the server deleted it |
@@ -105,6 +95,20 @@ nothing. Output: `candidates`, `skipped_no_identity` and `outcomes` (count per
 | `unknown` / `unknown_identity` | transport failure or no persisted queue ID (run `status --reconcile`); retryable |
 | `not_applicable` | no native queue item was ever accepted (for example `failed`) |
 | `unsupported` | Claude recipient (see limit below) |
+
+`cctrl bridge retire --handled [--dry-run] [--json]` sweeps the backlog: it
+finds this session's received messages (`received` or `replied` set, status
+`queued` or `ambiguous`) with no final native retirement and asks the daemon's
+retire-only action to retire each one. That action never ACKs, replies or sends
+a receipt, so a sweep creates no new messages. It only touches queue items this
+bridge submitted (persisted queue ID plus message ID). It needs a daemon with
+the `retire_handled` capability (protocol 3); an older daemon is refused with
+`daemon-outdated` (`--dry-run` reports `daemon_outdated`). `--dry-run` reads the
+ledger only and lists the IDs. Output (text by default, JSON with `--json`):
+`candidates`, `outcomes` (count per `native_retirement.outcome`), `skipped_ids`
+(no persisted queue identity: run `bridge status ID --reconcile`) and
+`error_ids` (the daemon call failed or was refused: rerun the sweep or
+`bridge ack ID`). A failed item never aborts the run.
 
 **Admission gate.** `bridge ack` and `bridge reply` refuse (exit 1, error says
 the message is not admitted) while the status is `held`, `refused`, `denied`,
@@ -205,7 +209,7 @@ cctrl bridge reply MESSAGE_ID -- "Reviewed; here is the result"
 # After handling without a reply:
 cctrl bridge ack MESSAGE_ID
 cctrl bridge status MESSAGE_ID
-# Retire stale Codex queue copies of messages already handled (see below):
+# Retire stale Codex queue copies of messages already handled:
 cctrl bridge retire --handled --dry-run
 cctrl bridge retire --handled
 # Read-only reconciliation for a Codex target:
