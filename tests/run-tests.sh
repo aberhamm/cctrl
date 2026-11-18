@@ -6341,6 +6341,34 @@ test_d10b_anchor_only_match_refuses_65() {
     echo "ok: a live pane matching the recorded anchor refuses even when no index entry says so"
 }
 
+test_d10b_no_launch_evidence_falls_back_to_index_match() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10bf1 conv-d10bf-1-0001 TMUX--ms--work--3
+    # A record with NO cctrl-launch evidence: the index-only match applies, even
+    # though the live pane is not the recorded anchor.
+    jq '.ownership_evidence = ((.ownership_evidence // []) | map(select(type != "object" or .source != "cctrl-launch")))' \
+        "$RF_REC" > "$RF_REC.tmp" && mv "$RF_REC.tmp" "$RF_REC"
+    printf '$1:TMUX--ms--work--3\n' > "$RF_STATE"
+    local out rc=0
+    out="$(TMUX_FAKE_ANCHOR='%9 1' _d10b_resume conv-d10bf-1-0001)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "no launch evidence: an indexed live session must refuse, got $rc: $out"
+    assert_contains "$out" "cctrl session attach TMUX--ms--work--3"
+    ! grep -q 'new-session' "$RF_LOG" || fail "a refused resume must not start a session"
+    echo "ok: a record without cctrl-launch evidence falls back to the index-only match"
+}
+
+test_d10b_failed_resume_removes_new_index_entry() {
+    unset TMUX TMUX_PANE
+    _d10b_fixture d10bf2 conv-d10bf-2-0001 TMUX--ms--work--3
+    local idx3 out
+    idx3="$CCTRL_SESSION_METADATA_DIR/.session-index-$(printf '%s' TMUX--ms--work--3 | shasum -a 256 | awk '{print $1}').ref"
+    rm -f "$idx3"
+    out="$(TMUX_FAKE_FAIL_NEW_SESSION=TMUX--ms--work--3 _d10b_resume conv-d10bf-2-0001 || true)"
+    [[ -f "$RF_REC" ]] || fail "the canonical record was deleted: $out"
+    [[ ! -e "$idx3" ]] || fail "a failed new-session left an index entry for a name that had none: $(head -1 "$idx3")"
+    echo "ok: a failed resume removes the index entry it created for a name with no prior entry"
+}
+
 test_d10b_failed_first_resume_leaves_no_new_record() {
     unset TMUX TMUX_PANE
     _rf_setup d10bb4 '{}'
@@ -29732,7 +29760,7 @@ test_predecessor_retire_fresh_launch_waits_for_the_conversation_id() {
 # codex-adapter add a python unittest step next to their tests.
 _group_tests() {
     case "$1" in
-        d10b) printf '%s\n' test_d10b_failed_new_session_keeps_canonical_record test_d10b_resume_reuses_free_recorded_name test_d10b_prefix_trap_uses_exact_probes test_d10b_held_by_self_refuses_65 test_d10b_held_by_another_takes_suffix test_d10b_real_flow_second_resume_while_live_refuses_65 test_d10b_real_flow_live_in_second_name_refuses_65 test_d10b_foreign_holder_of_recorded_name_is_not_taken_for_x test_d10b_anchor_only_match_refuses_65 test_d10b_failed_first_resume_leaves_no_new_record test_d10b_held_proof_start_time_is_bounded test_d10b_different_cwd_uses_derived_name test_d10b_repo_orchestrator_family_check test_d10b_fleet_record_is_unchanged test_d10b_keep_name_off_switch test_d10b_inline_resume_forms_keep_the_name test_d10b_missing_host_id_is_silent_and_writes_nothing test_d10b_foreign_device_and_placeholder_names_declined test_d10b_bare_resume_prints_hint_only ;;
+        d10b) printf '%s\n' test_d10b_failed_new_session_keeps_canonical_record test_d10b_resume_reuses_free_recorded_name test_d10b_prefix_trap_uses_exact_probes test_d10b_held_by_self_refuses_65 test_d10b_held_by_another_takes_suffix test_d10b_real_flow_second_resume_while_live_refuses_65 test_d10b_real_flow_live_in_second_name_refuses_65 test_d10b_foreign_holder_of_recorded_name_is_not_taken_for_x test_d10b_anchor_only_match_refuses_65 test_d10b_failed_first_resume_leaves_no_new_record test_d10b_no_launch_evidence_falls_back_to_index_match test_d10b_failed_resume_removes_new_index_entry test_d10b_held_proof_start_time_is_bounded test_d10b_different_cwd_uses_derived_name test_d10b_repo_orchestrator_family_check test_d10b_fleet_record_is_unchanged test_d10b_keep_name_off_switch test_d10b_inline_resume_forms_keep_the_name test_d10b_missing_host_id_is_silent_and_writes_nothing test_d10b_foreign_device_and_placeholder_names_declined test_d10b_bare_resume_prints_hint_only ;;
         role-skills) printf '%s\n' test_role_skills_ask_rule ;;
         bash-leg) printf '%s\n' test_bash_leg_is_honest test_no_shimless_test_path test_profile_settings_gc_portable_membership ;;
         session-prune) printf '%s\n' test_session_prune_never_prompted_claude test_session_prune_fresh_active_not_candidate test_session_prune_codex_no_claude_transcript_bug_guard test_session_prune_codex_never_prompted test_session_prune_dry_run_closes_nothing test_session_prune_claude_long_transcript_user_turn_not_flagged test_session_prune_yes_caps_large_batch ;;

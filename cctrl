@@ -6403,12 +6403,17 @@ _launch_resume_record_file() {
 #   - its session-index entry resolves to the conversation's record AND that
 #     name is the one the record's latest cctrl-launch evidence names (the index
 #     survives the record keeping an earlier execution's name and anchor, but a
-#     stale entry on a name held by another session must not count), or
+#     stale entry on a name held by another session must not count). A record
+#     with NO cctrl-launch evidence falls back to the index-only match, or
 #   - its live pane is the pane the record anchors (id and pid, plus the start
 #     time when one is recorded).
 # It scans every live session, not just the recorded name, so a conversation
 # resumed under another name (work--2 while the record says work--3) is found.
 # Fails toward refusing: an unprovable-but-indexed session is treated as X.
+# Residual (r1): X exited and a session made outside cctrl (no index write) took
+# X's last-launched name; its stale index entry still resolves to X, so it is
+# taken for X and the resume refuses (65). Any cctrl launch into that name
+# rewrites the index and clears it.
 _launch_resume_live_holder() {
     local file base s ref pane_id pane_pid pane_started live live_started run_bound last_name sessions
     file="$(_launch_resume_record_file "$1" "$2")" || return 1
@@ -6430,7 +6435,7 @@ _launch_resume_live_holder() {
     while IFS= read -r s; do
         [[ -n "$s" ]] || continue
         ref="$(head -1 "$(_session_record_index_file "$s" 2>/dev/null)" 2>/dev/null || true)"
-        if [[ "$ref" == "$base" && "$s" == "$last_name" ]]; then
+        if [[ "$ref" == "$base" && ( -z "$last_name" || "$s" == "$last_name" ) ]]; then
             printf '%s' "$s"
             return 0
         fi
@@ -7199,6 +7204,14 @@ _launch_detached() {
                     echo -e "${YELLOW}cctrl: could not start tmux session $session_name (not live); the record of ${resume_id:-this conversation} was kept, not deleted.${RESET}" >&2
                     if [[ -n "$_prev_index_ref" && -f "$SESSION_METADATA_DIR/$_prev_index_ref" ]]; then
                         _session_record_index_update "$session_name" "$SESSION_METADATA_DIR/$_prev_index_ref" 2>/dev/null || true
+                    else
+                        # No entry before this call: drop the one it wrote, as the
+                        # created-record branch below does.
+                        local _kept_idx
+                        _kept_idx="$(_session_record_index_file "$session_name" 2>/dev/null || true)"
+                        if [[ -n "$_kept_idx" && "$(head -1 "$_kept_idx" 2>/dev/null || true)" == "${_failed_rec##*/}" ]]; then
+                            rm -f "$_kept_idx" 2>/dev/null || true
+                        fi
                     fi
                 else
                     # This call created the record: leave nothing claiming a
