@@ -195,6 +195,23 @@ _runner_finish() {
 # <<< test runner
 _RT_SELF="$ROOT/tests/run-tests.sh"
 _runner_parse "$@"
+# Build speed: a FULL run (no test names, no CCTRL_TEST_NAMES, no group, not
+# --list) takes the host-wide suite lock and, only if it ends green on a clean
+# tree, records a pass stamp that install/self-install.sh can reuse. Filtered
+# and group runs skip both. See lib/suite-gate.sh for the rules.
+_SUITE_FULL=0
+_SUITE_TREE0=""
+_SUITE_BMM=""
+_SUITE_PMM=""
+if [[ "$_RT_LIST" -eq 0 && "$_RT_FILTER" -eq 0 && -z "${CCTRL_TEST_ONLY:-}" ]]; then
+    # shellcheck source=../lib/suite-gate.sh
+    source "$ROOT/lib/suite-gate.sh"
+    _SUITE_FULL=1
+    suite_lock_acquire
+    _SUITE_TREE0="$(suite_gate_tree "$ROOT" || true)"
+    _SUITE_BMM="$(suite_gate_bash_mm "$BASH")"
+    _SUITE_PMM="$(suite_gate_py_mm)"
+fi
 _RT_BANNER_FD=1
 [[ "$_RT_LIST" -eq 0 ]] || _RT_BANNER_FD=2
 TMPDIR="$(mktemp -d)"
@@ -438,6 +455,7 @@ _suite_exit() {
         fi
         rm -rf -- "$CCTRL_TEST_TMUX_TMPDIR"
     fi
+    if [[ "$_SUITE_FULL" -eq 1 ]]; then suite_lock_release; fi
     return "$rc"
 }
 trap _suite_exit EXIT
@@ -28798,6 +28816,189 @@ test_self_install_links_state_to_primary_checkout() {
     echo "ok: self-install links state at the primary checkout from a worktree, refuses when unresolved"
 }
 
+# ── build speed: suite lock + pass stamps + install-gate reuse ───────────
+# All of these use temp state dirs (CCTRL_SUITE_STATE_DIR) and never touch the
+# real host lock or the real stamps.
+
+test_suite_lock_serializes_and_breaks_only_stale() {
+    local d="$TMPDIR/sl" lib="$ROOT/lib/suite-gate.sh" hpid w1 w2 dead lp
+    rm -rf "$d"; mkdir -p "$d"
+    # A fake live holder whose command line is a run-tests.sh process.
+    cat > "$d/run-tests.sh" <<HOLD
+#!/usr/bin/env bash
+source "$lib"
+export CCTRL_SUITE_STATE_DIR="$d/state"
+suite_lock_acquire
+echo held > "$d/holder-up"
+while [[ ! -e "$d/holder-release" ]]; do sleep 0.1; done
+suite_lock_release
+HOLD
+    bash "$d/run-tests.sh" & hpid=$!
+    local i; for i in $(seq 1 100); do [[ -e "$d/holder-up" ]] && break; sleep 0.1; done
+    [[ -e "$d/holder-up" ]] || fail "fake holder never took the lock"
+    lp="$d/state/suite.lock"
+    [[ "$(cat "$lp/pid")" == "$hpid" ]] || fail "lock pid file does not name the holder"
+    # Second full run waits, says who holds it, and does NOT break a live holder.
+    ( CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 bash -c 'source "$0"; suite_lock_acquire; echo GOT; suite_lock_release' "$lib" ) > "$d/w1.out" 2> "$d/w1.err" & w1=$!
+    sleep 2
+    grep -q "waiting for suite lock held by PID $hpid since" "$d/w1.err" || fail "waiter did not announce the holder: $(cat "$d/w1.err")"
+    ! grep -q GOT "$d/w1.out" || fail "waiter ran concurrently with a live holder"
+    kill -0 "$w1" 2>/dev/null || fail "waiter exited while the holder was alive"
+    : > "$d/holder-release"
+    wait "$hpid" || true
+    wait "$w1" || fail "waiter failed after release"
+    grep -q GOT "$d/w1.out" || fail "waiter never acquired after the holder released"
+    [[ ! -e "$lp" ]] || fail "lock left behind after release"
+    # Stale: holder pid dead.
+    ( : ) & dead=$!; wait "$dead" || true
+    mkdir -p "$lp"; printf '%s\n' "$dead" > "$lp/pid"
+    CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 bash -c 'source "$0"; suite_lock_acquire; suite_lock_release' "$lib" 2> "$d/w2.err" \
+        || fail "a dead-holder lock was not broken"
+    grep -q "breaking stale lock" "$d/w2.err" || fail "stale break not announced"
+    # Stale: pid alive but NOT a run-tests process (pid reuse).
+    sleep 60 & w2=$!
+    mkdir -p "$lp"; printf '%s\n' "$w2" > "$lp/pid"
+    CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 bash -c 'source "$0"; suite_lock_acquire; suite_lock_release' "$lib" 2>/dev/null \
+        || fail "a lock held by a live non-run-tests pid was not broken"
+    kill "$w2" 2>/dev/null || true; wait "$w2" 2>/dev/null || true
+    # Release never removes a lock that names someone else.
+    mkdir -p "$lp"; printf '%s\n' "999999" > "$lp/pid"
+    CCTRL_SUITE_STATE_DIR="$d/state" bash -c 'source "$0"; _SUITE_LOCK_HELD=1; _SUITE_LOCK_DIR_HELD="$1"; suite_lock_release' "$lib" "$lp"
+    [[ -d "$lp" ]] || fail "release removed a lock that names another pid"
+    echo "ok: suite lock serializes full runs, breaks dead/non-run-tests holders, never a live one"
+}
+
+test_suite_pass_stamp_rules() {
+    local d="$TMPDIR/sp" lib="$ROOT/lib/suite-gate.sh" repo t
+    rm -rf "$d"; mkdir -p "$d/state"
+    # shellcheck source=/dev/null
+    source "$lib"
+    export CCTRL_SUITE_STATE_DIR="$d/state"
+    unset CCTRL_SUITE_TREE
+    repo="$d/repo"; mkdir -p "$repo"
+    ( cd "$repo" && git init -q && git config user.email t@t.co && git config user.name t \
+        && echo a > f && git add f && git commit -q -m c )
+    t="$(suite_gate_tree "$repo")" || fail "clean tree gave no key"
+    [[ "$t" == "$(git -C "$repo" rev-parse 'HEAD^{tree}')" ]] || fail "tree key is not the git tree hash"
+    # Full green run on a clean tree writes a stamp.
+    suite_record_pass "$repo" 1 "$t" 5.3 3.14 2>/dev/null || fail "full green clean run did not record"
+    suite_stamp_check "$t" 5.3 3.14 || fail "stamp not found for the recorded key"
+    # Different bash or python or tree -> no match.
+    ! suite_stamp_check "$t" 3.2 3.14 || fail "stamp matched a different bash"
+    ! suite_stamp_check "$t" 5.3 3.9 || fail "stamp matched a different python"
+    ! suite_stamp_check "0000000000000000000000000000000000000000" 5.3 3.14 || fail "stamp matched a different tree"
+    # Filtered run never writes.
+    rm -rf "$d/state/suite-passes"
+    ! suite_record_pass "$repo" 0 "$t" 5.3 3.14 2>/dev/null || fail "filtered run recorded"
+    [[ ! -e "$d/state/suite-passes" ]] || fail "filtered run wrote a stamp"
+    # Dirty tree (tracked edit or untracked file): no key, no stamp.
+    echo b >> "$repo/f"
+    [[ -z "$(suite_gate_tree "$repo" || true)" ]] || fail "dirty tree produced a key"
+    git -C "$repo" checkout -q -- f
+    echo u > "$repo/untracked"
+    [[ -z "$(suite_gate_tree "$repo" || true)" ]] || fail "untracked file produced a key"
+    rm "$repo/untracked"
+    # No tree at start -> no stamp; tree changed during the run -> no stamp.
+    ! suite_record_pass "$repo" 1 "" 5.3 3.14 2>/dev/null || fail "empty start tree recorded"
+    ! suite_record_pass "$repo" 1 "1111111111111111111111111111111111111111" 5.3 3.14 2>/dev/null || fail "changed tree recorded"
+    [[ ! -e "$d/state/suite-passes" ]] || fail "a refused record left a stamp"
+    # CCTRL_SUITE_TREE (install scratch copy) is the key when set and well formed.
+    [[ "$(CCTRL_SUITE_TREE="$t" suite_gate_tree "$d")" == "$t" ]] || fail "CCTRL_SUITE_TREE ignored"
+    ! CCTRL_SUITE_TREE="not-a-hash" suite_gate_tree "$d" >/dev/null || fail "malformed CCTRL_SUITE_TREE accepted"
+    # Prune keeps the newest N.
+    local n
+    for n in 1 2 3 4 5; do suite_stamp_write "$(printf '%040d' "$n")" 5.3 3.14 >/dev/null; sleep 1; done
+    suite_stamp_prune 3
+    [[ "$(ls -1 "$d/state/suite-passes" | wc -l | tr -d ' ')" == 3 ]] || fail "prune did not keep 3"
+    suite_stamp_check "$(printf '%040d' 5)" 5.3 3.14 || fail "prune removed the newest stamp"
+    # run-tests.sh records only after every gate, on the full path.
+    local last rep
+    last="$(grep -n 'suite_record_pass' "$ROOT/tests/run-tests.sh" | tail -1 | cut -d: -f1)"
+    rep="$(grep -n '^_runner_report || exit 1' "$ROOT/tests/run-tests.sh" | tail -1 | cut -d: -f1)"
+    [[ -n "$last" && -n "$rep" ]] || fail "run-tests.sh never records a pass after the report"
+    (( last > rep )) || fail "the pass record must come after the final report"
+    echo "ok: pass stamps only on full green clean runs; keyed on tree+bash+python; pruned"
+}
+
+test_run_tests_filtered_run_skips_lock_and_stamp() {
+    local d="$TMPDIR/rf" out rc=0
+    rm -rf "$d"; mkdir -p "$d/state/suite.lock"
+    # A filtered run with the lock already held by a live process: it must
+    # not wait for it and must write no stamp.
+    printf '%s\n' "$$" > "$d/state/suite.lock/pid"
+    out="$(env -u CCTRL_TEST_ONLY -u CCTRL_TEST_KEEP_GOING CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_TEST_NAMES=test_registration_guard_self_test \
+        "$BASH" "$ROOT/tests/run-tests.sh" 2>&1)" || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "filtered run failed (rc=$rc): $(printf '%s' "$out" | tail -5)"
+    [[ "$out" != *"waiting for suite lock"* ]] || fail "a filtered run waited for the suite lock"
+    [[ ! -e "$d/state/suite-passes" ]] || fail "a filtered run wrote a pass stamp"
+    echo "ok: a filtered run neither takes the suite lock nor records a stamp"
+}
+
+_si_gate_fixture() { # dir -> primary checkout with a stub suite that logs its call
+    local base="$1" primary="$1/primary"
+    rm -rf "$base"; mkdir -p "$primary/install" "$primary/tests" "$primary/lib" "$base/home"
+    cp "$ROOT/install/self-install.sh" "$ROOT/install/cctrl-launcher.sh" "$primary/install/"
+    cp "$ROOT/lib/suite-gate.sh" "$primary/lib/"
+    printf 'test_alpha\n# comment\n\ntest_beta\n' > "$primary/tests/smoke-tests.txt"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$primary/cctrl"
+    cat > "$primary/tests/run-tests.sh" <<'STUB'
+#!/usr/bin/env bash
+printf 'call names=[%s] tree=[%s]\n' "$(printf '%s' "${CCTRL_TEST_NAMES:-}" | tr '\n' ' ')" "${CCTRL_SUITE_TREE:-}" >> "$STUB_LOG"
+STUB
+    chmod +x "$primary/cctrl" "$primary/tests/run-tests.sh"
+    (cd "$primary" && git init -q && git config user.email t@t.co && git config user.name t \
+        && git add -A && git commit -q -m init)
+}
+
+test_self_install_gate_reuses_a_matching_pass_stamp() {
+    local base="$TMPDIR/si-gate" primary tree bmm pmm log out
+    _si_gate_fixture "$base"
+    primary="$base/primary"; log="$base/stub.log"; : > "$log"
+    tree="$(git -C "$primary" rev-parse 'HEAD^{tree}')"
+    bmm="$(source "$ROOT/lib/suite-gate.sh"; suite_gate_bash_mm bash)"
+    pmm="$(source "$ROOT/lib/suite-gate.sh"; suite_gate_py_mm)"
+    local -a run=(env -u CCTRL_INSTALL_FULL_GATE -u CCTRL_SUITE_TREE STUB_LOG="$log" CCTRL_SUITE_STATE_DIR="$base/state" \
+        CCTRL_HOME="$base/home/lib" CCTRL_BIN="$base/home/bin/cctrl")
+    # 1. No stamp: the full suite runs (no name filter), with the tree key passed in.
+    out="$("${run[@]}" bash "$primary/install/self-install.sh" 2>&1)" || fail "install without a stamp failed: $out"
+    [[ "$out" == *"FULL SUITE"* ]] || fail "no-stamp install did not say it ran the full suite: $out"
+    grep -q "call names=\[\] tree=\[$tree\]" "$log" || fail "full gate call wrong: $(cat "$log")"
+    # 2. Matching stamp: only the smoke subset runs, and it says so.
+    : > "$log"
+    ( source "$ROOT/lib/suite-gate.sh"; export CCTRL_SUITE_STATE_DIR="$base/state"; suite_stamp_write "$tree" "$bmm" "$pmm" >/dev/null )
+    out="$("${run[@]}" bash "$primary/install/self-install.sh" 2>&1)" || fail "install with a stamp failed: $out"
+    [[ "$out" == *"STAMP REUSE"* ]] || fail "stamped install did not say STAMP REUSE: $out"
+    [[ "$(wc -l < "$log" | tr -d ' ')" == 1 ]] || fail "stamped install ran the stub more than once: $(cat "$log")"
+    grep -q 'call names=\[test_alpha test_beta\]' "$log" || fail "stamped install did not run exactly the smoke subset: $(cat "$log")"
+    # 3. Forced: --full-gate and CCTRL_INSTALL_FULL_GATE=1 run the full suite despite the stamp.
+    : > "$log"
+    out="$("${run[@]}" bash "$primary/install/self-install.sh" --full-gate 2>&1)" || fail "--full-gate install failed: $out"
+    [[ "$out" == *"FULL SUITE"* && "$out" == *"forced"* ]] || fail "--full-gate did not force the full suite: $out"
+    grep -q 'call names=\[\] ' "$log" || fail "--full-gate ran a filtered suite: $(cat "$log")"
+    : > "$log"
+    "${run[@]}" CCTRL_INSTALL_FULL_GATE=1 bash "$primary/install/self-install.sh" >/dev/null 2>&1 || fail "CCTRL_INSTALL_FULL_GATE install failed"
+    grep -q 'call names=\[\] ' "$log" || fail "CCTRL_INSTALL_FULL_GATE=1 ran a filtered suite: $(cat "$log")"
+    # 4. Mismatch (other bash, other python, other tree): the full suite runs.
+    local variant vb vp vt
+    for variant in "3.2 $pmm $tree" "$bmm 2.7 $tree" "$bmm $pmm 0000000000000000000000000000000000000000"; do
+        rm -rf "$base/state"; : > "$log"
+        read -r vb vp vt <<< "$variant"
+        ( source "$ROOT/lib/suite-gate.sh"; export CCTRL_SUITE_STATE_DIR="$base/state"; suite_stamp_write "$vt" "$vb" "$vp" >/dev/null )
+        "${run[@]}" bash "$primary/install/self-install.sh" >/dev/null 2>&1 || fail "mismatch install failed ($variant)"
+        grep -q 'call names=\[\] ' "$log" || fail "a mismatched stamp ($variant) did not force the full suite: $(cat "$log")"
+    done
+    # 5. A dirty tree is refused outright, never gated on a stamp.
+    printf 'x\n' >> "$primary/cctrl"
+    if "${run[@]}" bash "$primary/install/self-install.sh" >/dev/null 2>&1; then fail "dirty tree installed"; fi
+    git -C "$primary" checkout -q -- cctrl
+    # 6. A tree without the gate library falls back to the full suite.
+    git -C "$primary" rm -q -f lib/suite-gate.sh && git -C "$primary" commit -q -m nolib
+    rm -rf "$base/state"; : > "$log"
+    "${run[@]}" bash "$primary/install/self-install.sh" >/dev/null 2>&1 || fail "install without the lib failed"
+    grep -q 'call names=\[\] ' "$log" || fail "missing gate lib did not fall back to the full suite: $(cat "$log")"
+    echo "ok: install gate reuses a matching stamp (smoke only), runs the full suite on mismatch, force, or no stamp"
+}
+
 # ── D10a: predecessor retire ─────────────────────────────────────────
 _PRED_X="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
 _PRED_P="b1b2c3d4-e5f6-7890-abcd-ef1234567891"
@@ -29230,3 +29431,9 @@ if [[ -z "${CCTRL_TEST_ONLY:-}" ]]; then
 fi
 
 _runner_report || exit 1
+
+# Every gate above passed (shell tests, python tests, report). Record the pass
+# stamp for the install gate; never fatal.
+if [[ "$_SUITE_FULL" -eq 1 ]]; then
+    suite_record_pass "$ROOT" "$_SUITE_FULL" "$_SUITE_TREE0" "$_SUITE_BMM" "$_SUITE_PMM" || true
+fi

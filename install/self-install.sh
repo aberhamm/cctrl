@@ -4,7 +4,35 @@
 # (default ~/.local/bin/cctrl). Never touches either path until every gate
 # (syntax + the full test suite) passes against the release that is about
 # to ship, not against the live working tree -- see docs/plans/079.
+#
+# Usage: self-install.sh [--full-gate]
+#
+# Gate reuse (build speed). The full suite takes about 25 minutes, so it is
+# not rerun on a tree that already passed it on this host. A green FULL run of
+# tests/run-tests.sh (no filter) writes a pass stamp under
+# $CCTRL_SUITE_STATE_DIR or ~/.local/state/cctrl/suite-passes/, keyed on the git
+# tree hash of the tested content + host + bash major.minor + python
+# major.minor (lib/suite-gate.sh). This script computes the same key for the
+# commit it installs (the tree of HEAD; the scratch copy has no .git, so the
+# key is handed to the suite as CCTRL_SUITE_TREE). Then:
+#   - stamp found: syntax checks plus the smoke subset in tests/smoke-tests.txt
+#     (the same names CI smoke runs) -- and it prints "STAMP REUSE";
+#   - no stamp, any mismatch, or an unreadable key: the full suite runs and
+#     records a stamp on success -- it prints "FULL SUITE" and why;
+#   - --full-gate, or CCTRL_INSTALL_FULL_GATE=1, forces the full suite.
+# A dirty tree is refused before any of this. The full suite goes through the
+# host-wide suite lock in tests/run-tests.sh, so it queues behind any other
+# full run instead of running concurrently.
 set -euo pipefail
+
+FULL_GATE=0
+for _arg in "$@"; do
+    case "$_arg" in
+        --full-gate) FULL_GATE=1 ;;
+        *) echo "usage: self-install.sh [--full-gate]" >&2; exit 64 ;;
+    esac
+done
+[[ "${CCTRL_INSTALL_FULL_GATE:-}" == 1 ]] && FULL_GATE=1
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SELF_DIR/.." && pwd)"
@@ -96,8 +124,45 @@ for f in "$SCRATCH"/lib/*.pl; do
     perl -c "$f" 2>/dev/null
 done
 
-echo "cctrl self-install: running full test suite (LANG=en_US.UTF-8)" >&2
-LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"
+# Decide the gate path: reuse a matching pass stamp, or run the full suite.
+GATE_REASON=""
+GATE_TREE=""
+GATE_BMM=""
+GATE_PMM=""
+if [[ -f "$SCRATCH/lib/suite-gate.sh" ]]; then
+    # shellcheck source=../lib/suite-gate.sh
+    source "$SCRATCH/lib/suite-gate.sh"
+    GATE_TREE="$(git -C "$ROOT" rev-parse --verify -q "$SHA^{tree}" || true)"
+    GATE_BMM="$(suite_gate_bash_mm bash)"
+    GATE_PMM="$(suite_gate_py_mm)"
+    if [[ "$FULL_GATE" == 1 ]]; then
+        GATE_REASON="forced by --full-gate or CCTRL_INSTALL_FULL_GATE=1"
+    elif [[ -z "$GATE_TREE" ]]; then
+        GATE_REASON="could not resolve the tree hash of $SHORT_SHA"
+    elif suite_stamp_check "$GATE_TREE" "$GATE_BMM" "$GATE_PMM"; then
+        GATE_REASON=""
+    else
+        GATE_REASON="no pass stamp for tree ${GATE_TREE:0:12}, host $(suite_gate_host), bash $GATE_BMM, python $GATE_PMM"
+    fi
+else
+    GATE_REASON="this tree has no lib/suite-gate.sh"
+fi
+
+if [[ -z "$GATE_REASON" ]]; then
+    STAMP_FILE="$(suite_stamp_path "$GATE_TREE" "$GATE_BMM" "$GATE_PMM")"
+    echo "cctrl self-install: gate path = STAMP REUSE: tree ${GATE_TREE:0:12} already passed the full suite on this host (bash $GATE_BMM, python $GATE_PMM, recorded $(suite_stamp_recorded "$STAMP_FILE")); running the smoke subset only. Use --full-gate to force the full suite." >&2
+    SMOKE_NAMES="$(grep -v '^[[:space:]]*#' "$SCRATCH/tests/smoke-tests.txt" | grep . || true)"
+    if [[ -z "$SMOKE_NAMES" ]]; then
+        echo "cctrl self-install: FATAL - tests/smoke-tests.txt names no tests; rerun with --full-gate" >&2
+        exit 1
+    fi
+    env -u CCTRL_TEST_ONLY CCTRL_TEST_NAMES="$SMOKE_NAMES" LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"
+else
+    echo "cctrl self-install: gate path = FULL SUITE ($GATE_REASON) (LANG=en_US.UTF-8)" >&2
+    # A stray CCTRL_TEST_NAMES/CCTRL_TEST_ONLY in the caller's environment
+    # would turn this into a filtered run; the gate must be the full suite.
+    env -u CCTRL_TEST_NAMES -u CCTRL_TEST_ONLY CCTRL_SUITE_TREE="$GATE_TREE" LANG=en_US.UTF-8 bash "$SCRATCH/tests/run-tests.sh"
+fi
 
 # Keep validation isolated from live registry churn. Mutable state is linked
 # only after the staged release has passed every gate.
