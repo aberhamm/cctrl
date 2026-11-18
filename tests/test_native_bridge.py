@@ -941,6 +941,88 @@ class DaemonVersionTests(unittest.TestCase):
             self.assertEqual(0, bridge.main(["--root", str(self.store.root), "stop", "--json"]))
         rpc.assert_called_once()
 
+    def handled(self, who, qid="q", sender="claude:sender", handle=True, status="queued"):
+        mid, _ = self.store.create(sender, who, "work")
+        self.store.event(mid, status, {"queued_submission_id": qid} if qid else {})
+        if handle:
+            self.store.acknowledge(mid, who)
+        return mid
+
+    def retire_cli(self, row, *flags):
+        who = row["actor"]
+        daemon = bridge.Daemon.__new__(bridge.Daemon)
+        daemon.store, daemon.who = self.store, who
+        daemon.deliver = lambda *args: {"status": "queued"}
+        self.retired = []
+        daemon.retire_queue = lambda *args: (self.retired.append(args) or {"outcome": "retired"})
+        out = io.StringIO()
+        with patch.object(bridge, "ensure_daemon", return_value=row), patch.object(bridge, "own_actor", return_value=who), \
+             patch.object(bridge, "rpc", side_effect=lambda r, req: {"ok": True, "data": daemon.handle(req)}) as rpc, \
+             patch.object(sys, "stdout", out):
+            code = bridge.main(["--root", str(self.store.root), "retire", *flags])
+        return code, json.loads(out.getvalue()), rpc
+
+    def events(self):
+        with self.store.db() as db:
+            return db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+
+    def current_row(self, who="codex:me"):
+        return self.live_row(who, protocol=bridge.DAEMON_PROTOCOL, capabilities=list(bridge.DAEMON_CAPABILITIES))
+
+    def test_retire_handled_retires_only_handled_items(self):
+        row = self.current_row()
+        done = self.handled("codex:me", "q-done")
+        self.handled("codex:me", "q-open", handle=False)
+        self.handled("codex:me", None, status="queued")
+        code, out, _ = self.retire_cli(row, "--handled", "--json")
+        self.assertEqual(0, code)
+        self.assertEqual([("me", done, "q-done")], self.retired)
+        self.assertEqual({"retired": 1}, out["outcomes"])
+        self.assertEqual(1, out["skipped_no_identity"])
+
+    def test_retire_handled_never_touches_another_actors_items(self):
+        row = self.current_row()
+        self.handled("codex:other", "q-other")
+        mine = self.handled("codex:me", "q-mine")
+        code, out, _ = self.retire_cli(row, "--handled", "--json")
+        self.assertEqual([("me", mine, "q-mine")], self.retired)
+        self.assertEqual(1, out["candidates"])
+
+    def test_retire_handled_is_idempotent(self):
+        row = self.current_row()
+        self.handled("codex:me", "q1")
+        self.retire_cli(row, "--handled", "--json")
+        code, out, rpc = self.retire_cli(row, "--handled", "--json")
+        self.assertEqual(0, code)
+        self.assertEqual(0, out["candidates"])
+        self.assertEqual([], self.retired)
+        rpc.assert_not_called()
+
+    def test_retire_handled_dry_run_writes_nothing(self):
+        row = self.current_row()
+        mid = self.handled("codex:me", "q1")
+        before = self.events()
+        code, out, rpc = self.retire_cli(row, "--handled", "--dry-run", "--json")
+        self.assertEqual(0, code)
+        self.assertTrue(out["dry_run"])
+        self.assertEqual([mid], out["ids"])
+        self.assertEqual(before, self.events())
+        rpc.assert_not_called()
+        self.assertEqual([], self.retired)
+
+    def test_retire_handled_refuses_on_outdated_daemon(self):
+        row = self.live_row("codex:me")
+        self.handled("codex:me", "q1")
+        code, out, rpc = self.run_cli(row, "retire", "--handled", "--json")
+        self.assertEqual((1, "daemon-outdated"), (code, out["error"]["code"]))
+        rpc.assert_not_called()
+
+    def test_retire_requires_handled_flag(self):
+        row = self.current_row()
+        code, out, rpc = self.run_cli(row, "retire", "--json")
+        self.assertEqual(1, code)
+        rpc.assert_not_called()
+
     def test_hello_reports_protocol(self):
         daemon = bridge.Daemon.__new__(bridge.Daemon)
         daemon.store, daemon.who = self.store, "codex:me"

@@ -88,23 +88,20 @@ Run these as the session that owns the endpoint, with the **new** cctrl.
    and ownership record. If cleanup stays pending, inspect it; do not kill an
    unverified PID.
 5. Retire stale Codex queue copies. Messages the old daemon already marked
-   handled were never retired from your Codex queue. Find them (read-only; only a successful or final retirement excludes a message, so `unknown`, `race` and `identity_mismatch` outcomes, which are meant to be retried, are listed too; the
-   ledger is `$CCTRL_NATIVE_BRIDGE_DIR/ledger.sqlite3`, default
-   `~/.local/state/cctrl/native-bridge/ledger.sqlite3`):
+   handled were never retired from your Codex queue. Preview, then retire:
    ```sh
-   sqlite3 -readonly LEDGER "SELECT id FROM messages m
-     WHERE recipient='codex:YOUR_THREAD_ID' AND kind='message' AND received IS NOT NULL
-       AND status IN ('queued','ambiguous')
-       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='native-retire'
-         AND json_extract(e.detail,'\$.outcome') IN ('retired','absent','already_consumed','unsupported','not_applicable'))"
+   cctrl bridge retire --handled --dry-run
+   cctrl bridge retire --handled
    ```
-   Repeat the ACK for each with the new daemon; it is idempotent and only deletes
-   the exact queue item this bridge submitted:
-   ```sh
-   cctrl bridge ack MESSAGE_ID
-   ```
-   Check `native_retirement.outcome` (see
-   [peer-messaging.md](peer-messaging.md)).
+   It selects your received messages whose native retirement is not final (so
+   `unknown`, `race` and `identity_mismatch` outcomes, which are meant to be
+   retried, are included), and retires each through the new daemon's idempotent
+   ACK path. It only deletes the exact queue item this bridge submitted, and
+   refuses with `daemon-outdated` on an old daemon. Messages with no persisted
+   queue identity are reported as `skipped_no_identity`; run
+   `cctrl bridge status ID --reconcile` for those. Check the per-outcome counts
+   (see [peer-messaging.md](peer-messaging.md)); a single message can be retried
+   with `cctrl bridge ack MESSAGE_ID`.
 
 A repeated ACK does not resend a receipt that was already sent; a receipt that earlier failed is retried, which is intended. A receipt owed to a Claude sender is never submitted natively (recorded as `suppressed`, see peer-messaging.md), so it has nothing to retry.
 

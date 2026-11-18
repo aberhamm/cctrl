@@ -85,6 +85,16 @@ message ID AND whose queue ID equals the persisted `queued_submission_id`. Body
 text is never consulted and no other queue entry is touched. The result carries
 `native_retirement.outcome` (`original.native_retirement` on a reply):
 
+`cctrl bridge retire --handled [--dry-run] [--json]` sweeps the backlog: it
+finds this session's received messages (`received` or `replied` set, status
+`queued` or `ambiguous`) with no final native retirement, and sends each through
+the same idempotent ACK/retire path. It only touches queue items this bridge
+submitted (persisted queue ID plus message ID); messages with no persisted queue
+identity are counted as `skipped_no_identity` and left alone. It is refused with
+`daemon-outdated` on a protocol-1 daemon. `--dry-run` lists the IDs and writes
+nothing. Output: `candidates`, `skipped_no_identity` and `outcomes` (count per
+`native_retirement.outcome`; `error` for an item the daemon refused).
+
 | outcome | meaning |
 |---|---|
 | `retired` | the item was pending and the server deleted it |
@@ -195,6 +205,9 @@ cctrl bridge reply MESSAGE_ID -- "Reviewed; here is the result"
 # After handling without a reply:
 cctrl bridge ack MESSAGE_ID
 cctrl bridge status MESSAGE_ID
+# Retire stale Codex queue copies of messages already handled (see below):
+cctrl bridge retire --handled --dry-run
+cctrl bridge retire --handled
 # Read-only reconciliation for a Codex target:
 cctrl bridge status MESSAGE_ID --reconcile
 # When this session no longer needs its endpoint:

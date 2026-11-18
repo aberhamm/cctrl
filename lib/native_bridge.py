@@ -50,6 +50,7 @@ MIGRATION_DOC = "docs/bridge-daemon-migration.md"
 REQUIRED_CAPABILITIES = {
     "send": ("sender_envelope",),
     "ack": ("native_retirement",),
+    "retire": ("native_retirement",),
     "reply": ("native_retirement", "reply_acks_original", "sender_envelope"),
 }
 ALL_REQUIRED = tuple(dict.fromkeys(c for caps in REQUIRED_CAPABILITIES.values() for c in caps))
@@ -376,6 +377,24 @@ class Store:
             if db.execute("SELECT 1 FROM events WHERE id=? AND kind=?", (mid, kind)).fetchone():
                 return
             db.execute("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)", (mid, time.time(), kind, json.dumps(detail)))
+
+    def pending_retirements(self, who):
+        """IDs of messages `who` handled whose native retirement is not final.
+
+        The single query behind `bridge retire --handled`. Rows without a
+        persisted queue identity are returned separately: they cannot be
+        retired without guessing, so they are never sent to the daemon.
+        """
+        final = ",".join("?" for _ in RETIRED_FINAL)
+        with self.db() as db:
+            rows = db.execute(
+                "SELECT m.id FROM messages m WHERE m.recipient=? AND m.kind='message' "
+                "AND (m.received IS NOT NULL OR m.replied IS NOT NULL) AND m.status IN ('queued','ambiguous') "
+                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='native-retire' "
+                f"AND json_extract(e.detail,'$.outcome') IN ({final})) ORDER BY m.created",
+                (who, *sorted(RETIRED_FINAL))).fetchall()
+        ids = [r[0] for r in rows]
+        return ([i for i in ids if self.queued_identity(i)], [i for i in ids if not self.queued_identity(i)])
 
     def retirement(self, mid):
         """Latest recorded native retirement outcome for a message, or None."""
@@ -921,6 +940,10 @@ def main(argv=None):
             item.add_argument("--limit", type=int, default=20, help="page size, 1..100")
             item.add_argument("--view", choices=VIEWS, default="actionable",
                               help="actionable (default): only messages native delivery did not accept; stranded: unhandled held/refused/ambiguous items; history: everything sent or received")
+    retire = sub.add_parser("retire", help="retire the Codex queue copies of messages this session already handled")
+    retire.add_argument("--handled", action="store_true", help="required: retire handled messages whose native retirement is not final")
+    retire.add_argument("--dry-run", action="store_true", help="list what would be retired; write nothing")
+    retire.add_argument("--json", action="store_true")
     for name in ("send", "reply", "ack", "status"):
         item = sub.add_parser(name)
         item.add_argument("target")
@@ -954,6 +977,26 @@ def main(argv=None):
                     if observed.get("status") == "queued":
                         store.event(result["id"], "queued", observed)
                     result = {**store.get(args.target, who), "reconciliation": observed}
+            elif args.command == "retire":
+                if not args.handled:
+                    raise ValueError("retire needs --handled (the only supported selection)")
+                ids, no_identity = store.pending_retirements(who)
+                result = {"actor": who, "dry_run": args.dry_run, "candidates": len(ids), "skipped_no_identity": len(no_identity)}
+                if args.dry_run:
+                    result.update(ids=ids, outcomes={})
+                else:
+                    outcomes = {}
+                    row = store.endpoint(who) or (ensure_daemon(store, who) if ids else None)
+                    if row is not None:
+                        check_daemon(row, "retire")
+                    if ids:
+                        for mid in ids:
+                            # The daemon's idempotent ACK path: it retires only the
+                            # exact queue item this bridge submitted for this message.
+                            response = rpc(row, {"actor": who, "action": "ack", "id": mid})
+                            outcome = ((response.get("data") or {}).get("native_retirement") or {}).get("outcome") if response.get("ok") else "error"
+                            outcomes[outcome or "error"] = outcomes.get(outcome or "error", 0) + 1
+                    result["outcomes"] = outcomes
             elif args.command == "inbox":
                 if not 1 <= args.limit <= 100 or args.after < 0:
                     raise ValueError("inbox limit must be 1..100 and after must be nonnegative")

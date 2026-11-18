@@ -24217,6 +24217,7 @@ cmd_help() {
     echo "  cctrl bridge send PROVIDER:ID -- BODY  Send once through native provider transport"
     echo "  cctrl bridge reply ID -- BODY       Correlated native reply and handling ACK"
     echo "  cctrl bridge ack|status ID           Explicit handling receipt / durable delivery status"
+    echo "  cctrl bridge retire --handled [--dry-run]  Retire Codex queue copies of messages already handled"
     echo "  cctrl peer mcp [--as NAME]          Run stdio MCP tools for one peer identity"
     echo "  cctrl peer show <id> [--as NAME]    Show a full message envelope"
     echo "  cctrl peer ack <id> [--as NAME]     Acknowledge a delivered message"
