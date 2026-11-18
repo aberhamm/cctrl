@@ -241,7 +241,7 @@ it does not expose provider sockets to the network.
 ```sh
 cctrl peer identify --json
 cctrl peer overview --json
-cctrl peer send RECIPIENT --deliver --json -- "Status report"
+cctrl peer send RECIPIENT --json -- "Status report"
 cctrl peer recv --all --json
 cctrl peer reply MESSAGE_ID --json -- "Handled"
 # Or, after handling without a reply:

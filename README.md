@@ -1510,7 +1510,7 @@ that thread. Use the usual mailbox commands:
 
 ```bash
 cctrl peer overview --json
-cctrl peer send reviewer --deliver --json -- "Please review the change."
+cctrl peer send reviewer --json -- "Please review the change."
 cctrl peer recv --json
 cctrl peer reply MESSAGE_ID --json -- "Review complete."
 cctrl peer ack MESSAGE_ID --json
@@ -1679,7 +1679,7 @@ tmux pane only gets the modal check. Every other recipient gets `sent-and-queued
 override flag: to push to a peer, enable the bell for it.
 
 ```bash
-cctrl peer send comet --as orchestrator --deliver --json -- "Please check XYZ"
+cctrl peer send comet --as orchestrator --json -- "Please check XYZ"
 cctrl peer reply msg_20260608_070000_abc123 --as comet --json -- "Checked, all green"
 ```
 
