@@ -6624,6 +6624,13 @@ _launch_detached() {
 
     mcp_mode="$(_mcp_mode_resolve "$mcp_flag" "" "" "" "" parent)" || return $?
 
+    # D10b 3.6: a bare resume (picker, -c) cannot know which record is being
+    # resumed until the conversation id is polled after launch, so it cannot
+    # keep a recorded name. Hint only; the launch is otherwise unchanged.
+    if [[ -n "$resuming" && -z "$resume_id" && -z "${_CCTRL_REPLAY:-}" ]]; then
+        echo -e "${DIM}cctrl: a bare --resume cannot keep a recorded name; to resume a known session under its name use: cctrl start -r <id> (ids: cctrl session ls --json).${RESET}" >&2
+    fi
+
     if ! command -v tmux &>/dev/null; then
         echo -e "${RED}tmux not found.${RESET} Install with: brew install tmux" >&2
         return 1
@@ -24032,6 +24039,8 @@ cmd_help() {
     echo "    --foreground, --no-tmux   Launch directly without tmux"
     echo "    -d, --detach              Start a detached tmux session and return"
     echo "    -r, --resume [id]         Resume a session (interactive picker or by session ID)"
+    echo "                              Resuming by id keeps the session's recorded tmux name when free"
+    echo "                              (CCTRL_RESUME_KEEP_NAME=0 disables); a bare --resume cannot"
     echo "    -n, --name NAME           Friendly label (session purpose); the agent's --name"
     echo "                              is always the tmux session id (TMUX--...)"
     echo "    --peer NAME               Export CCTRL_PEER for peer mailbox identity"

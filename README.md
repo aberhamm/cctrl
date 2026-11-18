@@ -280,6 +280,7 @@ cctrl start --agent claude        # launch Claude instead of Codex
 cctrl --agent claude start        # same, useful with global flags
 cctrl start --foreground          # direct one-off launch without tmux
 cctrl start --resume              # resume a session (interactive picker)
+cctrl start -d -r <id> <dir>      # resume by id: keeps the session's recorded tmux name when free
 cctrl start --yolo                # full bypass: Claude bypassPermissions / Codex --yolo
 cctrl start --permission-mode bypassPermissions  # also maps to Codex --yolo
 cctrl start -m "fix bug"          # launch with an initial prompt
@@ -700,7 +701,7 @@ not owned by the app, Codex needs App Server `confirmed-absence`). Provisional
 Resume launches (`start -r`, `@name -r`, restore replay, realign) trigger it
 right after the health check. A fresh Claude launch (no resume flag) triggers it
 once the conversation id is learned, the id update is verified and the pane still
-names it. A bare `-r`, `-c` or `--resume=` launch, and any fresh Codex launch, does
+names it. A bare `-r` or `-c` launch, and any fresh Codex launch, does
 not trigger it (a picker's first session id is not the user's pick). It runs in the background and never changes the
 launch's exit code. Every row, applied or skipped, appends a line to
 `$XDG_STATE_HOME/cctrl/audit/predecessor-retire.jsonl` (mode 600, ids and names
@@ -1077,6 +1078,23 @@ capture, belongs to this host and is at most `CCTRL_RESTORE_BOOT_MAX_AGE` second
 old (default 7 days); none qualifies: exit 69 with the reason for each file.
 That keeps a capture taken after the boot (one session, or none live) from
 becoming the restore source.
+
+**Resuming by id keeps the recorded tmux name (D10b).** `cctrl start -d -r <id>`
+(also `--resume=<id>`, `-r=<id>` and `cctrl @key -r <id>`) reuses the tmux name
+the conversation's record holds, checked exact-match (`=NAME`), when that name is
+free. If the conversation is already live in that name (the record's pane
+anchor matches the live pane) the launch refuses with exit 65 and an attach hint,
+so there is never a second writer. If another session holds the name, the launch
+takes the next free `--N` of the recorded base, as restore does. The recorded
+name is declined (derived name, one dim stderr reason) for an archived or
+app-owned record, another device tag or host, a placeholder name, a different
+cwd, or, for a repo orchestrator, a name outside the `orch-<repo>` family; fleet
+managers keep their `fleet-<runtime>` name. The launch receipt
+(`CCTRL_LAUNCH_RECEIPT_FILE`) gains `name_source` (`recorded`,
+`recorded-suffixed`, `derived`, `pinned`). A bare `--resume` (picker) cannot know
+the record, so it prints a hint and is otherwise unchanged. `CCTRL_RESUME_KEEP_NAME=0`
+turns the whole behaviour off. A failed `tmux new-session` no longer deletes the
+resumed conversation's task record.
 
 Several open records can claim one tmux name that is not live (a resume leaves
 its predecessor open). `session snapshot` now settles that when the evidence is

@@ -6324,6 +6324,21 @@ test_d10b_foreign_device_and_placeholder_names_declined() {
     echo "ok: foreign-device and placeholder recorded names are not adopted"
 }
 
+test_d10b_bare_resume_prints_hint_only() {
+    unset TMUX TMUX_PANE
+    _rf_setup d10b13 '{}'
+    local out sess
+    out="$(_rf start -d --agent claude -r --purpose p "$RF_PROJ")"
+    assert_contains "$out" "a bare --resume cannot keep a recorded name"
+    assert_contains "$out" "cctrl start -r <id>"
+    sess="$(_rf_session "$out")"
+    [[ "$sess" == TMUX--ms--rf-d10b13-proj ]] || fail "a bare resume must keep the derived name, got: $out"
+    grep -q 'new-session -d -s TMUX--ms--rf-d10b13-proj' "$RF_LOG" || fail "bare resume did not launch under the derived name"
+    out="$(_rf start -d --agent claude -r conv-d10b-t13-0001 --purpose p "$RF_PROJ")"
+    [[ "$out" != *"a bare --resume"* ]] || fail "a resume by id must not print the bare-resume hint: $out"
+    echo "ok: a bare --resume prints the hint and is otherwise unchanged"
+}
+
 test_snapshot_launch_flags_carry_role_and_kind() {
     _rf_setup snapflags '{}'
     local out sess flags

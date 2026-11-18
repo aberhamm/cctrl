@@ -105,6 +105,12 @@ memory and attention. One session = one purpose.
    cctrl start -d <dir> --agent <claude|codex> -n "<label>" [-m "<brief>"]
    ```
 
+   To bring back a known conversation, resume it by id (`cctrl start -d <dir>
+   -r <id>`), not with a bare `--resume`: by-id resumes keep the conversation's
+   recorded tmux name when it is free, a bare picker cannot (ids:
+   `cctrl session ls --json`). If the conversation is already live in that name
+   the launch refuses with exit 65; attach instead.
+
    Add `--profile <name>` when the new session should run on a different
    model/env overlay than the spawner's own (e.g. a Bedrock-routed worker
    next to a subscription one). Launch is hermetic and per-session, so
