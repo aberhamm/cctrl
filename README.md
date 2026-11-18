@@ -1431,7 +1431,7 @@ Claude→Codex, Codex→Claude, and Codex→Codex. Claude→Claude uses actual n
 `ListAgents`/`SendMessage`; bridge sends reject that route before submission. A Codex endpoint advertises a cctrl-owned Claude-compatible socket,
 so native Claude `ListAgents`/`SendMessage` can reach it too.
 A Codex `bridge send` to Claude goes to the Claude's mailbox by default
-(`routed: mailbox`; no admission prompt; refused when no single mailbox peer backs
+(`routed: mailbox`; delivered like any mailbox message, no admission prompt; refused when no single mailbox peer backs
 that session); `--urgent` keeps the native bridge. Urgent Codex bridge messages to
 Claude declare prompting provenance; a bypass recipient
 may hold them. No mode spoofing or admission override is applied. Claude actor

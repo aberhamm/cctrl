@@ -112,7 +112,8 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   address an agent by one canonical name (never also its `external-codex-*`
   alias). To many readers, write the status file, not N mails.
 - **Codex to Claude:** `bridge send claude:ID` now writes the Claude's mailbox
-  item (result `routed: mailbox`, reply via `peer reply`); no peer found, refused.
+  item (`routed: mailbox`, reply via `peer reply`), delivered like any mailbox
+  message (pushed if idle and bell-enabled, else next turn end); no one live peer: refused.
   `--urgent` (MCP `urgent: true`) is the bridge: it raises an admission prompt on
   Matthew's screen, so only when the Claude must act within 10 minutes. Never
   resend after an expiry; an expired prompt means "not now".

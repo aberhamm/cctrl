@@ -914,6 +914,61 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual([], self.mailbox_messages())
         self.assertEqual(0, self.ledger_count())
 
+    def meta_record(self, name, conversation, peer, state):
+        sessions = self.root / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        record = {"agent": "claude", "provider": "claude", "name": name, "peer": peer,
+                  "conversation_id": conversation, "provider_task_id": conversation, "lifecycle_state": state}
+        (sessions / (name + "-" + conversation + ".json")).write_text(json.dumps(record))
+
+    def by_session(self, sid):
+        proc = self.cctrl("peer", "by-session", "claude:" + sid, "--json", check=False)
+        return proc.returncode, json.loads(proc.stdout)
+
+    def test_by_session_ignores_a_closed_record_when_the_name_now_runs_another_conversation(self):
+        live_sid, peer = self.claude_backing_peer()
+        old = str(uuid.uuid4())
+        self.meta_record("TMUX--reused", old, peer, "closed")
+        self.meta_record("TMUX--reused", live_sid, peer, "active")
+        rc, out = self.by_session(old)
+        self.assertEqual(66, rc, out)
+        self.assertIn(out["error"]["code"], ("no-backing-peer", "stale-backing-peer"))
+        proc = self.raw("send", "claude:" + old, "--json", "--", "to the old conversation")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
+        self.assertEqual([], self.mailbox_messages())
+
+    def test_by_session_ignores_archived_records_too(self):
+        _, peer = self.claude_backing_peer()
+        old = str(uuid.uuid4())
+        self.meta_record("TMUX--arch", old, peer, "archived")
+        rc, out = self.by_session(old)
+        self.assertEqual(66, rc, out)
+
+    def test_by_session_resolves_an_active_session_record(self):
+        _, peer = self.claude_backing_peer()
+        conv = str(uuid.uuid4())
+        self.meta_record("TMUX--live", conv, peer, "active")
+        rc, out = self.by_session(conv)
+        self.assertEqual((0, peer), (rc, out["peer"]), out)
+
+    def test_by_session_refuses_two_live_candidates(self):
+        _, peer_a = self.claude_backing_peer()
+        _, peer_b = self.claude_backing_peer()
+        conv = str(uuid.uuid4())
+        self.meta_record("TMUX--a", conv, peer_a, "active")
+        self.meta_record("TMUX--b", conv, peer_b, "active")
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "ambiguous-backing-peer"), (rc, out["error"]["code"]), out)
+
+    def test_by_session_refuses_when_the_peer_now_runs_a_different_live_conversation(self):
+        live_sid, peer = self.claude_backing_peer()
+        conv = str(uuid.uuid4())
+        self.meta_record("TMUX--same", conv, peer, "active")
+        self.meta_record("TMUX--same-newer", live_sid, peer, "active")
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "stale-backing-peer"), (rc, out["error"]["code"]), out)
+
     def test_claude_to_codex_and_codex_to_codex_are_unchanged_and_claude_to_claude_stays_rejected(self):
         claude = str(uuid.uuid4())
         extra = {"CLAUDE_CODE_SESSION_ID": claude}
@@ -1024,6 +1079,42 @@ class MailboxRouteUnitTests(unittest.TestCase):
         self.assertEqual(("mailbox", "msg_1", "mailbox"), (out["routed"], out["mailbox_id"], out["status"]))
         self.assertEqual(out["mailbox_id"], again["mailbox_id"])
         self.assertEqual(1, send.call_count)
+
+    def test_an_unknown_outcome_write_stays_routing_and_a_retry_is_refused(self):
+        mid = str(uuid.uuid4())
+        unknown = bridge.UnknownOutcome("mailbox send did not complete (TimeoutExpired); it may or may not have been written. Check cctrl peer outbox")
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", side_effect=unknown):
+            with self.assertRaises(bridge.RouteRefused):
+                bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        self.assertEqual("routing", self.store.get(mid, self.who)["status"])
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send") as send:
+            with self.assertRaises(bridge.RouteRefused) as caught:
+                bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        send.assert_not_called()
+        self.assertIn("peer outbox", str(caught.exception))
+
+    def test_replay_of_a_completed_route_returns_the_record_even_if_the_peer_is_gone(self):
+        mid = str(uuid.uuid4())
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", return_value={"id": "msg_1"}):
+            first = bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        with patch.object(bridge, "backing_peer", side_effect=bridge.RouteRefused("gone")), \
+                patch.object(bridge, "mailbox_send") as send:
+            again = bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        send.assert_not_called()
+        self.assertEqual(first["mailbox_id"], again["mailbox_id"])
+
+    def test_an_id_from_a_native_message_row_is_not_reused_for_a_mailbox_route(self):
+        mid = str(uuid.uuid4())
+        self.store.create(self.who, self.target, "body", message_id=mid)
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send") as send:
+            with self.assertRaises(bridge.RouteRefused) as caught:
+                bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        send.assert_not_called()
+        self.assertIn("native", str(caught.exception))
 
     def test_a_crash_between_ledger_and_mailbox_write_is_never_resent_blindly(self):
         mid = str(uuid.uuid4())

@@ -8523,12 +8523,12 @@ _peer_cmd_by_session() {
     for a in "$@"; do
         case "$a" in
             --json) json=true ;;
-            *) $json && _json_error validation "Unknown peer by-session flag: $a" || echo -e "${RED}Unknown peer by-session flag: $a${RESET}" >&2; return 64 ;;
+            *) if $json; then _json_error validation "Unknown peer by-session flag: $a"; else echo -e "${RED}Unknown peer by-session flag: $a${RESET}" >&2; fi; return 64 ;;
         esac
     done
     sid="${target#claude:}"
     if [[ ! "$sid" =~ ^[A-Za-z0-9._-]{1,128}$ ]]; then
-        $json && _json_error validation "A Claude session id is 1-128 of A-Za-z0-9._-" || echo -e "${RED}Not a Claude session id: $target${RESET}" >&2
+        if $json; then _json_error validation "A Claude session id is 1-128 of A-Za-z0-9._-"; else echo -e "${RED}Not a Claude session id: $target${RESET}" >&2; fi
         return 64
     fi
     _peer_init || return $?
@@ -8540,7 +8540,7 @@ _peer_cmd_by_session() {
         for f in "$SESSION_METADATA_DIR"/*.json; do
             [[ -f "$f" ]] || continue
             jq -r --arg id "$sid" 'select(type == "object")
-                | select((.agent // .provider // "") == "claude" and ((.provider_task_id // .conversation_id // "") == $id))
+                | select((.agent // .provider // "") == "claude" and (.lifecycle_state // "") == "active" and ((.provider_task_id // .conversation_id // "") == $id))
                 | (.peer // .name // empty)' "$f" 2>/dev/null
         done
     )"
@@ -8548,6 +8548,7 @@ _peer_cmd_by_session() {
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
         peer_json="$(_peer_resolve_json "$name" 2>/dev/null)" || continue
+        [[ "$(jq -r '.agent // ""' <<< "$peer_json")" == claude ]] || continue
         names+=("$(jq -r '.name' <<< "$peer_json")")
     done <<< "$candidates"
     local unique
@@ -8555,13 +8556,29 @@ _peer_cmd_by_session() {
     local count
     count="$(printf '%s\n' "$unique" | grep -c . || true)"
     if [[ "$count" == "0" ]]; then
-        $json && _json_error no-backing-peer "No mailbox peer is bound to claude:$sid" || echo -e "${RED}No mailbox peer is bound to claude:$sid${RESET}" >&2
+        if $json; then _json_error no-backing-peer "No live mailbox peer is bound to claude:$sid (closed or archived records are ignored)"; else echo -e "${RED}No live mailbox peer is bound to claude:$sid${RESET}" >&2; fi
         return 66
     fi
     if [[ "$count" != "1" ]]; then
-        $json && _json_error ambiguous-backing-peer "Ambiguous: $count mailbox peers claim claude:$sid ($(printf '%s' "$unique" | paste -sd, -))" || echo -e "${RED}Ambiguous: $count mailbox peers claim claude:$sid${RESET}" >&2
+        if $json; then _json_error ambiguous-backing-peer "Ambiguous: $count mailbox peers claim claude:$sid ($(printf '%s' "$unique" | paste -sd, -))"; else echo -e "${RED}Ambiguous: $count mailbox peers claim claude:$sid${RESET}" >&2; fi
         return 66
     fi
+    # A live session record for the same peer that runs a DIFFERENT conversation
+    # means the name was reused: the id asked for is stale. Never route to it.
+    local other f2
+    for f2 in "$SESSION_METADATA_DIR"/*.json; do
+        [[ -f "$f2" ]] || continue
+        other="$(jq -r --arg id "$sid" --arg peer "$unique" 'select(type == "object")
+            | select((.agent // .provider // "") == "claude" and (.lifecycle_state // "") == "active"
+                     and ((.peer // .name // "") == $peer)
+                     and ((.provider_task_id // .conversation_id // "") != "")
+                     and ((.provider_task_id // .conversation_id // "") != $id))
+            | (.provider_task_id // .conversation_id)' "$f2" 2>/dev/null | head -1)"
+        if [[ -n "$other" ]]; then
+            if $json; then _json_error stale-backing-peer "Stale: mailbox peer $unique now runs a different live conversation than claude:$sid"; else echo -e "${RED}Stale: mailbox peer $unique now runs a different live conversation than claude:$sid${RESET}" >&2; fi
+            return 66
+        fi
+    done
     if $json; then
         jq -n --arg sid "$sid" --arg peer "$unique" '{ok:true, session_id:$sid, peer:$peer}'
     else

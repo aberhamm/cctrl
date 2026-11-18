@@ -104,6 +104,10 @@ def _run_cctrl(args, body=None):
     return subprocess.run([cctrl_command(), *args], input=body, capture_output=True, text=True, timeout=60)
 
 
+class UnknownOutcome(RouteRefused):
+    """The mailbox write may or may not have happened; the ledger row must stay routing."""
+
+
 def backing_peer(session_id):
     """The one mailbox peer backed by this Claude session, or RouteRefused."""
     hint = "Resend with --urgent to use the native bridge (it raises an admission prompt on the recipient's screen)."
@@ -126,7 +130,7 @@ def mailbox_send(peer, body):
     try:
         proc = _run_cctrl(["peer", "send", peer, "--json", "--body-file", "-"], body)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RouteRefused(f"mailbox send to {peer} did not complete ({exc.__class__.__name__}); it may or may not have been written. Check cctrl peer outbox before retrying.")
+        raise UnknownOutcome(f"mailbox send to {peer} did not complete ({exc.__class__.__name__}); it may or may not have been written. Check cctrl peer outbox before retrying.")
     try:
         value = json.loads(proc.stdout)
     except ValueError:
@@ -149,24 +153,39 @@ def route_to_mailbox(store, who, recipient, body, mid=None):
     if session.startswith("cctrl-bridge-"):
         raise ValueError("address the actual provider session, not a bridge registry identity")
     recipient = actor(provider, session)
-    peer = backing_peer(session_value(session))
+    session = session_value(session)
+    existing = None
+    if mid:
+        try:
+            existing = store.get(mid, who)
+        except ValueError:
+            existing = None
+    if existing is not None and existing.get("kind") != "routed":
+        raise RouteRefused(f"message {mid} was already used for a native send; reuse of its id for a mailbox route is refused. Use a new id, or resend with --urgent.")
+    if existing is not None and existing["status"] == "mailbox":
+        peer = None  # replay of a completed route: return the record, no lookup
+    else:
+        peer = backing_peer(session)
     mid, fresh = store.create(who, recipient, body, message_id=mid, initial_status="routing", kind="routed")
     if not fresh:
         row = store.get(mid, who)
         if row["status"] == "failed":
             store.event(mid, "routing", {"retry": True})
         elif row["status"] != "mailbox":
-            raise RouteRefused(f"message {mid} was routed but its mailbox write is unconfirmed; check cctrl peer outbox before resending. Or resend with --urgent under a new id.")
+            raise RouteRefused(f"message {mid} was routed but its mailbox write is unconfirmed (a timeout or crash left it in routing); check cctrl peer outbox for this id before resending. Or resend with --urgent under a new id.")
     if fresh or store.get(mid, who)["status"] == "routing":
         try:
             sent = mailbox_send(peer, body)
+        except UnknownOutcome as exc:
+            store.event(mid, "routing", {"routed": "mailbox", "peer": peer, "unknown_outcome": True, "reason": str(exc)})
+            raise
         except RouteRefused as exc:
             store.event(mid, "failed", {"routed": "mailbox", "peer": peer, "reason": str(exc)})
             raise
         store.event(mid, "mailbox", {"routed": "mailbox", "peer": peer, "mailbox_id": sent["id"]})
     row = store.get(mid, who)
     detail = next((json.loads(e["detail"]) for e in reversed(row["events"]) if e["kind"] == "mailbox" and e["detail"]), {})
-    return {**row, "routed": "mailbox", "mailbox_id": detail.get("mailbox_id"), "mailbox_peer": detail.get("peer", peer),
+    return {**row, "routed": "mailbox", "mailbox_id": detail.get("mailbox_id"), "mailbox_peer": detail.get("peer") or peer,
             "note": "Sent to the recipient's mailbox, not the native bridge: no admission prompt. Its reply arrives in your mailbox (cctrl peer recv --all)."}
 
 

@@ -44,13 +44,17 @@ is refused; the proxy is not a substitute Claude recipient.
 
 A bridge send from a Codex session to `claude:SESSION_ID` is routed to the
 Claude's **mailbox** unless it carries `--urgent` (MCP `native_send` with
-`urgent: true`). The mailbox doorbell rings at the recipient's next turn end, so
-nothing lands on Matthew's screen as an admission prompt mid-work.
+`urgent: true`). The item is delivered like any other mailbox message: pushed
+into the recipient's pane if it is idle and doorbell-enabled, otherwise waiting
+for its next turn end. Either way there is no admission prompt on Matthew's
+screen.
 
 - The backing peer comes from `cctrl peer by-session claude:SESSION_ID`: the peer
   registry (an external identity bound to that session) and managed-session
-  metadata (conversation id), each of which must still resolve to a peer. Exactly
-  one peer is required. Zero or two is refused (exit 1, error code
+  metadata (conversation id; only records whose lifecycle state is `active` count,
+  closed or archived ones are ignored), each of which must still resolve to a
+  Claude peer. Exactly one peer is required, and the peer must not now run a
+  different live conversation (error code `stale-backing-peer`). Zero or two is refused (exit 1, error code
   `mailbox-route-refused`, the message names `--urgent`); cctrl never guesses a
   peer. A refused send writes nothing: no mailbox item and no ledger row.
 - The result says which path ran. A routed send returns the ledger row with
