@@ -1226,6 +1226,21 @@ case "${1:-}" in
     delete-buffer)
         exit 0
         ;;
+    new-session)
+        # D10b seam: fail a new-session for one named session.
+        if [[ -n "${TMUX_FAKE_FAIL_NEW_SESSION:-}" ]]; then
+            for ((_i = 1; _i < $#; _i++)); do
+                if [[ "${!_i}" == "-s" ]]; then
+                    _j=$((_i + 1))
+                    if [[ "${!_j}" == "$TMUX_FAKE_FAIL_NEW_SESSION" ]]; then
+                        echo "duplicate session: ${!_j}" >&2
+                        exit 1
+                    fi
+                fi
+            done
+        fi
+        exit 0
+        ;;
     has-session)
         if [[ -n "${TMUX_FAKE_STATE:-}" ]]; then
             _fake_tmux_state_resolve "$(_fake_tmux_target "$@")" >/dev/null && exit 0 || exit 1
@@ -6117,6 +6132,27 @@ test_roleless_relaunch_keeps_recorded_role_and_kind() {
     [[ "$(session_record_json "$first" | jq -r '.role + "/" + (.orch_kind // "")')" == worker/ ]] \
         || fail "an explicit --role worker must win and clear the kind: $(session_record_json "$first")"
     echo "ok: a role-less relaunch keeps the recorded role and kind; an explicit flag wins"
+}
+
+test_d10b_failed_new_session_keeps_canonical_record() {
+    unset TMUX TMUX_PANE
+    _rf_setup d10bfail '{}'
+    local out sess rec before_n after_n
+    # Resume of conv-d10b-fail-1: seed the canonical record with a good launch.
+    out="$(_rf start -d --agent claude -r conv-d10b-fail-1 --purpose p "$RF_PROJ")"
+    sess="$(_rf_session "$out")"
+    [[ -n "$sess" ]] || fail "seed launch failed: $out"
+    rec="$(grep -l '"provider_task_id": "conv-d10b-fail-1"' "$CCTRL_SESSION_METADATA_DIR"/task-*.json | head -n 1)"
+    [[ -f "$rec" ]] || fail "no canonical record after the seed launch"
+    out="$(TMUX_FAKE_FAIL_NEW_SESSION="$sess" _rf start -d --agent claude -r conv-d10b-fail-1 --purpose p "$RF_PROJ" || true)"
+    [[ -f "$rec" ]] || fail "a failed new-session deleted the canonical task record: $out"
+    assert_contains "$out" "could not start tmux session"
+    # A fresh launch still removes its own provisional launch-*.json.
+    before_n="$({ ls "$CCTRL_SESSION_METADATA_DIR"/launch-*.json 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    out="$(TMUX_FAKE_FAIL_NEW_SESSION="$sess" _rf start -d --agent claude --purpose p "$RF_PROJ" || true)"
+    after_n="$({ ls "$CCTRL_SESSION_METADATA_DIR"/launch-*.json 2>/dev/null || true; } | wc -l | tr -d ' ')"
+    [[ "$before_n" == "$after_n" ]] || fail "a failed fresh launch left a provisional launch record ($before_n -> $after_n): $out"
+    echo "ok: a failed new-session keeps the canonical record and still removes a fresh launch record"
 }
 
 test_snapshot_launch_flags_carry_role_and_kind() {

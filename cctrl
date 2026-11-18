@@ -6956,6 +6956,14 @@ _launch_detached() {
         shell_cmd="cd $dir_q && ${env_q}$cctrl_q start --foreground --name $cc_name_q$extras_q"
     fi
 
+    # D10b 3.5: remember what this call is about to overwrite, so a failed
+    # new-session below only ever undoes what THIS call wrote. A resume merges
+    # into the conversation's canonical task-*.json and repoints the index.
+    local _prev_index_ref=""
+    CCTRL_LAST_LAUNCH_RECORD=""
+    if [[ -n "$resume_id" ]]; then
+        _prev_index_ref="$(head -1 "$(_session_record_index_file "$session_name" 2>/dev/null)" 2>/dev/null || true)"
+    fi
     if ! _session_write_metadata "$session_name" "$metadata_cwd" "$target_kind" "$metadata_target" "$display_label" "$final_purpose" "$initial_prompt" "$shell_cmd" "$peer_name" "$detach_agent" "$resume_id" "" \
         "$resolved_profile" "$resolved_profile_source" "$resolved_auth_backend" "$resolved_requested_model" "$resolved_claude_config_dir" "$resolved_profile_file" \
         "${ROLE_RESOLVED:-worker}" "$ORCH_KIND_RESOLVED" "$succeeds_flag" "$resuming" 2>/dev/null; then
@@ -6976,7 +6984,19 @@ _launch_detached() {
     tmux new-session -d -s "$session_name" "$shell_cmd" || _new_session_rc=$?
     _cctrl_own_umask
     if (( _new_session_rc != 0 )); then
-        rm -f "$(_session_metadata_file "$session_name")" 2>/dev/null || true
+        # D10b 3.5: remove only a provisional launch-*.json this call wrote.
+        # A resume's canonical task-*.json holds the conversation's role,
+        # history and evidence: it is never deleted here (R5).
+        local _failed_rec="${CCTRL_LAST_LAUNCH_RECORD:-}"
+        case "${_failed_rec##*/}" in
+            launch-*.json) rm -f "$_failed_rec" 2>/dev/null || true ;;
+            task-*.json)
+                echo -e "${YELLOW}cctrl: could not start tmux session; the record of ${resume_id:-this conversation} now names $session_name, which is not live.${RESET}" >&2
+                if [[ -n "$_prev_index_ref" && -f "$SESSION_METADATA_DIR/$_prev_index_ref" ]]; then
+                    _session_record_index_update "$session_name" "$SESSION_METADATA_DIR/$_prev_index_ref" 2>/dev/null || true
+                fi
+                ;;
+        esac
         [[ -n "$fleet_lock_runtime" ]] && _fleet_lock_release "$fleet_lock_runtime"
         return 1
     fi
