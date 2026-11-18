@@ -32,7 +32,7 @@ for _arg in "$@"; do
         *) echo "usage: self-install.sh [--full-gate]" >&2; exit 64 ;;
     esac
 done
-[[ "${CCTRL_INSTALL_FULL_GATE:-}" == 1 ]] && FULL_GATE=1
+case "${CCTRL_INSTALL_FULL_GATE:-}" in 1|true|yes) FULL_GATE=1 ;; esac
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SELF_DIR/.." && pwd)"

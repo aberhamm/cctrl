@@ -75,7 +75,7 @@ a tree it cannot key it runs the full suite and prints `gate path = FULL SUITE`
 with the reason. `bash install/self-install.sh --full-gate` (or
 `CCTRL_INSTALL_FULL_GATE=1`) forces the full suite. A dirty tree is refused
 before any of this. With a stamp from the worker's final-commit run, an install
-takes about a minute of syntax and smoke checks instead of about 25 minutes.
+takes one to three minutes of syntax and smoke checks instead of about 25 minutes.
 
 A full run of `tests/run-tests.sh`, including the install gate, takes a
 host-wide lock (`~/.local/state/cctrl/suite.lock/`, holding the pid and start
@@ -84,7 +84,9 @@ instead of running concurrently with another full run. A lock is stale when its
 holder is dead or is alive but not a `run-tests.sh` process; a live holder is
 never broken. Filtered runs (`CCTRL_TEST_NAMES`, test names, `CCTRL_TEST_ONLY`)
 and `--list` take no lock and write no stamp, so smoke checks never queue.
-Workers need no `pgrep` loop before a full run: the lock does the waiting. Rollback to a
+Workers need no `pgrep` loop before a full run: the lock does the waiting.
+
+Rollback to a
 plain symlink into the working tree:
 
 ```bash

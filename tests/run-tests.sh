@@ -207,7 +207,10 @@ if [[ "$_RT_LIST" -eq 0 && "$_RT_FILTER" -eq 0 && -z "${CCTRL_TEST_ONLY:-}" ]]; 
     # shellcheck source=../lib/suite-gate.sh
     source "$ROOT/lib/suite-gate.sh"
     _SUITE_FULL=1
-    suite_lock_acquire
+    # Release trap first, so an exit before the full _suite_exit trap below
+    # (installed later) cannot leave a lock behind; _suite_exit replaces it.
+    trap 'suite_lock_release' EXIT
+    suite_lock_acquire || exit 2
     # Pin the environment the stamp is written under: tests export their own
     # HOME/XDG_STATE_HOME/PATH, which must not redirect or re-key the stamp.
     _SUITE_STATE0="$(suite_gate_dir)"
@@ -28844,7 +28847,7 @@ HOLD
     [[ "$(cat "$lp/pid")" == "$hpid" ]] || fail "lock pid file does not name the holder"
     # Second full run waits, says who holds it, and does NOT break a live holder.
     ( CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 bash -c 'source "$0"; suite_lock_acquire; echo GOT; suite_lock_release' "$lib" ) > "$d/w1.out" 2> "$d/w1.err" & w1=$!
-    sleep 2
+    for i in $(seq 1 100); do grep -q "waiting for suite lock" "$d/w1.err" 2>/dev/null && break; sleep 0.1; done
     grep -q "waiting for suite lock held by PID $hpid since" "$d/w1.err" || fail "waiter did not announce the holder: $(cat "$d/w1.err")"
     ! grep -q GOT "$d/w1.out" || fail "waiter ran concurrently with a live holder"
     kill -0 "$w1" 2>/dev/null || fail "waiter exited while the holder was alive"
@@ -28870,6 +28873,57 @@ HOLD
     CCTRL_SUITE_STATE_DIR="$d/state" bash -c 'source "$0"; _SUITE_LOCK_HELD=1; _SUITE_LOCK_DIR_HELD="$1"; suite_lock_release' "$lib" "$lp"
     [[ -d "$lp" ]] || fail "release removed a lock that names another pid"
     echo "ok: suite lock serializes full runs, breaks dead/non-run-tests holders, never a live one"
+}
+
+test_suite_lock_hardening() {
+    local d="$TMPDIR/sh" lib="$ROOT/lib/suite-gate.sh" rc out pid i
+    rm -rf "$d"; mkdir -p "$d"
+    # 1. A state dir where the lock cannot be created fails fast, loudly.
+    mkdir -p "$d/ro"; chmod 555 "$d/ro"
+    if [[ -w "$d/ro" ]]; then
+        echo "note: state dir stayed writable (root?); skipping the unwritable-dir check"
+    else
+        rc=0
+        out="$(CCTRL_SUITE_STATE_DIR="$d/ro" CCTRL_SUITE_LOCK_POLL=0.1 perl -e 'alarm 20; exec @ARGV' \
+            bash -c 'source "$0"; suite_lock_acquire' "$lib" 2>&1)" || rc=$?
+        chmod 755 "$d/ro"
+        [[ "$rc" -ne 0 && "$rc" -ne 142 ]] || fail "unwritable lock dir did not fail fast (rc=$rc)"
+        [[ "$out" == *"cannot create"* ]] || fail "unwritable lock dir gave no clear error: $out"
+    fi
+    chmod 755 "$d/ro" 2>/dev/null || true
+    # 2. Pid reuse: a live pid whose command only mentions run-tests.sh is not a holder.
+    local lp="$d/state/suite.lock"
+    mkdir -p "$lp"
+    sleep 60 & pid=$!
+    : > "$d/run-tests.sh"
+    tail -f "$d/run-tests.sh" >/dev/null 2>&1 & local tpid=$!
+    printf '%s\n' "$tpid" > "$lp/pid"
+    rc=0
+    CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 perl -e 'alarm 20; exec @ARGV' \
+        bash -c 'source "$0"; suite_lock_acquire; suite_lock_release' "$lib" 2>/dev/null || rc=$?
+    kill "$tpid" "$pid" 2>/dev/null || true; wait "$tpid" "$pid" 2>/dev/null || true
+    [[ "$rc" -eq 0 ]] || fail "a tail on run-tests.sh was treated as a live suite holder (rc=$rc)"
+    # 3. A fresh lock with no pid file yet waits (does not spin, is not broken)
+    #    and is acquired once the holder finishes; an old one is broken.
+    rm -rf "$lp"; mkdir -p "$lp"
+    ( sleep 1; rm -rf "$lp" ) & local rp=$!
+    rc=0
+    CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 perl -e 'alarm 20; exec @ARGV' \
+        bash -c 'source "$0"; suite_lock_acquire; suite_lock_release' "$lib" 2>/dev/null || rc=$?
+    wait "$rp" 2>/dev/null || true
+    [[ "$rc" -eq 0 ]] || fail "young pid-less lock was not waited out (rc=$rc)"
+    mkdir -p "$lp"; touch -t 200001010000 "$lp"
+    CCTRL_SUITE_STATE_DIR="$d/state" CCTRL_SUITE_LOCK_POLL=0.2 perl -e 'alarm 20; exec @ARGV' \
+        bash -c 'source "$0"; suite_lock_acquire; suite_lock_release' "$lib" 2>/dev/null \
+        || fail "an old pid-less lock was not broken"
+    # 4. Stale break never removes a lock whose holder changed (atomic break).
+    mkdir -p "$lp"; printf '%s\n' "$$" > "$lp/pid"
+    CCTRL_SUITE_STATE_DIR="$d/state" bash -c 'source "$0"; _suite_lock_break_stale "$1" 999999' "$lib" "$lp" \
+        && fail "break_stale removed a lock held by a different pid"
+    [[ "$(cat "$lp/pid")" == "$$" && -d "$lp" ]] || fail "break_stale damaged a lock it should have left alone"
+    [[ -z "$(ls -d "$d"/state/suite.lock.* 2>/dev/null)" ]] || fail "break_stale left a marker or aside dir behind"
+    rm -rf "$lp"
+    echo "ok: suite lock fails fast on an unwritable dir, ignores look-alike pids, waits out young locks, breaks atomically"
 }
 
 test_suite_pass_stamp_rules() {
@@ -28909,6 +28963,11 @@ test_suite_pass_stamp_rules() {
     # CCTRL_SUITE_TREE (install scratch copy) is the key when set and well formed.
     [[ "$(CCTRL_SUITE_TREE="$t" suite_gate_tree "$d")" == "$t" ]] || fail "CCTRL_SUITE_TREE ignored"
     ! CCTRL_SUITE_TREE="not-a-hash" suite_gate_tree "$d" >/dev/null || fail "malformed CCTRL_SUITE_TREE accepted"
+    # CCTRL_SUITE_TREE must not launder a dirty git work tree into a stamp.
+    echo b >> "$repo/f"
+    [[ -z "$(CCTRL_SUITE_TREE="$t" suite_gate_tree "$repo" || true)" ]] || fail "CCTRL_SUITE_TREE recorded a key for a dirty git tree"
+    git -C "$repo" checkout -q -- f
+    [[ "$(CCTRL_SUITE_TREE="$t" suite_gate_tree "$repo")" == "$t" ]] || fail "clean git tree lost its key under CCTRL_SUITE_TREE"
     # Prune keeps the newest N.
     local n
     for n in 1 2 3 4 5; do suite_stamp_write "$(printf '%040d' "$n")" 5.3 3.14 >/dev/null; sleep 1; done

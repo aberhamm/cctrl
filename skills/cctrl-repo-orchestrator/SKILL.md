@@ -169,6 +169,8 @@ takes a host-wide lock and waits, printing the holder, so they need no
 `pgrep` check before it (and the install gate uses the same lock). A green full
 run on a clean tree also leaves a pass stamp that lets `install/self-install.sh`
 skip the 25-minute suite on that exact tree; say so when you brief an install.
+Transition caveat: a worktree or release built from a commit older than 19ea830
+has no lock, so a full run there still runs unlocked; keep the pgrep wait for those.
 
 ## Driving workers (tmux gotchas)
 

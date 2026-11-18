@@ -21,8 +21,11 @@
 #     smoke and the install smoke subset must never queue behind a 25 minute
 #     run. --list never takes it either.
 #   - A lock is stale when its holder pid is dead, or alive but not a
-#     run-tests.sh process (pid reuse). A live run-tests.sh holder is never
-#     broken, however old. A lock with no pid file yet is "starting" and is
+#     `bash .../run-tests.sh` process (pid reuse; an editor or tail naming the
+#     file does not count). A live holder is never broken, however old. Breaks
+#     are serialised by a mkdir break-marker so two waiters cannot both win.
+#   - If the lock cannot be created at all (unwritable state dir) acquire
+#     fails fast with exit status 2 rather than spin or run unlocked. A lock with no pid file yet is "starting" and is
 #     only treated as stale once the directory is over a minute old.
 #
 # Pass stamp rules
@@ -50,16 +53,16 @@ suite_gate_dir() {
 suite_lock_path() { printf '%s/suite.lock' "$(suite_gate_dir)"; }
 suite_pass_dir() { printf '%s/suite-passes' "$(suite_gate_dir)"; }
 
-# 0 when PID is alive and its command line is a run-tests.sh process.
+# 0 when PID is alive and its command line is a suite run: the interpreter is
+# bash and its script is run-tests.sh (bash [-opts] [dir/]run-tests.sh ...).
+# An editor or tail that merely names run-tests.sh does not count.
 _suite_lock_holder_live() {
-    local pid="${1:-}" cmd
+    local pid="${1:-}" cmd re
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
     cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     [[ -n "$cmd" ]] || return 1
-    case "$cmd" in
-        *run-tests.sh*) return 0 ;;
-    esac
-    return 1
+    re='^[[:space:]]*([^[:space:]]*/)?bash([[:space:]]+-[^[:space:]]+)*[[:space:]]+([^[:space:]]*/)?run-tests\.sh([[:space:]]|$)'
+    [[ "$cmd" =~ $re ]]
 }
 
 _suite_fmt_epoch() {
@@ -71,29 +74,41 @@ _suite_fmt_epoch() {
     fi
 }
 
-# Move a stale lock aside and delete it. Two waiters may both judge the same
-# lock stale; only one mv wins. If the lock we moved is not the one we judged
-# (the holder changed between the check and the mv), put it back.
+# Break a stale lock atomically. A break-marker directory (mkdir, so only one
+# waiter gets it) serialises breakers: while we hold it, nobody else removes
+# the lock, and nobody can recreate the lock while it still exists, so
+# re-reading the pid and removing the lock cannot hit a new holder. A marker
+# left by a dead breaker is itself cleared once over a minute old.
 _suite_lock_break_stale() { # lock-path judged-pid
-    local lock="$1" pid="$2" aside moved
-    aside="$lock.stale.$$.$RANDOM"
-    mv "$lock" "$aside" 2>/dev/null || return 1
-    moved="$(cat "$aside/pid" 2>/dev/null || true)"
-    if [[ "$moved" != "$pid" ]]; then
-        if ! mv "$aside" "$lock" 2>/dev/null; then
-            echo "suite lock: warning: displaced a lock whose holder changed while it was being judged stale ($aside)" >&2
+    local lock="$1" pid="$2" marker cur rc=1
+    marker="$lock.breaking"
+    if ! mkdir "$marker" 2>/dev/null; then
+        if [[ -n "$(find "$marker" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+            rmdir "$marker" 2>/dev/null || true
         fi
         return 1
     fi
-    rm -rf "$aside"
-    return 0
+    cur="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [[ -d "$lock" && "$cur" == "$pid" ]]; then
+        rm -rf "$lock" && rc=0
+    fi
+    rmdir "$marker" 2>/dev/null || true
+    return "$rc"
 }
 
 # Take the host-wide lock, waiting while a live run-tests.sh holds it.
+# Returns 2 (with a clear message) when the lock cannot be created at all,
+# for example an unwritable state dir. Failing fast beats running unlocked:
+# an unlocked run would silently defeat the serialisation the caller asked
+# for, and the cause (permissions, a read-only mount) is fixed by the user,
+# not by waiting.
 suite_lock_acquire() {
     local lock pid started announced=0 poll="${CCTRL_SUITE_LOCK_POLL:-5}" tries=0
     lock="$(suite_lock_path)"
-    mkdir -p "$(dirname "$lock")"
+    if ! mkdir -p "$(dirname "$lock")" 2>/dev/null; then
+        echo "suite lock: cannot create the state dir $(dirname "$lock"); fix its permissions or set CCTRL_SUITE_STATE_DIR" >&2
+        return 2
+    fi
     while :; do
         if mkdir "$lock" 2>/dev/null; then
             date +%s > "$lock/started_at"
@@ -105,11 +120,25 @@ suite_lock_acquire() {
             _SUITE_LOCK_DIR_HELD="$lock"
             return 0
         fi
+        if [[ ! -d "$lock" ]]; then
+            # mkdir failed and nothing is there: not a contended lock.
+            # (A holder releasing between the two checks is a one-off; the
+            # retry below tolerates it, a persistent failure ends here.)
+            if (( ++tries > 3 )); then
+                echo "suite lock: cannot create $lock (permission denied or read-only filesystem?); not running unlocked" >&2
+                return 2
+            fi
+            sleep 0.2
+            continue
+        fi
         pid="$(cat "$lock/pid" 2>/dev/null || true)"
         if [[ -z "$pid" ]]; then
-            # Holder is between mkdir and writing its pid, or died there.
-            if [[ -d "$lock" && -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
+            # Holder is between mkdir and writing its pid, or died there:
+            # bounded grace of a minute, then break.
+            if [[ -n "$(find "$lock" -maxdepth 0 -mmin +1 2>/dev/null)" ]]; then
                 _suite_lock_break_stale "$lock" "" || true
+            else
+                sleep "$poll"
             fi
         elif ! _suite_lock_holder_live "$pid"; then
             echo "suite lock: breaking stale lock (holder pid $pid is not a live run-tests.sh)" >&2
@@ -157,11 +186,15 @@ suite_gate_py_mm() {
 
 # Print the git tree hash of the content under ROOT, or nothing when the key
 # cannot be trusted. CCTRL_SUITE_TREE (set by self-install for its .git-less
-# scratch copy) wins. Otherwise ROOT must be the top of a git work tree with
+# scratch copy) is used when ROOT is not in a git work tree. Otherwise ROOT must be the top of a git work tree with
 # no tracked modifications and no untracked, non-ignored files.
 suite_gate_tree() { # root
     local root="$1" top phys
-    if [[ -n "${CCTRL_SUITE_TREE:-}" ]]; then
+    # CCTRL_SUITE_TREE is honoured only for a copy that is NOT inside a git
+    # work tree (the install scratch). Inside one it could launder a dirty
+    # tree into a stamp, so it is ignored and the clean-tree check applies.
+    if [[ -n "${CCTRL_SUITE_TREE:-}" ]] \
+        && ! git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         [[ "$CCTRL_SUITE_TREE" =~ ^[0-9a-f]{40,64}$ ]] || return 1
         printf '%s' "$CCTRL_SUITE_TREE"
         return 0
