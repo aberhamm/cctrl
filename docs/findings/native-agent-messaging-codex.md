@@ -70,6 +70,29 @@ an active turn requires **`expectedTurnId`**, not `turnId`:
 {"id":4,"method":"turn/steer","params":{"threadId":"THREAD","expectedTurnId":"TURN","input":[{"type":"text","text":"Follow-up"}]}}
 ```
 
+Verified steer semantics (codex-cli 0.167.0, a throwaway app-owned thread, 2026-11-18 and 2026-11-19;
+ids and facts in the [evidence file](native-agent-messaging-evidence.md#steer-probes-p0-and-p0b)):
+
+- `turn/steer` works only on a thread the shared app server has **loaded**. A cctrl
+  tmux or CLI Codex runs its own in-process server and is `notLoaded` there, so the
+  steer fails with `thread not found` and nothing is loaded or resumed.
+- Every rejection is JSON-RPC code **-32600**, so a classifier must match on the
+  message text and never on the code alone. Measured texts: `no active turn to steer`;
+  a stale or unknown `expectedTurnId`: ``expected active turn id `X` but found `Y` ``;
+  not loaded: `thread not found: THREAD`. Each is a definitive rejection (the text never
+  reached history). Any other -32600 text is not classified and stays ambiguous.
+- A matching steer returns `{"turnId": <expected id>}`, lands as a second `userMessage` in the
+  same turn (no new turn), and `clientUserMessageId` comes back as `userMessage.clientId`.
+- A steer is **accepted during an approval wait** (`activeFlags: [waitingOnApproval]`;
+  the server does not reject it) but the text may be **dropped**: after an interrupt it was
+  absent from every turn and the queue. Accepted does not mean delivered; the client
+  must check `activeFlags` before steering and confirm by `clientId` afterwards.
+- `thread/turns/list {limit:1, sortDirection:desc, itemsView:notLoaded}` reports the
+  `inProgress` turn of a loaded app thread (equal to the `turn/start` turn id). For a thread
+  another process owns it labels the running turn `interrupted`, so it is not a source there.
+- Approval requests for an app-owned thread did not reach the connection that started the
+  turn; `activeFlags` from `thread/read` is the only signal a client sees.
+
 Both input methods expose optional `clientUserMessageId`; its presence alone
 does not establish idempotency semantics. cctrl's existing adapter emits the
 RPC envelopes above without a `jsonrpc` property.

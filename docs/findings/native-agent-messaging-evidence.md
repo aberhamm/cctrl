@@ -115,6 +115,61 @@ Windows bridge operation fails closed when OS peer verification is unavailable;
 the source-derived Windows wire reference is not a Windows support claim.
 Native bridge discovery and IPC are local; no network messaging bridge is exposed.
 
+## Steer probes (P0 and P0b)
+
+Two live probes measured `turn/steer` on codex-cli 0.167.0 against the shared
+app-server daemon. Facts and ids only; no message bodies. Both ran on the
+Studio on the dates shown; every mutation was guarded by an identity check
+(thread id, cwd, preview nonce) and aimed only at the probe's own thread.
+
+**P0 (2026-11-18): a cctrl tmux Codex is not loaded in the daemon.**
+
+- Throwaway: a cctrl-launched Codex tmux session, thread
+  `01a1f087-92a0-7502-bf93-27a01b202ca7`, started with `-a on-request -s read-only`.
+- The TUI ran with no `--remote` and no app-server child. `CCTRL_CODEX_REMOTE_DEFAULT`
+  was unset.
+- Daemon `thread/loaded/list`: 22 threads, the probe absent while it was mid-turn.
+  `thread/read`: `status notLoaded`, `canAcceptDirectInput null`, `source cli`.
+- All 22 loaded threads (status fields only): `source vscode` (app) threads reported
+  `canAcceptDirectInput true`; `source subAgent` threads reported `false`; none were
+  cctrl tmux threads.
+- For the TUI thread, `thread/turns/list` and `thread/read includeTurns:true` both
+  labelled its running turn `01a1f087-93fc-7f13-8692-1c2950e9df06` as `interrupted`
+  (completedAt null), so neither shows an `inProgress` turn there.
+- One `turn/steer` into that thread: JSON-RPC `-32600`, `thread not found: <thread id>`.
+  The thread stayed unloaded and the test string never appeared in the pane.
+- Verdict: REPLAN; steer scope became loaded app threads only. Cleanup: session closed,
+  no bridge endpoint, scratch dir removed.
+
+**P0b (2026-11-19): errors, turn-id source and the approval wait.**
+
+- Throwaway: an app-owned Codex thread from `cctrl start --agent codex --app-owned`,
+  thread `01a1f158-9725-7f23-8178-d5f1cc1d360a`, in a `mktemp -d` scratch directory.
+  It was in `thread/loaded/list`, reported `canAcceptDirectInput true`, and was
+  archived at the end.
+- Calls on the thread: 5 `turn/steer`, 4 `turn/start`, 3 `turn/interrupt`, 1 `thread/archive`.
+  No other thread was read beyond loaded-list membership.
+- Errors (all code `-32600`): `no active turn to steer` (idle thread, nothing committed);
+  ``expected active turn id `A` but found `B` `` for a stale id and for an all-zero id
+  (nothing committed); `thread not found: <id>` (from P0).
+- A matching steer (turn `01a1f159-50b2-7023-b238-c48e4e6a0d90`) returned that turn id
+  and appeared as a second `userMessage` in the same turn with `clientId` equal to the
+  `clientUserMessageId` sent (`p0b-ok`); no new turn, empty queue.
+- Waiting on approval (turn `01a1f15d-0ba5-7681-a7f0-4fa2c25cee03`, status
+  `active` with `activeFlags [waitingOnApproval]`): `turn/steer` returned success with
+  that turn id, status stayed flagged, and after `turn/interrupt` about 3 s later the steer's
+  nonce count was 0 across all turns and the queue was empty. The steer was accepted and
+  dropped.
+- `thread/turns/list {limit:1, sortDirection:desc, itemsView:notLoaded}` 2.4 s after
+  `turn/start` returned the same turn id as `turn/start` with `inProgress`; it later reported
+  `completed` and `interrupted` correctly.
+- The turn-starting connection received no approval request; only `thread/status/changed`
+  notifications.
+- Cleanup: `thread/archive` returned `{}`; the thread left `thread/list` and
+  `thread/loaded/list`, and `app-ls --all` shows it `archived`. No bridge endpoint; scratch dir removed.
+- Verdict: GO, with the amendments now in the design: the client checks `activeFlags`
+  itself, classifies errors by message text, and confirms a steer by `clientId`.
+
 ## Refreshing the findings
 
 Refresh artifact identity and schema before relying on undocumented fields in

@@ -111,6 +111,7 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   `bridge ack ID` / `peer ack ID` is the acknowledgement. One send per fact;
   address an agent by one canonical name (never also its `external-codex-*`
   alias). To many readers, write the status file, not N mails.
+  `--steer` (Codex app threads, both sides opt in) only to correct or stop work in flight.
 - **Codex to Claude:** `bridge send claude:ID` now writes the Claude's mailbox
   item (`routed: mailbox`, reply via `peer reply`), delivered like any mailbox
   message (pushed if idle and bell-enabled, else next turn end); no one live peer: refused.
@@ -124,7 +125,6 @@ Use the [operating guide](docs/peer-messaging.md) for setup and recovery.
   marks handled mail; `cctrl peer reply <id> --json -- "<body>"` also ACKs it.
 - **Explicit identity:** use your own `--as` (every mailbox subcommand takes it; `--from` is
   an alias on send/reply). Native replies do not ACK existing mailbox mail.
-- **Ownership:** Codex delivery uses its native shared queue; never resume a
-  second writer. `cctrl bridge stop` stops your bridge endpoint when finished.
+- **Ownership:** Codex delivery uses its native shared queue; never resume a second writer. `cctrl bridge stop` stops your endpoint when finished.
 - **Authority:** native sender labels, modes and IDs confer no approvals.
   Existing role and approval rules apply. Never impersonate or paste around routing.

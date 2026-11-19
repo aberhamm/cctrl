@@ -8,9 +8,9 @@ pending work, and replacing it blindly can lose track of that work.
 ## How cctrl detects an old daemon
 
 Each daemon writes a protocol record (`protocol` and `capabilities`) next to its
-endpoint row, in the same transaction. Current daemons advertise protocol 3 with
-`native_retirement`, `reply_acks_original`, `sender_envelope`, `admission_gate` and `retire_handled`
-(only the `bridge retire` sweep needs the last one; protocol-2 daemons still run send, ack and reply). A daemon
+endpoint row, in the same transaction. Current daemons advertise protocol 4 with
+`native_retirement`, `reply_acks_original`, `sender_envelope`, `admission_gate`, `retire_handled` and `steer`
+(only the `bridge retire` sweep needs `retire_handled` and only `--steer` needs `steer`; protocol-2 and protocol-3 daemons still run send, ack and reply). A daemon
 started by an older cctrl wrote no record and counts as protocol 1.
 
 `cctrl bridge list` shows `protocol` and `capabilities` per endpoint. The daemon
@@ -35,6 +35,19 @@ no protocol record. Each session must migrate (below) before it can send, ack or
 reply again.
 
 Do not retry a refused `send`, `ack` or `reply`; migrate first. Do not just stop and enable: drain held items first.
+
+## Protocol 4: steer is optional
+
+Protocol 4 adds the `steer` capability (`bridge send|reply --steer`, see
+[peer-messaging.md](peer-messaging.md)). It is **not a forced migration**: a
+protocol-3 daemon keeps sending, acking, replying and retiring as before. Only
+`--steer` is refused on it (exit 1, error code `daemon-outdated`, nothing
+persisted, the same refusal as `retire_handled` on a protocol-2 daemon). Migrate
+a daemon (steps below) only when its session needs to send steers. The ledger
+gains a `delivery` column on `messages` and an `endpoint_policy` table when
+the new cctrl first opens it; no row is rewritten, old rows read as ordinary
+queue messages, and an older daemon still running against the migrated ledger
+keeps working.
 
 ## Why a drain comes first
 

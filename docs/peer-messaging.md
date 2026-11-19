@@ -176,6 +176,77 @@ outcome proves: `already_consumed` adds `late-native-delivery-after-handled`
 may still surface later as user input). Each marker is written once; neither
 marker changes handling, and neither can remove text the model already received.
 
+## Steer: correcting a running Codex turn
+
+`--steer` injects text into the recipient's **running** Codex turn
+(`turn/steer`) instead of queuing it for the next turn. Use it only to correct
+or stop work already in flight, never for status, an acknowledgement or a
+report (the message budget in AGENTS.md says the same).
+
+```sh
+cctrl bridge send codex:THREAD_ID --steer -- "Stop: use the staging table, not prod"
+cctrl bridge reply MESSAGE_ID --steer -- "Wrong branch, switch to main"
+# Recipient, once, in its own shell (the default is off):
+cctrl bridge enable --accept-steer
+cctrl bridge policy --steer allow --steer-from ACTOR   # or: --steer off ; no --steer shows it
+```
+
+**Scope: Codex app threads only.** A steer reaches only a thread the shared
+Codex app server has loaded and that reports direct input (in practice the
+Codex desktop app). A cctrl tmux worker and a CLI Codex run their own
+in-process server, so they are never loaded there and **always queue**, exactly
+as before. A sub-agent thread does not accept direct input and queues too.
+`--steer` to `claude:*` is refused before anything is stored ("steer applies
+only to Codex recipients; nothing sent"), and `--steer` with `--urgent` is a
+usage error, so a steer never turns into a mailbox send.
+
+**Both sides opt in.** The sender passes `--steer` (MCP `native_send` /
+`native_reply` `steer: true`) on each message. The recipient sets a standing
+policy for its own endpoint (`bridge policy`, `bridge enable --accept-steer`);
+only the endpoint's own actor can set it, the allow list matches the routing
+actor, and `bridge list` shows each policy. No policy row means off. A steer
+confers no approval authority; its wire header carries `delivery=steer`.
+
+**When a steer is not used, the message is queued, never refused.** The result
+carries `steer.outcome` and a plain reason:
+
+| outcome | why it queued |
+|---|---|
+| `declined` | recipient policy is off, or the sender is not in its allow list |
+| `stale` | the row was older than 60 s at dispatch (for example after a daemon restart) |
+| `rate_limited` | more than 1 steer per sender and recipient pair in 2 minutes |
+| `not_loaded` | thread not loaded in the shared app server (tmux or CLI Codex), or it unloaded before the steer |
+| `no_direct_input` | the thread does not accept direct input (for example a sub-agent) |
+| `idle` | no running turn; the queue starts one |
+| `busy_flag` | the turn waits on an approval or user input |
+| `turn_unknown` | the active turn could not be read |
+| `stale_turn` | the turn changed twice during the attempt |
+| `unknown` | the thread state could not be read |
+
+A steer never calls `turn/start`, `turn/interrupt`, `thread/resume` or
+`thread/queue/start`. A policy skip is the first and only submission, not a
+fallback after a possible send.
+
+**Ledger statuses for a steer.**
+
+| status | meaning | what to do |
+|---|---|---|
+| `steered` | the server accepted it into the active turn; not queued | wait; cctrl checks the turn history for the message ID |
+| `queued` | not steered (see the outcome above); delivered by the normal queue | as any queued message |
+| `lost` | accepted, but the text never appeared in the turn's history (for example the turn ended or was interrupted first). **Not requeued**: that would replay an accepted send | resend only if it still matters |
+| `ambiguous` | transport failed after the steer was written; no retry and no queue fallback | `bridge status ID --reconcile` before resending |
+
+`lost` is a stranded, non-handleable row: its body is withheld and it cannot be
+ACKed. `steered` messages are reply-ackable like `queued` ones; `bridge retire`
+treats them as final with no queue item to delete. `steered` is not proof of
+delivery: the server accepts a steer sent during an approval wait and can drop
+it, which is why cctrl never steers a flagged turn and confirms by the message
+ID (`clientUserMessageId` returns as `userMessage.clientId`).
+
+A steer needs a protocol 4 daemon with the `steer` capability; an older daemon
+refuses only `--steer` (`daemon-outdated`), and plain sends keep working. See
+[bridge-daemon-migration.md](bridge-daemon-migration.md).
+
 ## Receipts are control facts
 
 A receipt (`[cctrl-bridge receipt ... control=true]`) tells the original sender

@@ -384,6 +384,7 @@ without the right prefix has killed every session of a fleet.
   Claude delivered means held-mail release; immediate accepts have no positive
   receipt. Only explicit received/replied confirms handling. Stop your endpoint
   with `cctrl bridge stop` when finished.
+- **Steer:** `bridge send --steer` only to correct or stop a Codex app thread's work (both sides opt in; tmux/CLI Codex queue; never status or acks); see `docs/peer-messaging.md`.
 - **Fallback without duplication.** Use existing `cctrl peer` mailbox commands
   when the route is unavailable or definitively not sent, or mailbox records
   are requested. Establish your own identity with `cctrl peer identify --json`.
