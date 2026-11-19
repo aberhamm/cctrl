@@ -16116,6 +16116,24 @@ test_peer_native_log_reader() {
     echo "ok: plan 114 peer native-log joins, filters and stays read-only"
 }
 
+test_native_send_log_rejected_send_is_not_logged_as_sent() {
+    # A SendMessage the tool rejected must read refused or error, never sent,
+    # even when the structured response carries a "success" key set to false.
+    local data="$TMPDIR/nsl-rejected" out id
+    _nsl_fixture "$data"
+    for id in toolu_r1 toolu_r2 toolu_r3 toolu_r4; do
+        _nsl_run "$data" "$(_nsl_pre "$id" bare-name 'hello')"
+    done
+    _nsl_run "$data" "$(jq -cn '{session_id:"s",hook_event_name:"PostToolUse",tool_name:"SendMessage",tool_use_id:"toolu_r1",tool_input:{to:"bare-name",message:"x"},tool_response:{success:false,message:"need full name with ref"}}')"
+    _nsl_run "$data" "$(jq -cn '{session_id:"s",hook_event_name:"PostToolUse",tool_name:"SendMessage",tool_use_id:"toolu_r2",tool_input:{to:"bare-name",message:"x"},tool_response:{success:false,error:"no such agent"}}')"
+    _nsl_run "$data" "$(jq -cn '{session_id:"s",hook_event_name:"PostToolUse",tool_name:"SendMessage",tool_use_id:"toolu_r3",tool_input:{to:"bare-name",message:"x"},tool_response:"Error: need full name with ref (name[ref])"}')"
+    _nsl_run "$data" "$(jq -cn '{session_id:"s",hook_event_name:"PostToolUse",tool_name:"SendMessage",tool_use_id:"toolu_r4",tool_input:{to:"bare-name",message:"x"},tool_response:{success:true,message:"Message sent to worker"}}')"
+    out="$(CCTRL_DATA_DIR="$data" CCTRL_HOST_ID_FILE="$data/host-id" "$ROOT/cctrl" peer native-log --json)" || fail "reader failed"
+    jq -e '.count == 4 and ([.sends[0,1,2].outcome] | all(. != "sent")) and .sends[3].outcome == "sent"' <<< "$out" >/dev/null \
+        || fail "a rejected send was logged as sent: $(jq -c '[.sends[].outcome]' <<< "$out")"
+    echo "ok: native send log records a rejected send as refused or error, not sent"
+}
+
 test_doorbell_fast_path_call_budget() {
     _bell_fixture "$TMPDIR/bell-budget"
     _bell_send TMUX--t-a s1 2025-12-01T00:00:00Z

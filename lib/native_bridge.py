@@ -197,7 +197,8 @@ def route_to_mailbox(store, who, recipient, body, mid=None):
     if not fresh:
         row = store.get(mid, who)
         if row["status"] == "failed":
-            store.event(mid, "routing", {"retry": True})
+            if not store.claim_retry(mid):
+                raise RouteRefused(f"message {mid} is already being retried by another send; nothing was written by this call. Wait for it, then check the status.")
         elif row["status"] != "mailbox":
             raise RouteRefused(f"message {mid} was routed but its mailbox write is unconfirmed (a timeout or crash left it in routing); check cctrl peer outbox for this id before resending. Or resend with --urgent under a new id.")
     if fresh or store.get(mid, who)["status"] == "routing":
@@ -398,6 +399,8 @@ class Store:
             if "delivery" not in columns:
                 # NULL is read as 'queue', so rows written before steering are untouched.
                 db.execute("ALTER TABLE messages ADD COLUMN delivery TEXT")
+            # The confirm tick selects on these four columns; without it every tick reads the whole table.
+            db.execute("CREATE INDEX IF NOT EXISTS messages_confirm ON messages(dispatcher, delivery, status, created)")
         os.chmod(path, 0o600)
 
     @contextlib.contextmanager
@@ -541,6 +544,16 @@ class Store:
                         "receipt" if receipt else kind, json.dumps(envelope) if envelope else None, now if receipt else None, delivery))
             db.execute("INSERT INTO events(id,at,kind) VALUES (?,?,?)", (mid, now, "receipt" if receipt else initial_status))
         return mid, True
+
+    def claim_retry(self, mid):
+        """Atomically move a failed mailbox route to routing. True for the one caller that won."""
+        with self.db() as db:
+            now = time.time()
+            changed = db.execute("UPDATE messages SET status='routing',detail=? WHERE id=? AND status='failed' AND kind='routed'",
+                                 (json.dumps({"retry": True}), mid)).rowcount
+            if changed:
+                db.execute("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)", (mid, now, "routing", json.dumps({"retry": True})))
+            return bool(changed)
 
     def note(self, mid, kind, detail=None):
         """Append an audit event without touching the message status."""

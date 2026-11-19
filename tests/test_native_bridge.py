@@ -1390,7 +1390,7 @@ class MailboxRouteUnitTests(unittest.TestCase):
         self.assertEqual(1, results.count("sent"), results)
         loser = [r for r in results if r != "sent"]
         self.assertEqual(1, len(loser), results)
-        self.assertIn("another retry", loser[0])
+        self.assertIn("already being retried", loser[0])
 
     def test_an_unknown_outcome_write_stays_routing_and_a_retry_is_refused(self):
         mid = str(uuid.uuid4())
@@ -2289,7 +2289,7 @@ class SteerDaemonTests(unittest.TestCase):
         self.daemon.confirm_pending()
         self.assertNotIn("steer-unconfirmed", [e["kind"] for e in self.store.get(fresh, "codex:sender")["events"]])
 
-    def seed_band_rows(self, n=700, events=30000):
+    def seed_band_rows(self, n=1000, events=40000):
         """Steered rows that left the confirm window an hour ago (inside the one-day band), checking-stopped note already written."""
         aged = time.time() - 3600
         with self.store.db() as db:
