@@ -1081,6 +1081,187 @@ class CliProcessTests(unittest.TestCase):
             self.assertEqual("native", urgent["routed"])
             self.assertEqual(1, len(self.mailbox_messages()))
 
+    # ---- P3: the --steer CLI and MCP surface ----------------------------------
+
+    def me(self):
+        return "codex:" + self.env["CODEX_THREAD_ID"]
+
+    def assert_nothing_persisted(self):
+        self.assertEqual(0, self.ledger_count())
+        self.assertEqual([], bridge.Store(self.root / "ledger").endpoints(), "a refused steer must not start a bridge daemon")
+        self.assertEqual([], self.mailbox_messages())
+        self.assertEqual([], self.queue_calls())
+
+    def refused(self, *args, **kw):
+        proc = self.raw(*args, **kw)
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)["error"]["message"]
+
+    # A6 native 6: --steer to claude:* is refused before anything is persisted or routed
+    def test_steer_to_a_claude_target_from_codex_is_refused_with_nothing_persisted_or_routed(self):
+        sid, _ = self.claude_backing_peer()
+        message = self.refused("send", "claude:" + sid, "--json", "--steer", "--", "stop that")
+        self.assertIn("steer applies only to Codex recipients", message)
+        self.assertIn("nothing sent", message)
+        self.assert_nothing_persisted()
+
+    def test_steer_to_a_claude_target_from_claude_is_refused_with_the_steer_message(self):
+        message = self.refused("send", "claude:" + str(uuid.uuid4()), "--json", "--steer", "--", "stop that",
+                               extra={"CLAUDE_CODE_SESSION_ID": str(uuid.uuid4())}, drop=("CODEX_THREAD_ID",))
+        self.assertIn("steer applies only to Codex recipients", message)
+        self.assert_nothing_persisted()
+
+    def test_steer_with_urgent_is_a_usage_error_for_any_target(self):
+        sid, _ = self.claude_backing_peer()
+        for target in ("claude:" + sid, "codex:" + str(uuid.uuid4())):
+            message = self.refused("send", target, "--json", "--steer", "--urgent", "--", "x")
+            self.assertIn("--steer", message)
+            self.assertIn("--urgent", message)
+        self.assert_nothing_persisted()
+
+    def test_reply_steer_to_a_claude_sender_is_refused_and_persists_nothing_new(self):
+        store = bridge.Store(self.root / "ledger")
+        original, _ = store.create("claude:" + str(uuid.uuid4()), self.me(), "please look")
+        before = self.ledger_count()
+        message = self.refused("reply", original, "--json", "--steer", "--", "done")
+        self.assertIn("steer applies only to Codex recipients", message)
+        self.assertEqual(before, self.ledger_count())
+        self.assertEqual([], bridge.Store(self.root / "ledger").endpoints())
+        self.assertEqual([], self.queue_calls())
+
+    # A6 native 9: through the real CLI, a recipient that has not opted in, or whose allow list omits the sender, queues the message and says why
+    def test_cli_steer_to_a_recipient_with_policy_off_is_queued_and_reports_why(self):
+        target = "codex:" + str(uuid.uuid4())
+        out = self.cli("send", target, "--json", "--steer", "--", "mid-turn")
+        self.assertEqual(("queued", "declined"), (out["status"], out["steer"]["outcome"]))
+        self.assertIn("queued", out["steer_report"])
+        self.assertIn("not steered", out["steer_report"])
+        self.assertEqual(1, len(self.queue_calls()))
+        self.rows.append(bridge.Store(self.root / "ledger").endpoint(self.me()))
+
+    def test_cli_steer_from_a_sender_missing_from_the_allow_list_is_declined(self):
+        thread = str(uuid.uuid4())
+        bridge.Store(self.root / "ledger").set_policy("codex:" + thread, "allow", ["codex:somebody-else"])
+        out = self.cli("send", "codex:" + thread, "--json", "--steer", "--", "mid-turn")
+        self.assertEqual(("queued", "declined"), (out["status"], out["steer"]["outcome"]))
+        self.assertEqual(1, len(self.queue_calls()))
+        self.rows.append(bridge.Store(self.root / "ledger").endpoint(self.me()))
+
+    def test_a_plain_send_has_no_steer_fields(self):
+        out = self.cli("send", "codex:" + str(uuid.uuid4()), "--json", "--", "plain")
+        self.assertIsNone(out.get("steer"))
+        self.assertNotIn("steer_report", out)
+        self.rows.append(bridge.Store(self.root / "ledger").endpoint(self.me()))
+
+    def test_steer_to_a_protocol_3_endpoint_is_daemon_outdated_but_plain_send_works(self):
+        row = self.enable()
+        with bridge.Store(self.root / "ledger").db() as db:
+            db.execute("UPDATE endpoint_protocol SET protocol=3, capabilities=? WHERE actor=?",
+                       (json.dumps([c for c in bridge.DAEMON_CAPABILITIES if c != "steer"]), row["actor"]))
+        target = "codex:" + str(uuid.uuid4())
+        proc = self.raw("send", target, "--json", "--steer", "--", "x")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        self.assertEqual("daemon-outdated", json.loads(proc.stdout)["error"]["code"])
+        self.assertEqual(0, self.ledger_count())
+        self.assertEqual("queued", self.cli("send", target, "--json", "--", "x")["status"])
+
+    # steer_report: the sender is told steered, queued with the reason, lost or ambiguous
+    def test_steer_report_names_steered_queued_lost_and_ambiguous(self):
+        def row(status, outcome, reason=None):
+            return {"status": status, "delivery": "steer", "id": "m1", "steer": {"requested": True, "outcome": outcome, "reason": reason}}
+        self.assertIsNone(bridge.steer_report({"status": "queued", "delivery": "queue", "id": "m1", "steer": None}))
+        steered = bridge.steer_report(row("steered", "steered"))
+        self.assertIn("steered", steered)
+        self.assertIn("not queued", steered)
+        queued = bridge.steer_report(row("queued", "idle", "recipient has no running turn; queued instead"))
+        self.assertIn("queued", queued)
+        self.assertIn("not steered", queued)
+        self.assertIn("idle", queued)
+        self.assertIn("no running turn", queued)
+        lost = bridge.steer_report(row("lost", "lost", "accepted steer never appeared in the turn history; the message was not requeued"))
+        self.assertIn("lost", lost.lower())
+        self.assertIn("not requeued", lost)
+        ambiguous = bridge.steer_report(row("ambiguous", "ambiguous", "transport lost after the write"))
+        self.assertIn("unknown", ambiguous.lower())
+        self.assertIn("not queued", ambiguous)
+
+    # A6 native 10: bridge policy writes only the caller's own row
+    def test_bridge_policy_shows_off_by_default_and_writes_only_the_callers_own_row(self):
+        shown = self.cli("policy", "--json")
+        self.assertEqual((self.me(), "off", []), (shown["actor"], shown["steer"], shown["steer_from"]))
+        self.assertIn("tmux", shown["note"])
+        self.assertIn("queue", shown["note"])
+        wrote = self.cli("policy", "--steer", "allow", "--steer-from", "codex:b", "--steer-from", "codex:a", "--json")
+        self.assertEqual(("allow", ["codex:a", "codex:b"]), (wrote["steer"], wrote["steer_from"]))
+        store = bridge.Store(self.root / "ledger")
+        self.assertEqual({"steer": "allow", "steer_from": ["codex:a", "codex:b"]}, store.policy(self.me()))
+        with store.db() as db:
+            self.assertEqual([self.me()], [r[0] for r in db.execute("SELECT actor FROM endpoint_policy")])
+        self.assertEqual("off", self.cli("policy", "--steer", "off", "--json")["steer"])
+        self.assertEqual("off", store.policy(self.me())["steer"])
+
+    def test_bridge_policy_refuses_another_actor_and_bad_input_and_writes_nothing(self):
+        other = "codex:" + str(uuid.uuid4())
+        message = self.refused("policy", "--actor", other, "--steer", "allow", "--json")
+        self.assertIn("own", message)
+        self.refused("policy", "--steer", "allow", "--steer-from", "not-an-actor", "--json")
+        bad = self.raw("policy", "--steer", "maybe", "--json")
+        self.assertNotEqual(0, bad.returncode)
+        with bridge.Store(self.root / "ledger").db() as db:
+            self.assertEqual(0, db.execute("SELECT count(*) FROM endpoint_policy").fetchone()[0])
+
+    def test_enable_accept_steer_opts_the_caller_in_and_plain_enable_does_not(self):
+        row = self.enable()
+        self.assertEqual("off", bridge.Store(self.root / "ledger").policy(row["actor"])["steer"])
+        self.cli("stop", "--json")
+        again = self.cli("enable", "--accept-steer", "--json")
+        self.rows.append(again)
+        self.assertEqual("allow", again["steer_policy"]["steer"])
+        self.assertEqual("allow", bridge.Store(self.root / "ledger").policy(again["actor"])["steer"])
+
+    def test_bridge_list_shows_each_endpoints_steer_policy(self):
+        row = self.enable()
+        listed = self.cli("list", "--json")["endpoints"][0]
+        self.assertEqual("off", listed["steer_policy"]["steer"])
+        self.cli("policy", "--steer", "allow", "--json")
+        listed = self.cli("list", "--json")["endpoints"][0]
+        self.assertEqual(("allow", row["actor"]), (listed["steer_policy"]["steer"], listed["actor"]))
+
+    def test_cli_help_documents_steer_and_the_tmux_note(self):
+        for args, words in ((("send", "--help"), ("--steer", "Codex")), (("reply", "--help"), ("--steer",)),
+                            (("enable", "--help"), ("--accept-steer",)), (("policy", "--help"), ("--steer", "--steer-from", "tmux"))):
+            text = self.raw(*args).stdout
+            for word in words:
+                self.assertIn(word, text, args)
+
+    # MCP
+    def test_mcp_steer_flag_is_in_both_schemas_and_descriptions(self):
+        from peer_mcp import NATIVE_TOOLS
+        for name in ("native_send", "native_reply"):
+            tool = next(t for t in NATIVE_TOOLS if t["name"] == name)
+            self.assertEqual({"type": "boolean"}, tool["inputSchema"]["properties"]["steer"])
+            self.assertNotIn("steer", tool["inputSchema"]["required"])
+            self.assertIn("steer", tool["description"].lower())
+            self.assertIn("queue", tool["description"].lower())
+
+    def test_mcp_steer_maps_to_the_cli_flag_and_rejects_non_booleans(self):
+        from peer_mcp import Bridge, McpError
+        mcp = Bridge("/unused/cctrl", "mailbox-identity")
+        seen = []
+        mcp.cli = lambda command, *a, **k: seen.append(list(command)) or {"ok": True}
+        mcp.call_tool("native_send", {"to": "codex:t", "body": "b", "steer": True})
+        mcp.call_tool("native_reply", {"id": "m", "body": "b", "steer": True})
+        mcp.call_tool("native_send", {"to": "codex:t", "body": "b"})
+        mcp.call_tool("native_send", {"to": "codex:t", "body": "b", "steer": False})
+        for command in seen[:2]:
+            self.assertIn("--steer", command[:command.index("--")])
+        for command in seen[2:]:
+            self.assertNotIn("--steer", command)
+        with self.assertRaises(McpError):
+            mcp.call_tool("native_send", {"to": "codex:t", "body": "b", "steer": "yes"})
+        with self.assertRaises(McpError):
+            mcp.call_tool("native_reply", {"id": "m", "body": "b", "steer": 1})
+
     def test_real_daemon_advertises_protocol_and_stale_row_fails_closed(self):
         row = self.enable()
         self.assertEqual((bridge.DAEMON_PROTOCOL, False), (row["protocol"], row["daemon_outdated"]))
