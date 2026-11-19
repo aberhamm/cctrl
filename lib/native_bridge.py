@@ -155,6 +155,14 @@ def unsent_reason(row):
     return str(detail.get("reason") or "native delivery failed before anything was sent")
 
 
+class _Replay(Exception):
+    """Internal: a same-id retry was answered from an existing ledger row."""
+
+
+def fallback_id(base):
+    return str(uuid.uuid5(uuid.UUID(base), "cctrl-mailbox-fallback"))
+
+
 def fallback_to_mailbox(store, who, target, body, mid, reason, native_row=None):
     """Route to the mailbox because native delivery was impossible before any send.
 
@@ -163,7 +171,7 @@ def fallback_to_mailbox(store, who, target, body, mid, reason, native_row=None):
     resolved either, the native outcome is returned with the refusal attached.
     """
     base = mid or (native_row or {}).get("id")
-    fid = str(uuid.uuid5(uuid.UUID(base), "cctrl-mailbox-fallback")) if base else None
+    fid = fallback_id(base) if base else None
     try:
         out = route_to_mailbox(store, who, target, body, fid)
     except UnknownOutcome:
@@ -225,7 +233,7 @@ def mailbox_send(peer, body):
 
 
 def route_to_mailbox(store, who, recipient, body, mid=None):
-    """Send a non-urgent Codex-to-Claude message to the Claude's backing mailbox peer.
+    """Send a Codex-to-Claude message to the Claude's backing mailbox peer (the fallback when native is impossible).
 
     The ledger row (kind routed) is written before the mailbox write, so a retry
     with the same --id never writes a second mailbox item.
@@ -1541,17 +1549,45 @@ def main(argv=None):
                 fallback = args.command == "send" and native_first(who, args.target)
                 mid_arg = str(uuid.UUID(args.id)) if getattr(args, "id", None) else None
                 pre_send = None
+                replay = None
+                if fallback and mid_arg:
+                    # A same-id retry must not cross paths: a fallback row under the
+                    # derived id means the mailbox owns this id (replay it, never go
+                    # native); see the native-row check after the daemon try below.
+                    try:
+                        prior = store.get(fallback_id(mid_arg), who)
+                    except ValueError:
+                        prior = None
+                    if prior is not None and prior.get("kind") == "routed":
+                        replay = fallback_to_mailbox(store, who, args.target, " ".join(args.body), mid_arg,
+                                                     "an earlier send of this id already fell back to the mailbox")
                 try:
+                    if replay is not None:
+                        raise _Replay()
                     row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
                     if row is not None:
                         check_daemon(row, args.command)
                         if steer:
                             check_daemon(row, "send_steer")
+                except _Replay:
+                    pass
                 except (ValueError, OSError) as exc:
                     if not fallback:
                         raise
                     pre_send = f"this session's bridge is unavailable ({exc})"
-                if pre_send is not None:
+                    if mid_arg:
+                        try:
+                            native_prior = store.get(mid_arg, who)
+                        except ValueError:
+                            native_prior = None
+                        if native_prior is not None and native_prior.get("kind") != "routed":
+                            # The id was already sent natively: never add a mailbox copy.
+                            replay = {**native_prior, "routed": "native",
+                                      "note": "This id was already sent through the native bridge; the bridge is unavailable now, so the existing record is returned and nothing new was sent."}
+                            pre_send = None
+                if replay is not None:
+                    result = replay
+                elif pre_send is not None:
                     result = fallback_to_mailbox(store, who, args.target, " ".join(args.body), mid_arg, pre_send)
                 elif args.command == "enable":
                     result = row

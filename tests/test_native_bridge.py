@@ -834,7 +834,7 @@ class CliProcessTests(unittest.TestCase):
         finally:
             endpoint.close()
 
-    # ---- non-urgent Codex -> Claude goes to the mailbox (mdec-1118) ----------
+    # ---- Codex -> Claude: native first, mailbox fallback (mdec-1118) ----------
 
     def cctrl(self, *args, extra=None, drop=(), check=True):
         env = {k: v for k, v in {**self.env, **(extra or {})}.items() if k not in drop}
@@ -1651,6 +1651,44 @@ class NativeFirstDispatchTests(unittest.TestCase):
             rc = bridge.main(["--root", str(self.root), "send", self.target, "--json", "--", "hello"])
         value = json.loads(out.getvalue())
         self.assertEqual((0, "native", "failed", False, "no peer"), (rc, value["routed"], value["status"], value["fallback"]["used"], value["fallback"]["refused"]))
+
+    def send_real_ledger(self, daemon_error=None):
+        """One same-id send with the real ledger and route_to_mailbox; only the daemon, rpc and mailbox write are mocked."""
+        out = io.StringIO()
+        ensure = mock.Mock(side_effect=daemon_error) if daemon_error else mock.Mock(return_value={"socket": "x"})
+        rpc = mock.Mock(side_effect=lambda row, request: {"ok": True, "data": {
+            "id": request["id"], "status": "submitted", "sender": self.who, "recipient": self.target, "kind": "message",
+            "events": [{"kind": "submitting", "detail": None}, {"kind": "submitted", "detail": json.dumps({"status": "submitted"})}]}})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.who.split(":", 1)[1], "HOME": self.temp.name}, clear=True), \
+                patch.object(bridge, "ensure_daemon", ensure), patch.object(bridge, "check_daemon"), \
+                patch.object(bridge, "rpc", rpc), patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", self.mailbox_send), patch.object(bridge, "own_registry", return_value=None), \
+                patch.object(bridge, "sender_envelope", return_value=None), mock.patch("sys.stdout", out):
+            rc = bridge.main(["--root", str(self.root), "send", self.target, "--json", "--id", self.mid, "--", "hello"])
+        return rc, json.loads(out.getvalue()), rpc
+
+    def test_a_same_id_retry_after_a_pre_send_fallback_does_not_also_send_natively(self):
+        self.mailbox_send = mock.Mock(return_value={"id": "mbx-1"})
+        rc1, first, rpc1 = self.send_real_ledger(daemon_error=ValueError("bridge daemon exited; see log"))
+        self.assertEqual((0, "mailbox"), (rc1, first["routed"]), first)
+        rc2, second, rpc2 = self.send_real_ledger()  # the daemon is up now
+        self.assertEqual((0, "mailbox"), (rc2, second["routed"]), second)
+        self.assertEqual(first["id"], second["id"])
+        self.assertEqual(1, self.mailbox_send.call_count)
+        rpc1.assert_not_called()
+        rpc2.assert_not_called()
+
+    def test_a_same_id_retry_after_a_native_send_with_the_daemon_down_does_not_use_the_mailbox(self):
+        self.mailbox_send = mock.Mock(return_value={"id": "mbx-1"})
+        rc1, first, rpc1 = self.send_real_ledger()
+        # The mocked rpc does not touch the ledger; record the native row the daemon would have written.
+        bridge.Store(self.root).create(self.who, self.target, "hello", message_id=self.mid)
+        self.assertEqual((0, "native", 1), (rc1, first["routed"], rpc1.call_count), first)
+        rc2, second, rpc2 = self.send_real_ledger(daemon_error=ValueError("bridge daemon exited; see log"))
+        self.assertEqual((0, "native", self.mid), (rc2, second["routed"], second["id"]), second)
+        self.assertNotIn("fallback", second)
+        self.mailbox_send.assert_not_called()
+        rpc2.assert_not_called()
 
     def test_claude_to_codex_and_codex_to_codex_never_use_the_fallback(self):
         row = self.native("failed", ("submitting", None), ("failed", {"status": "failed", "reason": "x"}))
