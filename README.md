@@ -1430,9 +1430,11 @@ an actual session and discover exact addresses. Bridge sends support
 Claude→Codex, Codex→Claude, and Codex→Codex. Claude→Claude uses actual native
 `ListAgents`/`SendMessage`; bridge sends reject that route before submission. A Codex endpoint advertises a cctrl-owned Claude-compatible socket,
 so native Claude `ListAgents`/`SendMessage` can reach it too.
-A Codex `bridge send` to Claude goes to the Claude's mailbox by default
-(`routed: mailbox`; delivered like any mailbox message, no admission prompt; refused when no single mailbox peer backs
-that session); `--urgent` keeps the native bridge. Urgent Codex bridge messages to
+A Codex `bridge send` to Claude goes native by default, straight into the Claude's
+chat (`routed: native`; the approval check may hold it, reported as `held_for_approval`).
+The mailbox is only a fallback when native delivery is impossible before anything is sent
+(`routed: mailbox` with `fallback.native_reason`); an accepted, queued, held or ambiguous
+native send is never resent there. `--urgent` is accepted and is a no-op. Codex bridge messages to
 Claude declare prompting provenance; a bypass recipient
 may hold them. No mode spoofing or admission override is applied. Claude actor
 proxies refuse raw native ingress, preserving actual Claude admission context.
@@ -1440,9 +1442,8 @@ proxies refuse raw native ingress, preserving actual Claude admission context.
 ```sh
 cctrl bridge enable
 cctrl bridge list
-# From Codex (mailbox by default; --urgent for the native bridge):
+# From Codex (native by default; the mailbox is only a fallback; --urgent is a no-op):
 cctrl bridge send claude:ACTUAL_SESSION_ID -- "Please review"
-cctrl bridge send claude:ACTUAL_SESSION_ID --urgent -- "Needs an answer in 10 minutes"
 # From Claude or Codex:
 cctrl bridge send codex:ACTUAL_THREAD_ID -- "Please review"
 cctrl bridge inbox
@@ -2132,7 +2133,7 @@ arguments; it does not send or certify native availability. The agent uses its
 own native tools when the exact recipient is addressable. `send_message` is the
 durable mailbox fallback for unavailable native routes or explicitly requested
 mailbox work. Cross-provider native sends use `cctrl bridge` or `native_send`
-(from Codex to Claude, `native_send` routes to the mailbox unless `urgent: true`).
+(from Codex to Claude, `native_send` is native by default and falls back to the mailbox only when native is impossible before anything is sent; `urgent` is a no-op).
 Do not replay accepted, held or ambiguous native sends. Existing mailbox work still requires its cctrl ACK.
 
 `say_peer` remains an explicit live-tmux operation with `to`, `body`, optional

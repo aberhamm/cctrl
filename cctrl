@@ -8512,7 +8512,7 @@ _peer_cmd_whoami() {
 }
 
 # Which mailbox peer backs a native Claude session? Used by `bridge send` to route
-# a non-urgent Codex-to-Claude message to the mailbox. A candidate is a live Claude
+# a Codex-to-Claude message to the mailbox when native delivery was impossible before any send (the fallback). A candidate is a live Claude
 # process for the conversation (live pid, matching start time, bound to its tmux
 # pane, which survives a session rename) whose pane's session has a registered
 # peer. Exactly one distinct peer, or nothing: never a guess.

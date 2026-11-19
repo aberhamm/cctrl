@@ -15,9 +15,9 @@ unavailable. Run enable inside each actual participating provider session:
 ```sh
 cctrl bridge enable
 cctrl bridge list
-# From Codex to Claude: goes to the Claude's mailbox (no admission prompt):
+# From Codex to Claude: native, straight into the Claude's chat (an admission check may hold it):
 cctrl bridge send claude:ACTUAL_SESSION_ID -- "Please review the result"
-# ...unless the Claude must act within 10 minutes (native bridge, admission prompt):
+# --urgent is accepted and changes nothing; the mailbox is only a fallback when native is impossible:
 cctrl bridge send claude:ACTUAL_SESSION_ID --urgent -- "Approve the rollback now"
 # From Claude or Codex to Codex:
 cctrl bridge send codex:ACTUAL_THREAD_ID -- "Please review the result"
@@ -40,47 +40,62 @@ Claude native tools so sender/recipient permission admission retains its true
 provider context. Raw native ingress addressed to a Claude actor's bridge proxy
 is refused; the proxy is not a substitute Claude recipient.
 
-### Codex to Claude: mailbox by default, `--urgent` for the bridge
+### Codex to Claude: native by default, mailbox only as a fallback
 
-A bridge send from a Codex session to `claude:SESSION_ID` is routed to the
-Claude's **mailbox** unless it carries `--urgent` (MCP `native_send` with
-`urgent: true`). The item is delivered like any other mailbox message: pushed
-into the recipient's pane if it is idle and doorbell-enabled, otherwise waiting
-for its next turn end. Either way there is no admission prompt on Matthew's
-screen.
+A bridge send from a Codex session to `claude:SESSION_ID` goes **native**: straight into the
+Claude's chat like a native message, with no mailbox hop and no wait for its turn end. The
+recipient's approval check may hold it (the result says `held_for_approval: true` when it
+does; held is not failed and is never replayed). `--urgent` (MCP `urgent: true`) is still
+accepted and is now a no-op. This reverses the earlier mailbox-first rule (60c4425).
 
-- The backing peer comes from `cctrl peer by-session claude:SESSION_ID`: the session
+The mailbox is used only when native delivery is impossible **before anything is sent**.
+The exact cases, all taken from a native row that FAILED with no write:
+
+| Case | Where it comes from |
+|---|---|
+| The Claude has no live bridge endpoint, or its session is unavailable or ambiguous | `Daemon.target`: "Claude native session is unavailable or ambiguous; nothing submitted" |
+| The recipient's peer key or connected identity did not match its process | `ClaudeEndpoint._send` raised before `writing` |
+| The native text exceeds the input limit | `ClaudeEndpoint.send`: status `failed` |
+| This session's bridge endpoint is not active | `ClaudeEndpoint._send`: status `failed` |
+| This session's own bridge daemon cannot be reached or started, or is outdated (nothing was sent yet) | `ensure_daemon` or `check_daemon` raised in the CLI before the request |
+
+Everything else stays native and is never resent through the mailbox: accepted, `submitted`,
+`queued`, `held`, `released`, `denied`, `expired`, `refused`, `dropped`, `ambiguous`, an
+unknown result, a timeout or a connection error while talking to the daemon, and any
+`failed` row that also has an `ambiguous`/`submitted`/`queued`/`held` event. Reconcile those
+with `cctrl bridge status ID --reconcile`.
+
+- The fallback peer comes from `cctrl peer by-session claude:SESSION_ID`: the session
   id must be a live Claude (a `~/.claude/sessions` file with a live pid and
   matching start time) in a tmux pane whose session backs a registered Claude
   peer. The pane is matched by pane id and process ancestry, so a tmux session
   renamed after launch still resolves. Neither session records nor peer registry
-  fields (`external_identity.session_id`, `provider_task_id`) are trusted, so a
-  stale record can neither misroute nor block mail. A Claude outside tmux (an
-  external identity, no pane-bound process) is therefore never routed to the
-  mailbox; use `--urgent` for it. Exactly one peer is
-  required; a session that is not live anywhere is refused as `not-live`. Zero or two is refused (exit 1, error code
-  `mailbox-route-refused`, the message names `--urgent`); cctrl never guesses a
-  peer. A refused send writes nothing: no mailbox item and no ledger row.
-- The result says which path ran. A routed send returns the ledger row with
-  `"routed": "mailbox"`, `status: mailbox`, `mailbox_id` (the mailbox message ID,
-  the one to quote), `mailbox_peer` and `kind: routed`. A native send carries
-  `"routed": "native"`. A routed ledger row is not bridge work: `bridge ack` and
-  `bridge reply` refuse it, and it never appears in `inbox` actionable or stranded.
-- `--id` is idempotent: a repeat returns the same `mailbox_id` and writes one
-  item. A failed mailbox write is recorded as `failed` and the same `--id` can
-  retry; a row left `routing` (a crash between the ledger and the write) is
-  refused until you check `cctrl peer outbox`.
-- The Claude replies with `cctrl peer reply MAILBOX_ID -- "..."`, which sends to
-  the Codex sender's mailbox identity (the sender recorded on the item) and ACKs
-  the original. The Codex reads it with `cctrl peer recv --all`. A bridge reply
-  (`bridge reply ID`) is not the path for routed mail.
+  fields (`external_identity.session_id`, `provider_task_id`) are trusted. A Claude
+  outside tmux has no mailbox fallback. Exactly one peer is required; zero or two
+  means no fallback and cctrl never guesses a peer.
+- The result says which way it went. Native: `"routed": "native"` plus
+  `held_for_approval` and a note. Mailbox fallback: `"routed": "mailbox"`, `status: mailbox`,
+  `mailbox_id` (the one to quote), `mailbox_peer`, `kind: routed`, and
+  `fallback: {used: true, native_reason, native_id}`; the note says the Claude sees it when
+  its current turn ends. If native failed and the mailbox cannot take it either, the failed
+  native row comes back with `fallback: {used: false, native_reason, refused}`; nothing was
+  delivered.
+- The fallback leaves the failed native row (its own id) and writes a separate
+  `kind: routed` row whose id is derived from the native id, so retrying the same `--id`
+  can never write a second mailbox item. A routed row is not bridge work: `bridge ack` and
+  `bridge reply` refuse it, and it never appears in `inbox` actionable or stranded. A row left
+  `routing` (a crash between the ledger and the write) is refused until you check
+  `cctrl peer outbox`.
+- The Claude replies to fallback mail with `cctrl peer reply MAILBOX_ID -- "..."`, which sends to
+  the Codex sender's mailbox identity and ACKs the original. The Codex reads it with
+  `cctrl peer recv --all`. A bridge reply (`bridge reply ID`) is not the path for routed mail.
 - Unchanged: Claude to Codex and Codex to Codex use the bridge. Claude to Claude
-  stays rejected. `--urgent` is ignored for those directions.
+  stays rejected.
 - The mailbox send runs `cctrl peer send` as the calling Codex session, with the
   body on stdin, so sender identity, sealing and the push gate are those of an
   ordinary mailbox send. No `--deliver` is added.
 
-For `--urgent` Codex-to-Claude sends, the bridge conservatively declares **prompting**
+Codex-to-Claude bridge sends conservatively declare **prompting**
 provenance. A Claude recipient in bypass mode may hold that input for its own
 admission decision. The bridge never spoofs bypass provenance or overrides the
 recipient's admission policy. Held is not failed and must not be replayed.

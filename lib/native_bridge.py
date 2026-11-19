@@ -113,12 +113,68 @@ class RouteRefused(ValueError):
     code = "mailbox-route-refused"
 
 
-def routes_to_mailbox(who, target, urgent):
-    """True for a non-urgent Codex-to-Claude send: it goes to the mailbox.
+def native_first(who, target):
+    """True for a Codex-to-Claude send: native by default (and with --urgent, now a no-op).
 
-    Every other direction, and --urgent, keeps the native bridge path.
+    The mailbox is only a fallback, taken when native delivery is impossible
+    before anything is sent (see unsent_reason and fallback_to_mailbox).
     """
-    return who.startswith("codex:") and target.startswith("claude:") and not urgent
+    return who.startswith("codex:") and target.startswith("claude:")
+
+
+# Native states that mean the message may be, or is, in the recipient's hands.
+# A row that ever reached one of these is never resent through the mailbox.
+SENT_OR_MAYBE = {"submitted", "queued", "ambiguous", "held", "released", "denied", "expired", "delivered",
+                 "refused", "dropped", "steered", "lost", "received", "replied", "retired"}
+
+
+def unsent_reason(row):
+    """Why native delivery definitely did not happen, or None.
+
+    Only a row whose native attempt FAILED before any bytes were written counts
+    (the Claude has no live bridge endpoint, the endpoint key or identity did not
+    match, the frame was oversize, the bridge endpoint was inactive). Every other
+    state (submitted, queued, held, ambiguous, timeouts, anything unknown) is
+    native and stays native: it is reconciled, never replayed to the mailbox.
+    """
+    if not isinstance(row, dict) or row.get("status") != "failed":
+        return None
+    events = row.get("events") or []
+    if any(e.get("kind") in SENT_OR_MAYBE for e in events):
+        return None
+    detail = {}
+    for e in reversed(events):
+        if e.get("kind") == "failed" and e.get("detail"):
+            try:
+                detail = json.loads(e["detail"])
+            except ValueError:
+                detail = {}
+            break
+    if detail.get("status") not in (None, "failed", "send-failed"):
+        return None
+    return str(detail.get("reason") or "native delivery failed before anything was sent")
+
+
+def fallback_to_mailbox(store, who, target, body, mid, reason, native_row=None):
+    """Route to the mailbox because native delivery was impossible before any send.
+
+    The mailbox row id is derived from the native id, so a retry of the same
+    --id can never write a second mailbox item. If the mailbox cannot be
+    resolved either, the native outcome is returned with the refusal attached.
+    """
+    base = mid or (native_row or {}).get("id")
+    fid = str(uuid.uuid5(uuid.UUID(base), "cctrl-mailbox-fallback")) if base else None
+    try:
+        out = route_to_mailbox(store, who, target, body, fid)
+    except UnknownOutcome:
+        raise
+    except RouteRefused as exc:
+        if native_row is None:
+            raise RouteRefused(f"native delivery was not possible ({reason}) and the mailbox fallback was refused: {exc}")
+        return {**native_row, "routed": "native", "fallback": {"used": False, "native_reason": reason, "refused": str(exc)},
+                "note": f"Native delivery failed before anything was sent ({reason}); the mailbox fallback was refused ({exc}). Nothing was delivered."}
+    return {**out, "fallback": {"used": True, "from": "native", "native_reason": reason, "native_id": (native_row or {}).get("id")},
+            "note": f"Native delivery was not possible ({reason}), so this went to the recipient's mailbox. The Claude sees it when its current turn ends, not as a chat message."}
 
 
 def cctrl_command():
@@ -137,18 +193,18 @@ class UnknownOutcome(RouteRefused):
 
 def backing_peer(session_id):
     """The one mailbox peer backed by this Claude session, or RouteRefused."""
-    hint = "Resend with --urgent to use the native bridge (it raises an admission prompt on the recipient's screen)."
+    hint = "The native bridge is the default path; this mailbox fallback needs a live Claude in a registered tmux peer pane."
     try:
         proc = _run_cctrl(["peer", "by-session", "claude:" + session_id, "--json"])
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RouteRefused(f"cannot resolve a mailbox peer for claude:{session_id} ({exc.__class__.__name__}); nothing was sent. {hint}")
+        raise RouteRefused(f"cannot resolve a mailbox peer for claude:{session_id} ({exc.__class__.__name__}). {hint}")
     try:
         value = json.loads(proc.stdout)
     except ValueError:
         value = None
     if proc.returncode != 0 or not isinstance(value, dict) or value.get("ok") is False or not value.get("peer"):
         reason = ((value or {}).get("error") or {}).get("message") if isinstance(value, dict) else None
-        raise RouteRefused(f"no unambiguous mailbox peer backs claude:{session_id} ({reason or 'lookup failed'}); nothing was sent. {hint}")
+        raise RouteRefused(f"no unambiguous mailbox peer backs claude:{session_id} ({reason or 'lookup failed'}). {hint}")
     return value["peer"]
 
 
@@ -164,7 +220,7 @@ def mailbox_send(peer, body):
         value = None
     if proc.returncode != 0 or not isinstance(value, dict) or not value.get("id"):
         reason = ((value or {}).get("error") or {}).get("message") if isinstance(value, dict) else None
-        raise RouteRefused(f"mailbox send to {peer} failed ({reason or 'exit ' + str(proc.returncode)}); nothing was delivered. Retry, or resend with --urgent to use the native bridge.")
+        raise RouteRefused(f"mailbox send to {peer} failed ({reason or 'exit ' + str(proc.returncode)}); nothing was delivered. Retry.")
     return value
 
 
@@ -188,7 +244,7 @@ def route_to_mailbox(store, who, recipient, body, mid=None):
         except ValueError:
             existing = None
     if existing is not None and existing.get("kind") != "routed":
-        raise RouteRefused(f"message {mid} was already used for a native send; reuse of its id for a mailbox route is refused. Use a new id, or resend with --urgent.")
+        raise RouteRefused(f"message {mid} was already used for a native send; reuse of its id for a mailbox route is refused. Use a new id.")
     if existing is not None and existing["status"] == "mailbox":
         peer = None  # replay of a completed route: return the record, no lookup
     else:
@@ -200,7 +256,7 @@ def route_to_mailbox(store, who, recipient, body, mid=None):
             if not store.claim_retry(mid):
                 raise RouteRefused(f"message {mid} is already being retried by another send; nothing was written by this call. Wait for it, then check the status.")
         elif row["status"] != "mailbox":
-            raise RouteRefused(f"message {mid} is in routing: another send may be retrying it right now, or a timeout or crash left its mailbox write unconfirmed; check cctrl peer outbox for this id before resending. Or resend with --urgent under a new id.")
+            raise RouteRefused(f"message {mid} is in routing: another send may be retrying it right now, or a timeout or crash left its mailbox write unconfirmed; check cctrl peer outbox for this id before resending.")
     if fresh or store.get(mid, who)["status"] == "routing":
         try:
             sent = mailbox_send(peer, body)
@@ -1408,7 +1464,8 @@ def main(argv=None):
                                    "For correcting or stopping work in flight, not status or acks. " + STEER_NOTE + ". Cannot combine with --urgent")
         if name == "send":
             item.add_argument("--urgent", action="store_true",
-                              help="Codex to Claude only: use the native bridge (an admission prompt on the recipient's screen) instead of the mailbox")
+                              help="Codex to Claude: accepted for compatibility and now a no-op. Every Codex-to-Claude send goes native by default "
+                                   "(an admission prompt may hold it); the mailbox is used only when native delivery is impossible before anything is sent")
     service = sub.add_parser("_serve", help=argparse.SUPPRESS)
     service.add_argument("actor")
     service.add_argument("--cwd", required=True)
@@ -1478,15 +1535,25 @@ def main(argv=None):
                 if not 1 <= args.limit <= 100 or args.after < 0:
                     raise ValueError("inbox limit must be 1..100 and after must be nonnegative")
                 result = store.inbox(who, args.view, args.after, args.limit)
-            elif args.command == "send" and routes_to_mailbox(who, args.target, args.urgent):
-                result = route_to_mailbox(store, who, args.target, " ".join(args.body), str(uuid.UUID(args.id)) if args.id else None)
             else:
-                row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
-                if row is not None:
-                    check_daemon(row, args.command)
-                    if steer:
-                        check_daemon(row, "send_steer")
-                if args.command == "enable":
+                # Codex to Claude is native first; the mailbox only when native is
+                # impossible before anything is sent (unsent_reason, pre-send below).
+                fallback = args.command == "send" and native_first(who, args.target)
+                mid_arg = str(uuid.UUID(args.id)) if getattr(args, "id", None) else None
+                pre_send = None
+                try:
+                    row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
+                    if row is not None:
+                        check_daemon(row, args.command)
+                        if steer:
+                            check_daemon(row, "send_steer")
+                except (ValueError, OSError) as exc:
+                    if not fallback:
+                        raise
+                    pre_send = f"this session's bridge is unavailable ({exc})"
+                if pre_send is not None:
+                    result = fallback_to_mailbox(store, who, args.target, " ".join(args.body), mid_arg, pre_send)
+                elif args.command == "enable":
                     result = row
                     outdated = bool(daemon_missing(row, ALL_REQUIRED))
                     result = {**row, "daemon_outdated": outdated}
@@ -1518,6 +1585,14 @@ def main(argv=None):
                     result = response["data"]
                     if args.command == "send":
                         result = {**result, "routed": "native"}
+                        reason = unsent_reason(result) if fallback else None
+                        if reason:
+                            result = fallback_to_mailbox(store, who, args.target, " ".join(args.body), mid_arg or result.get("id"), reason, native_row=result)
+                        elif fallback:
+                            result = {**result, "held_for_approval": result.get("status") == "held",
+                                      "note": "Sent through the native bridge, into the Claude's chat like a native message. "
+                                              + ("It is held for the recipient's approval check." if result.get("status") == "held"
+                                                 else "The recipient's approval check may still hold it; see bridge status for the outcome.")}
                     if steer:
                         report = steer_report(result)
                         if report:

@@ -869,42 +869,54 @@ class CliProcessTests(unittest.TestCase):
         with bridge.Store(self.root / "ledger").db() as db:
             return db.execute("SELECT count(*) FROM messages").fetchone()[0]
 
-    def test_non_urgent_codex_to_claude_writes_a_mailbox_item_with_no_native_submit(self):
-        sid, peer = self.live_backing_peer()
+    def test_default_codex_to_claude_with_no_native_endpoint_falls_back_to_the_mailbox(self):
+        sid, peer = self.live_backing_peer()  # live in a pane, but no bridge endpoint (no messaging socket)
+        self.enable()
         mid = str(uuid.uuid4())
         proc = self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "status for the claude")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         out = json.loads(proc.stdout)
-        self.assertEqual(("mailbox", peer, "mailbox", mid), (out["routed"], out["mailbox_peer"], out["status"], out["id"]))
+        self.assertEqual(("mailbox", peer, "mailbox"), (out["routed"], out["mailbox_peer"], out["status"]))
+        self.assertTrue(out["fallback"]["used"])
+        self.assertEqual(mid, out["fallback"]["native_id"])
+        self.assertIn("unavailable or ambiguous", out["fallback"]["native_reason"])
+        self.assertIn("turn ends", out["note"])
         sent = self.mailbox_messages()
         self.assertEqual([out["mailbox_id"]], [m["id"] for m in sent])
         self.assertEqual((peer, "status for the claude"), (sent[0]["to"], sent[0]["body"]))
         store = bridge.Store(self.root / "ledger")
-        self.assertEqual([], store.endpoints(), "routing must not start a bridge daemon")
-        row = store.get(mid, "codex:" + self.env["CODEX_THREAD_ID"])
-        self.assertEqual(("routed", "mailbox"), (row["kind"], row["status"]))
-        self.assertNotIn("submitting", [e["kind"] for e in row["events"]])
+        native = store.get(mid, "codex:" + self.env["CODEX_THREAD_ID"])
+        self.assertEqual(("message", "failed"), (native["kind"], native["status"]))  # native was tried first
+        self.assertIn("submitting", [e["kind"] for e in native["events"]])
+        self.assertNotEqual(mid, out["id"])  # the mailbox row has its own derived id
         self.assertEqual([], self.queue_calls())
 
-    def test_urgent_codex_to_claude_keeps_the_native_path_and_writes_no_mailbox_item(self):
+    def test_default_fallback_is_idempotent_for_a_stable_id(self):
         sid, _ = self.live_backing_peer()
         self.enable()
         mid = str(uuid.uuid4())
-        out = self.cli("send", "claude:" + sid, "--json", "--urgent", "--id", mid, "--", "needs an answer now")
-        self.assertEqual("native", out["routed"])
-        self.assertNotIn("mailbox_id", out)
-        kinds = [e["kind"] for e in bridge.Store(self.root / "ledger").get(mid, out["sender"])["events"]]
-        self.assertIn("submitting", kinds)  # the native admission path was attempted
-        self.assertEqual([], self.mailbox_messages())
+        first = json.loads(self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "once").stdout)
+        again = json.loads(self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "once").stdout)
+        self.assertEqual(first["mailbox_id"], again["mailbox_id"])
+        self.assertEqual(1, len(self.mailbox_messages()))
 
-    def test_unresolvable_backing_peer_is_refused_naming_urgent_and_leaves_no_trace(self):
+    def test_urgent_is_accepted_and_behaves_exactly_like_the_default(self):
+        sid, peer = self.live_backing_peer()
+        self.enable()
+        out = json.loads(self.raw("send", "claude:" + sid, "--json", "--urgent", "--", "needs an answer now").stdout)
+        self.assertEqual(("mailbox", peer, True), (out["routed"], out["mailbox_peer"], out["fallback"]["used"]))
+        kinds = [e["kind"] for e in bridge.Store(self.root / "ledger").get(out["fallback"]["native_id"], "codex:" + self.env["CODEX_THREAD_ID"])["events"]]
+        self.assertIn("submitting", kinds)  # native was attempted first, urgent or not
+
+    def test_neither_native_nor_mailbox_possible_returns_the_failed_native_row_and_the_refusal(self):
+        self.enable()
         proc = self.raw("send", "claude:" + str(uuid.uuid4()), "--json", "--", "hello")
-        self.assertEqual(1, proc.returncode, proc.stdout)
-        error = json.loads(proc.stdout)["error"]
-        self.assertIn("--urgent", error["message"])
+        self.assertEqual(0, proc.returncode, proc.stdout)
+        out = json.loads(proc.stdout)
+        self.assertEqual(("native", "failed", False), (out["routed"], out["status"], out["fallback"]["used"]))
+        self.assertIn("no live Claude process", out["fallback"]["refused"])
+        self.assertIn("Nothing was delivered", out["note"])
         self.assertEqual([], self.mailbox_messages())
-        self.assertEqual(0, self.ledger_count())
-        self.assertEqual([], bridge.Store(self.root / "ledger").endpoints())
 
     def fake_pane(self, tmux_session, conversation, live=True, claim=None, start=None):
         """A fake Claude in a fake tmux pane: a real process, its ~/.claude/sessions
@@ -942,6 +954,16 @@ class CliProcessTests(unittest.TestCase):
         peers_file.write_text(json.dumps(peers))
         return name
 
+    def refused_fallback_send(self, sid, body="hello"):
+        """A default send where native is impossible and the mailbox fallback is refused: the failed native row comes back."""
+        self.enable()
+        proc = self.raw("send", "claude:" + sid, "--json", "--", body)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        out = json.loads(proc.stdout)
+        self.assertEqual(("native", "failed", False), (out["routed"], out["status"], out["fallback"]["used"]), out)
+        self.assertEqual([], self.mailbox_messages())
+        return out
+
     def by_session(self, sid):
         proc = self.cctrl("peer", "by-session", "claude:" + sid, "--json", check=False)
         return proc.returncode, json.loads(proc.stdout)
@@ -966,10 +988,8 @@ class CliProcessTests(unittest.TestCase):
         rc, out = self.by_session(old)
         self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
         self.assertNotIn("different live conversation", out["error"]["message"])
-        proc = self.raw("send", "claude:" + old, "--json", "--", "to the old conversation")
-        self.assertEqual(1, proc.returncode, proc.stdout)
-        self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
-        self.assertEqual([], self.mailbox_messages())
+        out = self.refused_fallback_send(old, "to the old conversation")
+        self.assertIn("no live Claude process", out["fallback"]["refused"])
 
     def test_by_session_a_dead_active_record_does_not_block_the_live_conversation(self):
         conv = str(uuid.uuid4())
@@ -989,10 +1009,8 @@ class CliProcessTests(unittest.TestCase):
         missing = str(uuid.uuid4())
         rc, out = self.by_session(missing)
         self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
-        proc = self.raw("send", "claude:" + missing, "--json", "--", "nobody home")
-        self.assertEqual(1, proc.returncode, proc.stdout)
-        self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
-        self.assertEqual([], self.mailbox_messages())
+        out = self.refused_fallback_send(missing, "nobody home")
+        self.assertIn("no live Claude process", out["fallback"]["refused"])
 
     def test_by_session_refuses_a_dead_process_for_the_conversation(self):
         conv = str(uuid.uuid4())
@@ -1047,26 +1065,20 @@ class CliProcessTests(unittest.TestCase):
         rc, out = self.by_session(conv)
         self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
 
-    def test_send_refuses_two_live_panes_for_one_conversation_naming_urgent_and_writes_nothing(self):
+    def test_send_with_two_live_panes_for_one_conversation_never_guesses_a_mailbox_peer(self):
         conv = str(uuid.uuid4())
         self.fake_pane("TMUX--send-a", conv)
         self.fake_pane("TMUX--send-b", conv)
-        proc = self.raw("send", "claude:" + conv, "--json", "--", "hello")
-        self.assertEqual(1, proc.returncode, proc.stdout)
-        message = json.loads(proc.stdout)["error"]["message"]
-        self.assertIn("ambiguous", message.lower())
-        self.assertIn("--urgent", message)
-        self.assertEqual([], self.mailbox_messages())
-        self.assertEqual(0, self.ledger_count())
+        out = self.refused_fallback_send(conv)
+        self.assertIn("ambiguous", out["fallback"]["refused"].lower())
+        self.assertEqual(1, self.ledger_count())  # only the failed native row
 
     def test_by_session_refuses_a_peers_json_identity_with_no_live_process(self):
         sid, _ = self.claude_backing_peer()  # registers external_identity.session_id, no process
         rc, out = self.by_session(sid)
         self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
-        proc = self.raw("send", "claude:" + sid, "--json", "--", "to a dead identity")
-        self.assertEqual(1, proc.returncode, proc.stdout)
-        self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
-        self.assertEqual([], self.mailbox_messages())
+        out = self.refused_fallback_send(sid, "to a dead identity")
+        self.assertIn("no live Claude process", out["fallback"]["refused"])
 
     def test_by_session_refuses_a_stale_provider_task_id_on_a_tmux_peer(self):
         conv = str(uuid.uuid4())
@@ -1133,25 +1145,26 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual(first["mailbox_id"], again["mailbox_id"])
         self.assertEqual(1, len(self.mailbox_messages()))
 
-    def test_mcp_native_send_routes_to_the_mailbox_unless_urgent(self):
+    def test_mcp_native_send_is_native_first_with_a_mailbox_fallback_and_urgent_is_a_no_op(self):
         from peer_mcp import Bridge, McpError, NATIVE_TOOLS
         send = next(t for t in NATIVE_TOOLS if t["name"] == "native_send")
         self.assertIn("urgent", send["inputSchema"]["properties"])
-        self.assertIn("mailbox", send["description"].lower())
+        self.assertIn("default is the native bridge", send["description"].lower())
+        self.assertIn("no-op", send["description"].lower())
         self.assertNotIn("urgent", next(t for t in NATIVE_TOOLS if t["name"] == "native_reply")["inputSchema"]["properties"])
         sid, peer = self.live_backing_peer()
         mcp = Bridge(str(ROOT / "cctrl"), "unrelated-mailbox-identity")
         with patch.dict(os.environ, self.env, clear=True):
+            endpoint = mcp.call_tool("native_enable", {})["data"]
+            self.rows.append(endpoint)
             out = mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "via mcp"})["data"]
-            self.assertEqual(("mailbox", peer), (out["routed"], out["mailbox_peer"]))
+            self.assertEqual(("mailbox", peer, True), (out["routed"], out["mailbox_peer"], out["fallback"]["used"]))
             self.assertEqual(1, len(self.mailbox_messages()))
             with self.assertRaises(McpError):
                 mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "x", "urgent": "yes"})
-            endpoint = mcp.call_tool("native_enable", {})["data"]
-            self.rows.append(endpoint)
             urgent = mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "now", "urgent": True})["data"]
-            self.assertEqual("native", urgent["routed"])
-            self.assertEqual(1, len(self.mailbox_messages()))
+            self.assertEqual(("mailbox", True), (urgent["routed"], urgent["fallback"]["used"]))
+            self.assertEqual(2, len(self.mailbox_messages()))
 
     # ---- P3: the --steer CLI and MCP surface ----------------------------------
 
@@ -1397,13 +1410,26 @@ class MailboxRouteUnitTests(unittest.TestCase):
         self.who = "codex:" + str(uuid.uuid4())
         self.target = "claude:" + str(uuid.uuid4())
 
-    def test_routing_decision_covers_only_non_urgent_codex_to_claude(self):
-        decide = bridge.routes_to_mailbox
-        self.assertTrue(decide("codex:t", "claude:s", False))
-        self.assertFalse(decide("codex:t", "claude:s", True))
-        self.assertFalse(decide("codex:t", "codex:u", False))
-        self.assertFalse(decide("claude:s", "codex:t", False))
-        self.assertFalse(decide("claude:s", "claude:r", False))
+    def test_native_first_covers_every_codex_to_claude_send(self):
+        decide = bridge.native_first
+        self.assertTrue(decide("codex:t", "claude:s"))
+        self.assertFalse(decide("codex:t", "codex:u"))
+        self.assertFalse(decide("claude:s", "codex:t"))
+        self.assertFalse(decide("claude:s", "claude:r"))
+
+    def test_unsent_reason_counts_only_a_native_failure_before_any_write(self):
+        def row(status, *events):
+            return {"status": status, "events": [{"kind": k, "detail": json.dumps(d)} for k, d in events]}
+        failed = {"msg_id": "x", "status": "failed", "reason": "Claude native session is unavailable or ambiguous; nothing submitted"}
+        self.assertIn("unavailable", bridge.unsent_reason(row("failed", ("submitting", None), ("failed", failed))))
+        # everything else is native and stays native
+        for status in ("persisted", "submitting", "submitted", "queued", "held", "released", "ambiguous", "refused", "denied", "expired", "dropped"):
+            self.assertIsNone(bridge.unsent_reason(row(status, ("submitting", None))), status)
+        # a failure that follows a possible write is never unsent
+        self.assertIsNone(bridge.unsent_reason(row("failed", ("submitting", None), ("ambiguous", {"status": "ambiguous"}), ("failed", failed))))
+        self.assertIsNone(bridge.unsent_reason(row("failed", ("submitted", {}), ("failed", failed))))
+        self.assertIsNone(bridge.unsent_reason(row("failed", ("submitting", None), ("failed", {"status": "ambiguous", "reason": "OSError"}))))
+        self.assertIsNone(bridge.unsent_reason(None))
 
     def test_failed_mailbox_write_is_recorded_and_the_same_id_can_retry(self):
         mid = str(uuid.uuid4())
@@ -1508,8 +1534,7 @@ class MailboxRouteUnitTests(unittest.TestCase):
             with self.assertRaises(bridge.RouteRefused) as caught:
                 bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
         send.assert_not_called()
-        self.assertIn("--urgent", str(caught.exception))
-
+        
     def test_a_routed_record_cannot_be_acked_or_replied_through_the_bridge(self):
         mid = str(uuid.uuid4())
         with patch.object(bridge, "backing_peer", return_value="peer-a"), \
@@ -1523,6 +1548,118 @@ class MailboxRouteUnitTests(unittest.TestCase):
             self.assertIn("mailbox", str(caught.exception))
         listed = self.store.inbox(self.target, "actionable")["messages"] + self.store.inbox(self.target, "stranded")["messages"]
         self.assertEqual([], listed)
+
+
+class NativeFirstDispatchTests(unittest.TestCase):
+    """Codex to Claude: the native result decides, and only a definite non-send reaches the mailbox."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "ledger"
+        self.who = "codex:" + str(uuid.uuid4())
+        self.target = "claude:" + str(uuid.uuid4())
+        self.mid = str(uuid.uuid4())
+
+    def run_send(self, native_row=None, rpc_error=None, urgent=False, daemon_error=None):
+        row = native_row
+        argv = ["--root", str(self.root), "send", self.target, "--json", "--id", self.mid] + (["--urgent"] if urgent else []) + ["--", "hello"]
+        out = io.StringIO()
+        mailbox = mock.Mock(return_value={"id": "route-row", "routed": "mailbox", "status": "mailbox", "mailbox_peer": "peer-a", "mailbox_id": "m1"})
+        rpc = mock.Mock(side_effect=rpc_error) if rpc_error else mock.Mock(return_value={"ok": True, "data": row})
+        ensure = mock.Mock(side_effect=daemon_error) if daemon_error else mock.Mock(return_value={"socket": "x"})
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.who.split(":", 1)[1], "HOME": self.temp.name}, clear=True), \
+                patch.object(bridge, "ensure_daemon", ensure), patch.object(bridge, "check_daemon"), \
+                patch.object(bridge, "rpc", rpc), patch.object(bridge, "route_to_mailbox", mailbox), \
+                patch.object(bridge, "own_registry", return_value=None), \
+                patch.object(bridge, "sender_envelope", return_value=None), \
+                mock.patch("sys.stdout", out):
+            try:
+                rc = bridge.main(argv)
+            except Exception as exc:  # the CLI turns errors into a result; any escape is a test failure
+                self.fail(repr(exc))
+        return rc, json.loads(out.getvalue()), mailbox, rpc
+
+    def native(self, status, *events):
+        return {"id": self.mid, "status": status, "sender": self.who, "recipient": self.target, "kind": "message",
+                "events": [{"kind": k, "detail": json.dumps(d)} for k, d in events]}
+
+    def test_a_native_acceptance_is_native_and_never_touches_the_mailbox(self):
+        for urgent in (False, True):
+            for status in ("queued", "submitted"):
+                rc, out, mailbox, rpc = self.run_send(self.native(status, ("submitting", None), (status, {"status": status})), urgent=urgent)
+                self.assertEqual((0, "native", status, False), (rc, out["routed"], out["status"], out["held_for_approval"]), out)
+                self.assertIn("native bridge", out["note"])
+                mailbox.assert_not_called()
+                self.assertEqual(1, rpc.call_count)
+
+    def test_a_native_hold_for_approval_is_reported_as_held_and_stays_native(self):
+        rc, out, mailbox, _ = self.run_send(self.native("held", ("submitting", None), ("submitted", {}), ("held", {"status": "held"})))
+        self.assertEqual((0, "native", True), (rc, out["routed"], out["held_for_approval"]), out)
+        self.assertIn("held for the recipient's approval", out["note"])
+        mailbox.assert_not_called()
+
+    def test_a_native_ambiguous_result_stays_native_reconcilable_and_never_reaches_the_mailbox(self):
+        failed_after = {"status": "ambiguous", "reason": "OSError"}
+        for row in (self.native("ambiguous", ("submitting", None), ("ambiguous", failed_after)),
+                    self.native("failed", ("submitting", None), ("ambiguous", failed_after), ("failed", {"status": "failed", "reason": "late"}))):
+            rc, out, mailbox, _ = self.run_send(row)
+            self.assertEqual((0, "native"), (rc, out["routed"]), out)
+            self.assertNotIn("fallback", out)
+            mailbox.assert_not_called()
+
+    def test_a_timeout_talking_to_the_daemon_stays_native_and_is_never_resent_through_the_mailbox(self):
+        for error in (subprocess.TimeoutExpired("rpc", 45), TimeoutError("timed out"), ConnectionResetError("reset")):
+            out = io.StringIO()
+            with patch.dict(os.environ, {"CODEX_THREAD_ID": self.who.split(":", 1)[1], "HOME": self.temp.name}, clear=True), \
+                    patch.object(bridge, "ensure_daemon", return_value={"socket": "x"}), patch.object(bridge, "check_daemon"), \
+                    patch.object(bridge, "rpc", side_effect=error), patch.object(bridge, "own_registry", return_value=None), \
+                    patch.object(bridge, "sender_envelope", return_value=None), \
+                    patch.object(bridge, "route_to_mailbox") as mailbox, mock.patch("sys.stdout", out):
+                rc = bridge.main(["--root", str(self.root), "send", self.target, "--json", "--id", self.mid, "--", "hello"])
+            self.assertEqual(1, rc)
+            self.assertFalse(json.loads(out.getvalue())["ok"])
+            mailbox.assert_not_called()
+
+    def test_a_definite_native_failure_falls_back_once_with_an_id_derived_from_the_native_id(self):
+        reason = "Claude native session is unavailable or ambiguous; nothing submitted"
+        row = self.native("failed", ("submitting", None), ("failed", {"msg_id": self.mid, "status": "failed", "reason": reason}))
+        for urgent in (False, True):
+            rc, out, mailbox, _ = self.run_send(row, urgent=urgent)
+            self.assertEqual((0, "mailbox", True), (rc, out["routed"], out["fallback"]["used"]), out)
+            self.assertEqual(reason, out["fallback"]["native_reason"])
+            self.assertEqual(self.mid, out["fallback"]["native_id"])
+            self.assertIn("turn ends", out["note"])
+            self.assertEqual(1, mailbox.call_count)
+            self.assertEqual(str(uuid.uuid5(uuid.UUID(self.mid), "cctrl-mailbox-fallback")), mailbox.call_args.args[4])
+
+    def test_an_unavailable_sender_bridge_falls_back_before_anything_was_sent(self):
+        rc, out, mailbox, rpc = self.run_send(daemon_error=ValueError("bridge daemon exited; see /x.log"))
+        self.assertEqual((0, "mailbox", True), (rc, out["routed"], out["fallback"]["used"]), out)
+        self.assertIn("bridge is unavailable", out["fallback"]["native_reason"])
+        rpc.assert_not_called()
+        self.assertEqual(1, mailbox.call_count)
+
+    def test_a_refused_fallback_returns_the_failed_native_row_with_the_reason(self):
+        row = self.native("failed", ("submitting", None), ("failed", {"status": "failed", "reason": "unavailable"}))
+        out = io.StringIO()
+        with patch.dict(os.environ, {"CODEX_THREAD_ID": self.who.split(":", 1)[1], "HOME": self.temp.name}, clear=True), \
+                patch.object(bridge, "ensure_daemon", return_value={"socket": "x"}), patch.object(bridge, "check_daemon"), \
+                patch.object(bridge, "rpc", return_value={"ok": True, "data": row}), patch.object(bridge, "own_registry", return_value=None), \
+                patch.object(bridge, "sender_envelope", return_value=None), \
+                patch.object(bridge, "route_to_mailbox", side_effect=bridge.RouteRefused("no peer")), mock.patch("sys.stdout", out):
+            rc = bridge.main(["--root", str(self.root), "send", self.target, "--json", "--", "hello"])
+        value = json.loads(out.getvalue())
+        self.assertEqual((0, "native", "failed", False, "no peer"), (rc, value["routed"], value["status"], value["fallback"]["used"], value["fallback"]["refused"]))
+
+    def test_claude_to_codex_and_codex_to_codex_never_use_the_fallback(self):
+        row = self.native("failed", ("submitting", None), ("failed", {"status": "failed", "reason": "x"}))
+        for target in ("codex:" + str(uuid.uuid4()),):
+            self.target = target
+            rc, out, mailbox, _ = self.run_send(row)
+            self.assertEqual("native", out["routed"])
+            self.assertNotIn("fallback", out)
+            mailbox.assert_not_called()
 
 
 class DaemonVersionTests(unittest.TestCase):
