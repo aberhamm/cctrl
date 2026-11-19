@@ -1211,11 +1211,12 @@ class CliProcessTests(unittest.TestCase):
             ("lost", "lost", False, ["LOST", "not requeued"], ["queue add"]),
             ("ambiguous", "ambiguous", False, ["unknown whether the steer landed", "not queued", "cannot be reconciled"], ["--reconcile", "queue add"]),
             ("queued", "idle", True, ["queued, not steered (idle)"], ["NOT queued", "queue add"]),
-            ("queued", "rate", True, ["queued, not steered (rate)"], ["NOT queued"]),
+            ("queued", "rate_limited", True, ["queued, not steered (rate_limited)"], ["NOT queued"]),
+            ("submitting", "pending", False, ["steer requested; outcome pending (submitting)"], ["NOT queued"]),
             ("failed", "idle", True, ["not steered and NOT queued: send failed"], ["queued, not steered"]),
             ("failed", "not_loaded", True, ["not steered and NOT queued: send failed"], ["queued, not steered"]),
-            ("ambiguous", "idle", True, ["not steered (idle)", "queue add ambiguous, a queued copy may exist", "do not resend blindly"], ["not queued and is never"]),
-            ("ambiguous", "flags", True, ["not steered (flags)", "queue add ambiguous"], ["unknown whether the steer landed"]),
+            ("ambiguous", "idle", True, ["not steered (idle)", "queue add ambiguous, a queued copy may exist", "do not resend blindly", "--reconcile"], ["not queued and is never"]),
+            ("ambiguous", "busy_flag", True, ["not steered (busy_flag)", "queue add ambiguous", "--reconcile"], ["unknown whether the steer landed"]),
         ]
         for status, outcome, queued, wants, unwants in cases:
             text = bridge.steer_report(row(status, outcome, queued))
@@ -2202,6 +2203,47 @@ class SteerDaemonTests(unittest.TestCase):
             db.execute("DELETE FROM events WHERE kind='steer-confirmed'")
             db.execute("UPDATE messages SET created=? WHERE id=?", (time.time() - 3600, mid))
         self.assertEqual(0, self.daemon.confirm_pending(), "old rows are no longer chased")
+
+    def test_ten_pending_steers_all_get_checked_over_the_confirm_window(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending"}
+        mids = []
+        base = time.time()
+        for i in range(10):
+            self.allow(f"codex:r{i}")
+            mids.append(self.steer_send(body=f"m{i}", to=f"codex:r{i}")["id"])
+        with self.store.db() as db:
+            for i, mid in enumerate(mids):
+                db.execute("UPDATE messages SET created=? WHERE id=?", (base + i * 0.001, mid))
+        seen = set()
+        now = [base]
+        real = time.time
+        time.time = lambda: now[0]
+        orig = self.daemon.confirm_steer
+        self.daemon.confirm_steer = lambda mid: (seen.add(mid), orig(mid))[1]
+        try:
+            while now[0] < base + 590:
+                self.daemon.confirm_pending()
+                now[0] += 5
+        finally:
+            time.time = real
+        self.assertEqual(set(mids), seen)
+
+    def test_window_expiry_records_one_checking_stopped_note_and_keeps_status_steered(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending"}
+        mid = self.steer_send()["id"]
+        with self.store.db() as db:
+            db.execute("UPDATE messages SET created=? WHERE id=?", (time.time() - 3600, mid))
+        self.daemon.confirm_pending()
+        self.daemon.confirm_pending()
+        row = self.store.get(mid, "codex:sender")
+        self.assertEqual("steered", row["status"])
+        self.assertEqual(1, [e["kind"] for e in row["events"]].count("steer-unconfirmed"))
+        self.allow("codex:other")
+        fresh = self.steer_send(body="fresh", to="codex:other")["id"]
+        self.daemon.confirm_pending()
+        self.assertNotIn("steer-unconfirmed", [e["kind"] for e in self.store.get(fresh, "codex:sender")["events"]])
 
     def test_pending_confirmation_backs_off_5_10_20_40_then_caps_at_60(self):
         self.allow()
