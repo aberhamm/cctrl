@@ -722,11 +722,18 @@ def steer_report(row):
         return None
     outcome, reason, status = steer.get("outcome"), steer.get("reason"), row.get("status")
     why = f": {reason}" if reason else ""
+    queue_tried = any(e.get("kind") == "queueing" for e in (row.get("events") or []))
     if status == "lost" or outcome == "lost":
         return f"LOST: the steer was accepted but never appeared in the recipient's turn history, and it was not requeued{why}. Resend if it still matters"
+    if outcome not in (None, "pending", "steered", "ambiguous") and status in ("failed", "ambiguous"):
+        # The steer was skipped; the report follows what the queue fallback did.
+        if status == "failed":
+            return f"not steered and NOT queued: send failed{why}"
+        return (f"not steered ({outcome}); queue add ambiguous, a queued copy may exist: "
+                f"check bridge status {row.get('id')}, do not resend blindly{why}")
     if status == "ambiguous" or outcome == "ambiguous":
         return (f"unknown whether the steer landed{why}. It was not queued and is never replayed; "
-                f"check bridge status {row.get('id')} --reconcile before resending")
+                "it cannot be reconciled, so ask the recipient or resend with a note saying it may be a duplicate")
     if status == "steered" or outcome == "steered":
         return "steered into the recipient's active turn; not queued"
     if outcome in (None, "pending"):
@@ -774,6 +781,7 @@ class Daemon:
         from bridge_claude import ClaudeEndpoint
         self.store, self.who, self.cwd = store, who, cwd
         self.stopping = threading.Event()
+        self.confirm_due = {}
         self.incoming = queue.Queue(maxsize=256)
         key = hashlib.sha256(who.encode()).hexdigest()[:24]
         self.control_path = store.root / (key + ".sock")
@@ -957,9 +965,17 @@ class Daemon:
                 "SELECT m.id FROM messages m WHERE m.dispatcher=? AND m.delivery='steer' AND m.status='steered' AND m.created>? "
                 "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steer-confirmed') ORDER BY m.created LIMIT ?",
                 (self.who, time.time() - CONFIRM_WINDOW, limit))]
-        for mid in ids:
+        now = time.time()
+        self.__dict__.setdefault("confirm_due", {})
+        due = [mid for mid in ids if self.confirm_due.get(mid, (0.0, 0.0))[0] <= now]
+        for mid in due:
+            # Back off 5, 10, 20, 40 s, capped at 60 s, so a long turn is not re-read every sweep.
+            gap = min(60.0, self.confirm_due.get(mid, (0.0, 2.5))[1] * 2)
+            self.confirm_due[mid] = (now + gap, gap)
             self.confirm_steer(mid)
-        return len(ids)
+        for mid in [m for m in self.confirm_due if m not in ids]:
+            del self.confirm_due[mid]
+        return len(due)
 
     def notify_receipt(self, original):
         mid = original["id"]
@@ -1392,7 +1408,7 @@ def main(argv=None):
                 result = store.get(args.target, who)
                 if args.reconcile and result["recipient"].startswith("codex:") and result["delivery"] == "steer" and store.steer_only(result["id"]):
                     # A steer attempt has no queue item: never fall through to a queue lookup or a resend.
-                    result = {**result, "reconciliation": {"status": "ambiguous", "reason": "steer outcome cannot be reconciled; never replay"}}
+                    result = {**result, "reconciliation": {"status": "ambiguous", "reason": "steer outcome cannot be reconciled; never replay; ask the recipient or resend with a note"}}
                 elif args.reconcile and result["recipient"].startswith("codex:"):
                     from bridge_codex import reconcile
                     observed = reconcile(result["recipient"].split(":", 1)[1], wire_text(result["id"], result["sender"], result["recipient"], result["body"], result["reply_to"], result["envelope"]), result["id"])

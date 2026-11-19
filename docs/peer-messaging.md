@@ -234,8 +234,9 @@ fallback after a possible send.
 | `steered` | the server accepted it into the active turn; not queued | wait; cctrl checks the turn history for the message ID |
 | `queued` | not steered (see the outcome above); delivered by the normal queue | as any queued message |
 | `lost` | accepted, but the text never appeared in the turn's history (for example the turn ended or was interrupted first). **Not requeued**: that would replay an accepted send | resend only if it still matters |
-| `ambiguous` | transport failed after the steer was written; no retry and no queue fallback | `bridge status ID --reconcile` before resending |
+| `ambiguous` | transport failed after the steer was written; no retry and no queue fallback; cannot be reconciled (no queue item to look up) | ask the recipient, or resend with a note that it may be a duplicate |
 
+`lost` means "not found in the steered turn" (a steer that landed in a later turn would also read as lost; this is not measured).
 `lost` is a stranded, non-handleable row: its body is withheld and it cannot be
 ACKed. `steered` messages are reply-ackable like `queued` ones; `bridge retire`
 treats them as final with no queue item to delete. `steered` is not proof of
