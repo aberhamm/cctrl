@@ -77,6 +77,13 @@ STEER_REASONS = {
     "rate_limited": "at most one steer per sender and recipient every 2 minutes; queued instead",
 }
 
+# The confirm sweep's row selection. Module constants so a test can EXPLAIN the real SQL.
+CONFIRM_BASE_SQL = ("FROM messages m WHERE m.dispatcher=? AND m.delivery='steer' AND m.status='steered' "
+                    "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steer-confirmed') ")
+CONFIRM_IN_WINDOW_SQL = "SELECT m.id " + CONFIRM_BASE_SQL + "AND m.created>? ORDER BY m.created"
+CONFIRM_EXPIRED_SQL = ("SELECT m.id " + CONFIRM_BASE_SQL + "AND m.created<=? AND m.created>? "
+                       "AND NOT EXISTS (SELECT 1 FROM events u WHERE u.id=m.id AND u.kind='steer-unconfirmed')")
+
 # Exit code of `bridge retire` when the run finished but some rows errored (1 stays "refused / failed").
 RETIRE_PARTIAL_EXIT = 3
 
@@ -962,14 +969,11 @@ class Daemon:
     def confirm_pending(self, limit=8):
         """Re-check recent accepted steers this daemon sent that are not yet confirmed. Returns how many it checked."""
         now = time.time()
-        base = ("FROM messages m WHERE m.dispatcher=? AND m.delivery='steer' AND m.status='steered' "
-                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steer-confirmed') ")
         with self.store.db() as db:
             # No SQL limit: the backoff filter runs first, so rows waiting out a backoff never hold the slots.
-            ids = [r[0] for r in db.execute("SELECT m.id " + base + "AND m.created>? ORDER BY m.created", (self.who, now - CONFIRM_WINDOW))]
+            ids = [r[0] for r in db.execute(CONFIRM_IN_WINDOW_SQL, (self.who, now - CONFIRM_WINDOW))]
             expired = [r[0] for r in db.execute(
-                "SELECT m.id " + base + "AND m.created<=? AND m.created>? AND NOT EXISTS (SELECT 1 FROM events u WHERE u.id=m.id AND u.kind='steer-unconfirmed')",
-                (self.who, now - CONFIRM_WINDOW, now - CONFIRM_WINDOW - EXPIRY_BAND))]
+                CONFIRM_EXPIRED_SQL, (self.who, now - CONFIRM_WINDOW, now - CONFIRM_WINDOW - EXPIRY_BAND))]
         for mid in expired:
             # Checking stopped; the status stays steered (never lost, never requeued).
             self.store.note_once(mid, "steer-unconfirmed", {"reason": "checking stopped after the confirm window; the steer was accepted but never confirmed in the turn history"})
