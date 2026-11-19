@@ -1348,6 +1348,50 @@ class MailboxRouteUnitTests(unittest.TestCase):
         self.assertEqual(out["mailbox_id"], again["mailbox_id"])
         self.assertEqual(1, send.call_count)
 
+    def test_two_concurrent_retries_of_a_failed_row_write_one_mailbox_item(self):
+        mid = str(uuid.uuid4())
+        with patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", side_effect=bridge.RouteRefused("mailbox write failed")):
+            with self.assertRaises(bridge.RouteRefused):
+                bridge.route_to_mailbox(self.store, self.who, self.target, "body", mid)
+        self.assertEqual("failed", self.store.get(mid, self.who)["status"])
+        import threading
+        barrier = threading.Barrier(2, timeout=5)
+        real_get = bridge.Store.get
+
+        def get(store, key, who):
+            row = real_get(store, key, who)
+            if row["status"] == "failed":
+                try:
+                    barrier.wait()  # both retries have seen "failed" before either writes
+                except threading.BrokenBarrierError:
+                    pass
+            return row
+
+        results, lock = [], threading.Lock()
+
+        def retry():
+            try:
+                bridge.route_to_mailbox(bridge.Store(self.store.root), self.who, self.target, "body", mid)
+                outcome = "sent"
+            except bridge.RouteRefused as exc:
+                outcome = str(exc)
+            with lock:
+                results.append(outcome)
+
+        with patch.object(bridge.Store, "get", get), patch.object(bridge, "backing_peer", return_value="peer-a"), \
+                patch.object(bridge, "mailbox_send", return_value={"id": "msg_1"}) as send:
+            threads = [threading.Thread(target=retry) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(15)
+        self.assertEqual(1, send.call_count, results)
+        self.assertEqual(1, results.count("sent"), results)
+        loser = [r for r in results if r != "sent"]
+        self.assertEqual(1, len(loser), results)
+        self.assertIn("another retry", loser[0])
+
     def test_an_unknown_outcome_write_stays_routing_and_a_retry_is_refused(self):
         mid = str(uuid.uuid4())
         unknown = bridge.UnknownOutcome("mailbox send did not complete (TimeoutExpired); it may or may not have been written. Check cctrl peer outbox")
@@ -2245,25 +2289,56 @@ class SteerDaemonTests(unittest.TestCase):
         self.daemon.confirm_pending()
         self.assertNotIn("steer-unconfirmed", [e["kind"] for e in self.store.get(fresh, "codex:sender")["events"]])
 
-    def test_confirm_tick_stays_cheap_on_a_ledger_with_many_old_steered_rows(self):
-        self.allow()
-        self.confirm_result = {"outcome": "pending"}
-        self.steer_send()
-        old = time.time() - 400 * 86400
+    def seed_band_rows(self, n=700, events=30000):
+        """Steered rows that left the confirm window an hour ago (inside the one-day band), checking-stopped note already written."""
+        aged = time.time() - 3600
         with self.store.db() as db:
             db.executemany(
                 "INSERT INTO messages(id,sender,recipient,body,created,status,dispatcher,delivery) VALUES (?,?,?,?,?,?,?,?)",
-                [(f"old-{i}", "codex:sender", "codex:receiver", "x", old + i, "steered", "codex:sender", "steer") for i in range(1500)])
+                [(f"band-{i}", "codex:sender", "codex:receiver", "x", aged + i * 0.001, "steered", "codex:sender", "steer") for i in range(n)])
             db.executemany("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)",
-                           [(f"old-{i % 1500}", old, "noise-%d" % (i % 7), None) for i in range(40000)])
-            plan = " ".join(str(r[3]) for r in db.execute(
-                "EXPLAIN QUERY PLAN SELECT 1 FROM events e WHERE e.id=? AND e.kind='steer-confirmed'", ("old-1",)))
-            names = {r[1] for r in db.execute("PRAGMA index_list(events)")}
-        self.assertIn("events_id_kind", names)
-        self.assertIn("events_id_kind", plan)
+                           [(f"band-{i}", aged, "steer-unconfirmed", None) for i in range(n)])
+            db.executemany("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)",
+                           [(f"band-{i % n}", aged, "noise-%d" % (i % 7), None) for i in range(events)])
+
+    def test_confirm_queries_use_the_events_index(self):
+        self.seed_band_rows(50, 500)
+        now = time.time()
+        queries = ((bridge.CONFIRM_IN_WINDOW_SQL, ("codex:sender", now - bridge.CONFIRM_WINDOW)),
+                   (bridge.CONFIRM_EXPIRED_SQL, ("codex:sender", now - bridge.CONFIRM_WINDOW, now - bridge.CONFIRM_WINDOW - bridge.EXPIRY_BAND)))
+        with self.store.db() as db:
+            for sql, args in queries:
+                plan = [str(r[3]) for r in db.execute("EXPLAIN QUERY PLAN " + sql, args)]
+                self.assertTrue(any("events_id_kind" in line and "SEARCH" in line for line in plan), plan)
+                self.assertFalse(any(line.startswith("SCAN e") or line.startswith("SCAN u") for line in plan), plan)
+
+    def test_confirm_tick_stays_cheap_with_many_steered_rows_inside_the_band(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending"}
+        self.steer_send()
+        self.seed_band_rows()
+        self.daemon.confirm_pending()
         start = time.monotonic()
         self.daemon.confirm_pending()
-        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertLess(time.monotonic() - start, 0.25)
+
+    def test_confirm_tick_does_not_scan_the_whole_messages_table(self):
+        self.seed_band_rows(50, 500)
+        now = time.time()
+        with self.store.db() as db:
+            plan = [str(r[3]) for r in db.execute("EXPLAIN QUERY PLAN " + bridge.CONFIRM_IN_WINDOW_SQL, ("codex:sender", now - bridge.CONFIRM_WINDOW))]
+            names = {r[1] for r in db.execute("PRAGMA index_list(messages)")}
+        self.assertIn("messages_confirm", names)
+        self.assertTrue(any("SEARCH m" in line and "messages_confirm" in line for line in plan), plan)
+
+    def test_messages_index_is_added_to_an_existing_ledger(self):
+        root = Path(tempfile.mkdtemp())
+        store = bridge.Store(root / "ledger")
+        with store.db() as db:
+            db.execute("DROP INDEX IF EXISTS messages_confirm")
+        again = bridge.Store(root / "ledger")
+        with again.db() as db:
+            self.assertIn("messages_confirm", {r[1] for r in db.execute("PRAGMA index_list(messages)")})
 
     def test_events_index_is_added_to_an_existing_ledger(self):
         root = Path(tempfile.mkdtemp())
