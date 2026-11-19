@@ -710,6 +710,30 @@ def steer_summary(row):
     return {"requested": True, "outcome": outcome or "pending", "reason": reason}
 
 
+STEER_NOTE = ("steering reaches only Codex app threads that the app-server has loaded and that accept direct input; "
+              "a tmux or CLI Codex target always queues")
+ACTOR_PATTERN = re.compile(r"^(codex|claude):[^\s:]+$")
+
+
+def steer_report(row):
+    """One plain sentence for the sender: steered, queued (with why), lost or unknown. None when no steer was asked."""
+    steer = row.get("steer") if isinstance(row, dict) else None
+    if not steer:
+        return None
+    outcome, reason, status = steer.get("outcome"), steer.get("reason"), row.get("status")
+    why = f": {reason}" if reason else ""
+    if status == "lost" or outcome == "lost":
+        return f"LOST: the steer was accepted but never appeared in the recipient's turn history, and it was not requeued{why}. Resend if it still matters"
+    if status == "ambiguous" or outcome == "ambiguous":
+        return (f"unknown whether the steer landed{why}. It was not queued and is never replayed; "
+                f"check bridge status {row.get('id')} --reconcile before resending")
+    if status == "steered" or outcome == "steered":
+        return "steered into the recipient's active turn; not queued"
+    if outcome in (None, "pending"):
+        return f"steer requested; outcome pending ({status})"
+    return f"queued, not steered ({outcome}){why}"
+
+
 def wire_text(mid, sender, recipient, body, reply_to=None, envelope=None, delivery=None):
     header = f"[cctrl-bridge message={mid} from={sender} to={recipient}"
     if reply_to:
@@ -1274,6 +1298,33 @@ def ensure_daemon(store, who):
     raise ValueError(f"bridge startup pending; inspect {log} before retrying")
 
 
+def refuse_steer(store, who, args):
+    """Reject a --steer that can never work, before a daemon starts, a row is written or the mailbox is touched."""
+    if args.command == "send" and args.urgent:
+        raise ValueError("--steer and --urgent cannot be combined: --urgent raises an admission prompt, --steer adds to a running turn; nothing sent")
+    if args.command == "send":
+        recipient = args.target
+    else:
+        recipient = store.get(args.target, who)["sender"]
+    if not str(recipient).startswith("codex:"):
+        raise ValueError("steer applies only to Codex recipients; nothing sent")
+
+
+def run_policy(store, who, args):
+    """Show or set the caller's own steer policy. Never writes another actor's row."""
+    if args.actor and args.actor != who:
+        raise ValueError(f"policy can only be changed for your own actor ({who}); refusing {args.actor}")
+    senders = args.steer_from or []
+    for sender in senders:
+        if not ACTOR_PATTERN.match(sender):
+            raise ValueError(f"--steer-from needs actors like codex:THREAD_ID or claude:SESSION_ID, not {sender!r}")
+    if senders and not args.steer:
+        raise ValueError("--steer-from needs --steer allow or --steer off")
+    if args.steer:
+        store.set_policy(who, args.steer, senders)
+    return {"actor": who, **store.policy(who), "note": STEER_NOTE}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.environ.get("CCTRL_NATIVE_BRIDGE_DIR", str(Path.home() / ".local/state/cctrl/native-bridge")))
@@ -1281,11 +1332,21 @@ def main(argv=None):
     for name in ("enable", "list", "inbox", "stop"):
         item = sub.add_parser(name)
         item.add_argument("--json", action="store_true")
+        if name == "enable":
+            item.add_argument("--accept-steer", action="store_true",
+                              help="also opt this session in to being steered (any sender); same as `policy --steer allow`. " + STEER_NOTE)
         if name == "inbox":
             item.add_argument("--after", type=int, default=0, help="row cursor from previous page")
             item.add_argument("--limit", type=int, default=20, help="page size, 1..100")
             item.add_argument("--view", choices=VIEWS, default="actionable",
                               help="actionable (default): only messages native delivery did not accept; stranded: unhandled held/refused/ambiguous items; history: everything sent or received")
+    policy = sub.add_parser("policy", help="show or set this session's own steer policy (default off)",
+                            description="Show or set this session's own steer policy (default off). Without --steer it only shows. " + STEER_NOTE + ".")
+    policy.add_argument("--steer", choices=("allow", "off"), help="allow: accept --steer from the senders listed (or any); off: queue every message")
+    policy.add_argument("--steer-from", action="append", metavar="ACTOR", default=None,
+                        help="only these senders (codex:ID or claude:ID); repeatable; omit to allow any sender. A set replaces the whole row")
+    policy.add_argument("--actor", help="must be your own actor; another actor's policy is never written")
+    policy.add_argument("--json", action="store_true")
     retire = sub.add_parser("retire", help="retire the Codex queue copies of messages this session already handled")
     retire.add_argument("--handled", action="store_true", help="required: retire handled messages whose native retirement is not final")
     retire.add_argument("--dry-run", action="store_true", help="list what would be retired; write nothing")
@@ -1301,6 +1362,10 @@ def main(argv=None):
             item.add_argument("--name", help="explicit display-name claim for the sender envelope (recorded as claimed)")
             item.add_argument("--harness", help="explicit harness claim, e.g. codex-cli (recorded as claimed, never as the provider-reported source)")
             item.add_argument("body", nargs="+")
+            item.add_argument("--steer", action="store_true",
+                              help="Codex app-thread recipients only: add the message to the recipient's running turn instead of queueing it. "
+                                   "Needs the recipient's opt-in (`bridge policy --steer allow`); otherwise, or if the recipient is idle, the message is queued and the result says why. "
+                                   "For correcting or stopping work in flight, not status or acks. " + STEER_NOTE + ". Cannot combine with --urgent")
         if name == "send":
             item.add_argument("--urgent", action="store_true",
                               help="Codex to Claude only: use the native bridge (an admission prompt on the recipient's screen) instead of the mailbox")
@@ -1315,10 +1380,15 @@ def main(argv=None):
             return 0
         if args.command == "list":
             from bridge_claude import discover_sessions
-            result = {"endpoints": [{**e, "daemon_outdated": bool(daemon_missing(e, ALL_REQUIRED))} for e in store.endpoints()], "claude": [{**r, "actor": actor("claude", r["session_id"])} for r in discover_sessions() if not r["session_id"].startswith("cctrl-bridge-")]}
+            result = {"endpoints": [{**e, "daemon_outdated": bool(daemon_missing(e, ALL_REQUIRED)), "steer_policy": store.policy(e["actor"])} for e in store.endpoints()], "steer_note": STEER_NOTE, "claude": [{**r, "actor": actor("claude", r["session_id"])} for r in discover_sessions() if not r["session_id"].startswith("cctrl-bridge-")]}
         else:
             who = own_actor()
-            if args.command == "status":
+            steer = bool(getattr(args, "steer", False)) and args.command in {"send", "reply"}
+            if steer:
+                refuse_steer(store, who, args)
+            if args.command == "policy":
+                result = run_policy(store, who, args)
+            elif args.command == "status":
                 result = store.get(args.target, who)
                 if args.reconcile and result["recipient"].startswith("codex:") and result["delivery"] == "steer" and store.steer_only(result["id"]):
                     # A steer attempt has no queue item: never fall through to a queue lookup or a resend.
@@ -1374,12 +1444,18 @@ def main(argv=None):
                 row = store.endpoint(who) if args.command == "stop" else ensure_daemon(store, who)
                 if row is not None:
                     check_daemon(row, args.command)
+                    if steer:
+                        check_daemon(row, "send_steer")
                 if args.command == "enable":
                     result = row
                     outdated = bool(daemon_missing(row, ALL_REQUIRED))
                     result = {**row, "daemon_outdated": outdated}
                     if outdated:
                         result["warning"] = f"{daemon_problem(row)}. send, ack and reply are refused until it is migrated (drain held items first); see {MIGRATION_DOC}."
+                    if args.accept_steer:
+                        store.set_policy(who, "allow", [])
+                    result["steer_policy"] = store.policy(who)
+                    result["steer_note"] = STEER_NOTE
                 elif row is None:
                     result = {"stopped": True}
                 else:
@@ -1393,6 +1469,8 @@ def main(argv=None):
                         request["body"] = " ".join(args.body)
                         if args.id:
                             request["id" if args.command == "send" else "reply_id"] = str(uuid.UUID(args.id))
+                        if steer:
+                            request["delivery"] = "steer"
                     response = rpc(row, request)
                     if not response.get("ok"):
                         print(json.dumps(response))
@@ -1400,6 +1478,10 @@ def main(argv=None):
                     result = response["data"]
                     if args.command == "send":
                         result = {**result, "routed": "native"}
+                    if steer:
+                        report = steer_report(result)
+                        if report:
+                            result = {**result, "steer_report": report}
                     if args.command == "stop":
                         for _ in range(100):
                             if store.endpoint(who) is None:

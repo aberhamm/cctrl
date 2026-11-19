@@ -429,6 +429,7 @@ _cctrl() {
                     'list:Discover local native destinations'
                     'send:Send to exact provider-qualified session'
                     'reply:Reply to a bridge message ID'
+                    'policy:Show or set this session steer policy'
                     'ack:Acknowledge handling and send receipt'
                     'status:Inspect durable delivery receipts'
                     'inbox:Read unacknowledged native messages'
@@ -436,7 +437,7 @@ _cctrl() {
                 )
                 _describe 'native bridge commands' bridge_cmds
             else
-                _arguments '--json[Machine-readable result]' '--id[Idempotent client UUID]:UUID:' '*:target or message:'
+                _arguments '--json[Machine-readable result]' '--id[Idempotent client UUID]:UUID:' '--steer[Steer into the recipient running turn (Codex app threads only)]' '--accept-steer[Enable and accept steering]' '--steer-from[Only these senders may steer]:actor:' '*:target or message:'
             fi
             ;;
         peer)
