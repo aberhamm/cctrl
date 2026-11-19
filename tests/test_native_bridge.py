@@ -19,6 +19,7 @@ import no_real_tmux  # Prevent public cctrl children reaching a user's tmux serv
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "lib"))
 import native_bridge as bridge
+import bridge_codex
 
 
 class LedgerTests(unittest.TestCase):
@@ -1474,6 +1475,637 @@ class DaemonVersionTests(unittest.TestCase):
         self.live_row()
         with self.store.db() as db:
             self.assertEqual(7, len(db.execute("PRAGMA table_info(endpoints)").fetchall()))
+
+
+STEERED = {"status": "steered", "classification": "accepted", "turn_id": "turn-1", "expected_turn_id": "turn-1"}
+AMBIGUOUS = {"status": "ambiguous", "classification": "ambiguous", "reason": "transport lost after the steer write"}
+
+
+def skipped(outcome, reason="r2.1 reason text"):
+    return {"status": "skipped", "classification": "definitive", "outcome": outcome, "reason": reason}
+
+
+class SteerDaemonTests(unittest.TestCase):
+    """P2: steer-then-queue in the sender's daemon. Fakes only: bridge_codex is patched, no app-server is reached."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.store = bridge.Store(Path(self.temp.name) / "ledger")
+        self.daemon = self.make_daemon("codex:sender")
+        self.steers, self.queues, self.confirms = [], [], []
+        self.steer_result = dict(STEERED)
+        self.confirm_result = {"outcome": "confirmed"}
+        self.enqueue_result = {"status": "queued", "queued_submission_id": "queue-1"}
+        forbidden = ("resume", "start", "interrupt")
+
+        def steer(thread_id, text, client_id, *args, **kwargs):
+            self.steers.append((thread_id, text, client_id))
+            return dict(self.steer_result)
+
+        def enqueue(thread_id, text, client_id, *args, **kwargs):
+            self.queues.append((thread_id, text, client_id))
+            return dict(self.enqueue_result)
+
+        def confirm(thread_id, client_id, turn_id, *args, **kwargs):
+            self.confirms.append((thread_id, client_id, turn_id))
+            return dict(self.confirm_result)
+
+        for name, fake in (("steer", steer), ("enqueue", enqueue), ("confirm_steer", confirm)):
+            patcher = patch.object(bridge_codex, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.assertTrue(forbidden)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def make_daemon(self, who):
+        daemon = bridge.Daemon.__new__(bridge.Daemon)
+        daemon.store, daemon.who = self.store, who
+        return daemon
+
+    def allow(self, actor="codex:receiver", only=None):
+        self.store.set_policy(actor, "allow", only)
+
+    def steer_send(self, body="hello", mid=None, to="codex:receiver", daemon=None):
+        return (daemon or self.daemon).send(to, body, mid=mid, delivery="steer")
+
+    def kinds(self, mid, who="codex:sender"):
+        return [e["kind"] for e in self.store.get(mid, who)["events"]]
+
+    # ---- A6 native 1: recipient policy off -> declined, queued once ----
+    def test_policy_off_is_declined_and_queued_once_with_the_reason(self):
+        row = self.steer_send()
+        self.assertEqual("queued", row["status"])
+        self.assertEqual("declined", row["steer"]["outcome"])
+        self.assertTrue(row["steer"]["requested"])
+        self.assertTrue(row["steer"]["reason"])
+        self.assertEqual([], self.steers)
+        self.assertEqual(1, len(self.queues))
+        self.assertEqual(["persisted", "submitting", "steer-skipped", "queueing", "queued"], self.kinds(row["id"]))
+
+    # ---- A6 native 2: allow + active turn -> steered, no queue ----
+    def test_allowed_steer_into_an_active_turn_is_steered_with_no_queue_add(self):
+        self.allow()
+        row = self.steer_send()
+        self.assertEqual("steered", row["status"])
+        self.assertEqual("steered", row["steer"]["outcome"])
+        self.assertEqual([], self.queues)
+        self.assertEqual(1, len(self.steers))
+        thread, text, client = self.steers[0]
+        self.assertEqual(("receiver", row["id"]), (thread, client))
+        self.assertIn("delivery=steer]", text)
+        self.assertIn("message=" + row["id"], text)
+        self.assertEqual("steer", row["delivery"])
+        detail = json.loads(row["detail"])
+        self.assertEqual("turn-1", detail["turn_id"])
+        self.assertEqual(["persisted", "submitting", "steering", "steered"], self.kinds(row["id"])[:4])
+
+    # ---- A6 native 3 plus R2.1 reasons: every adapter skip queues with its reason ----
+    def test_every_adapter_skip_queues_once_with_the_adapter_outcome_and_reason(self):
+        for outcome in ("idle", "not_loaded", "no_direct_input", "busy_flag", "turn_unknown", "stale_turn", "unknown"):
+            with self.subTest(outcome=outcome):
+                self.allow()
+                self.steers.clear(), self.queues.clear()
+                self.steer_result = skipped(outcome, "reason for " + outcome)
+                with self.store.db() as db:
+                    db.execute("DELETE FROM events")  # keep D6 out of this loop
+                row = self.steer_send("hi " + outcome)
+                self.assertEqual("queued", row["status"])
+                self.assertEqual((outcome, "reason for " + outcome), (row["steer"]["outcome"], row["steer"]["reason"]))
+                self.assertEqual(1, len(self.queues))
+                self.assertNotIn("delivery=steer", self.queues[0][1], "the queued copy is a plain queue message")
+                kinds = self.kinds(row["id"])
+                self.assertLess(kinds.index("steer-skipped"), kinds.index("queueing"))
+                self.assertLess(kinds.index("queueing"), kinds.index("queued"))
+
+    def test_idle_thread_is_queued_and_the_steer_skipped_event_carries_the_outcome(self):
+        self.allow()
+        self.steer_result = skipped("idle")
+        row = self.steer_send()
+        event = next(e for e in row["events"] if e["kind"] == "steer-skipped")
+        self.assertEqual("idle", json.loads(event["detail"])["outcome"])
+
+    def test_steer_adapter_failed_status_queues_it_so_the_queue_path_reports_its_own_failure(self):
+        self.allow()
+        self.steer_result = {"status": "failed", "classification": "definitive", "reason": "no runtime"}
+        self.enqueue_result = {"status": "failed", "reason": "no runtime"}
+        row = self.steer_send()
+        self.assertEqual("failed", row["status"])
+        self.assertEqual(1, len(self.queues))
+        self.assertEqual("unknown", row["steer"]["outcome"])
+
+    def test_a_non_codex_runtime_error_raised_inside_the_adapter_is_ambiguous_never_requeued(self):
+        self.allow()
+        with patch.object(bridge_codex, "steer", side_effect=RuntimeError("boom")):
+            row = self.steer_send()
+        self.assertEqual("ambiguous", row["status"])
+        self.assertEqual([], self.queues)
+
+    # ---- A6 native 4: ambiguous steer ----
+    def test_ambiguous_steer_stays_ambiguous_with_no_enqueue_and_is_never_replayed(self):
+        self.allow()
+        self.steer_result = dict(AMBIGUOUS)
+        mid = str(uuid.uuid4())
+        row = self.steer_send(mid=mid)
+        self.assertEqual("ambiguous", row["status"])
+        self.assertEqual("ambiguous", row["steer"]["outcome"])
+        self.assertEqual([], self.queues)
+        self.steer_send(mid=mid)
+        self.assertEqual(1, len(self.steers), "a retry of an ambiguous steer never steers again")
+        self.assertEqual([], self.queues)
+
+    def test_ambiguous_steer_row_retires_as_final_not_applicable_and_is_not_a_pending_retirement(self):
+        self.allow()
+        self.steer_result = dict(AMBIGUOUS)
+        mid = self.steer_send()["id"]
+        recipient = self.make_daemon("codex:receiver")
+        recipient.deliver = lambda *args: {"status": "queued"}
+        recipient.retire_queue = lambda *args: self.fail("retired a queue item for a steer attempt")
+        self.store.acknowledge(mid, "codex:receiver")
+        self.assertEqual(([], []), self.store.pending_retirements("codex:receiver"))
+        outcome = recipient.retire_native(mid)
+        self.assertEqual("not_applicable", outcome["outcome"])
+        self.assertIn("steer", outcome["reason"])
+        self.assertEqual(outcome, recipient.retire_native(mid), "final: recorded, not recomputed")
+        row = self.store.get(mid, "codex:receiver")
+        self.assertFalse(row["late_native_delivery"] or row["late_native_delivery_possible"])
+
+    def test_a_row_that_fell_back_to_the_queue_is_still_retired_normally(self):
+        self.allow()
+        self.steer_result = skipped("idle")
+        mid = self.steer_send()["id"]
+        self.store.acknowledge(mid, "codex:receiver")
+        self.assertEqual(([mid], []), self.store.pending_retirements("codex:receiver"))
+        recipient = self.make_daemon("codex:receiver")
+        calls = []
+        recipient.retire_queue = lambda *args: (calls.append(args) or {"outcome": "retired"})
+        self.assertEqual("retired", recipient.retire_native(mid)["outcome"])
+        self.assertEqual([("receiver", mid, "queue-1")], calls)
+
+    def test_a_queued_ambiguous_row_without_a_steer_attempt_keeps_the_old_unknown_identity_path(self):
+        mid, _ = self.store.create("codex:sender", "codex:receiver", "x")
+        self.store.event(mid, "ambiguous", {"status": "ambiguous"})
+        recipient = self.make_daemon("codex:receiver")
+        self.assertEqual("unknown_identity", recipient.retire_native(mid)["outcome"])
+
+    def test_steered_row_has_nothing_to_retire_and_never_touches_the_queue(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        self.store.acknowledge(mid, "codex:receiver")
+        self.assertEqual(([], []), self.store.pending_retirements("codex:receiver"))
+        recipient = self.make_daemon("codex:receiver")
+        recipient.retire_queue = lambda *args: self.fail("retired a queue item for a steered message")
+        outcome = recipient.retire_native(mid)
+        self.assertEqual("not_applicable", outcome["outcome"])
+        self.assertIn("steered", outcome["reason"])
+
+    # ---- A6 native 5: idempotency per --id ----
+    def test_retry_with_the_same_id_does_not_steer_again(self):
+        self.allow()
+        mid = str(uuid.uuid4())
+        first = self.steer_send(mid=mid)
+        again = self.steer_send(mid=mid)
+        self.assertEqual(first["id"], again["id"])
+        self.assertEqual(1, len(self.steers))
+        self.assertEqual([], self.queues)
+
+    def test_same_id_with_a_different_delivery_is_refused_both_ways(self):
+        self.allow()
+        mid = str(uuid.uuid4())
+        self.steer_send(mid=mid)
+        with self.assertRaisesRegex(ValueError, "different content"):
+            self.daemon.send("codex:receiver", "hello", mid=mid)
+        other = str(uuid.uuid4())
+        self.daemon.send("codex:receiver", "plain", mid=other)
+        with self.assertRaisesRegex(ValueError, "different content"):
+            self.daemon.send("codex:receiver", "plain", mid=other, delivery="steer")
+
+    def test_explicit_queue_delivery_equals_the_default(self):
+        mid = str(uuid.uuid4())
+        self.daemon.send("codex:receiver", "plain", mid=mid)
+        self.daemon.send("codex:receiver", "plain", mid=mid, delivery="queue")
+        self.assertEqual(1, len(self.queues))
+
+    # ---- A6 native 6 (daemon half): steer to Claude is refused before anything is persisted ----
+    def test_steer_to_a_claude_recipient_is_refused_with_nothing_persisted(self):
+        for who in ("codex:sender", "claude:sender"):
+            with self.subTest(sender=who), self.assertRaisesRegex(ValueError, "steer applies only to Codex recipients; nothing sent"):
+                self.daemon = self.make_daemon(who)
+                self.steer_send(to="claude:target")
+        with self.store.db() as db:
+            self.assertEqual(0, db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+        self.assertEqual([], self.steers + self.queues)
+
+    def test_unknown_delivery_value_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.daemon.send("codex:receiver", "x", delivery="push")
+
+    # ---- A6 native 7: a reply that ends steered acks the original ----
+    def test_reply_that_ends_steered_acks_the_original_and_retires_it(self):
+        original, _ = self.store.create("codex:sender", "codex:receiver", "question")
+        self.store.event(original, "queued", {"queued_submission_id": "queue-1"})
+        self.allow("codex:sender")
+        recipient = self.make_daemon("codex:receiver")
+        recipient.retire_queue = lambda *args: {"outcome": "retired"}
+        result = recipient.handle({"actor": "codex:receiver", "action": "reply", "id": original, "body": "answer", "delivery": "steer"})
+        self.assertEqual("steered", result["status"])
+        self.assertTrue(result["original"]["handled"])
+        self.assertEqual("retired", result["original"]["native_retirement"]["outcome"])
+        self.assertTrue(self.store.get(original, "codex:receiver")["handled"])
+        self.assertEqual(original, result["reply_to"])
+
+    def test_a_steered_reply_still_needs_the_senders_endpoint_policy(self):
+        original, _ = self.store.create("codex:sender", "codex:receiver", "question")
+        self.store.event(original, "queued", {"queued_submission_id": "queue-1"})
+        recipient = self.make_daemon("codex:receiver")
+        recipient.retire_queue = lambda *args: {"outcome": "retired"}
+        result = recipient.handle({"actor": "codex:receiver", "action": "reply", "id": original, "body": "answer", "delivery": "steer"})
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("declined", result["steer"]["outcome"])
+
+    # ---- A6 native 8: protocol 4 and the optional steer capability ----
+    def live_row(self, who, protocol, capabilities):
+        started = bridge.start_identity(os.getpid())
+        with self.store.db() as db:
+            db.execute("INSERT OR REPLACE INTO endpoints VALUES (?,?,?,?,?,?,?)", (who, os.getpid(), started, "/x", "/y", "n", "/tmp"))
+            db.execute("INSERT OR REPLACE INTO endpoint_protocol VALUES (?,?,?,?,?)", (who, os.getpid(), started, protocol, json.dumps(capabilities)))
+        return self.store.endpoint(who)
+
+    def test_protocol_is_4_and_advertises_steer(self):
+        self.assertEqual(4, bridge.DAEMON_PROTOCOL)
+        self.assertIn("steer", bridge.DAEMON_CAPABILITIES)
+        self.assertEqual(("steer",), bridge.REQUIRED_CAPABILITIES["send_steer"])
+        self.assertEqual({"retire", "send_steer"}, set(bridge.OPTIONAL_ACTIONS))
+        self.assertNotIn("steer", bridge.ALL_REQUIRED)
+        self.assertEqual(2, bridge.MIN_DAEMON_PROTOCOL)
+
+    def test_protocol_3_endpoint_refuses_a_steer_send_but_still_sends_acks_and_replies(self):
+        old = [c for c in bridge.DAEMON_CAPABILITIES if c != "steer"]
+        row = self.live_row("codex:me", 3, old)
+        with self.assertRaises(bridge.DaemonOutdated) as caught:
+            bridge.check_daemon(row, "send_steer")
+        self.assertIn("nothing was sent", str(caught.exception))
+        self.assertNotIn("nothing was retired", str(caught.exception))
+        self.assertIn("send, ack and reply still work", str(caught.exception))
+        for action in ("send", "ack", "reply"):
+            self.assertIsNone(bridge.check_daemon(row, action))
+        self.assertFalse(bridge.daemon_missing(row, bridge.ALL_REQUIRED))
+
+    def test_retire_refusal_text_is_unchanged(self):
+        row = self.live_row("codex:me", 2, ["native_retirement", "sender_envelope"])
+        with self.assertRaisesRegex(bridge.DaemonOutdated, "nothing was retired"):
+            bridge.check_daemon(row, "retire")
+
+    def test_a_protocol_4_endpoint_accepts_a_steer_send(self):
+        row = self.live_row("codex:me", bridge.DAEMON_PROTOCOL, list(bridge.DAEMON_CAPABILITIES))
+        self.assertIsNone(bridge.check_daemon(row, "send_steer"))
+
+    # ---- A6 native 9: steer_from ----
+    def test_a_sender_missing_from_steer_from_is_declined_and_a_listed_one_is_steered(self):
+        self.allow(only=["codex:friend"])
+        row = self.steer_send()
+        self.assertEqual(("queued", "declined"), (row["status"], row["steer"]["outcome"]))
+        self.assertEqual([], self.steers)
+        friend = self.make_daemon("codex:friend")
+        row = self.steer_send(daemon=friend)
+        self.assertEqual("steered", row["status"])
+
+    def test_policy_defaults_to_off_and_is_keyed_by_actor(self):
+        self.assertEqual({"steer": "off", "steer_from": []}, self.store.policy("codex:receiver"))
+        self.store.set_policy("codex:receiver", "allow", ["codex:a", "codex:b"])
+        self.assertEqual({"steer": "allow", "steer_from": ["codex:a", "codex:b"]}, self.store.policy("codex:receiver"))
+        self.assertEqual("off", self.store.policy("codex:other")["steer"])
+        self.store.set_policy("codex:receiver", "off")
+        self.assertEqual("off", self.store.policy("codex:receiver")["steer"])
+        with self.assertRaises(ValueError):
+            self.store.set_policy("codex:receiver", "maybe")
+
+    def test_policy_survives_a_reopened_ledger(self):
+        self.allow()
+        again = bridge.Store(self.store.root)
+        self.assertEqual("allow", again.policy("codex:receiver")["steer"])
+
+    # ---- A6 native 11: age ----
+    def test_a_persisted_row_older_than_60s_at_dispatch_is_not_steered(self):
+        self.allow()
+        mid, _ = self.store.create("codex:sender", "codex:receiver", "late", delivery="steer")
+        with self.store.db() as db:
+            db.execute("UPDATE messages SET created=? WHERE id=?", (time.time() - 61, mid))
+        self.daemon.dispatch(mid)
+        row = self.store.get(mid, "codex:sender")
+        self.assertEqual("queued", row["status"])
+        self.assertEqual("stale", row["steer"]["outcome"])
+        self.assertEqual([], self.steers)
+        self.assertEqual(1, len(self.queues))
+
+    def test_a_fresh_row_under_60s_is_steered(self):
+        self.allow()
+        mid, _ = self.store.create("codex:sender", "codex:receiver", "fresh", delivery="steer")
+        with self.store.db() as db:
+            db.execute("UPDATE messages SET created=? WHERE id=?", (time.time() - 50, mid))
+        self.daemon.dispatch(mid)
+        self.assertEqual("steered", self.store.get(mid, "codex:sender")["status"])
+
+    # ---- A6 native 12: D6 rate cap, 1 per pair per 2 minutes ----
+    def test_a_second_steer_to_the_same_pair_inside_two_minutes_is_rate_limited_and_queued(self):
+        self.allow()
+        first = self.steer_send("one")
+        second = self.steer_send("two")
+        self.assertEqual("steered", first["status"])
+        self.assertEqual(("queued", "rate_limited"), (second["status"], second["steer"]["outcome"]))
+        self.assertEqual(1, len(self.steers))
+        self.assertEqual(1, len(self.queues))
+
+    def test_the_rate_cap_is_per_pair_and_expires_after_120s(self):
+        self.allow()
+        self.allow("codex:third")
+        first = self.steer_send("one")
+        other_pair = self.steer_send("two", to="codex:third")
+        self.assertEqual("steered", other_pair["status"], "a different recipient is a different pair")
+        other_sender = self.steer_send("three", daemon=self.make_daemon("codex:friend"))
+        self.assertEqual("steered", other_sender["status"], "a different sender is a different pair")
+        with self.store.db() as db:
+            db.execute("UPDATE events SET at=at-121 WHERE id=?", (first["id"],))
+        self.assertEqual("steered", self.steer_send("four")["status"])
+
+    def test_a_skipped_steer_does_not_spend_the_rate_budget(self):
+        self.allow()
+        self.steer_result = skipped("idle")
+        self.assertEqual("idle", self.steer_send("one")["steer"]["outcome"])
+        self.steer_result = dict(STEERED)
+        self.assertEqual("steered", self.steer_send("two")["status"])
+
+    def test_an_ambiguous_steer_spends_the_rate_budget(self):
+        self.allow()
+        self.steer_result = dict(AMBIGUOUS)
+        self.steer_send("one")
+        self.steer_result = dict(STEERED)
+        self.assertEqual("rate_limited", self.steer_send("two")["steer"]["outcome"])
+
+    def test_check_order_is_policy_then_age_then_rate(self):
+        self.steer_send("one")
+        self.assertEqual("declined", self.steer_send("two")["steer"]["outcome"], "policy first")
+
+    # ---- A6 native 13: receipts never steer ----
+    def test_a_receipt_to_a_steering_sender_always_uses_queue_delivery(self):
+        self.allow()
+        self.allow("codex:sender")
+        mid = self.steer_send()["id"]
+        recipient = self.make_daemon("codex:receiver")
+        self.steers.clear(), self.queues.clear()
+        recipient.handle({"actor": "codex:receiver", "action": "ack", "id": mid})
+        self.assertEqual([], self.steers, "a receipt never steers")
+        self.assertEqual(1, len(self.queues))
+        self.assertTrue(self.queues[0][1].startswith(bridge.RECEIPT_PREFIX))
+        self.assertNotIn("delivery=steer", self.queues[0][1])
+
+    # ---- A6 native 14, 15: inbox ----
+    def test_steered_shows_only_in_history_and_never_in_actionable_or_stranded(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        ids = lambda view: [m["id"] for m in self.store.inbox("codex:receiver", view)["messages"]]
+        self.assertEqual([mid], ids("history"))
+        self.assertEqual([], ids("actionable"))
+        self.assertEqual([], ids("stranded"))
+
+    # ---- admission: steered is accepted, lost is not ----
+    def test_a_steered_message_can_be_acked_and_replied_to(self):
+        self.allow()
+        self.allow("codex:sender")
+        mid = self.steer_send()["id"]
+        recipient = self.make_daemon("codex:receiver")
+        result = recipient.handle({"actor": "codex:receiver", "action": "ack", "id": mid})
+        self.assertTrue(result["handled"])
+        self.assertEqual("not_applicable", result["native_retirement"]["outcome"])
+
+    # ---- delivery confirmation through the P1 helper ----
+    def test_confirmed_steer_records_one_audit_event_and_keeps_status(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        self.confirm_result = {"outcome": "confirmed"}
+        self.assertEqual("confirmed", self.daemon.confirm_steer(mid)["outcome"])
+        self.daemon.confirm_steer(mid)
+        row = self.store.get(mid, "codex:sender")
+        self.assertEqual("steered", row["status"])
+        self.assertEqual(1, [e["kind"] for e in row["events"]].count("steer-confirmed"))
+        self.assertEqual(("receiver", mid, "turn-1"), self.confirms[0])
+        self.assertEqual(1, len(self.confirms), "a confirmed steer is never re-read")
+
+    def test_dispatch_checks_the_steered_row_once_straight_away(self):
+        self.allow()
+        self.steer_send()
+        self.assertEqual(1, len(self.confirms))
+
+    def test_pending_and_unknown_confirmations_change_nothing_and_can_be_retried(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending", "reason": "running"}
+        mid = self.steer_send()["id"]
+        for outcome in ("pending", "unknown"):
+            self.confirm_result = {"outcome": outcome, "reason": "x"}
+            self.assertEqual(outcome, self.daemon.confirm_steer(mid)["outcome"])
+            self.assertEqual("steered", self.store.get(mid, "codex:sender")["status"])
+        self.confirm_result = {"outcome": "confirmed"}
+        self.assertEqual("confirmed", self.daemon.confirm_steer(mid)["outcome"])
+
+    def test_an_accepted_steer_that_never_appears_in_history_becomes_lost_and_is_never_requeued(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        self.confirm_result = {"outcome": "lost", "reason": "steered turn ended without the steered message in its history"}
+        result = self.daemon.confirm_steer(mid)
+        self.assertEqual("lost", result["outcome"])
+        row = self.store.get(mid, "codex:sender")
+        self.assertEqual("lost", row["status"])
+        self.assertEqual("lost", row["steer"]["outcome"])
+        self.assertIn("not requeued", row["steer"]["reason"])
+        self.assertEqual([], self.queues, "lost is surfaced to the sender, never auto-requeued")
+        self.daemon.confirm_steer(mid)
+        self.daemon.dispatch(mid)
+        self.assertEqual([], self.queues)
+        self.assertEqual(1, len(self.steers))
+
+    def test_a_lost_steer_cannot_be_acked_and_its_body_is_withheld_in_stranded(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        self.confirm_result = {"outcome": "lost", "reason": "x"}
+        self.daemon.confirm_steer(mid)
+        recipient = self.make_daemon("codex:receiver")
+        with self.assertRaisesRegex(ValueError, "not admitted|has not admitted"):
+            recipient.handle({"actor": "codex:receiver", "action": "ack", "id": mid})
+        rows = self.store.inbox("codex:receiver", "stranded")["messages"]
+        self.assertEqual([mid], [m["id"] for m in rows])
+        self.assertEqual(bridge.WITHHELD, rows[0]["body"])
+
+    def test_lost_row_has_nothing_to_retire(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        self.confirm_result = {"outcome": "lost", "reason": "x"}
+        self.daemon.confirm_steer(mid)
+        recipient = self.make_daemon("codex:receiver")
+        recipient.retire_queue = lambda *args: self.fail("retire for a lost steer")
+        with self.store.db() as db:
+            db.execute("UPDATE messages SET status='steered' WHERE id=?", (mid,))  # a handled-first race: still no queue item
+        self.assertEqual("not_applicable", recipient.retire_native(mid)["outcome"])
+
+    def test_confirm_only_applies_to_a_steered_row(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        queued = self.daemon.send("codex:receiver", "plain")["id"]
+        self.assertEqual("not_steered", self.daemon.confirm_steer(queued)["outcome"])
+        self.assertEqual(1, len(self.confirms))
+        self.assertTrue(mid)
+
+    def test_confirm_never_runs_for_a_row_this_daemon_did_not_send(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        stranger = self.make_daemon("codex:receiver")
+        self.assertEqual("not_steered", stranger.confirm_steer(mid)["outcome"])
+
+    def test_confirm_steer_action_goes_through_handle_for_the_sender_only(self):
+        self.allow()
+        mid = self.steer_send()["id"]
+        data = self.daemon.handle({"actor": "codex:sender", "action": "confirm_steer", "id": mid})
+        self.assertEqual("confirmed", data["outcome"])
+
+    def test_pending_confirmation_sweep_checks_recent_unconfirmed_steered_rows_only(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending"}
+        mid = self.steer_send()["id"]
+        self.confirms.clear()
+        self.confirm_result = {"outcome": "confirmed"}
+        self.assertEqual(1, self.daemon.confirm_pending())
+        self.assertEqual(0, self.daemon.confirm_pending(), "confirmed rows leave the sweep")
+        with self.store.db() as db:
+            db.execute("DELETE FROM events WHERE kind='steer-confirmed'")
+            db.execute("UPDATE messages SET created=? WHERE id=?", (time.time() - 3600, mid))
+        self.assertEqual(0, self.daemon.confirm_pending(), "old rows are no longer chased")
+
+    # ---- the adapter's forbidden calls are never made by the daemon either ----
+    def test_the_steer_path_calls_only_steer_confirm_and_enqueue(self):
+        self.allow()
+        for name in ("resume", "reconcile", "retire", "thread_facts"):
+            patcher = patch.object(bridge_codex, name, side_effect=AssertionError(name))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.steer_send()
+        self.steer_send("two")
+
+    # ---- status --reconcile never queue-looks-up a steer attempt ----
+    def reconcile_cli(self, mid, who="codex:sender"):
+        out = io.StringIO()
+        with patch.object(bridge, "own_actor", return_value=who), \
+             patch.object(bridge_codex, "reconcile", side_effect=AssertionError("queue lookup for a steer row")) as lookup, \
+             patch.object(sys, "stdout", out):
+            code = bridge.main(["--root", str(self.store.root), "status", mid, "--reconcile"])
+        return code, json.loads(out.getvalue()), lookup
+
+    def test_status_reconcile_on_an_ambiguous_steer_never_queue_looks_up_or_replays(self):
+        self.allow()
+        self.steer_result = dict(AMBIGUOUS)
+        mid = self.steer_send()["id"]
+        code, out, lookup = self.reconcile_cli(mid)
+        self.assertEqual(0, code)
+        self.assertIn("never replay", out["reconciliation"]["reason"])
+        self.assertEqual("ambiguous", out["status"])
+        lookup.assert_not_called()
+
+
+class SteerMigrationTests(unittest.TestCase):
+    """The ledger must open and keep working on a ledger.sqlite3 written by an older release. Temp copies only."""
+
+    OLD = """
+    CREATE TABLE endpoints (actor TEXT PRIMARY KEY, pid INTEGER, started TEXT, socket TEXT, native_socket TEXT, name TEXT, cwd TEXT);
+    CREATE TABLE messages (id TEXT PRIMARY KEY, sender TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, reply_to TEXT,
+      created REAL NOT NULL, status TEXT NOT NULL, detail TEXT, received REAL, replied TEXT);
+    CREATE TABLE events (seq INTEGER PRIMARY KEY, id TEXT NOT NULL, at REAL NOT NULL, kind TEXT NOT NULL, detail TEXT);
+    CREATE TABLE receipt_attempts (original TEXT PRIMARY KEY, id TEXT NOT NULL, recipient TEXT NOT NULL, body TEXT NOT NULL, status TEXT NOT NULL, detail TEXT);
+    CREATE TABLE endpoint_protocol (actor TEXT NOT NULL, pid INTEGER NOT NULL, started TEXT NOT NULL, protocol INTEGER NOT NULL, capabilities TEXT NOT NULL, PRIMARY KEY(actor,pid,started));
+    CREATE TABLE ownership (actor TEXT NOT NULL,pid INTEGER NOT NULL,started TEXT NOT NULL, resources TEXT NOT NULL, PRIMARY KEY(actor,pid,started));
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name) / "ledger"
+        self.root.mkdir(mode=0o700)
+        self.ids = [str(uuid.uuid4()) for _ in range(3)]
+        db = __import__("sqlite3").connect(str(self.root / "ledger.sqlite3"))
+        db.executescript(self.OLD)
+        for n, (mid, status) in enumerate(zip(self.ids, ("queued", "ambiguous", "failed"))):
+            db.execute("INSERT INTO messages(id,sender,recipient,body,created,status,detail) VALUES (?,?,?,?,?,?,?)",
+                       (mid, "claude:a", "codex:b", "old body %d" % n, 1000.0 + n, status, json.dumps({"queued_submission_id": "q%d" % n})))
+            db.execute("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)", (mid, 1000.0 + n, status, json.dumps({"queued_submission_id": "q%d" % n})))
+        db.commit()
+        db.close()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def columns(self, store, table):
+        with store.db() as db:
+            return {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+
+    def test_old_ledger_gains_the_delivery_column_and_policy_table_and_keeps_every_row(self):
+        store = bridge.Store(self.root)
+        self.assertIn("delivery", self.columns(store, "messages"))
+        self.assertEqual({"actor", "steer", "steer_from", "updated"}, self.columns(store, "endpoint_policy"))
+        with store.db() as db:
+            rows = {r["id"]: dict(r) for r in db.execute("SELECT * FROM messages")}
+        self.assertEqual(3, len(rows))
+        self.assertEqual(["queued", "ambiguous", "failed"], [rows[m]["status"] for m in self.ids])
+        self.assertEqual("old body 0", rows[self.ids[0]]["body"])
+        self.assertTrue(all(r["delivery"] is None for r in rows.values()), "old rows are not rewritten")
+
+    def test_old_rows_read_as_queue_delivery_and_old_queue_identity_still_resolves(self):
+        store = bridge.Store(self.root)
+        row = store.get(self.ids[0], "codex:b")
+        self.assertEqual("queue", row["delivery"])
+        self.assertIsNone(row["steer"] if row.get("steer") is None else None)
+        self.assertEqual("q0", store.queued_identity(self.ids[0]))
+        self.assertEqual(self.ids[0], [m["id"] for m in store.inbox("codex:b", "history")["messages"]][0])
+
+    def test_migration_is_idempotent_and_a_second_open_changes_nothing(self):
+        bridge.Store(self.root)
+        store = bridge.Store(self.root)
+        self.assertEqual(1, [c for c in sorted(self.columns(store, "messages"))].count("delivery"))
+        with store.db() as db:
+            self.assertEqual(3, db.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+
+    def test_old_row_same_id_same_content_is_the_same_message_under_queue_delivery_only(self):
+        store = bridge.Store(self.root)
+        mid, fresh = store.create("claude:a", "codex:b", "old body 0", message_id=self.ids[0])
+        self.assertEqual((self.ids[0], False), (mid, fresh))
+        mid, fresh = store.create("claude:a", "codex:b", "old body 0", message_id=self.ids[0], delivery="queue")
+        self.assertFalse(fresh)
+        with self.assertRaisesRegex(ValueError, "different content"):
+            store.create("claude:a", "codex:b", "old body 0", message_id=self.ids[0], delivery="steer")
+
+    def test_old_rows_retire_and_sweep_exactly_as_before(self):
+        store = bridge.Store(self.root)
+        store.acknowledge(self.ids[0], "codex:b")
+        store.acknowledge(self.ids[1], "codex:b")
+        identified, anonymous = store.pending_retirements("codex:b")
+        self.assertCountEqual([self.ids[0], self.ids[1]], identified + anonymous)
+
+    def test_old_daemon_writes_without_the_delivery_column_still_work(self):
+        store = bridge.Store(self.root)
+        with store.db() as db:
+            db.execute("INSERT INTO messages(id,sender,recipient,body,reply_to,created,status,dispatcher,kind,envelope) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (str(uuid.uuid4()), "codex:x", "codex:y", "from an old daemon", None, 5.0, "persisted", "codex:x", "message", None))
+            db.execute("INSERT OR REPLACE INTO endpoints VALUES (?,?,?,?,?,?,?)", ("codex:x", 1, "s", "/a", "/b", "n", "/c"))
+        self.assertEqual(7, len(self.columns(store, "endpoints")))
+
+    def test_a_steered_status_row_in_the_migrated_ledger_is_history_only(self):
+        store = bridge.Store(self.root)
+        mid, _ = store.create("codex:s", "codex:b", "new", delivery="steer")
+        store.event(mid, "steered", {"turn_id": "t"})
+        self.assertEqual("steered", store.get(mid, "codex:b")["status"])
+        self.assertNotIn(mid, [m["id"] for m in store.inbox("codex:b", "actionable")["messages"]])
+        self.assertNotIn(mid, [m["id"] for m in store.inbox("codex:b", "stranded")["messages"]])
+        self.assertIn(mid, [m["id"] for m in store.inbox("codex:b", "history")["messages"]])
+
+    def test_the_real_live_ledger_is_never_opened_by_these_tests(self):
+        self.assertTrue(str(self.root).startswith(self.temp.name))
+        self.assertNotIn("native-bridge", str(self.root))
 
 
 if __name__ == "__main__":
