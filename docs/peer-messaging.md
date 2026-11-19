@@ -55,7 +55,9 @@ screen.
   peer. The pane is matched by pane id and process ancestry, so a tmux session
   renamed after launch still resolves. Neither session records nor peer registry
   fields (`external_identity.session_id`, `provider_task_id`) are trusted, so a
-  stale record can neither misroute nor block mail. Exactly one peer is
+  stale record can neither misroute nor block mail. A Claude outside tmux (an
+  external identity, no pane-bound process) is therefore never routed to the
+  mailbox; use `--urgent` for it. Exactly one peer is
   required; a session that is not live anywhere is refused as `not-live`. Zero or two is refused (exit 1, error code
   `mailbox-route-refused`, the message names `--urgent`); cctrl never guesses a
   peer. A refused send writes nothing: no mailbox item and no ledger row.

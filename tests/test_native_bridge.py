@@ -1036,6 +1036,29 @@ class CliProcessTests(unittest.TestCase):
         rc, out = self.by_session(conv)
         self.assertEqual((66, "ambiguous-backing-peer"), (rc, out["error"]["code"]), out)
 
+    def test_by_session_renamed_session_refuses_when_two_panes_with_that_id_both_hold_the_pid(self):
+        conv = str(uuid.uuid4())
+        self.fake_pane("TMUX--renamed4", conv, claim="TMUX--before-rename4")
+        panes = self.root / "panes.tsv"
+        pane = panes.read_text().split()[1]
+        real = panes.read_text()
+        # same pane id on another server, listed first; the pid descends from its process too
+        panes.write_text(f"TMUX--other-server\t{pane}\t{os.getpid()}\n" + real)
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+
+    def test_send_refuses_two_live_panes_for_one_conversation_naming_urgent_and_writes_nothing(self):
+        conv = str(uuid.uuid4())
+        self.fake_pane("TMUX--send-a", conv)
+        self.fake_pane("TMUX--send-b", conv)
+        proc = self.raw("send", "claude:" + conv, "--json", "--", "hello")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        message = json.loads(proc.stdout)["error"]["message"]
+        self.assertIn("ambiguous", message.lower())
+        self.assertIn("--urgent", message)
+        self.assertEqual([], self.mailbox_messages())
+        self.assertEqual(0, self.ledger_count())
+
     def test_by_session_refuses_a_peers_json_identity_with_no_live_process(self):
         sid, _ = self.claude_backing_peer()  # registers external_identity.session_id, no process
         rc, out = self.by_session(sid)

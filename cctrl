@@ -8535,22 +8535,20 @@ _peer_cmd_by_session() {
     # peers.json (external_identity.session_id, provider_task_id) is a record,
     # not proof of life, so it is never a candidate source: a dead or stale id
     # must not route. Only the live process below counts.
-    local candidates=""
     # Live process, not record status (session records can stay "active" for
     # sessions that died): X counts only as a live Claude process (a
     # ~/.claude/sessions file with a live pid and matching procStart) bound to a
     # tmux pane, and the peer is the one registered for that pane's session.
     # Reuses _peer_record_for_pid (the plan 111 resolver); nothing is sniffed twice.
-    local sf spid live_candidates=""
+    local sf spid candidates=""
     for sf in "$CLAUDE_SESSIONS_DIR"/*.json; do
         [[ -f "$sf" && ! -L "$sf" ]] || continue
         [[ "$(jq -r '.sessionId // ""' "$sf" 2>/dev/null)" == "$sid" ]] || continue
         spid="${sf##*/}"; spid="${spid%.json}"
         _peer_record_for_pid "$spid" --follow-rename || continue
         [[ "$PEER_REC_ALIVE" == true && "$PEER_REC_PROC_START_MATCH" == true && "$PEER_REC_TMUX_BOUND" == true ]] || continue
-        live_candidates+="$PEER_REC_PEER_NAME"$'\n'
+        candidates+="$PEER_REC_PEER_NAME"$'\n'
     done
-    candidates="$live_candidates"
     local -a names=()
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
