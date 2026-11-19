@@ -168,9 +168,19 @@ def _outcome(response):
     except Exception:
         return "unknown"
     text = text.lower()
+    # A structured response that says it failed is never "sent", even though
+    # the key name "success" contains a sent-word. Sort it into refused or error.
+    if isinstance(response, dict) and (response.get("success") is False or response.get("ok") is False
+                                       or response.get("error") or response.get("is_error") is True):
+        for outcome, words in (("held", ("held", "awaiting approval", "pending approval", "requires approval")),
+                               ("refused", ("refused", "denied", "rejected", "not allowed", "blocked", "need full name")),
+                               ("offline", ("offline", "not connected", "no such", "not found", "unreachable"))):
+            if any(word in text for word in words):
+                return outcome
+        return "error"
     for outcome, words in (
         ("held", ("held", "awaiting approval", "pending approval", "requires approval")),
-        ("refused", ("refused", "denied", "rejected", "not allowed", "blocked")),
+        ("refused", ("refused", "denied", "rejected", "not allowed", "blocked", "need full name")),
         ("offline", ("offline", "not connected", "no such", "not found", "unreachable")),
         ("error", ("error", "failed", "failure")),
         ("sent", ("sent", "delivered", "success", "queued")),
