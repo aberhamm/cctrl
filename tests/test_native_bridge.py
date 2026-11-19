@@ -2245,6 +2245,35 @@ class SteerDaemonTests(unittest.TestCase):
         self.daemon.confirm_pending()
         self.assertNotIn("steer-unconfirmed", [e["kind"] for e in self.store.get(fresh, "codex:sender")["events"]])
 
+    def test_confirm_tick_stays_cheap_on_a_ledger_with_many_old_steered_rows(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending"}
+        self.steer_send()
+        old = time.time() - 400 * 86400
+        with self.store.db() as db:
+            db.executemany(
+                "INSERT INTO messages(id,sender,recipient,body,created,status,dispatcher,delivery) VALUES (?,?,?,?,?,?,?,?)",
+                [(f"old-{i}", "codex:sender", "codex:receiver", "x", old + i, "steered", "codex:sender", "steer") for i in range(1500)])
+            db.executemany("INSERT INTO events(id,at,kind,detail) VALUES (?,?,?,?)",
+                           [(f"old-{i % 1500}", old, "noise-%d" % (i % 7), None) for i in range(40000)])
+            plan = " ".join(str(r[3]) for r in db.execute(
+                "EXPLAIN QUERY PLAN SELECT 1 FROM events e WHERE e.id=? AND e.kind='steer-confirmed'", ("old-1",)))
+            names = {r[1] for r in db.execute("PRAGMA index_list(events)")}
+        self.assertIn("events_id_kind", names)
+        self.assertIn("events_id_kind", plan)
+        start = time.monotonic()
+        self.daemon.confirm_pending()
+        self.assertLess(time.monotonic() - start, 0.5)
+
+    def test_events_index_is_added_to_an_existing_ledger(self):
+        root = Path(tempfile.mkdtemp())
+        store = bridge.Store(root / "ledger")
+        with store.db() as db:
+            db.execute("DROP INDEX IF EXISTS events_id_kind")
+        again = bridge.Store(root / "ledger")
+        with again.db() as db:
+            self.assertIn("events_id_kind", {r[1] for r in db.execute("PRAGMA index_list(events)")})
+
     def test_pending_confirmation_backs_off_5_10_20_40_then_caps_at_60(self):
         self.allow()
         self.confirm_result = {"outcome": "pending"}
