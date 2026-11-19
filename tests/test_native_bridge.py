@@ -2332,7 +2332,9 @@ class SteerDaemonTests(unittest.TestCase):
         self.assertTrue(any("SEARCH m" in line and "messages_confirm" in line for line in plan), plan)
 
     def test_messages_index_is_added_to_an_existing_ledger(self):
-        root = Path(tempfile.mkdtemp())
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
         store = bridge.Store(root / "ledger")
         with store.db() as db:
             db.execute("DROP INDEX IF EXISTS messages_confirm")
@@ -2341,7 +2343,9 @@ class SteerDaemonTests(unittest.TestCase):
             self.assertIn("messages_confirm", {r[1] for r in db.execute("PRAGMA index_list(messages)")})
 
     def test_events_index_is_added_to_an_existing_ledger(self):
-        root = Path(tempfile.mkdtemp())
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
         store = bridge.Store(root / "ledger")
         with store.db() as db:
             db.execute("DROP INDEX IF EXISTS events_id_kind")

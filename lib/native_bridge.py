@@ -200,7 +200,7 @@ def route_to_mailbox(store, who, recipient, body, mid=None):
             if not store.claim_retry(mid):
                 raise RouteRefused(f"message {mid} is already being retried by another send; nothing was written by this call. Wait for it, then check the status.")
         elif row["status"] != "mailbox":
-            raise RouteRefused(f"message {mid} was routed but its mailbox write is unconfirmed (a timeout or crash left it in routing); check cctrl peer outbox for this id before resending. Or resend with --urgent under a new id.")
+            raise RouteRefused(f"message {mid} is in routing: another send may be retrying it right now, or a timeout or crash left its mailbox write unconfirmed; check cctrl peer outbox for this id before resending. Or resend with --urgent under a new id.")
     if fresh or store.get(mid, who)["status"] == "routing":
         try:
             sent = mailbox_send(peer, body)

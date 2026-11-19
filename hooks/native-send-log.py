@@ -173,14 +173,14 @@ def _outcome(response):
     if isinstance(response, dict) and (response.get("success") is False or response.get("ok") is False
                                        or response.get("error") or response.get("is_error") is True):
         for outcome, words in (("held", ("held", "awaiting approval", "pending approval", "requires approval")),
-                               ("refused", ("refused", "denied", "rejected", "not allowed", "blocked", "need full name")),
+                               ("refused", ("refused", "denied", "rejected", "not allowed", "blocked", "need full name", "no agent")),
                                ("offline", ("offline", "not connected", "no such", "not found", "unreachable"))):
             if any(word in text for word in words):
                 return outcome
         return "error"
     for outcome, words in (
         ("held", ("held", "awaiting approval", "pending approval", "requires approval")),
-        ("refused", ("refused", "denied", "rejected", "not allowed", "blocked", "need full name")),
+        ("refused", ("refused", "denied", "rejected", "not allowed", "blocked", "need full name", "no agent")),
         ("offline", ("offline", "not connected", "no such", "not found", "unreachable")),
         ("error", ("error", "failed", "failure")),
         ("sent", ("sent", "delivered", "success", "queued")),
