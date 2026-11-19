@@ -30,9 +30,13 @@ LIMIT = 1024 * 1024
 RECEIPT_PREFIX = "[cctrl-bridge receipt "
 # Statuses meaning the native provider owns delivery (or may yet deliver): the
 # message must never also be actionable in the default inbox.
-NATIVE_OWNED = ("persisted", "submitting", "submitted", "queued", "held", "released", "ambiguous")
+# `steered` means the provider accepted the text into the recipient's running turn
+# (not that the recipient handled it).
+NATIVE_OWNED = ("persisted", "submitting", "submitted", "queued", "held", "released", "ambiguous", "steered")
 # Policy outcomes that are not authorized work either.
-NOT_WORK = ("refused", "denied", "expired", "dropped")
+# `lost`: an accepted steer that never appeared in the turn history. It is surfaced
+# to the sender and never requeued automatically.
+NOT_WORK = ("refused", "denied", "expired", "dropped", "lost")
 VIEWS = ("actionable", "stranded", "history")
 
 # Daemon protocol. A daemon outlives the CLI that started it, so after an upgrade
@@ -40,9 +44,9 @@ VIEWS = ("actionable", "stranded", "history")
 # check wrote no protocol record (treated as protocol 1: no native-queue
 # retirement, no sender envelope). Bump DAEMON_PROTOCOL when a CLI-visible daemon
 # behavior is added; MIN_DAEMON_PROTOCOL is what the CLI needs to act safely.
-DAEMON_PROTOCOL = 3
+DAEMON_PROTOCOL = 4
 MIN_DAEMON_PROTOCOL = 2
-DAEMON_CAPABILITIES = ("native_retirement", "reply_acks_original", "sender_envelope", "admission_gate", "retire_handled")
+DAEMON_CAPABILITIES = ("native_retirement", "reply_acks_original", "sender_envelope", "admission_gate", "retire_handled", "steer")
 MIGRATION_DOC = "docs/bridge-daemon-migration.md"
 # An outdated daemon allows only stop, list, status and inbox. Every action that
 # goes through the daemon (send, ack, reply) is refused: ack/reply would drop the
@@ -52,10 +56,25 @@ REQUIRED_CAPABILITIES = {
     "ack": ("native_retirement",),
     "retire": ("native_retirement", "retire_handled"),
     "reply": ("native_retirement", "reply_acks_original", "sender_envelope"),
+    "send_steer": ("steer",),
 }
-# `retire` is an optional sweep: a daemon lacking it is not "outdated" for send/ack/reply.
-ALL_REQUIRED = tuple(dict.fromkeys(c for a, caps in REQUIRED_CAPABILITIES.items() if a != "retire" for c in caps))
+# `retire` (the sweep) and `send_steer` (a `--steer` send) are optional actions: a
+# daemon lacking them is not "outdated" for send/ack/reply.
+OPTIONAL_ACTIONS = ("retire", "send_steer")
+ALL_REQUIRED = tuple(dict.fromkeys(c for a, caps in REQUIRED_CAPABILITIES.items() if a not in OPTIONAL_ACTIONS for c in caps))
+OPTIONAL_REFUSAL = {"retire": "nothing was retired", "send_steer": "nothing was sent"}
 
+# Steer admission (D4-D6). A steer is only attempted for a fresh row, for an opted-in
+# recipient, and at most once per sender/recipient pair per window.
+STEER_MAX_AGE = 60.0
+STEER_RATE_WINDOW = 120.0
+CONFIRM_WINDOW = 600.0
+DELIVERIES = ("queue", "steer")
+STEER_REASONS = {
+    "declined": "recipient has not opted in to steering (or this sender is not on its allow list); queued instead",
+    "stale": "the message was not dispatched within 60 seconds of being written; queued instead",
+    "rate_limited": "at most one steer per sender and recipient every 2 minutes; queued instead",
+}
 
 # Exit code of `bridge retire` when the run finished but some rows errored (1 stays "refused / failed").
 RETIRE_PARTIAL_EXIT = 3
@@ -355,6 +374,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS ownership (
               actor TEXT NOT NULL,pid INTEGER NOT NULL,started TEXT NOT NULL,
               resources TEXT NOT NULL, PRIMARY KEY(actor,pid,started));
+            CREATE TABLE IF NOT EXISTS endpoint_policy (
+              actor TEXT PRIMARY KEY, steer TEXT NOT NULL DEFAULT 'off',
+              steer_from TEXT, updated REAL);
             """)
             if "dispatcher" not in {r[1] for r in db.execute("PRAGMA table_info(messages)")}:
                 db.execute("ALTER TABLE messages ADD COLUMN dispatcher TEXT")
@@ -364,6 +386,9 @@ class Store:
                 db.execute("ALTER TABLE messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'message'")
             if "envelope" not in columns:
                 db.execute("ALTER TABLE messages ADD COLUMN envelope TEXT")
+            if "delivery" not in columns:
+                # NULL is read as 'queue', so rows written before steering are untouched.
+                db.execute("ALTER TABLE messages ADD COLUMN delivery TEXT")
         os.chmod(path, 0o600)
 
     @contextlib.contextmanager
@@ -442,8 +467,51 @@ class Store:
             if unresolved:
                 raise ValueError("exited bridge cleanup failed; ownership manifest retained in ledger")
 
-    def create(self, sender, recipient, body, reply_to=None, message_id=None, dispatcher=None, initial_status="persisted", envelope=None, kind="message"):
-        if initial_status not in {"persisted", "refused", "routing"} or kind not in {"message", "routed"}:
+    def policy(self, who):
+        """The actor's own steer opt-in. No row means off; an empty allow list means any sender."""
+        with self.db() as db:
+            row = db.execute("SELECT steer,steer_from FROM endpoint_policy WHERE actor=?", (who,)).fetchone()
+        if not row or row["steer"] != "allow":
+            return {"steer": "off", "steer_from": list(json.loads(row["steer_from"] or "[]")) if row else []}
+        return {"steer": "allow", "steer_from": list(json.loads(row["steer_from"] or "[]"))}
+
+    def set_policy(self, who, steer, steer_from=None):
+        if steer not in {"allow", "off"}:
+            raise ValueError("steer policy must be allow or off")
+        senders = sorted({str(a) for a in (steer_from or [])})
+        with self.db() as db:
+            db.execute("INSERT OR REPLACE INTO endpoint_policy(actor,steer,steer_from,updated) VALUES (?,?,?,?)",
+                       (who, steer, json.dumps(senders), time.time()))
+
+    def steer_attempts(self, sender, recipient, since, exclude=None):
+        """Steers this pair actually tried recently and that were not skipped (they spend the D6 budget)."""
+        with self.db() as db:
+            return db.execute(
+                "SELECT COUNT(*) FROM messages m WHERE m.sender=? AND m.recipient=? AND m.delivery='steer' AND m.id IS NOT ? "
+                "AND m.status IN ('steered','ambiguous','lost') "
+                "AND EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steering' AND e.at>?) "
+                "AND NOT EXISTS (SELECT 1 FROM events q WHERE q.id=m.id AND q.kind='queueing')",
+                (sender, recipient, exclude, since)).fetchone()[0]
+
+    def steer_only(self, mid):
+        """True when a steer was attempted and nothing was ever queued for this row."""
+        with self.db() as db:
+            return bool(db.execute(
+                "SELECT 1 FROM events e WHERE e.id=? AND e.kind='steering' AND NOT EXISTS "
+                "(SELECT 1 FROM events q WHERE q.id=e.id AND q.kind='queueing')", (mid,)).fetchone())
+
+    def steered_turn(self, mid):
+        """Turn the provider accepted the steer into, from the steered event."""
+        with self.db() as db:
+            row = db.execute("SELECT detail FROM events WHERE id=? AND kind='steered' ORDER BY seq DESC", (mid,)).fetchone()
+        try:
+            value = json.loads(row[0] or "null") if row else None
+        except ValueError:
+            return None
+        return value.get("turn_id") if isinstance(value, dict) and isinstance(value.get("turn_id"), str) else None
+
+    def create(self, sender, recipient, body, reply_to=None, message_id=None, dispatcher=None, initial_status="persisted", envelope=None, kind="message", delivery="queue"):
+        if initial_status not in {"persisted", "refused", "routing"} or kind not in {"message", "routed"} or delivery not in DELIVERIES:
             raise ValueError("invalid initial bridge status")
         if not isinstance(body, str) or not body or len(body.encode()) > LIMIT // 2:
             raise ValueError("body must be nonempty UTF-8 text of at most 512 KiB")
@@ -455,13 +523,13 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
             if old:
-                if (old["sender"], old["recipient"], old["body"], old["reply_to"]) != (sender, recipient, body, reply_to):
+                if (old["sender"], old["recipient"], old["body"], old["reply_to"], old["delivery"] or "queue") != (sender, recipient, body, reply_to, delivery):
                     raise ValueError("message ID already belongs to different content")
                 return mid, False
             now = time.time()
-            db.execute("INSERT INTO messages(id,sender,recipient,body,reply_to,created,status,dispatcher,kind,envelope,received) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO messages(id,sender,recipient,body,reply_to,created,status,dispatcher,kind,envelope,received,delivery) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                        (mid, sender, recipient, body, reply_to, now, "receipt" if receipt else initial_status, dispatcher or sender,
-                        "receipt" if receipt else kind, json.dumps(envelope) if envelope else None, now if receipt else None))
+                        "receipt" if receipt else kind, json.dumps(envelope) if envelope else None, now if receipt else None, delivery))
             db.execute("INSERT INTO events(id,at,kind) VALUES (?,?,?)", (mid, now, "receipt" if receipt else initial_status))
         return mid, True
 
@@ -503,7 +571,10 @@ class Store:
                 "SELECT m.id FROM messages m WHERE m.recipient=? AND m.kind='message' "
                 "AND (m.received IS NOT NULL OR m.replied IS NOT NULL) AND m.status IN ('queued','ambiguous') "
                 "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='native-retire' "
-                f"AND json_extract(e.detail,'$.outcome') IN ({final})) ORDER BY m.created",
+                f"AND json_extract(e.detail,'$.outcome') IN ({final})) "
+                # A steer attempt that never queued has no queue item to retire or to report.
+                "AND NOT (EXISTS (SELECT 1 FROM events s WHERE s.id=m.id AND s.kind='steering') "
+                "AND NOT EXISTS (SELECT 1 FROM events q WHERE q.id=m.id AND q.kind='queueing')) ORDER BY m.created",
                 (who, *sorted(RETIRED_FINAL))).fetchall()
         identified, anonymous = [], []
         for (mid,) in rows:
@@ -533,7 +604,7 @@ class Store:
             if not kind.startswith("receipt-") and kind not in {"received", "replied"}:
                 current = db.execute("SELECT status FROM messages WHERE id=?", (mid,)).fetchone()[0]
                 policy = {"held", "denied", "expired", "released", "refused", "dropped"}
-                if not (kind in {"submitted", "queued", "failed", "ambiguous", "submitting"} and current in policy):
+                if not (kind in {"submitted", "queued", "failed", "ambiguous", "submitting", "steered"} and current in policy):
                     db.execute("UPDATE messages SET status=?,detail=? WHERE id=?", (kind, json.dumps(detail), mid))
 
     def get(self, mid, who):
@@ -546,6 +617,8 @@ class Store:
             receipt = db.execute("SELECT * FROM receipt_attempts WHERE original=?", (mid,)).fetchone()
             value["receipt_attempt"] = dict(receipt) if receipt else None
             value["envelope"] = json.loads(value["envelope"]) if value.get("envelope") else None
+            value["delivery"] = value.get("delivery") or "queue"
+            value["steer"] = steer_summary(value) if value["delivery"] == "steer" else None
             value["handled"] = value["received"] is not None
             value["late_native_delivery"] = any(e["kind"] == "late-native-delivery-after-handled" for e in value["events"])
             value["late_native_delivery_possible"] = any(e["kind"] == "late-native-delivery-possible" for e in value["events"])
@@ -615,10 +688,34 @@ def envelope_line(envelope):
             "; reported_source=" + show("reported_source") + "; host=" + show("host") + "\n")
 
 
-def wire_text(mid, sender, recipient, body, reply_to=None, envelope=None):
+def steer_summary(row):
+    """What happened to a steer request, from the row's own events: the sender's answer."""
+    outcome, reason = None, None
+    for event in row["events"]:
+        try:
+            detail = json.loads(event["detail"] or "null")
+        except ValueError:
+            detail = None
+        detail = detail if isinstance(detail, dict) else {}
+        if event["kind"] == "steer-skipped":
+            outcome, reason = detail.get("outcome"), detail.get("reason")
+        elif event["kind"] == "steered":
+            outcome, reason = "steered", None
+        elif event["kind"] == "lost":
+            outcome, reason = "lost", detail.get("reason")
+        elif event["kind"] == "ambiguous" and outcome is None:
+            outcome, reason = "ambiguous", detail.get("reason")
+    if row["status"] == "ambiguous" and outcome is None:
+        outcome = "ambiguous"
+    return {"requested": True, "outcome": outcome or "pending", "reason": reason}
+
+
+def wire_text(mid, sender, recipient, body, reply_to=None, envelope=None, delivery=None):
     header = f"[cctrl-bridge message={mid} from={sender} to={recipient}"
     if reply_to:
         header += f" reply_to={reply_to}"
+    if delivery == "steer":
+        header += " delivery=steer"
     return (header + "]\n" + envelope_line(envelope) + body + "\n\n"
             f"Receipt: cctrl bridge ack {mid} --json\n"
             f"Reply: cctrl bridge reply {mid} --json -- \"your reply\"\n"
@@ -718,24 +815,127 @@ class Daemon:
         status = result.get("status")
         return {"queued": "queued", "submitted": "submitted", "send-failed": "failed", "unknown": "ambiguous", "failed": "failed", "ambiguous": "ambiguous"}.get(status, "ambiguous")
 
-    def send(self, recipient, body, reply_to=None, mid=None, envelope=None):
+    def send(self, recipient, body, reply_to=None, mid=None, envelope=None, delivery=None):
         if isinstance(body, str) and body.startswith(RECEIPT_PREFIX):
             raise ValueError("receipt text is a control fact and cannot be sent as a message")
+        delivery = delivery or "queue"
+        if delivery not in DELIVERIES:
+            raise ValueError("delivery must be queue or steer")
         provider, session = recipient.split(":", 1)
         recipient = actor(provider, session)
+        if delivery == "steer" and provider != "codex":
+            raise ValueError("steer applies only to Codex recipients; nothing sent")
         if self.who.startswith("claude:") and provider == "claude":
             raise ValueError("use Claude ListAgents/SendMessage for Claude-to-Claude so native admission modes remain intact; nothing submitted")
         # Resolve Claude before persistence, so unavailable is definitively
         # not sent. A duplicate client id always returns its existing receipt.
-        mid, _ = self.store.create(self.who, recipient, body, reply_to, mid, envelope=envelope_from_request(envelope, self.who))
+        mid, _ = self.store.create(self.who, recipient, body, reply_to, mid, envelope=envelope_from_request(envelope, self.who), delivery=delivery)
         self.dispatch(mid)
         return self.store.get(mid, self.who)
 
     def dispatch(self, mid):
         if self.store.claim(mid, self.who):
             original = self.store.get(mid, self.who)
+            if original["delivery"] == "steer" and original["recipient"].startswith("codex:"):
+                self.dispatch_steer(original)
+                return
             result = self.deliver(original["recipient"], wire_text(mid, original["sender"], original["recipient"], original["body"], original["reply_to"], original["envelope"]), mid)
             self.store.event(mid, self.outcome(result), result)
+
+    def steer_refusal(self, original):
+        """Why this steer must not be attempted (queue instead), or None. Checked in order: policy, age, rate."""
+        policy = self.store.policy(original["recipient"])
+        if policy["steer"] != "allow" or (policy["steer_from"] and original["sender"] not in policy["steer_from"]):
+            return "declined"
+        now = time.time()
+        if now - original["created"] > STEER_MAX_AGE:
+            return "stale"
+        if self.store.steer_attempts(original["sender"], original["recipient"], now - STEER_RATE_WINDOW, exclude=original["id"]):
+            return "rate_limited"
+        return None
+
+    def dispatch_steer(self, original):
+        """Steer into the recipient's running turn, else queue. Never both.
+
+        A definitive skip queues exactly as a plain send. An ambiguous steer is
+        never retried and never queued: a late duplicate in the recipient's turn
+        is worse than an uncertain one the sender can see.
+        """
+        mid, recipient = original["id"], original["recipient"]
+        queue_text = wire_text(mid, original["sender"], recipient, original["body"], original["reply_to"], original["envelope"])
+
+        def queue(outcome, reason):
+            self.store.note(mid, "steer-skipped", {"outcome": outcome, "reason": reason})
+            self.store.note(mid, "queueing")
+            result = self.deliver(recipient, queue_text, mid)
+            self.store.event(mid, self.outcome(result), result)
+
+        refusal = self.steer_refusal(original)
+        if refusal:
+            return queue(refusal, STEER_REASONS[refusal])
+        from bridge_codex import steer
+        self.store.note(mid, "steering", {"method": "turn/steer"})
+        try:
+            result = steer(recipient.split(":", 1)[1],
+                           wire_text(mid, original["sender"], recipient, original["body"], original["reply_to"], original["envelope"], delivery="steer"), mid)
+        except Exception as exc:
+            result = {"status": "ambiguous", "classification": "ambiguous", "reason": f"steer raised: {exc}", "method": "turn/steer"}
+        status = result.get("status") if isinstance(result, dict) else None
+        if status == "steered":
+            self.store.event(mid, "steered", {"method": "turn/steer", "turn_id": result.get("turn_id"),
+                                              "expected_turn_id": result.get("expected_turn_id")})
+            self.confirm_steer(mid)
+        elif status == "skipped":
+            queue(result.get("outcome") or "unknown", result.get("reason") or STEER_REASONS.get("unknown", "queued instead"))
+        elif status == "failed":
+            # Definitive: nothing was written. The queue path reports its own failure.
+            queue("unknown", result.get("reason") or "steer unavailable; queued instead")
+        else:
+            self.store.event(mid, "ambiguous", {**(result if isinstance(result, dict) else {}), "method": "turn/steer"})
+
+    def confirm_steer(self, mid):
+        """Look for an accepted steer in the recipient's history (read-only).
+
+        confirmed: audit event once. lost: the provider accepted it and dropped
+        it, so the row becomes `lost` for the sender to see; it is never
+        requeued. pending/unknown change nothing and can be asked again.
+        """
+        try:
+            row = self.store.get(mid, self.who)
+        except ValueError:
+            return {"outcome": "not_steered", "reason": "unknown message"}
+        turn = self.store.steered_turn(mid)
+        if row["sender"] != self.who or row["delivery"] != "steer" or row["status"] not in {"steered", "lost"} or not turn:
+            return {"outcome": "not_steered", "reason": "this daemon has no accepted steer for that message"}
+        if row["status"] == "lost":
+            return {"outcome": "lost", "reason": row["steer"]["reason"]}
+        if any(e["kind"] == "steer-confirmed" for e in row["events"]):
+            return {"outcome": "confirmed"}
+        from bridge_codex import confirm_steer
+        try:
+            result = confirm_steer(row["recipient"].split(":", 1)[1], mid, turn)
+        except Exception as exc:
+            return {"outcome": "unknown", "reason": str(exc)}
+        outcome = result.get("outcome") if isinstance(result, dict) else None
+        if outcome == "confirmed":
+            self.store.note_once(mid, "steer-confirmed", {"turn_id": turn})
+        elif outcome == "lost":
+            self.store.event(mid, "lost", {"reason": (result.get("reason") or "accepted steer never appeared in the turn history") + "; the message was not requeued",
+                                            "turn_id": turn, "requeued": False})
+        else:
+            outcome = "pending" if outcome == "pending" else "unknown"
+        return {"outcome": outcome, "reason": result.get("reason") if isinstance(result, dict) else None}
+
+    def confirm_pending(self, limit=8):
+        """Re-check recent accepted steers this daemon sent that are not yet confirmed. Returns how many it checked."""
+        with self.store.db() as db:
+            ids = [r[0] for r in db.execute(
+                "SELECT m.id FROM messages m WHERE m.dispatcher=? AND m.delivery='steer' AND m.status='steered' AND m.created>? "
+                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steer-confirmed') ORDER BY m.created LIMIT ?",
+                (self.who, time.time() - CONFIRM_WINDOW, limit))]
+        for mid in ids:
+            self.confirm_steer(mid)
+        return len(ids)
 
     def notify_receipt(self, original):
         mid = original["id"]
@@ -784,8 +984,12 @@ class Daemon:
         if not original["recipient"].startswith("codex:"):
             outcome = {"outcome": "unsupported",
                        "reason": "native Claude input has no supported retraction; the message is recorded as handled so any late or held native delivery is flagged late_native_delivery"}
+        elif original["status"] == "steered":
+            outcome = {"outcome": "not_applicable", "reason": "steered into the active turn; no queue item"}
         elif original["status"] not in {"queued", "ambiguous"}:
             outcome = {"outcome": "not_applicable", "reason": "no native queue item was accepted for this message"}
+        elif self.store.steer_only(mid):
+            outcome = {"outcome": "not_applicable", "reason": "steer attempt; no queue item"}
         else:
             queued = self.store.queued_identity(mid)
             if not queued:
@@ -822,7 +1026,7 @@ class Daemon:
             raise ValueError("bridge endpoint belongs to a different session")
         action = request.get("action")
         if action == "send":
-            return self.send(request["to"], request["body"], mid=request.get("id"), envelope=request.get("envelope"))
+            return self.send(request["to"], request["body"], mid=request.get("id"), envelope=request.get("envelope"), delivery=request.get("delivery"))
         if action in {"ack", "reply"}:
             original = self.store.get(request["id"], self.who)
             if original["recipient"] != self.who:
@@ -835,7 +1039,7 @@ class Daemon:
             if problem:
                 raise ValueError(problem)
             if action == "reply":
-                value = self.send(original["sender"], request["body"], reply_to=original["id"], mid=request.get("reply_id"), envelope=request.get("envelope"))
+                value = self.send(original["sender"], request["body"], reply_to=original["id"], mid=request.get("reply_id"), envelope=request.get("envelope"), delivery=request.get("delivery"))
                 # A late `held` callback may have landed while sending: re-read
                 # the status and do not mark handled (retryable after release).
                 late_row = self.store.get(original["id"], self.who)
@@ -847,7 +1051,7 @@ class Daemon:
                                         f"Do not retry without --id {value['id']} (a plain retry sends a duplicate reply). "
                                         f"After native admission (release) run: bridge reply {original['id']} --id {value['id']} (deduplicated), or bridge ack {original['id']}.")}
                 # A failed/ambiguous reply is not proof of handling.
-                if value["status"] in {"queued", "submitted", "released"}:
+                if value["status"] in {"queued", "submitted", "released", "steered"}:
                     self.store.acknowledge(original["id"], self.who, value["id"])
                     value = {**self.store.get(value["id"], self.who),
                              "original": {"id": original["id"], "handled": True,
@@ -872,6 +1076,8 @@ class Daemon:
             if problem:
                 raise ValueError(problem)
             return {"id": original["id"], "native_retirement": self.retire_native(original["id"])}
+        if action == "confirm_steer":
+            return self.confirm_steer(request["id"])
         if action == "hello":
             return {"protocol": DAEMON_PROTOCOL, "capabilities": list(DAEMON_CAPABILITIES), "pid": os.getpid()}
         if action == "stop":
@@ -953,7 +1159,14 @@ class Daemon:
                     db.execute("INSERT OR REPLACE INTO endpoints VALUES (?,?,?,?,?,?,?)", (self.who, os.getpid(), started, str(self.control_path), str(self.native.socket_path), self.native.record.get("name"), self.cwd))
                 signal.signal(signal.SIGTERM, lambda *_: self.stopping.set())
                 signal.signal(signal.SIGINT, lambda *_: self.stopping.set())
+                last_confirm = 0.0
                 while not self.stopping.is_set():
+                    if time.time() - last_confirm >= 5:
+                        last_confirm = time.time()
+                        try:
+                            self.confirm_pending()
+                        except Exception as exc:
+                            print(f"steer confirmation failed: {exc}", file=sys.stderr, flush=True)
                     # Only persisted means no submission began. Atomic claim
                     # recovers ingress interrupted before scheduling. Never
                     # replay submitting or ambiguous attempts after restart.
@@ -1033,7 +1246,7 @@ def check_daemon(row, action):
     if lacking and int(row.get("protocol") or 1) >= MIN_DAEMON_PROTOCOL:
         # Current enough for send/ack/reply; only a newer optional action is missing.
         raise DaemonOutdated(f"the running bridge daemon for {row['actor']} (pid {row['pid']}) is protocol {row.get('protocol')}; `{action}` needs {', '.join(lacking)} "
-                             f"(protocol {DAEMON_PROTOCOL}), so `{action}` was NOT performed: nothing was retired. send, ack and reply still work on this endpoint. "
+                             f"(protocol {DAEMON_PROTOCOL}), so `{action}` was NOT performed: {OPTIONAL_REFUSAL.get(action, 'nothing was done')}. send, ack and reply still work on this endpoint. "
                              f"To upgrade, run `cctrl bridge stop` then `cctrl bridge enable` (drain held items first). See {MIGRATION_DOC}.")
     if lacking:
         raise DaemonOutdated(f"{daemon_problem(row)}; it cannot do {', '.join(lacking)}, so `{action}` was NOT performed: nothing was sent, acknowledged or retired. "
@@ -1107,7 +1320,10 @@ def main(argv=None):
             who = own_actor()
             if args.command == "status":
                 result = store.get(args.target, who)
-                if args.reconcile and result["recipient"].startswith("codex:"):
+                if args.reconcile and result["recipient"].startswith("codex:") and result["delivery"] == "steer" and store.steer_only(result["id"]):
+                    # A steer attempt has no queue item: never fall through to a queue lookup or a resend.
+                    result = {**result, "reconciliation": {"status": "ambiguous", "reason": "steer outcome cannot be reconciled; never replay"}}
+                elif args.reconcile and result["recipient"].startswith("codex:"):
                     from bridge_codex import reconcile
                     observed = reconcile(result["recipient"].split(":", 1)[1], wire_text(result["id"], result["sender"], result["recipient"], result["body"], result["reply_to"], result["envelope"]), result["id"])
                     if observed.get("status") == "queued":

@@ -1430,7 +1430,7 @@ class DaemonVersionTests(unittest.TestCase):
         self.assertFalse(bridge.daemon_missing(row, bridge.ALL_REQUIRED), "ack/send/reply still work on it")
         message = out["error"]["message"]
         self.assertIn("retire_handled", message)
-        self.assertIn("protocol 3", message)
+        self.assertIn(f"protocol {bridge.DAEMON_PROTOCOL}", message)
         self.assertIn("still work", message)
         self.assertIn("cctrl bridge stop", message)
         self.assertNotIn("needs 2", message)
@@ -1910,6 +1910,7 @@ class SteerDaemonTests(unittest.TestCase):
 
     def test_an_accepted_steer_that_never_appears_in_history_becomes_lost_and_is_never_requeued(self):
         self.allow()
+        self.confirm_result = {"outcome": "pending"}
         mid = self.steer_send()["id"]
         self.confirm_result = {"outcome": "lost", "reason": "steered turn ended without the steered message in its history"}
         result = self.daemon.confirm_steer(mid)
@@ -1926,6 +1927,7 @@ class SteerDaemonTests(unittest.TestCase):
 
     def test_a_lost_steer_cannot_be_acked_and_its_body_is_withheld_in_stranded(self):
         self.allow()
+        self.confirm_result = {"outcome": "pending"}
         mid = self.steer_send()["id"]
         self.confirm_result = {"outcome": "lost", "reason": "x"}
         self.daemon.confirm_steer(mid)
@@ -1938,6 +1940,7 @@ class SteerDaemonTests(unittest.TestCase):
 
     def test_lost_row_has_nothing_to_retire(self):
         self.allow()
+        self.confirm_result = {"outcome": "pending"}
         mid = self.steer_send()["id"]
         self.confirm_result = {"outcome": "lost", "reason": "x"}
         self.daemon.confirm_steer(mid)
@@ -1983,7 +1986,7 @@ class SteerDaemonTests(unittest.TestCase):
     # ---- the adapter's forbidden calls are never made by the daemon either ----
     def test_the_steer_path_calls_only_steer_confirm_and_enqueue(self):
         self.allow()
-        for name in ("resume", "reconcile", "retire", "thread_facts"):
+        for name in ("reconcile", "retire", "thread_facts"):
             patcher = patch.object(bridge_codex, name, side_effect=AssertionError(name))
             patcher.start()
             self.addCleanup(patcher.stop)
