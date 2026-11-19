@@ -1185,6 +1185,45 @@ class CliProcessTests(unittest.TestCase):
         self.assertIn("unknown", ambiguous.lower())
         self.assertIn("not queued", ambiguous)
 
+    # fix round: the report must follow what the queue fallback really did
+    def test_steer_report_idle_then_queue_ambiguous_says_a_queued_copy_may_exist(self):
+        row = {"status": "ambiguous", "delivery": "steer", "id": "m1", "events": [{"kind": "steering", "detail": None}, {"kind": "queueing", "detail": None}],
+               "steer": {"requested": True, "outcome": "idle", "reason": "no running turn"}}
+        text = bridge.steer_report(row)
+        self.assertIn("not steered (idle)", text)
+        self.assertIn("queue add ambiguous, a queued copy may exist", text)
+        self.assertIn("do not resend blindly", text)
+        self.assertNotIn("not queued", text)
+
+    def test_steer_report_idle_then_queue_failed_says_not_queued(self):
+        row = {"status": "failed", "delivery": "steer", "id": "m1", "events": [{"kind": "queueing", "detail": None}],
+               "steer": {"requested": True, "outcome": "idle", "reason": "no running turn"}}
+        text = bridge.steer_report(row)
+        self.assertIn("not steered and NOT queued: send failed", text)
+        self.assertNotIn("queued, not steered", text)
+
+    def test_steer_report_table_over_every_steer_and_queue_outcome(self):
+        def row(status, outcome, queued):
+            events = [{"kind": "queueing", "detail": None}] if queued else []
+            return {"status": status, "delivery": "steer", "id": "m1", "events": events, "steer": {"requested": True, "outcome": outcome, "reason": None}}
+        cases = [
+            ("steered", "steered", False, ["steered into", "not queued"], ["NOT queued", "ambiguous"]),
+            ("lost", "lost", False, ["LOST", "not requeued"], ["queue add"]),
+            ("ambiguous", "ambiguous", False, ["unknown whether the steer landed", "not queued", "cannot be reconciled"], ["--reconcile", "queue add"]),
+            ("queued", "idle", True, ["queued, not steered (idle)"], ["NOT queued", "queue add"]),
+            ("queued", "rate", True, ["queued, not steered (rate)"], ["NOT queued"]),
+            ("failed", "idle", True, ["not steered and NOT queued: send failed"], ["queued, not steered"]),
+            ("failed", "not_loaded", True, ["not steered and NOT queued: send failed"], ["queued, not steered"]),
+            ("ambiguous", "idle", True, ["not steered (idle)", "queue add ambiguous, a queued copy may exist", "do not resend blindly"], ["not queued and is never"]),
+            ("ambiguous", "flags", True, ["not steered (flags)", "queue add ambiguous"], ["unknown whether the steer landed"]),
+        ]
+        for status, outcome, queued, wants, unwants in cases:
+            text = bridge.steer_report(row(status, outcome, queued))
+            for w in wants:
+                self.assertIn(w, text, (status, outcome, queued))
+            for u in unwants:
+                self.assertNotIn(u, text, (status, outcome, queued))
+
     # A6 native 10: bridge policy writes only the caller's own row
     def test_bridge_policy_shows_off_by_default_and_writes_only_the_callers_own_row(self):
         shown = self.cli("policy", "--json")
@@ -2163,6 +2202,28 @@ class SteerDaemonTests(unittest.TestCase):
             db.execute("DELETE FROM events WHERE kind='steer-confirmed'")
             db.execute("UPDATE messages SET created=? WHERE id=?", (time.time() - 3600, mid))
         self.assertEqual(0, self.daemon.confirm_pending(), "old rows are no longer chased")
+
+    def test_pending_confirmation_backs_off_5_10_20_40_then_caps_at_60(self):
+        self.allow()
+        self.confirm_result = {"outcome": "pending"}
+        mid = self.steer_send()["id"]
+        self.confirms.clear()
+        now = [time.time()]
+        real = time.time
+        time.time = lambda: now[0]
+        try:
+            self.assertEqual(1, self.daemon.confirm_pending())
+            gaps = []
+            for _ in range(7):
+                step = 0
+                while self.daemon.confirm_pending() == 0:
+                    now[0] += 1
+                    step += 1
+                gaps.append(step)
+        finally:
+            time.time = real
+        self.assertEqual([5, 10, 20, 40, 60, 60, 60], gaps)
+        self.assertTrue(mid)
 
     # ---- the adapter's forbidden calls are never made by the daemon either ----
     def test_the_steer_path_calls_only_steer_confirm_and_enqueue(self):
