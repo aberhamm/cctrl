@@ -722,7 +722,6 @@ def steer_report(row):
         return None
     outcome, reason, status = steer.get("outcome"), steer.get("reason"), row.get("status")
     why = f": {reason}" if reason else ""
-    queue_tried = any(e.get("kind") == "queueing" for e in (row.get("events") or []))
     if status == "lost" or outcome == "lost":
         return f"LOST: the steer was accepted but never appeared in the recipient's turn history, and it was not requeued{why}. Resend if it still matters"
     if outcome not in (None, "pending", "steered", "ambiguous") and status in ("failed", "ambiguous"):
@@ -730,7 +729,7 @@ def steer_report(row):
         if status == "failed":
             return f"not steered and NOT queued: send failed{why}"
         return (f"not steered ({outcome}); queue add ambiguous, a queued copy may exist: "
-                f"check bridge status {row.get('id')}, do not resend blindly{why}")
+                f"check bridge status {row.get('id')} --reconcile, do not resend blindly{why}")
     if status == "ambiguous" or outcome == "ambiguous":
         return (f"unknown whether the steer landed{why}. It was not queued and is never replayed; "
                 "it cannot be reconciled, so ask the recipient or resend with a note saying it may be a duplicate")
@@ -960,14 +959,20 @@ class Daemon:
 
     def confirm_pending(self, limit=8):
         """Re-check recent accepted steers this daemon sent that are not yet confirmed. Returns how many it checked."""
-        with self.store.db() as db:
-            ids = [r[0] for r in db.execute(
-                "SELECT m.id FROM messages m WHERE m.dispatcher=? AND m.delivery='steer' AND m.status='steered' AND m.created>? "
-                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steer-confirmed') ORDER BY m.created LIMIT ?",
-                (self.who, time.time() - CONFIRM_WINDOW, limit))]
         now = time.time()
+        base = ("FROM messages m WHERE m.dispatcher=? AND m.delivery='steer' AND m.status='steered' "
+                "AND NOT EXISTS (SELECT 1 FROM events e WHERE e.id=m.id AND e.kind='steer-confirmed') ")
+        with self.store.db() as db:
+            # No SQL limit: the backoff filter runs first, so rows waiting out a backoff never hold the slots.
+            ids = [r[0] for r in db.execute("SELECT m.id " + base + "AND m.created>? ORDER BY m.created", (self.who, now - CONFIRM_WINDOW))]
+            expired = [r[0] for r in db.execute(
+                "SELECT m.id " + base + "AND m.created<=? AND NOT EXISTS (SELECT 1 FROM events u WHERE u.id=m.id AND u.kind='steer-unconfirmed')",
+                (self.who, now - CONFIRM_WINDOW))]
+        for mid in expired:
+            # Checking stopped; the status stays steered (never lost, never requeued).
+            self.store.note_once(mid, "steer-unconfirmed", {"reason": "checking stopped after the confirm window; the steer was accepted but never confirmed in the turn history"})
         self.__dict__.setdefault("confirm_due", {})
-        due = [mid for mid in ids if self.confirm_due.get(mid, (0.0, 0.0))[0] <= now]
+        due = [mid for mid in ids if self.confirm_due.get(mid, (0.0, 0.0))[0] <= now][:limit]
         for mid in due:
             # Back off 5, 10, 20, 40 s, capped at 60 s, so a long turn is not re-read every sweep.
             gap = min(60.0, self.confirm_due.get(mid, (0.0, 2.5))[1] * 2)
