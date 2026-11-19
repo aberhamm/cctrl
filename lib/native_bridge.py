@@ -69,6 +69,7 @@ OPTIONAL_REFUSAL = {"retire": "nothing was retired", "send_steer": "nothing was 
 STEER_MAX_AGE = 60.0
 STEER_RATE_WINDOW = 120.0
 CONFIRM_WINDOW = 600.0
+EXPIRY_BAND = 86400.0  # only rows that left the window within a day get the checking-stopped note
 DELIVERIES = ("queue", "steer")
 STEER_REASONS = {
     "declined": "recipient has not opted in to steering (or this sender is not on its allow list); queued instead",
@@ -377,6 +378,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS endpoint_policy (
               actor TEXT PRIMARY KEY, steer TEXT NOT NULL DEFAULT 'off',
               steer_from TEXT, updated REAL);
+            CREATE INDEX IF NOT EXISTS events_id_kind ON events(id, kind);
             """)
             if "dispatcher" not in {r[1] for r in db.execute("PRAGMA table_info(messages)")}:
                 db.execute("ALTER TABLE messages ADD COLUMN dispatcher TEXT")
@@ -966,8 +968,8 @@ class Daemon:
             # No SQL limit: the backoff filter runs first, so rows waiting out a backoff never hold the slots.
             ids = [r[0] for r in db.execute("SELECT m.id " + base + "AND m.created>? ORDER BY m.created", (self.who, now - CONFIRM_WINDOW))]
             expired = [r[0] for r in db.execute(
-                "SELECT m.id " + base + "AND m.created<=? AND NOT EXISTS (SELECT 1 FROM events u WHERE u.id=m.id AND u.kind='steer-unconfirmed')",
-                (self.who, now - CONFIRM_WINDOW))]
+                "SELECT m.id " + base + "AND m.created<=? AND m.created>? AND NOT EXISTS (SELECT 1 FROM events u WHERE u.id=m.id AND u.kind='steer-unconfirmed')",
+                (self.who, now - CONFIRM_WINDOW, now - CONFIRM_WINDOW - EXPIRY_BAND))]
         for mid in expired:
             # Checking stopped; the status stays steered (never lost, never requeued).
             self.store.note_once(mid, "steer-unconfirmed", {"reason": "checking stopped after the confirm window; the steer was accepted but never confirmed in the turn history"})
