@@ -854,6 +854,11 @@ class CliProcessTests(unittest.TestCase):
         proc = self.cctrl("peer", "whoami", "--json", extra={"CLAUDE_CODE_SESSION_ID": sid}, drop=("CODEX_THREAD_ID",))
         return sid, json.loads(proc.stdout)["name"]
 
+    def live_backing_peer(self):
+        """A live Claude in a fake tmux pane with a registered peer; returns (session id, peer name)."""
+        conv = str(uuid.uuid4())
+        return conv, self.fake_pane("TMUX--" + conv[:8], conv)
+
     def mailbox_messages(self):
         path = self.root / "data" / "messages.jsonl"
         if not path.exists():
@@ -865,7 +870,7 @@ class CliProcessTests(unittest.TestCase):
             return db.execute("SELECT count(*) FROM messages").fetchone()[0]
 
     def test_non_urgent_codex_to_claude_writes_a_mailbox_item_with_no_native_submit(self):
-        sid, peer = self.claude_backing_peer()
+        sid, peer = self.live_backing_peer()
         mid = str(uuid.uuid4())
         proc = self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "status for the claude")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
@@ -882,7 +887,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual([], self.queue_calls())
 
     def test_urgent_codex_to_claude_keeps_the_native_path_and_writes_no_mailbox_item(self):
-        sid, _ = self.claude_backing_peer()
+        sid, _ = self.live_backing_peer()
         self.enable()
         mid = str(uuid.uuid4())
         out = self.cli("send", "claude:" + sid, "--json", "--urgent", "--id", mid, "--", "needs an answer now")
@@ -901,21 +906,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual(0, self.ledger_count())
         self.assertEqual([], bridge.Store(self.root / "ledger").endpoints())
 
-    def test_ambiguous_backing_peer_is_refused_never_guessed(self):
-        sid, peer = self.claude_backing_peer()
-        peers_file = self.root / "data" / "peers.json"
-        peers = json.loads(peers_file.read_text())
-        peers["twin-of-" + peer] = {**peers[peer], "name": "twin-of-" + peer}
-        peers_file.write_text(json.dumps(peers))
-        proc = self.raw("send", "claude:" + sid, "--json", "--", "hello")
-        self.assertEqual(1, proc.returncode, proc.stdout)
-        message = json.loads(proc.stdout)["error"]["message"]
-        self.assertIn("--urgent", message)
-        self.assertIn("ambiguous", message.lower())
-        self.assertEqual([], self.mailbox_messages())
-        self.assertEqual(0, self.ledger_count())
-
-    def fake_pane(self, tmux_session, conversation, live=True):
+    def fake_pane(self, tmux_session, conversation, live=True, claim=None, start=None):
         """A fake Claude in a fake tmux pane: a real process, its ~/.claude/sessions
         file (pid + procStart) and a stub tmux listing the pane. The peer backing the
         tmux session is a registry entry with no session-id binding of its own."""
@@ -928,8 +919,8 @@ class CliProcessTests(unittest.TestCase):
         sessions = self.root / "claude" / "sessions"
         sessions.mkdir(parents=True, exist_ok=True)
         (sessions / (str(proc.pid) + ".json")).write_text(json.dumps({
-            "pid": proc.pid, "sessionId": conversation, "name": tmux_session, "procStart": started,
-            "tmux": tmux_session + ":@1." + pane, "messagingSocketPath": ""}))
+            "pid": proc.pid, "sessionId": conversation, "name": tmux_session, "procStart": start or started,
+            "tmux": (claim or tmux_session) + ":@1." + pane, "messagingSocketPath": ""}))
         if not live:
             proc.kill()
             proc.wait()
@@ -1016,6 +1007,64 @@ class CliProcessTests(unittest.TestCase):
         rc, out = self.by_session(conv)
         self.assertEqual((66, "ambiguous-backing-peer"), (rc, out["error"]["code"]), out)
 
+    def test_by_session_resolves_a_claude_in_a_tmux_session_renamed_after_launch(self):
+        conv = str(uuid.uuid4())
+        peer = self.fake_pane("TMUX--renamed", conv, claim="TMUX--before-rename")
+        rc, out = self.by_session(conv)
+        self.assertEqual((0, peer), (rc, out.get("peer")), out)
+
+    def test_by_session_renamed_session_still_refuses_a_pid_that_is_not_in_the_pane(self):
+        conv = str(uuid.uuid4())
+        self.fake_pane("TMUX--renamed2", conv, claim="TMUX--before-rename2")
+        panes = self.root / "panes.tsv"
+        rows = [line.split("\t") for line in panes.read_text().splitlines()]
+        rows[0][2] = "1"  # the pane's own process is now unrelated to the Claude pid
+        panes.write_text("".join("\t".join(r) + "\n" for r in rows))
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+
+    def test_by_session_renamed_session_with_a_reused_pid_start_time_refuses(self):
+        conv = str(uuid.uuid4())
+        self.fake_pane("TMUX--renamed3", conv, claim="TMUX--before-rename3", start="Mon Jan  1 00:00:00 2001")
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+
+    def test_by_session_renamed_session_with_two_live_claudes_refuses(self):
+        conv = str(uuid.uuid4())
+        self.fake_pane("TMUX--ren-a", conv, claim="TMUX--old-a")
+        self.fake_pane("TMUX--ren-b", conv, claim="TMUX--old-b")
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "ambiguous-backing-peer"), (rc, out["error"]["code"]), out)
+
+    def test_by_session_refuses_a_peers_json_identity_with_no_live_process(self):
+        sid, _ = self.claude_backing_peer()  # registers external_identity.session_id, no process
+        rc, out = self.by_session(sid)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+        proc = self.raw("send", "claude:" + sid, "--json", "--", "to a dead identity")
+        self.assertEqual(1, proc.returncode, proc.stdout)
+        self.assertIn("--urgent", json.loads(proc.stdout)["error"]["message"])
+        self.assertEqual([], self.mailbox_messages())
+
+    def test_by_session_refuses_a_stale_provider_task_id_on_a_tmux_peer(self):
+        conv = str(uuid.uuid4())
+        peer = self.fake_pane("TMUX--ptid", str(uuid.uuid4()))
+        peers_file = self.root / "data" / "peers.json"
+        peers = json.loads(peers_file.read_text())
+        peers[peer]["provider_task_id"] = conv
+        peers_file.write_text(json.dumps(peers))
+        rc, out = self.by_session(conv)
+        self.assertEqual((66, "not-live"), (rc, out["error"]["code"]), out)
+
+    def test_by_session_a_peers_json_identity_plus_a_live_process_resolves_once(self):
+        conv = str(uuid.uuid4())
+        peer = self.fake_pane("TMUX--both", conv)
+        peers_file = self.root / "data" / "peers.json"
+        peers = json.loads(peers_file.read_text())
+        peers[peer]["external_identity"] = {"session_id": conv}
+        peers_file.write_text(json.dumps(peers))
+        rc, out = self.by_session(conv)
+        self.assertEqual((0, peer), (rc, out.get("peer")), out)
+
     def test_claude_to_codex_and_codex_to_codex_are_unchanged_and_claude_to_claude_stays_rejected(self):
         claude = str(uuid.uuid4())
         extra = {"CLAUDE_CODE_SESSION_ID": claude}
@@ -1037,7 +1086,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual([], self.mailbox_messages())
 
     def test_reply_to_a_routed_mailbox_item_reaches_the_codex_sender(self):
-        sid, peer = self.claude_backing_peer()
+        sid, peer = self.live_backing_peer()
         claude_env = {"CLAUDE_CODE_SESSION_ID": sid}
         sent = json.loads(self.raw("send", "claude:" + sid, "--json", "--", "please look at the plan").stdout)
         mailbox_id = sent["mailbox_id"]
@@ -1054,7 +1103,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertEqual((peer, codex_peer), (replies[0]["from"], replies[0]["to"]))
 
     def test_routed_send_is_idempotent_for_a_stable_id(self):
-        sid, _ = self.claude_backing_peer()
+        sid, _ = self.live_backing_peer()
         mid = str(uuid.uuid4())
         first = json.loads(self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "once").stdout)
         again = json.loads(self.raw("send", "claude:" + sid, "--json", "--id", mid, "--", "once").stdout)
@@ -1067,7 +1116,7 @@ class CliProcessTests(unittest.TestCase):
         self.assertIn("urgent", send["inputSchema"]["properties"])
         self.assertIn("mailbox", send["description"].lower())
         self.assertNotIn("urgent", next(t for t in NATIVE_TOOLS if t["name"] == "native_reply")["inputSchema"]["properties"])
-        sid, peer = self.claude_backing_peer()
+        sid, peer = self.live_backing_peer()
         mcp = Bridge(str(ROOT / "cctrl"), "unrelated-mailbox-identity")
         with patch.dict(os.environ, self.env, clear=True):
             out = mcp.call_tool("native_send", {"to": "claude:" + sid, "body": "via mcp"})["data"]
@@ -1099,7 +1148,7 @@ class CliProcessTests(unittest.TestCase):
 
     # A6 native 6: --steer to claude:* is refused before anything is persisted or routed
     def test_steer_to_a_claude_target_from_codex_is_refused_with_nothing_persisted_or_routed(self):
-        sid, _ = self.claude_backing_peer()
+        sid, _ = self.live_backing_peer()
         message = self.refused("send", "claude:" + sid, "--json", "--steer", "--", "stop that")
         self.assertIn("steer applies only to Codex recipients", message)
         self.assertIn("nothing sent", message)
@@ -1112,7 +1161,7 @@ class CliProcessTests(unittest.TestCase):
         self.assert_nothing_persisted()
 
     def test_steer_with_urgent_is_a_usage_error_for_any_target(self):
-        sid, _ = self.claude_backing_peer()
+        sid, _ = self.live_backing_peer()
         for target in ("claude:" + sid, "codex:" + str(uuid.uuid4())):
             message = self.refused("send", target, "--json", "--steer", "--urgent", "--", "x")
             self.assertIn("--steer", message)

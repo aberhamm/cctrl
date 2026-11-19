@@ -49,11 +49,13 @@ into the recipient's pane if it is idle and doorbell-enabled, otherwise waiting
 for its next turn end. Either way there is no admission prompt on Matthew's
 screen.
 
-- The backing peer comes from `cctrl peer by-session claude:SESSION_ID`: the peer
-  registry (an external identity bound to that session) or the live process: the session id must be a live Claude (a `~/.claude/sessions`
-  file with a live pid and matching start time) in a tmux pane whose session
-  backs a registered Claude peer. Session records are never trusted, so a stale
-  "active" record can neither misroute nor block mail. Exactly one peer is
+- The backing peer comes from `cctrl peer by-session claude:SESSION_ID`: the session
+  id must be a live Claude (a `~/.claude/sessions` file with a live pid and
+  matching start time) in a tmux pane whose session backs a registered Claude
+  peer. The pane is matched by pane id and process ancestry, so a tmux session
+  renamed after launch still resolves. Neither session records nor peer registry
+  fields (`external_identity.session_id`, `provider_task_id`) are trusted, so a
+  stale record can neither misroute nor block mail. Exactly one peer is
   required; a session that is not live anywhere is refused as `not-live`. Zero or two is refused (exit 1, error code
   `mailbox-route-refused`, the message names `--urgent`); cctrl never guesses a
   peer. A refused send writes nothing: no mailbox item and no ledger row.

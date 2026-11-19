@@ -8512,12 +8512,12 @@ _peer_cmd_whoami() {
 }
 
 # Which mailbox peer backs a native Claude session? Used by `bridge send` to route
-# a non-urgent Codex-to-Claude message to the mailbox. Candidates come from the
-# peer registry (an external identity bound to the session) and from managed
-# session metadata (conversation id); each must still resolve to a live or
-# registered peer. Exactly one distinct peer, or nothing: never a guess.
+# a non-urgent Codex-to-Claude message to the mailbox. A candidate is a live Claude
+# process for the conversation (live pid, matching start time, bound to its tmux
+# pane, which survives a session rename) whose pane's session has a registered
+# peer. Exactly one distinct peer, or nothing: never a guess.
 _peer_cmd_by_session() {
-    local target="${1:-}" json=false sid candidates name peer_json a
+    local target="${1:-}" json=false sid name peer_json a
     [[ -n "$target" && "$target" != -* ]] || { echo -e "${RED}Usage: cctrl peer by-session claude:SESSION_ID [--json]${RESET}" >&2; return 64; }
     shift
     for a in "$@"; do
@@ -8532,11 +8532,10 @@ _peer_cmd_by_session() {
         return 64
     fi
     _peer_init || return $?
-    candidates="$(
-        jq -r --arg id "$sid" 'to_entries[]
-            | select((.value.agent // "") == "claude" and (.value.external_identity.session_id == $id or .value.provider_task_id == $id))
-            | (.value.name // .key)' "$PEERS_FILE" 2>/dev/null
-    )"
+    # peers.json (external_identity.session_id, provider_task_id) is a record,
+    # not proof of life, so it is never a candidate source: a dead or stale id
+    # must not route. Only the live process below counts.
+    local candidates=""
     # Live process, not record status (session records can stay "active" for
     # sessions that died): X counts only as a live Claude process (a
     # ~/.claude/sessions file with a live pid and matching procStart) bound to a
@@ -8547,11 +8546,11 @@ _peer_cmd_by_session() {
         [[ -f "$sf" && ! -L "$sf" ]] || continue
         [[ "$(jq -r '.sessionId // ""' "$sf" 2>/dev/null)" == "$sid" ]] || continue
         spid="${sf##*/}"; spid="${spid%.json}"
-        _peer_record_for_pid "$spid" || continue
+        _peer_record_for_pid "$spid" --follow-rename || continue
         [[ "$PEER_REC_ALIVE" == true && "$PEER_REC_PROC_START_MATCH" == true && "$PEER_REC_TMUX_BOUND" == true ]] || continue
         live_candidates+="$PEER_REC_PEER_NAME"$'\n'
     done
-    candidates+=$'\n'"$live_candidates"
+    candidates="$live_candidates"
     local -a names=()
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
@@ -8679,8 +8678,13 @@ _peer_whois_list_panes() {
 # PEER_REC_NOTES lists what was not checked. Returns 1 when the session file
 # is missing or unreadable (PEER_REC_REASONS says why), else 0.
 _peer_record_for_pid() {
-    local pid="$1" no_tmux=false f fields line lstart want got cmd panes p_s p_id p_pid
+    local pid="$1" no_tmux=false follow_rename=false f fields line lstart want got cmd panes p_s p_id p_pid
     [[ "${2:-}" == "--no-tmux" ]] && no_tmux=true
+    # --follow-rename (by-session routing): a tmux session renamed after launch
+    # leaves a stale name in the session file's pane claim. The pane id and the
+    # pid's descent from the pane's process survive a rename, so bind to the
+    # session that pane is really in. Still refuses when the pid is not in the pane.
+    [[ "${2:-}" == "--follow-rename" ]] && follow_rename=true
     PEER_REC_FILE=""; PEER_REC_SESSION_ID=""; PEER_REC_NAME=""; PEER_REC_NAME_SOURCE=""
     PEER_REC_ENTRYPOINT=""; PEER_REC_CLAUDE_KIND=""; PEER_REC_TMUX_CLAIM=""; PEER_REC_BRIDGE=false
     PEER_REC_SOCKET=""; PEER_REC_FILE_PID=""
@@ -8750,7 +8754,7 @@ _peer_record_for_pid() {
         PEER_REC_TMUX_BOUND=false
         # Pane ids repeat across tmux servers (mdec-1110): when one row has
         # both the claimed session and pane, check that row.
-        local _wmatch
+        local _wmatch panes_all="$panes"
         _wmatch="$(awk -F '\t' -v s="$PEER_REC_TMUX_SESSION" -v p="$PEER_REC_TMUX_PANE" '$1 == s && $2 == p { print; exit }' <<< "$panes")"
         [[ -n "$_wmatch" ]] && panes="$_wmatch"
         while IFS=$'\t' read -r p_s p_id p_pid; do
@@ -8765,6 +8769,21 @@ _peer_record_for_pid() {
             fi
             break
         done <<< "$panes"
+        if $follow_rename && [[ "$PEER_REC_TMUX_BOUND" != true && -n "$PEER_REC_TMUX_PANE_PID" ]]; then
+            # Every row for this pane id (ids repeat across servers): the one whose
+            # process the pid descends from. Exactly one, or the claim stays refused.
+            local _fcount=0 _fs="" _fpid=""
+            while IFS=$'\t' read -r p_s p_id p_pid; do
+                [[ "$p_id" == "$PEER_REC_TMUX_PANE" ]] || continue
+                if _peer_pid_descends_from "$pid" "$p_pid"; then
+                    _fcount=$((_fcount + 1)); _fs="$p_s"; _fpid="$p_pid"
+                fi
+            done <<< "$panes_all"
+            if [[ "$_fcount" == 1 ]]; then
+                PEER_REC_NOTES+="tmux session renamed after launch: claimed $PEER_REC_TMUX_SESSION, pane $PEER_REC_TMUX_PANE is in $_fs"$'\n'
+                PEER_REC_TMUX_SESSION="$_fs"; PEER_REC_TMUX_PANE_PID="$_fpid"; PEER_REC_TMUX_BOUND=true
+            fi
+        fi
         if [[ -z "$PEER_REC_TMUX_PANE_PID" ]]; then
             PEER_REC_REASONS+="pane $PEER_REC_TMUX_PANE not found"$'\n'
         fi
