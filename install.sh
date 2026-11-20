@@ -68,6 +68,7 @@ info "✓ cctrl installed"
 dim "  Binary:      $BIN_DIR/cctrl"
 dim "  Source:       $INSTALL_DIR"
 dim "  Update:       cctrl itself or re-run this script"
+dim "  Next:         run 'cctrl peer doctor' to check cross-session messaging"
 echo ""
 
 if ! command -v cctrl &>/dev/null; then

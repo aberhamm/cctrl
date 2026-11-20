@@ -1519,6 +1519,61 @@ this host's log of built-in `SendMessage` calls (see Hooks,
 `native-send-log.py`): who sent, to whom, when, the outcome, the size and any
 cctrl message ids, never the body.
 
+### Cross-session messaging setup
+
+**Why Claude holds a message.** Claude Code admits a message from another
+session by permission-mode class. cctrl starts every Claude in bypass mode, so a
+message between a cctrl worker and a normal-mode session (yours, or a Codex
+sender, which always claims the prompting class) is held until a person
+approves it. Claude Desktop, VS Code and `claude -p` cannot show that dialog, so
+a held message there expires (5 minutes by default) and never arrives. The
+bridge reports it as `held_for_approval`.
+
+**`cctrl peer setup`** is the one opt-in that fixes this. It sets Claude's
+`crossSessionInbound` to `accept` (or `hold`, `refuse`, `unset` with `--value`):
+
+```sh
+cctrl peer setup                       # --scope user (default)
+cctrl peer setup --scope spawned       # only the Claude sessions cctrl starts
+cctrl peer setup --scope both --yes
+cctrl peer setup --dry-run             # show the change, write nothing
+```
+
+- `--scope user` writes `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json`. It
+  covers every session you run, Desktop and VS Code included, and also the
+  sessions cctrl spawns (Claude merges user settings into them).
+- `--scope spawned` writes the cctrl config key
+  `messaging.claude.crossSessionInbound`; cctrl then adds it to the `--settings`
+  overlay of the Claude sessions it starts. Your own sessions are unchanged.
+- The file is backed up, replaced atomically, and left alone when nothing
+  changes. An invalid `settings.json` is refused, never read as empty. Setup
+  checks the Claude Code version and any managed, project or local value that
+  would override yours, and prints those warnings before it asks to proceed.
+
+**Security trade-off.** `accept` lets your other sessions on this Mac start a
+turn in the receiving session. So can any process running as your user that
+writes the session socket. Permission prompts still fire in a receiving session
+that is not in bypass mode, and a message can never approve one. The larger
+escalation is on bypass workers: a guarded session, or a Codex sender, can then
+make a bypass worker act with no prompt. Setup prints this and asks first
+(`--yes` skips the question). It never touches `permissions`, `dialogExpiry` or
+`isolatePeerMachines`.
+
+**`cctrl peer doctor`** reports messaging readiness for Claude and Codex (version,
+effective value for your sessions and for cctrl spawns, managed, project and
+invalid values, `isolatePeerMachines`, `dialogExpiry`, Codex bridge endpoints and
+orphan daemons). A missing opt-in is a warning, never a failure, and every
+problem prints the exact command that fixes it.
+
+**Another Mac.** Setup changes only the Mac it runs on. For a registered host:
+`cctrl --host ALIAS peer setup --yes`; doctor prints that line for each host.
+
+**A new launch is needed.** A running Claude session keeps the value it started
+with. Spawned scope applies to new launches. `cctrl restart` re-reads it only
+for a session that already has an overlay (a profile session, or one started
+with the key set); a session started with no profile and no overlay gets it when
+you close it and start a new one. Details: [docs/peer-messaging.md](docs/peer-messaging.md#cross-session-messaging-setup).
+
 ### App-owned Codex peers
 
 Create an app-owned task, then register the returned `provider_task_id`:

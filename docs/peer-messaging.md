@@ -6,6 +6,178 @@ Claude-to-Claude messages use actual Claude `ListAgents`/`SendMessage`. For wire
 and approvals follow the [agent contract](../AGENTS.md#peer-messaging) and
 [selected role skill](../skills/README.md).
 
+## Cross-session messaging setup
+
+Claude Code decides whether to admit a message from another session by
+comparing permission-mode classes (bypass versus prompting). cctrl starts every
+Claude in bypass mode, and a Codex-to-Claude bridge send always claims the
+prompting class. So a cctrl worker and a normal-mode session, or a Codex sender
+and any cctrl-spawned Claude, are in different classes, and Claude holds the
+message until a person approves it. Desktop, VS Code and `claude -p` cannot show
+the dialog, so a held message there is dropped after `dialogExpiry` (5 minutes by
+default). Held is not failed; the bridge reports `held_for_approval`.
+
+The fix is Claude's `crossSessionInbound` setting (`accept`, `hold` or
+`refuse`). `cctrl peer setup` sets it for you after a version check and a
+trade-off prompt. `cctrl peer doctor` reports whether it took effect.
+
+### `cctrl peer setup`
+
+```sh
+cctrl peer setup [--scope user|spawned|both] [--value accept|hold|refuse|unset]
+                 [--dir PATH] [--dry-run] [--yes] [--override-user] [--json]
+```
+
+| Scope | Writes | Covers |
+|---|---|---|
+| `user` (default) | `${CLAUDE_CONFIG_DIR:-~/.claude}/settings.json` | every session you run, Desktop and VS Code included, and the sessions cctrl spawns (user settings still apply to them) |
+| `spawned` | cctrl config key `messaging.claude.crossSessionInbound` | the Claude sessions cctrl starts, through their `--settings` overlay; your own sessions are unchanged |
+| `both` | both of the above | both |
+
+Behaviour that applies to every scope:
+
+- **Safe write.** The file is parsed as JSON and only the one key changes, so other keys
+  and their order are kept. The write is atomic (same-directory temp file, fsync,
+  `os.replace`), under a lock, and a symlinked file is written through to its
+  target. Before a change, an exact copy is saved as
+  `settings.json.cctrl-backup-<UTC>`.
+- **Invalid JSON is refused**, never read as `{}`. The file is left byte-identical
+  and setup exits 1. `cctrl hooks install` and `cctrl statusline claude install`
+  follow the same rule.
+- **Idempotent.** A second run with the same value prints `unchanged`, exits 0,
+  and makes no backup and no write. `--value unset` removes the key, so
+  Claude's per-class default applies again.
+- **Warnings come before the question.** Version, managed, project, local and
+  invalid-value findings and the trade-off text print first; then the
+  confirmation (`--yes` skips it, and is required when stdin is not a terminal).
+  `--dry-run` prints the same and writes nothing. `--json` carries the trade-off
+  text in a `trade_off` field.
+- **Exit codes.** 0 done or unchanged, 1 refused, 2 Claude Code too old, 3 managed
+  override, 64 usage, 65 not confirmed.
+
+### Precedence, and why stricter wins
+
+Claude resolves `crossSessionInbound` in this order (settings reference):
+
+1. **Managed settings** (macOS managed preferences, else the managed-settings
+   file and `managed-settings.d/*.json`) win over everything. An invalid managed
+   value counts as `refuse` (v2.1.248 and later). Server-managed settings cannot
+   be read locally; setup and doctor report them as `unknown`, never as clear.
+2. The **`--settings` overlay**, then **user settings**: the first value found.
+3. A **project or local** value (`<repo>/.claude/settings.json`,
+   `settings.local.json`) applies only when it is stricter than the above
+   (`refuse` over `hold` over `accept`). With no trusted value at all, a project
+   or local `hold` or `refuse` replaces the per-class default.
+4. An **unrecognised value** in a user, project, local or overlay file forces
+   `hold`, even when a higher source says `accept`.
+
+Setup therefore checks before it writes. A managed value that overrides yours
+makes setup stop with exit 3 and write nothing. A stricter project or local value
+is reported as applying in that repo only (`--dir`, default the current
+directory) and does not block a user write. An invalid value anywhere is named by
+file.
+
+Setup also reports two effective values with their sources: one for "a cctrl
+spawn in DIR" (overlay plus user) and one for "a session you start yourself in
+DIR".
+
+### Managed settings
+
+Setup and doctor read, read-only:
+
+- macOS: `/Library/Managed Preferences/<user>/com.anthropic.claudecode.plist`,
+  then `/Library/Managed Preferences/com.anthropic.claudecode.plist`, converted
+  with `plutil -convert json -o -`; then
+  `/Library/Application Support/ClaudeCode/managed-settings.json` and
+  `managed-settings.d/*.json`.
+- Linux: `/etc/claude-code/managed-settings.json` and `managed-settings.d/*.json`.
+
+`managedSourcesBehavior: merge` in the plist merges it with the file. Tests point
+the readers at fixtures with `CCTRL_CLAUDE_MANAGED_DIR` and
+`CCTRL_CLAUDE_MANAGED_PLIST_JSON`. cctrl never writes a managed source.
+
+### Version gate
+
+| Claude Code | Result |
+|---|---|
+| below 2.1.224 | refused: no cross-session messaging (`claude update`) |
+| below 2.1.232 | warns: no `/config` row "Messages from your other sessions" |
+| below 2.1.248 | warns: an invalid value is silently ignored instead of handled as documented |
+| 2.1.248 and later | no version finding |
+| not found, unparseable or a pre-release | needs `--yes` |
+
+The key's own first version is undocumented, so 2.1.224 is the messaging floor,
+not a verified first-key version.
+
+### Spawned scope and `--override-user`
+
+`messaging.claude.crossSessionInbound` lives in cctrl's merged config
+(defaults, legacy, user, then `data/config.local.json`; later wins). It is unset by
+default. At each launch cctrl adds the key to the profile's `--settings`
+overlay; a launch with no profile gets a key-only overlay, and no overlay file is
+written when nothing applies. `cctrl peer setup --scope spawned|both` reads
+the merged config the same way a spawn does. It prints the value in force and the
+file it came from, and **refuses (exit 1, naming the file)** when
+`config.local.json` sets the key, or when `--value unset` cannot remove a value
+that a lower file sets. Edit that file by hand in those cases.
+
+Because `--settings` outranks user settings, an overlay `accept` could override a
+user `hold` or `refuse`. It does not, unless asked. At every launch and restart
+cctrl keeps the stricter of the two (`refuse` over `hold` over `accept`): when the
+user value is stricter than the configured one, the overlay omits the key and cctrl
+prints one warning naming `--override-user`. `--override-user` (spawned or both
+scope) writes `messaging.claude.overrideUser: true`, which lets the overlay
+override a user value. Only the JSON boolean `true` counts; any other value
+warns. Running setup again without `--override-user` removes it.
+
+**Restart limit.** Spawned scope applies to new launches only. A running session
+keeps the overlay it started with, even after a later change. `cctrl restart`
+refreshes the overlay for a session that already has one (a profile session, or
+one started with the key set) and drops a stale key. A session started with no
+profile and no overlay has no `--settings` flag, and a restart does not add one,
+so it picks the value up only when you close it and start a new one. This fails
+closed: such a session simply keeps Claude's default.
+
+### `cctrl peer doctor` messaging checks
+
+Read-only. Each check is `{name, ok, status, summary, remedy}` in `--json`;
+`status` is `pass`, `warn` or `fail`, and `ok` is false only for `fail`. A missing
+opt-in is a warning, because `accept` is a choice. Every remedy for a Claude
+check ends with `on another Mac: cctrl --host ALIAS peer setup --yes` for each
+other registered host.
+
+| Check | Warns or fails when | Fix |
+|---|---|---|
+| `claude_cli_version` | version below 2.1.224 (fail), 2.1.232 or 2.1.248 (warn), or not readable | `claude update` |
+| `claude_inbound_own_sessions` | no value is set, so Claude's per-class default decides | `cctrl peer setup --scope user` |
+| `claude_inbound_spawned` | the value for a cctrl spawn is not `accept` | `cctrl peer setup --scope spawned` (or `user`) |
+| `claude_inbound_managed` | a managed value overrides, or is invalid (fail) | ask the administrator to change the managed settings |
+| `claude_inbound_project_stricter` | a project or local file in the repo is stricter | edit that file |
+| `claude_inbound_invalid` | an unrecognised value or unreadable settings file (fail): inbound mail is forced to `hold` | fix or remove the key in the named file |
+| `claude_isolate_peer_machines` | `isolatePeerMachines` is `true` anywhere | remove it from the named file |
+| `claude_dialog_expiry` | `dialogExpiry` or the dialog-timeout variable is not a positive value | set `dialogExpiry` to a positive value, or remove it |
+| `codex_bridge_endpoints` | a live cctrl Codex session has no live bridge endpoint | run `cctrl bridge enable` inside that Codex session |
+| `codex_bridge_orphans` | a bridge daemon belongs to an archived or missing Codex thread | informational: doctor reports orphans only for archived or missing threads, never stops a daemon and never advises `kill` |
+
+Codex needs no admission setting. Bridge input enters through `thread/queue/add`
+with no approval dialog (steer stays off by default and setup never changes
+it). Codex needs a bridge endpoint so Claude can find it. A hook-driven
+auto-enable for cctrl-started Codex sessions is not part of setup; see the
+[auto-enable findings](findings/codex-bridge-auto-enable.md).
+
+### Never set `isolatePeerMachines`
+
+`cctrl peer setup` never writes `isolatePeerMachines`. Where it is `true`,
+messages that cross machines wait for an approval prompt, and unattended bypass
+workers would stall on it. Doctor warns when it is `true` in any scope.
+
+### Remote Macs
+
+The native bridge is local only. Each Mac reads its own settings, so each Mac
+needs its own setup: `cctrl --host ALIAS peer setup --scope user --yes`. cctrl
+never propagates the setting. Whether `accept` also governs messages arriving
+from another machine through Remote Control is unverified; do not rely on it.
+
 ## Enable, discover, and send
 
 The current bridge is local and POSIX-only: it does not expose a network
