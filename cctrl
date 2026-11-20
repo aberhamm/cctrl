@@ -15681,7 +15681,7 @@ cmd_peer() {
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer by-session claude:SESSION_ID [--json]"
             echo "                                     The one mailbox peer backing a native Claude session (refuses 0 or 2+)"
-            echo "  cctrl peer setup [--scope user] [--value accept|hold|refuse|unset] [--dir PATH] [--dry-run] [--yes] [--json]"
+            echo "  cctrl peer setup [--scope user|spawned|both] [--value accept|hold|refuse|unset] [--dir PATH] [--dry-run] [--yes] [--override-user] [--json]"
             echo "                                     Opt in to Claude cross-session messages (crossSessionInbound in user settings)"
             echo "  cctrl peer whoami [--as NAME] [--json]"
             echo "  cctrl peer whois <uds:/path.sock|pid:N> [--name NAME] [--mode MODE] [--no-tmux] [--json]"
