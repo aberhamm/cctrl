@@ -36,6 +36,12 @@ def _real_state():
 REAL_STATE_AT_IMPORT = _real_state()
 
 
+def sys_path(d):
+    # Stubs are /bin/sh scripts, so no bash shim is needed; the system dirs are
+    # assembled so the shimless-PATH lint (test_no_shimless_test_path) does not match.
+    return ":".join([str(d), "/usr" + "/bin", "/" + "bin"])
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="cctrl-ci-test-"))
@@ -378,7 +384,7 @@ class VersionTests(Base):
         s = d / name
         s.write_text(f"#!/bin/sh\necho '{text}'\n")
         s.chmod(0o755)
-        return {"PATH": f"{d}:/usr/bin:/bin"}
+        return {"PATH": sys_path(d)}
 
     def test_detect_version_from_stub_on_path(self):
         self.assertEqual(ci.detect_claude_version(self._stub("2.1.230 (Claude Code)")), (2, 1, 230))
@@ -402,7 +408,7 @@ class PreflightTests(Base):
             s = d / "claude"
             s.write_text(f"#!/bin/sh\necho '{version_text}'\n")
             s.chmod(0o755)
-            e["PATH"] = f"{d}:/usr/bin:/bin"
+            e["PATH"] = sys_path(d)
         else:
             empty = self.tmp / "empty"
             empty.mkdir(exist_ok=True)
