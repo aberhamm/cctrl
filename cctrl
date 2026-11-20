@@ -59,17 +59,6 @@ _cctrl_own_umask() {
     export CCTRL_CALLER_UMASK="$_CCTRL_CALLER_UMASK"
 }
 
-# Replace TARGET with TMP, keeping TARGET's own mode when it already exists
-# (tmp files are 0600, so a plain mv would tighten a user's 0644 file).
-_mv_keep_mode() { # TMP TARGET
-    local tmp="$1" target="$2" m=""
-    if [[ -f "$target" && ! -L "$target" ]]; then
-        m="$(stat -f '%Lp' "$target" 2>/dev/null || stat -c '%a' "$target" 2>/dev/null || true)"
-        [[ "$m" =~ ^[0-7]{3,4}$ ]] && chmod "$m" "$tmp" 2>/dev/null
-    fi
-    mv -f "$tmp" "$target"
-}
-
 # Plan 116 A0: every data, costs, usage, snapshot, audit and config path comes
 # from the one resolver, lib/paths.sh (rules there; lib/paths.py is its Python
 # twin). cctrl must run as a single file (tests and old tooling copy only this
