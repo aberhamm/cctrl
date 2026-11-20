@@ -10,6 +10,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("claude_inbound", ROOT / "lib/claude_inbound.py")
 ci = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = ci
 spec.loader.exec_module(ci)
 
 REAL_SETTINGS = Path(os.path.expanduser("~/.claude/settings.json"))
