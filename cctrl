@@ -2111,6 +2111,39 @@ _profile_settings_ensure_dir() {
     return 0
 }
 
+# msg-setup P3: the crossSessionInbound value a spawned Claude's --settings
+# overlay should carry, or nothing. Opt-in: only the cctrl config key
+# messaging.claude.crossSessionInbound (accept|hold|refuse) turns it on.
+# The overlay beats user settings, so without messaging.claude.overrideUser
+# (stored by `cctrl peer setup --scope spawned --override-user`) a user-set
+# hold or refuse is never overridden: the key is omitted and one warning
+# explains why. Prints the value (or nothing); warnings go to stderr.
+_spawn_cross_session_inbound() {
+    command -v jq >/dev/null 2>&1 || return 0
+    local v override user_file user_val
+    v="$(_config_jq '.messaging.claude.crossSessionInbound // empty' 2>/dev/null || true)"
+    [[ -n "$v" ]] || return 0
+    case "$v" in
+        accept|hold|refuse) ;;
+        *)
+            echo -e "${YELLOW}WARN: messaging.claude.crossSessionInbound must be accept, hold or refuse (got '$v'); ignored.${RESET}" >&2
+            return 0
+            ;;
+    esac
+    override="$(_config_jq '.messaging.claude.overrideUser // false' 2>/dev/null || true)"
+    if [[ "$override" != "true" ]]; then
+        user_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+        user_val="$(jq -r '.crossSessionInbound // empty' "$user_file" 2>/dev/null || true)"
+        case "$user_val" in
+            hold|refuse)
+                echo -e "${YELLOW}WARN: user settings set crossSessionInbound to $user_val; the spawn overlay will not override it. Run: cctrl peer setup --scope spawned --override-user (or change the user setting).${RESET}" >&2
+                return 0
+                ;;
+        esac
+    fi
+    printf '%s' "$v"
+}
+
 # Write a profile's --settings overlay file for one launch/restart (claude
 # only -- codex has no --settings mechanism here). Built from the same
 # _profile_overlay_json_for_agent used by the process-env overlay, plus an
@@ -2119,31 +2152,49 @@ _profile_settings_ensure_dir() {
 # through to whatever the global settings.json happens to have -- the spike
 # in docs/findings/profile-settings-spike.md confirmed --settings merges its
 # env per-key with the global settings.json, not block-replace, so no other
-# global env keys need copying here).
+# global env keys need copying here). msg-setup P3 adds the opt-in
+# crossSessionInbound key (_spawn_cross_session_inbound); with no profile
+# (empty/none) the overlay is that key alone, and when there is nothing to
+# write no file is made -- unless $4 is "refresh" and the file already
+# exists (a restart: the running flags still point at it), in which case it
+# is rewritten, as {} if nothing applies, so a stale key cannot linger.
 #   $1=agent $2=profile_file(may be empty/none) $3=key (tmux session name, or
 #   fg-$$ for a foreground launch -- see _profile_settings_gc for how the key
-#   is later classified as live/dead)
+#   is later classified as live/dead) $4=optional "refresh"
 # Prints the written file's absolute path on success; prints nothing and
 # returns nonzero on any failure (missing jq, dir refusal, etc).
 _profile_settings_write() {
-    local agent="$1" pf="${2:-}" key="$3"
+    local agent="$1" pf="${2:-}" key="$3" mode="${4:-}"
     [[ "$agent" == "claude" ]] || return 0
     command -v jq >/dev/null 2>&1 || return 0
     [[ -n "$key" ]] || return 1
 
+    local inbound
+    inbound="$(_spawn_cross_session_inbound)"
+
     local dir
     dir="$(_profile_settings_dir)"
+    if [[ -z "$pf" ]]; then
+        if [[ -z "$inbound" && ! ( "$mode" == "refresh" && -f "$dir/${key}.json" ) ]]; then
+            return 0
+        fi
+    fi
     _profile_settings_ensure_dir "$dir" || return 1
 
-    local overlay provider_keys_json
-    overlay="$(_profile_overlay_json_for_agent "$agent" "$pf")"
-    provider_keys_json="$(printf '%s\n' "${CCTRL_PROVIDER_ENV_KEYS[@]}" | jq -R . | jq -s .)"
-
     local file="$dir/${key}.json" tmp="$dir/.${key}.json.tmp.$$"
-    jq -n --argjson overlay "$overlay" --argjson keys "$provider_keys_json" '
-        ($keys | map({(.): ""}) | add // {}) as $neutral
-        | {env: ($neutral + $overlay.env)}
-    ' > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    if [[ -z "$pf" ]]; then
+        jq -n --arg v "$inbound" 'if $v == "" then {} else {crossSessionInbound: $v} end' > "$tmp" 2>/dev/null \
+            || { rm -f "$tmp"; return 1; }
+    else
+        local overlay provider_keys_json
+        overlay="$(_profile_overlay_json_for_agent "$agent" "$pf")"
+        provider_keys_json="$(printf '%s\n' "${CCTRL_PROVIDER_ENV_KEYS[@]}" | jq -R . | jq -s .)"
+        jq -n --argjson overlay "$overlay" --argjson keys "$provider_keys_json" --arg v "$inbound" '
+            ($keys | map({(.): ""}) | add // {}) as $neutral
+            | {env: ($neutral + $overlay.env)}
+            + (if $v == "" then {} else {crossSessionInbound: $v} end)
+        ' > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    fi
     chmod 600 "$tmp"
     mv -f "$tmp" "$file" || { rm -f "$tmp"; return 1; }
     printf '%s' "$file"
@@ -2626,8 +2677,11 @@ _launch_exec_agent() {
         # overlay -- belt-and-braces, so a profile's provider choice still
         # wins even if something downstream of claude's own startup reads
         # the global settings.json directly. Profile "none" (pf empty) gets
-        # no file; its only protection is the phase-4 scrub.
-        if [[ -n "$pf" ]]; then
+        # no file (unless the crossSessionInbound opt-in applies); its only
+        # protection is the phase-4 scrub.
+        # msg-setup P3: with no profile the overlay is made only when the
+        # opt-in crossSessionInbound config key applies (key-only file).
+        if [[ "$agent" == "claude" ]]; then
             local _settings_key
             if [[ "${CCTRL_SESSION_KIND:-}" == "tmux" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
                 _settings_key="$CCTRL_SESSION_NAME"
@@ -2635,7 +2689,7 @@ _launch_exec_agent() {
                 _settings_key="fg-$$"
             fi
             local _settings_file
-            _settings_file="$(_profile_settings_write "$agent" "$pf" "$_settings_key")"
+            _settings_file="$(_profile_settings_write "$agent" "$pf" "$_settings_key" || true)"
             if [[ -n "$_settings_file" ]]; then
                 export CCTRL_PROFILE_SETTINGS_FILE="$_settings_file"
                 LAUNCH_FLAGS+=("--settings" "$_settings_file")
@@ -15610,7 +15664,7 @@ cmd_peer() {
         gc) _peer_cmd_gc "$@" ;;
         watch) _peer_cmd_watch "$@" ;;
         doctor) _peer_cmd_doctor "$@" ;;
-        setup) python3 -I "$SCRIPT_DIR/lib/peer_setup.py" "$@" ;;
+        setup) CCTRL_SETUP_CONFIG_FILE="$CONFIG_USER_FILE" python3 -I "$SCRIPT_DIR/lib/peer_setup.py" "$@" ;;
         repair) _peer_cmd_repair "$@" ;;
         doorbell) _peer_cmd_doorbell "$@" ;;
         mcp) _peer_cmd_mcp "$@" ;;
@@ -23205,11 +23259,17 @@ cmd_restart() {
     # original launch wrote. Same key (the tmux session name) as the
     # original launch, so this overwrites in place rather than littering.
     local _restart_profile="${CCTRL_SESSION_PROFILE:-none}"
-    if [[ "$_restart_profile" != "none" && -n "${CCTRL_SESSION_NAME:-}" ]]; then
-        local _restart_pf
-        _restart_pf="$(_profile_find "$_restart_profile" 2>/dev/null || true)"
-        if [[ -n "$_restart_pf" ]]; then
-            _profile_settings_write claude "$_restart_pf" "$CCTRL_SESSION_NAME" >/dev/null \
+    if [[ -n "${CCTRL_SESSION_NAME:-}" ]]; then
+        local _restart_pf=""
+        if [[ "$_restart_profile" != "none" ]]; then
+            _restart_pf="$(_profile_find "$_restart_profile" 2>/dev/null || true)"
+        fi
+        # msg-setup P3: a profile-none session may still carry a key-only
+        # crossSessionInbound overlay; "refresh" rewrites that existing file
+        # the same way launch would. A named profile that cannot be found is
+        # left alone, as before.
+        if [[ -n "$_restart_pf" || "$_restart_profile" == "none" ]]; then
+            _profile_settings_write claude "$_restart_pf" "$CCTRL_SESSION_NAME" refresh >/dev/null \
                 || echo -e "${YELLOW}WARN: could not refresh the profile overlay for restart; continuing with the existing file.${RESET}" >&2
         fi
     fi

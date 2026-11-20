@@ -16236,6 +16236,169 @@ test_statusline_claude_install_refuses_invalid_settings() {
     echo "ok: statusline claude install refuses invalid settings.json"
 }
 
+_sp_launch() { # _sp_launch HOME PROFILE: foreground fake-claude launch; prints argv lines (+ stderr)
+    local home="$1" prof="$2"
+    env -u CLAUDE_CONFIG_DIR HOME="$home" CCTRL_USER_CONFIG="$home/cctrl-config.json" \
+        CCTRL_PROFILES_DIR="$home/profiles" CCTRL_RUNTIME_DIR="$home/runtime" \
+        PATH="$TMPDIR:$PATH" "$ROOT/cctrl" start --foreground --agent claude --profile "$prof" -m x 2>&1
+}
+_sp_settings_path() { printf '%s\n' "$1" | awk '/^ARG\[[0-9]+\]=--settings$/{getline; sub(/^ARG\[[0-9]+\]=/, ""); print; exit}'; }
+
+test_spawned_overlay_cross_session_inbound() {
+    # msg-setup P3 (plan case 8): the spawn overlay carries crossSessionInbound
+    # only when the cctrl config opts in; it never overrides a user hold/refuse
+    # without overrideUser; a profile-none launch gets a key-only overlay.
+    make_fake_agent "$TMPDIR/claude" claude
+    local home="$TMPDIR/sp-home" out sp cfg
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
+    cfg="$home/cctrl-config.json"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}}}\n' > "$home/profiles/work.json"
+
+    # Unset (default): no key anywhere, and profile none still gets no overlay.
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    [[ -f "$sp" ]] || fail "no overlay for a profile launch: $out"
+    jq -e 'has("crossSessionInbound") | not' "$sp" >/dev/null || fail "key present while unset: $(cat "$sp")"
+    out="$(_sp_launch "$home" none)"
+    assert_not_contains "$out" "--settings"
+
+    # Opt in: the key rides in the overlay next to env; profile none gets a key-only file.
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept"}}}\n' > "$cfg"
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e '.crossSessionInbound == "accept" and .env.CLAUDE_CODE_USE_BEDROCK == "1"' "$sp" >/dev/null \
+        || fail "profile overlay lacks the key or lost env: $(cat "$sp")"
+    out="$(_sp_launch "$home" none)"; sp="$(_sp_settings_path "$out")"
+    [[ -f "$sp" ]] || fail "profile none got no overlay while opted in: $out"
+    [[ "$(jq -c . "$sp")" == '{"crossSessionInbound":"accept"}' ]] || fail "profile none overlay is not key-only: $(cat "$sp")"
+    [[ "$(stat -f %Lp "$sp")" == "600" ]] || fail "overlay mode is not 600"
+
+    # User hold or refuse: the overlay omits the key and a warning is printed.
+    local v
+    for v in hold refuse; do
+        printf '{"crossSessionInbound":"%s"}\n' "$v" > "$home/.claude/settings.json"
+        out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+        jq -e 'has("crossSessionInbound") | not' "$sp" >/dev/null || fail "overlay overrode user $v: $(cat "$sp")"
+        assert_contains "$out" "--override-user"
+        assert_contains "$out" "user settings"
+        out="$(_sp_launch "$home" none)"
+        assert_not_contains "$out" "--settings"
+        assert_contains "$out" "--override-user"
+    done
+
+    # overrideUser in the config applies it.
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept","overrideUser":true}}}\n' > "$cfg"
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e '.crossSessionInbound == "accept"' "$sp" >/dev/null || fail "overrideUser did not apply the key: $(cat "$sp")"
+    out="$(_sp_launch "$home" none)"; sp="$(_sp_settings_path "$out")"
+    [[ "$(jq -c . "$sp")" == '{"crossSessionInbound":"accept"}' ]] || fail "profile none override overlay: $(cat "$sp")"
+
+    # A user accept never needs the override.
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept"}}}\n' > "$cfg"
+    printf '{"crossSessionInbound":"accept"}\n' > "$home/.claude/settings.json"
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e '.crossSessionInbound == "accept"' "$sp" >/dev/null || fail "user accept blocked the overlay"
+    assert_not_contains "$out" "--override-user"
+
+    # An unrecognised config value is ignored with a warning.
+    printf '{"messaging":{"claude":{"crossSessionInbound":"yes"}}}\n' > "$cfg"
+    rm -f "$home/.claude/settings.json"
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e 'has("crossSessionInbound") | not' "$sp" >/dev/null || fail "bad config value reached the overlay"
+    assert_contains "$out" "accept, hold or refuse"
+    echo "ok: spawn overlay carries crossSessionInbound only when opted in, never overrides user hold/refuse without overrideUser, and profile none gets a key-only overlay"
+}
+
+test_restart_overlay_cross_session_inbound() {
+    # msg-setup P3: restart regenerates the same overlay as launch, for a
+    # profile session and for a profile-none session that has an overlay file.
+    local home="$TMPDIR/sr-home" runtime out marker log dir
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
+    runtime="$home/runtime"; dir="$runtime/cctrl-$(id -u)/profile-settings"; mkdir -p "$dir"
+    printf '{"agents":{"claude":{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}}}\n' > "$home/profiles/work.json"
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept"}}}\n' > "$home/cctrl-config.json"
+    marker="$home/marker"; make_fake_tmux "$TMPDIR/tmux"; log="$home/tmux.log"; : > "$log"
+    _sr() { # _sr PROFILE
+        env -u CLAUDE_CONFIG_DIR HOME="$home" CCTRL_USER_CONFIG="$home/cctrl-config.json" \
+            CLAUDE_CODE_SESSION_ID="sess-sr" CCTRL_RESTART_MARKER="$marker" CCTRL_SESSION_KIND=tmux \
+            CCTRL_SESSION_NAME="TMUX--sr" CCTRL_SESSION_PROFILE="$1" CCTRL_PROFILES_DIR="$home/profiles" \
+            CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1
+    }
+    printf '{"env":{"CLAUDE_CODE_USE_BEDROCK":""}}\n' > "$dir/TMUX--sr.json"
+    out="$(_sr work)" || fail "restart (profile) failed: $out"
+    jq -e '.crossSessionInbound == "accept" and .env.CLAUDE_CODE_USE_BEDROCK == "1"' "$dir/TMUX--sr.json" >/dev/null \
+        || fail "restart overlay (profile) lacks the key: $(cat "$dir/TMUX--sr.json")"
+    printf '{"crossSessionInbound":"hold"}\n' > "$home/.claude/settings.json"
+    out="$(_sr work)" || fail "restart (profile, user hold) failed: $out"
+    jq -e 'has("crossSessionInbound") | not' "$dir/TMUX--sr.json" >/dev/null || fail "restart overrode user hold"
+    assert_contains "$out" "--override-user"
+    rm -f "$home/.claude/settings.json"
+    # Profile none with an existing overlay file: rewritten key-only; unset -> empty object.
+    printf '{"crossSessionInbound":"hold"}\n' > "$dir/TMUX--sr.json"
+    out="$(_sr none)" || fail "restart (none) failed: $out"
+    [[ "$(jq -c . "$dir/TMUX--sr.json")" == '{"crossSessionInbound":"accept"}' ]] || fail "restart (none) overlay: $(cat "$dir/TMUX--sr.json")"
+    printf '{}\n' > "$home/cctrl-config.json"
+    out="$(_sr none)" || fail "restart (none, unset) failed: $out"
+    [[ "$(jq -c . "$dir/TMUX--sr.json")" == '{}' ]] || fail "stale key left after unset: $(cat "$dir/TMUX--sr.json")"
+    # Profile none without any overlay file and nothing configured: no file appears.
+    rm -f "$dir/TMUX--sr.json"
+    out="$(_sr none)" || fail "restart (none, no file) failed: $out"
+    [[ ! -e "$dir/TMUX--sr.json" ]] || fail "restart created an overlay nobody asked for"
+    unset -f _sr
+    echo "ok: restart regenerates the same crossSessionInbound overlay as launch"
+}
+
+test_peer_setup_spawned_scope() {
+    # msg-setup P3: `peer setup --scope spawned|both` writes the cctrl config key,
+    # not Claude user settings (spawned), idempotently, with the same trade-off
+    # and warning flow.
+    local home="$TMPDIR/pss-home" out rc cfg f sum
+    rm -rf "$home"; mkdir -p "$home/.claude"
+    cfg="$home/cctrl-config.json"; f="$home/.claude/settings.json"
+    _pss() { CCTRL_USER_CONFIG="$cfg" _ps_env "$home" "${PS_VER:-2.1.329}" "$ROOT/cctrl" peer setup "$@"; }
+    printf '{"model":"opus"}\n' > "$f"; local usum; usum="$(shasum -a 256 "$f")"
+    printf '{"defaultProfile":"work"}\n' > "$cfg"
+
+    out="$(_pss --scope spawned --yes 2>&1)" || fail "spawned setup failed: $out"
+    assert_contains "$out" "What accept means"
+    [[ "$(jq -r '.messaging.claude.crossSessionInbound' "$cfg")" == "accept" ]] || fail "config key not written: $(cat "$cfg")"
+    [[ "$(jq -r '.defaultProfile' "$cfg")" == "work" ]] || fail "other config keys lost"
+    jq -e '.messaging.claude | has("overrideUser") | not' "$cfg" >/dev/null || fail "overrideUser set without the flag"
+    [[ "$usum" == "$(shasum -a 256 "$f")" ]] || fail "spawned scope touched Claude user settings"
+    sum="$(shasum -a 256 "$cfg")"
+    out="$(_pss --scope spawned --yes 2>&1)" || fail "second spawned run failed: $out"
+    assert_contains "$out" "unchanged"
+    [[ "$sum" == "$(shasum -a 256 "$cfg")" ]] || fail "second spawned run changed the config"
+
+    # User hold: warn that the overlay will omit the key; --override-user stores the opt-in.
+    printf '{"crossSessionInbound":"hold"}\n' > "$f"
+    out="$(_pss --scope spawned --yes 2>&1)" || fail "spawned with user hold failed: $out"
+    assert_contains "$out" "--override-user"
+    out="$(_pss --scope spawned --override-user --yes 2>&1)" || fail "override run failed: $out"
+    [[ "$(jq -r '.messaging.claude.overrideUser' "$cfg")" == "true" ]] || fail "overrideUser not stored: $(cat "$cfg")"
+    assert_not_contains "$out" "will omit"
+    out="$(_pss --scope spawned --dry-run --json 2>&1)" || fail "dry-run json failed: $out"
+    printf '%s' "$out" | jq -e '.scope == "spawned"' >/dev/null || fail "json lacks scope: $out"
+
+    # both: user settings and config both change, one confirmation.
+    printf '{"model":"opus"}\n' > "$f"; printf '{}\n' > "$cfg"
+    out="$(_pss --scope both --yes 2>&1)" || fail "both failed: $out"
+    [[ "$(jq -r .crossSessionInbound "$f")" == "accept" ]] || fail "both: user settings not written"
+    [[ "$(jq -r '.messaging.claude.crossSessionInbound' "$cfg")" == "accept" ]] || fail "both: config not written"
+
+    # unset removes the key and the empty parents.
+    out="$(_pss --scope spawned --value unset --yes 2>&1)" || fail "unset failed: $out"
+    [[ "$(jq -c . "$cfg")" == '{}' ]] || fail "unset left residue: $(cat "$cfg")"
+    # --override-user means nothing for user scope.
+    rc=0; out="$(_pss --scope user --override-user --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 64 ]] || fail "--override-user with user scope: rc $rc: $out"
+    # An invalid config file is refused and left alone.
+    printf '{"x":,}\n' > "$cfg"; sum="$(shasum -a 256 "$cfg")"
+    rc=0; out="$(_pss --scope spawned --yes 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "invalid config accepted"
+    [[ "$sum" == "$(shasum -a 256 "$cfg")" ]] || fail "invalid config touched"
+    unset -f _pss
+    echo "ok: peer setup --scope spawned/both writes the cctrl config key idempotently with the override guard"
+}
+
 test_hooks_doctor_fix_hint_names_the_side() {
     # mdec-1103 verify: plain `hooks install` no longer touches Codex, so the
     # doctor's final hint must name the command for the side with the issue.
