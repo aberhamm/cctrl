@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Library-level tests for lib/claude_inbound.py (msg-setup P1, plan cases 1-7).
+"""Library-level tests for lib/claude_inbound.py (read, resolve and set crossSessionInbound).
 
 Every path lives under a temp directory. The real ~/.claude is never read or
 written; a guard test asserts its settings.json mtime did not move.

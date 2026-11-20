@@ -90,7 +90,7 @@ class CodexChecks(unittest.TestCase):
         self.assertEqual([o["actor"] for o in c["orphans"]], ["codex:T1"])
         self.assertIn("never stops", c["remedy"])
         self.assertNotIn("kill", c["remedy"])
-        self.assertIn("CODEX_THREAD_ID=<thread id> cctrl bridge stop", c["remedy"])
+        self.assertIn("env -u CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID=<thread id> cctrl bridge stop", c["remedy"])
 
     def test_live_app_thread_is_not_flagged(self):
         make_ledger(self.root, [("codex:T1", self.proc.pid, self.started)])

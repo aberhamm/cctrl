@@ -16015,7 +16015,7 @@ _ps_env() { # _ps_env HOME VERSION cmd...: temp HOME, stub claude, managed fixtu
 }
 
 test_peer_setup_user_scope() {
-    # msg-setup P2: `cctrl peer setup` writes crossSessionInbound into user settings.
+    # `cctrl peer setup` writes crossSessionInbound into user settings.
     # Temp HOME only; claude is a stub; managed paths point at fixtures.
     local home="$TMPDIR/ps-home" out rc f b real_before real_after
     real_before="$(shasum -a 256 "$HOME/.claude/settings.json" 2>/dev/null || echo absent)"
@@ -16120,7 +16120,7 @@ test_peer_setup_user_scope() {
 }
 
 test_hooks_install_refuses_invalid_settings() {
-    # msg-setup P2: a broken settings.json must never be replaced by hooks only.
+    # a broken settings.json must never be replaced by hooks only.
     local home="$TMPDIR/hi-bad-home" f out rc sum
     rm -rf "$home"; mkdir -p "$home/.claude"; f="$home/.claude/settings.json"
     _hi() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks install; }
@@ -16144,7 +16144,7 @@ test_hooks_install_refuses_invalid_settings() {
 }
 
 test_peer_setup_trade_off_and_warning_order() {
-    # msg-setup P2 fix: the trade-off text shows on every accept write path, in
+    # the trade-off text shows on every accept write path, in
     # --json as the "trade_off" field; every warning prints BEFORE the prompt
     # (driven through a pty); a missing claude says so and asks for --yes.
     local home="$TMPDIR/pst-home" out rc f
@@ -16218,7 +16218,7 @@ PY
 }
 
 test_statusline_claude_install_refuses_invalid_settings() {
-    # msg-setup P2 fix: statusline install must not claim success on bad JSON.
+    # statusline install must not claim success on bad JSON.
     local home="$TMPDIR/sl-home" f out rc sum
     rm -rf "$home"; mkdir -p "$home/.claude"; f="$home/.claude/settings.json"
     _sl() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR -u CCTRL_CLAUDE_SETTINGS HOME="$home" "$ROOT/cctrl" statusline claude install; }
@@ -16245,7 +16245,7 @@ _sp_launch() { # _sp_launch HOME PROFILE: foreground fake-claude launch; prints 
 _sp_settings_path() { printf '%s\n' "$1" | awk '/^ARG\[[0-9]+\]=--settings$/{getline; sub(/^ARG\[[0-9]+\]=/, ""); print; exit}'; }
 
 test_spawned_overlay_cross_session_inbound() {
-    # msg-setup P3 (plan case 8): the spawn overlay carries crossSessionInbound
+    # Cross-session inbound: the spawn overlay carries crossSessionInbound
     # only when the cctrl config opts in; it never overrides a user hold/refuse
     # without overrideUser; a profile-none launch gets a key-only overlay.
     make_fake_agent "$TMPDIR/claude" claude
@@ -16308,7 +16308,7 @@ test_spawned_overlay_cross_session_inbound() {
 }
 
 test_restart_overlay_cross_session_inbound() {
-    # msg-setup P3: restart regenerates the same overlay as launch, for a
+    # restart regenerates the same overlay as launch, for a
     # profile session and for a profile-none session that has an overlay file.
     local home="$TMPDIR/sr-home" runtime out marker log dir
     rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
@@ -16347,7 +16347,7 @@ test_restart_overlay_cross_session_inbound() {
 }
 
 test_peer_setup_spawned_scope() {
-    # msg-setup P3: `peer setup --scope spawned|both` writes the cctrl config key,
+    # `peer setup --scope spawned|both` writes the cctrl config key,
     # not Claude user settings (spawned), idempotently, with the same trade-off
     # and warning flow.
     local home="$TMPDIR/pss-home" out rc cfg f sum
@@ -16405,7 +16405,7 @@ test_peer_setup_spawned_scope() {
 }
 
 test_msg_setup_p3fix_setup_reads_merged_config() {
-    # msg-setup P3 fix F1: setup reads the merged cctrl config like a spawn does;
+    # Merged config: setup reads the merged cctrl config like a spawn does;
     # config.local.json wins over the user config, so setup refuses and names it.
     local home="$TMPDIR/p3f1-home" out rc cfg loc sum
     rm -rf "$home"; mkdir -p "$home/.claude"
@@ -16435,14 +16435,14 @@ test_msg_setup_p3fix_setup_reads_merged_config() {
 }
 
 test_msg_setup_p3fix_strictest_wins_and_override_boolean() {
-    # msg-setup P3 fix F2 + F3 (launch, setup text and doctor).
+    # Strictest setting wins and only a boolean overrides (launch, setup text and doctor).
     make_fake_agent "$TMPDIR/claude" claude
     local home="$TMPDIR/p3f2-home" out sp cfg
     rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
     cfg="$home/cctrl-config.json"; printf '{}\n' > "$home/profiles/work.json"
     _p3c() { printf '{"messaging":{"claude":{"crossSessionInbound":"%s"%s}}}\n' "$1" "${2:-}" > "$cfg"; }
     _p3u() { printf '{"crossSessionInbound":"%s"}\n' "$1" > "$home/.claude/settings.json"; }
-    # F2: config refuse beats user hold; no warning.
+    # Config refuse beats user hold; no warning.
     _p3c refuse; _p3u hold
     out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
     jq -e '.crossSessionInbound == "refuse"' "$sp" >/dev/null || fail "stricter config value dropped: $(cat "$sp")"
@@ -16457,7 +16457,7 @@ test_msg_setup_p3fix_strictest_wins_and_override_boolean() {
     out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
     jq -e 'has("crossSessionInbound") | not' "$sp" >/dev/null || fail "looser config overrode user refuse: $(cat "$sp")"
     assert_contains "$out" "--override-user"
-    # F3: only a JSON boolean true overrides.
+    # Only a JSON boolean true overrides.
     local bad
     for bad in '"true"' '1' '"yes"'; do
         _p3c accept ",\"overrideUser\":$bad"; _p3u refuse
@@ -16494,7 +16494,7 @@ test_msg_setup_p3fix_strictest_wins_and_override_boolean() {
 }
 
 test_msg_setup_p3fix_restart_missing_profile() {
-    # msg-setup P3 fix F4: a restart whose named profile is gone still refreshes the overlay.
+    # Restart: a restart whose named profile is gone still refreshes the overlay.
     local home="$TMPDIR/p3f4-home" runtime out marker log dir
     rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
     runtime="$home/runtime"; dir="$runtime/cctrl-$(id -u)/profile-settings"; mkdir -p "$dir"
@@ -16513,7 +16513,7 @@ test_msg_setup_p3fix_restart_missing_profile() {
 }
 
 test_msg_setup_p3fix_text_says_new_launches() {
-    # msg-setup P3 fix F5: no promise of "restart" for spawned scope.
+    # Spawned scope: no promise of "restart" for spawned scope.
     local home="$TMPDIR/p3f5-home" out
     rm -rf "$home"; mkdir -p "$home/.claude"
     out="$(_ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup --help 2>&1)"
@@ -16528,7 +16528,7 @@ test_msg_setup_p3fix_text_says_new_launches() {
 }
 
 test_peer_setup_version_unreadable_wording() {
-    # msg-setup P4: claude on PATH but its version unreadable is not "not found on PATH".
+    # claude on PATH but its version unreadable is not "not found on PATH".
     local home="$TMPDIR/psv-home" out rc=0
     rm -rf "$home"; mkdir -p "$home/.claude" "$home/stub" "$home/managed"
     printf '#!/bin/sh\necho "garbage"\n' > "$home/stub/claude"; chmod 755 "$home/stub/claude"
@@ -16549,7 +16549,7 @@ test_peer_setup_version_unreadable_wording() {
 }
 
 test_peer_doctor_messaging_readiness() {
-    # msg-setup P4 (plan case 10): doctor's messaging checks, every state, temp HOME only.
+    # Doctor: doctor's messaging checks, every state, temp HOME only.
     local home="$TMPDIR/pdm-home" out txt proj="$TMPDIR/pdm-home/proj" cfg="$TMPDIR/pdm-home/cfg.json"
     local data="$TMPDIR/pdm-home/data" hosts="$TMPDIR/pdm-home/hosts.json" bridge="$TMPDIR/pdm-home/bridge"
     local names="claude_cli_version claude_inbound_own_sessions claude_inbound_spawned claude_inbound_managed claude_inbound_project_stricter claude_inbound_invalid claude_isolate_peer_machines claude_dialog_expiry codex_bridge_endpoints codex_bridge_orphans"

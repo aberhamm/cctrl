@@ -2111,7 +2111,7 @@ _profile_settings_ensure_dir() {
     return 0
 }
 
-# msg-setup P3: the crossSessionInbound value a spawned Claude's --settings
+# Spawn overlay: the crossSessionInbound value a spawned Claude's --settings
 # overlay should carry, or nothing. Opt-in: only the cctrl config key
 # messaging.claude.crossSessionInbound (accept|hold|refuse) turns it on.
 # The overlay beats user settings, so without messaging.claude.overrideUser
@@ -2162,7 +2162,7 @@ _spawn_cross_session_inbound() {
 # through to whatever the global settings.json happens to have -- the spike
 # in docs/findings/profile-settings-spike.md confirmed --settings merges its
 # env per-key with the global settings.json, not block-replace, so no other
-# global env keys need copying here). msg-setup P3 adds the opt-in
+# global env keys need copying here). cross-session inbound adds the opt-in
 # crossSessionInbound key (_spawn_cross_session_inbound); with no profile
 # (empty/none) the overlay is that key alone, and when there is nothing to
 # write no file is made -- unless $4 is "refresh" and the file already
@@ -2689,7 +2689,7 @@ _launch_exec_agent() {
         # the global settings.json directly. Profile "none" (pf empty) gets
         # no file (unless the crossSessionInbound opt-in applies); its only
         # protection is the phase-4 scrub.
-        # msg-setup P3: with no profile the overlay is made only when the
+        # Spawn overlay: with no profile the overlay is made only when the
         # opt-in crossSessionInbound config key applies (key-only file).
         if [[ "$agent" == "claude" ]]; then
             local _settings_key
@@ -15443,7 +15443,7 @@ _peer_cmd_repair() {
     fi
 }
 
-# msg-setup P4: messaging readiness. Read-only: thread ids of live cctrl-owned
+# Doctor messaging readiness. Read-only: thread ids of live cctrl-owned
 # Codex tmux sessions, one per line.
 _peer_doctor_codex_threads() {
     local name agent id
@@ -15524,7 +15524,9 @@ _peer_cmd_doctor() {
                 echo "  claude_inbound_managed, claude_inbound_project_stricter, claude_inbound_invalid,"
                 echo "  claude_isolate_peer_machines, claude_dialog_expiry, codex_bridge_endpoints and"
                 echo "  codex_bridge_orphans (bridge daemons whose Codex thread is archived or missing;
-  doctor reports them and never stops or advises killing one)."
+  doctor reports them and never stops or advises killing one) and
+  codex_bridge_unseen_owner (passing info, shown beside a real orphan, for daemons whose
+  owner cctrl cannot see)."
                 echo "  Each has status pass, warn or fail and prints the exact fix, plus the"
                 echo "  cctrl --host ALIAS peer setup --yes form for every other registered host."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
@@ -23332,7 +23334,7 @@ cmd_restart() {
         if [[ "$_restart_profile" != "none" ]]; then
             _restart_pf="$(_profile_find "$_restart_profile" 2>/dev/null || true)"
         fi
-        # msg-setup P3: a profile-none session may still carry a key-only
+        # A profile-none session may still carry a key-only
         # crossSessionInbound overlay; "refresh" rewrites that existing file
         # the same way launch would. A named profile that cannot be found
         # still refreshes, key-only (its env is dropped), so a stale

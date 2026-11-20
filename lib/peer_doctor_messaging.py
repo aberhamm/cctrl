@@ -379,7 +379,7 @@ def _orphan_check(threads: list[str], rows, err, env=None, db: Path | None | str
                f"Codex state database: {text}")
     return check(name, WARN, summary,
                  "doctor never stops a daemon; check the thread is really gone first, then run "
-                 "CODEX_THREAD_ID=<thread id> cctrl bridge stop (the id is the part after codex: in the actor)",
+                 "env -u CLAUDE_CODE_SESSION_ID CODEX_THREAD_ID=<thread id> cctrl bridge stop (the id is the part after codex: in the actor; the env -u part lets it run from inside a Claude session too)",
                  orphans=orphans, unseen=unseen, info=info)
 
 
