@@ -157,7 +157,7 @@ other registered host.
 | `claude_isolate_peer_machines` | `isolatePeerMachines` is `true` anywhere | remove it from the named file |
 | `claude_dialog_expiry` | `dialogExpiry` or the dialog-timeout variable is not a positive value | set `dialogExpiry` to a positive value, or remove it |
 | `codex_bridge_endpoints` | a live cctrl Codex session has no live bridge endpoint | run `cctrl bridge enable` inside that Codex session |
-| `codex_bridge_orphans` | a bridge daemon belongs to an archived or missing Codex thread | informational: doctor reports orphans only for archived or missing threads, never stops a daemon and never advises `kill` |
+| `codex_bridge_orphans` | a bridge daemon belongs to an archived or missing Codex thread | the WARN counts only daemons whose Codex thread is archived or missing from the Codex state database; check the thread is really gone, then run `CODEX_THREAD_ID=<thread id> cctrl bridge stop`. Doctor never stops a daemon and never advises `kill`. Daemons whose thread is not archived (a Codex app thread, a hand-started codex) are listed on a separate passing check, `codex_bridge_unseen_owner`, as information |
 
 Codex needs no admission setting. Bridge input enters through `thread/queue/add`
 with no approval dialog (steer stays off by default and setup never changes

@@ -90,6 +90,7 @@ class CodexChecks(unittest.TestCase):
         self.assertEqual([o["actor"] for o in c["orphans"]], ["codex:T1"])
         self.assertIn("never stops", c["remedy"])
         self.assertNotIn("kill", c["remedy"])
+        self.assertIn("CODEX_THREAD_ID=<thread id> cctrl bridge stop", c["remedy"])
 
     def test_live_app_thread_is_not_flagged(self):
         make_ledger(self.root, [("codex:T1", self.proc.pid, self.started)])
@@ -106,6 +107,14 @@ class CodexChecks(unittest.TestCase):
         self.assertEqual(c["status"], "warn")
         self.assertEqual([o["actor"] for o in c["orphans"]], ["codex:T2"])
         self.assertEqual([o["actor"] for o in c["unseen"]], ["codex:T1"])
+        self.assertNotIn("owner not visible", c["summary"])
+        self.assertTrue(c["summary"].startswith("1 bridge daemon(s)"))
+        rows, err = pdm._ledger_endpoints(self.root)
+        with mock.patch.object(pdm, "_orphan_check", return_value=c):
+            split = pdm._orphan_checks([], rows, err)
+        self.assertEqual([x["name"] for x in split], ["codex_bridge_orphans", "codex_bridge_unseen_owner"])
+        self.assertEqual(split[1]["status"], "pass")
+        self.assertIn("owner not visible to cctrl", split[1]["summary"])
 
     def test_missing_or_unreadable_db_degrades_to_info(self):
         make_ledger(self.root, [("codex:T1", self.proc.pid, self.started)])
@@ -170,7 +179,7 @@ class Nits(unittest.TestCase):
         self.proj = Path(self.tmp.name) / "proj"
         (self.proj / ".claude").mkdir(parents=True)
 
-    def checks(self, user=None, project=None, local=None, hosts=(), managed=None):
+    def checks(self, user=None, project=None, local=None, hosts=(), managed=None, **kw):
         import json as _j
         if user is not None:
             (Path(self.tmp.name) / ".claude/settings.json").write_text(_j.dumps(user))
@@ -184,7 +193,7 @@ class Nits(unittest.TestCase):
             m.write_text(_j.dumps(managed))
             env["CCTRL_CLAUDE_MANAGED_PLIST_JSON"] = str(m)
         with mock.patch.object(pdm.ci, "detect_claude_version", return_value=(2, 1, 329)):
-            return {c["name"]: c for c in pdm.run(env, self.proj, [], list(hosts), None)}
+            return {c["name"]: c for c in pdm.run(env, self.proj, [], list(hosts), None, **kw)}
 
     def test_invalid_value_is_not_described_as_deliberate(self):
         c = self.checks(user={"crossSessionInbound": "yes"})["claude_inbound_own_sessions"]
@@ -205,6 +214,18 @@ class Nits(unittest.TestCase):
         c = self.checks(managed={"crossSessionInbound": "hold"})["claude_inbound_spawned"]
         self.assertIn("ask your administrator", c["remedy"])
         self.assertNotIn("cctrl peer setup", c["remedy"])
+
+    def test_bad_override_keeps_the_holding_scope_remedy(self):
+        cases = [({"managed": {"crossSessionInbound": "hold"}}, "ask your administrator"),
+                 ({"project": {"crossSessionInbound": "refuse"}}, "project settings"),
+                 ({"project": {}, "local": {"crossSessionInbound": "hold"}}, "settings.local.json")]
+        for kw, expect in cases:
+            c = self.checks(bad_override="'yes'", **kw)["claude_inbound_spawned"]
+            self.assertEqual(c["status"], "warn", kw)
+            self.assertIn("overrideUser", c["remedy"], kw)
+            self.assertIn(expect, c["remedy"], kw)
+        c = self.checks(bad_override="'yes'")["claude_inbound_spawned"]
+        self.assertIn("overrideUser", c["remedy"])
 
     def test_spawned_remote_form_uses_spawned_scope(self):
         c = self.checks(hosts=["mbp"])["claude_inbound_spawned"]

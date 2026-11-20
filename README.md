@@ -1545,6 +1545,9 @@ cctrl peer setup --dry-run             # show the change, write nothing
 - `--scope spawned` writes the cctrl config key
   `messaging.claude.crossSessionInbound`; cctrl then adds it to the `--settings`
   overlay of the Claude sessions it starts. Your own sessions are unchanged.
+  The stricter of the overlay and a user value wins unless `--override-user`
+  (only the JSON boolean `true` counts). Setup refuses, naming the file, when
+  `data/config.local.json` sets the key; edit that file by hand.
 - The file is backed up, replaced atomically, and left alone when nothing
   changes. An invalid `settings.json` is refused, never read as empty. Setup
   checks the Claude Code version and any managed, project or local value that

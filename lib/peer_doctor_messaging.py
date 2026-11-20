@@ -133,13 +133,16 @@ def _spawn_check(managed, user, proj, loc, config_inbound, override, hosts, bad_
     eff = ci.resolve(managed=managed.data if managed.source else None, overlay=overlay,
                      user=_doc(user), project=_doc(proj), local=_doc(loc))
     summary = f"sessions cctrl spawns: {_describe(eff)}" + (f"; {note}" if note else "")
+    bad_text = ""
+    bad_fix = ""
     if bad_override:
-        summary += (f"; messaging.claude.overrideUser is {bad_override}, not the JSON boolean true, so it counts as "
+        bad_text = (f"; messaging.claude.overrideUser is {bad_override}, not the JSON boolean true, so it counts as "
                     f"false")
-        return check(name, WARN, summary, "set messaging.claude.overrideUser to true (a JSON boolean) or remove it "
-                     "(cctrl peer setup --scope spawned --override-user writes it correctly)",
-                     effective=eff.value, source=eff.source)
+        bad_fix = ("set messaging.claude.overrideUser to true (a JSON boolean) or remove it "
+                   "(cctrl peer setup --scope spawned --override-user writes it correctly)")
     if eff.value == "accept":
+        if bad_override:
+            return check(name, WARN, summary + bad_text, bad_fix, effective=eff.value, source=eff.source)
         return check(name, PASS, summary, effective=eff.value, source=eff.source)
     tail = "; cctrl starts every Claude in bypass mode, so held messages wait for a person to approve them in that worker"
     if eff.source == "managed settings":
@@ -153,7 +156,9 @@ def _spawn_check(managed, user, proj, loc, config_inbound, override, hosts, bad_
     else:
         fix = _with_remote(f"{SETUP_SPAWNED} (or {SETUP_USER})", hosts,
                            "peer setup --scope spawned --yes")
-    return check(name, WARN, summary + tail, fix, effective=eff.value, source=eff.source)
+    if bad_fix:
+        fix = f"{fix}; also {bad_fix}"
+    return check(name, WARN, summary + bad_text + tail, fix, effective=eff.value, source=eff.source)
 
 
 def _managed_check(managed) -> dict:
@@ -371,10 +376,20 @@ def _orphan_check(threads: list[str], rows, err, env=None, db: Path | None | str
         return check(name, PASS, info, unseen=unseen)
     text = ", ".join(f"pid {o['pid']} ({o['actor']})" for o in orphans)
     summary = (f"{len(orphans)} bridge daemon(s) belong to a Codex thread that is archived or missing from the "
-               f"Codex state database: {text}" + (f"; {info}" if info else ""))
+               f"Codex state database: {text}")
     return check(name, WARN, summary,
-                 "doctor never stops a daemon; check the thread is really gone first, then run cctrl bridge stop "
-                 "from inside that thread (CODEX_THREAD_ID set to it)", orphans=orphans, unseen=unseen)
+                 "doctor never stops a daemon; check the thread is really gone first, then run "
+                 "CODEX_THREAD_ID=<thread id> cctrl bridge stop (the id is the part after codex: in the actor)",
+                 orphans=orphans, unseen=unseen, info=info)
+
+
+def _orphan_checks(threads, rows, err) -> list[dict]:
+    """The orphan check, plus a separate passing INFO check for daemons whose owner is not visible,
+    so the WARN line counts only the real orphans."""
+    c = _orphan_check(threads, rows, err)
+    if c["status"] == WARN and c.get("info"):
+        return [c, check("codex_bridge_unseen_owner", PASS, c["info"], unseen=c.get("unseen", []))]
+    return [c]
 
 
 # --- entry ------------------------------------------------------------------
@@ -397,7 +412,7 @@ def run(env, project_dir: Path, threads: list[str], hosts: list[str], bridge_roo
         _isolate_check(managed, user, proj, loc),
         _dialog_check(env, managed, user, proj, loc),
         _codex_endpoint_check(threads, rows, err),
-        _orphan_check(threads, rows, err),
+        *_orphan_checks(threads, rows, err),
     ]
 
 
