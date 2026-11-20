@@ -16143,6 +16143,99 @@ test_hooks_install_refuses_invalid_settings() {
     echo "ok: hooks install refuses invalid settings.json and leaves it byte-identical"
 }
 
+test_peer_setup_trade_off_and_warning_order() {
+    # msg-setup P2 fix: the trade-off text shows on every accept write path, in
+    # --json as the "trade_off" field; every warning prints BEFORE the prompt
+    # (driven through a pty); a missing claude says so and asks for --yes.
+    local home="$TMPDIR/pst-home" out rc f
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/proj/.claude"; f="$home/.claude/settings.json"
+    _pst() { _ps_env "$home" "${PS_VER:-2.1.329}" "$ROOT/cctrl" peer setup "$@"; }
+    printf '{}\n' > "$f"
+    out="$(_pst --yes 2>&1)" || fail "--yes failed: $out"
+    assert_contains "$out" "What accept means"
+    assert_contains "$out" "every bypass-mode session"
+    printf '{}\n' > "$f"
+    out="$(_pst --dry-run 2>&1)" || fail "dry-run failed: $out"
+    assert_contains "$out" "What accept means"
+    out="$(_pst --dry-run --json 2>&1)" || fail "dry-run json failed: $out"
+    printf '%s' "$out" | jq -e '.trade_off | contains("What accept means")' >/dev/null || fail "no trade_off in json: $out"
+    out="$(_pst --yes --json 2>&1)" || fail "yes json failed: $out"
+    printf '%s' "$out" | jq -e '.trade_off | contains("bypass")' >/dev/null || fail "no trade_off in --yes json: $out"
+    # A hold write is a loosening of nothing: no trade-off text.
+    printf '{}\n' > "$f"
+    out="$(_pst --value hold --yes 2>&1)" || fail "hold failed: $out"
+    assert_not_contains "$out" "What accept means"
+
+    # Warning order through a pty: the repo has a stricter local value, so the
+    # "will not take effect" warning must appear before "Proceed?".
+    printf '{}\n' > "$f"
+    printf '{"crossSessionInbound":"hold"}\n' > "$home/proj/.claude/settings.local.json"
+    out="$(_ps_env "$home" 2.1.329 python3 -I - "$ROOT/cctrl" "$home/proj" <<'PY'
+import os, pty, sys, select
+cctrl, proj = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(cctrl, [cctrl, "peer", "setup", "--dir", proj])
+buf = b""
+sent = False
+while True:
+    r, _, _ = select.select([fd], [], [], 20)
+    if not r:
+        break
+    try:
+        d = os.read(fd, 4096)
+    except OSError:
+        break
+    if not d:
+        break
+    buf += d
+    if not sent and b"Proceed?" in buf:
+        os.write(fd, b"n\n")
+        sent = True
+os.waitpid(pid, 0)
+sys.stdout.write(buf.decode("utf-8", "replace"))
+PY
+    )" || true
+    assert_contains "$out" "will not take effect"
+    assert_contains "$out" "What accept means"
+    assert_contains "$out" "Proceed?"
+    local head="${out%%Proceed?*}"
+    assert_contains "$head" "will not take effect"
+    assert_contains "$head" "What accept means"
+    [[ "$(cat "$f")" == "{}" ]] || fail "declined prompt wrote: $(cat "$f")"
+
+    # Missing claude: on a terminal the refusal names claude and --yes.
+    rm -f "$home/proj/.claude/settings.local.json"
+    rc=0; out="$(env -u CLAUDE_CONFIG_DIR -u TMUX -u TMUX_PANE HOME="$home" PATH="$(_test_path)" \
+        CCTRL_CLAUDE_MANAGED_DIR="$home/managed" CCTRL_CLAUDE_MANAGED_PLIST_JSON="$home/none.json" \
+        "$ROOT/cctrl" peer setup </dev/null 2>&1)" || rc=$?
+    [[ "$rc" -eq 65 ]] || fail "missing claude: rc $rc, want 65: $out"
+    assert_contains "$out" "claude was not found"
+    assert_contains "$out" "--yes"
+    assert_not_contains "$out" "no terminal to ask on"
+    unset -f _pst
+    echo "ok: peer setup shows the trade-off on every accept path, warns before the prompt, and names a missing claude"
+}
+
+test_statusline_claude_install_refuses_invalid_settings() {
+    # msg-setup P2 fix: statusline install must not claim success on bad JSON.
+    local home="$TMPDIR/sl-home" f out rc sum
+    rm -rf "$home"; mkdir -p "$home/.claude"; f="$home/.claude/settings.json"
+    _sl() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR -u CCTRL_CLAUDE_SETTINGS HOME="$home" "$ROOT/cctrl" statusline claude install; }
+    printf '{x' > "$f"; sum="$(shasum -a 256 "$f")"
+    rc=0; out="$(_sl 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "statusline install exited 0 on invalid settings: $out"
+    assert_not_contains "$out" "Installed"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "invalid settings.json was changed"
+    printf '{"model":"opus"}\n' > "$f"
+    out="$(_sl 2>&1)" || fail "valid install failed: $out"
+    assert_contains "$out" "Installed Claude statusline"
+    [[ "$(jq -r .model "$f")" == "opus" ]] || fail "model lost"
+    [[ "$(jq -r .statusLine.type "$f")" == "command" ]] || fail "statusLine not written"
+    unset -f _sl
+    echo "ok: statusline claude install refuses invalid settings.json"
+}
+
 test_hooks_doctor_fix_hint_names_the_side() {
     # mdec-1103 verify: plain `hooks install` no longer touches Codex, so the
     # doctor's final hint must name the command for the side with the issue.

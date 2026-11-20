@@ -33,7 +33,8 @@ Usage: cctrl peer setup [--scope user] [--value accept|hold|refuse|unset]
   --dir PATH      repo whose project and local settings are checked (default: here)
   --dry-run       show what would change; write nothing
   --yes           skip the confirmation (needed when stdin is not a terminal)
-  --json          machine-readable result
+  --json          machine-readable result; the trade-off text is in the
+                  "trade_off" field (it is printed as text on every other path)
 
   The file is backed up (settings.json.cctrl-backup-<UTC>) before a change and
   replaced atomically. Invalid JSON is refused. A second run changes nothing.
@@ -45,8 +46,11 @@ TRADE_OFF = """\
 What accept means:
   - Any of your other sessions on this Mac can start a turn in your sessions,
     including a bypass worker. So can any process running as you that writes
-    the session socket. Permission prompts still fire in the receiving
-    session; a message can never approve one.
+    the session socket. Permission prompts still fire in a receiving session
+    that is not in bypass mode; a message can never approve one.
+  - Bigger escalation: user scope also applies to every bypass-mode session
+    cctrl spawns. A guarded session, or a Codex sender through the bridge, can
+    then trigger no-prompt actions in a bypass worker.
   - Provider guards stay on: rate limits, loop throttling, and the rule that
     messages cannot change configuration. Setup never touches permissions.
   - Not set by setup: isolatePeerMachines. dialogExpiry is left alone."""
@@ -132,6 +136,10 @@ def main(argv: list[str]) -> int:
         lines.append(f"unchanged: {ci.KEY} is already {'absent' if target is None else target}")
         return _out(args, base, lines, 0)
 
+    if target == "accept":
+        base["trade_off"] = TRADE_OFF
+        if not args.json:
+            lines.append(TRADE_OFF)
     base["changed"] = True
     verb = "remove" if target is None else f"set to {target}"
     if args.dry_run:
@@ -139,11 +147,18 @@ def main(argv: list[str]) -> int:
         return _out(args, base, lines, 0)
 
     if not args.yes:
-        if pf.needs_yes or not sys.stdin.isatty() or args.json:
+        if pf.needs_yes:
+            lines.append("not confirmed: claude was not found on PATH, so its version cannot be checked; "
+                         "pass --yes to write anyway")
+            base["changed"] = False
+            return _out(args, base, lines, 65)
+        if not sys.stdin.isatty() or args.json:
             lines.append("not confirmed: pass --yes to write (no terminal to ask on)")
             base["changed"] = False
             return _out(args, base, lines, 65)
-        print(TRADE_OFF)
+        for line in lines:  # warnings, notes and the trade-off come before the prompt
+            print(line)
+        lines = []
         print(f"\nAbout to {verb} {ci.KEY} in {real}")
         try:
             answer = input("Proceed? [y/N] ").strip().lower()

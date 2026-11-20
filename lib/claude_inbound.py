@@ -22,6 +22,7 @@ Environment overrides (tests point managed paths at fixtures):
 from __future__ import annotations
 
 import datetime as dt
+import copy
 import fcntl
 import hashlib
 import json
@@ -506,18 +507,15 @@ def _lock(path: Path) -> int:
         raise
 
 
-def set_cross_session_inbound(path: Path, value: str | None, *,
-                              before_compare: Callable[[int, Path], None] | None = None,
+def edit_settings(path: Path, mutate: Callable[[dict], None], *,
+                  before_compare: Callable[[int, Path], None] | None = None,
                               ) -> tuple[bool, Path | None]:
-    """Set (or, with value None, remove) crossSessionInbound in a settings file.
+    """Apply `mutate(cfg)` to a settings file (locked, atomic, backed up).
 
-    Returns (changed, backup_path). Atomic, locked, other keys and their order
-    untouched. Invalid JSON, a non-object top level or an empty file is refused
+    Returns (changed, backup_path). Other keys and their order untouched. Invalid JSON, a non-object top level or an empty file is refused
     with SettingsError and the file is left as it was. A symlink is written
     through to its target. `before_compare` exists for deterministic race tests.
     """
-    if value is not None and value not in VALUES:
-        raise ValueError(f"value must be one of {VALUES} or None")
     path = real_target(Path(path).expanduser())
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = _lock(path)
@@ -531,12 +529,9 @@ def set_cross_session_inbound(path: Path, value: str | None, *,
                 if parsed is None:
                     raise SettingsError(f"refusing to change {path}: {err}; fix it by hand first")
                 cfg = parsed
-            new = dict(cfg)
-            if value is None:
-                new.pop(KEY, None)
-            else:
-                new[KEY] = value
-            if new == cfg and (KEY in cfg) == (KEY in new):
+            new = copy.deepcopy(cfg)
+            mutate(new)
+            if new == cfg and list(new) == list(cfg):
                 return False, None
             mode = stat.S_IMODE(path.stat().st_mode) if source_raw is not None else 0o600
             indent = _indent_of(source_raw)
@@ -566,3 +561,19 @@ def set_cross_session_inbound(path: Path, value: str | None, *,
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)
     raise SettingsError("unreachable settings merge state")
+
+
+def set_cross_session_inbound(path: Path, value: str | None, *,
+                              before_compare: Callable[[int, Path], None] | None = None,
+                              ) -> tuple[bool, Path | None]:
+    """Set (or, with value None, remove) crossSessionInbound in a settings file."""
+    if value is not None and value not in VALUES:
+        raise ValueError(f"value must be one of {VALUES} or None")
+
+    def mutate(cfg: dict) -> None:
+        if value is None:
+            cfg.pop(KEY, None)
+        else:
+            cfg[KEY] = value
+
+    return edit_settings(path, mutate, before_compare=before_compare)

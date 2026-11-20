@@ -24446,12 +24446,13 @@ cmd_statusline() {
     case "$action" in
         install)
             if [[ "$agent" == "claude" ]]; then
-                mkdir -p "$CLAUDE_DIR"
-                [[ -f "$SETTINGS" ]] || echo "{}" > "$SETTINGS"
-                local tmp status_cmd
-                tmp="$(mktemp)"
+                local status_cmd
                 status_cmd="$SCRIPT_DIR/hooks/statusline.sh"
-                jq --arg cmd "$status_cmd" '.statusLine = {type: "command", command: $cmd}' "$SETTINGS" > "$tmp" && _mv_keep_mode "$tmp" "$SETTINGS"
+                mkdir -p "$CLAUDE_DIR"
+                if ! python3 -I "$SCRIPT_DIR/lib/statusline_claude.py" "$SETTINGS" "$status_cmd"; then
+                    echo -e "${RED}Claude statusline not installed: $SETTINGS was left unchanged${RESET}" >&2
+                    return 1
+                fi
                 echo -e "${GREEN}Installed Claude statusline:${RESET} $status_cmd"
                 return 0
             fi
