@@ -157,6 +157,7 @@ class ManagedDoc:
     source: str | None = None
     invalid: list[str] = field(default_factory=list)
     server_managed: str = "unknown"  # cannot be read locally; never "clear"
+    unknown: list[str] = field(default_factory=list)  # sources present but not readable here
 
 
 def _has_policy_key(d: dict) -> bool:
@@ -188,6 +189,16 @@ def _read_plist_doc(env: Mapping[str, str]) -> tuple[dict | None, list[str]]:
     return None, []
 
 
+def _read_managed_one(p: Path) -> ReadResult:
+    # An empty managed settings file counts as {} (managed-settings.md); user files do not.
+    try:
+        if p.read_bytes().strip() == b"":
+            return ReadResult(p, "ok", {})
+    except OSError:
+        pass
+    return read_settings(p)
+
+
 def _read_managed_files(base: Path) -> tuple[dict | None, list[str]]:
     invalid: list[str] = []
     merged: dict = {}
@@ -200,7 +211,7 @@ def _read_managed_files(base: Path) -> tuple[dict | None, list[str]]:
     except (FileNotFoundError, NotADirectoryError):
         pass
     for p in files:
-        r = read_settings(p)
+        r = _read_managed_one(p)
         if r.status == "absent":
             continue
         present = True
@@ -217,11 +228,20 @@ def read_managed(env: Mapping[str, str] | None = None) -> ManagedDoc:
     doc = ManagedDoc()
     plist, bad = _read_plist_doc(env)
     doc.invalid += bad
-    if plist is not None and _has_policy_key(plist):
-        doc.data, doc.source = plist, "managed preferences (MDM)"
-        return doc
     files, bad = _read_managed_files(managed_dir(env))
     doc.invalid += bad
+    for label, d in (("MDM", plist), ("managed-settings file", files)):
+        if d and "policyHelper" in d:
+            doc.unknown.append(f"policyHelper in {label} cannot be read locally; its policy is unknown")
+    if plist is not None and _has_policy_key(plist):
+        if plist.get("managedSourcesBehavior") == "merge" and files is not None:
+            # merge: the higher source wins per key; lower sources fill what it leaves unset
+            merged = dict(files)
+            merged.update({k: v for k, v in plist.items() if v is not None})
+            doc.data, doc.source = merged, "managed preferences (MDM) merged with managed-settings file"
+            return doc
+        doc.data, doc.source = plist, "managed preferences (MDM)"
+        return doc
     if files is not None:
         doc.data, doc.source = files, "managed-settings file"
     return doc
@@ -291,7 +311,10 @@ Version = tuple[int, int, int]
 
 
 def parse_version(text: str | None) -> Version | None:
-    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    # First line only, leading X.Y.Z (optionally "v" or "claude " before it) followed by
+    # whitespace or the end. A "-rc" suffix, a fourth number or a later line is not accepted.
+    lines = (text or "").strip().splitlines()
+    m = re.match(r"\s*(?:claude\s+|v)?(\d+)\.(\d+)\.(\d+)(?=\s|$)", lines[0]) if lines else None
     return (int(m[1]), int(m[2]), int(m[3])) if m else None
 
 
@@ -310,8 +333,8 @@ def version_gate(version: Version | None) -> VersionGate:
     g = VersionGate()
     if version is None:
         g.needs_yes = True
-        g.warnings.append("could not determine the Claude Code version (claude not on PATH or "
-                          "unparseable); confirm with --yes")
+        g.warnings.append("could not determine the Claude Code version (claude not on PATH, "
+                          "unparseable, or a pre-release such as -rc); confirm with --yes")
         return g
     if version < MIN_VERSION:
         g.refuse = True
@@ -397,6 +420,7 @@ def preflight(target: str | None, *, env: Mapping[str, str] | None = None,
         if r.status == "ok" and _valid(r.data.get(KEY)) and r.data[KEY] != "accept":
             pf.notes.append(f"applies in this repo only: {r.data[KEY]} ({label}, {r.path})")
 
+    pf.notes.extend(managed.unknown)
     pf.notes.append(f"server-managed settings: {managed.server_managed} (cannot be read locally)")
 
     if gate.refuse:
@@ -442,11 +466,12 @@ def _write_temp(directory: Path, prefix: str, raw: bytes, mode: int) -> Path:
     p = Path(name)
     try:
         os.fchmod(fd, mode)
-        with os.fdopen(fd, "wb", closefd=True) as s:
+        s = os.fdopen(fd, "wb", closefd=True)
+        fd = -1  # the file object owns the descriptor now; it closes it exactly once
+        with s:
             s.write(raw)
             s.flush()
             os.fsync(s.fileno())
-        fd = -1
         return p
     except BaseException:
         if fd >= 0:

@@ -23,14 +23,15 @@ REAL_SETTINGS = Path(os.path.expanduser("~/.claude/settings.json"))
 
 
 def _real_state():
-    # A live Claude may rewrite settings.json for its own reasons, so compare what this
-    # library could change: the key's value and any cctrl backup/lock files beside it.
+    # Stat only, never read: the real file's mtime and size plus any cctrl backup/lock
+    # files beside it. Checked once after the whole module (tearDownModule).
     try:
-        val = json.loads(REAL_SETTINGS.read_text()).get("crossSessionInbound")
-    except (OSError, ValueError, AttributeError):
-        val = None
+        st = REAL_SETTINGS.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None
     extra = sorted(p.name for p in REAL_SETTINGS.parent.glob("*cctrl*")) if REAL_SETTINGS.parent.is_dir() else []
-    return val, extra
+    return sig, extra
 
 
 REAL_STATE_AT_IMPORT = _real_state()
@@ -197,6 +198,69 @@ class MergeTests(Base):
         self.assertNotIn("crossSessionInbound", json.loads(self.settings.read_text()))
 
 
+class LockAndTempTests(Base):
+    def test_held_lock_times_out_and_leaves_file_alone(self):
+        import fcntl
+        self.write(self.settings, {"a": 1})
+        before = self.settings.read_bytes()
+        lock_path = self.cfg / ".settings.json.cctrl.lock"
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        old = ci.LOCK_TIMEOUT_SECONDS
+        ci.LOCK_TIMEOUT_SECONDS = 0.2
+        self.addCleanup(setattr, ci, "LOCK_TIMEOUT_SECONDS", old)
+        with self.assertRaises(ci.SettingsError) as cm:
+            ci.set_cross_session_inbound(self.settings, "accept")
+        self.assertIn("lock", str(cm.exception))
+        self.assertEqual(self.settings.read_bytes(), before)
+
+    def _failing_fdopen(self, closes):
+        import errno
+        real_fdopen, real_close = os.fdopen, os.close
+
+        class Boom:
+            def __init__(s, f):
+                s.f = f
+            def __enter__(s):
+                return s
+            def __exit__(s, *a):
+                s.f.close()  # what a real file object does: closes the fd once
+                closes.append("closed")
+                return False
+            def write(s, raw):
+                raise OSError(errno.ENOSPC, "No space left on device")
+        return lambda fd, *a, **k: Boom(real_fdopen(fd, *a, **k))
+
+    def test_failed_write_raises_real_error_closes_once_and_removes_temp(self):
+        import errno
+        from unittest import mock
+        closes = []
+        real_close = os.close
+        def counting_close(fd):
+            closes.append(fd)
+            return real_close(fd)
+        d = self.tmp / "tmpdir"
+        d.mkdir()
+        with mock.patch.object(ci.os, "fdopen", self._failing_fdopen([])), \
+                mock.patch.object(ci.os, "close", counting_close):
+            with self.assertRaises(OSError) as cm:
+                ci._write_temp(d, "x-", b"data", 0o600)
+        self.assertEqual(cm.exception.errno, errno.ENOSPC)
+        self.assertEqual(closes, [])  # the file object closed the fd; no second os.close
+        self.assertEqual(list(d.iterdir()), [])
+
+    def test_failed_write_in_set_leaves_no_temp_and_real_error(self):
+        import errno
+        from unittest import mock
+        self.write(self.settings, {"a": 1})
+        with mock.patch.object(ci.os, "fdopen", self._failing_fdopen([])):
+            with self.assertRaises(OSError) as cm:
+                ci.set_cross_session_inbound(self.settings, "accept")
+        self.assertEqual(cm.exception.errno, errno.ENOSPC)
+        self.assertEqual(sorted(p.name for p in self.cfg.iterdir() if p.suffix == ".tmp"), [])
+
+
 class ReadTests(Base):
     def test_read_states(self):
         self.assertEqual(ci.read_settings(self.settings).status, "absent")
@@ -268,6 +332,50 @@ class ManagedTests(Base):
                          '<key>crossSessionInbound</key><string>refuse</string></dict></plist>')
         data = ci.convert_plist(plist)
         self.assertEqual(data, {"crossSessionInbound": "refuse"})
+
+    def test_empty_managed_file_counts_as_empty_object(self):
+        self.write(self.managed / "managed-settings.json", "")
+        self.write(self.managed / "managed-settings.d" / "10-a.json", "  \n")
+        doc = ci.read_managed(self.env())
+        self.assertEqual(doc.invalid, [])
+        self.assertEqual(doc.source, "managed-settings file")
+        self.assertEqual(doc.data, {})
+
+    def test_empty_user_file_is_still_refused(self):
+        self.write(self.settings, "")
+        with self.assertRaises(ci.SettingsError):
+            ci.set_cross_session_inbound(self.settings, "accept")
+
+    def test_merge_behavior_falls_through_to_files_for_unset_keys(self):
+        self.write(self.managed / "managed-settings.json", {"crossSessionInbound": "refuse"})
+        plist = self.tmp / "plist.json"
+        self.write(plist, {"managedSourcesBehavior": "merge", "model": "opus"})
+        doc = ci.read_managed(self.env(plist))
+        self.assertEqual(doc.data["crossSessionInbound"], "refuse")
+        self.assertEqual(doc.data["model"], "opus")
+        self.assertIn("MDM", doc.source)
+
+    def test_merge_behavior_plist_value_wins_over_files(self):
+        self.write(self.managed / "managed-settings.json", {"crossSessionInbound": "refuse"})
+        plist = self.tmp / "plist.json"
+        self.write(plist, {"managedSourcesBehavior": "merge", "crossSessionInbound": "hold"})
+        doc = ci.read_managed(self.env(plist))
+        self.assertEqual(doc.data["crossSessionInbound"], "hold")
+
+    def test_without_merge_plist_still_replaces_files(self):
+        self.write(self.managed / "managed-settings.json", {"crossSessionInbound": "refuse"})
+        plist = self.tmp / "plist.json"
+        self.write(plist, {"model": "opus"})
+        doc = ci.read_managed(self.env(plist))
+        self.assertNotIn("crossSessionInbound", doc.data)
+
+    def test_policy_helper_is_reported_unknown(self):
+        plist = self.tmp / "plist.json"
+        self.write(plist, {"managedSourcesBehavior": "merge", "policyHelper": {"path": "/x"}})
+        doc = ci.read_managed(self.env(plist))
+        self.assertTrue(any("policyHelper" in u for u in doc.unknown))
+        pf = ci.preflight("accept", env=self.env(plist), project_dir=self.proj)
+        self.assertTrue(any("policyHelper" in n for n in pf.notes))
 
     def test_nothing_managed_is_absent_and_server_managed_unknown(self):
         doc = ci.read_managed(self.env())
@@ -349,6 +457,25 @@ class VersionTests(Base):
         self.assertEqual(ci.parse_version("claude 2.1.224\n"), (2, 1, 224))
         self.assertIsNone(ci.parse_version("garbage"))
         self.assertIsNone(ci.parse_version(""))
+
+    def test_parse_anchored_and_prerelease(self):
+        self.assertIsNone(ci.parse_version("node 20.11.1\n2.1.329"))
+        self.assertEqual(ci.parse_version("2.1.329 (Claude Code)\nnode 20.11.1"), (2, 1, 329))
+        self.assertEqual(ci.parse_version("v2.1.250\n"), (2, 1, 250))
+        self.assertIsNone(ci.parse_version("2.1"))
+        self.assertIsNone(ci.parse_version("2.1.329.7"))
+        self.assertIsNone(ci.parse_version("2.1.224-rc.1"))
+
+    def test_prerelease_detected_version_warns_and_needs_yes(self):
+        d = self.tmp / "bin"
+        d.mkdir(exist_ok=True)
+        s = d / "claude"
+        s.write_text("#!/bin/sh\necho '2.1.224-rc.1'\n")
+        s.chmod(0o755)
+        self.assertIsNone(ci.detect_claude_version({"PATH": sys_path(d)}))
+        g = ci.version_gate(ci.detect_claude_version({"PATH": sys_path(d)}))
+        self.assertTrue(g.needs_yes)
+        self.assertTrue(any("pre-release" in w for w in g.warnings))
 
     def test_compare(self):
         self.assertLess(ci.parse_version("2.1.9"), ci.parse_version("2.1.10"))
@@ -499,10 +626,21 @@ class PreflightTests(Base):
         self.assertFalse(r.needs_yes)
 
 
-class NoLiveStateTests(unittest.TestCase):
-    # Case 11
-    def test_real_settings_untouched_by_this_suite(self):
+def tearDownModule():
+    # Case 11: runs after every class, so Preflight/Read/Resolve/Version are covered too.
+    if _real_state() != REAL_STATE_AT_IMPORT:
+        raise AssertionError("the real ~/.claude/settings.json (or cctrl files beside it) changed during the suite")
+
+
+class GuardTests(unittest.TestCase):
+    def test_guard_detects_a_change(self):
         self.assertEqual(_real_state(), REAL_STATE_AT_IMPORT)
+        fake = Path(tempfile.mkdtemp(prefix="cctrl-ci-guard-")) / "settings.json"
+        self.addCleanup(shutil.rmtree, fake.parent, ignore_errors=True)
+        fake.write_text("{}")
+        before = (fake.stat().st_mtime_ns, fake.stat().st_size)
+        fake.write_text('{"a": 1}')
+        self.assertNotEqual(before, (fake.stat().st_mtime_ns, fake.stat().st_size))
 
 
 if __name__ == "__main__":
