@@ -16580,6 +16580,10 @@ test_peer_doctor_messaging_readiness() {
     printf '{"mbp":{"hostname":"some-other-mac.example"}}\n' > "$hosts"
     out="$(_pdm --json)"
     [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_own_sessions") | .remedy' <<< "$out")" == "cctrl peer setup --scope user; on another Mac: cctrl --host mbp peer setup --yes" ]] || fail "remote form: $(jq -c '.checks[] | select(.name == "claude_inbound_own_sessions")' <<< "$out")"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_spawned") | .remedy' <<< "$out")" == "cctrl peer setup --scope spawned (or cctrl peer setup --scope user); on another Mac: cctrl --host mbp peer setup --scope spawned --yes" ]] || fail "spawned remote form: $(jq -c '.checks[] | select(.name == "claude_inbound_spawned")' <<< "$out")"
+    printf '{"nohost":{"hostname":""},"mbp":{"hostname":"some-other-mac.example"}}\n' > "$hosts"
+    out="$(_pdm --json)"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_own_sessions") | .remedy' <<< "$out")" == "cctrl peer setup --scope user; on another Mac: cctrl --host mbp peer setup --yes" ]] || fail "empty-hostname alias must be skipped: $(jq -c '.checks[] | select(.name == "claude_inbound_own_sessions")' <<< "$out")"
     printf '{}\n' > "$hosts"
 
     # Pass: user accept plus spawned opt-in.

@@ -15466,7 +15466,7 @@ _peer_doctor_remote_aliases() {
         [[ -n "$alias" ]] || continue
         _host_is_local "$host" && continue
         printf '%s\n' "$alias"
-    done < <(jq -r 'to_entries | sort_by(.key)[] | select((.value | type) == "object")
+    done < <(jq -r 'to_entries | sort_by(.key)[] | select((.value | type) == "object" and ((.value.hostname // "") | tostring) != "")
         | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
     return 0
 }

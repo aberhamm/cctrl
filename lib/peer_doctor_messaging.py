@@ -48,8 +48,8 @@ def remote_form(hosts: list[str], command: str = "peer setup --yes") -> str:
     return "; ".join(f"on another Mac: cctrl --host {h} {command}" for h in hosts)
 
 
-def _with_remote(local: str, hosts: list[str]) -> str:
-    extra = remote_form(hosts)
+def _with_remote(local: str, hosts: list[str], command: str = "peer setup --yes") -> str:
+    extra = remote_form(hosts, command)
     return f"{local}; {extra}" if extra else local
 
 
@@ -98,6 +98,11 @@ def _own_check(own: ci.Effective, hosts) -> dict:
     summary = f"sessions you start yourself: {_describe(own)}"
     if own.value == "accept":
         return check(name, PASS, summary, effective=own.value, source=own.source)
+    if own.invalid:
+        return check(name, WARN, summary + f"; this is not a deliberate hold: {ci.KEY} has an unrecognised value, "
+                     "which forces hold (see claude_inbound_invalid)",
+                     f"fix or remove the unrecognised {ci.KEY} value (see claude_inbound_invalid)",
+                     effective=own.value, source=own.source)
     if own.value in ("hold", "refuse") and own.source != "default":
         return check(name, PASS, summary + "; set on purpose, so messages from sessions of another permission "
                      "class wait for approval or are refused", effective=own.value, source=own.source)
@@ -122,6 +127,7 @@ def _spawn_overlay(config_inbound: str, override: bool, user: dict | None):
 
 
 def _spawn_check(managed, user, proj, loc, config_inbound, override, hosts, bad_override: str = "") -> dict:
+    """Spawned-session readiness; the remedy depends on which file holds the value."""
     name = "claude_inbound_spawned"
     overlay, note = _spawn_overlay(config_inbound, override, _doc(user))
     eff = ci.resolve(managed=managed.data if managed.source else None, overlay=overlay,
@@ -135,9 +141,19 @@ def _spawn_check(managed, user, proj, loc, config_inbound, override, hosts, bad_
                      effective=eff.value, source=eff.source)
     if eff.value == "accept":
         return check(name, PASS, summary, effective=eff.value, source=eff.source)
-    return check(name, WARN, summary + "; cctrl starts every Claude in bypass mode, so held messages wait for "
-                 "a person to approve them in that worker", _with_remote(f"{SETUP_SPAWNED} (or {SETUP_USER})", hosts),
-                 effective=eff.value, source=eff.source)
+    tail = "; cctrl starts every Claude in bypass mode, so held messages wait for a person to approve them in that worker"
+    if eff.source == "managed settings":
+        fix = f"managed settings set {eff.value}; ask your administrator (peer setup cannot change it)"
+    elif eff.source in ("project settings", "local settings") and eff.value in ("hold", "refuse") and not eff.invalid:
+        path = proj.path if eff.source == "project settings" else loc.path
+        fix = (f"edit {ci.KEY} in {path} ({eff.source}); peer setup does not change a project or local "
+               "value, and it overrides the spawned opt-in")
+    elif eff.invalid:
+        fix = f"fix or remove the unrecognised {ci.KEY} value (see claude_inbound_invalid)"
+    else:
+        fix = _with_remote(f"{SETUP_SPAWNED} (or {SETUP_USER})", hosts,
+                           "peer setup --scope spawned --yes")
+    return check(name, WARN, summary + tail, fix, effective=eff.value, source=eff.source)
 
 
 def _managed_check(managed) -> dict:
@@ -187,14 +203,15 @@ def _invalid_check(managed, user_path, user, proj, loc) -> dict:
 
 def _isolate_check(managed, user, proj, loc) -> dict:
     name = "claude_isolate_peer_machines"
-    where = [str(r.path) for r in (user, proj, loc) if r.status == "ok" and r.data.get("isolatePeerMachines") is True]
-    if managed.data.get("isolatePeerMachines") is True:
-        where.append("managed settings")
+    files = [str(r.path) for r in (user, proj, loc) if r.status == "ok" and r.data.get("isolatePeerMachines") is True]
+    is_managed = managed.data.get("isolatePeerMachines") is True
+    where = files + (["managed settings"] if is_managed else [])
     if not where:
         return check(name, PASS, "isolatePeerMachines is not set to true")
+    fixes = ([f"remove isolatePeerMachines from {files[0]}"] if files else []) + (
+        ["managed settings set isolatePeerMachines; ask your administrator"] if is_managed else [])
     return check(name, WARN, "isolatePeerMachines is true in " + ", ".join(where)
-                 + ": unattended bypass workers stall on the cross-machine approval prompt",
-                 f"remove isolatePeerMachines from {where[0]}")
+                 + ": unattended bypass workers stall on the cross-machine approval prompt", "; ".join(fixes))
 
 
 def _dialog_check(env, managed, user, proj, loc) -> dict:
@@ -278,12 +295,52 @@ def _ps_codex_lines() -> list[str]:
     return [ln for ln in out.splitlines() if "codex" in ln and "native_bridge.py" not in ln]
 
 
-def _orphan_check(threads: list[str], rows, err) -> dict:
+def codex_state_db(env) -> Path | None:
+    """Newest state_*.sqlite under $CODEX_HOME (default ~/.codex), or None."""
+    home = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        dbs = [p for p in home.glob("state_*.sqlite") if p.is_file()]
+    except OSError:
+        return None
+
+    def rank(p: Path):
+        tail = p.stem.split("_", 1)[1]
+        return (int(tail) if tail.isdigit() else -1, p.name)
+    return max(dbs, key=rank) if dbs else None
+
+
+def thread_archive_states(db: Path | None, ids: list[str]) -> dict[str, bool | None] | None:
+    """{thread id: archived?} from the Codex state db, opened read-only; a missing id maps to None.
+    Returns None when the db is absent or unreadable (the caller degrades to INFO)."""
+    if db is None:
+        return None
+    try:
+        con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(threads)")}
+            if "id" not in cols:
+                return None
+            field = "archived" if "archived" in cols else "0"
+            out: dict[str, bool | None] = {}
+            for tid in ids:
+                row = con.execute(f"SELECT {field} FROM threads WHERE id = ?", (tid,)).fetchone()
+                out[tid] = None if row is None else row[0] not in (0, None, "")
+            return out
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return None
+
+
+def _orphan_check(threads: list[str], rows, err, env=None, db: Path | None | str = "auto") -> dict:
+    """A daemon is an orphan only when its Codex thread is archived or gone from the Codex state db.
+    A thread that is live there but invisible in tmux/ps (a Codex app thread, a hand-started codex)
+    is "owner not visible to cctrl": information, never a warning and never a kill remedy."""
     name = "codex_bridge_orphans"
     if err:
         return check(name, WARN, err + "; orphan daemons cannot be checked", "inspect or move aside the bridge ledger")
     lines = _ps_codex_lines()
-    orphans = []
+    unowned = []
     for r in rows:
         actor = str(r["actor"])
         if not actor.startswith("codex:") or not _endpoint_alive(r):
@@ -291,14 +348,33 @@ def _orphan_check(threads: list[str], rows, err) -> dict:
         thread = actor.split(":", 1)[1]
         if thread in threads or any(thread in ln for ln in lines):
             continue
-        orphans.append({"actor": actor, "pid": r["pid"]})
-    if not orphans:
+        unowned.append({"actor": actor, "pid": r["pid"], "thread": thread})
+    if not unowned:
         return check(name, PASS, "no bridge daemon is left without its Codex session")
+    if db == "auto":
+        db = codex_state_db(env if env is not None else dict(os.environ))
+    states = thread_archive_states(db, [o["thread"] for o in unowned])
+    orphans, unseen = [], []
+    for o in unowned:
+        item = {"actor": o["actor"], "pid": o["pid"]}
+        if states is not None and (o["thread"] not in states or states[o["thread"]] is None or states[o["thread"]]):
+            orphans.append(item)
+        else:
+            unseen.append(item)
+    info = ""
+    if unseen:
+        why = ("the Codex state database could not be read, so liveness is unknown"
+               if states is None else "their Codex threads are not archived")
+        info = (f"{len(unseen)} bridge daemon(s) have an owner not visible to cctrl (a Codex app thread or a "
+                f"hand-started codex; {why}): informational, no action")
+    if not orphans:
+        return check(name, PASS, info, unseen=unseen)
     text = ", ".join(f"pid {o['pid']} ({o['actor']})" for o in orphans)
-    return check(name, WARN, f"{len(orphans)} bridge daemon(s) run with no live Codex process or cctrl session "
-                 f"naming their thread: {text}. A Codex app thread cannot be seen this way, so check before acting",
-                 "doctor never stops a daemon; once you have confirmed the Codex session is gone, stop it by hand "
-                 "(kill PID)", orphans=orphans)
+    summary = (f"{len(orphans)} bridge daemon(s) belong to a Codex thread that is archived or missing from the "
+               f"Codex state database: {text}" + (f"; {info}" if info else ""))
+    return check(name, WARN, summary,
+                 "doctor never stops a daemon; check the thread is really gone first, then run cctrl bridge stop "
+                 "from inside that thread (CODEX_THREAD_ID set to it)", orphans=orphans, unseen=unseen)
 
 
 # --- entry ------------------------------------------------------------------

@@ -36,10 +36,21 @@ class CodexChecks(unittest.TestCase):
         rows, err = pdm._ledger_endpoints(self.root)
         return pdm._codex_endpoint_check(threads, rows, err)
 
-    def orphans(self, threads, ps_lines=()):
+    def orphans(self, threads, ps_lines=(), db=None):
         rows, err = pdm._ledger_endpoints(self.root)
         with mock.patch.object(pdm, "_ps_codex_lines", return_value=list(ps_lines)):
-            return pdm._orphan_check(threads, rows, err)
+            return pdm._orphan_check(threads, rows, err, db=db)
+
+    def codex_db(self, threads):
+        """A temp Codex state db: {thread id: archived} (never the real ~/.codex)."""
+        path = self.root / "state_5.sqlite"
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, archived INTEGER NOT NULL DEFAULT 0)")
+        for tid, archived in threads.items():
+            con.execute("INSERT INTO threads VALUES (?,?)", (tid, archived))
+        con.commit()
+        con.close()
+        return path
 
     def test_endpoints_pass_without_codex_sessions(self):
         c = self.endpoints([])
@@ -73,11 +84,67 @@ class CodexChecks(unittest.TestCase):
         make_ledger(self.root, [("codex:T1", self.proc.pid, self.started),
                                 ("claude:C1", self.proc.pid, self.started),
                                 ("codex:T2", 999999, "gone")])
-        c = self.orphans(["other"], ["codex resume zzz"])
+        c = self.orphans(["other"], ["codex resume zzz"], db=self.codex_db({"T1": 1}))
         self.assertEqual(c["status"], "warn")
         self.assertTrue(c["ok"])
         self.assertEqual([o["actor"] for o in c["orphans"]], ["codex:T1"])
         self.assertIn("never stops", c["remedy"])
+        self.assertNotIn("kill", c["remedy"])
+
+    def test_live_app_thread_is_not_flagged(self):
+        make_ledger(self.root, [("codex:T1", self.proc.pid, self.started)])
+        c = self.orphans([], db=self.codex_db({"T1": 0}))
+        self.assertEqual(c["status"], "pass")
+        self.assertNotIn("orphans", c)
+        self.assertEqual([o["actor"] for o in c["unseen"]], ["codex:T1"])
+        self.assertIn("owner not visible to cctrl", c["summary"])
+        self.assertNotIn("remedy", c)
+
+    def test_missing_thread_is_flagged_and_mixed_split(self):
+        make_ledger(self.root, [("codex:T1", self.proc.pid, self.started), ("codex:T2", self.proc.pid, self.started)])
+        c = self.orphans([], db=self.codex_db({"T1": 0}))
+        self.assertEqual(c["status"], "warn")
+        self.assertEqual([o["actor"] for o in c["orphans"]], ["codex:T2"])
+        self.assertEqual([o["actor"] for o in c["unseen"]], ["codex:T1"])
+
+    def test_missing_or_unreadable_db_degrades_to_info(self):
+        make_ledger(self.root, [("codex:T1", self.proc.pid, self.started)])
+        for db in (None, self.root / "nope.sqlite"):
+            c = self.orphans([], db=db)
+            self.assertEqual(c["status"], "pass")
+            self.assertIn("owner not visible to cctrl", c["summary"])
+        bad = self.root / "state_9.sqlite"
+        bad.write_bytes(b"not sqlite" * 50)
+        c = self.orphans([], db=bad)
+        self.assertEqual(c["status"], "pass")
+        self.assertIn("could not be read", c["summary"])
+
+    def test_state_db_is_found_by_glob_and_opened_read_only(self):
+        self.codex_db({"T1": 0})
+        (self.root / "state_4.sqlite").write_bytes(b"old")
+        self.assertEqual(pdm.codex_state_db({"CODEX_HOME": str(self.root)}).name, "state_5.sqlite")
+        self.assertIsNone(pdm.codex_state_db({"CODEX_HOME": str(self.root / "empty")}))
+        real = sqlite3.connect
+        seen = []
+
+        def spy(target, *a, **kw):
+            con = real(target, *a, **kw)
+            seen.append(con)
+            return con
+        db = self.root / "state_5.sqlite"
+        before = db.read_bytes()
+        with mock.patch.object(pdm.sqlite3, "connect", side_effect=spy):
+            self.assertEqual(pdm.thread_archive_states(db, ["T1"]), {"T1": False})
+        self.assertEqual(db.read_bytes(), before)
+        # The same URI form refuses writes.
+        ro = real(db.resolve().as_uri() + "?mode=ro", uri=True)
+        with self.assertRaises(sqlite3.OperationalError):
+            ro.execute("DELETE FROM threads")
+        ro.close()
+        with mock.patch.object(pdm.sqlite3, "connect", wraps=real) as m:
+            pdm.thread_archive_states(db, ["T1"])
+        self.assertIn("mode=ro", m.call_args.args[0])
+        self.assertTrue(m.call_args.kwargs.get("uri"))
 
     def test_orphan_detection_is_read_only(self):
         make_ledger(self.root, [("codex:T1", self.proc.pid, self.started)])
@@ -91,6 +158,66 @@ class CodexChecks(unittest.TestCase):
         fake = "codex resume T9\npython native_bridge.py _serve codex:T1\nvim x\n"
         with mock.patch("subprocess.run", return_value=mock.Mock(stdout=fake)):
             self.assertEqual(pdm._ps_codex_lines(), ["codex resume T9"])
+
+
+class Nits(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = {"HOME": self.tmp.name, "PATH": os.environ.get("PATH", ""),
+                    "CCTRL_CLAUDE_MANAGED_PLIST_JSON": str(Path(self.tmp.name) / "none.json")}
+        (Path(self.tmp.name) / ".claude").mkdir()
+        self.proj = Path(self.tmp.name) / "proj"
+        (self.proj / ".claude").mkdir(parents=True)
+
+    def checks(self, user=None, project=None, local=None, hosts=(), managed=None):
+        import json as _j
+        if user is not None:
+            (Path(self.tmp.name) / ".claude/settings.json").write_text(_j.dumps(user))
+        if project is not None:
+            (self.proj / ".claude/settings.json").write_text(_j.dumps(project))
+        if local is not None:
+            (self.proj / ".claude/settings.local.json").write_text(_j.dumps(local))
+        env = dict(self.env)
+        if managed is not None:
+            m = Path(self.tmp.name) / "managed.json"
+            m.write_text(_j.dumps(managed))
+            env["CCTRL_CLAUDE_MANAGED_PLIST_JSON"] = str(m)
+        with mock.patch.object(pdm.ci, "detect_claude_version", return_value=(2, 1, 329)):
+            return {c["name"]: c for c in pdm.run(env, self.proj, [], list(hosts), None)}
+
+    def test_invalid_value_is_not_described_as_deliberate(self):
+        c = self.checks(user={"crossSessionInbound": "yes"})["claude_inbound_own_sessions"]
+        self.assertEqual(c["status"], "warn")
+        self.assertNotIn("set on purpose", c["summary"])
+        self.assertIn("unrecognised", c["summary"])
+
+    def test_spawned_remedy_names_the_holding_file(self):
+        c = self.checks(user={"crossSessionInbound": "accept"}, project={"crossSessionInbound": "refuse"},
+                        hosts=["mbp"])["claude_inbound_spawned"]
+        self.assertIn("settings.json", c["remedy"])
+        self.assertIn("project settings", c["remedy"])
+        self.assertNotIn("another Mac", c["remedy"])
+        c = self.checks(project={}, local={"crossSessionInbound": "hold"})["claude_inbound_spawned"]
+        self.assertIn("settings.local.json", c["remedy"])
+
+    def test_spawned_managed_hold_says_ask_administrator(self):
+        c = self.checks(managed={"crossSessionInbound": "hold"})["claude_inbound_spawned"]
+        self.assertIn("ask your administrator", c["remedy"])
+        self.assertNotIn("cctrl peer setup", c["remedy"])
+
+    def test_spawned_remote_form_uses_spawned_scope(self):
+        c = self.checks(hosts=["mbp"])["claude_inbound_spawned"]
+        self.assertTrue(c["remedy"].endswith("on another Mac: cctrl --host mbp peer setup --scope spawned --yes"),
+                        c["remedy"])
+        o = self.checks(hosts=["mbp"])["claude_inbound_own_sessions"]
+        self.assertTrue(o["remedy"].endswith("cctrl --host mbp peer setup --yes"))
+
+    def test_managed_isolate_says_ask_administrator(self):
+        c = self.checks(managed={"isolatePeerMachines": True})["claude_isolate_peer_machines"]
+        self.assertEqual(c["status"], "warn")
+        self.assertIn("ask your administrator", c["remedy"])
+        self.assertNotIn("remove isolatePeerMachines", c["remedy"])
 
 
 if __name__ == "__main__":
