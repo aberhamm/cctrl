@@ -16375,6 +16375,11 @@ test_peer_setup_spawned_scope() {
     out="$(_pss --scope spawned --override-user --yes 2>&1)" || fail "override run failed: $out"
     [[ "$(jq -r '.messaging.claude.overrideUser' "$cfg")" == "true" ]] || fail "overrideUser not stored: $(cat "$cfg")"
     assert_not_contains "$out" "will omit"
+    # A re-run without --override-user removes the stored opt-in (it must not stick).
+    out="$(_pss --scope spawned --yes 2>&1)" || fail "re-run without override failed: $out"
+    jq -e '.messaging.claude | has("overrideUser") | not' "$cfg" >/dev/null || fail "overrideUser stuck after a re-run without the flag: $(cat "$cfg")"
+    [[ "$(jq -r '.messaging.claude.crossSessionInbound' "$cfg")" == "accept" ]] || fail "re-run lost the value: $(cat "$cfg")"
+    out="$(_pss --scope spawned --override-user --yes 2>&1)" || fail "override re-store failed: $out"
     out="$(_pss --scope spawned --dry-run --json 2>&1)" || fail "dry-run json failed: $out"
     printf '%s' "$out" | jq -e '.scope == "spawned"' >/dev/null || fail "json lacks scope: $out"
 
@@ -16397,6 +16402,129 @@ test_peer_setup_spawned_scope() {
     [[ "$sum" == "$(shasum -a 256 "$cfg")" ]] || fail "invalid config touched"
     unset -f _pss
     echo "ok: peer setup --scope spawned/both writes the cctrl config key idempotently with the override guard"
+}
+
+test_msg_setup_p3fix_setup_reads_merged_config() {
+    # msg-setup P3 fix F1: setup reads the merged cctrl config like a spawn does;
+    # config.local.json wins over the user config, so setup refuses and names it.
+    local home="$TMPDIR/p3f1-home" out rc cfg loc sum
+    rm -rf "$home"; mkdir -p "$home/.claude"
+    cfg="$home/cctrl-config.json"; loc="$home/config.local.json"
+    _pss() { CCTRL_USER_CONFIG="$cfg" CCTRL_CONFIG_LOCAL="$loc" _ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup "$@"; }
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept"}}}\n' > "$cfg"
+    printf '{"messaging":{"claude":{"crossSessionInbound":"hold","overrideUser":true}}}\n' > "$loc"
+    sum="$(shasum -a 256 "$cfg")"
+    rc=0; out="$(_pss --scope spawned --value unset --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "unset under a local override: rc $rc: $out"
+    assert_contains "$out" "$loc"
+    assert_not_contains "$out" "done:"
+    [[ "$sum" == "$(shasum -a 256 "$cfg")" ]] || fail "unset wrote the user config"
+    rc=0; out="$(_pss --scope both --value accept --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "accept under a local override: rc $rc: $out"
+    assert_contains "$out" "$loc"
+    [[ "$sum" == "$(shasum -a 256 "$cfg")" ]] || fail "accept wrote the user config"
+    [[ "$(jq -r '.crossSessionInbound // "absent"' "$home/.claude/settings.json" 2>/dev/null || echo absent)" == absent ]] \
+        || fail "both: user settings written before the refusal"
+    # A local file that sets neither key does not block, and the report names the source file.
+    printf '{"other":1}\n' > "$loc"
+    out="$(_pss --scope spawned --yes 2>&1)" || fail "setup with an unrelated local file failed: $out"
+    out="$(_pss --scope spawned --yes 2>&1)" || fail "second run failed: $out"
+    assert_contains "$out" "from $cfg"
+    unset -f _pss
+    echo "ok: peer setup spawned/both reads the merged cctrl config and refuses naming the winning file"
+}
+
+test_msg_setup_p3fix_strictest_wins_and_override_boolean() {
+    # msg-setup P3 fix F2 + F3 (launch, setup text and doctor).
+    make_fake_agent "$TMPDIR/claude" claude
+    local home="$TMPDIR/p3f2-home" out sp cfg
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
+    cfg="$home/cctrl-config.json"; printf '{}\n' > "$home/profiles/work.json"
+    _p3c() { printf '{"messaging":{"claude":{"crossSessionInbound":"%s"%s}}}\n' "$1" "${2:-}" > "$cfg"; }
+    _p3u() { printf '{"crossSessionInbound":"%s"}\n' "$1" > "$home/.claude/settings.json"; }
+    # F2: config refuse beats user hold; no warning.
+    _p3c refuse; _p3u hold
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e '.crossSessionInbound == "refuse"' "$sp" >/dev/null || fail "stricter config value dropped: $(cat "$sp")"
+    assert_not_contains "$out" "--override-user"
+    # Equal: kept, no warning.
+    _p3c hold; _p3u hold
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e '.crossSessionInbound == "hold"' "$sp" >/dev/null || fail "equal config value dropped: $(cat "$sp")"
+    assert_not_contains "$out" "--override-user"
+    # User stricter than config: omitted with the warning.
+    _p3c hold; _p3u refuse
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e 'has("crossSessionInbound") | not' "$sp" >/dev/null || fail "looser config overrode user refuse: $(cat "$sp")"
+    assert_contains "$out" "--override-user"
+    # F3: only a JSON boolean true overrides.
+    local bad
+    for bad in '"true"' '1' '"yes"'; do
+        _p3c accept ",\"overrideUser\":$bad"; _p3u refuse
+        out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+        jq -e 'has("crossSessionInbound") | not' "$sp" >/dev/null || fail "overrideUser $bad overrode user refuse: $(cat "$sp")"
+        assert_contains "$out" "not the JSON boolean true"
+    done
+    _p3c accept ',"overrideUser":true'
+    out="$(_sp_launch "$home" work)"; sp="$(_sp_settings_path "$out")"
+    jq -e '.crossSessionInbound == "accept"' "$sp" >/dev/null || fail "boolean true override lost: $(cat "$sp")"
+    # Doctor: warns about a non-boolean overrideUser and mirrors the strictness rule.
+    local proj="$home/proj" d
+    mkdir -p "$proj"
+    _p3d() { (cd "$proj" && _ps_env "$home" 2.1.329 CCTRL_DATA_DIR="$home/data" CCTRL_USER_CONFIG="$cfg" \
+        CCTRL_HOSTS_FILE="$home/hosts.json" CCTRL_NATIVE_BRIDGE_DIR="$home/bridge" CCTRL_SESSION_METADATA_DIR="$home/meta" \
+        "$ROOT/cctrl" peer doctor --json 2>/dev/null) || true; }
+    _p3c accept ',"overrideUser":"true"'; _p3u refuse
+    d="$(_p3d)"
+    jq -e '.checks[] | select(.name == "claude_inbound_spawned") | .status == "warn" and (.summary | contains("not the JSON boolean true"))' <<< "$d" >/dev/null \
+        || fail "doctor did not warn about overrideUser: $d"
+    _p3c refuse; _p3u hold
+    d="$(_p3d)"
+    jq -e '.checks[] | select(.name == "claude_inbound_spawned") | .effective == "refuse"' <<< "$d" >/dev/null \
+        || fail "doctor ignores the stricter config value: $d"
+    # Setup warning follows the same rule.
+    out="$(CCTRL_USER_CONFIG="$cfg" _ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup --scope spawned --value refuse --dry-run 2>&1)" \
+        || fail "setup dry-run failed: $out"
+    assert_not_contains "$out" "will omit"
+    out="$(CCTRL_USER_CONFIG="$cfg" _ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup --scope spawned --value accept --dry-run 2>&1)" \
+        || fail "setup dry-run failed: $out"
+    assert_contains "$out" "will omit"
+    unset -f _p3c _p3u _p3d
+    echo "ok: strictest crossSessionInbound wins and overrideUser must be a JSON boolean true"
+}
+
+test_msg_setup_p3fix_restart_missing_profile() {
+    # msg-setup P3 fix F4: a restart whose named profile is gone still refreshes the overlay.
+    local home="$TMPDIR/p3f4-home" runtime out marker log dir
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/profiles"
+    runtime="$home/runtime"; dir="$runtime/cctrl-$(id -u)/profile-settings"; mkdir -p "$dir"
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept"}}}\n' > "$home/cctrl-config.json"
+    marker="$home/marker"; make_fake_tmux "$TMPDIR/tmux"; log="$home/tmux.log"; : > "$log"
+    printf '{"crossSessionInbound":"accept","env":{"X":"1"}}\n' > "$dir/TMUX--gone.json"
+    printf '{"crossSessionInbound":"refuse"}\n' > "$home/.claude/settings.json"
+    out="$(env -u CLAUDE_CONFIG_DIR HOME="$home" CCTRL_USER_CONFIG="$home/cctrl-config.json" \
+        CLAUDE_CODE_SESSION_ID="sess-gone" CCTRL_RESTART_MARKER="$marker" CCTRL_SESSION_KIND=tmux \
+        CCTRL_SESSION_NAME="TMUX--gone" CCTRL_SESSION_PROFILE="gone" CCTRL_PROFILES_DIR="$home/profiles" \
+        CCTRL_RUNTIME_DIR="$runtime" PATH="$TMPDIR:$PATH" TMUX_LOG="$log" "$ROOT/cctrl" restart 2>&1)" \
+        || fail "restart failed: $out"
+    jq -e 'has("crossSessionInbound") | not' "$dir/TMUX--gone.json" >/dev/null \
+        || fail "stale accept survived a user refuse: $(cat "$dir/TMUX--gone.json")"
+    echo "ok: restart with a missing profile still refreshes the overlay key"
+}
+
+test_msg_setup_p3fix_text_says_new_launches() {
+    # msg-setup P3 fix F5: no promise of "restart" for spawned scope.
+    local home="$TMPDIR/p3f5-home" out
+    rm -rf "$home"; mkdir -p "$home/.claude"
+    out="$(_ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup --help 2>&1)"
+    assert_contains "$out" "NEW launches only"
+    assert_contains "$out" "profile-none"
+    assert_not_contains "$out" "next launch or restart"
+    out="$(CCTRL_USER_CONFIG="$home/c.json" _ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup --scope spawned --yes 2>&1)"
+    assert_contains "$out" "applies to new cctrl launches"
+    assert_contains "$out" "It applies to new launches"
+    assert_not_contains "$out" "next launch or restart"
+    echo "ok: setup text says spawned scope applies to new launches"
 }
 
 test_peer_setup_version_unreadable_wording() {

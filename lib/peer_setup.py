@@ -33,7 +33,8 @@ Usage: cctrl peer setup [--scope user|spawned|both] [--value accept|hold|refuse|
                   session you run, Desktop and VS Code included)
   --scope spawned the cctrl config key messaging.claude.crossSessionInbound: cctrl
                   adds it to the --settings overlay of the Claude sessions it starts
-                  (next launch or restart); your own sessions are not changed
+                  (applies to new launches; see the note below); your own sessions
+                  are not changed. It reads the merged cctrl config like a spawn does
   --scope both    both of the above
   --override-user spawned/both: the overlay may override a user-set hold or refuse.
                   Without it the overlay leaves such a value alone and cctrl warns
@@ -43,6 +44,12 @@ Usage: cctrl peer setup [--scope user|spawned|both] [--value accept|hold|refuse|
   --yes           skip the confirmation (needed when stdin is not a terminal)
   --json          machine-readable result; the trade-off text is in the
                   "trade_off" field (it is printed as text on every other path)
+
+  Spawned scope applies to NEW launches only. A running session keeps the overlay
+  it started with. `cctrl restart` re-reads the value only for a session that
+  already has an overlay file (a profile session, or one that started with this
+  key set). A profile-none session without one picks it up when you close it and
+  start a new one; a restart does not add --settings to it.
 
   The file is backed up (settings.json.cctrl-backup-<UTC>) before a change and
   replaced atomically. Invalid JSON is refused. A second run changes nothing.
@@ -68,8 +75,11 @@ OVERRIDE_KEY = "overrideUser"
 
 SPAWNED_NOTE = """\
 Spawned scope: only the Claude sessions cctrl starts get the value (in their
-  --settings overlay, from the next launch or restart). Your own sessions are
-  not changed, so they still hold messages from bypass workers."""
+  --settings overlay). It applies to new launches. A running session keeps what
+  it started with; a restart refreshes the value only for a session that already
+  has an overlay (a profile session). A profile-none session without one needs
+  a new launch. Your own sessions are not changed, so they still hold messages
+  from bypass workers."""
 
 
 def config_path() -> Path:
@@ -80,6 +90,60 @@ def config_path() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME", "")
     base = Path(xdg) if xdg.startswith("/") else Path(os.environ.get("HOME") or os.path.expanduser("~")) / ".config"
     return base / "cctrl" / "config.json"
+
+
+def _env_files(name: str) -> list[Path]:
+    return [Path(x) for x in os.environ.get(name, "").split("\n") if x]
+
+
+def _rank(v) -> int:
+    return {"accept": 0, "hold": 1, "refuse": 2}.get(v, -1)
+
+
+def _merge(a, b):
+    if isinstance(a, dict) and isinstance(b, dict):
+        out = dict(a)
+        for k, v in b.items():
+            out[k] = _merge(out[k], v) if k in out else v
+        return out
+    return b
+
+
+def merged_config(user: Path) -> tuple[dict, dict]:
+    """The merged cctrl config a spawn sees (default, legacy, user, local), and per-key winning files.
+
+    Returns (merged messaging.claude block, {key: winning file}). Unreadable files are skipped."""
+    order = _env_files("CCTRL_SETUP_CONFIG_LOWER") + [user] + _env_files("CCTRL_SETUP_CONFIG_HIGHER")
+    merged: dict = {}
+    won: dict = {}
+    for f in order:
+        r = ci.read_settings(ci.real_target(f))
+        if r.status != "ok":
+            continue
+        merged = _merge(merged, r.data)
+        blk = _claude_block(r.data)
+        for k in (ci.KEY, OVERRIDE_KEY):
+            if k in blk:
+                won[k] = f
+    return _claude_block(merged), won
+
+
+def _higher_or_lower_blockers(user: Path, target) -> list[tuple[str, Path]]:
+    """Files other than the user config that stop the user-config write from taking effect."""
+    out: list[tuple[str, Path]] = []
+    for f in _env_files("CCTRL_SETUP_CONFIG_HIGHER"):
+        r = ci.read_settings(ci.real_target(f))
+        blk = _claude_block(r.data) if r.status == "ok" else {}
+        for k in (ci.KEY, OVERRIDE_KEY):
+            if k in blk:
+                out.append((k, f))
+    if target is None:
+        for f in _env_files("CCTRL_SETUP_CONFIG_LOWER"):
+            r = ci.read_settings(ci.real_target(f))
+            blk = _claude_block(r.data) if r.status == "ok" else {}
+            if ci.KEY in blk:
+                out.append((ci.KEY, f))
+    return out
 
 
 def _claude_block(cfg: dict) -> dict:
@@ -184,6 +248,18 @@ def main(argv: list[str]) -> int:
         lines = [f"refusing to change {cfg_real}: {cfg_cur.error}; fix it by hand first"]
         base["error"] = lines[0]
         return _out(args, base, lines, 1)
+    merged_claude: dict = {}
+    if do_spawn:
+        merged_claude, won = merged_config(config_path())
+        base["config_source"] = {k: str(v) for k, v in won.items()}
+        blockers = _higher_or_lower_blockers(config_path(), target)
+        if blockers:
+            key, f = blockers[0]
+            lines = [f"refusing to change {cfg_real}: {f} sets messaging.claude.{key} and wins over "
+                     f"(or cannot be removed from) this file for spawned sessions; edit {f} by hand "
+                     f"(or remove that key), then run this again"]
+            base["error"] = lines[0]
+            return _out(args, base, lines, 1)
 
     have = current.data.get(ci.KEY) if current.status == "ok" else None
     user_change = do_user and ((ci.KEY in current.data) if target is None and current.status == "ok" else (
@@ -191,7 +267,7 @@ def main(argv: list[str]) -> int:
     cfg_change = False
     if do_spawn:
         cur_claude = _claude_block(cfg_cur.data)
-        cfg_change = (cur_claude.get(ci.KEY) != target) or (bool(cur_claude.get(OVERRIDE_KEY)) != override)
+        cfg_change = (cur_claude.get(ci.KEY) != target) or ((cur_claude.get(OVERRIDE_KEY) is True) != override)
 
     # Would the value actually apply? Simulate the user file after the write.
     managed = ci.read_managed()
@@ -212,7 +288,8 @@ def main(argv: list[str]) -> int:
     spawn_after = None
     if do_spawn:
         user_val = sim.get(ci.KEY)
-        blocked_by_user = target is not None and not override and user_val in ("hold", "refuse")
+        blocked_by_user = (target is not None and not override and user_val in ("hold", "refuse")
+                           and _rank(user_val) > _rank(target))
         spawn_after = ci.resolve(managed=mg, overlay=None if (target is None or blocked_by_user) else target,
                                  user=sim, project=proj, local=loc)
         base["spawn_effective_after"] = {"value": spawn_after.value, "source": spawn_after.source}
@@ -231,6 +308,9 @@ def main(argv: list[str]) -> int:
         lines.append(f"effective after: {after.value or 'per-class default'} (source: {after.source})")
     if do_spawn:
         lines.append(f"cctrl config: {cfg_real} (messaging.claude.{ci.KEY})")
+        src = base["config_source"].get(ci.KEY)
+        lines.append(f"cctrl config in force now: {merged_claude.get(ci.KEY) or 'unset'}"
+                     + (f" (from {src})" if src else ""))
         lines.append(f"spawned sessions after: {spawn_after.value or 'per-class default'} "
                      f"(source: {spawn_after.source})")
 
@@ -311,7 +391,8 @@ def main(argv: list[str]) -> int:
         if do_user:
             lines.append("running Claude sessions pick it up on restart; new sessions use it now")
         if do_spawn:
-            lines.append("cctrl-spawned sessions pick it up at their next launch or restart")
+            lines.append("applies to new cctrl launches; a running profile-none session without an overlay "
+                         "needs a new launch (a restart only refreshes an existing overlay)")
     return _out(args, base, lines, 0)
 
 

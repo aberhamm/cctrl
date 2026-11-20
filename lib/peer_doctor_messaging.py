@@ -106,24 +106,33 @@ def _own_check(own: ci.Effective, hosts) -> dict:
                  _with_remote(SETUP_USER, hosts), effective=own.value, source=own.source)
 
 
+_RANK = {"accept": 0, "hold": 1, "refuse": 2}
+
+
 def _spawn_overlay(config_inbound: str, override: bool, user: dict | None):
     """The value cctrl puts in a spawn's --settings overlay, mirroring _spawn_cross_session_inbound."""
     if config_inbound not in ci.VALUES:
         return None, ("messaging.claude.crossSessionInbound is not accept, hold or refuse; ignored"
                       if config_inbound else None)
     uv = (user or {}).get(ci.KEY)
-    if not override and uv in ("hold", "refuse"):
+    if not override and uv in ("hold", "refuse") and _RANK[uv] > _RANK[config_inbound]:
         return None, (f"user settings set {uv} and the overlay will not override it "
                       f"(cctrl peer setup --scope spawned --override-user)")
     return config_inbound, None
 
 
-def _spawn_check(managed, user, proj, loc, config_inbound, override, hosts) -> dict:
+def _spawn_check(managed, user, proj, loc, config_inbound, override, hosts, bad_override: str = "") -> dict:
     name = "claude_inbound_spawned"
     overlay, note = _spawn_overlay(config_inbound, override, _doc(user))
     eff = ci.resolve(managed=managed.data if managed.source else None, overlay=overlay,
                      user=_doc(user), project=_doc(proj), local=_doc(loc))
     summary = f"sessions cctrl spawns: {_describe(eff)}" + (f"; {note}" if note else "")
+    if bad_override:
+        summary += (f"; messaging.claude.overrideUser is {bad_override}, not the JSON boolean true, so it counts as "
+                    f"false")
+        return check(name, WARN, summary, "set messaging.claude.overrideUser to true (a JSON boolean) or remove it "
+                     "(cctrl peer setup --scope spawned --override-user writes it correctly)",
+                     effective=eff.value, source=eff.source)
     if eff.value == "accept":
         return check(name, PASS, summary, effective=eff.value, source=eff.source)
     return check(name, WARN, summary + "; cctrl starts every Claude in bypass mode, so held messages wait for "
@@ -295,7 +304,7 @@ def _orphan_check(threads: list[str], rows, err) -> dict:
 # --- entry ------------------------------------------------------------------
 
 def run(env, project_dir: Path, threads: list[str], hosts: list[str], bridge_root: Path | None,
-        config_inbound: str = "", config_override: bool = False) -> list[dict]:
+        config_inbound: str = "", config_override: bool = False, bad_override: str = "") -> list[dict]:
     version = ci.detect_claude_version(env)
     on_path = shutil.which("claude", path=env.get("PATH")) is not None
     user_path, user, pp, proj, lp, loc, managed = _settings_state(env, project_dir)
@@ -305,7 +314,7 @@ def run(env, project_dir: Path, threads: list[str], hosts: list[str], bridge_roo
     return [
         _version_check(env, version, on_path),
         _own_check(own, hosts),
-        _spawn_check(managed, user, proj, loc, config_inbound, config_override, hosts),
+        _spawn_check(managed, user, proj, loc, config_inbound, config_override, hosts, bad_override),
         _managed_check(managed),
         _project_check(project_dir, proj, loc),
         _invalid_check(managed, user_path, user, proj, loc),
@@ -328,9 +337,11 @@ def main(argv: list[str]) -> int:
     p.add_argument("--bridge-root", default=None)
     p.add_argument("--config-inbound", default="")
     p.add_argument("--config-override", default="false")
+    p.add_argument("--config-override-invalid", default="")
     a = p.parse_args(argv)
     checks = run(dict(os.environ), Path(a.project_dir or os.getcwd()), _csv(a.codex_threads), _csv(a.hosts),
-                 Path(a.bridge_root) if a.bridge_root else None, a.config_inbound, a.config_override == "true")
+                 Path(a.bridge_root) if a.bridge_root else None, a.config_inbound, a.config_override == "true",
+                 a.config_override_invalid)
     print(json.dumps(checks))
     return 0
 
