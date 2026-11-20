@@ -16004,6 +16004,7 @@ PY
     echo "ok: hooks install leaves Codex hooks untouched by default; --agent codex|all opts in"
 }
 
+_ps_nbak() { find "$1" -maxdepth 1 -name "*cctrl-backup-*" | wc -l | tr -d " "; }
 _ps_env() { # _ps_env HOME VERSION cmd...: temp HOME, stub claude, managed fixtures
     local home="$1" ver="$2"; shift 2
     mkdir -p "$home/stub" "$home/managed"
@@ -16032,7 +16033,7 @@ test_peer_setup_user_scope() {
     [[ "$(jq -r '.env.A' "$f")" == "1" ]] || fail "env lost"
 
     # 3. Backup: exactly one, byte-equal to the original, mode kept.
-    b="$(ls "$home/.claude" | grep -c 'settings.json.cctrl-backup-' || true)"
+    b="$(_ps_nbak "$home/.claude")"
     [[ "$b" == "1" ]] || fail "want 1 backup, got $b"
     b="$(ls "$home/.claude"/settings.json.cctrl-backup-*)"
     [[ "$(jq -c 'del(.crossSessionInbound)' "$f")" == "$(jq -c . "$b")" ]] || fail "backup differs from original"
@@ -16043,7 +16044,7 @@ test_peer_setup_user_scope() {
     out="$(_ps --yes 2>&1)" || fail "second run failed: $out"
     assert_contains "$out" "unchanged"
     [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "second run changed the file"
-    [[ "$(ls "$home/.claude" | grep -c 'cctrl-backup-' || true)" == "1" ]] || fail "second run made a backup"
+    [[ "$(_ps_nbak "$home/.claude")" == "1" ]] || fail "second run made a backup"
 
     # --dry-run writes nothing and says what it would do; --json is parseable.
     sum="$(shasum -a 256 "$f")"
@@ -16072,7 +16073,7 @@ test_peer_setup_user_scope() {
     [[ "$rc" -ne 0 ]] || fail "invalid JSON was accepted"
     assert_contains "$out" "not valid JSON"
     [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "invalid file was touched"
-    [[ -z "$(ls "$home/.claude" | grep 'cctrl-backup-' || true)" ]] || fail "backup made for an invalid file"
+    [[ -z "$(_ps_nbak "$home/.claude" | grep -v "^0$" || true)" ]] || fail "backup made for an invalid file"
     printf '{}\n' > "$f"
 
     # 5. Managed override: warning, exit 3, no write.
@@ -16122,7 +16123,7 @@ test_hooks_install_refuses_invalid_settings() {
     # msg-setup P2: a broken settings.json must never be replaced by hooks only.
     local home="$TMPDIR/hi-bad-home" f out rc sum
     rm -rf "$home"; mkdir -p "$home/.claude"; f="$home/.claude/settings.json"
-    _hi() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks install "$@"; }
+    _hi() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks install; }
     printf '{"model": "opus", "permissions": {"allow": ["Bash(ls)"],,}}\n' > "$f"
     sum="$(shasum -a 256 "$f")"
     rc=0; out="$(_hi 2>&1)" || rc=$?
@@ -16134,7 +16135,7 @@ test_hooks_install_refuses_invalid_settings() {
     out="$(_hi 2>&1)" || fail "valid install failed: $out"
     [[ "$(jq -r .model "$f")" == "opus" ]] || fail "model lost"
     jq -e '.hooks.Stop | length > 0' "$f" >/dev/null || fail "hooks not written"
-    [[ "$(ls "$home/.claude" | grep -c 'cctrl-backup-' || true)" == "1" ]] || fail "no backup of the valid file"
+    [[ "$(_ps_nbak "$home/.claude")" == "1" ]] || fail "no backup of the valid file"
     sum="$(shasum -a 256 "$f")"
     out="$(_hi 2>&1)" || fail "second install failed: $out"
     [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "second install changed the file"
