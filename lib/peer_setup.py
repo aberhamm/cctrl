@@ -253,8 +253,12 @@ def main(argv: list[str]) -> int:
 
     if not args.yes:
         if pf.needs_yes:
-            lines.append("not confirmed: claude was not found on PATH, so its version cannot be checked; "
-                         "pass --yes to write anyway")
+            if pf.claude_on_path:
+                lines.append("not confirmed: the Claude Code version could not be checked; "
+                             "pass --yes to write anyway")
+            else:
+                lines.append("not confirmed: claude was not found on PATH, so its version cannot be checked; "
+                             "pass --yes to write anyway")
             base["changed"] = False
             return _out(args, base, lines, 65)
         if not sys.stdin.isatty() or args.json:

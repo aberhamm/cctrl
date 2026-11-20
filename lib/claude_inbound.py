@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -374,6 +375,7 @@ class Preflight:
     needs_yes: bool = False
     server_managed: str = "unknown"
     version: Version | None = None
+    claude_on_path: bool = True
 
 
 def preflight(target: str | None, *, env: Mapping[str, str] | None = None,
@@ -402,6 +404,7 @@ def preflight(target: str | None, *, env: Mapping[str, str] | None = None,
 
     pf = Preflight(own, spawn, list(gate.warnings), server_managed=managed.server_managed, version=version)
     pf.needs_yes = gate.needs_yes and not yes
+    pf.claude_on_path = shutil.which("claude", path=env.get("PATH")) is not None
 
     for text in managed.invalid:
         pf.warnings.append(f"managed settings unreadable ({text}); Claude Code refuses to start with it")

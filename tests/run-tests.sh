@@ -16399,6 +16399,138 @@ test_peer_setup_spawned_scope() {
     echo "ok: peer setup --scope spawned/both writes the cctrl config key idempotently with the override guard"
 }
 
+test_peer_setup_version_unreadable_wording() {
+    # msg-setup P4: claude on PATH but its version unreadable is not "not found on PATH".
+    local home="$TMPDIR/psv-home" out rc=0
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/stub" "$home/managed"
+    printf '#!/bin/sh\necho "garbage"\n' > "$home/stub/claude"; chmod 755 "$home/stub/claude"
+    out="$(env -u CLAUDE_CONFIG_DIR -u TMUX -u TMUX_PANE HOME="$home" PATH="$(_test_path "$home/stub")" \
+        CCTRL_CLAUDE_MANAGED_DIR="$home/managed" CCTRL_CLAUDE_MANAGED_PLIST_JSON="$home/none.json" \
+        "$ROOT/cctrl" peer setup 2>&1)" || rc=$?
+    [[ "$rc" == 65 ]] || fail "want exit 65, got $rc: $out"
+    assert_contains "$out" "the Claude Code version could not be checked; pass --yes to write anyway"
+    assert_not_contains "$out" "not found on PATH"
+    [[ ! -e "$home/.claude/settings.json" ]] || fail "wrote without --yes"
+    # claude absent from PATH keeps the old wording.
+    rm -f "$home/stub/claude"; rc=0
+    out="$(env -u CLAUDE_CONFIG_DIR -u TMUX -u TMUX_PANE HOME="$home" PATH="$(_test_path "$home/stub")" \
+        CCTRL_CLAUDE_MANAGED_DIR="$home/managed" CCTRL_CLAUDE_MANAGED_PLIST_JSON="$home/none.json" \
+        "$ROOT/cctrl" peer setup 2>&1)" || rc=$?
+    assert_contains "$out" "claude was not found on PATH, so its version cannot be checked"
+    echo "ok: peer setup says the version could not be checked when claude is on PATH"
+}
+
+test_peer_doctor_messaging_readiness() {
+    # msg-setup P4 (plan case 10): doctor's messaging checks, every state, temp HOME only.
+    local home="$TMPDIR/pdm-home" out txt proj="$TMPDIR/pdm-home/proj" cfg="$TMPDIR/pdm-home/cfg.json"
+    local data="$TMPDIR/pdm-home/data" hosts="$TMPDIR/pdm-home/hosts.json" bridge="$TMPDIR/pdm-home/bridge"
+    local names="claude_cli_version claude_inbound_own_sessions claude_inbound_spawned claude_inbound_managed claude_inbound_project_stricter claude_inbound_invalid claude_isolate_peer_machines claude_dialog_expiry codex_bridge_endpoints codex_bridge_orphans"
+    local real_before; real_before="$(shasum -a 256 "$HOME/.claude/settings.json" 2>/dev/null || echo absent)"
+    rm -rf "$home"; mkdir -p "$home/.claude" "$proj" "$data" "$bridge"
+    printf '{}\n' > "$cfg"; printf '{}\n' > "$hosts"
+    _pdm() { (cd "$proj" && _ps_env "$home" "${PS_VER:-2.1.329}" CCTRL_DATA_DIR="$data" CCTRL_USER_CONFIG="$cfg" \
+        CCTRL_HOSTS_FILE="$hosts" CCTRL_NATIVE_BRIDGE_DIR="$bridge" CCTRL_SESSION_METADATA_DIR="$home/meta" \
+        "$ROOT/cctrl" peer doctor "$@" 2>/dev/null) || true; }
+    _st() { jq -r --arg n "$2" '.checks[] | select(.name == $n) | .status' <<< "$1"; }
+    local n
+
+    # Default: nothing opted in. Version passes; own and spawned warn with the exact fix.
+    out="$(_pdm --json)"
+    for n in $names; do [[ -n "$(_st "$out" "$n")" ]] || fail "doctor lacks check $n: $out"; done
+    [[ "$(_st "$out" claude_cli_version)" == pass ]] || fail "version should pass"
+    [[ "$(_st "$out" claude_inbound_own_sessions)" == warn ]] || fail "own should warn by default"
+    [[ "$(_st "$out" claude_inbound_spawned)" == warn ]] || fail "spawned should warn by default"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_own_sessions") | .remedy' <<< "$out")" == "cctrl peer setup --scope user" ]] || fail "own remedy: $out"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_spawned") | .remedy' <<< "$out")" == "cctrl peer setup --scope spawned (or cctrl peer setup --scope user)" ]] || fail "spawned remedy: $out"
+    jq -e '[.checks[] | select(.name | test("^(claude|codex)_")) | .ok] | all' <<< "$out" >/dev/null || fail "a warning must not fail a messaging check: $out"
+    txt="$(_pdm)"
+    assert_contains "$txt" "claude_inbound_own_sessions: WARN"
+    assert_contains "$txt" "(cctrl peer setup --scope user)"
+    assert_contains "$txt" "claude_cli_version: ok"
+
+    # Other Macs: the remote form of each fix, per alias.
+    printf '{"mbp":{"hostname":"some-other-mac.example"}}\n' > "$hosts"
+    out="$(_pdm --json)"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_own_sessions") | .remedy' <<< "$out")" == "cctrl peer setup --scope user; on another Mac: cctrl --host mbp peer setup --yes" ]] || fail "remote form: $(jq -c '.checks[] | select(.name == "claude_inbound_own_sessions")' <<< "$out")"
+    printf '{}\n' > "$hosts"
+
+    # Pass: user accept plus spawned opt-in.
+    printf '{"crossSessionInbound":"accept"}\n' > "$home/.claude/settings.json"
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept"}}}\n' > "$cfg"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_own_sessions)" == pass ]] || fail "own should pass: $out"
+    [[ "$(_st "$out" claude_inbound_spawned)" == pass ]] || fail "spawned should pass: $out"
+    jq -e '.checks[] | select(.name == "claude_inbound_own_sessions") | .effective == "accept" and (.summary | contains("user settings"))' <<< "$out" >/dev/null || fail "source missing: $out"
+
+    # Spawned: user hold without override is warned; with override it passes.
+    printf '{"crossSessionInbound":"hold"}\n' > "$home/.claude/settings.json"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_own_sessions)" == pass ]] || fail "deliberate hold is informational"
+    [[ "$(_st "$out" claude_inbound_spawned)" == warn ]] || fail "spawned under user hold should warn"
+    assert_contains "$out" "--override-user"
+    printf '{"messaging":{"claude":{"crossSessionInbound":"accept","overrideUser":true}}}\n' > "$cfg"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_spawned)" == pass ]] || fail "override should pass: $out"
+    printf '{}\n' > "$cfg"
+
+    # Fail: an unrecognised value, and an unreadable settings file.
+    printf '{"crossSessionInbound":"yes"}\n' > "$home/.claude/settings.json"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_invalid)" == fail ]] || fail "invalid value should fail: $out"
+    jq -e '[.checks[] | select(.name | test("^(claude|codex)_")) | .ok] | all | not' <<< "$out" >/dev/null || fail "a fail must make ok false"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_inbound_invalid") | .remedy' <<< "$out")" == "fix or remove crossSessionInbound in $home/.claude/settings.json" ]] || fail "invalid remedy: $out"
+    printf '{not json' > "$home/.claude/settings.json"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_invalid)" == fail ]] || fail "unreadable file should fail: $out"
+    rm -f "$home/.claude/settings.json"
+    [[ "$(_st "$(_pdm --json)" claude_inbound_invalid)" == pass ]] || fail "invalid should pass when clean"
+
+    # Version: below the gate fails; between the gates warns.
+    PS_VER=2.1.200 out="$(PS_VER=2.1.200 _pdm --json)"
+    [[ "$(_st "$out" claude_cli_version)" == fail ]] || fail "2.1.200 should fail: $out"
+    [[ "$(jq -r '.checks[] | select(.name == "claude_cli_version") | .remedy' <<< "$out")" == "update Claude Code (claude update)" ]] || fail "version remedy"
+    out="$(PS_VER=2.1.240 _pdm --json)"
+    [[ "$(_st "$out" claude_cli_version)" == warn ]] || fail "2.1.240 should warn: $out"
+
+    # Managed: hold warns, an invalid value fails, none passes.
+    [[ "$(_st "$(_pdm --json)" claude_inbound_managed)" == pass ]] || fail "managed should pass when absent"
+    printf '{"crossSessionInbound":"hold"}\n' > "$home/managed/managed-settings.json"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_managed)" == warn ]] || fail "managed hold should warn: $out"
+    printf '{"crossSessionInbound":"nope"}\n' > "$home/managed/managed-settings.json"
+    [[ "$(_st "$(_pdm --json)" claude_inbound_managed)" == fail ]] || fail "managed invalid should fail"
+    rm -f "$home/managed/managed-settings.json"
+
+    # Project stricter, isolatePeerMachines, dialogExpiry.
+    mkdir -p "$proj/.claude"
+    printf '{"crossSessionInbound":"refuse","isolatePeerMachines":true,"dialogExpiry":0}\n' > "$proj/.claude/settings.json"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_inbound_project_stricter)" == warn ]] || fail "project refuse should warn: $out"
+    [[ "$(_st "$out" claude_isolate_peer_machines)" == warn ]] || fail "isolate should warn: $out"
+    [[ "$(_st "$out" claude_dialog_expiry)" == warn ]] || fail "dialogExpiry 0 should warn: $out"
+    printf '{"dialogExpiry":300}\n' > "$proj/.claude/settings.json"
+    out="$(_pdm --json)"
+    [[ "$(_st "$out" claude_dialog_expiry)" == pass ]] || fail "dialogExpiry 300 should pass: $out"
+    [[ "$(_st "$out" claude_isolate_peer_machines)" == pass ]] || fail "isolate should pass"
+    [[ "$(_st "$out" claude_inbound_project_stricter)" == pass ]] || fail "project should pass"
+
+    # Codex: a live cctrl Codex tmux session with no bridge endpoint warns with the exact fix.
+    mkdir -p "$home/meta" "$home/tbin"
+    make_fake_tmux "$home/tbin/tmux"
+    printf '1:TMUX--pdm-codex\n' > "$home/tmux-state"
+    printf '{"name":"TMUX--pdm-codex","agent":"codex","conversation_id":"11111111-2222-3333-4444-555555555555"}\n' > "$home/meta/TMUX--pdm-codex.json"
+    out="$(cd "$proj" && _ps_env "$home" 2.1.329 PATH="$home/tbin:$(_test_path "$home/stub")" TMUX_FAKE_STATE="$home/tmux-state" \
+        CCTRL_DATA_DIR="$data" CCTRL_USER_CONFIG="$cfg" CCTRL_HOSTS_FILE="$hosts" CCTRL_NATIVE_BRIDGE_DIR="$bridge" \
+        CCTRL_SESSION_METADATA_DIR="$home/meta" "$ROOT/cctrl" peer doctor --json 2>/dev/null)" || true
+    [[ "$(_st "$out" codex_bridge_endpoints)" == warn ]] || fail "missing Codex endpoint should warn: $(jq -c '.checks[] | select(.name == "codex_bridge_endpoints")' <<< "$out")"
+    [[ "$(jq -r '.checks[] | select(.name == "codex_bridge_endpoints") | .remedy' <<< "$out")" == "run cctrl bridge enable inside that Codex session" ]] || fail "codex remedy"
+    assert_contains "$out" "11111111-2222-3333-4444-555555555555"
+
+    [[ "$real_before" == "$(shasum -a 256 "$HOME/.claude/settings.json" 2>/dev/null || echo absent)" ]] || fail "doctor touched the real ~/.claude/settings.json"
+    echo "ok: peer doctor messaging readiness reports pass, warn and fail with exact fixes"
+}
+
+
 test_hooks_doctor_fix_hint_names_the_side() {
     # mdec-1103 verify: plain `hooks install` no longer touches Codex, so the
     # doctor's final hint must name the command for the side with the issue.

@@ -15433,6 +15433,49 @@ _peer_cmd_repair() {
     fi
 }
 
+# msg-setup P4: messaging readiness. Read-only: thread ids of live cctrl-owned
+# Codex tmux sessions, one per line.
+_peer_doctor_codex_threads() {
+    local name agent id
+    command -v tmux >/dev/null 2>&1 || return 0
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        agent="$(_session_metadata_field "$name" agent 2>/dev/null || true)"
+        [[ "$agent" == "codex" ]] || continue
+        id="$(_session_codex_thread_id "$name" 2>/dev/null || true)"
+        [[ -n "$id" ]] && printf '%s\n' "$id"
+    done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null)
+    return 0
+}
+
+# Other hosts.json aliases (not this machine), one per line.
+_peer_doctor_remote_aliases() {
+    local alias host
+    [[ -f "$HOSTS_FILE" ]] || return 0
+    while IFS=$'\t' read -r alias host; do
+        [[ -n "$alias" ]] || continue
+        _host_is_local "$host" && continue
+        printf '%s\n' "$alias"
+    done < <(jq -r 'to_entries | sort_by(.key)[] | select((.value | type) == "object")
+        | [.key, ((.value.hostname // "") | tostring)] | map(gsub("[\t\n\r]"; " ")) | @tsv' "$HOSTS_FILE" 2>/dev/null)
+    return 0
+}
+
+# Prints a JSON array of checks (see lib/peer_doctor_messaging.py); never writes.
+_peer_doctor_messaging_checks() {
+    local threads hosts inbound override out
+    threads="$(_peer_doctor_codex_threads | paste -sd, - 2>/dev/null || true)"
+    hosts="$(_peer_doctor_remote_aliases | paste -sd, - 2>/dev/null || true)"
+    inbound="$(_config_jq '.messaging.claude.crossSessionInbound // empty' 2>/dev/null || true)"
+    override="$(_config_jq '.messaging.claude.overrideUser // false' 2>/dev/null || true)"
+    out="$(python3 -I "$SCRIPT_DIR/lib/peer_doctor_messaging.py" --codex-threads "$threads" --hosts "$hosts" \
+        --bridge-root "${CCTRL_NATIVE_BRIDGE_DIR:-$_CCTRL_P_STATE_ROOT/native-bridge}" \
+        --config-inbound "$inbound" --config-override "$override" 2>/dev/null)" \
+        && jq -e 'type == "array"' >/dev/null 2>&1 <<< "$out" \
+        && { printf '%s\n' "$out"; return 0; }
+    printf '%s\n' '[{"name":"messaging_readiness","ok":false,"status":"fail","summary":"the messaging checks could not run","remedy":"run python3 lib/peer_doctor_messaging.py by hand to see why"}]'
+}
+
 _peer_cmd_doctor() {
     local target="" json=false peers_doc messages peer_json checks="[]" check ok target_session target_agent="" hook_path
     _arg_has_json "$@" && json=true
@@ -15464,6 +15507,13 @@ _peer_cmd_doctor() {
                 echo "  sender_seal also flags a missing or replaced data/host-id."
                 echo "  sender_host_label (plan 111): the label cross-host sends carry as"
                 echo "  --sender-host; flags a CCTRL_HOST_PREFIX that is not a valid label."
+                echo "  Messaging readiness (msg-setup P4, read-only; a warning never fails doctor):"
+                echo "  claude_cli_version, claude_inbound_own_sessions, claude_inbound_spawned,"
+                echo "  claude_inbound_managed, claude_inbound_project_stricter, claude_inbound_invalid,"
+                echo "  claude_isolate_peer_machines, claude_dialog_expiry, codex_bridge_endpoints and"
+                echo "  codex_bridge_orphans (daemons whose Codex session is gone; never stopped)."
+                echo "  Each has status pass, warn or fail and prints the exact fix, plus the"
+                echo "  cctrl --host ALIAS peer setup --yes form for every other registered host."
                 echo "  Attestation is a same-uid misuse barrier, not authentication: any process"
                 echo "  running as this user can edit the mailbox, the session records or a pane."
                 return 0 ;;
@@ -15576,10 +15626,12 @@ _peer_cmd_doctor() {
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
     check="$(_peer_doctor_host_label_check)"
     checks="$(jq --argjson c "$check" '. + [$c]' <<< "$checks")"
+    check="$(_peer_doctor_messaging_checks)"
+    checks="$(jq --argjson c "$check" '. + $c' <<< "$checks")"
     if $json; then
         jq -n --arg target "$target" --argjson checks "$checks" '{ok: all($checks[]; .ok), target: ($target // ""), checks:$checks}'
     else
-        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" or .name == "sender_eligibility" or .name == "sender_replay_archive" or .name == "sender_host_label" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
+        jq -r '.[] | "\(.name): \(if .name == "sender_attest" or .name == "sender_seal" or .name == "sender_eligibility" or .name == "sender_replay_archive" or .name == "sender_host_label" then .summary elif .name == "doorbell_enabled" then (if .ok then "" else "FAIL: " end) + (if .enabled then "enabled" else "off" end) + (if .ring_cap_valid == false then ", INVALID max_rings_per_hour (never rings)" elif .max_rings_per_hour then ", ring cap \(.max_rings_per_hour)/hour" else "" end) elif .status then ((if .status == "pass" then "ok" else (.status | ascii_upcase) end) + ": " + .summary) elif .ok then "ok" else "FAIL" end)\(if .remedy then " (\(.remedy))" else "" end)"' <<< "$checks"
     fi
 }
 
