@@ -16004,6 +16004,144 @@ PY
     echo "ok: hooks install leaves Codex hooks untouched by default; --agent codex|all opts in"
 }
 
+_ps_env() { # _ps_env HOME VERSION cmd...: temp HOME, stub claude, managed fixtures
+    local home="$1" ver="$2"; shift 2
+    mkdir -p "$home/stub" "$home/managed"
+    printf '#!/bin/sh\necho "%s (Claude Code)"\n' "$ver" > "$home/stub/claude"
+    chmod 755 "$home/stub/claude"
+    env -u CLAUDE_CONFIG_DIR -u TMUX -u TMUX_PANE HOME="$home" PATH="$(_test_path "$home/stub")" \
+        CCTRL_CLAUDE_MANAGED_DIR="$home/managed" CCTRL_CLAUDE_MANAGED_PLIST_JSON="$home/none.json" "$@"
+}
+
+test_peer_setup_user_scope() {
+    # msg-setup P2: `cctrl peer setup` writes crossSessionInbound into user settings.
+    # Temp HOME only; claude is a stub; managed paths point at fixtures.
+    local home="$TMPDIR/ps-home" out rc f b real_before real_after
+    real_before="$(shasum -a 256 "$HOME/.claude/settings.json" 2>/dev/null || echo absent)"
+    rm -rf "$home"; mkdir -p "$home/.claude" "$home/proj"
+    f="$home/.claude/settings.json"
+    _ps() { _ps_env "$home" "${PS_VER:-2.1.329}" "$ROOT/cctrl" peer setup "$@"; }
+
+    # 1. Merge: other keys and their order are kept, only the key is added.
+    printf '{\n  "model": "opus",\n  "hooks": {"Stop": []},\n  "env": {"A": "1"}\n}\n' > "$f"
+    chmod 640 "$f"
+    out="$(_ps --yes 2>&1)" || fail "setup --yes failed: $out"
+    assert_contains "$out" "accept"
+    [[ "$(jq -r '.crossSessionInbound' "$f")" == "accept" ]] || fail "value not written: $(cat "$f")"
+    [[ "$(jq -c 'keys_unsorted' "$f")" == '["model","hooks","env","crossSessionInbound"]' ]] || fail "key order changed: $(cat "$f")"
+    [[ "$(jq -r '.env.A' "$f")" == "1" ]] || fail "env lost"
+
+    # 3. Backup: exactly one, byte-equal to the original, mode kept.
+    b="$(ls "$home/.claude" | grep -c 'settings.json.cctrl-backup-' || true)"
+    [[ "$b" == "1" ]] || fail "want 1 backup, got $b"
+    b="$(ls "$home/.claude"/settings.json.cctrl-backup-*)"
+    [[ "$(jq -c 'del(.crossSessionInbound)' "$f")" == "$(jq -c . "$b")" ]] || fail "backup differs from original"
+    [[ "$(stat -f %Lp "$b")" == "640" && "$(stat -f %Lp "$f")" == "640" ]] || fail "mode not kept"
+
+    # 2. Idempotence: second run says unchanged, no write, no new backup.
+    local sum; sum="$(shasum -a 256 "$f")"
+    out="$(_ps --yes 2>&1)" || fail "second run failed: $out"
+    assert_contains "$out" "unchanged"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "second run changed the file"
+    [[ "$(ls "$home/.claude" | grep -c 'cctrl-backup-' || true)" == "1" ]] || fail "second run made a backup"
+
+    # --dry-run writes nothing and says what it would do; --json is parseable.
+    sum="$(shasum -a 256 "$f")"
+    out="$(_ps --value hold --dry-run 2>&1)" || fail "dry-run failed: $out"
+    assert_contains "$out" "dry run"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "dry-run wrote"
+    out="$(_ps --value hold --dry-run --json 2>&1)" || fail "dry-run json failed: $out"
+    [[ "$(printf '%s' "$out" | jq -r '.changed, .dry_run, .value' | tr '\n' ' ')" == "true true hold " ]] || fail "json shape: $out"
+    out="$(_ps --value bogus --yes 2>&1)" && fail "bogus value accepted"
+
+    # 9. --value unset removes only the key.
+    out="$(_ps --value unset --yes 2>&1)" || fail "unset failed: $out"
+    [[ "$(jq -c 'keys_unsorted' "$f")" == '["model","hooks","env"]' ]] || fail "unset changed other keys: $(cat "$f")"
+
+    # No --yes and no terminal: refuses and writes nothing.
+    sum="$(shasum -a 256 "$f")"
+    rc=0; out="$(_ps </dev/null 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "wrote without confirmation"
+    assert_contains "$out" "--yes"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "unconfirmed run wrote"
+
+    # 4. Invalid JSON: refused, nonzero, file untouched, no backup.
+    rm -f "$home/.claude"/*cctrl-backup-*
+    printf '{"model": "opus",,}\n' > "$f"; sum="$(shasum -a 256 "$f")"
+    rc=0; out="$(_ps --yes 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "invalid JSON was accepted"
+    assert_contains "$out" "not valid JSON"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "invalid file was touched"
+    [[ -z "$(ls "$home/.claude" | grep 'cctrl-backup-' || true)" ]] || fail "backup made for an invalid file"
+    printf '{}\n' > "$f"
+
+    # 5. Managed override: warning, exit 3, no write.
+    printf '{"crossSessionInbound":"hold"}\n' > "$home/managed/managed-settings.json"
+    sum="$(shasum -a 256 "$f")"
+    rc=0; out="$(_ps --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 3 ]] || fail "managed override: rc $rc, want 3: $out"
+    assert_contains "$out" "managed value hold overrides"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "wrote despite managed override"
+    rm -f "$home/managed/managed-settings.json"
+
+    # 6. Project stricter: reported for --dir, does not block the user write.
+    mkdir -p "$home/proj/.claude"
+    printf '{"crossSessionInbound":"refuse"}\n' > "$home/proj/.claude/settings.json"
+    out="$(_ps --yes --dir "$home/proj" 2>&1)" || fail "project stricter blocked the write: $out"
+    assert_contains "$out" "applies in this repo only: refuse"
+    [[ "$(jq -r .crossSessionInbound "$f")" == "accept" ]] || fail "user write skipped"
+
+    # 7. Version gate.
+    printf '{}\n' > "$f"; sum="$(shasum -a 256 "$f")"
+    rc=0; out="$(PS_VER=2.1.200 _ps --yes 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] || fail "2.1.200: rc $rc, want 2: $out"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "wrote on a refused version"
+    out="$(PS_VER=2.1.230 _ps --yes 2>&1)" || fail "2.1.230 failed: $out"
+    assert_contains "$out" "no /config row"
+    out="$(PS_VER=2.1.240 _ps --yes 2>&1)" || fail "2.1.240 failed: $out"
+    assert_contains "$out" "silently ignore"
+    printf '{}\n' > "$f"
+    out="$(PS_VER=2.1.329 _ps --yes 2>&1)" || fail "2.1.329 failed: $out"
+    assert_not_contains "$out" "no /config row"
+    # A missing claude needs --yes (it is on PATH only through the stub).
+    rm -f "$home/stub/claude"; printf '{}\n' > "$f"
+    rc=0; out="$(_ps_env "$home" 2.1.329 "$ROOT/cctrl" peer setup </dev/null 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "missing claude and no --yes still wrote"
+
+    # Help names the command; scopes other than user are not offered yet.
+    assert_contains "$("$ROOT/cctrl" peer help 2>&1)" "cctrl peer setup"
+    assert_contains "$("$ROOT/cctrl" peer setup --help 2>&1)" "--dry-run"
+
+    real_after="$(shasum -a 256 "$HOME/.claude/settings.json" 2>/dev/null || echo absent)"
+    [[ "$real_before" == "$real_after" ]] || fail "test changed the real ~/.claude/settings.json"
+    unset -f _ps
+    echo "ok: peer setup merges, backs up once, is idempotent, refuses invalid JSON, honours managed and version gates, and unsets"
+}
+
+test_hooks_install_refuses_invalid_settings() {
+    # msg-setup P2: a broken settings.json must never be replaced by hooks only.
+    local home="$TMPDIR/hi-bad-home" f out rc sum
+    rm -rf "$home"; mkdir -p "$home/.claude"; f="$home/.claude/settings.json"
+    _hi() { env -u CODEX_HOME -u CLAUDE_CONFIG_DIR HOME="$home" "$ROOT/cctrl" hooks install "$@"; }
+    printf '{"model": "opus", "permissions": {"allow": ["Bash(ls)"],,}}\n' > "$f"
+    sum="$(shasum -a 256 "$f")"
+    rc=0; out="$(_hi 2>&1)" || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "hooks install exited 0 on invalid settings: $out"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "hooks install changed an invalid settings.json: $(cat "$f")"
+    assert_contains "$out" "not valid JSON"
+    # A valid file is still merged, with one backup and the other keys kept.
+    printf '{"model": "opus"}\n' > "$f"
+    out="$(_hi 2>&1)" || fail "valid install failed: $out"
+    [[ "$(jq -r .model "$f")" == "opus" ]] || fail "model lost"
+    jq -e '.hooks.Stop | length > 0' "$f" >/dev/null || fail "hooks not written"
+    [[ "$(ls "$home/.claude" | grep -c 'cctrl-backup-' || true)" == "1" ]] || fail "no backup of the valid file"
+    sum="$(shasum -a 256 "$f")"
+    out="$(_hi 2>&1)" || fail "second install failed: $out"
+    [[ "$sum" == "$(shasum -a 256 "$f")" ]] || fail "second install changed the file"
+    unset -f _hi
+    echo "ok: hooks install refuses invalid settings.json and leaves it byte-identical"
+}
+
 test_hooks_doctor_fix_hint_names_the_side() {
     # mdec-1103 verify: plain `hooks install` no longer touches Codex, so the
     # doctor's final hint must name the command for the side with the issue.

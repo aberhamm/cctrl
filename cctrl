@@ -15621,6 +15621,7 @@ cmd_peer() {
         gc) _peer_cmd_gc "$@" ;;
         watch) _peer_cmd_watch "$@" ;;
         doctor) _peer_cmd_doctor "$@" ;;
+        setup) python3 -I "$SCRIPT_DIR/lib/peer_setup.py" "$@" ;;
         repair) _peer_cmd_repair "$@" ;;
         doorbell) _peer_cmd_doorbell "$@" ;;
         mcp) _peer_cmd_mcp "$@" ;;
@@ -15637,6 +15638,8 @@ cmd_peer() {
             echo "  cctrl peer unregister <name>"
             echo "  cctrl peer by-session claude:SESSION_ID [--json]"
             echo "                                     The one mailbox peer backing a native Claude session (refuses 0 or 2+)"
+            echo "  cctrl peer setup [--scope user] [--value accept|hold|refuse|unset] [--dir PATH] [--dry-run] [--yes] [--json]"
+            echo "                                     Opt in to Claude cross-session messages (crossSessionInbound in user settings)"
             echo "  cctrl peer whoami [--as NAME] [--json]"
             echo "  cctrl peer whois <uds:/path.sock|pid:N> [--name NAME] [--mode MODE] [--no-tmux] [--json]"
             echo "                                     Read-only consistency check of a native sender (never proof of identity)"
@@ -24770,76 +24773,7 @@ _hooks_install() {
     if [[ "$install_agent" == "codex" ]]; then
         echo -e "${DIM}Skipping Claude Code — --agent codex${RESET}"
     elif [[ -d "$claude_dir" ]]; then
-        if python3 -c "
-import json, sys, os
-
-path = os.path.expanduser('$claude_settings')
-try:
-    with open(path) as f:
-        cfg = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError):
-    cfg = {}
-
-hooks = cfg.setdefault('hooks', {})
-
-# PreToolUse: replace any cctrl-sourced entry, preserve others
-new_ptu = []
-for entry in hooks.get('PreToolUse', []):
-    cmds = [h.get('command', '') for h in entry.get('hooks', [])]
-    if any('block-git-commit' in c or 'cctrl hooks run pre-tool-use' in c for c in cmds):
-        continue
-    new_ptu.append(entry)
-new_ptu.append({
-    'matcher': 'Bash',
-    'hooks': [{'type': 'command', 'command': 'cctrl hooks run pre-tool-use'}]
-})
-hooks['PreToolUse'] = new_ptu
-
-# Plan 114 (b): the SendMessage log, as its own PreToolUse (intent) and
-# PostToolUse (outcome) entries. Separate from the Bash entry above, so the
-# plan 107 Bash guard path is untouched. Replace cctrl's, keep others.
-for event in ('PreToolUse', 'PostToolUse'):
-    kept = []
-    for entry in hooks.get(event, []):
-        cmds = [h.get('command', '') for h in entry.get('hooks', [])]
-        if any('cctrl hooks run native-send-log' in c for c in cmds):
-            continue
-        kept.append(entry)
-    kept.append({
-        'matcher': 'SendMessage',
-        'hooks': [{'type': 'command', 'command': 'cctrl hooks run native-send-log'}]
-    })
-    hooks[event] = kept
-
-# Stop: replace cctrl-sourced entry, preserve others (e.g. gstack)
-new_stop = []
-for entry in hooks.get('Stop', []):
-    cmds = [h.get('command', '') for h in entry.get('hooks', [])]
-    if any('notify.sh' in c or 'session-log' in c or 'cctrl hooks run stop' in c for c in cmds):
-        if not entry.get('_gstack_source'):
-            continue
-    new_stop.append(entry)
-new_stop.insert(0, {
-    'hooks': [{'type': 'command', 'command': 'cctrl hooks run stop'}]
-})
-hooks['Stop'] = new_stop
-
-# Notification: replace cctrl-sourced entry, preserve others
-new_notif = []
-for entry in hooks.get('Notification', []):
-    cmds = [h.get('command', '') for h in entry.get('hooks', [])]
-    if any('notify.sh' in c or 'cctrl hooks run notify' in c for c in cmds):
-        continue
-    new_notif.append(entry)
-new_notif.append({
-    'hooks': [{'type': 'command', 'command': 'cctrl hooks run notify'}]
-})
-hooks['Notification'] = new_notif
-
-with open(path, 'w') as f:
-    json.dump(cfg, f, indent=2)
-    f.write('\n')
-" 2>&1; then
+        if python3 -I "$SCRIPT_DIR/lib/hooks_install_claude.py" "$claude_settings" 2>&1; then
             echo -e "${GREEN}✓${RESET} Claude Code hooks installed → $claude_settings"
         else
             echo -e "${RED}✗${RESET} Failed to update Claude Code hooks" >&2
